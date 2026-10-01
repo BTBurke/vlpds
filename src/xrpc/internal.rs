@@ -33,7 +33,7 @@ async fn cluster_status(State(app): AppState, headers: HeaderMap) -> XResult<Jso
     let (node, table, peers, lease_valid) = match &app.cluster {
         Some(c) => (
             c.cfg.node_id.clone(),
-            (0..c.cfg.shards).map(|p| c.owner_of(p).map(|(id, _)| id)).collect::<Vec<_>>(),
+            c.layout().shards.iter().map(|r| (r.id, c.owner_of(r.id).map(|(id, _)| id))).collect::<Vec<_>>(),
             c.peers().into_iter().map(|l| json!({"node": l.node_id, "log": l.log_id, "addr": l.addr})).collect::<Vec<_>>(),
             c.lease_valid(),
         ),
@@ -44,7 +44,13 @@ async fn cluster_status(State(app): AppState, headers: HeaderMap) -> XResult<Jso
         "log": app.log.log_id.to_string(),
         "log_durable_ordinal": app.log.durable_ordinal.load(std::sync::atomic::Ordering::Acquire),
         "owned": owned,
+        // routing by shard id, in slot order (ids are stable names: a split
+        // or merge replaces some with new ones)
         "table": table,
+        "layout": app.cluster.as_ref().map(|c| {
+            let l = c.layout();
+            json!({"version": l.version, "shards": l.ids(), "op": l.op})
+        }),
         "peers": peers,
         "lease_valid": lease_valid,
         "firehose_last_emitted": app.firehose.last_emitted.load(std::sync::atomic::Ordering::Acquire),
@@ -421,7 +427,7 @@ async fn sync_list_repos(
     Query(q): Query<ListPageQ>,
 ) -> XResult<Response> {
     check(&app, &headers)?;
-    let pos = super::sync::parse_list_cursor(&q.cursor, app.partitions.len())?;
+    let pos = super::sync::parse_list_cursor(&q.cursor)?;
     let limit = super::extract::limit_param(Some(q.limit), 500, 1, 1000)?;
     let (repos, next) = super::sync::list_repos_local(&app, pos, limit).await?;
     let page = super::sync::ReposPage::new(repos, next);

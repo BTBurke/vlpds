@@ -163,9 +163,6 @@ const RELOAD_SECS: u64 = 10;
 /// ... and when read from a partition this node owns (changes made here or
 /// forwarded here invalidate it at once; this only bounds a missed one).
 const LOCAL_RELOAD_SECS: u64 = 60;
-/// Cached per-DID views beyond this are evicted (stale ones first); ~250 B
-/// each, so ~125 MB at the cap.
-const CTL_CACHE_MAX: usize = 500_000;
 const EMAIL_TOKEN_TTL_MS: u64 = 15 * 60 * 1000;
 pub(super) const NEW_PASSWORD_MAX_LENGTH: usize = 256;
 pub(super) const OLD_PASSWORD_MAX_LENGTH: usize = 512;
@@ -303,16 +300,15 @@ pub(super) async fn scan_private_routing(
     app: &App,
     routing_prefix: &str,
 ) -> XResult<Vec<(String, String, Bytes)>> {
-    let lo = [b"p/".as_slice(), routing_prefix.as_bytes()].concat();
-    let hi = state::prefix_end(&lo);
+    // keys are slot-major: walk each slot's run of p/{routing_prefix}
+    let fam = [state::PRIVATE_FAMILY, routing_prefix.as_bytes()].concat();
     let mut out = Vec::new();
     for p in app.partitions.owned() {
-        let mut iter =
-            p.db.scan(lo.clone()..hi.clone())
-                .await
-                .map_err(XrpcError::from_err)?;
+        let mut iter = state::FamilyScan::new(p.db.as_ref(), &fam, None, &Default::default())
+            .await
+            .map_err(XrpcError::from_err)?;
         while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
-            let rest = String::from_utf8_lossy(&kv.key[2..]).to_string();
+            let rest = String::from_utf8_lossy(&state::key_body(&kv.key)[state::PRIVATE_FAMILY.len()..]).to_string();
             if let Some((routing, name)) = rest.split_once('\0') {
                 out.push((routing.to_string(), name.to_string(), kv.value));
             }
@@ -430,8 +426,9 @@ fn standard_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> X
 // ---------------------------------------------------------------------------
 
 pub(super) struct Ext {
-    /// did -> its revocations and takedowns ([`ctl`])
-    ctl: RwLock<HashMap<String, Arc<Ctl>>>,
+    /// did -> its revocations and takedowns ([`ctl`]), at most the
+    /// `security_controls` cap (src/caches.rs)
+    ctl: Arc<RwLock<HashMap<String, Arc<Ctl>>>>,
     /// bumped by every change, so a load racing one is not cached
     gen: AtomicU64,
     pub(super) dev_mail: PMutex<HashMap<String, Vec<Mail>>>,
@@ -450,7 +447,7 @@ pub(super) fn ext(app: &App) -> Arc<Ext> {
         return e.clone();
     }
     let e = Arc::new(Ext {
-        ctl: RwLock::new(HashMap::new()),
+        ctl: crate::caches::track(crate::caches::Cache::SecurityControls, Default::default()),
         gen: AtomicU64::new(0),
         dev_mail: PMutex::new(HashMap::new()),
         locks: (0..64).map(|_| tokio::sync::Mutex::new(())).collect(),
@@ -555,8 +552,7 @@ async fn load_sets(app: &App, did: &str, local: Option<(u16, u64)>) -> XResult<C
 pub(super) async fn ctl(app: &App, did: &str) -> Arc<Ctl> {
     let e = ext(app);
     let now = now_secs();
-    let p = state::partition_of(did, app.partitions.len() as u16);
-    let local = app.partitions.get(p as usize).map(|p| (p.id, p.epoch));
+    let local = app.partitions.for_key(did).map(|p| (p.id, p.epoch));
     let cached = e.ctl.read().get(did).cloned();
     if let Some(c) = &cached {
         let fresh = match (c.local, local) {
@@ -575,9 +571,12 @@ pub(super) async fn ctl(app: &App, did: &str) -> Arc<Ctl> {
             let mut m = e.ctl.write();
             // a change since the read began: use it for this check only
             if e.gen.load(Ordering::SeqCst) == gen0 {
-                if m.len() >= CTL_CACHE_MAX {
+                // full: evict the views older than RELOAD_SECS, else all of
+                // them (a dropped view only costs a re-read)
+                let cap = crate::caches::cap(crate::caches::Cache::SecurityControls);
+                if m.len() >= cap && !m.contains_key(did) {
                     m.retain(|_, v| now.saturating_sub(v.at) < RELOAD_SECS);
-                    if m.len() >= CTL_CACHE_MAX {
+                    if m.len() >= cap {
                         m.clear();
                     }
                 }

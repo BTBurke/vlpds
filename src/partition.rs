@@ -145,9 +145,10 @@ pub async fn open_db(
     // 2M records, 10 ms store calls: worst write 11.8 s -> 6 ms at 50k
     // records/s, 34 ms at 80k/s; tests/all/shard_ingest.rs). L0s live in the
     // object store and are bloom-filtered, so the cost is read
-    // amplification only while compaction lags. The polls stay at their
-    // defaults: at 1 s they also absorb unpaced bursts, but cost ~4x the
-    // idle GETs across 256 shards.
+    // amplification only while compaction lags. Compactor polling is
+    // adaptive (`spawn_compactor`): SlateDB's 5 s polls while L0 is shallow,
+    // 500 ms while it runs deep, so unpaced bursts are absorbed without the
+    // ~4x idle GETs of always-fast polls (tests/all/compaction_polling.rs).
     //
     // Memory: the active memtable freezes at 16 MiB (the 10 s node
     // checkpoint flushes idle shards' sooner), so memtables total at most
@@ -178,7 +179,7 @@ pub async fn open_db(
         oc.cache_on_flush = true;
         oc.cache_on_compaction = true;
     }
-    let path = format!("{}/state/{:03}", store.prefix, partition);
+    let path = db_path(store, partition);
     // cache ids only need to be distinct per DB in this process (tests open
     // several prefixes with the same shard numbers)
     let cache_id = {
@@ -194,8 +195,97 @@ pub async fn open_db(
         .with_sst_block_size(SST_BLOCK_SIZE)
         .build()
         .await?;
-    spawn_compactor(&db, path, store.raw.clone(), codec);
+    let raw = external_sst_redirect(&db, &path, store.raw.clone());
+    spawn_compactor(&db, path, raw, codec);
     Ok(db)
+}
+
+/// A shard cloned from others (split/merge, DESIGN.md "Online shard
+/// split/merge") reads its ancestors' SSTs in place until compaction
+/// rewrites them. The DB itself resolves them through its manifest, but a
+/// standalone compactor and compaction worker only know the DB's root, so
+/// they get a store that redirects those SST paths to their owners. The
+/// set only shrinks after the open (compaction drops external SSTs).
+fn external_sst_redirect(db: &Db, path: &str, raw: Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore> {
+    let m = db.manifest();
+    let ext = m.external_dbs();
+    if ext.is_empty() {
+        return raw;
+    }
+    let mut map = std::collections::HashMap::new();
+    for e in ext {
+        let resolver = slatedb::PathResolver::new(path.to_string(), &m);
+        for id in &e.sst_ids {
+            let theirs = resolver.sst_path(id);
+            let ours = object_store::path::Path::from(theirs.as_ref().replacen(e.path.as_str(), path, 1));
+            map.insert(ours, theirs);
+        }
+    }
+    Arc::new(Redirect { inner: raw, map })
+}
+
+#[derive(Debug)]
+struct Redirect {
+    inner: Arc<dyn object_store::ObjectStore>,
+    map: std::collections::HashMap<object_store::path::Path, object_store::path::Path>,
+}
+
+impl std::fmt::Display for Redirect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Redirect({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for Redirect {
+    async fn put_opts(&self, location: &object_store::path::Path, payload: object_store::PutPayload, opts: object_store::PutOptions) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(&self, location: &object_store::path::Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(&self, location: &object_store::path::Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(self.map.get(location).unwrap_or(location), options).await
+    }
+    fn delete_stream(&self, locations: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+    fn list(&self, prefix: Option<&object_store::path::Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(&self, prefix: Option<&object_store::path::Path>) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(&self, from: &object_store::path::Path, to: &object_store::path::Path, options: object_store::CopyOptions) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Where shard `id`'s SlateDB lives.
+pub fn db_path(store: &Store, id: u16) -> String {
+    format!("{}/state/{:03}", store.prefix, id)
+}
+
+/// Creates shard `child`'s SlateDB as a clone of `sources` (shard id, slots
+/// [lo, hi)), each projected to its slots: a split clones one parent per
+/// child, a merge clones both parents into one. O(manifest): the child
+/// references the sources' SSTs (pinned by a checkpoint in each source)
+/// until its compaction rewrites them. The sources must be closed (all
+/// their state in SSTs). Idempotent: a retry finds the clone initialized.
+pub async fn clone_db(store: &Store, child: u16, sources: &[(u16, u32, u32)]) -> anyhow::Result<()> {
+    use std::ops::Bound;
+    anyhow::ensure!(!sources.is_empty(), "clone of shard {child} without sources");
+    let spec = |&(id, lo, hi): &(u16, u32, u32)| {
+        let (a, b) = crate::state::slot_range_keys(lo, hi);
+        slatedb::CloneSourceSpec::new(db_path(store, id)).with_projection_range((Bound::Included(a), Bound::Excluded(b)))
+    };
+    let admin = slatedb::admin::AdminBuilder::new(db_path(store, child), store.raw.clone()).build();
+    let mut b = admin.create_clone_builder_from_source(spec(&sources[0]));
+    for s in &sources[1..] {
+        b = b.with_source(spec(s));
+    }
+    b.build().await?;
+    Ok(())
 }
 
 const SST_BLOCK_SIZE: slatedb::SstBlockSize = slatedb::SstBlockSize::Block16Kib;
@@ -209,43 +299,147 @@ const SST_BLOCK_SIZE: slatedb::SstBlockSize = slatedb::SstBlockSize::Block16Kib;
 /// written into the local SST disk cache (`cache_on_compaction`); reads
 /// cache them.
 fn spawn_compactor(db: &Db, path: String, raw: Arc<dyn object_store::ObjectStore>, codec: Option<slatedb::config::CompressionCodec>) {
-    use slatedb::config::{CompactionWorkerOptions, CompactorOptions};
     let mut status = db.subscribe();
+    let watch = db.subscribe();
     tokio::spawn(async move {
-        let mut opts = CompactorOptions { worker: None, checkpoint_lifetime: checkpoint_lifetime(), ..Default::default() };
-        let mut worker_opts = CompactionWorkerOptions { compression_codec: codec, ..Default::default() };
-        if cfg!(test) {
-            // unit tests wait for compactions
-            opts.poll_interval = Duration::from_millis(100);
-            worker_opts.compactions_poll_interval = Duration::from_millis(100);
-        }
-        let compactor = slatedb::CompactorBuilder::new(path.clone(), raw.clone()).with_options(opts);
-        let worker = slatedb::CompactionWorkerBuilder::new(path.clone(), raw).with_options(worker_opts).with_sst_block_size(SST_BLOCK_SIZE);
-        #[cfg(feature = "slatedb-metrics")]
-        let (compactor, worker) = (compactor.with_metrics_recorder(crate::metrics::slatedb_recorder()), worker.with_metrics_recorder(crate::metrics::slatedb_recorder()));
-        let compactor = compactor.build();
-        let worker = match worker.build().await {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::error!(%path, "compaction worker failed to start: {e}");
+        let polling = compaction_polling();
+        let mut fast = polling == CompactionPolling::Fast;
+        loop {
+            let (compactor, worker) = match build_compactor(&path, &raw, codec, fast).await {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(%path, "compaction worker failed to start: {e}");
+                    return;
+                }
+            };
+            // SlateDB marks the DB closed *before* its final memtable flush,
+            // and that flush waits for L0 room when L0 is full (a close
+            // under bulk ingest: a handback, or freezing a hot shard to
+            // split it). So keep compacting until the DB is gone (every
+            // handle dropped), at most CLOSE_GRACE: stopping at the close
+            // mark deadlocked such a close forever.
+            let closed = async {
+                while status.borrow_and_update().close_reason.is_none() {
+                    if status.changed().await.is_err() {
+                        return;
+                    }
+                }
+                let gone = async { while status.changed().await.is_ok() {} };
+                let _ = tokio::time::timeout(CLOSE_GRACE, gone).await;
+            };
+            let mut switch = false;
+            tokio::select! {
+                r = compactor.run() => if let Err(e) = r { tracing::warn!(%path, "compactor exited: {e}") },
+                r = worker.run() => if let Err(e) = r { tracing::warn!(%path, "compaction worker exited: {e}") },
+                _ = closed => {}
+                _ = mode_change(&watch, fast), if polling == CompactionPolling::Adaptive => switch = true,
+            }
+            // a graceful stop hands claimed jobs back as Scheduled, so the
+            // restarted worker picks them up again
+            let _ = compactor.stop().await;
+            let _ = worker.stop().await;
+            if !switch {
                 return;
             }
-        };
-        let closed = async {
-            while status.borrow_and_update().close_reason.is_none() {
-                if status.changed().await.is_err() {
-                    break;
-                }
-            }
-        };
-        tokio::select! {
-            r = compactor.run() => if let Err(e) = r { tracing::warn!(%path, "compactor exited: {e}") },
-            r = worker.run() => if let Err(e) = r { tracing::warn!(%path, "compaction worker exited: {e}") },
-            _ = closed => {}
+            fast = !fast;
+            crate::metrics::COMPACTION_POLL_MODE.with_label_values(&[if fast { "fast" } else { "slow" }]).inc();
+            tracing::debug!(%path, fast, "compaction polling switched");
         }
-        let _ = compactor.stop().await;
-        let _ = worker.stop().await;
     });
+}
+
+/// How long a closed shard's compactor keeps running for its final flush
+/// (see `spawn_compactor`) if some handle outlives the close.
+const CLOSE_GRACE: Duration = Duration::from_secs(60);
+
+/// How a shard's compactor polls for work (`--compaction-polling`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionPolling {
+    /// SlateDB's 5 s polls: cheapest idle, but an unpaced bulk ingest into
+    /// one shard fills L0 between cycles and backpressures for seconds.
+    Slow,
+    /// 500 ms polls always: ~10x the idle GETs.
+    Fast,
+    /// Slow while L0 is shallow, fast while it is deep (the default).
+    Adaptive,
+}
+
+impl std::str::FromStr for CompactionPolling {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        Ok(match s {
+            "slow" => CompactionPolling::Slow,
+            "fast" => CompactionPolling::Fast,
+            "adaptive" => CompactionPolling::Adaptive,
+            _ => anyhow::bail!("unknown compaction polling {s:?} (slow, fast, adaptive)"),
+        })
+    }
+}
+
+static COMPACTION_POLLING: parking_lot::RwLock<CompactionPolling> = parking_lot::RwLock::new(CompactionPolling::Adaptive);
+
+/// Compaction polling of shard DBs opened from now on.
+pub fn set_compaction_polling(p: CompactionPolling) {
+    *COMPACTION_POLLING.write() = p;
+}
+
+fn compaction_polling() -> CompactionPolling {
+    *COMPACTION_POLLING.read()
+}
+
+/// Poll interval of the slow (SlateDB default) and fast modes.
+const SLOW_POLL: Duration = Duration::from_secs(5);
+const FAST_POLL: Duration = Duration::from_millis(500);
+/// Adaptive: go fast at this many L0 SSTs (a quarter of `l0_max_ssts`: the
+/// writer is producing them faster than slow cycles drain them), back to
+/// slow once L0 has stayed at or below `CALM_L0` for `CALM_FOR`.
+const DEEP_L0: usize = 8;
+const CALM_L0: usize = 2;
+const CALM_FOR: Duration = Duration::from_secs(15);
+
+/// Resolves when an adaptive compactor in mode `fast` should switch. Reads
+/// L0 from the DB's status (holding no handle, so the DB can drop).
+async fn mode_change(status: &tokio::sync::watch::Receiver<slatedb::DbStatus>, fast: bool) {
+    let mut calm_since = None;
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let l0 = status.borrow().current_manifest.l0().len();
+        if !fast {
+            if l0 >= DEEP_L0 {
+                return;
+            }
+            continue;
+        }
+        if l0 > CALM_L0 {
+            calm_since = None;
+        } else if calm_since.get_or_insert_with(std::time::Instant::now).elapsed() >= CALM_FOR {
+            return;
+        }
+    }
+}
+
+/// A shard's compaction coordinator and worker, polling slow or fast.
+async fn build_compactor(
+    path: &str,
+    raw: &Arc<dyn object_store::ObjectStore>,
+    codec: Option<slatedb::config::CompressionCodec>,
+    fast: bool,
+) -> Result<(slatedb::compactor::Compactor, slatedb::CompactionWorker), slatedb::Error> {
+    use slatedb::config::{CompactionWorkerOptions, CompactorOptions};
+    let poll = if cfg!(test) {
+        Duration::from_millis(100) // unit tests wait for compactions
+    } else if fast {
+        FAST_POLL
+    } else {
+        SLOW_POLL
+    };
+    let opts = CompactorOptions { worker: None, checkpoint_lifetime: checkpoint_lifetime(), poll_interval: poll, ..Default::default() };
+    let worker_opts = CompactionWorkerOptions { compression_codec: codec, compactions_poll_interval: poll, ..Default::default() };
+    let compactor = slatedb::CompactorBuilder::new(path.to_string(), raw.clone()).with_options(opts);
+    let worker = slatedb::CompactionWorkerBuilder::new(path.to_string(), raw.clone()).with_options(worker_opts).with_sst_block_size(SST_BLOCK_SIZE);
+    #[cfg(feature = "slatedb-metrics")]
+    let (compactor, worker) = (compactor.with_metrics_recorder(crate::metrics::slatedb_recorder()), worker.with_metrics_recorder(crate::metrics::slatedb_recorder()));
+    Ok((compactor.build(), worker.build().await?))
 }
 
 #[cfg(test)]
@@ -430,4 +624,117 @@ mod tests {
         }
     }
 
+}
+
+#[cfg(test)]
+mod clone_tests {
+    use super::*;
+
+    fn k(slot: u16, rest: &str) -> Vec<u8> {
+        crate::state::slot_family(slot, rest.as_bytes())
+    }
+
+    async fn count(db: &Db) -> usize {
+        let mut n = 0;
+        let mut it = db.scan(..).await.unwrap();
+        while it.next().await.unwrap().is_some() {
+            n += 1;
+        }
+        n
+    }
+
+    /// A split is two projected clones of the parent, a merge one clone of
+    /// two sources: each child sees exactly its slots (never the parent's
+    /// shard-wide keys), writes and compacts on its own (its compactor reads
+    /// inherited SSTs through the redirect), and clones again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn split_and_merge_by_clone() {
+        let store = Store { prefix: "clone".into(), ..Store::memory(None) };
+        let db = open_db(&store, 0, None).await.unwrap();
+        for s in [0u16, 100, 32767, 32768, 50000, 65535] {
+            for i in 0..50 {
+                db.put(k(s, &format!("h/did{i:03}")), format!("v{s}-{i}")).await.unwrap();
+            }
+        }
+        db.put(crate::nodelog::META_APPLIED, b"m").await.unwrap();
+        db.close().await.unwrap();
+        clone_db(&store, 1, &[(0, 0, 32768)]).await.unwrap();
+        clone_db(&store, 1, &[(0, 0, 32768)]).await.expect("a retried clone is a no-op");
+        clone_db(&store, 2, &[(0, 32768, 65536)]).await.unwrap();
+        // an empty parent clones too
+        open_db(&store, 9, None).await.unwrap().close().await.unwrap();
+        clone_db(&store, 10, &[(9, 0, 100)]).await.unwrap();
+        let e = open_db(&store, 10, None).await.unwrap();
+        assert_eq!(count(&e).await, 0);
+        e.close().await.unwrap();
+
+        let c1 = open_db(&store, 1, None).await.unwrap();
+        let c2 = open_db(&store, 2, None).await.unwrap();
+        assert!(c1.get(crate::nodelog::META_APPLIED).await.unwrap().is_none(), "shard-wide keys stay with the parent");
+        assert!(c1.get(k(100, "h/did001")).await.unwrap().is_some());
+        assert!(c1.get(k(50000, "h/did001")).await.unwrap().is_none());
+        assert!(c2.get(k(50000, "h/did001")).await.unwrap().is_some());
+        assert_eq!((count(&c1).await, count(&c2).await), (150, 150));
+        for r in 0..10 {
+            for i in 0..50 {
+                c1.put(k(100, &format!("h/new{r}{i:03}")), "x").await.unwrap();
+                c1.delete(k(0, &format!("h/did{i:03}"))).await.unwrap();
+            }
+            c1.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
+        }
+        let t = std::time::Instant::now();
+        loop {
+            let m = c1.manifest();
+            if m.l0().len() < 4 && !m.compacted().is_empty() {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(30), "child never compacted: {} L0s", m.l0().len());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(c1.get(k(0, "h/did001")).await.unwrap().is_none());
+        assert!(c1.get(k(100, "h/did001")).await.unwrap().is_some());
+        c1.close().await.unwrap();
+        c2.close().await.unwrap();
+        clone_db(&store, 3, &[(1, 0, 32768), (2, 32768, 65536)]).await.unwrap();
+        let m = open_db(&store, 3, None).await.unwrap();
+        assert_eq!(count(&m).await, 600 + 150);
+        m.put(k(65535, "h/zz"), "z").await.unwrap();
+        m.close().await.unwrap();
+        let m = open_db(&store, 3, None).await.unwrap();
+        assert!(m.get(k(65535, "h/zz")).await.unwrap().is_some());
+        assert!(m.get(k(100, "h/new9001")).await.unwrap().is_some());
+        m.close().await.unwrap();
+    }
+
+    /// FamilyScan walks one family across slots, skipping other families and
+    /// empty slots, from any start key.
+    #[tokio::test]
+    async fn family_scan_skips_other_families() {
+        let store = Store { prefix: "fam".into(), ..Store::memory(None) };
+        let db = open_db(&store, 0, None).await.unwrap();
+        for s in [3u16, 7, 9, 65535] {
+            for f in ["C/x\0", "R/", "a/", "h/", "n/", "p/"] {
+                db.put(k(s, &format!("{f}d{s}")), b"").await.unwrap();
+            }
+        }
+        db.put(k(8, "R/only-records"), b"").await.unwrap();
+        db.put(crate::nodelog::META_APPLIED, b"m").await.unwrap();
+        let scan = |fam: &'static [u8], start: Option<Vec<u8>>| {
+            let db = &db;
+            async move {
+                let mut it = crate::state::FamilyScan::new(db, fam, start, &Default::default()).await.unwrap();
+                let mut out = Vec::new();
+                while let Some(kv) = it.next().await.unwrap() {
+                    out.push(String::from_utf8_lossy(crate::state::key_body(&kv.key)).into_owned());
+                }
+                out
+            }
+        };
+        assert_eq!(scan(b"h/", None).await, vec!["h/d3", "h/d7", "h/d9", "h/d65535"]);
+        assert_eq!(scan(b"a/", Some(k(7, "a/d7\0"))).await, vec!["a/d9", "a/d65535"]);
+        assert_eq!(scan(b"p/", Some(k(9, "a/"))).await, vec!["p/d9", "p/d65535"]);
+        assert_eq!(scan(b"C/x\0", None).await.len(), 4);
+        assert!(scan(b"L/", None).await.is_empty());
+        db.close().await.unwrap();
+    }
 }

@@ -120,16 +120,17 @@ async fn admin_listings_scatter_gather_across_nodes() {
     assert_eq!(owners.len(), 3, "accounts spread over all three nodes");
 
     // email-prefix search from any node, paged 2 at a time, sees all 9 in
-    // (shard, did) order with no duplicates
+    // (slot, did) order (layout-independent) with no duplicates
     let prefix = tag.to_ascii_lowercase();
+    let slot = |d: &str| vlpds::slots::slot_of(d);
     for s in [&a, &b, &c] {
         let (got, pages) = all_pages(s, "com.atproto.admin.searchAccounts", "accounts", &[("email", &prefix)], 2).await;
         let dids: Vec<String> = got.iter().map(|v| v["did"].as_str().unwrap().to_string()).collect();
         let mut sorted = dids.clone();
-        sorted.sort_by_key(|d| (shard(d), d.clone()));
-        assert_eq!(dids, sorted, "merged in (shard, did) order");
+        sorted.sort_by_key(|d| (slot(d), d.clone()));
+        assert_eq!(dids, sorted, "merged in (slot, did) order");
         let mut expect: Vec<String> = want.iter().map(|t| t.did.clone()).collect();
-        expect.sort_by_key(|d| (shard(d), d.clone()));
+        expect.sort_by_key(|d| (slot(d), d.clone()));
         assert_eq!(dids, expect, "every account exactly once");
         // the views come from the owning node (handle, email, invites)
         let h = got.iter().find(|v| v["did"] == want[4].did.as_str()).unwrap();

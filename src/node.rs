@@ -93,6 +93,20 @@ impl Node {
 }
 
 impl Node {
+    /// Tests only: drops every shard from routing and the workers' caches
+    /// without closing anything, as a crash would (see `Cluster::halt`).
+    pub fn halt(&self) {
+        self.cluster.halt();
+        self.log.halted.store(true, Ordering::Release);
+        for p in self.table.owned() {
+            self.table.set(p.id, None);
+            for w in self.workers.senders.iter() {
+                let (tx, _rx) = tokio::sync::oneshot::channel();
+                let _ = w.send(WorkerMsg::DropPartition(p.id, tx));
+            }
+        }
+    }
+
     /// Closes one shard (see [`ShardHost::close_many`]).
     pub async fn close(&self, shard: u16) -> anyhow::Result<()> {
         self.close_many(vec![shard]).await.pop().map_or(Ok(()), |(_, r)| r)
@@ -185,7 +199,7 @@ impl ShardHost for Node {
             }
             preload.push((shard, db.clone()));
             let apply_lock = Arc::new(tokio::sync::RwLock::new(()));
-            self.log.sinks.insert(Arc::new(ShardSink { id: shard, epoch, db: db.clone(), apply_lock: apply_lock.clone() }));
+            self.log.sinks.insert(Arc::new(ShardSink { id: shard, epoch, db: db.clone(), apply_lock: apply_lock.clone(), applied: Default::default() }));
             self.table.set(
                 shard,
                 Some(Arc::new(Partition {
@@ -335,6 +349,9 @@ impl ShardHost for Node {
     }
 
     fn lost(&self) {
+        if self.cluster.halted() {
+            return; // a "crashed" in-process test node: already inert
+        }
         crate::metrics::LEASE_EVENTS.with_label_values(&["lost"]).inc();
         tracing::error!("node lease lost unexpectedly: fail-stop");
         std::process::exit(5);
@@ -346,5 +363,45 @@ impl ShardHost for Node {
 
     async fn nudge(&self, nudges: Vec<(String, Vec<crate::cluster::Handoff>)>) {
         crate::xrpc::internal::nudge_peers(&self.http, &self.internal_token, nudges).await;
+    }
+
+    fn on_layout(&self, layout: Arc<crate::slots::Layout>) {
+        self.table.set_layout(layout);
+    }
+
+    async fn clone_shards(&self, layout: &crate::slots::Layout, op: &crate::slots::Reshard) -> anyhow::Result<()> {
+        use futures::StreamExt;
+        let started = Instant::now();
+        let parents: Vec<crate::slots::ShardRange> = op
+            .parents
+            .iter()
+            .map(|p| layout.range_of(*p).ok_or_else(|| anyhow::anyhow!("parent {p} not in layout v{}", layout.version)))
+            .collect::<anyhow::Result<_>>()?;
+        // each child takes, from every parent it overlaps, the slots they share
+        let plans: Vec<(u16, Vec<(u16, u32, u32)>)> = op
+            .children
+            .iter()
+            .map(|c| (c.id, parents.iter().filter(|p| p.lo < c.hi && c.lo < p.hi).map(|p| (p.id, p.lo.max(c.lo), p.hi.min(c.hi))).collect()))
+            .collect();
+        let results: Vec<anyhow::Result<()>> = futures::stream::iter(plans)
+            .map(|(c, srcs)| async move { partition::clone_db(&self.state_store, c, &srcs).await.map_err(|e| e.context(format!("cloning shard {c} from {srcs:?}"))) })
+            .buffer_unordered(4)
+            .collect()
+            .await;
+        results.into_iter().collect::<anyhow::Result<Vec<()>>>()?;
+        tracing::info!(op = op.id, children = ?op.children.iter().map(|c| c.id).collect::<Vec<_>>(), elapsed_ms = started.elapsed().as_millis() as u64, "cloned reshard children");
+        Ok(())
+    }
+
+    fn shard_stats(&self) -> Vec<(u16, u64, u64)> {
+        self.table
+            .owned()
+            .iter()
+            .map(|p| {
+                let m = p.db.manifest();
+                let bytes: u64 = m.l0().iter().map(|t| t.estimate_size()).sum::<u64>() + m.compacted().iter().map(|r| r.estimate_size()).sum::<u64>();
+                (p.id, bytes, self.log.sinks.applied_entries(p.id))
+            })
+            .collect()
     }
 }

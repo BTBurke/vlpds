@@ -41,16 +41,27 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, public: Opt
     .await
 }
 
-/// Waits until `nodes` own every shard exactly once between them (each
-/// owning some) and their routing tables agree on it.
+/// Waits until `nodes` own every shard exactly once at fair share (sizes
+/// within one of each other), their routing tables agree on it, and it has
+/// held still for 500 ms. "Each node owns some" can still be mid-rebalance
+/// (e.g. 6/1/1): the hand-backs that follow answer 503 PartitionUnavailable
+/// (retry) while a shard moves, which the single-shot steps below would
+/// take for a failure.
 async fn balanced(nodes: &[&TestServer]) {
+    let mut stable_since: Option<(Vec<Vec<u16>>, std::time::Instant)> = None;
     for _ in 0..400 {
-        let owned: Vec<Vec<u16>> =
-            nodes.iter().map(|n| n.app.partitions.owned().iter().map(|p| p.id).collect()).collect();
+        let owned: Vec<Vec<u16>> = nodes
+            .iter()
+            .map(|n| {
+                let mut v: Vec<u16> = n.app.partitions.owned().iter().map(|p| p.id).collect();
+                v.sort();
+                v
+            })
+            .collect();
         let all: HashSet<u16> = owned.iter().flatten().copied().collect();
-        let complete = owned.iter().all(|o| !o.is_empty())
-            && all.len() == SHARDS as usize
-            && owned.iter().map(|o| o.len()).sum::<usize>() == SHARDS as usize;
+        let sizes: Vec<usize> = owned.iter().map(|o| o.len()).collect();
+        let fair = sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1;
+        let complete = fair && all.len() == SHARDS as usize && sizes.iter().sum::<usize>() == SHARDS as usize;
         let routed = complete
             && nodes.iter().all(|n| {
                 let c = n.app.cluster.as_ref().unwrap();
@@ -60,7 +71,16 @@ async fn balanced(nodes: &[&TestServer]) {
                 })
             });
         if routed {
-            return;
+            match &stable_since {
+                Some((prev, at)) if *prev == owned => {
+                    if at.elapsed() >= Duration::from_millis(500) {
+                        return;
+                    }
+                }
+                _ => stable_since = Some((owned, std::time::Instant::now())),
+            }
+        } else {
+            stable_since = None;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

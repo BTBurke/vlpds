@@ -88,6 +88,9 @@ pub async fn serve_stream(mut ws: WebSocket, log: Arc<NodeLog>) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
+        if log.halted.load(Ordering::Acquire) {
+            return; // a halted test node: its connections die with it
+        }
         // Read the watermark *before* draining: batches covered by it were
         // broadcast before it advanced, so they are already in our queue.
         let w = log.wm.get();

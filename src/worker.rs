@@ -481,6 +481,21 @@ impl Worker {
                     continue;
                 }
                 let Some(st) = self.cache.get_mut(&did) else {
+                    // Dropped by a DropPartition in this same batch (its shard
+                    // closed: a handback, a takeover or a split's freeze).
+                    // These requests were silently dropped (500 "worker
+                    // dropped request"); load again instead, which answers
+                    // 503 "not owned" (retryable) or serves a new owner.
+                    let mut reqs = reqs.into_iter();
+                    if let Some(first) = reqs.next() {
+                        match self.loading.get_mut(&did) {
+                            Some(buf) => buf.push(first),
+                            None => self.start_load(first),
+                        }
+                        if let Some(buf) = self.loading.get_mut(&did) {
+                            buf.extend(reqs);
+                        }
+                    }
                     continue;
                 };
                 if let Err(e) = process(st, reqs, self.clock_id) {
@@ -859,7 +874,7 @@ impl Worker {
                 val: Some(req.account_json.clone()),
             },
             Mutation {
-                key: state::handle_key(&req.handle).into(),
+                key: state::handle_key(&req.did, &req.handle).into(),
                 val: Some(Bytes::from(req.did.to_string())),
             },
             Mutation {
@@ -932,9 +947,9 @@ pub fn spawn_preload(workers: &Workers, shards: Vec<(u16, Arc<slatedb::Db>)>) {
         let mut dids: Vec<Arc<str>> = Vec::new();
         for (shard, db) in shards {
             let r: anyhow::Result<()> = async {
-                let mut it = db.scan(state::LARGE_REPO_PREFIX.to_vec()..state::prefix_end(state::LARGE_REPO_PREFIX)).await?;
+                let mut it = state::FamilyScan::new(db.as_ref(), state::LARGE_REPO_FAMILY, None, &Default::default()).await?;
                 while let Some(kv) = it.next().await? {
-                    dids.push(String::from_utf8_lossy(&kv.key[state::LARGE_REPO_PREFIX.len()..]).into());
+                    dids.push(String::from_utf8_lossy(state::slot_did(&kv.key, state::LARGE_REPO_FAMILY.len()).1).into());
                 }
                 Ok(())
             }
@@ -1619,11 +1634,11 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
             };
             if account.handle != st.account.handle {
                 muts.push(Mutation {
-                    key: state::handle_key(&st.account.handle).into(),
+                    key: state::handle_key(&st.did, &st.account.handle).into(),
                     val: None,
                 });
                 muts.push(Mutation {
-                    key: state::handle_key(&account.handle).into(),
+                    key: state::handle_key(&st.did, &account.handle).into(),
                     val: Some(Bytes::from(st.did.to_string())),
                 });
             }
@@ -1741,7 +1756,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
                 val: None,
             });
             muts.push(Mutation {
-                key: state::handle_key(&st.account.handle).into(),
+                key: state::handle_key(&st.did, &st.account.handle).into(),
                 val: None,
             });
             frames.push(events::account_frame(

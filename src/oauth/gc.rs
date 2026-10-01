@@ -185,11 +185,10 @@ impl Sweeper {
             replay_entries: super::util::sweep_replays(app),
             ..Default::default()
         };
-        let lo = b"p/".to_vec();
-        let hi = crate::state::prefix_end(&lo);
+        let fam = crate::state::PRIVATE_FAMILY;
         for p in app.partitions.owned() {
-            let start = self.cursors.remove(&p.id).unwrap_or_else(|| lo.clone());
-            let mut it = p.db.scan(start..hi.clone()).await.map_err(server_err)?;
+            let start = self.cursors.remove(&p.id);
+            let mut it = crate::state::FamilyScan::new(p.db.as_ref(), fam, start, &Default::default()).await.map_err(server_err)?;
             let mut examined = 0;
             let mut resume = None;
             while let Some(kv) = it.next().await.map_err(server_err)? {
@@ -198,7 +197,7 @@ impl Sweeper {
                     break;
                 }
                 examined += 1;
-                let rest = String::from_utf8_lossy(&kv.key[2..]);
+                let rest = String::from_utf8_lossy(&crate::state::key_body(&kv.key)[fam.len()..]);
                 let Some((routing, name)) = rest.split_once('\0') else {
                     continue;
                 };

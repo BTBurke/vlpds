@@ -135,9 +135,10 @@ async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json
     out["node"] = json!(me);
     out["leaseValid"] = json!(c.lease_valid());
     out["leaseExpiresMs"] = json!(c.lease_expiry_us() / 1000);
-    out["table"] = json!((0..c.cfg.shards)
-        .map(|p| c.owner_of(p).map(|(id, _)| id))
-        .collect::<Vec<_>>());
+    // in slot order (shard ids are stable names since splits and merges)
+    let layout = c.layout();
+    out["table"] = json!(layout.shards.iter().map(|r| c.owner_of(r.id).map(|(id, _)| id)).collect::<Vec<_>>());
+    out["layout"] = json!({"version": layout.version, "shards": layout.shards, "op": layout.op});
     out["fencedLogs"] = json!(c.fenced_logs());
     let mut peers = c.peers();
     if !peers.iter().any(|l| l.node_id == me) {

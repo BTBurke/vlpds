@@ -41,6 +41,7 @@ python3 bench/ha/hactl.py list         # scenario catalogue
 | `VLPDS_HA_INJECT_PUT_MS` | 25 | Injected median latency on every node's segment PUTs (`--inject-put-ms`), so PUTs overlap. 0 turns it off. |
 | `VLPDS_HA_LOG_INFLIGHT` | 4 | Segment PUTs in flight per node log (`--log-inflight`). |
 | `VLPDS_HA_CLEANUP` | 1 | Delete the scenario's bucket prefix once its results are recorded. Deletion runs through `mc` in `vlpds-minio:local`. |
+| `VLPDS_HA_RETENTION_S` | 45 | `--log-retention` of the `retention-*` scenarios, in seconds. |
 | `VLPDS_HA_INTERNAL_TOKEN` | `dev-internal-token` | The `x-vlpds-internal` token. It falls back to the admin token on 401, for older dev-mode builds. |
 | `VLPDS_HA_BASE_PORT`, `VLPDS_BIN_DIR`, `VLPDS_HA_S3`, `VLPDS_HA_IMAGE`, `VLPDS_HA_DOCKER_S3` | | As before. |
 
@@ -77,6 +78,81 @@ These are as before:
 5. **Merged-history agreement (new):** every node that stayed up emits the identical commit sequence, both in the replay and in the live audit.
 6. **Availability:** probe outage windows. A probe is bad if it failed or took more than 2 s.
 7. **Exit codes:** these are recorded, and expected codes are checked where a scenario sets them.
+
+## Log retention under kill -9 (`ret1`–`ret3`): fa0975c, `retention-kill9`
+
+New scenario `retention-kill9`: 3 nodes with `--log-retention 45s`
+(`VLPDS_HA_RETENTION_S`) under the usual load (150 writes/s per node, 32
+probes) for 240 s. n2 is kill -9'd at 75 s and restarted at 135 s. Passes run
+every 60 s per node (`DEFAULT_INTERVAL`), so each node makes 3–4 passes and the
+leader prunes n2's dead log mid-run. The generic post-run replay from before
+the run is off (`replay=False`): with a 45 s window it is OutdatedCursor by
+design. The scenario checks instead:
+
+- **Acked writes:** the usual `loadgen verify`, checker `-strict` on n1, and
+  complete live audits on n1 and n3.
+- **No replay needed a pruned segment:** no node log has an open, backfill,
+  dead-log drain, follower-skip ("log pruned ahead of its follower"),
+  retained-floor, retention-pass, close, spill read-back or late-event
+  error. `vlpds_retention_ticks_total{result="error"}` is 0 on every node.
+- **Dead-log pruning down to the fence:** within 150 s after the load, a
+  survivor logs "dead log retired". The dead log in S3 is exactly one
+  object, the fence. Its `retain/` report is gone. `audit_dead_log` passes
+  (fence at the first hole, every span ends there, fencers agree).
+- **Live logs pruned too:** `vlpds_retention_deleted_objects_total{log="own"}`
+  is above 0.
+- **Old cursor:** at 200 s an `fhaudit` subscribes on every node (n2
+  restarted) from a cursor taken at 5 s. Each must get `#info OutdatedCursor`
+  first. It must then get exactly n1's history from its first event to the
+  end of the run (it stays live), skipping nothing above the retained floor
+  read after it subscribed. `fhaudit` now records `#info` names
+  (`info_names`).
+- **Restarted node clean:** n2's live audit attached at restart matches n1's
+  history over the common range. Exit codes are n2 `[-9]` only. The final
+  split is 22/20/22.
+
+Binaries were built from a `git archive` of fa0975c plus this lane's
+`caches.rs` / `xrpc/server.rs` change (the working tree was mid-edit by
+the shard split lane) and copied to a scratch dir. MinIO was shared with
+another agent's capacity runs (`dry1m`).
+
+| Run | Verdict | Acked / lost | Dead log after | Retired (after kill) | Objects deleted own (n1/n2/n3), dead | Old-cursor subscribers | Probe windows (s) |
+|---|---|---|---|---|---|---|---|
+| ret1 | PASS | 173,660 / 0 | fence 2374 only | +103 s (n3) | 4086 / 422 / 4047, 2008 | 3 × OutdatedCursor, 70,761 commits = n1, 0 skipped | 75.0–79.5, 136.2–137.0 |
+| ret2 | PASS | 172,785 / 0 | fence 2321 only | +102 s (n1) | 4073 / 443 / 4086, 1943 | 3 × OutdatedCursor, 69,758 = n1, 0 skipped | 75.0–79.8, 136.7–137.0 |
+| ret3 | PASS | 166,045 / 0 | fence 2315 only | +104 s (n3) | 3981 / 419 / 3935, 2315 | 3 × OutdatedCursor, 70,525 = n1, 0 skipped | **75.0–112.0**, 136.4–136.7 |
+
+(n2's own count is from its second incarnation.)
+
+**Result: every check passes in all 3 runs.**
+- No acked write was lost.
+- No replay, backfill or follower error appeared.
+- Each dead log ended as its fence alone, retired about 100 s after the kill
+  (window 45 s, plus the wait for the next pass).
+- The old-cursor subscribers continued from the floor (the first event right
+  above it) through the live tail.
+- No retention bug was found, and `src/retention.rs` is unchanged.
+
+**ret3's 37 s outage was not retention.** At 21:53:28, 5 s before the first
+retention pass and 24 s before the kill, one S3 request on n1 and one on n3
+stopped getting answers from MinIO. Which requests they were isn't logged. Each timed out after the
+store's 30 s request timeout, at 21:53:58. A second request, started at
+21:53:34, timed out at 21:54:04. The faultproxy saw the client cancel; MinIO
+never answered. Segment PUTs kept flowing the whole time (commit p50 ~48 ms).
+
+Both survivors fenced n2's log and took over only at 21:54:28: 36 s after
+the kill, not ~4 s. Their first retention passes finished at the same moment
+(21:54:25 and 21:54:28). This fits the cluster step, one sequential loop
+(the `cluster.rs` step task), sitting in a hung request and its retry.
+- **Cause:** the stall is attributed to the shared MinIO (another agent's
+  capacity run was writing `dry1m` at the time). The same passes took about
+  0.2 s in ret1 and ret2.
+- **Finding for the cluster lane:** an S3 call in the step is bounded only by
+  the store-wide 30 s timeout plus retries, so one stuck control-plane
+  request delays failover by 30–60 s. A per-call deadline on the step's
+  reads (a few × TTL), or a step that doesn't block takeover detection on
+  one request, would bound it.
+- **Status:** not fixed. `cluster.rs` belongs to the shard-split lane.
 
 ## Pipelined segment PUTs round (`k2*`, `k3*` runs): commit 2e64422, K = 4
 

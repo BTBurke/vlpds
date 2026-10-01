@@ -353,11 +353,11 @@ impl Retention {
     }
 }
 
-/// Assignments (index = shard) and every log's report.
-type Known = (Vec<Option<Assignment>>, HashMap<String, Report>);
+/// Assignments (by shard id) and every log's report.
+type Known = (BTreeMap<u16, Assignment>, HashMap<String, Report>);
 
-/// Every shard assignment (index = shard).
-async fn read_assignments(store: &Store) -> anyhow::Result<Vec<Option<Assignment>>> {
+/// Every shard assignment, by shard id (retired shards' included).
+async fn read_assignments(store: &Store) -> anyhow::Result<BTreeMap<u16, Assignment>> {
     let prefix = Path::from(format!("{}/assign", store.prefix));
     let names: Vec<u16> = store
         .raw
@@ -365,8 +365,7 @@ async fn read_assignments(store: &Store) -> anyhow::Result<Vec<Option<Assignment
         .filter_map(|m| async move { m.ok().and_then(|m| m.location.filename().and_then(|f| f.parse::<u16>().ok())) })
         .collect()
         .await;
-    let n = names.iter().copied().max().map_or(0, |m| m as usize + 1);
-    let mut out = vec![None; n];
+    let mut out = BTreeMap::new();
     let got: Vec<anyhow::Result<(u16, Option<Assignment>)>> = futures::stream::iter(names)
         .map(|s| async move {
             match store.raw.get(&Path::from(format!("{}/assign/{s:03}", store.prefix))).await {
@@ -379,8 +378,9 @@ async fn read_assignments(store: &Store) -> anyhow::Result<Vec<Option<Assignment
         .collect()
         .await;
     for r in got {
-        let (s, a) = r?;
-        out[s as usize] = a;
+        if let (s, Some(a)) = r? {
+            out.insert(s, a);
+        }
     }
     Ok(out)
 }
@@ -389,11 +389,14 @@ async fn read_assignments(store: &Store) -> anyhow::Result<Vec<Option<Assignment
 /// in `x`, and no later owner (higher epoch) has reported opening it. An
 /// open replays and flushes every earlier span, and durable markers only
 /// move forward, so once that is reported `x` is never read for the shard.
-fn needed_by(x: &str, assigns: &[Option<Assignment>], reports: &HashMap<String, Report>) -> Option<u16> {
-    for (s, a) in assigns.iter().enumerate() {
-        let Some(a) = a else { continue };
+/// A frozen shard (a split or merge parent) never replays again: its last
+/// owner closed it with every span applied and flushed, so it needs nothing.
+fn needed_by(x: &str, assigns: &BTreeMap<u16, Assignment>, reports: &HashMap<String, Report>) -> Option<u16> {
+    for (&s, a) in assigns {
+        if a.frozen.is_some() {
+            continue;
+        }
         let Some(last) = a.history.iter().filter(|sp| sp.log_id == x).map(|sp| sp.epoch).max() else { continue };
-        let s = s as u16;
         if !reports.values().any(|r| r.opened.get(&s).is_some_and(|&e| e > last)) {
             return Some(s);
         }
@@ -475,7 +478,7 @@ mod tests {
         let ncfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(10), lease_ok: None };
         let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
         let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, 3, None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: 3, epoch: 7, db, apply_lock: Default::default() }));
+        log.sinks.insert(Arc::new(ShardSink { id: 3, epoch: 7, db, apply_lock: Default::default(), applied: Default::default() }));
         let send = |i: usize| {
             let log = log.clone();
             async move {
@@ -533,7 +536,7 @@ mod tests {
         let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
         log.durable_ordinal.store(4, std::sync::atomic::Ordering::Release); // as if 0..=4 were durable
         let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, 1, None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: 1, epoch: 2, db: db.clone(), apply_lock: Default::default() }));
+        log.sinks.insert(Arc::new(ShardSink { id: 1, epoch: 2, db: db.clone(), apply_lock: Default::default(), applied: Default::default() }));
         log.checkpoint_all().await;
         assert!(db.get(nodelog::META_APPLIED).await.unwrap().is_none(), "no marker at 4 < insert floor 5");
         assert_eq!(log.sinks.replay_floor(), 4, "capped at the last durable segment");
@@ -568,7 +571,7 @@ mod tests {
         assert_eq!(ordinals(&store, "D").await, vec![0, 1, 2, 3, 4, 5]);
         // not the leader: never touches dead logs
         let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, 0, None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: 0, epoch: 2, db: db.clone(), apply_lock: Default::default() }));
+        log.sinks.insert(Arc::new(ShardSink { id: 0, epoch: 2, db: db.clone(), apply_lock: Default::default(), applied: Default::default() }));
         let follower = Retention::new(store.clone(), log.clone(), cfg(Duration::ZERO), members(&["B"], false));
         assert_eq!(follower.pass().await.unwrap(), Pass::default());
         let p = r.pass().await.unwrap();
@@ -588,8 +591,10 @@ mod tests {
     #[test]
     fn needed_by_requires_a_later_opener() {
         let sp = |log: &str, epoch| Span { log_id: log.into(), epoch, start: 0, end: None };
-        let a = |h: Vec<Span>| Some(Assignment { history: h, ..Default::default() });
-        let assigns = vec![a(vec![sp("X", 1), sp("Y", 2)]), a(vec![sp("Y", 3)]), None, a(vec![sp("X", 4), sp("Z", 5), sp("X", 6)])];
+        let a = |h: Vec<Span>| Assignment { history: h, ..Default::default() };
+        let mut assigns: BTreeMap<u16, Assignment> = [(0, a(vec![sp("X", 1), sp("Y", 2)])), (1, a(vec![sp("Y", 3)])), (3, a(vec![sp("X", 4), sp("Z", 5), sp("X", 6)]))].into();
+        // a frozen split parent whose last span is in X never needs X again
+        assigns.insert(9, Assignment { frozen: Some(1), ..a(vec![sp("X", 2)]) });
         let mut reports = HashMap::new();
         reports.insert("Y".to_string(), Report { opened: [(0, 2)].into(), pruned_seq: 0 });
         assert_eq!(needed_by("X", &assigns, &reports), Some(3), "X holds shard 3's last span");

@@ -254,6 +254,8 @@ pub struct ShardSink {
     /// Held (write) across apply + ack of a segment; export readers take it
     /// (read) to pair a repo's durable view with a matching SlateDB snapshot.
     pub apply_lock: Arc<tokio::sync::RwLock<()>>,
+    /// State mutations applied since the shard opened here (reshard policy).
+    pub applied: AtomicU64,
 }
 
 pub struct ShardSinks {
@@ -322,6 +324,11 @@ impl ShardSinks {
         self.map.read().values().cloned().collect()
     }
 
+    /// State mutations applied into `id` since it opened here.
+    pub fn applied_entries(&self, id: u16) -> u64 {
+        self.get(id).map_or(0, |s| s.applied.load(Ordering::Relaxed))
+    }
+
     /// The ordinal a checkpoint marker for `shard` must reach (its insert
     /// floor): a marker below it is ambiguous (it can name the end of an
     /// earlier span of this log for the shard, and replay would start there).
@@ -374,6 +381,9 @@ pub struct NodeLog {
     /// Last durable+applied ordinal (u64::MAX = none yet).
     pub durable_ordinal: Arc<AtomicU64>,
     pub sinks: Arc<ShardSinks>,
+    /// Tests: this in-process node "crashed" (`Node::halt`): stop streaming
+    /// the log to peers, as a dead process's connections would drop.
+    pub halted: std::sync::atomic::AtomicBool,
 }
 
 pub fn segment_path(store: &Store, log_id: &str, ordinal: u64) -> Path {
@@ -503,7 +513,7 @@ impl NodeLog {
             cfg.lease_ok,
             durable_ordinal.clone(),
         ));
-        Arc::new(NodeLog { log_id, tx, wm, live, durable_ordinal, sinks })
+        Arc::new(NodeLog { log_id, tx, wm, live, durable_ordinal, sinks, halted: Default::default() })
     }
 
     /// The ordinal the next segment will get (an owner records it as the start
@@ -902,6 +912,7 @@ async fn run_finalizer(
                 }
             }
             wb.put(META_APPLIED, encode_marker(&log_id, s.ordinal));
+            sink.applied.fetch_add(muts.len() as u64, Ordering::Relaxed);
             async move { (sink.id, sink.db.write(wb).await) }
         });
         for (shard, r) in futures::future::join_all(writes).await {
@@ -1285,7 +1296,7 @@ mod tests {
         let cfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes, hedge_after: Duration::from_secs(10), lease_ok: None };
         let log = NodeLog::start_with_inflight(store.clone(), cfg, k, tx);
         let db = Arc::new(crate::partition::open_db(&Store { prefix: "apply".into(), ..store.clone() }, shard, None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: shard, epoch: 1, db: db.clone(), apply_lock: Default::default() }));
+        log.sinks.insert(Arc::new(ShardSink { id: shard, epoch: 1, db: db.clone(), apply_lock: Default::default(), applied: Default::default() }));
         (log, db, rx)
     }
 

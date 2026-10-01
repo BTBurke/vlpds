@@ -488,20 +488,39 @@ pub(super) struct ListReposQ {
 
 /// A listRepos position: a shard, and the last DID listed in it (None =
 /// from the shard's start). Cursor form "{shard}:{did}" / "{shard}:".
-pub(super) type RepoPos = (usize, Option<String>);
-
-pub(super) fn parse_list_cursor(c: &str, shards: usize) -> XResult<RepoPos> {
-    let bad = || XrpcError::bad("InvalidRequest", "Malformed cursor");
-    let (p, d) = c.split_once(':').ok_or_else(bad)?;
-    let shard = p.parse::<usize>().map_err(|_| bad())?;
-    if shard >= shards {
-        return Err(bad());
-    }
-    Ok((shard, (!d.is_empty()).then(|| d.to_string())))
+/// A position in the global listRepos order, (slot, DID): every repo
+/// before it was listed. `after` = the last DID listed (in `slot`), or None
+/// at the start of `slot`. Independent of the shard layout, so a cursor
+/// stays valid across splits and merges.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct RepoPos {
+    pub slot: u32,
+    pub after: Option<String>,
 }
 
-fn list_cursor((shard, did): &RepoPos) -> String {
-    format!("{shard}:{}", did.as_deref().unwrap_or(""))
+impl RepoPos {
+    fn start() -> RepoPos {
+        RepoPos { slot: 0, after: None }
+    }
+
+    fn after(did: &str) -> RepoPos {
+        RepoPos { slot: crate::slots::slot_of(did) as u32, after: Some(did.to_string()) }
+    }
+}
+
+/// `{slot}:{last DID}` (DID empty at a slot's start).
+pub(super) fn parse_list_cursor(c: &str) -> XResult<RepoPos> {
+    let bad = || XrpcError::bad("InvalidRequest", "Malformed cursor");
+    let (p, d) = c.split_once(':').ok_or_else(bad)?;
+    let slot = p.parse::<u32>().map_err(|_| bad())?;
+    if slot >= crate::slots::SLOTS || (!d.is_empty() && crate::slots::slot_of(d) as u32 != slot) {
+        return Err(bad());
+    }
+    Ok(RepoPos { slot, after: (!d.is_empty()).then(|| d.to_string()) })
+}
+
+fn list_cursor(p: &RepoPos) -> String {
+    format!("{}:{}", p.slot, p.after.as_deref().unwrap_or(""))
 }
 
 /// One listRepos entry.
@@ -533,7 +552,7 @@ fn json_response(body: Vec<u8>) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], Body::from(body)).into_response()
 }
 
-fn unowned(shard: usize) -> XrpcError {
+fn unowned(shard: u16) -> XrpcError {
     XrpcError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         error: "PartitionUnavailable".into(),
@@ -541,11 +560,12 @@ fn unowned(shard: usize) -> XrpcError {
     }
 }
 
-/// Up to `limit` repos from `pos` on, through the consecutive shards this
-/// node owns; plus where the next page starts (None = past the last shard).
-/// Each shard is read from one SlateDB snapshot, heads merge-joined with
-/// accounts by DID. 503 if `pos`'s shard isn't ours. The local half of
-/// listRepos (also served to peers by /internal/v1/sync/listRepos).
+/// Up to `limit` repos from `pos` on, through the shards (in slot order)
+/// this node holds consecutively; plus where the next page starts (None =
+/// past the last slot). Each shard is read from one SlateDB snapshot, heads
+/// merge-joined with accounts in (slot, DID) order. 503 if `pos`'s shard
+/// isn't ours. The local half of listRepos (also served to peers by
+/// /internal/v1/sync/listRepos).
 pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> XResult<(Vec<RepoView>, Option<RepoPos>)> {
     /// Only an account's status (serde skips the rest of the JSON).
     #[derive(Deserialize)]
@@ -553,31 +573,39 @@ pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> X
         #[serde(borrow, default)]
         status: Option<std::borrow::Cow<'a, str>>,
     }
-    let (mut shard, mut after) = pos;
-    let first = shard;
+    let layout = app.partitions.layout();
+    let mut pos = pos;
+    let mut first = true;
     let mut repos = Vec::with_capacity(limit.min(1000));
-    while shard < app.partitions.len() {
-        let Some(p) = app.partitions.get(shard) else {
-            if shard == first {
-                return Err(unowned(shard));
+    let fam = state::HEAD_FAMILY.len();
+    while pos.slot < crate::slots::SLOTS {
+        let range = layout.shards[layout.index_of_slot(pos.slot as u16)];
+        let Some(p) = app.partitions.get(range.id) else {
+            if first {
+                return Err(unowned(range.id));
             }
-            return Ok((repos, Some((shard, None))));
+            return Ok((repos, Some(pos)));
         };
-        let (h_lo, a_lo) = match &after {
+        first = false;
+        let (h_lo, a_lo) = match &pos.after {
             Some(d) => ([state::head_key(d), vec![0]].concat(), [state::account_key(d), vec![0]].concat()),
-            None => (b"h/".to_vec(), b"a/".to_vec()),
+            None => (state::slot_family(pos.slot as u16, state::HEAD_FAMILY), state::slot_family(pos.slot as u16, state::ACCOUNT_FAMILY)),
         };
         let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
         let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, ..Default::default() };
-        let mut heads = snap.scan_with_options(h_lo..state::prefix_end(b"h/"), &opts).await.map_err(XrpcError::from_err)?;
-        let mut accts = snap.scan_with_options(a_lo..state::prefix_end(b"a/"), &opts).await.map_err(XrpcError::from_err)?;
+        let mut heads = state::FamilyScan::new(snap.as_ref(), state::HEAD_FAMILY, Some(h_lo), &opts).await.map_err(XrpcError::from_err)?;
+        let mut accts = state::FamilyScan::new(snap.as_ref(), state::ACCOUNT_FAMILY, Some(a_lo), &opts).await.map_err(XrpcError::from_err)?;
         let mut acct_peek: Option<slatedb::KeyValue> = None;
         let mut acct_done = false;
         while repos.len() < limit {
             let Some(kv) = heads.next().await.map_err(XrpcError::from_err)? else {
                 break;
             };
-            let did_b = &kv.key[2..];
+            // a shard's DB holds only its slots; stop at its end regardless
+            if state::key_slot(&kv.key).is_none_or(|s| s as u32 >= range.hi) {
+                break;
+            }
+            let head_pos = state::slot_did(&kv.key, fam);
             let head = Head::decode(&kv.value).map_err(XrpcError::from_err)?;
             let mut status = None;
             while !acct_done {
@@ -589,7 +617,7 @@ pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> X
                     }
                 }
                 let a = acct_peek.as_ref().unwrap();
-                match a.key[2..].cmp(did_b) {
+                match state::slot_did(&a.key, fam).cmp(&head_pos) {
                     std::cmp::Ordering::Less => acct_peek = None,
                     std::cmp::Ordering::Equal => {
                         status = serde_json::from_slice::<Status>(&a.value).ok().and_then(|s| s.status.map(|s| s.into_owned()));
@@ -600,7 +628,7 @@ pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> X
                 }
             }
             repos.push(RepoView {
-                did: String::from_utf8_lossy(did_b).into_owned(),
+                did: String::from_utf8_lossy(head_pos.1).into_owned(),
                 head: head.commit.to_string(),
                 rev: head.rev.to_string(),
                 active: status.is_none(),
@@ -608,11 +636,10 @@ pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> X
             });
         }
         if repos.len() >= limit {
-            let last = repos.last().map(|r| r.did.clone());
-            return Ok((repos, Some((shard, last))));
+            let last = repos.last().map(|r| RepoPos::after(&r.did));
+            return Ok((repos, last));
         }
-        shard += 1;
-        after = None;
+        pos = RepoPos { slot: range.hi, after: None };
     }
     Ok((repos, None))
 }
@@ -621,20 +648,21 @@ pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> X
 /// empty shards owned by different nodes returns early with a cursor).
 const LIST_REPOS_MAX_HOPS: usize = 16;
 
-/// Repos in (shard, DID) order. The cursor names a shard and the last DID
-/// listed in it; a page is served from that shard's owner's own SlateDB
-/// (this node, or the owner via /internal/v1/sync/listRepos), continuing
-/// through the following shards that owner holds, and on to the next owner
-/// only to fill the page. Each shard's DIDs are a stable key order, so a
-/// repo that exists for the whole enumeration is listed exactly once; one
+/// Repos in (slot, DID) order: the cursor is `{slot}:{last DID}`, a
+/// position in an order that doesn't depend on the shard layout. A page is
+/// served from the shard owner's own SlateDB (this node, or the owner via
+/// /internal/v1/sync/listRepos), continuing through the following shards
+/// that owner holds, and on to the next owner only to fill the page. A repo
+/// that exists for the whole enumeration is listed exactly once, even across
+/// shard splits and merges (DESIGN.md "Online shard split/merge"); one
 /// created or deleted meanwhile may or may not be. An unreachable owner ends
 /// the page early with a cursor at its shard (503 if nothing was listed),
 /// so a relay never skips repos.
 async fn list_repos(State(app): AppState, Query(q): Query<ListReposQ>) -> XResult<Response> {
     let limit = super::extract::limit_param(q.limit, 500, 1, 1000)?;
     let mut pos = Some(match &q.cursor {
-        Some(c) => parse_list_cursor(c, app.partitions.len())?,
-        None => (0, None),
+        Some(c) => parse_list_cursor(c)?,
+        None => RepoPos::start(),
     });
     let mut repos: Vec<RepoView> = Vec::new();
     let mut hops = 0;
@@ -644,24 +672,25 @@ async fn list_repos(State(app): AppState, Query(q): Query<ListReposQ>) -> XResul
         }
         hops += 1;
         let want = limit - repos.len();
-        if app.partitions.get(p.0).is_some() || app.cluster.is_none() {
+        let shard = app.partitions.layout().shard_of_slot(p.slot as u16);
+        if app.partitions.get(shard).is_some() || app.cluster.is_none() {
             let (r, next) = list_repos_local(&app, p, want).await?;
             repos.extend(r);
             pos = next;
             continue;
         }
-        match owner_page(&app, &p, want).await {
+        match owner_page(&app, shard, &p, want).await {
             Ok((body, page)) => {
                 // the owner's page is the whole answer: pass its bytes on
                 if repos.is_empty() && (page.repos.len() == want || page.cursor.is_none()) {
                     return Ok(json_response(body.to_vec()));
                 }
                 repos.extend(page.repos);
-                pos = page.cursor.as_deref().map(|c| parse_list_cursor(c, app.partitions.len())).transpose()?;
+                pos = page.cursor.as_deref().map(parse_list_cursor).transpose()?;
             }
             Err(e) if repos.is_empty() => return Err(e),
             Err(e) => {
-                tracing::warn!(shard = p.0, "listRepos: owner page failed, ending the page early: {}", e.message);
+                tracing::warn!(shard, "listRepos: owner page failed, ending the page early: {}", e.message);
                 break;
             }
         }
@@ -670,19 +699,19 @@ async fn list_repos(State(app): AppState, Query(q): Query<ListReposQ>) -> XResul
     Ok(json_response(serde_json::to_vec(&page).map_err(XrpcError::from_err)?))
 }
 
-/// A page from the owner of `pos`'s shard (its body and parsed form).
-async fn owner_page(app: &App, pos: &RepoPos, limit: usize) -> XResult<(Bytes, ReposPage)> {
-    let c = app.cluster.as_ref().ok_or_else(|| unowned(pos.0))?;
-    let Some((owner, addr)) = c.owner_of(pos.0 as u16).filter(|(id, _)| *id != c.cfg.node_id) else {
-        return Err(unowned(pos.0));
+/// A page from the owner of `shard` (holding `pos`): its body and parsed form.
+async fn owner_page(app: &App, shard: u16, pos: &RepoPos, limit: usize) -> XResult<(Bytes, ReposPage)> {
+    let c = app.cluster.as_ref().ok_or_else(|| unowned(shard))?;
+    let Some((owner, addr)) = c.owner_of(shard).filter(|(id, _)| *id != c.cfg.node_id) else {
+        return Err(unowned(shard));
     };
     let body = super::internal::owner_list_repos(app, &addr, &list_cursor(pos), limit).await.map_err(|e| {
-        tracing::warn!(%owner, shard = pos.0, "listRepos owner page: {}", e.message);
-        XrpcError { message: format!("shard {}: {}", pos.0, e.message), ..unowned(pos.0) }
+        tracing::warn!(%owner, shard, "listRepos owner page: {}", e.message);
+        XrpcError { message: format!("shard {shard}: {}", e.message), ..unowned(shard) }
     })?;
     let page: ReposPage = serde_json::from_slice(&body).map_err(|e| {
-        tracing::warn!(%owner, shard = pos.0, "listRepos owner page: {e}");
-        unowned(pos.0)
+        tracing::warn!(%owner, shard, "listRepos owner page: {e}");
+        unowned(shard)
     })?;
     Ok((body, page))
 }
@@ -694,9 +723,10 @@ pub(super) struct ByCollectionQ {
     cursor: Option<String>,
 }
 
-/// DIDs with records in the collection on this node's shards, in DID order
-/// after the cursor, at most `limit`; plus the shards it owns. The local half
-/// of listReposByCollection (also /internal/v1/sync/listReposByCollection).
+/// DIDs with records in the collection on this node's shards, in (slot,
+/// DID) order after the cursor, at most `limit`; plus the shards it owns. The
+/// local half of listReposByCollection (also
+/// /internal/v1/sync/listReposByCollection).
 pub(super) async fn list_repos_by_collection_local(
     app: &App,
     q: &ByCollectionQ,
@@ -708,25 +738,21 @@ pub(super) async fn list_repos_by_collection_local(
         ));
     }
     let limit = super::extract::limit_param(q.limit, 500, 1, 2000)?;
-    let prefix = state::collection_prefix(&q.collection);
-    let lo = match &q.cursor {
-        Some(c) => [state::collection_key(&q.collection, c), vec![0]].concat(),
-        None => prefix.clone(),
-    };
-    let hi = state::prefix_end(&prefix);
+    let fam = state::collection_family(&q.collection);
+    let start = q.cursor.as_ref().map(|c| [state::collection_key(&q.collection, c), vec![0]].concat());
     let owned = app.partitions.owned();
     let ids: Vec<u16> = owned.iter().map(|p| p.id).collect();
     let mut scans = Vec::new();
     for p in owned {
-        let (lo, hi, plen) = (lo.clone(), hi.clone(), prefix.len());
+        let (fam, start) = (fam.clone(), start.clone());
         scans.push(async move {
-            let mut iter = p.db.scan(lo..hi).await.map_err(XrpcError::from_err)?;
+            let mut iter = state::FamilyScan::new(p.db.as_ref(), &fam, start, &Default::default()).await.map_err(XrpcError::from_err)?;
             let mut dids = Vec::new();
             while dids.len() < limit {
                 let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? else {
                     break;
                 };
-                dids.push(String::from_utf8_lossy(&kv.key[plen..]).into_owned());
+                dids.push(String::from_utf8_lossy(&state::key_body(&kv.key)[fam.len()..]).into_owned());
             }
             Ok::<_, XrpcError>(dids)
         });
@@ -735,16 +761,22 @@ pub(super) async fn list_repos_by_collection_local(
     for r in futures::future::join_all(scans).await {
         all.extend(r?);
     }
-    all.sort();
-    all.dedup();
+    sort_slot_order(&mut all);
     all.truncate(limit);
     Ok((all, ids))
 }
 
-/// Scans the `C/{collection}\0{did}` index of every shard in the cluster
-/// (peers via /internal/v1/sync/listReposByCollection) and merges by DID.
-/// The cursor is the last DID returned. DID order spans every shard, so a
-/// shard with no answering owner fails the page with 503 (retry).
+/// Sorts DIDs into the global (slot, DID) order and dedups them.
+fn sort_slot_order(dids: &mut Vec<String>) {
+    dids.sort_by_cached_key(|d| (crate::slots::slot_of(d), d.clone()));
+    dids.dedup();
+}
+
+/// Scans the collection index of every shard in the cluster (peers via
+/// /internal/v1/sync/listReposByCollection) and merges in (slot, DID) order,
+/// an order independent of the shard layout. The cursor is the last DID
+/// returned. That order spans every shard, so a shard with no answering
+/// owner fails the page with 503 (retry).
 async fn list_repos_by_collection(
     State(app): AppState,
     Query(q): Query<ByCollectionQ>,
@@ -761,15 +793,14 @@ async fn list_repos_by_collection(
         covered.extend(r.owned);
         all.extend(serde_json::from_value::<Vec<String>>(r.body["repos"].clone()).unwrap_or_default());
     }
-    if let Some(m) = (0..app.partitions.len()).find(|p| !covered.contains(&(*p as u16))) {
+    if let Some(m) = app.partitions.layout().ids().into_iter().find(|p| !covered.contains(p)) {
         return Err(XrpcError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             error: "PartitionUnavailable".into(),
             message: format!("shard {m} has no reachable owner; retry"),
         });
     }
-    all.sort();
-    all.dedup();
+    sort_slot_order(&mut all);
     all.truncate(limit);
     let mut out = json!({"repos": all.iter().map(|d| json!({"did": d})).collect::<Vec<_>>()});
     if all.len() == limit {

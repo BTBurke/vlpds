@@ -83,8 +83,8 @@ type AppState = State<Arc<App>>;
 
 impl App {
     pub fn partition(&self, did: &str) -> Result<Arc<Partition>, XrpcError> {
-        let p = state::partition_of(did, self.partitions.len() as u16);
-        self.partitions.get(p as usize).ok_or_else(|| XrpcError {
+        let p = self.partitions.shard_of(did);
+        self.partitions.get(p).ok_or_else(|| XrpcError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             error: "PartitionUnavailable".into(),
             message: format!("partition {p} is not owned by this node"),
@@ -391,8 +391,8 @@ impl App {
     /// Base URL of the node owning `routing_key`'s partition, if that is not us.
     pub fn remote_owner(&self, routing_key: &str) -> Option<String> {
         let cluster = self.cluster.as_ref()?;
-        let p = state::partition_of(routing_key, self.partitions.len() as u16);
-        if self.partitions.get(p as usize).is_some() {
+        let p = self.partitions.shard_of(routing_key);
+        if self.partitions.get(p).is_some() {
             return None;
         }
         cluster.owner_of(p).filter(|(id, _)| *id != cluster.cfg.node_id).map(|(_, addr)| addr)
@@ -404,10 +404,9 @@ impl App {
         if self.cluster.is_none() {
             return Ok(crypto::random_plc_did());
         }
-        let n = self.partitions.len() as u16;
         for _ in 0..10_000 {
             let did = crypto::random_plc_did();
-            if self.partitions.get(state::partition_of(&did, n) as usize).is_some() {
+            if self.partitions.for_key(&did).is_some() {
                 return Ok(did);
             }
         }

@@ -81,6 +81,9 @@ enum Cmd {
         /// Write every acknowledged create (did -> rkeys) here, for `verify`.
         #[arg(long, default_value = "")]
         acked_out: String,
+        /// Seconds between the progress lines on stderr.
+        #[arg(long, default_value_t = 5)]
+        report_secs: u64,
         #[command(flatten)]
         sim: Sim,
     },
@@ -174,20 +177,85 @@ enum Cmd {
         acked: String,
     },
     /// Bulk-create simulation accounts (deterministic DIDs) via the admin API.
+    /// In a cluster send the same range to every node: each creates the DIDs
+    /// it owns and skips the rest.
     Bulk {
         #[arg(long, default_value_t = 0)]
         start: u64,
         #[arg(long)]
         count: u64,
-        #[arg(long, default_value_t = 5)]
-        records: u32,
+        /// Max accounts per bulkCreate request.
         #[arg(long, default_value_t = 1000)]
         batch: u64,
+        /// Max genesis records per bulkCreate request (a run of big repos is
+        /// split; one account always fits in a request).
+        #[arg(long, default_value_t = 50_000)]
+        max_request_records: u64,
         #[arg(long, default_value_t = 16)]
         concurrency: usize,
         #[arg(long, default_value = "dev-admin-token")]
         admin_token: String,
+        /// Write {"watermark": i, ...} here every 2 s and at the end: every
+        /// account below i is done (resume with --start i).
+        #[arg(long, default_value = "")]
+        progress_file: String,
+        #[command(flatten)]
+        dist: DistArgs,
     },
+    /// Print what `bulk` would create for a population (records per repo
+    /// from --dist), without a server: totals, quantiles, request count and a
+    /// byte estimate. JSON to stdout.
+    Dist {
+        #[arg(long, default_value_t = 0)]
+        start: u64,
+        #[arg(long)]
+        count: u64,
+        #[arg(long, default_value_t = 1000)]
+        batch: u64,
+        #[arg(long, default_value_t = 50_000)]
+        max_request_records: u64,
+        /// State bytes per repo / per record for the estimate (SST bytes,
+        /// zstd; bench/results/storage-2026-10-02).
+        #[arg(long, default_value_t = 323.0)]
+        bytes_per_repo: f64,
+        #[arg(long, default_value_t = 154.0)]
+        bytes_per_record: f64,
+        #[command(flatten)]
+        dist: DistArgs,
+    },
+}
+
+/// Records per bulk repo. `fixed`: --records each. `real`: drawn from the
+/// records-per-repo distribution of the real network (REAL_DIST), divided by
+/// --dist-scale with stochastic rounding (keeps the mean exactly /scale and
+/// the tail's shape; the body collapses toward 0/1 records), optionally
+/// capped. Deterministic in (seed, index / group): consecutive groups of
+/// --dist-group accounts share one draw, so a bulkCreate batch splits into
+/// few equal-count runs (the API takes one record count per range). DIDs
+/// are hashed, so a group's repos land on unrelated shards; the marginal
+/// distribution per repo is unchanged.
+#[derive(clap::Args, Clone)]
+struct DistArgs {
+    /// fixed | real
+    #[arg(long, default_value = "fixed")]
+    dist: String,
+    /// Genesis records per account with --dist fixed.
+    #[arg(long, default_value_t = 5)]
+    records: u32,
+    #[arg(long, default_value_t = 1.0)]
+    dist_scale: f64,
+    #[arg(long, default_value_t = 32)]
+    dist_group: u64,
+    #[arg(long, default_value_t = 1)]
+    dist_seed: u64,
+    /// Cap on records per repo after scaling (0 = none).
+    #[arg(long, default_value_t = 0)]
+    dist_cap: u32,
+    /// Only the part of a draw above this many records is divided by
+    /// --dist-scale (n <= knee stays exact: keeps the small-repo body; the
+    /// tail above the knee keeps its shape, scaled).
+    #[arg(long, default_value_t = 0)]
+    dist_knee: u32,
 }
 
 /// Sliding active-set simulation over bulk-created accounts: writes go to a
@@ -201,6 +269,10 @@ struct Sim {
     sim_active: u64,
     #[arg(long, default_value_t = 0.0)]
     sim_churn: f64,
+    /// Index the active window starts at (it then advances by sim_churn/s),
+    /// so successive runs can start on repos nothing has loaded yet.
+    #[arg(long, default_value_t = 0)]
+    sim_offset: u64,
     #[arg(long, default_value = "dev-secret-change-me")]
     jwt_secret: String,
     #[arg(long, default_value = "did:web:localhost")]
@@ -239,6 +311,7 @@ fn main() -> anyhow::Result<()> {
                 delete_pct,
                 warmup,
                 acked_out,
+                report_secs,
                 sim,
             } => {
                 run(
@@ -253,6 +326,7 @@ fn main() -> anyhow::Result<()> {
                     *delete_pct,
                     *warmup,
                     acked_out,
+                    *report_secs,
                     sim.clone(),
                 )
                 .await
@@ -278,24 +352,13 @@ fn main() -> anyhow::Result<()> {
             Cmd::Sweep { sizes, concurrency, seconds, fill_concurrency, json_out } => {
                 sweep(&args, sizes, *concurrency, *seconds, *fill_concurrency, json_out).await
             }
-            Cmd::Bulk {
-                start,
-                count,
-                records,
-                batch,
-                concurrency,
-                admin_token,
-            } => {
-                bulk(
-                    &args,
-                    *start,
-                    *count,
-                    *records,
-                    *batch,
-                    *concurrency,
-                    admin_token,
-                )
-                .await
+            Cmd::Bulk { start, count, batch, max_request_records, concurrency, admin_token, progress_file, dist } => {
+                let d = Dist::new(dist)?;
+                bulk(&args, *start, *count, &d, *batch, *max_request_records, *concurrency, admin_token, progress_file).await
+            }
+            Cmd::Dist { start, count, batch, max_request_records, bytes_per_repo, bytes_per_record, dist } => {
+                let d = Dist::new(dist)?;
+                dist_report(*start, *count, &d, *batch, *max_request_records, *bytes_per_repo, *bytes_per_record)
             }
         }
     })
@@ -433,6 +496,7 @@ async fn run(
     delete_pct: u32,
     warmup: u64,
     acked_out: &str,
+    report_secs: u64,
     sim: Sim,
 ) -> anyhow::Result<()> {
     let c = client();
@@ -521,7 +585,8 @@ async fn run(
         tokio::spawn(async move {
             let mut last_ok = 0;
             let mut last_fh = 0;
-            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            let every = report_secs.max(1) as f64;
+            let mut tick = tokio::time::interval(Duration::from_secs_f64(every));
             tick.tick().await;
             loop {
                 tick.tick().await;
@@ -536,14 +601,14 @@ async fn run(
                 eprintln!(
                     "[{:>4.0}s] ok/s {:>7.0} err {} dropped {} inflight {} | p50 {:.1}ms p99 {:.1}ms max {:.0}ms | firehose ev/s {:.0}",
                     start.elapsed().as_secs_f64(),
-                    (ok - last_ok) as f64 / 5.0,
+                    (ok - last_ok) as f64 / every,
                     st.err.load(Ordering::Relaxed),
                     st.dropped.load(Ordering::Relaxed),
                     st.inflight.load(Ordering::Relaxed),
                     p50 as f64 / 1000.0,
                     p99 as f64 / 1000.0,
                     max as f64 / 1000.0,
-                    (fh - last_fh) as f64 / 5.0
+                    (fh - last_fh) as f64 / every
                 );
                 last_ok = ok;
                 last_fh = fh;
@@ -592,7 +657,7 @@ async fn run(
                         let idx = if hot {
                             0
                         } else {
-                            let base = (start.elapsed().as_secs_f64() * sim.sim_churn) as u64;
+                            let base = sim.sim_offset + (start.elapsed().as_secs_f64() * sim.sim_churn) as u64;
                             (base + rand::thread_rng().gen_range(0..sim.sim_active)) % sim.sim_total
                         };
                         let did = vlpds::state::bulk_did(idx);
@@ -809,58 +874,303 @@ async fn consume_firehose(url: String, st: Arc<Run>) -> anyhow::Result<()> {
     Ok(())
 }
 
+
+/// Records per repo on the real network: (lo, hi, repos) buckets, exact up
+/// to 31 records, then 2^(1/8)-wide (~9%) buckets. From ClickHouse
+/// `default.crawl_records_by_repo` (34,915,703 repos with records, 17.75 B
+/// records; mean 508, p50 10, p90 395, p99 9,803, p99.9 62,685, max 593,772)
+/// plus the 4,092,655 repos of `crawl_repos` (39.0 M) without any (the
+/// (0, 0, n) row). Queried 2026-10-01.
+const REAL_DIST: &[(u32, u32, u64)] = &[
+    (0, 0, 4092655), (1, 1, 1070346), (2, 2, 7024072), (3, 3, 3361831), (4, 4, 1712781),
+    (5, 5, 1196227), (6, 6, 933137), (7, 7, 763258), (8, 8, 645444), (9, 9, 557577),
+    (10, 10, 495483), (11, 11, 451847), (12, 12, 456850), (13, 13, 407376), (14, 14, 368735),
+    (15, 15, 337775), (16, 16, 312161), (17, 17, 290157), (18, 18, 271855), (19, 19, 259542),
+    (20, 20, 247101), (21, 21, 260324), (22, 22, 235900), (23, 23, 217798), (24, 24, 204675),
+    (25, 25, 193538), (26, 26, 184489), (27, 27, 178056), (28, 28, 168967), (29, 29, 161696),
+    (30, 30, 154252), (31, 31, 148437), (32, 34, 412612), (35, 38, 484888), (39, 41, 322898),
+    (42, 45, 386952), (46, 49, 347244), (50, 53, 313539), (54, 58, 351839), (59, 63, 314296),
+    (64, 69, 336448), (70, 76, 348534), (77, 82, 266048), (83, 90, 317240), (91, 98, 283870),
+    (99, 107, 289061), (108, 117, 284059), (118, 127, 253251), (128, 139, 270525),
+    (140, 152, 263746), (153, 165, 236123), (166, 181, 256792), (182, 197, 226122),
+    (198, 215, 224905), (216, 234, 210564), (235, 255, 205839), (256, 279, 207616),
+    (280, 304, 192151), (305, 331, 184095), (332, 362, 186377), (363, 394, 170565),
+    (395, 430, 169985), (431, 469, 161631), (470, 511, 154212), (512, 558, 152489),
+    (559, 608, 142787), (609, 663, 139301), (664, 724, 135451), (725, 789, 126605),
+    (790, 861, 123114), (862, 939, 117378), (940, 1023, 110656), (1024, 1116, 108029),
+    (1117, 1217, 103009), (1218, 1327, 98172), (1328, 1448, 94585), (1449, 1579, 89852),
+    (1580, 1722, 85342), (1723, 1878, 81159), (1879, 2047, 77768), (2048, 2233, 73454),
+    (2234, 2435, 69596), (2436, 2655, 65661), (2656, 2896, 62770), (2897, 3158, 59536),
+    (3159, 3444, 57359), (3445, 3756, 53586), (3757, 4095, 50692), (4096, 4466, 48420),
+    (4467, 4870, 45784), (4871, 5311, 42878), (5312, 5792, 40721), (5793, 6316, 38666),
+    (6317, 6888, 36517), (6889, 7512, 34653), (7513, 8191, 32933), (8192, 8933, 30846),
+    (8934, 9741, 29062), (9742, 10623, 27471), (10624, 11585, 25792), (11586, 12633, 24440),
+    (12634, 13777, 22770), (13778, 15024, 21197), (15025, 16383, 19874), (16384, 17866, 18594),
+    (17867, 19483, 17277), (19484, 21247, 16433), (21248, 23170, 15146), (23171, 25267, 13962),
+    (25268, 27554, 12855), (27555, 30048, 12064), (30049, 32767, 11030), (32768, 35733, 10172),
+    (35734, 38967, 9343), (38968, 42494, 8659), (42495, 46340, 7570), (46341, 50535, 6974),
+    (50536, 55108, 6343), (55110, 60096, 5672), (60098, 65535, 5135), (65539, 71466, 4638),
+    (71468, 77935, 4025), (77937, 84988, 3623), (84994, 92680, 3148), (92684, 101061, 2836),
+    (101072, 110214, 2487), (110236, 120192, 2144), (120195, 131063, 1800), (131081, 142933, 1502),
+    (142943, 155861, 1289), (155890, 169961, 1140), (169980, 185323, 925), (185371, 202126, 851),
+    (202168, 220397, 666), (220444, 240333, 495), (240438, 261917, 423), (262207, 285817, 279),
+    (285915, 311675, 93), (312303, 334788, 10), (343494, 370415, 6), (376124, 377142, 2),
+    (423379, 423379, 1), (460949, 460949, 1), (593772, 593772, 1),
+];
+
+struct Dist {
+    fixed: Option<u32>,
+    /// cumulative repo counts per REAL_DIST bucket
+    cum: Vec<u64>,
+    scale: f64,
+    group: u64,
+    seed: u64,
+    cap: u32,
+    knee: u32,
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+fn unit(x: u64) -> f64 {
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+impl Dist {
+    fn new(a: &DistArgs) -> anyhow::Result<Dist> {
+        let fixed = match a.dist.as_str() {
+            "fixed" => Some(a.records),
+            "real" => None,
+            d => anyhow::bail!("--dist {d}: want fixed or real"),
+        };
+        anyhow::ensure!(a.dist_scale >= 1.0, "--dist-scale must be >= 1");
+        let mut acc = 0;
+        let cum = REAL_DIST.iter().map(|&(_, _, n)| { acc += n; acc }).collect();
+        Ok(Dist { fixed, cum, scale: a.dist_scale, group: a.dist_group.max(1), seed: a.dist_seed, cap: a.dist_cap, knee: a.dist_knee })
+    }
+
+    /// Unscaled draw for account `i` (same for its whole group).
+    fn real(&self, i: u64) -> u32 {
+        let g = i / self.group;
+        let h1 = splitmix64(self.seed.wrapping_mul(0xA24B_AED4_963E_E407) ^ g);
+        let h2 = splitmix64(h1);
+        let total = *self.cum.last().unwrap();
+        let r = ((unit(h1) * total as f64) as u64).min(total - 1);
+        let b = self.cum.partition_point(|&c| c <= r);
+        let (lo, hi, _) = REAL_DIST[b];
+        lo + ((unit(h2) * (hi - lo + 1) as f64) as u32).min(hi - lo)
+    }
+
+    fn records(&self, i: u64) -> u32 {
+        if let Some(n) = self.fixed {
+            return n;
+        }
+        let n = self.real(i);
+        if n <= self.knee {
+            return if self.cap > 0 { n.min(self.cap) } else { n };
+        }
+        let x = (n - self.knee) as f64 / self.scale;
+        let u = unit(splitmix64(splitmix64(self.seed ^ 0x5851_F42D_4C95_7F2D) ^ (i / self.group)));
+        let mut v = self.knee + x.floor() as u32 + (u < x.fract()) as u32;
+        if self.cap > 0 {
+            v = v.min(self.cap);
+        }
+        v
+    }
+}
+
+/// bulkCreate requests for accounts start..start+count, in index order: runs
+/// of equal record counts, at most `batch` accounts and (one account aside)
+/// `max_records` genesis records each. Yields (start, count, records).
+struct BulkPlan<'a> {
+    d: &'a Dist,
+    next: u64,
+    end: u64,
+    batch: u64,
+    max_records: u64,
+}
+
+impl Iterator for BulkPlan<'_> {
+    type Item = (u64, u64, u32);
+    fn next(&mut self) -> Option<(u64, u64, u32)> {
+        if self.next >= self.end {
+            return None;
+        }
+        let s = self.next;
+        let r = self.d.records(s);
+        let per = (self.max_records / (r as u64).max(1)).max(1).min(self.batch);
+        // batches stay aligned to `batch` so the plan is the same from any resume point
+        let batch_end = ((s / self.batch) + 1) * self.batch;
+        let lim = self.end.min(batch_end).min(s + per);
+        let mut e = s + 1;
+        // runs only change at group boundaries
+        while e < lim {
+            let ge = (((e / self.d.group) + 1) * self.d.group).min(lim);
+            if self.d.records(e) != r {
+                break;
+            }
+            e = ge;
+        }
+        self.next = e;
+        Some((s, e - s, r))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn bulk(
     args: &Args,
     start: u64,
     count: u64,
-    records: u32,
+    d: &Dist,
     batch: u64,
+    max_records: u64,
     concurrency: usize,
     admin_token: &str,
+    progress_file: &str,
 ) -> anyhow::Result<()> {
     let c = client();
     let t = Instant::now();
     let done = Arc::new(AtomicU64::new(0));
-    let batches: Vec<(u64, u64)> = (start..start + count)
-        .step_by(batch as usize)
-        .map(|b| (b, batch.min(start + count - b)))
-        .collect();
-    let results: Vec<anyhow::Result<()>> = futures::stream::iter(batches)
-        .map(|(b, n)| {
+    let recs = Arc::new(AtomicU64::new(0));
+    let created = Arc::new(AtomicU64::new(0));
+    let skipped = Arc::new(AtomicU64::new(0));
+    let reqs = Arc::new(AtomicU64::new(0));
+    // completed ranges past the watermark (requests finish out of order)
+    let wm = Arc::new(Mutex::new((start, std::collections::BTreeMap::<u64, u64>::new())));
+    let write_progress = {
+        let (done, recs, created, skipped, wm) = (done.clone(), recs.clone(), created.clone(), skipped.clone(), wm.clone());
+        let path = progress_file.to_string();
+        move |fin: bool| {
+            let secs = t.elapsed().as_secs_f64();
+            let (a, r) = (done.load(Ordering::Relaxed), recs.load(Ordering::Relaxed));
+            let v = json!({"start": start, "count": count, "watermark": wm.lock().0, "accounts": a, "records": r,
+                "created": created.load(Ordering::Relaxed), "skipped": skipped.load(Ordering::Relaxed),
+                "secs": secs, "accounts_s": a as f64 / secs, "records_s": r as f64 / secs, "done": fin});
+            if !path.is_empty() {
+                let tmp = format!("{path}.tmp");
+                if std::fs::write(&tmp, v.to_string()).is_ok() {
+                    let _ = std::fs::rename(&tmp, &path);
+                }
+            }
+            v
+        }
+    };
+    let reporter = {
+        let wp = write_progress.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            tick.tick().await;
+            let mut n = 0u64;
+            loop {
+                tick.tick().await;
+                let v = wp(false);
+                n += 1;
+                if n % 5 == 0 {
+                    eprintln!("bulk: {}/{count} accounts, {} records ({:.0} accounts/s, {:.0} records/s)",
+                        v["accounts"], v["records"], v["accounts_s"].as_f64().unwrap_or(0.0), v["records_s"].as_f64().unwrap_or(0.0));
+                }
+            }
+        })
+    };
+    let plan = BulkPlan { d, next: start, end: start + count, batch: batch.max(1), max_records: max_records.max(1) };
+    let mut results = futures::stream::iter(plan)
+        .map(|(b, n, r)| {
             let c = c.clone();
             let host = args.host.clone();
-            let done = done.clone();
+            let (done, recs, created, skipped, reqs, wm) = (done.clone(), recs.clone(), created.clone(), skipped.clone(), reqs.clone(), wm.clone());
             async move {
-                let r: serde_json::Value = c
+                let resp = c
                     .post(format!("{host}/xrpc/vlpds.admin.bulkCreate"))
                     .bearer_auth(admin_token)
-                    .json(&json!({"start": b, "count": n, "records": records}))
+                    .json(&json!({"start": b, "count": n, "records": r}))
                     .send()
-                    .await?
-                    .json()
                     .await?;
-                anyhow::ensure!(
-                    r["failed"].as_u64() == Some(0),
-                    "bulk batch {b} failed: {r}"
-                );
-                let d = done.fetch_add(n, Ordering::Relaxed) + n;
-                if (d / batch) % 100 == 0 {
-                    eprintln!(
-                        "bulk: {d}/{count} ({:.0}/s)",
-                        d as f64 / t.elapsed().as_secs_f64()
-                    );
+                let status = resp.status();
+                let body = resp.text().await?;
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({"raw": body}));
+                anyhow::ensure!(status.is_success() && v["failed"].as_u64() == Some(0), "bulk {b}+{n} (x{r}) failed: {status} {v}");
+                reqs.fetch_add(1, Ordering::Relaxed);
+                done.fetch_add(n, Ordering::Relaxed);
+                // records this node created (skipped = another node's DIDs)
+                let made = v["created"].as_u64().unwrap_or(0);
+                created.fetch_add(made, Ordering::Relaxed);
+                skipped.fetch_add(v["skipped"].as_u64().unwrap_or(0), Ordering::Relaxed);
+                recs.fetch_add(made * r as u64, Ordering::Relaxed);
+                let mut g = wm.lock();
+                g.1.insert(b, b + n);
+                loop {
+                    let k = g.0;
+                    let Some(e) = g.1.remove(&k) else { break };
+                    g.0 = e;
                 }
                 Ok(())
             }
         })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
-    results.into_iter().collect::<anyhow::Result<Vec<_>>>()?;
+        .buffer_unordered(concurrency);
+    let mut first_err = None;
+    while let Some(r) = results.next().await {
+        if let Err(e) = r {
+            first_err = Some(e);
+            break;
+        }
+    }
+    drop(results);
+    reporter.abort();
+    let v = write_progress(first_err.is_none());
+    if let Some(e) = first_err {
+        return Err(e);
+    }
     eprintln!(
-        "bulk done: {count} accounts x {records} records in {:.0}s ({:.0} accounts/s)",
-        t.elapsed().as_secs_f64(),
-        count as f64 / t.elapsed().as_secs_f64()
+        "bulk done: {count} accounts ({} created here, {} skipped) x {} dist, {} records here, {} requests in {:.1}s ({:.0} accounts/s, {:.0} records/s)",
+        v["created"], v["skipped"], d.fixed.map(|n| n.to_string()).unwrap_or_else(|| format!("real/{}", d.scale)),
+        v["records"], reqs.load(Ordering::Relaxed), t.elapsed().as_secs_f64(),
+        v["accounts_s"].as_f64().unwrap_or(0.0), v["records_s"].as_f64().unwrap_or(0.0)
+    );
+    println!("{v}");
+    Ok(())
+}
+
+/// `loadgen dist`: the population `bulk` would create, without a server.
+fn dist_report(start: u64, count: u64, d: &Dist, batch: u64, max_records: u64, per_repo: f64, per_record: f64) -> anyhow::Result<()> {
+    let t = Instant::now();
+    let mut total = 0u64;
+    let mut max = 0u32;
+    let mut zero = 0u64;
+    let mut h = Histogram::<u64>::new_with_bounds(1, 1 << 40, 3)?;
+    // per group (the draw is per group): weight each draw by its accounts
+    let mut i = start;
+    let end = start + count;
+    while i < end {
+        let ge = ((i / d.group + 1) * d.group).min(end);
+        let w = ge - i;
+        // scaled values differ per group only (rounding is per group too)
+        let r = d.records(i);
+        total += r as u64 * w;
+        max = max.max(r);
+        if r == 0 {
+            zero += w;
+        }
+        h.record_n(r as u64 + 1, w)?;
+        i = ge;
+    }
+    let requests = BulkPlan { d, next: start, end, batch: batch.max(1), max_records: max_records.max(1) }.count();
+    let q = |p: f64| h.value_at_quantile(p).saturating_sub(1);
+    let bytes = per_repo * count as f64 + per_record * total as f64;
+    println!(
+        "{}",
+        json!({
+            "count": count, "records": total, "mean": total as f64 / count.max(1) as f64, "max": max,
+            "zero_repos": zero, "requests": requests,
+            "p50": q(0.5), "p90": q(0.9), "p99": q(0.99), "p999": q(0.999), "p9999": q(0.9999),
+            "repos_ge_1k": count - h.count_between(1, 1000),
+            "est_state_gb": bytes / 1e9, "secs": t.elapsed().as_secs_f64(),
+            "dist": d.fixed.map(|n| format!("fixed/{n}")).unwrap_or_else(|| format!("real/{}", d.scale)),
+            "group": d.group, "cap": d.cap, "knee": d.knee,
+        })
     );
     Ok(())
 }

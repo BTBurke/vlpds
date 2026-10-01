@@ -70,9 +70,18 @@ struct Args {
     #[arg(long, default_value_t = 0.5)]
     inject_sigma: f64,
 
-    /// Number of shards (hash-slot ranges); fixed for the lifetime of a bucket prefix.
+    /// Shards (hash-slot ranges) of a new prefix's initial layout. Later the
+    /// layout stored in the prefix wins; shards split and merge online
+    /// (`vlpds admin shard-split`, `--reshard-split-mb`).
     #[arg(long, env = "VLPDS_SHARDS", default_value_t = 256)]
     shards: u16,
+    /// Split policy: split a shard whose SSTs exceed this many MiB (0 = off).
+    #[arg(long, env = "VLPDS_RESHARD_SPLIT_MB", default_value_t = 0)]
+    reshard_split_mb: u64,
+    /// Split policy: split a shard applying more state mutations per second
+    /// than this (0 = off).
+    #[arg(long, env = "VLPDS_RESHARD_SPLIT_WRITES", default_value_t = 0.0)]
+    reshard_split_writes: f64,
     /// Repo worker threads (MST + signing). Default: half the available
     /// cores (min 1); the request runtime does the rest of the CPU work.
     #[arg(long, env = "VLPDS_WORKERS")]
@@ -141,6 +150,11 @@ struct Args {
     /// SlateDB SST block compression: none, lz4 or zstd.
     #[arg(long, env = "VLPDS_SST_COMPRESSION", default_value = "zstd")]
     sst_compression: String,
+    /// Shard compactors' polling: slow (5 s, cheapest idle), fast (500 ms)
+    /// or adaptive (slow until a shard's L0 runs deep, then fast until it
+    /// drains; absorbs unpaced bulk ingests without the idle cost).
+    #[arg(long, env = "VLPDS_COMPACTION_POLLING", default_value = "adaptive")]
+    compaction_polling: String,
     /// Log segment body compression: zstd level (0 = store segments
     /// uncompressed). Level 1 stores real commits ~2x smaller for ~4-6 µs
     /// of CPU per commit (DESIGN.md "Log compression").
@@ -317,7 +331,75 @@ fn raise_nofile_limit() {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn raise_nofile_limit() {}
 
+/// `vlpds admin <command>`: shard layout operations against a running node.
+#[derive(Parser)]
+#[command(name = "vlpds admin", about = "Shard layout operations against a running vlpds node")]
+struct AdminArgs {
+    /// Any node of the cluster.
+    #[arg(long, env = "VLPDS_URL", default_value = "http://127.0.0.1:2583")]
+    url: String,
+    /// Admin token (default: the dev token).
+    #[arg(long, env = "VLPDS_ADMIN_TOKEN", hide_env_values = true)]
+    admin_token: Option<String>,
+    #[command(subcommand)]
+    cmd: AdminCmd,
+}
+
+#[derive(clap::Subcommand)]
+enum AdminCmd {
+    /// Print the shard layout and any split/merge in progress.
+    Layout,
+    /// Split a shard in two, online.
+    ShardSplit {
+        shard: u16,
+        /// First slot of the upper half (default: the range's midpoint).
+        #[arg(long)]
+        at: Option<u32>,
+        /// Return once planned instead of waiting for the flip.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Merge two adjacent shards (`left` holds the lower slots), online.
+    ShardMerge {
+        left: u16,
+        right: u16,
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Abort the split/merge in progress (only before it flips).
+    ReshardAbort,
+}
+
+fn admin_main(args: AdminArgs) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    rt.block_on(async move {
+        let token = args.admin_token.unwrap_or_else(|| server::DEV_ADMIN_TOKEN.to_string());
+        let http = reqwest::Client::new();
+        let url = |nsid: &str| format!("{}/xrpc/{nsid}", args.url.trim_end_matches('/'));
+        let rb = match args.cmd {
+            AdminCmd::Layout => http.get(url("vlpds.admin.getShardLayout")),
+            AdminCmd::ShardSplit { shard, at, no_wait } => {
+                http.post(url("vlpds.admin.splitShard")).json(&serde_json::json!({"shard": shard, "at": at, "wait": !no_wait}))
+            }
+            AdminCmd::ShardMerge { left, right, no_wait } => {
+                http.post(url("vlpds.admin.mergeShards")).json(&serde_json::json!({"left": left, "right": right, "wait": !no_wait}))
+            }
+            AdminCmd::ReshardAbort => http.post(url("vlpds.admin.abortReshard")).json(&serde_json::json!({})),
+        };
+        let r = rb.basic_auth("admin", Some(token)).timeout(Duration::from_secs(300)).send().await?;
+        let status = r.status();
+        let body = r.text().await?;
+        let pretty = serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or(body);
+        println!("{pretty}");
+        anyhow::ensure!(status.is_success(), "{status}");
+        Ok(())
+    })
+}
+
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("admin") {
+        return admin_main(AdminArgs::parse_from(std::env::args().skip(1)));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -358,6 +440,7 @@ fn secret(v: &Option<String>, dev_mode: bool, dev_default: &str) -> String {
 async fn run(args: Args) -> anyhow::Result<()> {
     vlpds::partition::set_block_cache_bytes(args.block_cache_mb << 20);
     vlpds::partition::set_sst_compression(args.sst_compression.parse()?);
+    vlpds::partition::set_compaction_polling(args.compaction_polling.parse()?);
     vlpds::partition::set_gc_min_age(vlpds::retention::parse_duration(&args.slatedb_gc_min_age)?);
     vlpds::partition::set_checkpoint_lifetime(vlpds::retention::parse_duration(&args.slatedb_checkpoint_lifetime)?);
     vlpds::segment::set_compression_level(args.log_compression);
@@ -427,6 +510,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         log_retention,
         cache_budget_bytes: args.cache_budget_mb.map(|m| m << 20),
         cache_entries: vlpds::caches::parse_overrides(&args.cache_entries)?,
+        reshard_policy: vlpds::reshard::Policy {
+            split_bytes: (args.reshard_split_mb > 0).then_some(args.reshard_split_mb << 20),
+            split_writes_per_sec: (args.reshard_split_writes > 0.0).then_some(args.reshard_split_writes),
+        },
     };
     cfg.check_secrets()?;
     if args.lease_ttl_ms < 10_000 && !args.dev_mode {

@@ -138,7 +138,8 @@ swappable.
   and SlateDB flushes L0 SSTs to S3 on its own schedule.
 - No double-write: the log is the WAL. Crash recovery = open SlateDB, read
   `applied_seq`, replay segments after it (events carry record blocks + commit).
-- Keys:
+- Keys (each prefixed by `0x01 ‖ slot` of its account, so a shard's state is
+  one key range: see "Online shard split/merge"):
   - `h/{did}` → head `{commit cid, signed commit bytes, rev, data cid, status}`
   - `R/{did}\0{collection}/{rkey}` → `{cid, record bytes}`
   - `c/{did}\0{cid8}{path}` → empty: record CID index for `getBlocks` (`cid8` =
@@ -160,7 +161,25 @@ swappable.
 - Each shard's compactor (coordinator + one worker writing the same SST
   format) starts after the DB opens rather than inside the open, so a
   takeover or handback serves ~11 store round trips sooner. Its outputs
-  aren't written into the local disk cache (reads fill it).
+  aren't written into the local disk cache (reads fill it). It keeps
+  running after the DB is marked closed until every handle is gone (at
+  most 60 s): SlateDB marks the DB closed *before* its final memtable
+  flush, and with L0 full (a close under bulk ingest: a handback, or
+  freezing a hot shard to split it) that flush waits for a compaction;
+  stopping at the mark deadlocked such a close.
+- **Adaptive compaction polling** (`--compaction-polling`, default
+  adaptive). SlateDB's compactor and worker poll every 5 s: cheap idle, but
+  an unpaced bulk ingest into one shard fills L0 (32 x 16 MiB) between
+  cycles and stalls. Always-fast (500 ms) polls fix that at ~4x the idle
+  requests. Adaptive runs slow polls while L0 is shallow and restarts the
+  compactor with fast polls once L0 reaches 8 SSTs, back to slow after 15 s
+  at <= 2 (a graceful worker stop hands claimed jobs back). Measured
+  (tests/all/compaction_polling.rs, in-memory store with 10 ms per call,
+  M4 Pro): idle 3.20 / 3.24 / 13.97 requests per shard per second (slow /
+  adaptive / fast; mostly the writer's own 1 s manifest poll); 2M records
+  unpaced into one shard: worst write 10.7 s / 1.6 s / 1.3 s, time in
+  writes over 250 ms 25.5 s / 2.2 s / 2.5 s of the run, throughput 71k /
+  376k / 374k records/s.
 - **What keeps replaced SSTs.** A scan or snapshot reads the SSTs of the
   manifest it started with. Before each manifest update that replaces SSTs,
   SlateDB's compactor writes a *checkpoint* of the old manifest that expires
@@ -332,9 +351,11 @@ All nodes serve reads and writes; write *ownership* is partitioned. This is
 the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
 `src/node.rs`, `src/nodelog.rs`); `bench/ha/RESULTS.md` has the failure matrix.
 
-- **Shards.** 65,536 fixed hash slots grouped into `--shards N` contiguous
-  ranges. A shard is the unit of ownership and state: one SlateDB at
-  `state/{shard}/` and an assignment object `assign/{shard}`.
+- **Shards.** 65,536 fixed hash slots grouped into contiguous ranges by a
+  versioned layout (`assign/layout`; `--shards N` uniform ranges when a
+  prefix is created), which splits and merges change online (see "Online
+  shard split/merge"). A shard is the unit of ownership and state: one
+  SlateDB at `state/{id}/` and an assignment object `assign/{id}`.
 - **One log per node incarnation.** A node group-commits every shard's entries,
   tagged `(shard, epoch)`, into `log/{log_id}/{ordinal}.seg`. Up to K
   segment PUTs are in flight (`--log-inflight`, default 4), each written with
@@ -554,6 +575,148 @@ segment missing below the log's lowest object was overtaken by retention
 (`backfill::Pruned`): it re-reads the floor and jumps with OutdatedCursor. A
 peer follower draining a dead log skips to the lowest object it finds.
 
+### Online shard split/merge (`src/reshard.rs`, `src/slots.rs`)
+
+The slot space stays fixed (65,536 slots, `slot = top 16 bits of
+sha256(routing key)`). What changes online is how slots group into shards:
+a hot or large shard splits into two, two adjacent cold shards merge into
+one. No acked write is lost, the affected slots are unavailable (503
+`PartitionUnavailable`, which clients retry) only for a window like a
+handback's, and every node routes by the same versioned map.
+
+**The layout is data.** `assign/layout` (JSON, CAS on its ETag) holds
+`{version, shards: [{id, lo, hi}], next_id, op_seq, op}`: contiguous slot
+ranges covering `[0, 65536)`, each naming a *shard id*. Ids are stable,
+never reused identifiers (`state/{id:03}`, `assign/{id:03}`, the `shard`
+tag of log entries), no longer positions in a uniform split: a split
+allocates two new ids, a merge one. The first node of a prefix creates
+version 1 as `--shards` uniform ranges with ids 0..n (the uniform layout
+of before). `version` increases only when routing changes (a flip below).
+The object sits under `assign/`, so the LIST every step already makes for
+assignments returns its ETag: nodes GET it only when it changed, and the
+steady state costs no extra request. Each node installs the layout it read
+into its partition table (`PartitionTable::shard_of(key)`); routing,
+forwarding (forward.rs asks the table), fair shares (`|shards| / live`)
+and acquisition all go by it.
+
+**State keys are slot-major.** Every per-account key is
+`0x01 ‖ slot (2 bytes, BE) ‖ family ‖ rest` (`state.rs`; the slot is that
+of the key's routing key: the DID, or a private entry's routing key; the
+handle and collection indexes use their account's DID). Shard-wide keys
+(`meta/applied2`, ...) start with ASCII and sort outside `[0x01, 0x02)`,
+so a clone never inherits them. A shard's slot range `[lo, hi)` is
+exactly the key range `[01‖lo, 01‖hi)`, and a split or merge is a
+**SlateDB clone with a projection range**, not a copy:
+
+- split P → C1 `[lo, mid)`, C2 `[mid, hi)`: clone P twice, projected to
+  each child's key range;
+- merge A, B → M: one clone with two sources, each projected to its range
+  (SlateDB's union clone requires disjoint ranges per source, which
+  adjacent slot ranges are).
+
+A clone writes a checkpoint into each source's manifest (pinning its SSTs)
+and a manifest for the child that references them ("external SSTs"); it is
+O(manifest), whatever the shard's size, and SlateDB makes it idempotent (a
+retry finds the initialized clone). The child's compaction rewrites the
+inherited SSTs into its own over time; until then the standalone
+compactor/worker (they only know the DB root) read them through a store
+that redirects those SST paths to their owners (`partition.rs`). The
+alternatives were rejected: scan-and-route copying moves the whole shard
+(hours for a hot 50 GB shard, exactly when it is stressed) and needs a
+two-phase copy plus slot-filtered log catch-up to keep the window short;
+a lazy read-through child changes every read path. The cost of slot-major
+keys is that cross-account scans (listRepos, listReposByCollection,
+searchAccounts, the large-repo index, OAuth GC, routing-prefix scans) walk
+slot by slot: `state::FamilyScan` keeps one iterator over the shard and
+`seek`s past slots without the family, so empty slots cost nothing and a
+populated one costs one seek.
+
+**Protocol.** One reshard op at a time, cluster-wide, recorded in the
+layout as `op = {id, parents, children, driver}`:
+
+1. *Plan* (admin call on any node, or the policy hook): CAS the layout to
+   add `op` (children ids from `next_id`, used up by the plan itself, so
+   an aborted op's clones are never mistaken for a later op's; split point
+   default = midpoint; merges only of adjacent shards). `driver` = the
+   parents' owner if they share one, else the planner. Every peer is
+   nudged.
+2. *Freeze* (each parent's owner, on its next step or nudge): the same
+   close as a release (one barrier segment, `META_APPLIED` marker, memtable
+   flush, DB closed), then a CAS of the parent's assignment to
+   `owner: None, frozen: op.id`, its span closed at the barrier and
+   `seq_floor` raised to the owner's watermark. A frozen shard is never
+   acquired or handed out. Freezing is only ever done by an owner after a
+   successful close, so **a frozen shard's DB holds every entry of every
+   span in its history** (a close that fails fail-stops the node as
+   before; a successor fences, replays, and freezes again). An unowned
+   parent is acquired normally (replaying its history) and then frozen.
+3. *Clone* (driver, once every parent is frozen with `op.id`): clone the
+   children; write each child's assignment fresh (`epoch 0`, no history,
+   `seq_floor` = max of the parents'). Nothing routes to a child yet. The
+   write is a create, or a CAS over a still-fresh one (a retry): never a
+   blind overwrite, so a driver presumed dead that wakes up late can't
+   reset a child some node already took after the flip.
+4. *Flip* (driver): CAS the layout to `version + 1` with the parents'
+   ranges replaced by the children's and `op` cleared. This is the commit
+   point. The driver then takes the children like free shards (epoch 1, an
+   open span in its log), opens them and nudges every peer, whose routing
+   follows at once; fair shares rebalance them later as usual.
+
+**Why no acked write is lost.** A slot's writes are applied by exactly one
+open shard at a time: the parent stops applying at its barrier (frozen
+before any clone exists), the child opens only after the flip, and the
+clone is taken of the frozen parent's flushed DB, which by step 2 already
+holds every acked entry of the parent. A child's history starts empty: it
+never replays a parent's spans, so log entries never need slot filtering.
+A node with a stale layout routes the moved slots to the parent, which no
+one serves (503, retried) until its next step or the flip's nudge; it
+cannot apply them, since only the parent's (frozen) owner had it open.
+
+**Crashes and aborts.** Every step is resumable from object-store state:
+
+| crash point | recovery |
+|---|---|
+| op planned, parent not frozen | a parent's owner died: its successor fences and replays as always, then freezes |
+| parent closed, freeze CAS not written | the parent is an orphan with an open span: taken over (fence, replay nothing new), then frozen |
+| frozen, clone partial | the driver (or, if it is dead, the live node with the lowest id, which CASes itself in as driver) re-runs the clone (idempotent) and rewrites the children's assignments |
+| flipped, children not taken | children are ordinary free shards in the layout; any node acquires them (epoch 1, empty history, `seq_floor` preserved in their assignment) |
+
+`vlpds.admin.abortReshard` (or the driver on a permanent clone error) works
+until the flip: CAS `op` away, then unfreeze the parents' assignments. A
+parent left frozen with an op id that is no longer the layout's op while
+it is still in the layout (an abort that crashed half-way) is unfrozen by
+whichever node notices, after a fresh GET of the layout.
+
+**What carries across.**
+- *Epochs, spans, fences, replay markers:* per shard id, unchanged. A
+  child starts at epoch 1 with no history; its applied marker is written by
+  its own owner's finalizer and checkpoints as for any shard.
+- *Seq order:* the children's `seq_floor` is the max over the frozen
+  parents', so a repo's firehose order survives the move (commit-wait as for
+  a takeover).
+- *Retention:* a frozen shard never replays again (its DB is complete), so
+  `needed_by` skips frozen assignments; a dead log whose last span of some
+  shard is a parent's becomes deletable once the parent froze. Live logs
+  release a frozen parent's replay floor after the usual retired grace.
+  Dead-log pruning is led by the owner of the shard holding slot 0.
+- *Firehose:* events and `?shard=k/n` filtering are by slot, so they are
+  unaffected; cursors are seqs.
+- *listRepos:* the order is `(slot, DID)`, a global order independent of
+  the layout, and the cursor is the last DID (its slot is derived). Any
+  node finds the shard holding the cursor's slot in its layout and serves
+  or forwards from there, so an enumeration that spans a split or merge
+  lists every repo that exists throughout exactly once.
+  listReposByCollection and searchAccounts use the same order.
+- *Retired parents:* their assignments stay (frozen) and their state
+  directories stay: children read their SSTs until compaction rewrites
+  them. Deleting a retired directory needs a check that no live manifest
+  references it (`external_dbs`); not implemented yet (bounded leak: the
+  parent's size at the split).
+
+**Policy hook** (off by default): `--reshard-split-mb` /
+`--reshard-split-writes` let the driver-elect (owner of slot 0) plan a split
+of a shard whose SST bytes or entry rate exceed them, one op at a time.
+
 ### Liveness: observed lease changes on the observer's monotonic clock
 
 No node ever compares its wall clock with another node's.
@@ -708,7 +871,8 @@ differently:
    permanent.
 2. **Shards own contiguous slot ranges** and are the unit of ownership and
    state. Start with ~2–4k shards (~1–2 M accounts each); split hot or large
-   shards online, as Redis Cluster / CockroachDB ranges do. Each shard keeps
+   shards online, as Redis Cluster / CockroachDB ranges do (implemented:
+   "Online shard split/merge", a metadata-only SlateDB clone per child). Each shard keeps
    one SlateDB (state lives in S3, so moving a shard is cheap: open manifest,
    warm cache, replay tail).
 3. **One log per node, not per shard.** Each node group-commits all its
@@ -738,15 +902,16 @@ differently:
      that can't take the full ~750 MB/s.
 7. **Global indexes at 5 B scale.**
    - Handles: S3 objects for uniqueness, plus a cache.
-   - listRepos (implemented): the cursor is `{shard}:{last DID}` and a page
-     is served by that shard's owner from its own SlateDB (one snapshot per
-     shard; heads merge-joined with accounts), continuing through the
-     following shards it owns and hopping to the next owner only to fill
-     the page. Any node accepts the cursor and forwards the page to the
+   - listRepos (implemented): repos come in (slot, DID) order, the cursor
+     is `{slot}:{last DID}` (layout-independent, so it survives splits and
+     merges), and a page is served by the owner of the shard holding that
+     slot from its own SlateDB (one snapshot per shard; heads merge-joined
+     with accounts), continuing through the following shards it owns and
+     hopping to the next owner only to fill the page. Any node accepts the cursor and forwards the page to the
      owner (`/internal/v1/sync/listRepos`, body passed through unparsed),
      so a page costs one shard scan instead of a scan on every node plus a
-     merge. Per-shard DID order is a stable key order: a repo that exists
-     for the whole enumeration is listed exactly once. 1M repos over 64
+     merge. (slot, DID) is a stable key order: a repo that exists for the
+     whole enumeration is listed exactly once. 1M repos over 64
      shards / 3 in-process nodes: see TODO.md.
    - Rate limits and abuse controls per shard.
 

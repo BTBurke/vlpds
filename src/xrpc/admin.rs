@@ -72,6 +72,101 @@ pub fn routes() -> Router<Arc<App>> {
             get(get_invite_codes),
         )
         .route("/xrpc/com.atproto.admin.sendEmail", post(send_email))
+        .route("/xrpc/vlpds.admin.getShardLayout", get(get_shard_layout))
+        .route("/xrpc/vlpds.admin.splitShard", post(split_shard))
+        .route("/xrpc/vlpds.admin.mergeShards", post(merge_shards))
+        .route("/xrpc/vlpds.admin.abortReshard", post(abort_reshard))
+}
+
+// ---------------------------------------------------------------------------
+// shard layout: online split/merge (src/reshard.rs)
+// ---------------------------------------------------------------------------
+
+fn cluster_of(app: &App) -> XResult<&Arc<crate::cluster::Cluster>> {
+    app.cluster.as_ref().ok_or_else(|| invalid_request("no cluster"))
+}
+
+fn layout_json(app: &App) -> XResult<J> {
+    let c = cluster_of(app)?;
+    let l = c.layout();
+    let shards: Vec<J> = l
+        .shards
+        .iter()
+        .map(|r| json!({"id": r.id, "lo": r.lo, "hi": r.hi, "owner": c.owner_of(r.id).map(|o| o.0)}))
+        .collect();
+    Ok(json!({"version": l.version, "shards": shards, "nextId": l.next_id, "op": l.op}))
+}
+
+/// The shard layout this node routes by, with owners and any op in flight.
+async fn get_shard_layout(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+    require_admin(&creds)?;
+    Ok(Json(layout_json(&app)?))
+}
+
+#[derive(Deserialize)]
+struct SplitIn {
+    shard: u16,
+    at: Option<u32>,
+    #[serde(default)]
+    wait: bool,
+}
+
+#[derive(Deserialize)]
+struct MergeIn {
+    left: u16,
+    right: u16,
+    #[serde(default)]
+    wait: bool,
+}
+
+/// Plans `plan`; with `wait`, returns once it flipped (or was aborted).
+async fn reshard(app: &Arc<App>, plan: crate::reshard::Plan, wait: bool) -> XResult<Json<J>> {
+    let c = cluster_of(app)?;
+    let host: Arc<dyn crate::cluster::ShardHost> = app.node.clone();
+    let before = c.layout().version;
+    let op = c.plan_reshard(&host, plan).await.map_err(|e| invalid_request(format!("{e:#}")))?;
+    let mut out = json!({"op": op});
+    if wait {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let l = c.layout();
+            if l.version > before && l.op.as_ref().is_none_or(|o| o.id != op.id) {
+                out["done"] = json!(l.shards.iter().any(|r| op.children.iter().any(|ch| ch.id == r.id)));
+                break;
+            }
+            if l.op.is_none() && l.version == before {
+                out["done"] = json!(false); // aborted
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(XrpcError { status: StatusCode::GATEWAY_TIMEOUT, error: "Timeout".into(), message: format!("op {} still in progress", op.id) });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+    out["layout"] = layout_json(app)?;
+    Ok(Json(out))
+}
+
+/// Splits a shard online (DESIGN.md "Online shard split/merge").
+async fn split_shard(State(app): AppState, Auth(creds): Auth, Json(inp): Json<SplitIn>) -> XResult<Json<J>> {
+    require_admin(&creds)?;
+    reshard(&app, crate::reshard::Plan::Split { shard: inp.shard, at: inp.at }, inp.wait).await
+}
+
+/// Merges two adjacent shards online.
+async fn merge_shards(State(app): AppState, Auth(creds): Auth, Json(inp): Json<MergeIn>) -> XResult<Json<J>> {
+    require_admin(&creds)?;
+    reshard(&app, crate::reshard::Plan::Merge { left: inp.left, right: inp.right }, inp.wait).await
+}
+
+/// Aborts the split/merge in progress (only before it flips).
+async fn abort_reshard(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+    require_admin(&creds)?;
+    let c = cluster_of(&app)?;
+    let host: Arc<dyn crate::cluster::ShardHost> = app.node.clone();
+    let op = c.abort_reshard(&host).await.map_err(XrpcError::from_err)?;
+    Ok(Json(json!({"aborted": op, "layout": layout_json(&app)?})))
 }
 
 fn require_admin(creds: &Credentials) -> XResult<()> {
@@ -432,16 +527,16 @@ pub(super) struct SearchQ {
     limit: Option<usize>,
 }
 
-/// One searchAccounts hit, keyed by the global sort key (shard, did).
+/// One searchAccounts hit, keyed by the global sort key (slot, did).
 #[derive(serde::Serialize, Deserialize)]
 pub(super) struct AccountHit {
-    shard: usize,
+    slot: u32,
     did: String,
     view: J,
 }
 
-/// (limit, lowercased email prefix, resume after (shard, did))
-type SearchParams = (usize, Option<String>, Option<(usize, String)>);
+/// (limit, lowercased email prefix, resume after this DID)
+type SearchParams = (usize, Option<String>, Option<String>);
 
 impl SearchQ {
     fn parsed(&self) -> XResult<SearchParams> {
@@ -454,7 +549,11 @@ impl SearchQ {
         let after = match self.cursor.as_deref().filter(|c| !c.is_empty()) {
             Some(c) => {
                 let (p, d) = c.split_once(':').ok_or_else(|| invalid_request("Malformed cursor"))?;
-                Some((p.parse::<usize>().map_err(|_| invalid_request("Malformed cursor"))?, d.to_string()))
+                let slot = p.parse::<u32>().map_err(|_| invalid_request("Malformed cursor"))?;
+                if d.is_empty() || crate::slots::slot_of(d) as u32 != slot {
+                    return Err(invalid_request("Malformed cursor"));
+                }
+                Some(d.to_string())
             }
             None => None,
         };
@@ -462,59 +561,55 @@ impl SearchQ {
     }
 }
 
-/// Accounts on the shards this node owns, in (shard, did) order after the
+/// Accounts on the shards this node owns, in (slot, did) order after the
 /// cursor, at most `limit`; plus the shards scanned. The local half of
 /// searchAccounts (also served to peers by /internal/v1/admin/searchAccounts).
 pub(super) async fn search_accounts_local(app: &App, q: &SearchQ) -> XResult<(Vec<AccountHit>, Vec<u16>)> {
     let (limit, email, after) = q.parsed()?;
-    let owned: Vec<u16> = app.partitions.owned().iter().map(|p| p.id).collect();
-    let (mut part, mut after) = match after {
-        Some((p, d)) => (p, Some(d)),
-        None => (0, None),
-    };
+    let layout = app.partitions.layout();
+    let mut owned = app.partitions.owned();
+    owned.sort_by_key(|p| layout.range_of(p.id).map_or(u32::MAX, |r| r.lo));
+    let ids: Vec<u16> = owned.iter().map(|p| p.id).collect();
+    let start = after.as_deref().map(|d| [state::account_key(d), vec![0]].concat());
     let mut out = Vec::new();
-    while part < app.partitions.len() && out.len() < limit {
-        if let Some(p) = app.partitions.get(part) {
-            let lo = match &after {
-                Some(d) => [state::account_key(d), vec![0]].concat(),
-                None => b"a/".to_vec(),
-            };
-            let mut iter =
-                p.db.scan(lo..state::prefix_end(b"a/"))
-                    .await
-                    .map_err(XrpcError::from_err)?;
-            while out.len() < limit {
-                let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? else {
-                    break;
-                };
-                let Ok(a) = serde_json::from_slice::<Account>(&kv.value) else {
-                    continue;
-                };
-                if let Some(e) = &email {
-                    if !a
-                        .email
-                        .as_deref()
-                        .is_some_and(|ae| ae.starts_with(e.as_str()))
-                    {
-                        continue;
-                    }
-                }
-                let did = String::from_utf8_lossy(&kv.key[2..]).to_string();
-                out.push(AccountHit { shard: part, did, view: account_view(app, &a).await? });
-            }
+    for p in owned {
+        if out.len() >= limit {
+            break;
         }
-        part += 1;
-        after = None;
+        let mut iter = state::FamilyScan::new(p.db.as_ref(), state::ACCOUNT_FAMILY, start.clone(), &Default::default())
+            .await
+            .map_err(XrpcError::from_err)?;
+        while out.len() < limit {
+            let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? else {
+                break;
+            };
+            let Ok(a) = serde_json::from_slice::<Account>(&kv.value) else {
+                continue;
+            };
+            if let Some(e) = &email {
+                if !a
+                    .email
+                    .as_deref()
+                    .is_some_and(|ae| ae.starts_with(e.as_str()))
+                {
+                    continue;
+                }
+            }
+            let (slot, did) = state::slot_did(&kv.key, state::ACCOUNT_FAMILY.len());
+            let slot = u16::from_be_bytes([slot[0], slot[1]]) as u32;
+            let did = String::from_utf8_lossy(did).to_string();
+            out.push(AccountHit { slot, did, view: account_view(app, &a).await? });
+        }
     }
-    Ok((out, owned))
+    Ok((out, ids))
 }
 
-/// Scans `a/` across every shard in the cluster (this node's, plus each live
-/// peer's via /internal/v1/admin/searchAccounts), merged in (shard, did)
-/// order; `email` filters by case-insensitive prefix. Cursor:
-/// `{shard}:{did}`, the last returned key, so a page resumes on every node.
-/// Unreachable peers / unowned shards are reported (`unreachableNodes`,
-/// `missingShards`) instead of silently dropped.
+/// Scans the accounts of every shard in the cluster (this node's, plus each
+/// live peer's via /internal/v1/admin/searchAccounts), merged in (slot, did)
+/// order, an order independent of the shard layout; `email` filters by
+/// case-insensitive prefix. Cursor: `{slot}:{did}`, the last returned key,
+/// so a page resumes on every node. Unreachable peers / unowned shards are
+/// reported (`unreachableNodes`, `missingShards`) instead of silently dropped.
 async fn search_accounts(
     State(app): AppState,
     Auth(creds): Auth,
@@ -536,12 +631,12 @@ async fn search_accounts(
         covered.extend(r.owned);
         hits.extend(serde_json::from_value::<Vec<AccountHit>>(r.body["accounts"].clone()).unwrap_or_default());
     }
-    hits.sort_by(|a, b| (a.shard, &a.did).cmp(&(b.shard, &b.did)));
+    hits.sort_by(|a, b| (a.slot, &a.did).cmp(&(b.slot, &b.did)));
     hits.dedup_by(|a, b| a.did == b.did);
     hits.truncate(limit);
-    let cursor = (hits.len() == limit).then(|| hits.last().map(|h| format!("{}:{}", h.shard, h.did))).flatten();
-    // shards before the cursor's are done; only the rest can be missing
-    let from = after.map(|(p, _)| p).unwrap_or(0);
+    let cursor = (hits.len() == limit).then(|| hits.last().map(|h| format!("{}:{}", h.slot, h.did))).flatten();
+    // slots before the cursor's are done; only shards past it can be missing
+    let from = after.map(|d| crate::slots::slot_of(&d) as u32).unwrap_or(0);
     let mut res = json!({"accounts": hits.into_iter().map(|h| h.view).collect::<Vec<_>>()});
     if let Some(c) = cursor {
         res["cursor"] = json!(c);
@@ -551,17 +646,17 @@ async fn search_accounts(
 }
 
 /// Marks a scatter-gather result incomplete: `unreachableNodes` (peers that
-/// timed out or failed) and `missingShards` (shards >= `from` that no
-/// answering node owned, e.g. mid-move). Absent when the result is complete.
+/// timed out or failed) and `missingShards` (shards holding slots >= `from`
+/// that no answering node owned, e.g. mid-move). Absent when complete.
 fn partial_fields(
     app: &App,
     res: &mut J,
     unreachable: Vec<String>,
     covered: &std::collections::HashSet<u16>,
-    from: usize,
+    from: u32,
 ) {
-    let missing: Vec<usize> =
-        (from..app.partitions.len()).filter(|p| !covered.contains(&(*p as u16))).collect();
+    let missing: Vec<u16> =
+        app.partitions.layout().shards.iter().filter(|r| r.hi > from && !covered.contains(&r.id)).map(|r| r.id).collect();
     if !unreachable.is_empty() {
         res["unreachableNodes"] = json!(unreachable);
     }

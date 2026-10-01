@@ -397,17 +397,44 @@ def ownership(nodes):
     return out
 
 
+def layout_shards(nodes):
+    """Shard ids of the cluster's current layout (splits and merges change
+    them; /internal/v1/cluster "layout"), or None on builds without one.
+    Every live node must agree on it (None if they don't yet)."""
+    seen = set()
+    for n in nodes:
+        if not n.alive():
+            continue
+        try:
+            l = n.status().get("layout")
+        except Exception:
+            continue
+        if not l:
+            return None
+        if l.get("op"):
+            return []  # a split/merge in flight: not converged yet
+        seen.add(tuple(sorted(l["shards"])))
+    if len(seen) != 1:
+        return [] if seen else None
+    return list(seen.pop())
+
+
 def converged(nodes, expect_nodes=None):
     """Every partition owned exactly once by a live node (and, optionally,
     spread over `expect_nodes` nodes within fair share). With only counts
-    (no status endpoint) this checks the counts sum to PARTITIONS."""
+    (no status endpoint) this checks the counts sum to PARTITIONS. With a
+    shard layout (online split/merge) the shards are the layout's."""
+    shards = layout_shards(nodes)
+    if shards == []:
+        return False, {"layout": "changing or disagreeing"}
+    want = len(shards) if shards else PARTITIONS
     own = ownership(nodes)
     if not own:
         # ownership not observable on this build: treat "all live nodes healthy" as converged
         live = [n for n in nodes if n.alive()]
         return bool(live) and all(n.ready() for n in live), {"unobserved": True}
     if all(isinstance(v, int) for v in own.values()):
-        ok = sum(own.values()) == PARTITIONS and (not expect_nodes or len([1 for v in own.values() if v]) >= min(expect_nodes, PARTITIONS))
+        ok = sum(own.values()) == want and (not expect_nodes or len([1 for v in own.values() if v]) >= min(expect_nodes, want))
         return ok, own
     seen = {}
     for nid, ps in own.items():
@@ -415,11 +442,11 @@ def converged(nodes, expect_nodes=None):
             if p in seen:
                 return False, own
             seen[p] = nid
-    if len(seen) != PARTITIONS:
+    if len(seen) != want or (shards and set(seen) != set(shards)):
         return False, own
     if expect_nodes:
-        fair = -(-PARTITIONS // expect_nodes)
-        if any(len(ps) > fair for ps in own.values()) or len([1 for ps in own.values() if ps]) < min(expect_nodes, PARTITIONS):
+        fair = -(-want // expect_nodes)
+        if any(len(ps) > fair for ps in own.values()) or len([1 for ps in own.values() if ps]) < min(expect_nodes, want):
             return False, own
     return True, own
 
@@ -822,9 +849,11 @@ def teardown(ctx):
 
 
 def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_final=None, per_node=30, rate=RATE,
-                      extra_checkers=None, start_nodes=None, node_extra=None, node_env=None, probes=None):
+                      extra_checkers=None, start_nodes=None, node_extra=None, node_env=None, probes=None, replay=True):
     """Generic shape: cluster up -> accounts -> checker + probes + load on all
-    nodes -> `actions` [(at_s, fn(ctx))] -> drain -> verify -> results."""
+    nodes -> `actions` [(at_s, fn(ctx))] -> drain -> verify -> results.
+    `replay=False` skips the post-hoc replay from before the run (with a short
+    --log-retention it is OutdatedCursor by design; such scenarios check it)."""
     nodes = make_cluster(ctx, n_nodes, start=False, extra=node_extra, env=node_env)
     for nd in nodes[: (start_nodes or n_nodes)]:
         nd.start()
@@ -900,7 +929,7 @@ def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_fina
     # post-hoc replay from a cursor before the run on every survivor: the merged
     # stream must be complete and identical on every node
     res["fh_replay"] = []
-    if first_seqs:
+    if first_seqs and replay:
         cur = min(first_seqs) - 1
         reps = [FhAudit(n, ctx.outdir, tag="-replay", cursor=cur) for n in survivors]
         # rejoined nodes backfill the run from S3 segments (slower than the ring)
@@ -1360,6 +1389,70 @@ def s_k9_ckpt(ctx):
             (27, watch_log_then(1, "checkpoint start", k, "kill -9 n2 mid-checkpoint (2nd)", delay=0.01)),
             (50, restart(1))]
     return run_load_scenario(ctx, 3, 65, acts)
+
+
+# ---- online shard split/merge (DESIGN.md "Online shard split/merge")
+
+
+def admin_post(node, nsid, body, timeout=60.0):
+    import base64
+    auth = "Basic " + base64.b64encode(f"admin:{ADMIN}".encode()).decode()
+    _, raw = http("POST", node.url + "/xrpc/" + nsid, body, headers={"authorization": auth}, timeout=timeout)
+    return json.loads(raw)
+
+
+def owned_by(ctx, idx):
+    try:
+        return sorted(ctx.nodes[idx].status()["owned"])
+    except Exception:
+        return []
+
+
+def reshard(idx_via, label, plan):
+    """Plans a split/merge through node idx_via. `plan(ctx)` -> (nsid, body)."""
+    def f(ctx):
+        nsid, body = plan(ctx)
+        ctx.mark(f"{label}: {nsid} {body}")
+        try:
+            r = admin_post(ctx.nodes[idx_via], nsid, body, timeout=90.0)
+            ctx.mark(f"{label}: op {r.get('op', {}).get('id')} done={r.get('done')} layout v{r.get('layout', {}).get('version')}")
+        except Exception as e:
+            ctx.mark(f"{label}: {e}")
+        return None
+    return f
+
+
+def split_owned_by(idx):
+    return lambda ctx: ("vlpds.admin.splitShard", {"shard": owned_by(ctx, idx)[0], "wait": False})
+
+
+def merge_adjacent(ctx):
+    l = ctx.nodes[0].status()["layout"]["shards"]
+    table = ctx.nodes[0].status()["table"]  # [(id, owner)] in slot order
+    for (a, oa), (b, ob) in zip(table, table[1:]):
+        if oa and ob and oa != ob:
+            return "vlpds.admin.mergeShards", {"left": a, "right": b, "wait": True}
+    return "vlpds.admin.mergeShards", {"left": l[0], "right": l[1], "wait": True}
+
+
+@scenario("reshard-kill9",
+          "3 nodes under load; split a shard n2 owns and kill -9 n2 as it freezes the parent (mid-split; the "
+          "survivors fence, replay, take over driving and finish the split); restart n2; merge two shards held "
+          "by different nodes; split again; every acked write readable, firehose complete")
+def s_reshard_kill9(ctx):
+    k = lambda ctx: ctx.nodes[1].signal(signal.SIGKILL)
+    acts = [(12, reshard(0, "split a shard n2 owns", split_owned_by(1))),
+            (12.01, watch_log_then(1, "freezing reshard parents", k, "kill -9 n2 mid-split", delay=0.01, timeout=10)),
+            (30, restart(1)),
+            (40, reshard(0, "merge shards held by two nodes", merge_adjacent)),
+            (48, reshard(2, "split a shard n3 owns", lambda ctx: ("vlpds.admin.splitShard", {"shard": owned_by(ctx, 2)[0], "wait": True})))]
+    res = run_load_scenario(ctx, 3, 60, acts)
+    res["expect_exit"] = {"n2": [-9, 137]}
+    try:
+        res["final_layout"] = ctx.nodes[0].status().get("layout")
+    except Exception:
+        pass
+    return res
 
 
 # ---- K segment PUTs in flight (pipelined log): holes, fences, garbage
@@ -1881,6 +1974,188 @@ def s_k_spill(ctx):
 
 
 # ---- container scenarios
+
+
+# ---- log retention under failover (src/retention.rs)
+
+# --log-retention for retention-* scenarios (s): short, so a few passes (one
+# every 60 s per node, DEFAULT_INTERVAL) prune live and dead logs mid-run
+RETENTION_S = int(os.environ.get("VLPDS_HA_RETENTION_S", "45"))
+# node-log lines that mean a replay, backfill or follower needed something
+# retention had deleted, or a retention pass itself failed
+RETENTION_BAD = ["open failed", "firehose backfill failed", "firehose backfill task failed", "draining dead log",
+                 "log pruned ahead of its follower", "reading the retained floor failed", "log retention pass failed",
+                 "close failed", "a shard failed to close", "reading back a spilled log failed",
+                 "dropped late events below the emitted watermark"]
+
+
+def retained_floor(prefix):
+    """Max pruned_seq over the retain/ reports (what readers check a cursor against)."""
+    floor = 0
+    for k in s3_list(f"{prefix}/retain/"):
+        try:
+            floor = max(floor, json.loads(s3_get(k) or b"{}").get("pruned_seq", 0))
+        except Exception:
+            pass
+    return floor
+
+
+def retention_metrics(node):
+    try:
+        m = node.metrics()
+    except Exception:
+        return None
+    return {"deleted_own": metric_sum(m, "vlpds_retention_deleted_objects_total", log="own"),
+            "deleted_dead": metric_sum(m, "vlpds_retention_deleted_objects_total", log="dead"),
+            "pruned_seq": metric_sum(m, "vlpds_retention_pruned_seq"),
+            "ticks_ok": metric_sum(m, "vlpds_retention_ticks_total", result="ok"),
+            "ticks_error": metric_sum(m, "vlpds_retention_ticks_total", result="error")}
+
+
+@scenario("retention-kill9", f"--log-retention {RETENTION_S}s, 3 nodes under load for 240 s: kill -9 n2 at 75 s, restart it at "
+          "135 s; dead log pruned to its fence, no replay needs a pruned segment, old-cursor subscribers get OutdatedCursor and "
+          "continue live, restarted node clean")
+def s_retention_kill9(ctx):
+    ctx.dead_logs, ctx.ret = [], {"cursor_audits": [], "start_audits": []}
+    extra = ["--log-retention", f"{RETENTION_S}s"]
+
+    def old_cursor(ctx):
+        st = ctx.nodes[0].status()
+        ctx.ret["old_cursor"] = st["firehose_last_emitted"]
+        ctx.mark(f"old cursor {ctx.ret['old_cursor']} (n1's last emitted)")
+
+    def kill_n2(ctx):
+        n = ctx.nodes[1]
+        ctx.dead_logs.append((n.id, n.status()["log"]))
+        return kill(1)(ctx)
+
+    def start_audit(ctx):
+        n = ctx.nodes[1]
+        wait_ready([n])
+        ctx.mark(f"live audit attached to {n.id} at start")
+        ctx.ret["start_audits"].append(FhAudit(n, ctx.outdir, tag="-start"))
+
+    def cursor_audits(ctx):
+        # every node (n2 restarted) from a cursor retention has passed: an
+        # OutdatedCursor #info, then the stream from the floor on, kept live
+        ctx.ret["floor_at_subscribe"] = retained_floor(ctx.prefix)
+        ctx.ret["retention_mid"] = {n.id: retention_metrics(n) for n in ctx.nodes}
+        ctx.mark(f"old-cursor subscribers on all nodes (cursor {ctx.ret['old_cursor']}, retained floor {ctx.ret['floor_at_subscribe']})")
+        ctx.ret["cursor_audits"] = [FhAudit(n, ctx.outdir, tag="-oldcursor", cursor=ctx.ret["old_cursor"]) for n in ctx.nodes]
+        time.sleep(1)
+        ctx.ret["floor_after_subscribe"] = retained_floor(ctx.prefix)
+
+    acts = [(5, old_cursor), (75, kill_n2), (135, restart(1)), (135.01, start_audit), (200, cursor_audits)]
+    res = run_load_scenario(ctx, 3, 240, acts, node_extra=extra, replay=False)
+    fails = []
+    out = res["retention"] = {"window_s": RETENTION_S, "old_cursor": ctx.ret.get("old_cursor"),
+                              "floor_at_subscribe": ctx.ret.get("floor_at_subscribe"),
+                              "floor_after_subscribe": ctx.ret.get("floor_after_subscribe"), "retention_mid": ctx.ret.get("retention_mid")}
+
+    # dead-log pruning down to the fence: retired by the leader within a few passes
+    logs = {n.id: os.path.join(ctx.outdir, f"{n.id}.log") for n in ctx.nodes}
+    dead = ctx.dead_logs[0][1] if ctx.dead_logs else None
+
+    def retired():
+        for path in logs.values():
+            for line in open(path, errors="replace"):
+                if "dead log retired" in line and dead in line:
+                    return strip_ansi(line).strip()[:240]
+        return None
+    end = time.time() + 150
+    while dead and not retired() and time.time() < end:
+        time.sleep(5)
+    out["retired_line"] = retired()
+    out["dead_log"] = dead
+    if dead:
+        ords = log_ordinals(ctx.prefix, dead)
+        kinds = [parse_log_object(s3_get(f"{ctx.prefix}/log/{dead}/{o:012}.seg") or b"")["kind"] for o in ords]
+        out["dead_log_objects"] = list(zip(ords, kinds))
+        out["dead_log_report_left"] = any(k.endswith("/" + dead) for k in s3_list(f"{ctx.prefix}/retain/"))
+        if not out["retired_line"]:
+            fails.append("dead log never retired")
+        if kinds != ["fence"]:
+            fails.append(f"dead log not pruned to its fence: {out['dead_log_objects'][:6]}")
+        if out["dead_log_report_left"]:
+            fails.append("dead log's retain/ report left behind")
+        k_audits(ctx, res)  # fence at the first hole, span ends at the fence
+    # live logs pruned too, every pass clean
+    out["retention_end"] = {n.id: retention_metrics(n) for n in ctx.nodes if n.alive()}
+    if not any((m or {}).get("deleted_own") for m in out["retention_end"].values()):
+        fails.append("no live log pruned")
+    if any((m or {}).get("ticks_error") for m in out["retention_end"].values()):
+        fails.append("retention pass errors")
+    out["final_floor"] = retained_floor(ctx.prefix)
+    # nothing needed a pruned segment: no replay/backfill/follower/pass errors in any node log
+    bad = {}
+    for nid, path in logs.items():
+        for line in open(path, errors="replace"):
+            if any(b in line for b in RETENTION_BAD):
+                bad.setdefault(nid, []).append(strip_ansi(line).strip()[:240])
+    out["bad_log_lines"] = {k: v[:5] for k, v in bad.items()}
+    out["bad_log_line_counts"] = {k: len(v) for k, v in bad.items()}
+    if bad:
+        fails.append(f"replay/retention errors in node logs: {out['bad_log_line_counts']}")
+
+    # the reference history: n1's cursorless live audit (stayed up the whole run)
+    ref = None
+    try:
+        ref = json.load(open(os.path.join(ctx.outdir, "fhaudit-n1.json")))
+    except Exception:
+        fails.append("no n1 live audit")
+    out["cursor_audits"] = []
+    for a in ctx.ret["cursor_audits"]:
+        data = a.stop()
+        r = audit_report(data, {}, a.node.id)
+        r["info_names"] = (data or {}).get("info_names")
+        if not data or not data.get("commits"):
+            fails.append(f"{a.node.id}: old-cursor subscriber got no commits")
+            out["cursor_audits"].append(r)
+            continue
+        if (r["info_names"] or [None])[0] != "OutdatedCursor":
+            fails.append(f"{a.node.id}: old cursor without OutdatedCursor first ({r['info_names']})")
+        if r["reorders"] or r["dups"]:
+            fails.append(f"{a.node.id}: old-cursor stream reorders {r['reorders']} dups {r['dups']}")
+        if r["first_seq"] <= (ctx.ret.get("old_cursor") or 0):
+            fails.append(f"{a.node.id}: old-cursor stream starts at {r['first_seq']}, at or below the cursor")
+        if ref:
+            # from its first event on, exactly n1's history to the end of the run
+            seqs = [c["s"] if isinstance(c, dict) else c[0] for c in data["commits"]]
+            ref_seqs = [c["s"] if isinstance(c, dict) else c[0] for c in ref["commits"]]
+            want = [x for x in ref_seqs if x >= seqs[0]]
+            r["ref_from_first"], r["got"] = len(want), len(seqs)
+            if seqs != want:
+                fails.append(f"{a.node.id}: old-cursor stream != n1 history from seq {seqs[0]} ({len(seqs)} vs {len(want)})")
+            # it continued from the floor: nothing above the floor it was
+            # served from (at most the one read after it subscribed) is skipped
+            floor = ctx.ret.get("floor_after_subscribe") or 0
+            r["skipped_above_floor"] = len([x for x in ref_seqs if floor < x < seqs[0]])
+            if r["skipped_above_floor"]:
+                fails.append(f"{a.node.id}: {r['skipped_above_floor']} events above the floor {floor} skipped")
+        out["cursor_audits"].append(r)
+    # the restarted node: its start audit is n1's history over the common range
+    out["start_audits"] = []
+    for a in ctx.ret["start_audits"]:
+        data = a.stop()
+        r = audit_report(data, {}, a.node.id)
+        if ref and data:
+            d = history_diff({"n1": ref, f"{a.node.id}-start": data}, common_range=True)
+            r["agree"], r["diff"] = d["agree"], d.get("pairs")
+        else:
+            r["agree"] = False
+        if not r["agree"]:
+            fails.append(f"{a.node.id}: start audit disagrees with n1")
+        out["start_audits"].append(r)
+    codes = res.get("exit_codes") or {}
+    if codes.get("n1") or codes.get("n3") or codes.get("n2") not in ([-9], [137]):
+        fails.append(f"unexpected exits {codes}")
+    if res.get("final_distribution") and len([1 for v in res["final_distribution"].values() if v]) < 3:
+        fails.append(f"restarted node owns nothing: {res['final_distribution']}")
+    if fails:
+        res.setdefault("k_fail", []).extend(fails)
+    log(f"  retention: retired={bool(out['retired_line'])} dead objs={out.get('dead_log_objects')} "
+        f"floor={out['final_floor']} end={out['retention_end']} bad={out['bad_log_line_counts']} fails={fails}")
+    return res
 
 
 def net(idx, up):

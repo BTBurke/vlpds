@@ -261,11 +261,16 @@ METRIC_KEYS = ["vlpds_commits_total", "vlpds_ops_total", "vlpds_segments_total",
                "vlpds_repo_evictions_total", "vlpds_cluster_store_requests_total", "vlpds_writes_shed_total",
                "vlpds_requests_forwarded_total", "vlpds_firehose_events_total", "vlpds_commit_requests_sum", "vlpds_commit_requests_count", "vlpds_commit_ops_sum", "vlpds_commit_ops_count",
                'vlpds_http_client_connects_total{role="peer"}', 'vlpds_http_client_connects_total{role="public"}',
-               "vlpds_http_server_connections_total"]
+               "vlpds_http_server_connections_total", "vlpds_segment_stored_bytes_total", "vlpds_retention_deleted_bytes_total",
+               "vlpds_segment_compress_seconds_count"]
+# float deltas (mdelta rounds to integers)
+METRIC_KEYS_F = ["vlpds_segment_compress_seconds_sum"]
 
 
 def mdelta(a, b):
-    return {k.replace("vlpds_", ""): round(msum(b, k) - msum(a, k)) for k in METRIC_KEYS}
+    d = {k.replace("vlpds_", ""): round(msum(b, k) - msum(a, k)) for k in METRIC_KEYS}
+    d.update({k.replace("vlpds_", ""): round(msum(b, k) - msum(a, k), 4) for k in METRIC_KEYS_F})
+    return d
 
 
 def run_loadgen(host, rate, total, active, duration=20, warmup=10, hot=200, churn=None, extra=(), firehose=True, tag="lg"):
@@ -541,8 +546,10 @@ def cmd_cluster(total, active, inject, rates, duration=20, failover_rate=None):
         cleanup_prefix(prefix)
 
 
-def fanout(url, subs, seconds, cursor=None, threads=8):
+def fanout(url, subs, seconds, cursor=None, threads=8, shard_of=0):
     args = [LOADGEN, "--host", url, "--threads", str(threads), "fanout", "--subscribers", str(subs), "--seconds", str(seconds)]
+    if shard_of:  # needs the loadgen with `fanout --shard-of` (bench/results/2026-10-03-benchbox/loadgen-shard-listrepos.patch)
+        args += ["--shard-of", str(shard_of)]
     jo = os.path.join(SCRATCH, "fanout.json")
     args += ["--json-out", jo]
     if cursor is not None:
@@ -552,23 +559,28 @@ def fanout(url, subs, seconds, cursor=None, threads=8):
 
 
 def cmd_firehose(inject=0):
-    out = os.path.join(OUTDIR, "firehose.jsonl")
+    out = os.path.join(OUTDIR, os.environ.get("OUT", "firehose.jsonl"))
     prefix = "bench-firehose"
     node = Node("firehose", prefix, inject=inject, extra=["--firehose-ring-mb", "64"]).start()
     try:
         bulk([node], 100000)
         # fan-out: N subscribers at a fixed write rate
-        for rate, subs in [(2000, 1), (2000, 10), (2000, 100), (2000, 1000), (10000, 1), (10000, 10), (10000, 100), (10000, 1000), (50000, 1), (50000, 10)]:
+        plan = [(2000, 1, 0), (2000, 10, 0), (2000, 100, 0), (2000, 1000, 0), (10000, 1, 0), (10000, 10, 0), (10000, 100, 0), (10000, 1000, 0), (50000, 1, 0), (50000, 10, 0)]
+        # FH_SHARD_OF=4: also sharded consumer sets (subscriber i takes ?shard=(i%4)/4)
+        so = int(os.environ.get("FH_SHARD_OF", "0"))
+        if so:
+            plan += [(10000, so, so), (10000, 10 * so, so), (10000, 100 * so, so), (50000, so, so), (50000, 10 * so, so)]
+        for rate, subs, shard_of in plan:
             check_disk()
             lg = run_loadgen(node.url, rate, 100000, 50000, duration=25, warmup=5, hot=0, firehose=False, tag="fh-load")
             time.sleep(7)
-            fo, jo = fanout(node.url, subs, 20)
+            fo, jo = fanout(node.url, subs, 20, shard_of=shard_of)
             with Sampler([node.p.pid, fo.pid]) as s:
                 text, _ = fo.communicate()
                 lgt, _ = lg.communicate()
             r = json.load(open(jo)) if os.path.exists(jo) else {"raw": text[-500:]}
             w = parse_loadgen(lgt)
-            rec = {"kind": "fanout", "write_rate": rate, "achieved_writes": w.get("achieved"), "write_p99": (w.get("all") or {}).get("p99"),
+            rec = {"kind": "fanout", "shard_of": shard_of, "write_rate": rate, "achieved_writes": w.get("achieved"), "write_p99": (w.get("all") or {}).get("p99"),
                    **r, "server": s.summary(node.p.pid), "subscriber_proc": s.summary(fo.pid)}
             write_jsonl(out, rec)
             log(f"fanout writes {rate}/s subs {subs}: {text.strip()[-330:]} | writes ok {w.get('achieved')} p99 {(w.get('all') or {}).get('p99')} | srv cpu {rec['server']['cpu_pct_avg']}")
@@ -591,7 +603,7 @@ def cmd_firehose(inject=0):
 
 
 def cmd_methods(inject=0, only=""):
-    out = os.path.join(OUTDIR, "methods.jsonl")
+    out = os.path.join(OUTDIR, os.environ.get("OUT", "methods.jsonl"))
     prefix = f"bench-methods-{int(inject)}"
     node = Node(f"methods-{int(inject)}", prefix, inject=inject).start()
     acc = os.path.join(SCRATCH, f"methods-accounts-{int(inject)}.json")
@@ -620,7 +632,7 @@ def cmd_methods(inject=0, only=""):
 def cmd_sweep(sizes, extra=()):
     """One server; one fresh repo per size, filled via applyWrites (200 creates
     per call, 16 in flight), then the read methods + getRepo export."""
-    out = os.path.join(OUTDIR, "sweep.jsonl")
+    out = os.path.join(OUTDIR, os.environ.get("OUT", "sweep.jsonl"))
     prefix = "bench-sweep"
     node = Node("sweep", prefix, extra=list(extra)).start()
     try:
@@ -745,7 +757,7 @@ def cmd_resource2(total, actives, rate, inject):
     """One bulk of `total`; per active window a fresh server: snapshots
     (started / idle / after 70 s at `rate`), CPU and RSS during the load.
     RESOURCE_EXTRA: extra server flags."""
-    out = os.path.join(OUTDIR, "resource.jsonl")
+    out = os.path.join(OUTDIR, os.environ.get("OUT", "resource.jsonl"))
     prefix = "bench-resource"
     cache = os.path.join(SCRATCH, "cache-resource")
     extra = os.environ.get("RESOURCE_EXTRA", "").split()
@@ -760,9 +772,18 @@ def cmd_resource2(total, actives, rate, inject):
                 if k == 0:
                     run["bulk_s"] = round(bulk([node], total))
                     run["snapshots"].append(snapshot(node, "after bulk"))
+                    if os.environ.get("RESOURCE_LISTREPOS") == "1":  # patched loadgen: list-repos
+                        for lim in (1000, 1000):
+                            r = subprocess.run([LOADGEN, "--host", node.url, "list-repos", "--limit", str(lim)], capture_output=True, text=True)
+                            try:
+                                lr = json.loads(r.stdout.strip().splitlines()[-1])
+                            except Exception:
+                                lr = {"error": (r.stderr or r.stdout)[-300:]}
+                            run.setdefault("list_repos", []).append(lr)
+                            log(f"listRepos enumeration: {lr}")
                 time.sleep(15)
                 run["snapshots"].append(snapshot(node, "idle"))
-                rec = grid_step(node, os.path.join(OUTDIR, "resource-grid.jsonl"), f"resource {total}/{active}/inj{int(inject)}", rate, total, active, inject, duration=60)
+                rec = grid_step(node, os.path.join(OUTDIR, os.environ.get("OUT", "resource.jsonl").replace(".jsonl", "-grid.jsonl")), f"resource {total}/{active}/inj{int(inject)}", rate, total, active, inject, duration=60)
                 run["load"] = {k2: rec.get(k2) for k2 in ("achieved", "errors", "all", "server", "jemalloc")}
                 run["snapshots"].append(snapshot(node, "after 70 s load"))
             finally:
@@ -776,7 +797,7 @@ def cmd_resource2(total, actives, rate, inject):
 
 def cmd_hot(hot_rates, injects):
     """Single hot repo, no fleet: latency and coalescing (requests/commit)."""
-    out = os.path.join(OUTDIR, "hot.jsonl")
+    out = os.path.join(OUTDIR, os.environ.get("OUT", "hot.jsonl"))
     for inject in injects:
         prefix = f"bench-hot-{int(inject)}"
         node = Node(f"hot-{int(inject)}", prefix, inject=inject).start()

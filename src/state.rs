@@ -1,10 +1,20 @@
-//! Materialized-state key layout (one SlateDB per partition).
+//! Materialized-state key layout (one SlateDB per shard).
+//!
+//! Every per-account key is slot-major: `0x01 ‖ slot (u16 BE) ‖ family ‖ rest`,
+//! where the slot is that of the key's routing key (`slots::slot_of`). A
+//! shard's slot range is then one contiguous key range, so a shard splits or
+//! merges by cloning its SlateDB with a projection range (DESIGN.md "Online
+//! shard split/merge"). Shard-wide keys (`meta/...`) are plain ASCII and sort
+//! outside every slot range.
 //!
 //! h/{did}                 -> head: commit cid | data cid | rev u64 | signed commit block
 //! a/{did}                 -> account JSON
-//! n/{handle}              -> did
+//! n/{handle}              -> did (slot of the account's DID)
 //! R/{did}\0{coll}/{rkey}  -> record cid | rev | record bytes
 //! c/{did}\0{cid8}{path}   -> empty (record CID index for getBlocks)
+//! C/{coll}\0{did}         -> empty (collection index; slot of the DID)
+//! b/{did}\0{cid}\0{path}  -> empty (blob references)
+//! p/{routing}\0{name}     -> private per-account state (slot of the routing key)
 //! L/{did}                 -> record count u64 (large repos: preloaded on shard open)
 
 use crate::cid::{Cid, CID_BYTES_LEN};
@@ -12,51 +22,98 @@ use crate::tid::Tid;
 use bytes::{BufMut, Bytes};
 use sha2::{Digest, Sha256};
 
+/// First byte of every slot-major key.
+pub const SLOT_TAG: u8 = 0x01;
+/// Tag + slot bytes in front of a key's family.
+pub const SLOT_PREFIX_LEN: usize = 3;
+
+pub fn slot_prefix(slot: u16) -> [u8; SLOT_PREFIX_LEN] {
+    let [a, b] = slot.to_be_bytes();
+    [SLOT_TAG, a, b]
+}
+
+/// `0x01 ‖ slot(routing) ‖ fam ‖ parts...`
+fn keyed(routing: &str, fam: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+    let len = SLOT_PREFIX_LEN + fam.len() + parts.iter().map(|p| p.len()).sum::<usize>();
+    let mut k = Vec::with_capacity(len);
+    k.extend_from_slice(&slot_prefix(crate::slots::slot_of(routing)));
+    k.extend_from_slice(fam);
+    for p in parts {
+        k.extend_from_slice(p);
+    }
+    k
+}
+
+/// Where family `fam` starts inside `slot`.
+pub fn slot_family(slot: u16, fam: &[u8]) -> Vec<u8> {
+    [&slot_prefix(slot)[..], fam].concat()
+}
+
+/// The slot of a slot-major key.
+pub fn key_slot(key: &[u8]) -> Option<u16> {
+    (key.len() >= SLOT_PREFIX_LEN && key[0] == SLOT_TAG).then(|| u16::from_be_bytes([key[1], key[2]]))
+}
+
+/// A slot-major key without its tag and slot: family ‖ rest.
+pub fn key_body(key: &[u8]) -> &[u8] {
+    key.get(SLOT_PREFIX_LEN..).unwrap_or_default()
+}
+
+/// The key range holding slots [lo, hi) (hi <= 65,536): a shard's state.
+pub fn slot_range_keys(lo: u32, hi: u32) -> (Bytes, Bytes) {
+    let at = |s: u32| -> Bytes {
+        if s >= crate::slots::SLOTS {
+            Bytes::from_static(&[SLOT_TAG + 1])
+        } else {
+            Bytes::copy_from_slice(&slot_prefix(s as u16))
+        }
+    };
+    (at(lo), at(hi))
+}
+
 pub fn head_key(did: &str) -> Vec<u8> {
-    [b"h/", did.as_bytes()].concat()
+    keyed(did, b"h/", &[did.as_bytes()])
 }
 
 pub fn account_key(did: &str) -> Vec<u8> {
-    [b"a/", did.as_bytes()].concat()
+    keyed(did, b"a/", &[did.as_bytes()])
 }
 
-pub fn handle_key(handle: &str) -> Vec<u8> {
-    [b"n/", handle.as_bytes()].concat()
+/// Handle index entry of `did`'s account (in `did`'s slot).
+pub fn handle_key(did: &str, handle: &str) -> Vec<u8> {
+    keyed(did, b"n/", &[handle.as_bytes()])
 }
+
+pub const HEAD_FAMILY: &[u8] = b"h/";
+pub const ACCOUNT_FAMILY: &[u8] = b"a/";
+pub const PRIVATE_FAMILY: &[u8] = b"p/";
 
 /// Collection index: which repos have records in a collection.
 pub fn collection_key(collection: &str, did: &str) -> Vec<u8> {
-    [b"C/", collection.as_bytes(), b"\0", did.as_bytes()].concat()
+    keyed(did, b"C/", &[collection.as_bytes(), b"\0", did.as_bytes()])
 }
 
-pub fn collection_prefix(collection: &str) -> Vec<u8> {
+/// The family (for [`FamilyScan`]) of a collection's index entries.
+pub fn collection_family(collection: &str) -> Vec<u8> {
     [b"C/", collection.as_bytes(), b"\0"].concat()
 }
 
 /// Blob refs: b/{did}\0{blob cid}\0{record path}
 pub fn blob_ref_key(did: &str, blob: &crate::cid::Cid, path: &str) -> Vec<u8> {
-    [
-        b"b/",
-        did.as_bytes(),
-        b"\0",
-        blob.to_string().as_bytes(),
-        b"\0",
-        path.as_bytes(),
-    ]
-    .concat()
+    keyed(did, b"b/", &[did.as_bytes(), b"\0", blob.to_string().as_bytes(), b"\0", path.as_bytes()])
 }
 
 pub fn blob_ref_prefix(did: &str) -> Vec<u8> {
-    [b"b/", did.as_bytes(), b"\0"].concat()
+    keyed(did, b"b/", &[did.as_bytes(), b"\0"])
 }
 
 /// Private (non-repo) per-account state: p/{did}\0{name}
 pub fn private_key(did: &str, name: &str) -> Vec<u8> {
-    [b"p/", did.as_bytes(), b"\0", name.as_bytes()].concat()
+    keyed(did, b"p/", &[did.as_bytes(), b"\0", name.as_bytes()])
 }
 
 pub fn private_prefix(did: &str) -> Vec<u8> {
-    [b"p/", did.as_bytes(), b"\0"].concat()
+    keyed(did, b"p/", &[did.as_bytes(), b"\0"])
 }
 
 /// Large-repo index: one key per repo with at least the pin threshold of
@@ -64,17 +121,17 @@ pub fn private_prefix(did: &str) -> Vec<u8> {
 /// it), so a new owner finds the repos to preload with one short scan. A
 /// hint: a stale key only costs a load.
 pub fn large_repo_key(did: &str) -> Vec<u8> {
-    [LARGE_REPO_PREFIX, did.as_bytes()].concat()
+    keyed(did, LARGE_REPO_FAMILY, &[did.as_bytes()])
 }
 
-pub const LARGE_REPO_PREFIX: &[u8] = b"L/";
+pub const LARGE_REPO_FAMILY: &[u8] = b"L/";
 
 pub fn record_prefix(did: &str) -> Vec<u8> {
-    [b"R/", did.as_bytes(), b"\0"].concat()
+    keyed(did, b"R/", &[did.as_bytes(), b"\0"])
 }
 
 pub fn record_key(did: &str, path: &str) -> Vec<u8> {
-    [b"R/", did.as_bytes(), b"\0", path.as_bytes()].concat()
+    keyed(did, b"R/", &[did.as_bytes(), b"\0", path.as_bytes()])
 }
 
 /// Bytes of a record CID's digest in its index key: enough to make
@@ -90,7 +147,59 @@ pub fn record_cid_key(did: &str, cid: &Cid, path: &str) -> Vec<u8> {
 }
 
 pub fn record_cid_prefix(did: &str, cid: &Cid) -> Vec<u8> {
-    [b"c/", did.as_bytes(), b"\0", &cid.digest[..RECORD_CID_KEY_BYTES]].concat()
+    keyed(did, b"c/", &[did.as_bytes(), b"\0", &cid.digest[..RECORD_CID_KEY_BYTES]])
+}
+
+/// The keys of one family (`b"h/"`, or a narrower prefix such as
+/// [`collection_family`]) across slots, in (slot, key) order. Slot-major
+/// keys interleave families, so one iterator over the whole slot space
+/// `seek`s from the end of a slot's run of the family to the next slot's:
+/// an empty slot costs nothing (the seek lands on the next key that exists)
+/// and a populated one one seek. A shard's DB holds only its own slots
+/// (a projection hides the rest), so no slot bounds are needed.
+pub struct FamilyScan {
+    iter: slatedb::DbIterator,
+    fam: Vec<u8>,
+}
+
+impl FamilyScan {
+    /// From `start` (a full slot-major key, inclusive) or slot 0.
+    pub async fn new<R: slatedb::DbReadOps + ?Sized>(
+        db: &R,
+        fam: &[u8],
+        start: Option<Vec<u8>>,
+        opts: &slatedb::config::ScanOptions,
+    ) -> Result<FamilyScan, slatedb::Error> {
+        let lo = start.unwrap_or_else(|| slot_family(0, fam));
+        let hi = vec![SLOT_TAG + 1];
+        let iter = db.scan_with_options(lo..hi, opts).await?;
+        Ok(FamilyScan { iter, fam: fam.to_vec() })
+    }
+
+    pub async fn next(&mut self) -> Result<Option<slatedb::KeyValue>, slatedb::Error> {
+        loop {
+            let Some(kv) = self.iter.next().await? else { return Ok(None) };
+            let Some(slot) = key_slot(&kv.key) else { return Ok(None) };
+            let body = key_body(&kv.key);
+            if body.starts_with(&self.fam) {
+                return Ok(Some(kv));
+            }
+            // this slot's run of the family is ahead (body < fam) or done
+            let target = if body < self.fam.as_slice() {
+                slot_family(slot, &self.fam)
+            } else if slot == u16::MAX {
+                return Ok(None);
+            } else {
+                slot_family(slot + 1, &self.fam)
+            };
+            self.iter.seek(target).await?;
+        }
+    }
+}
+
+/// (slot, DID) order key of a slot-major `family ‖ did` key (h/, a/, L/).
+pub fn slot_did(key: &[u8], fam_len: usize) -> (&[u8], &[u8]) {
+    (key.get(1..SLOT_PREFIX_LEN).unwrap_or_default(), key.get(SLOT_PREFIX_LEN + fam_len..).unwrap_or_default())
 }
 
 /// Smallest key greater than every key with this prefix.
@@ -215,7 +324,9 @@ pub fn did_hash(did: &str) -> u64 {
     u64::from_be_bytes(Sha256::digest(did.as_bytes())[..8].try_into().unwrap())
 }
 
-/// Shard owning `did`: fixed hash slot -> uniform slot range (see slots.rs).
+
+/// Shard of `did` in the initial uniform layout of `shards` (layout v1).
+/// Splits and merges change it: route with `PartitionTable::shard_of`.
 pub fn partition_of(did: &str, shards: u16) -> u16 {
     crate::slots::shard_of(did, shards)
 }

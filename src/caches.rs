@@ -1,5 +1,6 @@
 //! Entry caps of the in-memory caches (verified tokens, proxy accounts and
-//! service JWTs, DID documents, resolved lexicons, OAuth clients), sized from
+//! service JWTs, DID documents, resolved lexicons, OAuth clients, per-DID
+//! revocations and takedowns), sized from
 //! one memory budget: by default [`DEFAULT_BUDGET_FRACTION`] of the memory
 //! this process may use (physical RAM, or the cgroup limit when lower),
 //! split between the caches by weight and divided by each one's approximate
@@ -38,9 +39,11 @@ pub enum Cache {
     OAuthClients,
     /// Permission-set lexicons for `include:` scopes (oauth/lexicon.rs).
     PermissionSets,
+    /// Per-DID session revocations + record/blob takedowns (xrpc/server.rs `ctl`).
+    SecurityControls,
 }
 
-const N: usize = 8;
+const N: usize = 9;
 
 impl Cache {
     pub const ALL: [Cache; N] = [
@@ -52,6 +55,7 @@ impl Cache {
         Cache::Lexicons,
         Cache::OAuthClients,
         Cache::PermissionSets,
+        Cache::SecurityControls,
     ];
 
     pub fn name(self) -> &'static str {
@@ -64,6 +68,7 @@ impl Cache {
             Cache::Lexicons => "lexicons",
             Cache::OAuthClients => "oauth_clients",
             Cache::PermissionSets => "permission_sets",
+            Cache::SecurityControls => "security_controls",
         }
     }
 
@@ -85,20 +90,23 @@ impl Cache {
             // metadata + JWKS
             Cache::OAuthClients => 8 << 10,
             Cache::PermissionSets => 4 << 10,
+            // DID + Arc<Ctl> (empty sets for almost every account)
+            Cache::SecurityControls => 256,
         }
     }
 
     /// Share of the budget, in percent (the weights sum to 100).
     fn weight(self) -> u64 {
         match self {
-            Cache::SessionTokens => 30,
-            Cache::OAuthTokens => 30,
+            Cache::SessionTokens => 27,
+            Cache::OAuthTokens => 27,
             Cache::ProxyAccounts => 15,
             Cache::ProxyJwts => 10,
             Cache::DidDocs => 10,
             Cache::Lexicons => 2,
             Cache::OAuthClients => 2,
             Cache::PermissionSets => 1,
+            Cache::SecurityControls => 6,
         }
     }
 
@@ -213,6 +221,12 @@ impl<K: Send, V: Send> Len for parking_lot::Mutex<std::collections::HashMap<K, V
     }
 }
 
+impl<K: Send + Sync, V: Send + Sync> Len for parking_lot::RwLock<std::collections::HashMap<K, V>> {
+    fn len(&self) -> usize {
+        self.read().len()
+    }
+}
+
 static TRACKED: LazyLock<parking_lot::Mutex<Vec<(Cache, Weak<dyn Len>)>>> = LazyLock::new(Default::default);
 
 /// Registers `cache` for the entry-count metrics (until it is dropped) and
@@ -305,8 +319,8 @@ mod tests {
     fn budget_split() {
         assert_eq!(Cache::ALL.iter().map(|c| c.weight()).sum::<u64>(), 100);
         let caps = Caps::from_budget(1 << 30);
-        // 30% of 1 GiB at 400 B each
-        assert_eq!(caps.get(Cache::SessionTokens), (((1u64 << 30) / 100 * 30) / 400) as usize);
+        // 27% of 1 GiB at 400 B each
+        assert_eq!(caps.get(Cache::SessionTokens), (((1u64 << 30) / 100 * 27) / 400) as usize);
         assert!(caps.total_bytes() <= 1 << 30, "{caps}");
         assert!(caps.total_bytes() > (1 << 30) * 9 / 10, "{caps}");
         // tiny budgets keep a floor

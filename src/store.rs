@@ -64,6 +64,12 @@ impl Store {
         }
     }
 
+    /// Counts this handle's requests (`objstats`) under `client`. Wrap each
+    /// underlying client once.
+    pub fn counted(self, client: &'static str) -> Store {
+        Store { raw: crate::objstats::counted(self.raw, &self.prefix, client), ..self }
+    }
+
     pub async fn inject_latency(&self) {
         if let Some((median, sigma)) = self.latency {
             // Box-Muller standard normal -> lognormal around the median

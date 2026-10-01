@@ -6,7 +6,7 @@ use crate::cluster::{Cluster, ClusterConfig, ShardHost};
 use crate::firehose::Firehose;
 use crate::nodelog::{NodeLog, NodeLogConfig};
 use crate::store::{S3Config, Store};
-use crate::{auth, state, stats, worker, xrpc};
+use crate::{auth, stats, worker, xrpc};
 use axum::response::IntoResponse;
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,6 +108,8 @@ pub struct Config {
     pub cache_budget_bytes: Option<u64>,
     /// Entry caps overriding the budget's, per cache.
     pub cache_entries: Vec<(crate::caches::Cache, usize)>,
+    /// Automatic shard splits (src/reshard.rs; off by default).
+    pub reshard_policy: crate::reshard::Policy,
 }
 
 /// Well-known secrets: only accepted with `dev_mode` (see [`Config::check_secrets`]).
@@ -195,6 +197,7 @@ impl Default for Config {
             log_retention: Some(crate::retention::Config::default()),
             cache_budget_bytes: None,
             cache_entries: Vec::new(),
+            reshard_policy: Default::default(),
         }
     }
 }
@@ -217,9 +220,9 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
                 Some(raw) => Store { raw: raw.clone(), ..Store::memory(cfg.inject_latency) },
                 None => Store::memory(cfg.inject_latency),
             };
-            (m.clone(), Store { latency: None, ..m })
+            (m.clone().counted("log"), Store { latency: None, ..m }.counted("state"))
         }
-        Some(s3) => (Store::s3(s3, &cfg.prefix, cfg.inject_latency)?, Store::s3(s3, &cfg.prefix, None)?),
+        Some(s3) => (Store::s3(s3, &cfg.prefix, cfg.inject_latency)?.counted("log"), Store::s3(s3, &cfg.prefix, None)?.counted("state")),
     };
     let firehose = Firehose::new(crate::firehose::Options {
         ring_bytes: cfg.firehose_ring_bytes,
@@ -233,7 +236,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let n = cfg.shards;
     let table = crate::partitions::PartitionTable::new(n);
     let lookup_parts = table.clone();
-    let lookup: worker::PartitionLookup = Arc::new(move |did: &str| lookup_parts.get(state::partition_of(did, n) as usize));
+    let lookup: worker::PartitionLookup = Arc::new(move |did: &str| lookup_parts.for_key(did));
     let limits = worker::CacheLimits { entries: cfg.cache_per_worker, bytes: cfg.repo_cache_bytes / cfg.workers.max(1), pin_records: cfg.pin_repo_records };
     let workers = worker::spawn(cfg.workers, limits, lookup, tokio::runtime::Handle::current());
 
@@ -241,6 +244,10 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     cc.shards = n;
     let started = std::time::Instant::now();
     let cluster = Cluster::join(cc, state_store.clone()).await?;
+    // route by this prefix's layout (it may differ from --shards: splits,
+    // merges, or a different count at creation)
+    table.replace_layout(cluster.layout());
+    cluster.set_reshard_policy(cfg.reshard_policy.clone());
     let lease = cluster.clone();
     let log = NodeLog::start_with_inflight(
         store.clone(),
@@ -303,13 +310,13 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         let (c, l) = (cluster.clone(), cluster.clone());
         let members = crate::retention::Membership {
             live_logs: Box::new(move || c.peers().into_iter().map(|p| p.log_id).chain([c.log_id.clone()]).collect()),
-            // dead logs are pruned by the owner of the lowest-numbered shard
-            leader: Box::new(move || (0..n).find_map(|s| l.owner_of(s)).is_some_and(|(o, _)| o == l.cfg.node_id)),
+            // dead logs are pruned by the owner of the shard holding slot 0
+            leader: Box::new(move || l.owner_of(l.layout().shard_of_slot(0)).is_some_and(|(o, _)| o == l.cfg.node_id)),
         };
         crate::retention::Retention::new(store.clone(), log.clone(), rc, members).spawn();
     }
     tracing::info!(
-        node = %cluster.cfg.node_id, log = %cluster.log_id, writer = cluster.writer, shards = n,
+        node = %cluster.cfg.node_id, log = %cluster.log_id, writer = cluster.writer, shards = cluster.layout().shards.len(),
         owned = cluster.owned().len(), elapsed_ms = started.elapsed().as_millis() as u64, "node ready"
     );
 

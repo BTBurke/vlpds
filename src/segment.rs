@@ -509,7 +509,7 @@ mod tests {
         let mut bytes = Vec::new();
         frame.finish(5, &mut bytes);
         let derived = derive_commit_muts(&bytes).unwrap();
-        let keys: Vec<&[u8]> = derived.iter().map(|m| &m.key[..2]).collect();
+        let keys: Vec<&[u8]> = derived.iter().map(|m| &crate::state::key_body(&m.key)[..2]).collect();
         assert_eq!(keys, vec![b"c/" as &[u8], b"c/", b"R/", b"h/"]);
         assert_eq!(derived[2].val.as_deref(), Some(&crate::state::record_value(&rec, rev.0, &rec_block)[..]));
         let head = crate::state::Head::decode(derived[3].val.as_ref().unwrap()).unwrap();

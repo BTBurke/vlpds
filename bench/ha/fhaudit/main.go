@@ -3,7 +3,7 @@
 // Subscribes to a node's subscribeRepos (optionally from -cursor) and records
 // every record path created by a #commit, per repo. On SIGINT/SIGTERM it
 // writes {"seen": {did: [rkey...]}, "events": n, "first_seq": s, "last_seq": s,
-// "reorders": n, "dups": n, "end": reason} to -out. The harness then checks
+// "reorders": n, "dups": n, "infos": n, "info_names": [...], "end": reason} to -out. The harness then checks
 // that every acknowledged create appears on the firehose (a stalled or gappy
 // merge shows up as missing creates even when per-repo chains look clean).
 package main
@@ -55,6 +55,7 @@ func main() {
 	}
 	var log []rec
 	var events, reorders, dups, infos int64
+	var infoNames []string // #info names in order (e.g. OutdatedCursor)
 	var first, last int64 = -1, -1
 	var lastTime string
 	reason := "interrupted"
@@ -77,6 +78,10 @@ func main() {
 		}
 		if t == "#info" {
 			infos++
+			var i comatproto.SyncSubscribeRepos_Info
+			if err := i.UnmarshalCBOR(cr); err == nil {
+				infoNames = append(infoNames, i.Name)
+			}
 			continue
 		}
 		if t != "#commit" {
@@ -108,7 +113,7 @@ func main() {
 	}
 	b, _ := json.Marshal(map[string]any{
 		"seen": seen, "commits": log, "events": events, "first_seq": first, "last_seq": last, "last_time": lastTime,
-		"reorders": reorders, "dups": dups, "infos": infos, "end": reason, "at": time.Now().Format(time.RFC3339Nano),
+		"reorders": reorders, "dups": dups, "infos": infos, "info_names": infoNames, "end": reason, "at": time.Now().Format(time.RFC3339Nano),
 	})
 	if err := os.WriteFile(*out, b, 0o644); err != nil {
 		fmt.Fprintln(os.Stderr, err)
