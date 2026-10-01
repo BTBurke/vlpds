@@ -24,6 +24,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),
             skew: Duration::from_millis(200),
+            ..Default::default()
         });
     })
     .await
@@ -167,6 +168,7 @@ async fn admin_listings_scatter_gather_across_nodes() {
         addr: dead_addr,
         writer: 254,
         expires_ms: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() + 60_000) as u64,
+        renewals: 1,
     };
     store
         .put(&object_store::path::Path::from("vlpds/nodes/adm-ghost"), serde_json::to_vec(&lease).unwrap().into())

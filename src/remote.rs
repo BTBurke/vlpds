@@ -16,7 +16,7 @@
 //! (the host removes its firehose source).
 
 use crate::firehose::Firehose;
-use crate::nodelog::{segment_path, LogBatch, NodeLog};
+use crate::nodelog::{segment_path, LiveRecv, LogBatch, NodeLog};
 use crate::segment::{self, LogObject};
 use crate::store::Store;
 use axum::extract::ws::{Message, WebSocket};
@@ -26,7 +26,7 @@ use object_store::ObjectStoreExt;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 const HEARTBEAT: Duration = Duration::from_millis(5);
 /// A live log stream (or its connect) silent this long is presumed dead.
@@ -91,18 +91,19 @@ pub async fn serve_stream(mut ws: WebSocket, log: Arc<NodeLog>) {
         let w = log.wm.get();
         loop {
             match rx.try_recv() {
-                Ok(b) => {
+                LiveRecv::Batch(b) => {
                     if ws.send(Message::Binary(encode_batch(&b))).await.is_err() {
                         return;
                     }
                 }
-                Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                LiveRecv::Empty => break,
+                LiveRecv::Lagged => {
                     // the peer catches up from S3 when it reconnects
+                    crate::metrics::LOG_STREAM_LAGGED.inc();
+                    tracing::warn!(log_id = %log.log_id, "peer fell behind our live ring: dropping its stream (it catches up from S3)");
                     let _ = ws.close().await;
                     return;
                 }
-                Err(broadcast::error::TryRecvError::Closed) => return,
             }
         }
         let mut m = Vec::with_capacity(9);
@@ -190,6 +191,12 @@ async fn catch_up(
         match segment::parse(data, false, None)? {
             LogObject::Fence { .. } => return Ok(true),
             LogObject::Segment(h, entries) => {
+                anyhow::ensure!(
+                    *h.log_id == **log_id && h.ordinal == *next,
+                    "log object {log_id}/{next} has header {}/{}",
+                    h.log_id,
+                    h.ordinal
+                );
                 let events: Vec<_> = entries.into_iter().filter(|e| !e.frame.is_empty()).map(|e| (e.seq, e.frame)).collect();
                 let _ = merger_tx.send(LogBatch { log_id: log_id.clone(), ordinal: *next, events });
                 wm.fetch_max(h.last_seq, Ordering::AcqRel);

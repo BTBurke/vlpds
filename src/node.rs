@@ -17,6 +17,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// Longest commit-wait for a previous owner's clock (see `wait_seq_floor`).
+const SEQ_FLOOR_MAX_WAIT: Duration = Duration::from_secs(30);
+
 pub struct Node {
     pub cluster: Arc<Cluster>,
     pub log: Arc<NodeLog>,
@@ -86,6 +89,11 @@ impl Node {
 }
 
 impl Node {
+    /// Closes one shard (see [`ShardHost::close_many`]).
+    pub async fn close(&self, shard: u16) -> anyhow::Result<()> {
+        self.close_many(vec![shard]).await.pop().map_or(Ok(()), |(_, r)| r)
+    }
+
     /// Drops every worker's cached repos for `shards` and waits until each
     /// worker has done so.
     async fn purge_worker_caches(&self, shards: &[u16]) {
@@ -188,48 +196,129 @@ impl ShardHost for Node {
         results
     }
 
-    async fn close(&self, shard: u16) -> anyhow::Result<()> {
-        let Some(part) = self.table.get(shard as usize) else { return Ok(()) };
+    fn seq_high(&self) -> i64 {
+        self.log.wm.get()
+    }
+
+    async fn wait_seq_floor(&self, seq: i64) {
+        // Commit-wait: the previous owner's clock ran ahead of ours, so our
+        // seqs for its shards would sort before its last ones (a repo's
+        // commits out of order on the firehose). Wait until our clock passes
+        // its last seq; bounded, so a wildly wrong clock costs order, not
+        // availability.
         let started = Instant::now();
+        while nodelog::seq_floor(crate::tid::now_micros()) <= seq {
+            if started.elapsed() > SEQ_FLOOR_MAX_WAIT {
+                tracing::error!(seq, "previous owner's clock is more than {SEQ_FLOOR_MAX_WAIT:?} ahead of ours: serving anyway");
+                return;
+            }
+            let ahead_us = ((seq >> 8) as u64).saturating_sub(crate::tid::now_micros());
+            tokio::time::sleep(Duration::from_micros(ahead_us.clamp(1_000, 50_000))).await;
+        }
+        if started.elapsed() > Duration::from_millis(1) {
+            tracing::warn!(waited_ms = started.elapsed().as_millis() as u64, "waited for our clock to pass the previous owner's last seq");
+        }
+    }
+
+    async fn close_many(&self, shards: Vec<u16>) -> Vec<(u16, anyhow::Result<()>)> {
+        use futures::StreamExt;
+        let started = Instant::now();
+        let mut results = Vec::with_capacity(shards.len());
+        // Keyed off the sink (what our log still applies into), not the
+        // routing table: a shard whose earlier close failed half-way (already
+        // unrouted) is still drained, never reported closed early.
+        let mut sinks = Vec::new();
+        for s in shards {
+            match self.log.sinks.get(s) {
+                Some(k) => sinks.push(k),
+                None => results.push((s, Ok(()))),
+            }
+        }
+        if sinks.is_empty() {
+            return results;
+        }
+        let ids: Vec<u16> = sinks.iter().map(|k| k.id).collect();
         // 1. stop routing new work here
-        self.table.set(shard, None);
-        // 2. no worker may keep (or start) building commits for it. Loads still
-        //    in flight are dropped when they land: the worker caches a load only
-        //    while its Partition is still the routed one (bench/ha N6)
-        self.purge_worker_caches(&[shard]).await;
-        // 3. barrier: once an empty entry for this shard is durable, every
-        //    earlier entry for it is durable and applied (the log is FIFO)
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.log
-            .tx
-            .send(LogEntry {
-                shard,
-                frames: Vec::new(),
-                muts: Vec::new(),
-                ack: Some(Box::new(move |r| {
-                    let _ = tx.send(r);
-                })),
-                pending: None,
-                enqueued: Instant::now(),
-            })
-            .await
-            .map_err(|_| anyhow::anyhow!("node log gone"))?;
-        tokio::time::timeout(Duration::from_secs(30), rx).await??.map_err(|e| anyhow::anyhow!("{e}"))?;
+        for &s in &ids {
+            self.table.set(s, None);
+        }
+        // 2. no worker may keep (or start) building commits for them. Loads
+        //    still in flight are dropped when they land: the worker caches a
+        //    load only while its Partition is still the routed one (bench/ha N6)
+        self.purge_worker_caches(&ids).await;
+        // 3. barriers: once an empty entry for a shard is durable, every
+        //    earlier entry for it is durable and applied (the log is FIFO).
+        //    Queued back to back, they share one segment (bench/ha O6).
+        let mut acks = Vec::with_capacity(sinks.len());
+        for k in &sinks {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let sent = self
+                .log
+                .tx
+                .send(LogEntry {
+                    shard: k.id,
+                    frames: Vec::new(),
+                    muts: Vec::new(),
+                    ack: Some(Box::new(move |r| {
+                        let _ = tx.send(r);
+                    })),
+                    pending: None,
+                    enqueued: Instant::now(),
+                })
+                .await;
+            acks.push(sent.map(|_| rx));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut drained = Vec::with_capacity(sinks.len());
+        for (k, ack) in sinks.into_iter().zip(acks) {
+            let r: anyhow::Result<()> = async {
+                let rx = ack.map_err(|_| anyhow::anyhow!("node log gone"))?;
+                tokio::time::timeout_at(deadline, rx).await.map_err(|_| anyhow::anyhow!("barrier not durable within 30 s"))??.map_err(|e| anyhow::anyhow!("{e}"))
+            }
+            .await;
+            match r {
+                Ok(()) => drained.push(k),
+                Err(e) => results.push((k.id, Err(e))),
+            }
+        }
         // 4. checkpoint + close so the successor replays nothing
         let ord = self.log.durable_ordinal.load(Ordering::Acquire);
-        {
-            let _g = part.apply_lock.write().await;
-            let mut wb = slatedb::WriteBatch::new();
-            wb.put(nodelog::META_APPLIED, nodelog::encode_marker(&self.log.log_id, ord));
-            part.db.write(wb).await?;
-        }
-        part.db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await?;
-        self.log.sinks.remove(shard);
-        part.db.close().await?;
+        let closed: Vec<(u16, anyhow::Result<()>)> = futures::stream::iter(drained)
+            .map(|k| async move {
+                let r = async {
+                    {
+                        let _g = k.apply_lock.write().await;
+                        let mut wb = slatedb::WriteBatch::new();
+                        wb.put(nodelog::META_APPLIED, nodelog::encode_marker(&self.log.log_id, ord));
+                        k.db.write(wb).await?;
+                    }
+                    k.db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await?;
+                    self.log.sinks.remove(k.id);
+                    k.db.close().await?;
+                    crate::metrics::LEASE_EVENTS.with_label_values(&["closed"]).inc();
+                    anyhow::Ok(())
+                }
+                .await;
+                (k.id, r)
+            })
+            .buffer_unordered(32)
+            .collect()
+            .await;
+        results.extend(closed);
         crate::metrics::OWNED_PARTITIONS.set(self.table.owned().len() as i64);
-        crate::metrics::LEASE_EVENTS.with_label_values(&["closed"]).inc();
-        tracing::debug!(shard, elapsed_ms = started.elapsed().as_millis() as u64, "shard closed");
-        Ok(())
+        tracing::info!(shards = results.len(), elapsed_ms = started.elapsed().as_millis() as u64, "shards closed");
+        results
+    }
+
+    async fn quiesce(&self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.log.wm.idle() {
+            if Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
     }
 
     fn lost(&self) {

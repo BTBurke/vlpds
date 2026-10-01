@@ -123,8 +123,14 @@ swappable.
   cache → local disk cache → S3).
 
 ### 5. Firehose
-- Live: after durability, frames go to a broadcast ring (`Arc<Bytes>`, zero-copy
-  fan-out). Slow consumers fall off and must resume from a cursor.
+- Live: after durability, a node's sealed segments go to a byte-bounded live ring
+  (`LiveRing`, 128 MiB of segment bytes by default; zero-copy `Bytes` fan-out).
+  A peer follower that falls behind the cap is dropped and catches up from S3.
+- Merge: the firehose merger queues each log's events until every log's watermark
+  passes them. The queues share a byte budget (256 MiB default); a log over
+  budget stops being queued and is read back from S3 in chunks until it reaches
+  the live ordinal, so a stalled peer can't grow memory without bound.
+- Subscribers that are too slow fall off and resume from a cursor.
 - Backfill: recent segments come from memory; older ones are range-GETs from S3.
 - Events: `#commit` (sync 1.1), `#sync` (account creation / repo reset),
   `#identity`, `#account`.
@@ -173,44 +179,135 @@ Auth: HS256 session JWTs + admin token. No OAuth, email, moderation, or app-view
 
 ## HA: multiple nodes, partitioned write ownership
 
-All nodes serve reads and writes; write *ownership* is partitioned.
+All nodes serve reads and writes; write *ownership* is partitioned. This is
+the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
+`src/node.rs`, `src/nodelog.rs`); `bench/ha/RESULTS.md` has the failure matrix.
 
-- **Partitions.** `partition = hash(did) % P` (P ≈ 16–64, fixed at bucket
-  creation). A partition is the unit of ownership and owns: a segment log
-  `log/{p:03}/{ordinal:012}.seg`, a SlateDB at `state/{p:03}/`, and a lease
-  object `lease/{p:03}`.
-- **Leases** are S3 objects updated by compare-and-swap (`PutMode::Update` with
-  the ETag): `{owner, addr, epoch, expires_at}`. Owners renew every ~2 s with a
-  ~10 s TTL. A node acquires expired/unowned partitions up to its fair share
-  (P ÷ live nodes); graceful shutdown releases leases.
-- **Routing.** Every node polls lease objects (~1 s) into a routing table. A
-  request for a DID owned elsewhere is proxied to the owner. Reads are proxied
-  too (read-your-writes); stale-tolerant reads could later use a SlateDB
-  `DbReader` locally.
-- **Log fencing, no holes.** Each partition has exactly one segment PUT in
-  flight, written with `If-None-Match: *` to the next ordinal. The log is a
-  dense chain, and a zombie owner always collides on the next name. Batching
-  becomes adaptive: whatever queues during one PUT goes in the next (latency ≈
-  1–2 PUTs). Throughput comes from P parallel logs.
-- **Takeover safety.** An owner stops acking once `now > lease_expiry − margin`.
-  A new owner waits for `expiry + skew margin`, opens the partition's SlateDB
-  (SlateDB's writer epoch fences the old writer a second time), replays the
-  log tail after `applied_seq`, and only then accepts writes. If its first PUT
-  collides (`AlreadyExists`), the zombie got a segment in; it re-replays.
+- **Shards.** 65,536 fixed hash slots grouped into `--shards N` contiguous
+  ranges. A shard is the unit of ownership and state: one SlateDB at
+  `state/{shard}/` and an assignment object `assign/{shard}`.
+- **One log per node incarnation.** A node group-commits every shard's entries,
+  tagged `(shard, epoch)`, into `log/{log_id}/{ordinal}.seg`. Exactly one
+  segment PUT is in flight, written with `If-None-Match: *` at the next
+  ordinal, so the log is a dense chain. A write is acked only after its segment
+  PUT succeeded and only while the node's lease is valid.
+- **Node leases.** `nodes/{node_id}` holds `{log_id, addr, writer, renewals}`
+  and is renewed by CAS on its ETag every TTL/5 (default TTL 10 s). Renewal
+  bumps `renewals`, so every renewal changes the object.
+- **Assignments.** `assign/{shard}` holds `{owner, log_id, epoch, seq_floor,
+  history[spans]}` and changes only when a shard moves (CAS on its ETag). A
+  node takes free or orphaned shards up to its fair share (shards ÷ live
+  nodes) and closes and releases extras.
+- **Handoff.** A graceful release closes the shards together: one barrier
+  segment for all of them (once it is durable, every earlier entry of those
+  shards is durable and applied), a checkpoint, then the span end in the
+  assignment. A takeover from a dead node first **fences its log**: a
+  conditional create of a fence object at the first free ordinal, which ends
+  its last span for good. The new owner replays its shards' previous spans
+  (one pass over each dead log for all shards) before serving.
 - **Global firehose order with no global sequencer.**
-  `seq = unix_micros × 256 + partition`, strictly increasing within a
-  partition, so seqs are unique but not dense (atproto allows gaps). Each
-  owner publishes a **watermark** `W_p` (every event with seq ≤ W_p is durable),
-  capped at its lease expiry so a successor's seqs always exceed it. Every
-  node serves `subscribeRepos` by k-way merging partition streams in seq order,
-  emitting an event once `seq ≤ min_p W_p`. Live data comes from owners over an
-  internal stream (segments + watermark heartbeats); history and catch-up come
-  from S3 segments. The merge is deterministic, so cursors replay identically
-  on any node.
+  `seq = unix_micros × 256 + writer`, strictly increasing within a log. Each
+  log carries a watermark (every event ≤ W is durable); every node k-way
+  merges all node logs and emits an event once `seq ≤ min W`. Live data comes
+  from owners over an internal stream, history and catch-up from S3 segments,
+  and a dead log is drained to its fence. The merge is deterministic, so
+  cursors replay identically on any node.
 - **Global uniqueness:** handles are claimed with a conditional PUT of
-  `handle/{handle}`.
+  `handle/{handle}`; writer ids (the seq low byte) by CAS on `writers/{w}`.
 
-Single-node mode is the same code with one node owning all partitions.
+Single-node mode is the same code with one node owning all shards.
+
+### Liveness: observed lease changes on the observer's monotonic clock
+
+No node ever compares its wall clock with another node's.
+
+- **Peers.** Every step (each TTL/5), a node LISTs `nodes/` and records, per
+  peer, the instant on *its own* monotonic clock at which it last saw that
+  lease's ETag (or `renewals`) change. A lease seen for the first time gets a
+  full TTL from first sight. A peer is presumed dead once its lease has gone
+  unchanged for **TTL + skew** of the observer's time, judged as of before
+  the LIST (a slow LIST can't age a lease). It is also dead once the observer
+  has fenced its log: a renewal it sent before lapsing that lands late can't
+  resurrect it.
+- **Self.** A node's own validity is `send time of its last successful
+  renewal + TTL − skew`, on its own monotonic clock. It stops acking and
+  PUTting segments past that point. It never renews a lapsed lease, and a
+  watchdog fail-stops it 2 × skew after the lapse, which is about when peers
+  can first presume it dead.
+- **Reassigned under us.** Every step compares the shards a node holds with
+  the assignments; if one names another owner, a peer fenced us and the node
+  fail-stops instead of serving stale reads until its next PUT collides.
+- **Writer ids.** A claim is taken over only if its holder has no node lease
+  at all. After creating its lease, the claimant rewrites the claim (CAS),
+  which changes its ETag, so a joiner that read it before the lease existed
+  fails its CAS instead of sharing the id.
+
+Takeover after a crash is TTL + skew after the last observed renewal, plus at
+most one step of observation delay, plus replay.
+
+### Why safety needs no clocks
+
+Clocks only decide *when* a node is presumed dead. A wrong presumption must
+cost availability, never an acked write. Three mechanisms make that hold
+whatever the clocks do:
+
+1. **Fencing.** A successor fences the dead log before it reassigns any of its
+   shards, and the span it replays ends at the fence. A segment the old owner
+   got in before the fence is below it and is replayed. One after it can't
+   exist: its `If-None-Match` PUT collides with the fence (or with the
+   segment that took that ordinal), so it is never acked and the old owner
+   fail-stops (exit 3). An acked write is therefore always inside the span the
+   successor replays.
+2. **CAS assignments.** An assignment moves only by CAS on its ETag, so each
+   epoch has one owner, and its history (spans with fence- or barrier-final
+   ends) is what the next owner replays. SlateDB's writer epoch fences a
+   second writer on the state itself as well.
+3. **Self fail-stop.** A node stops acking when its own monotonic validity
+   ends, when a renewal CAS conflicts, when a shard is reassigned under it,
+   when a close fails (a shard whose barrier never became durable is never
+   released, since its entries may still be in flight past the span end it
+   would publish), and when its log is fenced.
+
+Even a peer that presumes a live node dead immediately (clock jumps,
+arbitrary offsets) causes only a fence and a fail-stop. Ownership is decided
+by CAS on S3 and durability by conditional PUTs, both of which are
+linearizable.
+
+**Remaining clock assumptions:**
+- **Bounded drift *rate*, not offset.** The owner's validity
+  (TTL − skew of its time) must end before an observer's TTL + skew of its
+  own time elapses: `(TTL − skew)(1 + ρ) ≤ (TTL + skew)(1 − ρ)`, so
+  ρ ≤ skew/TTL = 20 %. Real oscillators drift ~10⁻⁵. Within that bound a
+  presumed-dead node has already stopped serving, so reads are not stale
+  either. Beyond it only availability and read freshness suffer, not acked
+  writes.
+- **Monotonic clocks count paused time** (`CLOCK_MONOTONIC` counts SIGSTOP and
+  cgroup freezes). A VM or host suspend that stops the monotonic clock makes
+  a node believe its lease is still valid on wake. It then serves stale reads
+  until its next PUT hits the fence, but acks nothing.
+- **Wall-clock offset affects only seq ordering and merge latency.**
+  - Seqs are wall-clock based. When a shard moves, the new owner's seqs must
+    exceed the old owner's for its repos to keep their firehose order. The
+    assignment carries `seq_floor`: the releaser's watermark at release, or a
+    dead log's last segment seq at fence time. A new owner whose clock is
+    behind waits until its clock passes it (commit-wait, capped at 30 s)
+    before serving.
+  - The merged firehose emits at `min W`, so it lags by the largest offset
+    between nodes.
+  - Revs use `next_rev(prev)` and stay monotonic regardless of the clock.
+
+**Renewal RTT ceiling.** Renewals are sequential CAS PUTs, and validity counts
+from the send time. A renewal round trip above `(TTL − skew)/2` = 0.4 × TTL
+therefore opens a validity gap and fail-stops the node. That is 4 s at the
+production default TTL of 10 s (`--lease-ttl-ms`, which warns below 10 s
+outside dev mode), and 1.2 s at the 3 s TTL the HA bench uses. A cluster-wide
+S3 brownout past the ceiling stops every node. Keep the TTL at 10 s or more.
+
+**Control-plane reads.** Each step makes one LIST of `nodes/` and one of
+`assign/` (per 1,000 objects), plus a GET only for objects whose ETag
+changed: one per peer renewal, one per moved shard. Every 150 steps (~5 min) it
+re-reads every assignment as a safety net. Releases CAS against the cached
+assignment and re-read only on a conflict.
 
 ## What benchmarking changed (Oct 2026)
 

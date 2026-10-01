@@ -25,6 +25,7 @@ mod firehose_backfill;
 mod firehose_startup;
 mod go_checker;
 mod ha_auth;
+mod ha_liveness;
 mod handle_validation;
 mod handles;
 mod harness;

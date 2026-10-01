@@ -22,11 +22,11 @@ use object_store::path::Path;
 use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use parking_lot::{Mutex, RwLock};
 use slatedb::{Db, WriteBatch};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 pub type AckFn = Box<dyn FnOnce(Result<(), Arc<anyhow::Error>>) + Send>;
 /// Returns false once this node may no longer act as an owner (lease lapsed).
@@ -54,8 +54,133 @@ pub struct LogBatch {
     pub events: Vec<(i64, Bytes)>,
 }
 
+/// Default byte budget of a log's live ring (see `LiveRing`).
+pub const DEFAULT_LIVE_RING_BYTES: usize = 128 << 20;
+
+/// This log's recent durable batches, for peers following it (remote.rs).
+/// A batch is kept until every subscriber has read it, up to a byte budget:
+/// each batch pins its whole segment, so the old 1024-batch broadcast let one
+/// slow follower pin GBs. A subscriber the budget evicts batches from is told
+/// it lagged and catches up from S3 instead.
+pub struct LiveRing {
+    inner: Mutex<LiveInner>,
+    max_bytes: AtomicUsize,
+}
+
+struct LiveInner {
+    /// (batch, pinned bytes), consecutive ordinals
+    buf: VecDeque<(Arc<LogBatch>, usize)>,
+    bytes: usize,
+    /// ordinal of the next batch to be pushed
+    next: u64,
+    /// subscriber id -> next ordinal it will read
+    subs: HashMap<u64, u64>,
+    next_id: u64,
+}
+
+impl LiveInner {
+    /// Drops batches every subscriber has read, then the oldest while over
+    /// budget (always keeping the newest).
+    fn trim(&mut self, max: usize) {
+        let min_next = self.subs.values().copied().min().unwrap_or(self.next);
+        while let Some((b, n)) = self.buf.front() {
+            if b.ordinal >= min_next && (self.bytes <= max || self.buf.len() == 1) {
+                break;
+            }
+            self.bytes -= n;
+            self.buf.pop_front();
+        }
+        metrics::LOG_LIVE_BYTES.set(self.bytes as i64);
+    }
+}
+
+pub enum LiveRecv {
+    Batch(Arc<LogBatch>),
+    Empty,
+    /// Batches this subscriber hadn't read were evicted: catch up from S3.
+    Lagged,
+}
+
+pub struct LiveSub {
+    ring: Arc<LiveRing>,
+    id: u64,
+    next: u64,
+}
+
+impl LiveRing {
+    pub fn new(max_bytes: usize) -> Arc<LiveRing> {
+        let inner = LiveInner { buf: VecDeque::new(), bytes: 0, next: 0, subs: HashMap::new(), next_id: 0 };
+        Arc::new(LiveRing { inner: Mutex::new(inner), max_bytes: AtomicUsize::new(max_bytes) })
+    }
+
+    pub fn set_max_bytes(&self, n: usize) {
+        self.max_bytes.store(n, Ordering::Relaxed);
+    }
+
+    /// Bytes currently pinned by the ring.
+    pub fn bytes(&self) -> usize {
+        self.inner.lock().bytes
+    }
+
+    /// Receives every batch pushed from now on (while it keeps up).
+    pub fn subscribe(self: &Arc<Self>) -> LiveSub {
+        let mut g = self.inner.lock();
+        let (id, next) = (g.next_id, g.next);
+        g.next_id += 1;
+        g.subs.insert(id, next);
+        LiveSub { ring: self.clone(), id, next }
+    }
+
+    fn push(&self, b: Arc<LogBatch>, bytes: usize) {
+        let mut g = self.inner.lock();
+        g.next = b.ordinal + 1;
+        g.buf.push_back((b, bytes));
+        g.bytes += bytes;
+        g.trim(self.max_bytes.load(Ordering::Relaxed));
+    }
+}
+
+impl LiveSub {
+    pub fn try_recv(&mut self) -> LiveRecv {
+        let mut g = self.ring.inner.lock();
+        if self.next >= g.next {
+            return LiveRecv::Empty;
+        }
+        let front = g.buf.front().map(|(b, _)| b.ordinal).unwrap_or(g.next);
+        if self.next < front {
+            return LiveRecv::Lagged;
+        }
+        let b = g.buf[(self.next - front) as usize].0.clone();
+        self.next += 1;
+        g.subs.insert(self.id, self.next);
+        if front < self.next {
+            g.trim(self.ring.max_bytes.load(Ordering::Relaxed));
+        }
+        LiveRecv::Batch(b)
+    }
+}
+
+impl Drop for LiveSub {
+    fn drop(&mut self) {
+        let mut g = self.ring.inner.lock();
+        g.subs.remove(&self.id);
+        g.trim(self.ring.max_bytes.load(Ordering::Relaxed));
+    }
+}
+
 pub fn seq_floor(now_us: u64) -> i64 {
     (now_us as i64) << 8
+}
+
+/// The highest seq <= `v` carrying `writer` in its low byte: as `assigned`, it
+/// makes the next seq (>= it + 256) exceed `v` and keep the writer byte.
+fn own_seq_at_or_below(v: i64, writer: u8) -> i64 {
+    let wr = writer as i64;
+    if v & 0xff >= wr {
+        (v & !0xff) | wr
+    } else {
+        ((v & !0xff) - 256) | wr
+    }
 }
 
 /// Every event with seq <= `get()` is durable and has been handed to the merger.
@@ -67,7 +192,7 @@ pub struct Watermark {
 
 impl Watermark {
     pub fn new(writer: u8, last: i64) -> Watermark {
-        Watermark { writer, inner: Mutex::new((last, last)), cap: std::sync::atomic::AtomicI64::new(i64::MAX) }
+        Watermark { writer, inner: Mutex::new((own_seq_at_or_below(last, writer), last)), cap: std::sync::atomic::AtomicI64::new(i64::MAX) }
     }
 
     /// Time-based, strictly increasing; the low byte is this node's writer id
@@ -90,9 +215,19 @@ impl Watermark {
     }
 
     pub fn get(&self) -> i64 {
-        let w = self.inner.lock();
-        let v = if w.0 > w.1 { w.1 } else { w.1.max(seq_floor(crate::tid::now_micros()) - 1) };
-        v.min(self.cap.load(Ordering::Acquire).max(w.1))
+        let mut w = self.inner.lock();
+        if w.0 > w.1 {
+            return w.1;
+        }
+        let v = w.1.max(seq_floor(crate::tid::now_micros()) - 1).min(self.cap.load(Ordering::Acquire).max(w.1));
+        if v > w.1 {
+            // Idle: we advertise the clock. Record it, so a later seq can't land
+            // at or below it if the wall clock steps back (assign() is
+            // max(now, last + 256)); the merger would drop such events as late.
+            w.0 = w.0.max(own_seq_at_or_below(v, self.writer));
+            w.1 = v;
+        }
+        v
     }
 
     /// Never announce beyond our node lease: a successor's seqs start after it.
@@ -143,7 +278,7 @@ pub struct NodeLog {
     pub log_id: Arc<str>,
     pub tx: mpsc::Sender<LogEntry>,
     pub wm: Arc<Watermark>,
-    pub live: broadcast::Sender<Arc<LogBatch>>,
+    pub live: Arc<LiveRing>,
     /// Last durable+applied ordinal (u64::MAX = none yet).
     pub durable_ordinal: Arc<AtomicU64>,
     pub sinks: Arc<ShardSinks>,
@@ -175,7 +310,7 @@ impl NodeLog {
         let wm = Arc::new(Watermark::new(cfg.writer, seq_floor(crate::tid::now_micros())));
         let (tx, rx) = mpsc::channel(64 * 1024);
         let (fin_tx, fin_rx) = mpsc::channel(4);
-        let (live, _) = broadcast::channel(1024);
+        let live = LiveRing::new(DEFAULT_LIVE_RING_BYTES);
         let sinks: Arc<ShardSinks> = Arc::default();
         let durable_ordinal = Arc::new(AtomicU64::new(u64::MAX));
         let log_id: Arc<str> = cfg.log_id.clone().into();
@@ -410,24 +545,70 @@ async fn upload(store: &Store, log_id: &str, ordinal: u64, data: Bytes, hedge_af
                 STATS.record_put(t.elapsed(), data.len());
                 return;
             }
-            Err(object_store::Error::AlreadyExists { .. }) => {
-                if let Ok(r) = store.raw.get(&path).await {
-                    if let Ok(b) = r.bytes().await {
-                        if b == data {
-                            STATS.record_put(t.elapsed(), data.len());
-                            return;
-                        }
-                        if matches!(segment::parse(b, false, None), Ok(LogObject::Fence { .. })) {
-                            tracing::error!(log_id, ordinal, "our log was fenced by a successor: fail-stop");
-                            std::process::exit(3);
-                        }
-                    }
+            Err(object_store::Error::AlreadyExists { .. }) => match resolve_conflict(store, &path, &data).await {
+                Conflict::Ours => {
+                    STATS.record_put(t.elapsed(), data.len());
+                    return;
                 }
-                tracing::error!(log_id, ordinal, "segment ordinal taken by another writer: fail-stop");
-                std::process::exit(3);
-            }
+                Conflict::Fenced => {
+                    tracing::error!(log_id, ordinal, "our log was fenced by a successor: fail-stop");
+                    std::process::exit(3);
+                }
+                Conflict::Other => {
+                    tracing::error!(log_id, ordinal, "segment ordinal taken by another writer: fail-stop");
+                    std::process::exit(3);
+                }
+                Conflict::Missing => {
+                    // S3 answers 409 (mapped to AlreadyExists) on conditional
+                    // write conflicts too, e.g. our own hedge racing: nothing
+                    // is there (yet), so PUT again.
+                    tracing::warn!(log_id, ordinal, "segment PUT conflicted but no object is there; retrying");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(2));
+                }
+            },
             Err(e) => {
                 tracing::warn!(log_id, ordinal, "segment PUT failed, retrying: {e}");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Conflict {
+    /// Our bytes are there (a hedge or an earlier attempt won).
+    Ours,
+    /// A fence object: a successor closed this log.
+    Fenced,
+    /// A different segment: another writer.
+    Other,
+    /// Nothing there: the conflict was transient.
+    Missing,
+}
+
+/// What occupies a segment path our conditional PUT conflicted on. Transient
+/// GET errors are retried: only a confirmed fence or different bytes may make
+/// the caller fail-stop.
+async fn resolve_conflict(store: &Store, path: &Path, data: &Bytes) -> Conflict {
+    let mut backoff = Duration::from_millis(20);
+    loop {
+        let got = match store.raw.get(path).await {
+            Ok(r) => r.bytes().await,
+            Err(e) => Err(e),
+        };
+        match got {
+            Ok(b) if b == *data => return Conflict::Ours,
+            Ok(b) => {
+                return match segment::parse(b, false, None) {
+                    Ok(LogObject::Fence { .. }) => Conflict::Fenced,
+                    _ => Conflict::Other,
+                };
+            }
+            Err(object_store::Error::NotFound { .. }) => return Conflict::Missing,
+            Err(e) => {
+                tracing::warn!(%path, "reading a conflicting segment failed, retrying: {e}");
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_secs(2));
             }
@@ -442,7 +623,7 @@ async fn run_finalizer(
     wm: Arc<Watermark>,
     mut rx: mpsc::Receiver<Sealed>,
     merger_tx: mpsc::UnboundedSender<LogBatch>,
-    live: broadcast::Sender<Arc<LogBatch>>,
+    live: Arc<LiveRing>,
     lease_ok: Option<LeaseCheck>,
     durable_ordinal: Arc<AtomicU64>,
 ) {
@@ -481,7 +662,7 @@ async fn run_finalizer(
         let events: Vec<(i64, Bytes)> =
             s.frames.iter().filter(|(_, r)| !r.is_empty()).map(|(seq, r)| (*seq, s.data.slice(r.clone()))).collect();
         let batch = LogBatch { log_id: log_id.clone(), ordinal: s.ordinal, events };
-        let _ = live.send(Arc::new(batch.clone()));
+        live.push(Arc::new(batch.clone()), s.data.len());
         let _ = merger_tx.send(batch);
         if let Some(ok) = &lease_ok {
             if !ok() {
@@ -522,6 +703,17 @@ pub struct Span {
     pub end: Option<u64>,
 }
 
+/// The span an applied marker `(log, ord)` was written in: the *earliest* span
+/// of `log` that covers it (start - 1 <= ord < end; start - 1 = nothing of the
+/// span applied yet). A node can hold a shard twice in one log (A -> B -> A),
+/// so the log id alone is ambiguous: matching its last span skipped every
+/// span in between (B's acked writes). Where the marker sits on the boundary
+/// of two spans of the same log, the earlier one wins: replaying more than
+/// needed is safe (absolute puts/deletes, in log order), replaying less is not.
+fn marker_span(history: &[Span], log: &str, ord: u64) -> Option<usize> {
+    history.iter().position(|s| s.log_id == log && s.start <= ord.saturating_add(1) && s.end.is_none_or(|e| ord < e))
+}
+
 /// Brings a shard's SlateDB up to date from the log spans of its previous
 /// owners (chronological), starting after its applied marker.
 pub async fn replay_shard(store: &Store, shard: u16, db: &Db, history: &[Span]) -> anyhow::Result<u64> {
@@ -538,7 +730,7 @@ pub async fn replay_many(store: &Store, shards: &[(u16, &Db, &[Span])]) -> anyho
     for (_, db, history) in shards {
         let marker = db.get(META_APPLIED).await?.and_then(|b| decode_marker(&b));
         let first = match &marker {
-            Some((log, _)) => history.iter().rposition(|s| &s.log_id == log).unwrap_or(0),
+            Some((log, ord)) => marker_span(history, log, *ord).unwrap_or(0),
             None => 0,
         };
         let mut v = Vec::new();
@@ -579,8 +771,28 @@ pub async fn replay_many(store: &Store, shards: &[(u16, &Db, &[Span])]) -> anyho
             let mut objs = futures::stream::iter(lo..hi).map(fetch).buffered(16);
             let mut ord = lo;
             while let Some(obj) = objs.next().await {
-                let Some(data) = obj? else { break };
-                let LogObject::Segment(_, entries) = segment::parse(data, true, None)? else { break };
+                // The end of the log (missing object or its fence) is only
+                // legitimate past every closed span: a closed span's end is the
+                // fence ordinal, so every segment before it exists.
+                let seg = match obj? {
+                    Some(data) => match segment::parse(data, true, None)? {
+                        LogObject::Segment(h, entries) => Some((h, entries)),
+                        LogObject::Fence { .. } => None,
+                    },
+                    None => None,
+                };
+                let Some((h, entries)) = seg else {
+                    if let Some((_, span, _)) = members.iter().find(|(_, s, from)| ord >= *from && s.end.is_some_and(|e| ord < e)) {
+                        anyhow::bail!("log {log_id} ends at ordinal {ord} inside closed span {span:?}");
+                    }
+                    break;
+                };
+                anyhow::ensure!(
+                    h.log_id == log_id && h.ordinal == ord,
+                    "log object {log_id}/{ord} has header {}/{}",
+                    h.log_id,
+                    h.ordinal
+                );
                 read += 1;
                 for (i, span, from) in &members {
                     if ord < *from || span.end.is_some_and(|e| ord >= e) {
@@ -604,4 +816,171 @@ pub async fn replay_many(store: &Store, shards: &[(u16, &Db, &[Span])]) -> anyho
         }
     }
     Ok(read)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::segment::SegmentBuilder;
+
+    fn seg_bytes(log: &str, ord: u64, shard: u16, epoch: u64, key: &str) -> Vec<u8> {
+        let mut b = SegmentBuilder::new();
+        let m = Mutation { key: Bytes::from(key.to_string()), val: Some(Bytes::from_static(b"v")) };
+        b.push(1000 + ord as i64, shard, epoch, |_| {}, &[m]);
+        let mut obj = b.header(log, ord);
+        obj.extend_from_slice(&b.body);
+        obj
+    }
+
+    async fn put_seg(store: &Store, log: &str, ord: u64, shard: u16, epoch: u64, key: &str) {
+        store.raw.put(&segment_path(store, log, ord), PutPayload::from(seg_bytes(log, ord, shard, epoch, key))).await.unwrap();
+    }
+
+    fn span(log: &str, epoch: u64, start: u64, end: Option<u64>) -> Span {
+        Span { log_id: log.into(), epoch, start, end }
+    }
+
+    /// A -> B -> A in one incarnation of A: the marker (A, 1) left by B's
+    /// takeover replay must not match A's second span, or B's acked writes
+    /// are skipped.
+    #[tokio::test]
+    async fn replay_aba_keeps_middle_span() {
+        let store = Store::memory(None);
+        let shard = 7u16;
+        put_seg(&store, "A", 0, shard, 1, "a0").await;
+        put_seg(&store, "A", 1, shard, 1, "a1").await;
+        put_seg(&store, "B", 0, shard, 2, "b0").await;
+        put_seg(&store, "B", 1, shard, 2, "b1").await;
+        let db = crate::partition::open_db(&store, shard, None).await.unwrap();
+        let mut wb = WriteBatch::new();
+        wb.put(b"a0", b"v");
+        wb.put(b"a1", b"v");
+        wb.put(META_APPLIED, encode_marker("A", 1));
+        db.write(wb).await.unwrap();
+        let history = vec![span("A", 1, 0, Some(2)), span("B", 2, 0, Some(2)), span("A", 3, 2, None)];
+        let n = replay_many(&store, &[(shard, &db, &history)]).await.unwrap();
+        assert_eq!(n, 2);
+        assert!(db.get(b"b0").await.unwrap().is_some());
+        assert!(db.get(b"b1").await.unwrap().is_some());
+        // marker inside A's second span: nothing before it is replayed
+        put_seg(&store, "A", 2, shard, 3, "a2").await;
+        put_seg(&store, "A", 3, shard, 3, "a3").await;
+        let mut wb = WriteBatch::new();
+        wb.put(META_APPLIED, encode_marker("A", 2));
+        db.write(wb).await.unwrap();
+        assert_eq!(replay_many(&store, &[(shard, &db, &history)]).await.unwrap(), 1);
+        assert!(db.get(b"a3").await.unwrap().is_some());
+    }
+
+    #[test]
+    fn marker_span_picks_the_covering_span() {
+        let h = vec![span("A", 1, 0, Some(5)), span("B", 2, 0, Some(3)), span("A", 3, 9, None)];
+        assert_eq!(marker_span(&h, "A", 2), Some(0));
+        assert_eq!(marker_span(&h, "A", 4), Some(0));
+        assert_eq!(marker_span(&h, "A", 8), Some(2)); // start - 1: nothing of it applied
+        assert_eq!(marker_span(&h, "A", 20), Some(2));
+        assert_eq!(marker_span(&h, "A", 6), None);
+        assert_eq!(marker_span(&h, "B", 2), Some(1));
+        assert_eq!(marker_span(&h, "C", 0), None);
+        // back-to-back spans of one log: the earlier wins (replays more)
+        let h = vec![span("A", 1, 0, Some(4)), span("A", 2, 4, None)];
+        assert_eq!(marker_span(&h, "A", 3), Some(0));
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_holes_and_mislabeled_segments() {
+        let store = Store::memory(None);
+        let shard = 1u16;
+        put_seg(&store, "A", 0, shard, 1, "a0").await;
+        // ordinal 1 missing inside the closed span [0, 3)
+        put_seg(&store, "A", 2, shard, 1, "a2").await;
+        let db = crate::partition::open_db(&store, shard, None).await.unwrap();
+        let history = vec![span("A", 1, 0, Some(3)), span("B", 2, 0, None)];
+        let e = replay_many(&store, &[(shard, &db, &history)]).await.unwrap_err();
+        assert!(e.to_string().contains("inside closed span"), "{e}");
+        // a segment stored under the wrong ordinal
+        let p = segment_path(&store, "A", 1);
+        store.raw.put(&p, PutPayload::from(seg_bytes("A", 7, shard, 1, "a1"))).await.unwrap();
+        let e = replay_many(&store, &[(shard, &db, &history)]).await.unwrap_err();
+        assert!(e.to_string().contains("has header"), "{e}");
+        // the end of an open span is fine (0 was applied before the errors)
+        store.raw.put(&p, PutPayload::from(seg_bytes("A", 1, shard, 1, "a1"))).await.unwrap();
+        assert_eq!(replay_many(&store, &[(shard, &db, &history)]).await.unwrap(), 2);
+        assert!(db.get(b"a2").await.unwrap().is_some());
+    }
+
+    /// An idle watermark advertises the clock; after the clock steps back,
+    /// new seqs must still land above what was advertised.
+    #[test]
+    fn idle_watermark_is_monotonic_across_clock_steps() {
+        let writer = 9u8;
+        let wm = Watermark::new(writer, seq_floor(crate::tid::now_micros()));
+        let advertised = wm.get();
+        assert!(wm.idle());
+        crate::tid::set_test_skew_us(-5_000_000);
+        let seq = wm.assign();
+        crate::tid::set_test_skew_us(0);
+        assert!(seq > advertised, "seq {seq} <= advertised watermark {advertised}");
+        assert_eq!(seq & 0xff, writer as i64);
+        assert!(!wm.idle());
+        assert!(wm.get() < seq);
+        wm.set_durable(seq);
+        assert!(wm.get() >= seq);
+        // a log started with the clock ahead of its first seq keeps the writer byte
+        let wm = Watermark::new(writer, seq_floor(crate::tid::now_micros() + 1_000_000));
+        assert_eq!(wm.assign() & 0xff, writer as i64);
+        // the bump keeps the writer byte under a lease cap that ends in 0x00
+        let wm = Watermark::new(writer, 0);
+        wm.set_lease_expiry(crate::tid::now_micros() - 1_000_000);
+        let capped = wm.get();
+        assert!(wm.idle());
+        crate::tid::set_test_skew_us(-60_000_000);
+        let seq = wm.assign();
+        crate::tid::set_test_skew_us(0);
+        assert!(seq > capped && seq & 0xff == writer as i64);
+    }
+
+    #[tokio::test]
+    async fn conflict_resolution() {
+        let store = Store::memory(None);
+        let path = segment_path(&store, "A", 0);
+        let ours = Bytes::from(seg_bytes("A", 0, 1, 1, "k"));
+        assert_eq!(resolve_conflict(&store, &path, &ours).await, Conflict::Missing);
+        store.raw.put(&path, PutPayload::from_bytes(ours.clone())).await.unwrap();
+        assert_eq!(resolve_conflict(&store, &path, &ours).await, Conflict::Ours);
+        let other = Bytes::from(seg_bytes("A", 0, 1, 1, "other"));
+        assert_eq!(resolve_conflict(&store, &path, &other).await, Conflict::Other);
+        store.raw.put(&path, PutPayload::from_bytes(segment::fence_object("B"))).await.unwrap();
+        assert_eq!(resolve_conflict(&store, &path, &ours).await, Conflict::Fenced);
+    }
+
+    fn batch(ordinal: u64, n: usize) -> Arc<LogBatch> {
+        Arc::new(LogBatch { log_id: "A".into(), ordinal, events: vec![(ordinal as i64, Bytes::from(vec![0u8; n]))] })
+    }
+
+    #[test]
+    fn live_ring_is_bounded_by_bytes() {
+        let ring = LiveRing::new(1000);
+        // no subscribers: nothing retained
+        ring.push(batch(0, 400), 400);
+        assert_eq!(ring.bytes(), 0);
+        let mut fast = ring.subscribe();
+        let mut slow = ring.subscribe();
+        for o in 1..=2 {
+            ring.push(batch(o, 400), 400);
+            assert!(matches!(fast.try_recv(), LiveRecv::Batch(b) if b.ordinal == o));
+        }
+        assert!(matches!(fast.try_recv(), LiveRecv::Empty));
+        assert_eq!(ring.bytes(), 800); // the slow one hasn't read them
+        assert!(matches!(slow.try_recv(), LiveRecv::Batch(b) if b.ordinal == 1));
+        assert_eq!(ring.bytes(), 400); // read by everyone: released
+        for o in 3..=6 {
+            ring.push(batch(o, 400), 400);
+            assert!(matches!(fast.try_recv(), LiveRecv::Batch(b) if b.ordinal == o));
+        }
+        assert!(ring.bytes() <= 1000);
+        assert!(matches!(slow.try_recv(), LiveRecv::Lagged));
+        drop(slow);
+        assert_eq!(ring.bytes(), 0);
+    }
 }

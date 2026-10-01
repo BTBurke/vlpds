@@ -32,6 +32,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, public: Opt
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),
             skew: Duration::from_millis(200),
+            ..Default::default()
         });
         if let Some(p) = public {
             c.public_url = p;

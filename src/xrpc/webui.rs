@@ -147,6 +147,7 @@ async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json
             addr: c.cfg.addr.clone(),
             writer: c.writer,
             expires_ms: c.lease_expiry_us() / 1000,
+            renewals: 0,
         });
     }
     peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));

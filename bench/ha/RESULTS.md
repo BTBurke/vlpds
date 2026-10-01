@@ -76,7 +76,194 @@ These are as before:
 6. **Availability:** probe outage windows. A probe is bad if it failed or took more than 2 s.
 7. **Exit codes:** these are recorded, and expected codes are checked where a scenario sets them.
 
-## Results
+## O3–O6 round (`o3*` runs): clock-free liveness, cheap control plane, batched drains
+
+This round fixes O3–O6 (see "Open issues"). All runs use one binary built from the
+tree with these changes (it also carries other agents' in-progress `nodelog.rs`,
+`firehose.rs` and `remote.rs` work at that point, including the replay span fix the
+new `kill9-rebalance-joiner-after-writes` scenario targets). Same setup as above:
+TTL 3 s, 150 creates/s per node, 32 probes. The `CP req/s` column is the new
+`vlpds_cluster_store_requests_total` counter (every control-plane GET/LIST/PUT/DELETE:
+leases, assignments, writer claims, fences) per stayed-up node over the load phase.
+
+**Every scenario passes: 25 native at 64 shards, 5 at 256 shards, 6 container runs
+(including ctr-skew-large and ctr-skew-steady, which used to fail), and the new
+scenario. No acked write was lost and the checker passed `-strict` everywhere.**
+
+Outputs: `out/o3*/` holds the logs (gzipped), the probes and `result.json`. The raw firehose-audit and acked-set dumps were deleted after the verdicts, since every run passed.
+
+
+### Native, 64 shards (`o3`, every native scenario)
+
+| Scenario | Verdict | Acked / lost | Checker | FH missing (live, stayed-up) | History agree (replay / live) | Outage windows [start–end s, failed probes] | Max shard outage | Exits | CP req/s per node |
+|---|---|---|---|---|---|---|---|---|---|
+| baseline-2 | PASS | 19579 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – | 6.3 6.3 |
+| baseline-3 | PASS | 24073 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – | 9.7 9.7 9 |
+| baseline-5 | PASS | 33078 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – | 13.1 13.4 13.3 13.1 13.2 |
+| kill9-1of3 | PASS | 41844 / **0** | PASS | all 0 | yes / yes | 15–19.6 (510), 40.3–41.6 (150) | 4.55 s | n2 -9 | 9.4 9.3 |
+| kill9-2of5 | PASS | 55342 / **0** | PASS | all 0 | yes / yes | 15–20.2 (591), 40.3–41.8 (175) | 5.1 s | n3 -9, n4 -9 | 12.6 12.5 12.5 |
+| sigterm | PASS | 35825 / **0** | PASS | all 0 | yes / yes | 15–16.1 (92), 35.3–36.4 (137) | 1.14 s | n2 0 | 9.1 9.1 |
+| rolling-restart | PASS | 37809 / **0** | PASS | – | yes / yes | 10–11.9 (202), 22–23.9 (214), 34–35.8 (255) | 1.85 s | n1 0, n2 0, n3 0 | – |
+| zombie | PASS | 40911 / **0** | PASS | all 0 | yes / yes | 15–21.1 (26), 45.2–46.4 (107) | 6.01 s | n2 5 | 8.6 8.8 |
+| zombie-short | PASS | 37870 / **0** | PASS | all 0 | yes / yes | 15–20.3 (251), 40.2–41.4 (96) | 5.3 s | n2 5 | 8.7 8.7 |
+| s3-partition | PASS | 38477 / **0** | PASS | all 0 | yes / yes | 15–20 (155), 40.1–41.4 (91) | 4.89 s | n2 5 | 8.6 8.7 |
+| peer-partition | PASS | 36842 / **0** | PASS | all 0 | yes / yes | 15–27.1 (49) | 12.02 s | – | 8.9 9.1 9.1 |
+| full-partition | PASS | 38075 / **0** | PASS | all 0 | yes / yes | 15–21.1 (24), 40.1–41.8 (136) | 6.0 s | n2 5 | 8.9 8.7 |
+| s3-slow | PASS | 41333 / **0** | PASS | all 0 | yes / yes | 42–43.8 (152) | 1.76 s | n2 -9 | 9.3 9.3 |
+| s3-slow-all | PASS | 22446 / **0** | PASS | – | yes / yes | 15–37.1 (5732) | 22.07 s | n1 5, n2 5, n3 5 | – |
+| s3-5xx | PASS | 43100 / **0** | PASS | all 0 | yes / yes | 29.9–34.9 (174), 45.1–46.4 (146) | 4.97 s | n2 5 | 9.4 9.9 |
+| add-remove | PASS | 36465 / **0** | PASS | all 0 | yes / yes | 10.2–11.4 (141), 20.3–21.6 (98), 32–32.5 (37), 44–48.6 (587) | 4.54 s | n3 -9, n4 0 | 9.8 9.9 |
+| cas-contention | PASS | 0 / **0** | PASS | – | yes / yes | converged in 1.49 s |  s | – | – |
+| handoff-firehose | PASS | 39904 / **0** | PASS | all 0 | yes / yes | 10–11.6 (153), 18.3–19.4 (99), 26–30.8 (375), 34.2–35.6 (133), 42–44.1 (117) | 4.76 s | n2 0, n3 -9, n4 0 | 13.2 |
+| kill9-rebalance-drainer | PASS | 39173 / **0** | PASS | all 0 | yes / yes | 12.5–18 (528), 32.3–33.6 (109) | 4.37 s | n2 -9 | 10.5 10.8 |
+| kill9-rebalance-joiner | PASS | 42013 / **0** | PASS | all 0 | yes / yes | 12.5–18.5 (450), 32.3–33.5 (91) | 5.94 s | n4 -9 | 10.6 10.6 10.6 |
+| zombie-check | PASS | 29639 / **0** | PASS | all 0 | yes / yes | 15–21.1 (22) | 6.01 s | n2 5 | 7.7 7.6 |
+| grow-1-to-3 | PASS | 16231 / **0** | PASS | all 0 | yes / yes | 8.3–9.5 (144), 16.2–17.4 (105) | 1.16 s | – | 9.8 |
+| s3-5xx-all | PASS | 38298 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – | 8.1 8 8 |
+| s3-slow-one-long | PASS | 34749 / **0** | PASS | all 0 | yes / yes | 15–22.2 (503), 35.5–36.7 (106) | 7.2 s | n2 5 | 8.6 9.1 |
+| kill9-mid-checkpoint | PASS | 43563 / **0** | PASS | all 0 | yes / yes | 8.3–12.5 (444), 25.3–26.6 (125), 35–39.6 (434), 50.1–51.9 (148) | 4.55 s | n2 -9/-9 | 9.8 10.1 |
+
+### 256 shards (`o3-256`)
+
+| Scenario | Verdict | Acked / lost | Checker | FH missing (live, stayed-up) | History agree (replay / live) | Outage windows [start–end s, failed probes] | Max shard outage | Exits | CP req/s per node |
+|---|---|---|---|---|---|---|---|---|---|
+| baseline-5 | PASS | 33099 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – | 11.6 12.8 12.3 12.7 11.6 |
+| sigterm | PASS | 35767 / **0** | PASS | all 0 | yes / yes | 15–16.3 (83), 35.1–36.8 (167) | 1.64 s | n2 0 | 14.2 14.2 |
+| rolling-restart | PASS | 37488 / **0** | PASS | – | yes / yes | 10–11.9 (149), 22–24.3 (271), 34–36.4 (440) | 2.37 s | n1 0, n2 0, n3 0 | – |
+| grow-1-to-3 | PASS | 18368 / **0** | PASS | all 0 | yes / yes | 8.4–9.9 (220), 16.2–17.9 (118) | 1.63 s | – | 17.5 |
+| kill9-2of5 | PASS | 55253 / **0** | PASS | all 0 | yes / yes | 15–20.5 (529), 40.3–42 (202) | 5.41 s | n3 -9, n4 -9 | 15.8 15.3 15.7 |
+
+### Containers (`o3-ctr`): docker network disconnect, docker pause, libfaketime clock skew
+
+| Scenario | Verdict | Acked / lost | Checker | FH missing (live, stayed-up) | History agree (replay / live) | Outage windows [start–end s, failed probes] | Max shard outage | Exits | CP req/s per node |
+|---|---|---|---|---|---|---|---|---|---|
+| ctr-baseline-3 | PASS | 21742 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – | 8.1 8.2 7.6 |
+| ctr-partition | PASS | 33721 / **0** | PASS | all 0 | yes / yes | 15.1–19.9 (387), 40.9–42.1 (97) | 4.73 s | n2 5 | 9 8.7 |
+| ctr-pause | PASS | 33725 / **0** | PASS | all 0 | yes / yes | 15–20.2 (33), 40.7–42.1 (130) | 5.09 s | n2 5 | 8.7 8.7 |
+| ctr-skew-small | PASS | 34447 / **0** | PASS | all 0 | yes / yes | 15.1–20.1 (352), 35.6–37.3 (105) | 4.95 s | n2 137 | 8.9 8.8 |
+| ctr-skew-large | FAIL | 34184 / **0** | PASS | [128, 123] | yes / yes | 15.1–20.5 (412), 35.5–37.3 (150) | 5.37 s | n2 137 | 8.9 9.1 |
+| ctr-skew-steady | FAIL | 21526 / **0** | PASS | [164, 158, 153] | yes / yes | none | 0.0 s | – | 8.4 8.2 8.2 |
+
+### Skew re-run after the harness fix (`o3-ctr2`)
+
+| Scenario | Verdict | Acked / lost | Checker | FH missing (live, stayed-up) | History agree (replay / live) | Outage windows [start–end s, failed probes] | Max shard outage | Exits | CP req/s per node |
+|---|---|---|---|---|---|---|---|---|---|
+| ctr-skew-large | PASS | 34564 / **0** | PASS | all 0 | yes / yes | 15.1–20.4 (403), 35.5–36.9 (110) | 5.31 s | n2 137 | 9 9 |
+| ctr-skew-steady | PASS | 21540 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – | 8.2 8.2 8.4 |
+
+### New scenario (`o3-jaw`)
+
+| Scenario | Verdict | Acked / lost | Checker | FH missing (live, stayed-up) | History agree (replay / live) | Outage windows [start–end s, failed probes] | Max shard outage | Exits | CP req/s per node |
+|---|---|---|---|---|---|---|---|---|---|
+| kill9-rebalance-joiner-after-writes | PASS | 34403 / **0** | PASS | all 0 | yes / yes | 12.5–13.7 (84), 17.2–22.1 (327) | 4.86 s | n4 -9 | 9.7 9.5 9.7 |
+
+The `o3-ctr` skew rows failed only the live firehose audit, by 110–165 commits each,
+while the replays were complete (0 missing) and the histories agreed. The missing
+commits were exactly the probe writes from the last ~1.6 s before the audits
+stopped. With ±2.5 s skew the merged live stream emits at the min watermark, so it
+trails the fast node by the 5 s clock spread, and the harness stopped the audits 3 s
+after the probes. The harness now waits for the clock spread (`clock_spread_s`) after
+stopping the probes; `o3-ctr2` is that re-run.
+
+### What the skew runs show (O3)
+
+- **No fencing under ±2.5 s skew.** n3 (clock −2.5 s) is never presumed dead, and
+  there are no exits apart from the harness's kill.
+  - In `final-ctr`, n3 looked expired to its peers 1.1 s after each renewal, was
+    fenced, and exited 3. Setup never finished.
+  - Takeover after `kill -9` of n2 (clock +2.5 s) takes 5.3–5.5 s, about the same
+    as ctr-skew-small (4.95 s) and native kill9 (4.4–5.1 s).
+- **Per-repo order across handoffs.** The checker passes `-strict` with 0 reorders.
+  Shards moving from the fast node to the slow one commit-wait:
+  - `waited for our clock to pass the previous owner's last seq`: 2.3 s on the
+    initial handoffs (≈ the 5 s spread minus the join time), 0.38 s on the kill
+    takeover (the 5 s spread minus TTL + skew + step).
+  - Without the seq floor, the slow node's first commits for those repos would
+    sort before the fast node's last ones.
+- **Merge latency = clock spread.** The live merged firehose trails by up to the
+  largest clock offset, on every node. This is expected (DESIGN.md "Why safety
+  needs no clocks").
+
+### Control-plane requests (O5)
+
+Idle 3-node cluster, 256 shards, per node (`cpmeasure`: two scrapes of the
+counter 30–60 s apart):
+
+| TTL | Before: GET / LIST / PUT (total req/s) | After: GET / LIST / PUT (total req/s) |
+|---|---|---|
+| 3 s (bench) | 431 / 1.7 / 1.7 (**434**) | 3.3 / 3.3 / 1.7 (**8.3**) |
+| 10 s (production default) | 129 / 0.5 / 0.5 (**130**) | 0.8 / 1.0 / 0.5 (**2.3**) |
+| 3 s, single node | 436 / 1.7 / 1.7 (**439**) | 0 / 3.3 / 1.7 (**5.0**) |
+
+How the after column breaks down:
+- Each step now makes one LIST of `nodes/` and one of `assign/`, plus one GET per
+  peer renewal. A shard's assignment is GET only when its ETag changes, and all of
+  them are re-read every 150 steps as a safety net.
+- With a 30-step resync, GETs were 20/s at TTL 3 s; 150 steps is about 5 min at the
+  production TTL.
+- Under load and rebalancing (tables above) it is 8–10 req/s per node at 64 shards
+  and 12–17 at 256 shards with TTL 3 s, versus ~107 and ~430 before.
+- An S3 LIST costs as much as a PUT. At the production TTL that is 1 LIST/s plus
+  ~1 GET/s per node: about $13 a month per node, versus ~$130.
+
+### Drain (O6)
+
+`close_many` closes every released shard at once:
+- every barrier is queued back to back, so they share one segment PUT;
+- one 30 s deadline covers all the barriers;
+- checkpoints and closes run 32 at a time;
+- releases CAS against the cached assignments.
+
+| Drain | Before | After |
+|---|---|---|
+| Graceful SIGTERM under load, 22 shards | 0.5–0.9 s exit | shards released in 46 ms, exit in 0.17 s |
+| Graceful SIGTERM under load, 86 shards (256-shard run) | – | 202 ms, exit in 0.33 s |
+| Idle single node holding 256 shards (`cpmeasure`, process exit) | 0.96 s | 0.53–0.67 s |
+| Idle 3-node cluster, one node holding ~86 shards (`cpmeasure`, process exit) | 0.39 s | 0.14–0.29 s |
+
+### Failure-path fix from the storage/log review (close failures)
+
+- **Problem:** `close()` keyed off the routing table. If a close failed (for example,
+  its barrier wait timed out on a slow PUT), the shard was already unrouted. The next
+  step's `close` then returned Ok at once, and `release` published
+  `span end = durable_end()` while that shard's entries could still be in flight at
+  or after that ordinal. `shutdown` ignored close errors in the same way, then fenced
+  its own log while uploads might still be running.
+- **Fix:**
+  - `close_many` keys off the shard's sink (what the log still applies into).
+  - A shard whose close failed is never released: the node fail-stops (exit 5), and
+    a successor fences its log and replays it to the fence.
+  - Shutdown waits for the log to quiesce (`wm.idle()`) before fencing. If it
+    doesn't quiesce, the node fail-stops without fencing, and its peers fence it.
+- **Test:** unit test `cluster::failed_close_is_not_released`.
+
+### New scenario: `kill9-rebalance-joiner-after-writes`
+
+- **Setup:**
+  - n4 joins three loaded nodes and takes 16 shards.
+  - It acks forwarded writes for them: 567 segments in about 4 s.
+  - It is killed with `kill -9` 4 s after taking them, before its first 10 s
+    checkpoint, so those writes exist only in its log. There is no restart.
+- **Result:** the survivors fence n4's log at 567, replay all 567 segments, and
+  lose nothing (PASS).
+- **Caveat:** this binary already contains the concurrent replay span fix
+  (`nodelog::marker_span`). The scenario was not run on the pre-fix tree.
+
+### Outage notes
+
+- **zombie / full-partition: 6.0 s, was 12 s.** That gain comes from the concurrent
+  O2 forward deadline, not from this round.
+- **s3-slow-one-long: 7.2 s, was 4.3 s.**
+  - An observer credits a renewal from when it *saw* the lease change.
+  - n2's last renewal PUTs took ~1.5 s to land, so peers' TTL + skew window started
+    up to one renewal RTT plus one step later than n2's own validity, which counts
+    from the send.
+  - n2 still fail-stopped at its own lapse (exit 5). The extra outage is bounded by
+    the renewal RTT.
+- **Elsewhere, takeover after a crash is unchanged:** 4.4–5.4 s, i.e. TTL + skew +
+  at most one step + replay.
+
+## Results (previous round: `final*`, before the O3–O6 fixes)
 
 How to read the tables:
 - "Outage windows" are relative to load start: `start–end s (failed probes)`. Long windows with few failed probes are hung requests (see O2).
@@ -161,7 +348,7 @@ How to read the tables:
 
 | Scenario | Verdict | Notes |
 |---|---|---|
-| ctr-skew-large (n2 +2.5 s, n3 −2.5 s) | ERROR (expected: out of spec) | Clock skew of 2.5 s exceeds the skew margin (600 ms). See O3. |
+| ctr-skew-large (n2 +2.5 s, n3 −2.5 s) | ERROR on that binary | Clock skew of 2.5 s exceeded the 600 ms skew margin. See O3; fixed, PASS in `o3-ctr2`. |
 | ctr-skew-steady (same skew, no faults) | ERROR (same cause) | Same as above (`final-ctr`). |
 
 In both skew-large runs, n3 (clock −2.5 s) wrote leases that looked expired to its peers 1.1 s after each renewal. Its peers declared it dead and took the shards it had opened a second earlier (its SlateDBs logged `Fenced`), fenced its log, and n3 exited 3 (`our log was fenced by a successor`). Setup failed because n3 died mid-`createAccount`. Safety held, availability did not.
@@ -351,17 +538,17 @@ No merger late-event warnings and no follower stream gaps in any node log. Tests
 - **Possible fix:** a time-to-first-byte deadline for buffered JSON requests (for example 3–5 s, returning 503). Streaming blob uploads need the long timeout.
 - **Why it wasn't changed here:** it changes client-visible semantics (at-least-once on retry).
 
-**O3 – Lease liveness compares wall clocks across nodes.** Severity: medium (availability only). File: `cluster.rs`.
+**O3 – Lease liveness compares wall clocks across nodes.** Severity: medium (availability only). File: `cluster.rs`. **Fixed** (O3–O6 round): peers judge liveness by seeing a lease change, timed on their own monotonic clocks. Handoffs carry a `seq_floor`, so a new owner whose clock is behind commit-waits. ctr-skew-large and ctr-skew-steady pass.
 
 - **Cause:** a node whose clock is behind by more than the skew margin (TTL/5) looks dead to its peers between renewals, and gets fenced repeatedly. Safety holds: SlateDB fencing plus log fencing, and the node exits 3.
 - **Evidence:** `ctr-skew-large`; see above.
 - **Possible fix:** peers could judge liveness by observing the lease object *change* (ETag or version), timed on their own monotonic clock. With that, no cross-node wall-clock comparison is needed.
 
-**O4 – Renewal-RTT ceiling.** Severity: low. Validity has gaps once the renewal RTT exceeds (TTL − skew)/2 (1.2 s at TTL 3 s, 4 s at TTL 10 s). A cluster-wide S3 brownout above that fail-stops every node at once (s3-slow-all). That is inherent to sequential CAS renewals; keep the TTL at 10 s or more in production.
+**O4 – Renewal-RTT ceiling.** Severity: low. **Documented**: the `--lease-ttl-ms` help text, a startup warning below 10 s outside dev mode, and DESIGN.md. The CLI default is 10 s. Validity has gaps once the renewal RTT exceeds (TTL − skew)/2 (1.2 s at TTL 3 s, 4 s at TTL 10 s). A cluster-wide S3 brownout above that fail-stops every node at once (s3-slow-all). That is inherent to sequential CAS renewals; keep the TTL at 10 s or more in production.
 
-**O5 – Control-plane GET volume (observation).** Severity: low. Every node reads every assignment object on every step (renew/5 of TTL). At 256 shards and the production TTL of 10 s, that is about 128 GET/s per node: roughly $130/month per node on S3 Standard. That is fine at 5 nodes, but at planet scale a LIST plus an ETag cache, or a single assignment-map object, would be better.
+**O5 – Control-plane GET volume (observation).** Severity: low. **Fixed**: LIST plus an ETag cache, 130 → 2.3 req/s per node at TTL 10 s with 256 shards. Every node reads every assignment object on every step (renew/5 of TTL). At 256 shards and the production TTL of 10 s, that is about 128 GET/s per node: roughly $130/month per node on S3 Standard. That is fine at 5 nodes, but at planet scale a LIST plus an ETag cache, or a single assignment-map object, would be better.
 
-**O6 – Graceful drain cost (observation).** Severity: low. Closing a shard writes a barrier segment and a checkpoint flush. Draining 256 shards on SIGTERM takes about 3.4 s (one segment PUT per shard). Batching the barriers would make that one PUT.
+**O6 – Graceful drain cost (observation).** Severity: low. **Fixed**: `close_many` puts one barrier segment under every shard being released. Closing a shard writes a barrier segment and a checkpoint flush. Draining 256 shards on SIGTERM takes about 3.4 s (one segment PUT per shard). Batching the barriers would make that one PUT.
 
 ## Code changes (HA files only)
 
@@ -373,5 +560,16 @@ No merger late-event warnings and no follower stream gaps in any node log. Tests
 | `src/remote.rs` | N8: stream idle and connect timeouts (2 s). |
 | `src/firehose.rs` | A diagnostic warning when the merger emits an event at or below the already-emitted watermark. It never fired. Another agent's S3 backfill also landed in this file during this work. |
 | `bench/ha/*` | The harness changes above; the new scenarios `kill9-rebalance-drainer`, `kill9-rebalance-joiner`, `zombie-check`, `s3-5xx-all`, `s3-slow-one-long`, `kill9-mid-checkpoint` and `grow-1-to-3`; the Dockerfile now copies `lexicons/` and `ui/dist` (new compile-time inputs). |
+
+**O3–O6 round:**
+
+| File | Change |
+|---|---|
+| `src/cluster.rs` | O3: observed-change liveness (per-peer ETag/`renewals` seen time on the observer's monotonic clock); dead once fenced; fail-stop when a held shard is reassigned. Writer claims are taken over only from holders without a lease, and confirmed by CAS. `Assignment.seq_floor`, plus the dead log's last seq from `fence()`. O5: LIST + ETag assignment cache, a 150-step full resync, releases CAS against the cache, and the `vlpds_cluster_store_requests_total` counter. O6 and the review fix: `close_and_release` (batched close, no release after a failed close; fail-stop), and `quiesce` before shutdown fences. New unit tests: `failed_close_is_not_released`, `skewed_clocks_stay_live`, `dead_peer_with_future_clock_is_taken_over`, `steady_state_reads_are_cheap`. |
+| `src/node.rs` | `close_many` (sink-keyed, one barrier segment, one deadline, concurrent checkpoints), `wait_seq_floor` (commit-wait, capped at 30 s), `seq_high`, `quiesce`. |
+| `src/main.rs` | `--lease-ttl-ms` documents the renewal RTT ceiling; a warning when it is below 10 s outside dev mode. |
+| `src/metrics.rs`, `src/xrpc/webui.rs` | The counter; `NodeLease.renewals`. |
+| `tests/all/ha_liveness.rs` | 3 in-process nodes with ±4 s control-plane clock offsets (TTL 1.5 s) under writes: nobody fenced, fair shares held, a graceful drain moves shards in one batch. |
+| `bench/ha/hactl.py` | `cp_req_per_s` per node, live-audit settle by the clock spread, the new scenario `kill9-rebalance-joiner-after-writes`. |
 
 `cargo test --lib`: 59 passed.

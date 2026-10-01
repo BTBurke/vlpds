@@ -132,6 +132,11 @@ struct Args {
     /// URL peers use to reach this node (default: public_url).
     #[arg(long, env = "VLPDS_ADVERTISE_URL")]
     advertise_url: Option<String>,
+    /// Node lease TTL. Renewal and skew margin are TTL/5 each. A node's
+    /// renewal (one CAS PUT) must complete within (TTL - skew)/2 = 0.4 x TTL
+    /// (4 s at the default) or its validity gaps and it fail-stops; a
+    /// cluster-wide S3 brownout beyond that stops every node. Keep >= 10 s in
+    /// production; takeover after a crash is about TTL + skew + replay.
     #[arg(long, env = "VLPDS_LEASE_TTL_MS", default_value_t = 10_000)]
     lease_ttl_ms: u64,
     /// Disable the reference rate limits (benchmarks / load tests).
@@ -228,10 +233,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
             ttl: Duration::from_millis(args.lease_ttl_ms),
             renew_every: Duration::from_millis(args.lease_ttl_ms / 5),
             skew: Duration::from_millis(args.lease_ttl_ms / 5),
+            clock_offset_ms: 0,
         }),
         memory_store: None,
     };
     cfg.check_secrets()?;
+    if args.lease_ttl_ms < 10_000 && !args.dev_mode {
+        tracing::warn!(
+            lease_ttl_ms = args.lease_ttl_ms,
+            "lease TTL below 10 s: a renewal slower than 0.4 x TTL fail-stops the node (see --lease-ttl-ms)"
+        );
+    }
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     let app = server::build(cfg).await?;
     server::spawn_reporters(&app);

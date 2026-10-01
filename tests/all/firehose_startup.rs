@@ -25,6 +25,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),
             skew: Duration::from_millis(200),
+            ..Default::default()
         });
     })
     .await

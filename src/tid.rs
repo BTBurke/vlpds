@@ -47,10 +47,24 @@ impl fmt::Display for Tid {
 }
 
 pub fn now_micros() -> u64 {
-    SystemTime::now()
+    let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_micros() as u64
+        .as_micros() as u64;
+    #[cfg(test)]
+    let t = t.wrapping_add_signed(TEST_SKEW_US.with(|s| s.get()));
+    t
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SKEW_US: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test seam: shifts this thread's wall clock (e.g. a backward NTP step).
+#[cfg(test)]
+pub fn set_test_skew_us(us: i64) {
+    TEST_SKEW_US.with(|s| s.set(us));
 }
 
 /// Process-wide monotonic TID source (record keys).

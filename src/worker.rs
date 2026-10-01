@@ -19,7 +19,7 @@ use crossbeam_channel::{Receiver, Sender};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 /// Spec limits for a single commit.
@@ -278,6 +278,11 @@ struct Worker {
     cache: lru::LruCache<Arc<str>, RepoState>,
     cap: usize,
     loading: HashMap<Arc<str>, Vec<Queued>>,
+    /// Repos whose commit failed while earlier commits were still in flight:
+    /// held out of the cache (their requests buffer in `loading`) until those
+    /// commits are durable, then reloaded. Reloading any sooner would build
+    /// the next commit on a durable head that lacks them: a fork.
+    draining: HashMap<Arc<str>, RepoState>,
     clock_id: u64,
 }
 
@@ -297,13 +302,29 @@ impl Worker {
             cache: lru::LruCache::unbounded(),
             cap,
             loading: HashMap::new(),
+            draining: HashMap::new(),
             clock_id: rand::random::<u64>() & 0x3ff,
         }
     }
 
     fn run(mut self, rx: Receiver<WorkerMsg>) {
         let mut msgs = Vec::with_capacity(8192);
-        while let Ok(first) = rx.recv() {
+        loop {
+            let first = if self.draining.is_empty() {
+                match rx.recv() {
+                    Ok(m) => m,
+                    Err(_) => break,
+                }
+            } else {
+                match rx.recv_timeout(Duration::from_millis(5)) {
+                    Ok(m) => m,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        self.release_drained();
+                        continue;
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            };
             msgs.push(first);
             while msgs.len() < 8192 {
                 match rx.try_recv() {
@@ -354,11 +375,12 @@ impl Worker {
                 };
                 if let Err(e) = process(st, reqs, self.clock_id) {
                     // MST errors mean in-memory state can't be trusted: drop it and
-                    // reload from durable state on the next write.
+                    // reload from durable state, once nothing is in flight.
                     tracing::error!(%did, "commit failed, evicting repo: {e:#}");
-                    self.cache.pop(&did);
+                    self.discard(did);
                 }
             }
+            self.release_drained();
             self.evict();
             metrics::CACHED_REPOS
                 .with_label_values(&[&self.label])
@@ -430,9 +452,49 @@ impl Worker {
                         for d in drop {
                             self.cache.pop(&d);
                         }
+                        // the shard is unrouted (and its close barrier settles
+                        // the in-flight commits): buffered requests go through a
+                        // load, which fails over as "not owned"
+                        let drained: Vec<Arc<str>> =
+                            self.draining.iter().filter(|(_, st)| st.partition.id == p).map(|(d, _)| d.clone()).collect();
+                        for d in drained {
+                            self.draining.remove(&d);
+                            self.reload_buffered(&d);
+                        }
                         let _ = done.send(());
                     }
                 }
+            }
+        }
+    }
+
+    /// Drops a repo's in-memory state; it reloads from durable state on the
+    /// next write, but only once its in-flight commits are durable.
+    fn discard(&mut self, did: Arc<str>) {
+        let Some(st) = self.cache.pop(&did) else { return };
+        if st.pending.load(Ordering::Acquire) > 0 {
+            self.loading.entry(did.clone()).or_default();
+            self.draining.insert(did, st);
+        }
+    }
+
+    /// Reloads drained repos (see `draining`) whose commits are all durable.
+    fn release_drained(&mut self) {
+        let done: Vec<Arc<str>> =
+            self.draining.iter().filter(|(_, st)| st.pending.load(Ordering::Acquire) == 0).map(|(d, _)| d.clone()).collect();
+        for did in done {
+            self.draining.remove(&did);
+            self.reload_buffered(&did);
+        }
+    }
+
+    /// Starts a load for the requests buffered under `did` (if any).
+    fn reload_buffered(&mut self, did: &Arc<str>) {
+        let mut buffered = self.loading.remove(did).unwrap_or_default().into_iter();
+        if let Some(first) = buffered.next() {
+            self.start_load(first);
+            if let Some(buf) = self.loading.get_mut(did) {
+                buf.extend(buffered);
             }
         }
     }
@@ -1052,10 +1114,18 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
         pending: Some(st.pending.clone()),
         enqueued: Instant::now(),
     };
-    st.partition
-        .tx
-        .blocking_send(entry)
-        .map_err(|_| anyhow::anyhow!("partition sequencer gone"))
+    enqueue(st, entry)
+}
+
+/// Hands a commit's log entry to the node log.
+fn enqueue(st: &RepoState, entry: LogEntry) -> anyhow::Result<()> {
+    st.partition.tx.blocking_send(entry).map_err(|e| {
+        // never logged: it must not hold the repo out of reloads (see `draining`)
+        if let Some(p) = &e.0.pending {
+            p.fetch_sub(1, Ordering::AcqRel);
+        }
+        anyhow::anyhow!("partition sequencer gone")
+    })
 }
 
 /// Maintains the collection index and blob-ref index for one net op.
@@ -1117,10 +1187,7 @@ fn index_mutations(
 
 fn send_entry(st: &RepoState, entry: LogEntry) -> anyhow::Result<()> {
     st.pending.fetch_add(1, Ordering::AcqRel);
-    st.partition
-        .tx
-        .blocking_send(entry)
-        .map_err(|_| anyhow::anyhow!("partition sequencer gone"))
+    enqueue(st, entry)
 }
 
 fn head_ack(
@@ -1338,4 +1405,85 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
         enqueued: Instant::now(),
     };
     send_entry(st, entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nodelog::{NodeLog, NodeLogConfig};
+
+    fn settle(e: LogEntry) {
+        if let Some(p) = e.pending {
+            p.fetch_sub(1, Ordering::AcqRel);
+        }
+        if let Some(ack) = e.ack {
+            ack(Ok(()));
+        }
+    }
+
+    fn write(did: &Arc<str>, rkey: &str) -> (WorkerMsg, oneshot::Receiver<Result<CommitAck, WriteError>>) {
+        let bytes = Bytes::from(format!("record {rkey}"));
+        let (reply, rx) = oneshot::channel();
+        let w = Write::Create { collection: "app.test.thing".into(), rkey: rkey.into(), cid: Cid::dag_cbor(&bytes), bytes, blobs: Vec::new() };
+        (WorkerMsg::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply }), rx)
+    }
+
+    /// A commit that fails while an earlier one is still in flight must not
+    /// reload the repo before that one is durable: the reload would build on
+    /// a durable head without it (a fork).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_commit_waits_for_inflight_before_reload() {
+        let store = crate::store::Store::memory(None);
+        let db = Arc::new(crate::partition::open_db(&store, 0, None).await.unwrap());
+        let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
+        let log = NodeLog::start(
+            store.clone(),
+            NodeLogConfig { log_id: "t".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(1), lease_ok: None },
+            merger_tx,
+        );
+        // the "sequencer" is this test: it decides when entries become durable
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(16);
+        let part = Arc::new(Partition { id: 0, epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone() });
+        let p2 = part.clone();
+        let workers = spawn(1, 100, Arc::new(move |_: &str| Some(p2.clone())), tokio::runtime::Handle::current());
+        drop(part);
+        let w = workers.senders[0].clone();
+        let did: Arc<str> = "did:plc:test".into();
+        let key = Arc::new(Keypair::generate());
+        let account = serde_json::json!({
+            "did": &*did, "handle": "t.test", "signing_key": hex::encode(key.to_bytes()),
+            "password_hash": "", "created_at": "2026-01-01T00:00:00Z",
+        });
+        let (reply, created) = oneshot::channel();
+        w.send(WorkerMsg::CreateRepo(CreateRepoReq {
+            did: did.clone(),
+            handle: "t.test".into(),
+            key,
+            account_json: Bytes::from(serde_json::to_vec(&account).unwrap()),
+            records: Vec::new(),
+            reply,
+        }))
+        .unwrap();
+        settle(rx.recv().await.unwrap());
+        created.await.unwrap().unwrap();
+        // commit 1: in flight, not durable yet
+        let (m, first) = write(&did, "a");
+        w.send(m).unwrap();
+        let inflight = rx.recv().await.unwrap();
+        // commit 2 fails (the log intake is gone)
+        drop(rx);
+        let (m, second) = write(&did, "b");
+        w.send(m).unwrap();
+        assert!(second.await.is_err());
+        // a later write must wait for commit 1 instead of reloading now
+        let (m, mut third) = write(&did, "c");
+        w.send(m).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(third.try_recv().is_err(), "repo reloaded with a commit in flight");
+        settle(inflight);
+        first.await.unwrap().unwrap();
+        // now it reloads (from a state that never got the commits applied here)
+        let r = tokio::time::timeout(Duration::from_secs(5), third).await.unwrap().unwrap();
+        assert!(r.is_err());
+    }
 }

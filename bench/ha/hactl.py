@@ -821,6 +821,7 @@ def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_fina
     live = nodes[: (start_nodes or n_nodes)]
     accounts_file, accts = setup_accounts(live, ctx.outdir, per_node=per_node)
     ctx.t0 = time.time()
+    cp0 = {nd.id: cp_requests(nd) for nd in live}
     checker = Checker(nodes[checker_on], ctx.outdir)
     audits = {nd.id: FhAudit(nd, ctx.outdir) for nd in live}
     time.sleep(1)
@@ -846,9 +847,20 @@ def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_fina
     for lg in lgs:
         lg.wait(duration + 120)
     load_end = time.time()
+    # control-plane object-store requests/s per node over the load phase
+    # (nodes restarted mid-run reset their counter: not reported)
+    res["cp_req_per_s"] = {}
+    for nd in nodes:
+        if nd.id in cp0 and nd.alive() and not nd.exit_codes() and nd.started_at < ctx.t0:
+            c1 = cp_requests(nd)
+            if c1 is not None and cp0[nd.id] is not None and c1 >= cp0[nd.id]:
+                res["cp_req_per_s"][nd.id] = round((c1 - cp0[nd.id]) / (load_end - ctx.t0), 1)
     time.sleep(3)
     prober_acked = prober.stop()
-    time.sleep(3)
+    # the merged firehose emits at the min watermark, so it trails the node
+    # whose clock is furthest ahead by the clock spread: give live audits that
+    # long to see the last (probe) writes
+    time.sleep(3 + clock_spread_s(ctx))
     res["checker"] = checker.stop()
     res["extra_checkers"] = [c.stop() for c in extra]
     survivors = [n for n in nodes if n.alive()]
@@ -924,6 +936,22 @@ def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_fina
         pass
     res["events"] = ctx.events
     return res
+
+
+def clock_spread_s(ctx):
+    """Max minus min wall-clock offset across the cluster (libfaketime skews)."""
+    if getattr(ctx, "factory", None) is not CNode or not CNode.skews:
+        return 0.0
+    vals = [float(v.rstrip("s")) for v in CNode.skews.values()] + [0.0]
+    return max(vals) - min(vals)
+
+
+def cp_requests(node):
+    """Total control-plane object-store requests (vlpds_cluster_store_requests_total)."""
+    try:
+        return sum(v for k, v in node.metrics().items() if k.startswith("vlpds_cluster_store_requests_total"))
+    except Exception:
+        return None
 
 
 def judge(res, allow_lost=0):
@@ -1258,6 +1286,17 @@ def s_k9_reb_joiner(ctx):
     return run_load_scenario(ctx, 4, 55, acts, start_nodes=3, expect_final=4)
 
 
+@scenario("kill9-rebalance-joiner-after-writes",
+          "3 nodes; n4 joins under load, takes shards and acks writes for them; kill -9 n4 ~4 s later "
+          "(before its first 10 s checkpoint, so acked writes live only in its log); the old owners retake; no restart")
+def s_k9_reb_joiner_writes(ctx):
+    grace = 2 * TTL_MS / 5000
+    acts = [(12, start_node(3)), (12 + grace + 4, kill(3, label="kill -9 n4 (holding handed-off shards, writes acked)"))]
+    res = run_load_scenario(ctx, 4, 45, acts, start_nodes=3, expect_final=3)
+    res["expect_exit"] = {"n4": [-9, 137]}
+    return res
+
+
 @scenario("zombie-check", "SIGSTOP n2 for 4x TTL; after SIGCONT it must exit 3 (fenced) or 5 (lease lapsed); no restart")
 def s_zombie_check(ctx):
     acts = [(15, kill(1, signal.SIGSTOP)), (15 + 4 * TTL_MS / 1000, kill(1, signal.SIGCONT, "SIGCONT n2 (zombie wakes)"))]
@@ -1421,7 +1460,8 @@ def summarize(r):
             f"| fh-missing live {' '.join(fl)} replay {' '.join(fr)} start-audits {' '.join(fs) or '-'} cursor-checkers {' '.join(xc) or '-'} | windows {pr.get('windows')} | errs {errs_by} "
             f"({ck.get('commits')} commits, fails {ck.get('failures')}) | unavail {pr.get('unavail_s')}s recov {pr.get('recovery_s')}s "
             f"(max partition {pr.get('max_partition_outage_s')}s) | loadgen errs {errs} | final {dist_s} | exits {r.get('exit_codes')} "
-            f"| history agree replay={(r.get('fh_replay_diff') or {}).get('agree')} live={(r.get('fh_live_diff') or {}).get('agree')} |")
+            f"| history agree replay={(r.get('fh_replay_diff') or {}).get('agree')} live={(r.get('fh_live_diff') or {}).get('agree')} "
+            f"| cp req/s {r.get('cp_req_per_s')} |")
 
 
 def main():

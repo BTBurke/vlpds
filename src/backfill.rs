@@ -18,6 +18,7 @@ use std::collections::{BinaryHeap, VecDeque};
 use tokio::sync::mpsc;
 
 /// Header of a segment (or None if missing / a fence), via a small range GET.
+/// The header must name the log and ordinal it was read from.
 async fn seg_header(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result<Option<(i64, i64)>> {
     let opts = GetOptions { range: Some(GetRange::Bounded(0..4096)), ..Default::default() };
     let data = match store.raw.get_opts(&segment_path(store, log_id, ordinal), opts).await {
@@ -30,8 +31,14 @@ async fn seg_header(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result
     }
     anyhow::ensure!(data.len() >= 10 && data.starts_with(segment::MAGIC), "bad segment header");
     let idlen = u16::from_be_bytes(data[8..10].try_into()?) as usize;
-    let p = 10 + idlen + 8; // skip log id and ordinal
+    let p = 10 + idlen + 8;
     anyhow::ensure!(data.len() >= p + 16, "short segment header");
+    let (id, ord) = (&data[10..10 + idlen], u64::from_be_bytes(data[10 + idlen..p].try_into()?));
+    anyhow::ensure!(
+        id == log_id.as_bytes() && ord == ordinal,
+        "log object {log_id}/{ordinal} has header {}/{ord}",
+        String::from_utf8_lossy(id)
+    );
     let first = i64::from_be_bytes(data[p..p + 8].try_into()?);
     let last = i64::from_be_bytes(data[p + 8..p + 16].try_into()?);
     Ok(Some((first, last)))
@@ -51,21 +58,39 @@ async fn first_ordinal_after(store: &Store, log_id: &str, after: i64) -> anyhow:
     Ok(seg_header(store, log_id, o).await?.map(|_| o))
 }
 
+/// The lowest ordinal of `log_id` still in the store (None = no objects).
+/// Retention may have pruned the head of a log, so it needn't be 0. Object
+/// listings are lexicographic (S3, in-memory) and ordinals zero-padded, so
+/// the first key listed is the lowest.
+pub async fn first_ordinal(store: &Store, log_id: &str) -> anyhow::Result<Option<u64>> {
+    use futures::StreamExt;
+    let prefix = Path::from(format!("{}/log/{}", store.prefix, log_id));
+    let mut list = store.raw.list(Some(&prefix));
+    while let Some(meta) = list.next().await {
+        let meta = meta?;
+        if let Some(ord) = meta.location.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse::<u64>().ok()) {
+            return Ok(Some(ord));
+        }
+    }
+    Ok(None)
+}
+
 /// First ordinal of `log_id` that is missing (not written yet, or the fence)
 /// or whose segment has events with seq > `after`. Segments appear in ordinal
 /// order and their seqs increase, so everything before it is <= `after`.
 pub async fn seek(store: &Store, log_id: &str, after: i64) -> anyhow::Result<u64> {
+    let base = first_ordinal(store, log_id).await?.unwrap_or(0);
     // exponential probe for an upper bound (first missing ordinal or a segment past `after`)
-    match seg_header(store, log_id, 0).await? {
+    match seg_header(store, log_id, base).await? {
         Some((_, last0)) if last0 <= after => {}
-        _ => return Ok(0),
+        _ => return Ok(base),
     }
-    let (mut lo, mut hi) = (0u64, 1u64); // invariant: seg(lo).last <= after
+    let (mut lo, mut hi) = (base, base + 1); // invariant: seg(lo).last <= after
     loop {
         match seg_header(store, log_id, hi).await? {
             Some((_, last)) if last <= after => {
                 lo = hi;
-                hi *= 2;
+                hi = base + (hi - base) * 2;
             }
             _ => break,
         }
@@ -100,13 +125,21 @@ impl LogCursor {
                 }
                 Err(e) => return Err(e.into()),
             };
-            self.next += 1;
             match segment::parse(data, false, None)? {
                 LogObject::Fence { .. } => self.done = true,
-                LogObject::Segment(_, entries) => {
+                LogObject::Segment(h, entries) => {
+                    anyhow::ensure!(
+                        h.log_id == self.log_id && h.ordinal == self.next,
+                        "log object {}/{} has header {}/{}",
+                        self.log_id,
+                        self.next,
+                        h.log_id,
+                        h.ordinal
+                    );
                     self.buf.extend(entries.into_iter().filter(|e| !e.frame.is_empty() && e.seq > after).map(|e| (e.seq, e.frame)));
                 }
             }
+            self.next += 1;
         }
         Ok(())
     }
@@ -145,4 +178,46 @@ pub async fn backfill(store: &Store, after: i64, until: i64, tx: &mpsc::Sender<(
         }
     }
     Ok(last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::segment::SegmentBuilder;
+    use object_store::PutPayload;
+
+    async fn put_seg(store: &Store, log: &str, ord: u64, seq: i64) {
+        let mut b = SegmentBuilder::new();
+        b.push(seq, 0, 1, |o| o.extend_from_slice(b"frame"), &[]);
+        let mut obj = b.header(log, ord);
+        obj.extend_from_slice(&b.body);
+        store.raw.put(&segment_path(store, log, ord), PutPayload::from(obj)).await.unwrap();
+    }
+
+    /// A log whose first segments were pruned is still found and read.
+    #[tokio::test]
+    async fn seek_starts_at_the_first_existing_segment() {
+        let store = Store::memory(None);
+        for ord in 5..12u64 {
+            put_seg(&store, "A", ord, 1000 + ord as i64).await;
+        }
+        assert_eq!(first_ordinal(&store, "A").await.unwrap(), Some(5));
+        assert_eq!(first_ordinal(&store, "B").await.unwrap(), None);
+        assert_eq!(seek(&store, "A", 0).await.unwrap(), 5);
+        assert_eq!(seek(&store, "A", 1007).await.unwrap(), 8);
+        assert_eq!(seek(&store, "A", 5000).await.unwrap(), 12);
+        let (tx, mut rx) = mpsc::channel(64);
+        assert_eq!(backfill(&store, 1006, i64::MAX, &tx).await.unwrap(), 1011);
+        drop(tx);
+        let mut seqs = Vec::new();
+        while let Some((s, _)) = rx.recv().await {
+            seqs.push(s);
+        }
+        assert_eq!(seqs, (1007..=1011).collect::<Vec<_>>());
+        // a segment stored under the wrong ordinal is an error, not data
+        put_seg(&store, "A", 12, 2000).await;
+        store.raw.put(&segment_path(&store, "A", 13), PutPayload::from(store.raw.get(&segment_path(&store, "A", 12)).await.unwrap().bytes().await.unwrap())).await.unwrap();
+        let (tx, _rx) = mpsc::channel(64);
+        assert!(backfill(&store, 1011, i64::MAX, &tx).await.is_err());
+    }
 }

@@ -1181,10 +1181,16 @@ async fn record_writes_accept_large_json_bodies() {
         a.did,
         "x".repeat(1_000_000)
     );
-    s.xrpc
-        .post_bytes("com.atproto.repo.createRecord", huge.into_bytes(), "application/json", &a.auth())
+    // The server rejects from Content-Length without reading the body, so it may
+    // close before the client finishes writing; either outcome is a rejection.
+    match s
+        .xrpc
+        .try_post_bytes("com.atproto.repo.createRecord", huge.into_bytes(), "application/json", &a.auth())
         .await
-        .err(413, "PayloadTooLarge");
+    {
+        Ok(r) => r.err(413, "PayloadTooLarge"),
+        Err(e) => assert!(e.is_request() || e.is_body(), "unexpected error: {e}"),
+    }
 }
 
 /// Without an AppView, getRecord for a repo not hosted here is the

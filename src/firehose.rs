@@ -15,12 +15,13 @@
 use crate::events;
 use crate::metrics;
 use crate::nodelog::{LogBatch, Watermark};
+use crate::segment::{self, LogObject};
 use crate::stats::STATS;
 use axum::extract::ws::{Message, WebSocket};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
@@ -68,6 +69,8 @@ pub struct Firehose {
     settled: AtomicI64,
     /// Object store for S3 backfill (set once the node log is known).
     pub store: RwLock<Option<crate::store::Store>>,
+    max_queue_bytes: AtomicUsize,
+    queued_bytes: AtomicUsize,
 }
 
 impl Firehose {
@@ -85,6 +88,8 @@ impl Firehose {
             start_floor: floor,
             settled: AtomicI64::new(i64::MIN),
             store: RwLock::new(None),
+            max_queue_bytes: AtomicUsize::new(DEFAULT_MERGE_QUEUE_BYTES),
+            queued_bytes: AtomicUsize::new(0),
         })
     }
 
@@ -124,70 +129,152 @@ impl Firehose {
         }
     }
 
+    /// Byte budget of the merger's queues (events waiting for the min
+    /// watermark). Over it, logs are spilled: see `spawn_merger`.
+    pub fn set_max_queue_bytes(&self, n: usize) {
+        self.max_queue_bytes.store(n, Ordering::Relaxed);
+    }
+
+    /// Frame bytes currently queued in the merger.
+    pub fn queued_bytes(&self) -> usize {
+        self.queued_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Merges every followed log's batches by seq.
+    ///
+    /// While one log holds the min watermark back (a dead peer whose fence
+    /// hasn't been drained yet), every other log queues here. Past the byte
+    /// budget the merger *spills* a log instead of queueing it: it ignores
+    /// that log's batches from then on and later reads them back from its S3
+    /// segments, one chunk at a time as the watermark lets them out, until it
+    /// meets the live stream again. Memory stays near the budget however long
+    /// the stall lasts; the merged order is unchanged (events are durable in
+    /// S3 before any producer hands them to us).
     pub fn spawn_merger(self: &Arc<Self>, mut rx: mpsc::UnboundedReceiver<LogBatch>) {
         let fh = self.clone();
         tokio::spawn(async move {
-            let mut queues: HashMap<Arc<str>, VecDeque<(i64, Bytes)>> = HashMap::new();
-            // Highest seq accepted per log: drops duplicates when a log's
-            // events arrive twice (S3 catch-up overlapping a live stream).
-            let mut high: HashMap<Arc<str>, i64> = HashMap::new();
+            let mut logs: HashMap<Arc<str>, LogQ> = HashMap::new();
+            // Everything at or below this has been emitted (or is below the
+            // start floor): later events at or below it are late.
+            let mut emitted = fh.start_floor;
+            let mut total = 0usize;
             let mut tick = tokio::time::interval(Duration::from_millis(2));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut behind = false;
             loop {
-                tick.tick().await;
+                if !behind {
+                    tick.tick().await;
+                }
+                behind = false;
                 // Read the watermark *before* draining: anything at or below it
                 // was sent to us before the watermark was published. Settle it
-                // under the sources lock (see add_remote).
-                let (w, prev) = {
+                // under the sources lock (see add_remote): from here on the
+                // merger owes exactly the events <= w of the logs it saw.
+                let w = {
                     let s = fh.sources.read();
                     let Some(w) = s.values().map(|s| s.get()).min() else {
                         continue;
                     };
-                    let prev = fh.position();
                     fh.settled.fetch_max(w, Ordering::AcqRel);
-                    (w, prev)
+                    w
                 };
+                let max = fh.max_queue_bytes.load(Ordering::Relaxed);
+                let store = fh.store.read().clone();
                 let mut late = 0usize;
                 loop {
-                    match rx.try_recv() {
-                        Ok(b) => {
-                            let h = high.entry(b.log_id.clone()).or_insert(i64::MIN);
-                            let q = queues.entry(b.log_id.clone()).or_default();
-                            for (seq, frame) in b.events {
-                                if seq <= *h {
-                                    continue;
-                                }
-                                *h = seq;
-                                // At or below what we already emitted: the start
-                                // of a follower's S3 catch-up (<= the start floor,
-                                // backfill serves it), or a late event (a log we
-                                // weren't following yet, or a watermark that
-                                // overpromised), which live order can't take.
-                                if seq <= prev {
-                                    if seq > fh.start_floor {
-                                        late += 1;
-                                    }
-                                    continue;
-                                }
-                                q.push_back((seq, frame));
-                            }
-                        }
+                    let b = match rx.try_recv() {
+                        Ok(b) => b,
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => return,
+                    };
+                    let lq = logs.entry(b.log_id.clone()).or_default();
+                    match &lq.spill {
+                        // already read back from S3, or will be
+                        Some(sp) if b.ordinal != sp.next || sp.end || total >= max / 2 => continue,
+                        Some(_) => {
+                            // the read-back met the live stream: queue it again
+                            tracing::info!(log_id = %b.log_id, ordinal = b.ordinal, "firehose merger: spilled log rejoined the live stream");
+                            lq.spill = None;
+                        }
+                        None if total >= max && store.is_some() => {
+                            tracing::warn!(log_id = %b.log_id, ordinal = b.ordinal, queued = total, "firehose merger: queue over budget, spilling log to S3 read-back");
+                            metrics::FIREHOSE_SPILLS.inc();
+                            lq.spill = Some(Spill { next: b.ordinal, loaded: lq.high, end: false });
+                            continue;
+                        }
+                        None => {}
+                    }
+                    total += lq.accept(b.events, emitted, fh.start_floor, &mut late);
+                }
+                // Read spilled logs back, up to w, a chunk at a time: emit only
+                // up to what every spilled log has loaded.
+                let mut bound = w;
+                if let Some(store) = &store {
+                    let chunk = (max / 16).max(1);
+                    for (log_id, lq) in logs.iter_mut() {
+                        let Some(sp) = &mut lq.spill else { continue };
+                        let mut caught_up = sp.end || sp.loaded >= w;
+                        let mut failed = false;
+                        while !caught_up && lq.bytes < chunk {
+                            match read_segment(store, log_id, sp.next).await {
+                                Ok(Some(LogObject::Segment(_, entries))) => {
+                                    metrics::FIREHOSE_SPILL_SEGMENTS.inc();
+                                    sp.next += 1;
+                                    let last = entries.last().map(|e| e.seq);
+                                    let events = entries.into_iter().filter(|e| !e.frame.is_empty()).map(|e| (e.seq, e.frame)).collect();
+                                    let LogQ { q, bytes, high, .. } = lq;
+                                    let n = accept_into(q, bytes, high, events, emitted, fh.start_floor, &mut late);
+                                    total += n;
+                                    if let Some(l) = last {
+                                        sp.loaded = sp.loaded.max(l);
+                                    }
+                                    caught_up = sp.loaded >= w;
+                                }
+                                // the fence: the log is complete
+                                Ok(Some(LogObject::Fence { .. })) => {
+                                    sp.end = true;
+                                    caught_up = true;
+                                }
+                                // not written: every event <= w of this log was
+                                // PUT before w was published, so all are loaded
+                                Ok(None) => caught_up = true,
+                                Err(e) => {
+                                    tracing::warn!(%log_id, ordinal = sp.next, "firehose merger: reading back a spilled log failed: {e:#}");
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !caught_up {
+                            bound = bound.min(sp.loaded);
+                            // more to read once this round is emitted (errors
+                            // wait for the next tick)
+                            behind |= !failed;
+                        }
                     }
                 }
                 if late > 0 {
-                    tracing::warn!(late, settled = prev, "firehose merger: dropped late events below the emitted watermark");
+                    tracing::warn!(late, emitted, "firehose merger: dropped late events below the emitted watermark");
                 }
                 let mut out = Vec::new();
-                for q in queues.values_mut() {
-                    while let Some((seq, _)) = q.front() {
-                        if *seq > w {
+                for lq in logs.values_mut() {
+                    while let Some((seq, f)) = lq.q.front() {
+                        if *seq > bound {
                             break;
                         }
-                        out.push(q.pop_front().unwrap());
+                        lq.bytes -= f.len();
+                        total -= f.len();
+                        out.push(lq.q.pop_front().unwrap());
                     }
                 }
+                emitted = emitted.max(bound);
+                // forget logs that are gone and fully emitted
+                {
+                    let s = fh.sources.read();
+                    logs.retain(|id, lq| !lq.q.is_empty() || s.contains_key(id) || lq.spill.as_ref().is_some_and(|sp| !sp.end));
+                }
+                fh.queued_bytes.store(total, Ordering::Relaxed);
+                metrics::FIREHOSE_MERGE_QUEUE_BYTES.set(total as i64);
                 if out.is_empty() {
                     continue;
                 }
@@ -339,6 +426,84 @@ impl Firehose {
     }
 }
 
+/// Default byte budget of the merger's queues (see `Firehose::spawn_merger`).
+pub const DEFAULT_MERGE_QUEUE_BYTES: usize = 256 << 20;
+
+/// One log's events waiting in the merger.
+#[derive(Default)]
+struct LogQ {
+    q: VecDeque<(i64, Bytes)>,
+    bytes: usize,
+    /// Highest seq accepted: drops duplicates when a log's events arrive
+    /// twice (S3 catch-up overlapping a live stream).
+    high: i64,
+    spill: Option<Spill>,
+}
+
+/// A log the merger stopped queueing: its batches are read back from S3.
+struct Spill {
+    /// next ordinal to read
+    next: u64,
+    /// every event of the log <= this is queued or emitted
+    loaded: i64,
+    /// read up to the log's fence
+    end: bool,
+}
+
+impl LogQ {
+    fn accept(&mut self, events: Vec<(i64, Bytes)>, emitted: i64, start_floor: i64, late: &mut usize) -> usize {
+        accept_into(&mut self.q, &mut self.bytes, &mut self.high, events, emitted, start_floor, late)
+    }
+}
+
+/// Queues a log's events in seq order; returns the bytes added.
+fn accept_into(
+    q: &mut VecDeque<(i64, Bytes)>,
+    bytes: &mut usize,
+    high: &mut i64,
+    events: Vec<(i64, Bytes)>,
+    emitted: i64,
+    start_floor: i64,
+    late: &mut usize,
+) -> usize {
+    let mut added = 0;
+    for (seq, frame) in events {
+        if seq <= *high {
+            continue;
+        }
+        *high = seq;
+        // At or below what we already emitted: the start of a follower's S3
+        // catch-up (<= the start floor, backfill serves it), or a late event
+        // (a log we weren't following yet, or a watermark that overpromised),
+        // which live order can't take.
+        if seq <= emitted {
+            if seq > start_floor {
+                *late += 1;
+            }
+            continue;
+        }
+        added += frame.len();
+        q.push_back((seq, frame));
+    }
+    *bytes += added;
+    added
+}
+
+/// A log object, checked against the path it was read from (None = missing).
+async fn read_segment(store: &crate::store::Store, log_id: &str, ordinal: u64) -> anyhow::Result<Option<LogObject>> {
+    use object_store::ObjectStoreExt;
+    let data = match store.raw.get(&crate::nodelog::segment_path(store, log_id, ordinal)).await {
+        Ok(r) => r.bytes().await?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let obj = segment::parse(data, false, None)?;
+    if let LogObject::Segment(h, _) = &obj {
+        anyhow::ensure!(h.log_id == log_id && h.ordinal == ordinal, "log object {log_id}/{ordinal} has header {}/{}", h.log_id, h.ordinal);
+    }
+    Ok(Some(obj))
+}
+
 async fn send_batches(
     ws: &mut WebSocket,
     batches: &[Arc<MergedBatch>],
@@ -374,4 +539,68 @@ fn info_frame(name: &str, message: &str) -> Vec<u8> {
     write_text(&mut out, "message");
     write_text(&mut out, message);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::segment::SegmentBuilder;
+    use object_store::{ObjectStoreExt, PutPayload};
+
+    async fn put_seg(store: &crate::store::Store, log: &str, ord: u64, seq: i64, frame_len: usize) -> LogBatch {
+        let frame = Bytes::from(vec![ord as u8; frame_len]);
+        let mut b = SegmentBuilder::new();
+        b.push(seq, 0, 1, |o| o.extend_from_slice(&frame), &[]);
+        let mut obj = b.header(log, ord);
+        obj.extend_from_slice(&b.body);
+        store.raw.put(&crate::nodelog::segment_path(store, log, ord), PutPayload::from(obj)).await.unwrap();
+        LogBatch { log_id: log.into(), ordinal: ord, events: vec![(seq, frame)] }
+    }
+
+    /// A stalled log holds the min watermark back while another keeps
+    /// writing: the merger's queue stays near its budget (the busy log is
+    /// read back from S3 later) and the merged stream is still complete and
+    /// in order once the stall ends.
+    #[tokio::test]
+    async fn merger_queue_is_bounded_while_a_log_stalls() {
+        let store = crate::store::Store::memory(None);
+        let fh = Firehose::new(64 << 20);
+        fh.set_max_queue_bytes(2000);
+        *fh.store.write() = Some(store.clone());
+        let (_, wa) = fh.add_remote("A");
+        let (_, wb) = fh.add_remote("B");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut sub = fh.tx.subscribe();
+        fh.spawn_merger(rx);
+        let base = fh.position();
+        let seq = |k: i64| base + k * 256 + 1;
+        let n = 60;
+        for k in 0..n {
+            tx.send(put_seg(&store, "B", k as u64, seq(2 * k + 1), 200).await).unwrap();
+            wb.store(seq(2 * k + 1), Ordering::Release);
+            if k % 8 == 0 {
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+            assert!(fh.queued_bytes() <= 2000 + 200, "queued {}", fh.queued_bytes());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(fh.queued_bytes() <= 2000 + 200, "queued {}", fh.queued_bytes());
+        // the stalled log delivers interleaved events, then catches up
+        for k in 0..n {
+            tx.send(put_seg(&store, "A", k as u64, seq(2 * k), 10).await).unwrap();
+        }
+        wa.store(seq(2 * n), Ordering::Release);
+        let mut got = Vec::new();
+        while got.len() < 2 * n as usize {
+            let b = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await.expect("merged stream stalled").unwrap();
+            got.extend(b.events.iter().map(|(s, _)| *s));
+        }
+        assert_eq!(got, (0..2 * n).map(seq).collect::<Vec<_>>());
+        // B rejoins the live stream after the read-back
+        tx.send(put_seg(&store, "B", n as u64, seq(2 * n + 1), 200).await).unwrap();
+        wb.store(seq(2 * n + 1), Ordering::Release);
+        wa.store(seq(2 * n + 1), Ordering::Release);
+        let b = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await.unwrap().unwrap();
+        assert_eq!(b.events[0].0, seq(2 * n + 1));
+    }
 }

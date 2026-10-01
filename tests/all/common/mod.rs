@@ -558,17 +558,23 @@ impl Xrpc {
     }
 
     pub async fn send(&self, rb: reqwest::RequestBuilder) -> Resp {
-        let r = rb.send().await.expect("http request");
+        self.try_send(rb).await.expect("http request")
+    }
+
+    /// Like `send`, but a transport error (e.g. the server answered and closed
+    /// before the request body was fully written) comes back as `Err`.
+    pub async fn try_send(&self, rb: reqwest::RequestBuilder) -> reqwest::Result<Resp> {
+        let r = rb.send().await?;
         let status = r.status().as_u16();
         let headers = r.headers().clone();
         let body = r.bytes().await.unwrap_or_default();
         let json = serde_json::from_slice(&body).unwrap_or(J::Null);
-        Resp {
+        Ok(Resp {
             status,
             headers,
             body,
             json,
-        }
+        })
     }
 
     pub async fn get(&self, nsid: &str, query: &[(&str, &str)], auth: &Auth) -> Resp {
@@ -606,6 +612,22 @@ impl Xrpc {
             .header("content-type", content_type)
             .body(body);
         self.send(Self::apply(rb, auth)).await
+    }
+
+    /// `post_bytes` that tolerates the server closing early (see `try_send`).
+    pub async fn try_post_bytes(
+        &self,
+        nsid: &str,
+        body: Vec<u8>,
+        content_type: &str,
+        auth: &Auth,
+    ) -> reqwest::Result<Resp> {
+        let rb = self
+            .http
+            .post(self.url(nsid))
+            .header("content-type", content_type)
+            .body(body);
+        self.try_send(Self::apply(rb, auth)).await
     }
 }
 
