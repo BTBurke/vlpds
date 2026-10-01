@@ -288,10 +288,7 @@ fn verify_sig(multibase: &str, msg: &[u8], sig: &[u8]) -> Result<bool, String> {
         .map_err(|e| e.to_string())?;
     match raw.as_slice() {
         [0xe7, 0x01, key @ ..] => {
-            use k256::ecdsa::signature::Verifier;
-            let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(key).map_err(|e| e.to_string())?;
-            let s = k256::ecdsa::Signature::from_slice(sig).map_err(|e| e.to_string())?;
-            Ok(vk.verify(msg, &s).is_ok())
+            crate::crypto::verify_k256(key, msg, sig).map_err(|e| e.to_string())
         }
         [0x80, 0x24, key @ ..] => {
             use p256::ecdsa::signature::Verifier;

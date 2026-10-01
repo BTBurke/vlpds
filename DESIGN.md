@@ -49,7 +49,7 @@ uploading, ack both in order), and **no per-commit MST storage churn**.
   previous commit to be durable; it builds on the in-memory head. Writes are
   acked in log order, so a client never sees commit N+1 acked before N.
 - Per commit: MST path rewrite (~log₄ n nodes, encode + SHA-256),
-  inversion proof, one k256 signature (25 µs measured). Estimated
+  inversion proof, one secp256k1 signature (13.5 µs with libsecp256k1; 25 µs with k256). Estimated
   60–80 µs CPU per commit → ~10k commits/s per repo before CPU saturates, so
   200/s per repo is comfortable.
 - `swapCommit` / `swapRecord` compare against the in-memory head, which includes

@@ -78,7 +78,7 @@ async fn issues_verifiable_token_for_bare_did_aud() {
 
     // ...and not against an unrelated key
     let other = vlpds::crypto::Keypair::generate();
-    assert!(verify_jwt(&j, other.sk.verifying_key()).is_err(), "JWT verified with an unrelated key");
+    assert!(verify_jwt(&j, &k256::ecdsa::VerifyingKey::from_sec1_bytes(&other.public_key_sec1()).unwrap()).is_err(), "JWT verified with an unrelated key");
 
     // each token is unique
     let t2 = service_auth(&s, &a.auth(), &[("aud", &aud), ("lxm", "com.atproto.server.describeServer")]).await.ok();

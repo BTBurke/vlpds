@@ -725,7 +725,7 @@ async fn validator_detects_tampering() {
     // 4. wrong signing key
     let other = vlpds::crypto::Keypair::generate();
     let mut k2 = HashMap::new();
-    k2.insert(a.did.clone(), *other.sk.verifying_key());
+    k2.insert(a.did.clone(), k256::ecdsa::VerifyingKey::from_sec1_bytes(&other.public_key_sec1()).unwrap());
     assert!(validate_stream(&s, &frames, &k2).await.0.iter().any(|f| f.contains("signature")), "bad signature not detected");
     // 5. op claims a different record CID than the tree holds
     let mut t = frames.clone();

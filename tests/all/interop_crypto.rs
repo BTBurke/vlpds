@@ -58,7 +58,9 @@ fn w3c_did_key_k256_from_private_key() {
         assert_eq!(kp.did_key(), c.public_did_key);
         // and the did:key decodes back to the same public key
         let vk = decode_did_key_k256(&c.public_did_key).unwrap();
-        assert_eq!(&vk, kp.sk.verifying_key());
+        assert_eq!(vk.to_encoded_point(true).as_bytes(), &kp.public_key_sec1()[..]);
+        // and to_bytes round-trips the fixture's private key
+        assert_eq!(hex::encode(kp.to_bytes()), c.private_key_bytes_hex.to_lowercase());
     }
 }
 
@@ -88,8 +90,13 @@ fn signature_fixtures_k256() {
     for c in cases.iter().filter(|c| c.algorithm == "ES256K") {
         n += 1;
         let key = decode_did_key_k256(&c.public_key_did).unwrap();
-        let ok = atproto_verify_k256(&key, &b64(&c.message_base64), &b64(&c.signature_base64));
+        let (msg, sig) = (b64(&c.message_base64), b64(&c.signature_base64));
+        let ok = atproto_verify_k256(&key, &msg, &sig);
         assert_eq!(ok, c.valid_signature, "{}", c.comment);
+        // the production verifier (libsecp256k1) agrees, incl. rejecting high-S
+        let pk = key.to_encoded_point(true);
+        let ours = vlpds::crypto::verify_k256(pk.as_bytes(), &msg, &sig).unwrap_or(false);
+        assert_eq!(ours, c.valid_signature, "vlpds::crypto::verify_k256: {}", c.comment);
     }
     assert!(n >= 3);
 }
@@ -163,4 +170,64 @@ fn service_auth_jwt_is_es256k_and_verifies() {
         format!("{}.{}", parts[0], parts[1]).as_bytes(),
         &dec(parts[2])
     ));
+}
+
+#[test]
+fn signatures_byte_identical_to_rustcrypto_k256() {
+    // libsecp256k1 and k256 both use RFC 6979 nonces: after low-S
+    // normalization the compact signatures must match byte for byte.
+    use k256::ecdsa::signature::Signer;
+    for k in 0..16u32 {
+        let kp = vlpds::crypto::Keypair::generate();
+        let sk = k256::ecdsa::SigningKey::from_slice(&kp.to_bytes()).unwrap();
+        assert_eq!(
+            sk.verifying_key().to_encoded_point(true).as_bytes(),
+            &kp.public_key_sec1()[..]
+        );
+        for i in 0..64u32 {
+            let msg = format!("commit {k} {i} {}", "x".repeat(i as usize));
+            let theirs: k256::ecdsa::Signature = sk.sign(msg.as_bytes());
+            let theirs = theirs.normalize_s().unwrap_or(theirs);
+            assert_eq!(kp.sign(msg.as_bytes())[..], theirs.to_bytes()[..], "key {k} msg {i}");
+            assert!(vlpds::crypto::verify_k256(&kp.public_key_sec1(), msg.as_bytes(), &theirs.to_bytes()).unwrap());
+            assert!(!vlpds::crypto::verify_k256(&kp.public_key_sec1(), b"other", &theirs.to_bytes()).unwrap());
+        }
+    }
+    // malformed encodings are errors, not panics
+    let kp = vlpds::crypto::Keypair::generate();
+    assert!(vlpds::crypto::verify_k256(&[0u8; 33], b"m", &kp.sign(b"m")).is_err());
+    assert!(vlpds::crypto::verify_k256(&kp.public_key_sec1(), b"m", &[0u8; 63]).is_err());
+    assert!(vlpds::crypto::Keypair::from_bytes(&[0u8; 32]).is_err());
+}
+
+/// Throughput of the commit-signing path. Run with
+/// `cargo test --profile dev-release --test all -- --ignored --nocapture sign_verify_bench`.
+#[test]
+#[ignore]
+fn sign_verify_bench() {
+    let kp = vlpds::crypto::Keypair::generate();
+    let msg = vec![7u8; 200];
+    let sig = kp.sign(&msg);
+    let pk = kp.public_key_sec1();
+    let n = 20_000;
+    let mut sign = || {
+        std::hint::black_box(kp.sign(&msg));
+    };
+    let mut verify = || {
+        std::hint::black_box(vlpds::crypto::verify_k256(&pk, &msg, &sig).unwrap());
+    };
+    let cases: [(&str, &mut dyn FnMut()); 2] = [("sign", &mut sign), ("verify", &mut verify)];
+    for (name, f) in cases {
+        let mut runs: Vec<f64> = (0..7)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                for _ in 0..n {
+                    f();
+                }
+                t.elapsed().as_nanos() as f64 / n as f64 / 1000.0
+            })
+            .collect();
+        runs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("{name}: median {:.2} µs", runs[3]);
+    }
 }
