@@ -1,0 +1,74 @@
+[package]
+name = "vlpds"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["jemalloc"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# A/B alternative: cargo build --release --no-default-features --features mimalloc
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+slatedb = { version = "0.17", features = ["aws", "wal_disable"] }
+object_store = { version = "0.14", features = ["aws"] }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws", "macros", "http2"] }
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha2 = { version = "0.10", features = ["asm"] }
+rand = "0.8"
+anyhow = "1"
+argon2 = { version = "0.5", features = ["std"] }
+async-trait = "0.1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+lru = "0.12"
+base64 = "0.22"
+hmac = "0.12"
+sha1 = "0.10"
+futures = "0.3"
+hdrhistogram = "7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls", "stream"] }
+tokio-tungstenite = "0.26"
+tikv-jemallocator = { version = "0.7", optional = true }
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"], optional = true }
+mimalloc = { version = "0.1", optional = true }
+prometheus = { version = "0.14", default-features = false }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
+bs58 = "0.5"
+hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# OAuth (src/oauth): ES256 (P-256) for DPoP proofs, client assertions and access tokens;
+# DNS TXT lookups for lexicon authority resolution (include: permission sets).
+p256 = { version = "0.13", features = ["ecdsa"] }
+hickory-resolver = "0.25"
+# HTTP: server-wide CORS, response compression (json/car) and request
+# Content-Encoding decoding, as the reference PDS does.
+# grapheme counts for lexicon maxGraphemes (src/lexicon.rs)
+unicode-segmentation = "1"
+tower = { version = "0.5", features = ["util"] }
+# embedded web UI (ui/dist, built by `just ui`; build.rs leaves a placeholder)
+rust-embed = { version = "8", features = ["mime-guess"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "decompression-gzip", "decompression-deflate"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# keep symbols for profiling (sample/perf/pprof)
+debug = 1
+
+# fast iteration builds: `cargo build --profile dev-release`
+[profile.dev-release]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true

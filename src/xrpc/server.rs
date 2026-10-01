@@ -1,0 +1,2677 @@
+//! com.atproto.server.* (sessions, accounts, app passwords, email flows,
+//! invites, service auth), com.atproto.temp.{checkSignupQueue,
+//! checkHandleAvailability} and the vlpds.server.*Totp second factor.
+//!
+//! Durable state (all through the partition log via `put_private` /
+//! `account_op`):
+//!   p/{did}\0sess/{refresh id}     refresh-token session (rotated on refresh)
+//!   p/{did}\0apppass/{name}        app password metadata
+//!   p/{did}\0apphash/{hash}        app password hash -> name (login lookup)
+//!   p/{did}\0etok/{purpose}        current email token per purpose
+//!   p/{did}\0totp                  TOTP state (src/totp.rs)
+//!   p/_reset:{TOKEN}\0t            password-reset token -> did
+//!   p/_invite:{code}\0c            invite code (+ p/{account}\0invite/{code} index)
+//!   p/_revoked\0f/{family}         revoked session family (access tokens), TTL'd
+//!   p/_revoked\0d/{did}            all sessions of a DID revoked before a time
+//!   {prefix}/email/{sha256(email)} global email claim -> did (object store,
+//!                                  conditional create, like handle claims)
+//! Account fields owned here live in `Account.extra`: deactivatedAt,
+//! deleteAfter, takedownRef, emailConfirmedAt, invitesDisabled, invitedBy,
+//! totpEnabled.
+//!
+//! Access tokens carry `jti` = session family id (`{issue micros:016x}{rand}`),
+//! refresh tokens `jti` = refresh id. `verify_bearer` checks revocations
+//! against in-memory maps (loaded from `p/_revoked` and refreshed every few
+//! seconds), so the hot path does no storage reads.
+
+use super::authn::Credentials;
+use super::*;
+use crate::segment::Mutation;
+use crate::worker::AccountOp;
+use parking_lot::{Mutex as PMutex, RwLock};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64};
+
+pub fn routes() -> Router<Arc<App>> {
+    Router::new()
+        .route(
+            "/xrpc/com.atproto.server.describeServer",
+            get(describe_server),
+        )
+        .route(
+            "/xrpc/com.atproto.server.createAccount",
+            post(create_account),
+        )
+        .route(
+            "/xrpc/com.atproto.server.createSession",
+            post(create_session),
+        )
+        .route("/xrpc/com.atproto.server.getSession", get(get_session))
+        .route(
+            "/xrpc/com.atproto.server.refreshSession",
+            post(refresh_session),
+        )
+        .route(
+            "/xrpc/com.atproto.server.deleteSession",
+            post(delete_session),
+        )
+        .route(
+            "/xrpc/com.atproto.server.createAppPassword",
+            post(create_app_password),
+        )
+        .route(
+            "/xrpc/com.atproto.server.listAppPasswords",
+            get(list_app_passwords),
+        )
+        .route(
+            "/xrpc/com.atproto.server.revokeAppPassword",
+            post(revoke_app_password),
+        )
+        .route(
+            "/xrpc/com.atproto.server.deactivateAccount",
+            post(deactivate_account),
+        )
+        .route(
+            "/xrpc/com.atproto.server.activateAccount",
+            post(activate_account),
+        )
+        .route(
+            "/xrpc/com.atproto.server.checkAccountStatus",
+            get(check_account_status),
+        )
+        .route(
+            "/xrpc/com.atproto.server.requestAccountDelete",
+            post(request_account_delete),
+        )
+        .route(
+            "/xrpc/com.atproto.server.deleteAccount",
+            post(delete_account),
+        )
+        .route(
+            "/xrpc/com.atproto.server.reserveSigningKey",
+            post(reserve_signing_key),
+        )
+        .route(
+            "/xrpc/com.atproto.server.requestEmailConfirmation",
+            post(request_email_confirmation),
+        )
+        .route("/xrpc/com.atproto.server.confirmEmail", post(confirm_email))
+        .route(
+            "/xrpc/com.atproto.server.requestEmailUpdate",
+            post(request_email_update),
+        )
+        .route("/xrpc/com.atproto.server.updateEmail", post(update_email))
+        .route(
+            "/xrpc/com.atproto.server.requestPasswordReset",
+            post(request_password_reset),
+        )
+        .route(
+            "/xrpc/com.atproto.server.resetPassword",
+            post(reset_password),
+        )
+        .route(
+            "/xrpc/com.atproto.server.createInviteCode",
+            post(create_invite_code),
+        )
+        .route(
+            "/xrpc/com.atproto.server.createInviteCodes",
+            post(create_invite_codes),
+        )
+        .route(
+            "/xrpc/com.atproto.server.getAccountInviteCodes",
+            get(get_account_invite_codes),
+        )
+        .route(
+            "/xrpc/com.atproto.server.getServiceAuth",
+            get(get_service_auth),
+        )
+        .route(
+            "/xrpc/com.atproto.temp.checkSignupQueue",
+            get(check_signup_queue),
+        )
+        .route(
+            "/xrpc/com.atproto.temp.checkHandleAvailability",
+            get(check_handle_availability),
+        )
+        .route("/xrpc/vlpds.server.setupTotp", post(setup_totp))
+        .route("/xrpc/vlpds.server.confirmTotp", post(confirm_totp))
+        .route("/xrpc/vlpds.server.disableTotp", post(disable_totp))
+        .route("/xrpc/vlpds.server.getTotpStatus", get(get_totp_status))
+}
+
+// ---------------------------------------------------------------------------
+// constants, small helpers
+// ---------------------------------------------------------------------------
+
+const ACCESS_TTL: u64 = 2 * 3600;
+const REFRESH_TTL: u64 = 90 * 86400;
+/// A rotated refresh token stays usable this long (reference REFRESH_GRACE_MS).
+const REFRESH_GRACE: u64 = 2 * 3600;
+/// How long a revocation must be remembered for access tokens: their lifetime + slack.
+const REVOKE_TTL: u64 = ACCESS_TTL + 600;
+/// Revocation/takedown sets are re-read from storage this often (other nodes' changes).
+const RELOAD_SECS: u64 = 10;
+const EMAIL_TOKEN_TTL_MS: u64 = 15 * 60 * 1000;
+pub(super) const NEW_PASSWORD_MAX_LENGTH: usize = 256;
+pub(super) const OLD_PASSWORD_MAX_LENGTH: usize = 512;
+
+pub(super) const REVOKED: &str = "_revoked";
+pub(super) const TAKEDOWNS: &str = "_takedowns";
+
+pub(super) const SCOPE_ACCESS: &str = "com.atproto.access";
+pub(super) const SCOPE_APP_PASS: &str = "com.atproto.appPass";
+pub(super) const SCOPE_APP_PASS_PRIVILEGED: &str = "com.atproto.appPassPrivileged";
+pub(super) const SCOPE_REFRESH: &str = "com.atproto.refresh";
+/// Access scope of a taken-down account's restricted session.
+pub(super) const SCOPE_TAKENDOWN: &str = "com.atproto.takendown";
+
+pub(super) fn now_secs() -> u64 {
+    crate::tid::now_micros() / 1_000_000
+}
+
+pub(super) fn now_ms() -> u64 {
+    crate::tid::now_micros() / 1000
+}
+
+fn err(status: StatusCode, error: &str, message: impl Into<String>) -> XrpcError {
+    XrpcError {
+        status,
+        error: error.into(),
+        message: message.into(),
+    }
+}
+
+pub(super) fn invalid_request(message: impl Into<String>) -> XrpcError {
+    XrpcError::bad("InvalidRequest", message)
+}
+
+fn invalid_token(message: &str) -> XrpcError {
+    XrpcError::bad("InvalidToken", message)
+}
+
+fn expired_token(message: &str) -> XrpcError {
+    XrpcError::bad("ExpiredToken", message)
+}
+
+fn auth_required(message: &str) -> XrpcError {
+    err(StatusCode::UNAUTHORIZED, "AuthenticationRequired", message)
+}
+
+pub(super) fn takedown_error() -> XrpcError {
+    err(
+        StatusCode::UNAUTHORIZED,
+        "AccountTakedown",
+        "Account has been taken down",
+    )
+}
+
+fn oauth_forbidden() -> XrpcError {
+    err(
+        StatusCode::FORBIDDEN,
+        "Forbidden",
+        "OAuth credentials are not supported for this endpoint",
+    )
+}
+
+fn bad_scope() -> XrpcError {
+    invalid_token("Bad token scope")
+}
+
+fn random_hex(n: usize) -> String {
+    let b: Vec<u8> = (0..n).map(|_| rand::random::<u8>()).collect();
+    hex::encode(b)
+}
+
+/// TS getRandomToken(): `xxxxx-xxxxx` in base32.
+pub(super) fn random_token() -> String {
+    let s = crate::cid::base32_encode(&rand::random::<[u8; 8]>());
+    format!("{}-{}", &s[..5], &s[5..10])
+}
+
+pub(super) fn pmut(routing: &str, name: &str, val: Option<Vec<u8>>) -> Mutation {
+    Mutation {
+        key: state::private_key(routing, name).into(),
+        val: val.map(Bytes::from),
+    }
+}
+
+pub(super) fn to_json_bytes<T: serde::Serialize>(v: &T) -> Vec<u8> {
+    serde_json::to_vec(v).expect("serializable")
+}
+
+pub(super) async fn get_json<T: serde::de::DeserializeOwned>(
+    app: &App,
+    routing: &str,
+    name: &str,
+) -> XResult<Option<T>> {
+    match app.get_private(routing, name).await? {
+        Some(v) => Ok(Some(
+            serde_json::from_slice(&v).map_err(XrpcError::from_err)?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// All private entries of `routing` whose name starts with `name_prefix`:
+/// (name, value) pairs.
+pub(super) async fn scan_private(
+    app: &App,
+    routing: &str,
+    name_prefix: &str,
+) -> XResult<Vec<(String, Bytes)>> {
+    let p = app.partition(routing)?;
+    let base = state::private_prefix(routing);
+    let lo = [base.as_slice(), name_prefix.as_bytes()].concat();
+    let hi = state::prefix_end(&lo);
+    let mut iter = p.db.scan(lo..hi).await.map_err(XrpcError::from_err)?;
+    let mut out = Vec::new();
+    while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
+        out.push((
+            String::from_utf8_lossy(&kv.key[base.len()..]).to_string(),
+            kv.value,
+        ));
+    }
+    Ok(out)
+}
+
+/// Every private entry whose routing key starts with `routing_prefix`,
+/// across all partitions this node owns: (routing key, name, value).
+pub(super) async fn scan_private_routing(
+    app: &App,
+    routing_prefix: &str,
+) -> XResult<Vec<(String, String, Bytes)>> {
+    let lo = [b"p/".as_slice(), routing_prefix.as_bytes()].concat();
+    let hi = state::prefix_end(&lo);
+    let mut out = Vec::new();
+    for p in app.partitions.owned() {
+        let mut iter =
+            p.db.scan(lo.clone()..hi.clone())
+                .await
+                .map_err(XrpcError::from_err)?;
+        while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
+            let rest = String::from_utf8_lossy(&kv.key[2..]).to_string();
+            if let Some((routing, name)) = rest.split_once('\0') {
+                out.push((routing.to_string(), name.to_string(), kv.value));
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub(super) fn set_extra(a: &mut Account, k: &str, v: J) {
+    if v.is_null() {
+        a.extra.remove(k);
+    } else {
+        a.extra.insert(k.to_string(), v);
+    }
+}
+
+/// Derives `Account.status` from the flags owned here: a takedown wins over a
+/// deactivation; other statuses (e.g. "suspended") set elsewhere are kept.
+pub(super) fn recompute_status(a: &mut Account) {
+    if a.extra.get("takedownRef").is_some_and(|v| !v.is_null()) {
+        a.status = Some("takendown".into());
+    } else if a.extra.get("deactivatedAt").is_some_and(|v| !v.is_null()) {
+        a.status = Some("deactivated".into());
+    } else if matches!(a.status.as_deref(), Some("takendown") | Some("deactivated")) {
+        a.status = None;
+    }
+}
+
+pub(super) fn is_takendown_account(a: &Account) -> bool {
+    matches!(a.status.as_deref(), Some("takendown") | Some("suspended"))
+}
+
+/// (active, status) as in the reference's formatAccountStatus.
+fn account_status(a: &Account) -> (bool, Option<String>) {
+    (a.status.is_none(), a.status.clone())
+}
+
+pub(super) async fn verify_password(a: &Account, password: &str) -> bool {
+    if password.len() > OLD_PASSWORD_MAX_LENGTH || a.password_hash.is_empty() {
+        return false;
+    }
+    state::verify_password_hash(&a.password_hash, password).await
+}
+
+pub(super) fn valid_email(e: &str) -> bool {
+    let Some((local, domain)) = e.rsplit_once('@') else {
+        return false;
+    };
+    e.len() <= 254
+        && !local.is_empty()
+        && local.len() <= 64
+        && !e.chars().any(|c| c.is_whitespace() || c.is_control())
+        && !local.contains('@')
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && domain
+            .split('.')
+            .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+}
+
+fn user_did(creds: &Credentials) -> XResult<String> {
+    creds
+        .did()
+        .map(str::to_string)
+        .ok_or_else(|| auth_required("user credentials required"))
+}
+
+/// Full-access session only (the reference's ACCESS_FULL; OAuth refused).
+fn full_access(creds: &Credentials) -> XResult<String> {
+    match creds {
+        // (takendown tokens only reach the methods that accept them)
+        Credentials::Session { did } | Credentials::Takendown { did } => Ok(did.clone()),
+        Credentials::AppPassword { .. } => Err(bad_scope()),
+        Credentials::OAuth { .. } => Err(oauth_forbidden()),
+        Credentials::Admin => Err(auth_required("user credentials required")),
+    }
+}
+
+/// Session or app password (the reference's ACCESS_STANDARD; OAuth refused).
+fn standard_no_oauth(creds: &Credentials) -> XResult<String> {
+    match creds {
+        Credentials::Session { did }
+        | Credentials::AppPassword { did, .. }
+        | Credentials::Takendown { did } => Ok(did.clone()),
+        Credentials::OAuth { .. } => Err(oauth_forbidden()),
+        Credentials::Admin => Err(auth_required("user credentials required")),
+    }
+}
+
+/// Full session, or OAuth holding `account:{attr}?action={action}`.
+fn full_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> XResult<String> {
+    match creds {
+        Credentials::OAuth { did, .. } => {
+            creds.require(creds.allows_account(attr, action))?;
+            Ok(did.clone())
+        }
+        _ => full_access(creds),
+    }
+}
+
+/// Session/app password, or OAuth holding `account:{attr}?action={action}`.
+fn standard_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> XResult<String> {
+    match creds {
+        Credentials::OAuth { did, .. } => {
+            creds.require(creds.allows_account(attr, action))?;
+            Ok(did.clone())
+        }
+        _ => standard_no_oauth(creds),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// per-App in-memory state: revocations, takedowns, dev mailbox, locks
+// ---------------------------------------------------------------------------
+
+pub(super) struct Ext {
+    /// revoked session family -> expiry (unix secs)
+    families: RwLock<HashMap<String, u64>>,
+    /// did -> (sessions issued at or before this many micros are revoked, expiry secs)
+    dids: RwLock<HashMap<String, (u64, u64)>>,
+    /// taken-down subjects: at:// URIs, bare blob CIDs and "blob/{did}/{cid}"
+    takedowns: RwLock<HashSet<String>>,
+    loaded: AtomicBool,
+    loading: tokio::sync::Mutex<()>,
+    last_load: AtomicU64,
+    /// bumped by every local change, so a concurrent reload merges instead of replacing
+    gen: AtomicU64,
+    pub(super) dev_mail: PMutex<HashMap<String, Vec<Mail>>>,
+    locks: Vec<tokio::sync::Mutex<()>>,
+}
+
+static EXTS: RwLock<Vec<(usize, Arc<Ext>)>> = RwLock::new(Vec::new());
+
+pub(super) fn ext(app: &App) -> Arc<Ext> {
+    let id = app as *const App as usize;
+    if let Some((_, e)) = EXTS.read().iter().find(|(k, _)| *k == id) {
+        return e.clone();
+    }
+    let mut w = EXTS.write();
+    if let Some((_, e)) = w.iter().find(|(k, _)| *k == id) {
+        return e.clone();
+    }
+    let e = Arc::new(Ext {
+        families: RwLock::new(HashMap::new()),
+        dids: RwLock::new(HashMap::new()),
+        takedowns: RwLock::new(HashSet::new()),
+        loaded: AtomicBool::new(false),
+        loading: tokio::sync::Mutex::new(()),
+        last_load: AtomicU64::new(0),
+        gen: AtomicU64::new(0),
+        dev_mail: PMutex::new(HashMap::new()),
+        locks: (0..64).map(|_| tokio::sync::Mutex::new(())).collect(),
+    });
+    w.push((id, e.clone()));
+    e
+}
+
+impl Ext {
+    /// Serializes read-modify-write of one account/key on this node.
+    pub(super) async fn lock(&self, key: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        self.locks[(state::did_hash(key) % self.locks.len() as u64) as usize]
+            .lock()
+            .await
+    }
+
+    fn is_revoked(&self, did: &str, jti: Option<&str>, iat: u64) -> bool {
+        let issued_us = jti
+            .and_then(family_micros)
+            .unwrap_or(iat.saturating_mul(1_000_000));
+        {
+            let d = self.dids.read();
+            if !d.is_empty() {
+                if let Some((before, _)) = d.get(did) {
+                    if issued_us <= *before {
+                        return true;
+                    }
+                }
+            }
+        }
+        if let Some(j) = jti {
+            let f = self.families.read();
+            if !f.is_empty() && f.contains_key(j) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(super) fn has_takedown(&self, subject: &str) -> bool {
+        let t = self.takedowns.read();
+        !t.is_empty() && t.contains(subject)
+    }
+
+    pub(super) fn set_takedown(&self, subjects: &[String], applied: bool) {
+        self.gen.fetch_add(1, Ordering::SeqCst);
+        let mut t = self.takedowns.write();
+        for s in subjects {
+            if applied {
+                t.insert(s.clone());
+            } else {
+                t.remove(s);
+            }
+        }
+    }
+}
+
+/// Issue time (micros) encoded in a session family id.
+fn family_micros(jti: &str) -> Option<u64> {
+    if jti.len() < 16 {
+        return None;
+    }
+    u64::from_str_radix(&jti[..16], 16).ok()
+}
+
+fn new_family_id() -> String {
+    format!("{:016x}{}", crate::tid::now_micros(), random_hex(8))
+}
+
+/// In-memory takedown keys for a stored takedown entry name.
+pub(super) fn takedown_keys(name: &str) -> Vec<String> {
+    if let Some(uri) = name.strip_prefix("rec/") {
+        vec![uri.to_string()]
+    } else if let Some(rest) = name.strip_prefix("blob/") {
+        let cid = rest.rsplit_once('/').map(|(_, c)| c).unwrap_or(rest);
+        vec![name.to_string(), cid.to_string()]
+    } else {
+        vec![]
+    }
+}
+
+type Sets = (
+    HashMap<String, u64>,
+    HashMap<String, (u64, u64)>,
+    HashSet<String>,
+);
+
+async fn load_sets(app: &App) -> XResult<Sets> {
+    let now = now_secs();
+    let mut fams = HashMap::new();
+    let mut dids = HashMap::new();
+    let mut tds = HashSet::new();
+    if app.partition(REVOKED).is_ok() {
+        for (name, v) in scan_private(app, REVOKED, "").await? {
+            let Ok(j) = serde_json::from_slice::<J>(&v) else {
+                continue;
+            };
+            let exp = j["exp"].as_u64().unwrap_or(0);
+            if exp < now {
+                continue;
+            }
+            if let Some(f) = name.strip_prefix("f/") {
+                fams.insert(f.to_string(), exp);
+            } else if let Some(d) = name.strip_prefix("d/") {
+                dids.insert(d.to_string(), (j["before"].as_u64().unwrap_or(0), exp));
+            }
+        }
+    }
+    if app.partition(TAKEDOWNS).is_ok() {
+        for (name, _) in scan_private(app, TAKEDOWNS, "").await? {
+            tds.extend(takedown_keys(&name));
+        }
+    }
+    Ok((fams, dids, tds))
+}
+
+/// Makes sure the revocation/takedown sets are loaded (first call awaits the
+/// scan) and refreshes them every RELOAD_SECS (one request pays for it).
+pub(super) async fn ensure_loaded(app: &App, e: &Ext) {
+    let now = now_secs();
+    if e.loaded.load(Ordering::Acquire)
+        && now.saturating_sub(e.last_load.load(Ordering::Relaxed)) < RELOAD_SECS
+    {
+        return;
+    }
+    let _g = match e.loading.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            if e.loaded.load(Ordering::Acquire) {
+                return; // someone else is refreshing; serve the current view
+            }
+            e.loading.lock().await
+        }
+    };
+    if e.loaded.load(Ordering::Acquire)
+        && now.saturating_sub(e.last_load.load(Ordering::Relaxed)) < RELOAD_SECS
+    {
+        return;
+    }
+    let gen0 = e.gen.load(Ordering::SeqCst);
+    match load_sets(app).await {
+        Ok((fams, dids, tds)) => {
+            let replace = e.gen.load(Ordering::SeqCst) == gen0;
+            let mut f = e.families.write();
+            let mut d = e.dids.write();
+            let mut t = e.takedowns.write();
+            if replace {
+                *f = fams;
+                *d = dids;
+                *t = tds;
+            } else {
+                f.extend(fams);
+                d.extend(dids);
+                t.extend(tds);
+            }
+            f.retain(|_, exp| *exp >= now);
+            d.retain(|_, (_, exp)| *exp >= now);
+        }
+        Err(err) => tracing::warn!(
+            "loading session revocations/takedowns failed: {}",
+            err.message
+        ),
+    }
+    e.last_load.store(now, Ordering::Relaxed);
+    e.loaded.store(true, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------------
+// mail
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Mail {
+    pub to: String,
+    pub subject: String,
+    pub body: String,
+    /// confirm_email | update_email | reset_password | delete_account | plc_operation | admin
+    pub purpose: String,
+    pub token: Option<String>,
+    pub sent_at: String,
+}
+
+/// Outbound email. The default logs; a real SMTP/API mailer can be installed
+/// once at startup with `set_mailer`.
+pub trait Mailer: Send + Sync {
+    fn send(&self, mail: &Mail);
+}
+
+pub struct LogMailer;
+
+impl Mailer for LogMailer {
+    fn send(&self, m: &Mail) {
+        tracing::info!(to = %m.to, subject = %m.subject, purpose = %m.purpose, token = ?m.token, "mail (log mailer)");
+    }
+}
+
+static MAILER: std::sync::OnceLock<Box<dyn Mailer>> = std::sync::OnceLock::new();
+
+#[allow(dead_code)]
+pub fn set_mailer(m: Box<dyn Mailer>) -> bool {
+    MAILER.set(m).is_ok()
+}
+
+/// Sends through the mailer; in dev mode also keeps it in the per-address
+/// dev mailbox (vlpds.admin.getDevMail).
+pub(super) fn deliver(
+    app: &App,
+    to: &str,
+    subject: &str,
+    body: &str,
+    purpose: &str,
+    token: Option<&str>,
+) {
+    let mail = Mail {
+        to: to.to_string(),
+        subject: subject.to_string(),
+        body: body.to_string(),
+        purpose: purpose.to_string(),
+        token: token.map(str::to_string),
+        sent_at: crate::events::now_rfc3339(),
+    };
+    MAILER.get_or_init(|| Box::new(LogMailer)).send(&mail);
+    if app.config.dev_mode {
+        let e = ext(app);
+        let mut box_ = e.dev_mail.lock();
+        let v = box_.entry(to.to_ascii_lowercase()).or_default();
+        v.push(mail);
+        if v.len() > 50 {
+            v.remove(0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// email tokens
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EmailToken {
+    token: String,
+    requested_at: u64,
+}
+
+pub(super) const EMAIL_PURPOSES: &[&str] = &[
+    "confirm_email",
+    "update_email",
+    "reset_password",
+    "delete_account",
+    "plc_operation",
+];
+
+/// Creates (replacing any previous) the account's token for `purpose`.
+pub(super) async fn create_email_token(app: &App, did: &str, purpose: &str) -> XResult<String> {
+    let token = random_token().to_ascii_uppercase();
+    let rec = EmailToken {
+        token: token.clone(),
+        requested_at: now_ms(),
+    };
+    app.put_private(
+        did,
+        vec![pmut(
+            did,
+            &format!("etok/{purpose}"),
+            Some(to_json_bytes(&rec)),
+        )],
+    )
+    .await?;
+    if purpose == "reset_password" {
+        let routing = format!("_reset:{token}");
+        app.put_private(
+            &routing,
+            vec![pmut(&routing, "t", Some(did.as_bytes().to_vec()))],
+        )
+        .await?;
+    }
+    Ok(token)
+}
+
+pub(super) async fn assert_email_token(
+    app: &App,
+    did: &str,
+    purpose: &str,
+    token: &str,
+) -> XResult<()> {
+    let rec: Option<EmailToken> = get_json(app, did, &format!("etok/{purpose}")).await?;
+    let Some(rec) = rec else {
+        return Err(invalid_token("Token is invalid"));
+    };
+    if !rec.token.eq_ignore_ascii_case(token.trim()) {
+        return Err(invalid_token("Token is invalid"));
+    }
+    if now_ms().saturating_sub(rec.requested_at) > EMAIL_TOKEN_TTL_MS {
+        return Err(expired_token("Token is expired"));
+    }
+    Ok(())
+}
+
+pub(super) async fn delete_email_tokens(app: &App, did: &str, purposes: &[&str]) -> XResult<()> {
+    let muts = purposes
+        .iter()
+        .map(|p| pmut(did, &format!("etok/{p}"), None))
+        .collect();
+    app.put_private(did, muts).await
+}
+
+// ---------------------------------------------------------------------------
+// email claims (global uniqueness via conditional create, like handles)
+// ---------------------------------------------------------------------------
+
+fn email_path(app: &App, email: &str) -> object_store::path::Path {
+    let h = hex::encode(Sha256::digest(email.to_ascii_lowercase().as_bytes()));
+    object_store::path::Path::from(format!("{}/email/{}", app.store.prefix, h))
+}
+
+pub(super) async fn did_by_email(app: &App, email: &str) -> XResult<Option<String>> {
+    match app.store.raw.get(&email_path(app, email)).await {
+        Ok(r) => Ok(Some(
+            String::from_utf8_lossy(&r.bytes().await.map_err(XrpcError::from_err)?).to_string(),
+        )),
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(XrpcError::from_err(e)),
+    }
+}
+
+/// Claims `email` for `did`. Ok(false) when another account holds it.
+pub(super) async fn claim_email(app: &App, email: &str, did: &str) -> XResult<bool> {
+    let opts = PutOptions {
+        mode: PutMode::Create,
+        ..Default::default()
+    };
+    match app
+        .store
+        .raw
+        .put_opts(
+            &email_path(app, email),
+            PutPayload::from(did.as_bytes().to_vec()),
+            opts,
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            let holder = did_by_email(app, email).await?;
+            if holder.as_deref() == Some(did) {
+                return Ok(true);
+            }
+            // stale claim from a deleted account
+            if let Some(h) = &holder {
+                if app.partition(h).is_ok() && app.account(h).await.is_err() {
+                    app.store
+                        .raw
+                        .put(
+                            &email_path(app, email),
+                            PutPayload::from(did.as_bytes().to_vec()),
+                        )
+                        .await
+                        .map_err(XrpcError::from_err)?;
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Err(e) => Err(XrpcError::from_err(e)),
+    }
+}
+
+/// Releases `email` if `did` holds it.
+pub(super) async fn release_email(app: &App, email: &str, did: &str) {
+    if did_by_email(app, email).await.ok().flatten().as_deref() == Some(did) {
+        if let Err(e) = app.store.raw.delete(&email_path(app, email)).await {
+            tracing::warn!(%did, "failed to release email claim: {e}");
+        }
+    }
+}
+
+fn handle_path(app: &App, handle: &str) -> object_store::path::Path {
+    object_store::path::Path::from(format!("{}/handle/{}", app.store.prefix, handle))
+}
+
+/// Claims `handle` for `did` (conditional create). Ok(false) when taken.
+pub(super) async fn claim_handle(app: &App, handle: &str, did: &str) -> XResult<bool> {
+    let opts = PutOptions {
+        mode: PutMode::Create,
+        ..Default::default()
+    };
+    match app
+        .store
+        .raw
+        .put_opts(
+            &handle_path(app, handle),
+            PutPayload::from(did.as_bytes().to_vec()),
+            opts,
+        )
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(object_store::Error::AlreadyExists { .. }) => {
+            Ok(app.resolve_handle(handle).await?.as_deref() == Some(did))
+        }
+        Err(e) => Err(XrpcError::from_err(e)),
+    }
+}
+
+pub(super) async fn release_handle(app: &App, handle: &str, did: &str) {
+    if app.resolve_handle(handle).await.ok().flatten().as_deref() == Some(did) {
+        if let Err(e) = app.store.raw.delete(&handle_path(app, handle)).await {
+            tracing::warn!(%did, %handle, "failed to release handle claim: {e}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// handles
+// ---------------------------------------------------------------------------
+
+pub(super) fn normalize_handle(h: &str) -> XResult<String> {
+    let h = h.trim().to_ascii_lowercase();
+    if !super::syntax::valid_handle(&h) {
+        return Err(XrpcError::bad(
+            "InvalidHandle",
+            "Input/handle must be a valid handle",
+        ));
+    }
+    const DISALLOWED_TLDS: &[&str] = &[
+        ".local",
+        ".arpa",
+        ".invalid",
+        ".localhost",
+        ".internal",
+        ".example",
+        ".alt",
+        ".onion",
+    ];
+    if DISALLOWED_TLDS.iter().any(|t| h.ends_with(t)) {
+        return Err(XrpcError::bad(
+            "InvalidHandle",
+            "Handle TLD is invalid or disallowed",
+        ));
+    }
+    Ok(h)
+}
+
+fn is_reserved(front: &str) -> bool {
+    RESERVED_HANDLES
+        .split_ascii_whitespace()
+        .any(|w| w == front)
+}
+
+/// Constraints for a handle under our service domain (reference
+/// ensureHandleServiceConstraints). Non-service domains are refused
+/// (UnsupportedDomain) for new accounts.
+pub(super) fn ensure_service_handle(app: &App, handle: &str, allow_reserved: bool) -> XResult<()> {
+    let suffix = format!(".{}", app.handle_domain);
+    let Some(front) = handle.strip_suffix(&suffix) else {
+        return Err(XrpcError::bad(
+            "UnsupportedDomain",
+            "Not a supported handle domain",
+        ));
+    };
+    if front.contains('.') {
+        return Err(XrpcError::bad(
+            "InvalidHandle",
+            "Invalid characters in handle",
+        ));
+    }
+    if front.len() < 3 {
+        return Err(XrpcError::bad("InvalidHandle", "Handle too short"));
+    }
+    if front.len() > 18 {
+        return Err(XrpcError::bad("InvalidHandle", "Handle too long"));
+    }
+    if !allow_reserved && is_reserved(front) {
+        return Err(XrpcError::bad("HandleNotAvailable", "Reserved handle"));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// sessions
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct AppPassRef {
+    pub name: String,
+    pub privileged: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct RefreshState {
+    family: String,
+    exp: u64,
+    #[serde(default)]
+    app_password: Option<AppPassRef>,
+    created_at: u64,
+    /// Set once rotated: reuse within the grace period re-issues this id.
+    #[serde(default)]
+    next_id: Option<String>,
+}
+
+fn access_scope(ap: &Option<AppPassRef>) -> &'static str {
+    match ap {
+        None => SCOPE_ACCESS,
+        Some(a) if a.privileged => SCOPE_APP_PASS_PRIVILEGED,
+        Some(_) => SCOPE_APP_PASS,
+    }
+}
+
+fn issue_pair(
+    app: &App,
+    did: &str,
+    family: &str,
+    refresh_id: &str,
+    ap: &Option<AppPassRef>,
+) -> (String, String) {
+    (
+        app.jwt
+            .issue_with_jti(did, access_scope(ap), ACCESS_TTL, "at+jwt", Some(family)),
+        app.jwt.issue_with_jti(
+            did,
+            SCOPE_REFRESH,
+            REFRESH_TTL,
+            "refresh+jwt",
+            Some(refresh_id),
+        ),
+    )
+}
+
+/// Starts a new session family and returns (accessJwt, refreshJwt).
+pub(super) async fn create_session_tokens(
+    app: &App,
+    did: &str,
+    ap: Option<AppPassRef>,
+) -> XResult<(String, String)> {
+    create_session_tokens_scoped(app, did, ap, false).await
+}
+
+/// `takendown`: the access token gets the restricted `com.atproto.takendown`
+/// scope (reference createSession for a soft-deleted account).
+async fn create_session_tokens_scoped(
+    app: &App,
+    did: &str,
+    ap: Option<AppPassRef>,
+    takendown: bool,
+) -> XResult<(String, String)> {
+    let family = new_family_id();
+    let rid = random_hex(24);
+    let st = RefreshState {
+        family: family.clone(),
+        exp: now_secs() + REFRESH_TTL,
+        app_password: ap.clone(),
+        created_at: now_secs(),
+        next_id: None,
+    };
+    app.put_private(
+        did,
+        vec![pmut(did, &format!("sess/{rid}"), Some(to_json_bytes(&st)))],
+    )
+    .await?;
+    let (access, refresh) = issue_pair(app, did, &family, &rid, &ap);
+    if takendown {
+        let access =
+            app.jwt
+                .issue_with_jti(did, SCOPE_TAKENDOWN, ACCESS_TTL, "at+jwt", Some(&family));
+        return Ok((access, refresh));
+    }
+    Ok((access, refresh))
+}
+
+async fn revoke_families(app: &App, families: &[String]) {
+    if families.is_empty() {
+        return;
+    }
+    let e = ext(app);
+    let exp = now_secs() + REVOKE_TTL;
+    e.gen.fetch_add(1, Ordering::SeqCst);
+    {
+        let mut f = e.families.write();
+        for fam in families {
+            f.insert(fam.clone(), exp);
+        }
+    }
+    let muts = families
+        .iter()
+        .map(|fam| {
+            pmut(
+                REVOKED,
+                &format!("f/{fam}"),
+                Some(to_json_bytes(&json!({"exp": exp}))),
+            )
+        })
+        .collect();
+    if let Err(err) = app.put_private(REVOKED, muts).await {
+        tracing::warn!(
+            "persisting session revocation failed (in-memory only): {}",
+            err.message
+        );
+    }
+}
+
+/// Revokes every session of `did` (refresh tokens deleted, outstanding access
+/// tokens rejected). Used on password change, takedown and deletion.
+pub(super) async fn revoke_all_sessions(app: &App, did: &str) -> XResult<()> {
+    let e = ext(app);
+    let before = crate::tid::now_micros();
+    let exp = now_secs() + REVOKE_TTL;
+    e.gen.fetch_add(1, Ordering::SeqCst);
+    e.dids.write().insert(did.to_string(), (before, exp));
+    if let Err(err) = app
+        .put_private(
+            REVOKED,
+            vec![pmut(
+                REVOKED,
+                &format!("d/{did}"),
+                Some(to_json_bytes(&json!({"before": before, "exp": exp}))),
+            )],
+        )
+        .await
+    {
+        tracing::warn!(
+            "persisting session revocation failed (in-memory only): {}",
+            err.message
+        );
+    }
+    revoke_refresh_tokens(app, did).await
+}
+
+/// Deletes every refresh token (session) of `did`; outstanding access tokens
+/// stay valid until they expire. What the reference does on takedown
+/// (`revokeRefreshTokensByDid`), so the owner can still use the access token
+/// for what a taken-down account may do (e.g. sync its own repo).
+pub(super) async fn revoke_refresh_tokens(app: &App, did: &str) -> XResult<()> {
+    let sessions = scan_private(app, did, "sess/").await?;
+    if !sessions.is_empty() {
+        app.put_private(
+            did,
+            sessions
+                .iter()
+                .map(|(name, _)| pmut(did, name, None))
+                .collect(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Revokes the sessions created with app password `name`.
+async fn revoke_app_password_sessions(app: &App, did: &str, name: &str) -> XResult<()> {
+    let mut dels = Vec::new();
+    let mut fams = Vec::new();
+    for (k, v) in scan_private(app, did, "sess/").await? {
+        let Ok(st) = serde_json::from_slice::<RefreshState>(&v) else {
+            continue;
+        };
+        if st.app_password.as_ref().is_some_and(|a| a.name == name) {
+            dels.push(pmut(did, &k, None));
+            fams.push(st.family);
+        }
+    }
+    if !dels.is_empty() {
+        app.put_private(did, dels).await?;
+    }
+    revoke_families(app, &fams).await;
+    Ok(())
+}
+
+/// Verifies a legacy Bearer token (session or app-password access JWT).
+/// Hot path: signature + in-memory revocation check, no storage reads.
+pub async fn verify_bearer(app: &App, token: &str) -> XResult<Credentials> {
+    let c = app
+        .jwt
+        .verify_signature(token)
+        .ok_or_else(|| invalid_token("Token could not be verified"))?;
+    if c.aud != app.jwt.service_did || !c.sub.starts_with("did:") {
+        return Err(invalid_token("Malformed token"));
+    }
+    if c.exp < now_secs() {
+        return Err(expired_token("Token has expired"));
+    }
+    let creds = match c.scope.as_str() {
+        SCOPE_ACCESS => Credentials::Session { did: c.sub.clone() },
+        SCOPE_APP_PASS => Credentials::AppPassword {
+            did: c.sub.clone(),
+            privileged: false,
+        },
+        SCOPE_APP_PASS_PRIVILEGED => Credentials::AppPassword {
+            did: c.sub.clone(),
+            privileged: true,
+        },
+        SCOPE_TAKENDOWN => Credentials::Takendown { did: c.sub.clone() },
+        _ => return Err(bad_scope()),
+    };
+    let e = ext(app);
+    ensure_loaded(app, &e).await;
+    if e.is_revoked(&c.sub, c.jti.as_deref(), c.iat) {
+        return Err(expired_token("Token has been revoked"));
+    }
+    Ok(creds)
+}
+
+/// Verifies the refresh token in the Authorization header.
+fn refresh_claims(
+    app: &App,
+    headers: &HeaderMap,
+    allow_expired: bool,
+) -> XResult<crate::auth::Claims> {
+    let tok = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| {
+            err(
+                StatusCode::UNAUTHORIZED,
+                "AuthMissing",
+                "Authentication Required",
+            )
+        })?;
+    let c = app
+        .jwt
+        .verify_signature(tok.trim())
+        .ok_or_else(|| invalid_token("Token could not be verified"))?;
+    if c.scope != SCOPE_REFRESH {
+        return Err(bad_scope());
+    }
+    if c.aud != app.jwt.service_did || c.jti.is_none() {
+        return Err(invalid_token("Malformed token"));
+    }
+    if !allow_expired && c.exp < now_secs() {
+        return Err(expired_token("Token has expired"));
+    }
+    Ok(c)
+}
+
+fn session_info(app: &App, a: &Account, include_email: bool) -> J {
+    let (active, status) = account_status(a);
+    let mut out = json!({
+        "did": a.did,
+        "handle": a.handle,
+        "active": active,
+    });
+    if let Ok(doc) = super::identity::did_doc(app, a) {
+        out["didDoc"] = doc;
+    }
+    if let Some(s) = status {
+        out["status"] = json!(s);
+    }
+    if include_email {
+        if let Some(e) = &a.email {
+            out["email"] = json!(e);
+        }
+        out["emailConfirmed"] = json!(a.email_confirmed);
+        out["emailAuthFactor"] = json!(false);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// describeServer / createAccount
+// ---------------------------------------------------------------------------
+
+pub(super) fn invites_required(app: &App) -> bool {
+    app.config.invite_required
+}
+
+async fn describe_server(State(app): AppState) -> Json<J> {
+    Json(json!({
+        "did": app.jwt.service_did,
+        "availableUserDomains": [format!(".{}", app.handle_domain)],
+        "inviteCodeRequired": invites_required(&app),
+        "links": {},
+        "contact": {},
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAccountIn {
+    handle: String,
+    email: Option<String>,
+    password: Option<String>,
+    invite_code: Option<String>,
+    did: Option<String>,
+    plc_op: Option<J>,
+}
+
+async fn create_account(
+    State(app): AppState,
+    Json(inp): Json<CreateAccountIn>,
+) -> XResult<Json<J>> {
+    if inp.plc_op.is_some() {
+        return Err(invalid_request("Unsupported input: \"plcOp\""));
+    }
+    if inp.did.is_some() {
+        return Err(invalid_request(
+            "Creating an account with an existing DID is not supported",
+        ));
+    }
+    let password = inp
+        .password
+        .ok_or_else(|| invalid_request("Password is required"))?;
+    if password.len() > NEW_PASSWORD_MAX_LENGTH {
+        return Err(invalid_request(format!(
+            "Password too long. Maximum length is {NEW_PASSWORD_MAX_LENGTH} characters."
+        )));
+    }
+    let invite = inp
+        .invite_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string);
+    if invites_required(&app) && invite.is_none() {
+        return Err(XrpcError::bad(
+            "InvalidInviteCode",
+            "No invite code provided",
+        ));
+    }
+    let email = match inp
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    {
+        Some(e) => {
+            let e = e.to_ascii_lowercase();
+            if !valid_email(&e) {
+                return Err(invalid_request(
+                    "This email address is not supported, please use a different email.",
+                ));
+            }
+            Some(e)
+        }
+        None => None,
+    };
+    let handle = normalize_handle(&inp.handle)?;
+    ensure_service_handle(&app, &handle, false)?;
+    let did = app.mint_local_did()?;
+    // Atomic use of the invite code (a conditional-create claim per use).
+    let claim = match (&invite, invites_required(&app)) {
+        (Some(code), true) => Some(super::admin::claim_invite_use(&app, code, &did).await?),
+        _ => None,
+    };
+    let release = |claim: Option<super::admin::InviteClaim>| {
+        let app = app.clone();
+        async move {
+            if let Some(c) = claim {
+                super::admin::release_invite_use(&app, c).await;
+            }
+        }
+    };
+    // Global handle uniqueness across nodes: conditional create of handle/{handle}.
+    let claimed = match claim_handle(&app, &handle, &did).await {
+        Ok(c) => c,
+        Err(e) => {
+            release(claim).await;
+            return Err(e);
+        }
+    };
+    if !claimed {
+        release(claim).await;
+        return Err(XrpcError::bad("HandleNotAvailable", format!("Handle already taken: {handle}")));
+    }
+    if let Some(e) = &email {
+        let r = claim_email(&app, e, &did).await;
+        if !matches!(r, Ok(true)) {
+            release_handle(&app, &handle, &did).await;
+            release(claim).await;
+            r?;
+            return Err(invalid_request(format!("Email already taken: {e}")));
+        }
+    }
+    let key = Arc::new(Keypair::generate());
+    let mut acct = Account {
+        did: did.clone(),
+        handle: handle.clone(),
+        signing_key: hex::encode(key.to_bytes()),
+        created_at: crate::events::now_rfc3339(),
+        email: email.clone(),
+        ..Default::default()
+    };
+    acct.password_hash = state::hash_password(&password).await;
+    set_extra(&mut acct, "totpEnabled", json!(false));
+    if let Some(code) = &invite {
+        set_extra(&mut acct, "invitedBy", json!(code));
+    }
+    let did_arc: Arc<str> = did.clone().into();
+    let (tx, rx) = oneshot::channel();
+    let sent = app
+        .workers
+        .route(&did)
+        .send(WorkerMsg::CreateRepo(CreateRepoReq {
+            did: did_arc,
+            handle: handle.clone(),
+            key,
+            account_json: Bytes::from(serde_json::to_vec(&acct).unwrap()),
+            records: Vec::new(),
+            reply: tx,
+        }));
+    let created = match sent {
+        Ok(()) => rx
+            .await
+            .map_err(|_| XrpcError::internal("worker dropped request"))
+            .and_then(|r| r.map_err(XrpcError::from)),
+        Err(e) => Err(XrpcError::from_err(e)),
+    };
+    if let Err(e) = created {
+        release_handle(&app, &handle, &did).await;
+        if let Some(em) = &email {
+            release_email(&app, em, &did).await;
+        }
+        release(claim).await;
+        return Err(e);
+    }
+    if let Some(c) = &claim {
+        if let Err(e) = super::admin::record_invite_use(&app, c, &did).await {
+            tracing::warn!(%did, "recording invite use failed: {}", e.message);
+        }
+    }
+    let (access, refresh) = create_session_tokens(&app, &did, None).await?;
+    let mut out = json!({"handle": handle, "did": did, "accessJwt": access, "refreshJwt": refresh});
+    if let Ok(doc) = super::identity::did_doc(&app, &acct) {
+        out["didDoc"] = doc;
+    }
+    Ok(Json(out))
+}
+
+// ---------------------------------------------------------------------------
+// createSession / getSession / refreshSession / deleteSession
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSessionIn {
+    identifier: String,
+    password: String,
+    auth_factor_token: Option<String>,
+    #[serde(default)]
+    allow_takendown: bool,
+}
+
+/// Resolves a login identifier (handle, DID or email) to a local account.
+pub(super) async fn login_account(app: &App, identifier: &str) -> Option<Account> {
+    let ident = identifier.trim().to_ascii_lowercase();
+    let did = if ident.contains('@') {
+        did_by_email(app, &ident).await.ok()??
+    } else {
+        app.resolve_repo(&ident).await.ok()?.to_string()
+    };
+    let a = app.account(&did).await.ok()?;
+    if ident.contains('@') && a.email.as_deref() != Some(ident.as_str()) {
+        return None;
+    }
+    Some(a)
+}
+
+/// App passwords are server-generated with ~80 bits of randomness, so a fast
+/// deterministic hash is safe here (no dictionary to attack) and lets us look
+/// them up by hash. User-chosen account passwords use Argon2id instead.
+fn app_password_hash(did: &str, password: &str) -> String {
+    hex::encode(Sha256::digest(
+        format!("vlpds-app-password:{did}:{password}").as_bytes(),
+    ))
+}
+
+async fn verify_app_password(app: &App, did: &str, password: &str) -> XResult<Option<AppPassRef>> {
+    let h = app_password_hash(did, password.trim());
+    let Some(name) = app.get_private(did, &format!("apphash/{h}")).await? else {
+        return Ok(None);
+    };
+    let name = String::from_utf8_lossy(&name).to_string();
+    let meta: Option<J> = get_json(app, did, &format!("apppass/{name}")).await?;
+    Ok(meta.map(|m| AppPassRef {
+        name,
+        privileged: m["privileged"].as_bool().unwrap_or(false),
+    }))
+}
+
+async fn create_session(
+    State(app): AppState,
+    Json(inp): Json<CreateSessionIn>,
+) -> XResult<Json<J>> {
+    if inp.password.len() > OLD_PASSWORD_MAX_LENGTH {
+        return Err(auth_required(
+            "Password too long. Consider resetting your password.",
+        ));
+    }
+    // reference: 300/day and 30/5min per `${identifier}-${ip}`
+    {
+        use crate::ratelimit::*;
+        check_with_ip(&[&CREATE_SESSION_DAY, &CREATE_SESSION_5MIN], &inp.identifier, 1)?;
+    }
+    let invalid = || auth_required("Invalid identifier or password");
+    let acct = login_account(&app, &inp.identifier)
+        .await
+        .ok_or_else(invalid)?;
+    let soft_deleted = is_takendown_account(&acct);
+    let mut app_pass = None;
+    if !verify_password(&acct, &inp.password).await {
+        // takendown/suspended accounts cannot log in with an app password
+        if soft_deleted {
+            return Err(invalid());
+        }
+        app_pass = Some(
+            verify_app_password(&app, &acct.did, &inp.password)
+                .await?
+                .ok_or_else(invalid)?,
+        );
+    }
+    if soft_deleted && !inp.allow_takendown {
+        return Err(takedown_error());
+    }
+    // second factor for password logins (app passwords bypass it)
+    if app_pass.is_none() {
+        crate::totp::check_second_factor(&app, &acct, inp.auth_factor_token.as_deref()).await?;
+    }
+    let (access, refresh) =
+        create_session_tokens_scoped(&app, &acct.did, app_pass, soft_deleted).await?;
+    let mut out = session_info(&app, &acct, true);
+    out["accessJwt"] = json!(access);
+    out["refreshJwt"] = json!(refresh);
+    Ok(Json(out))
+}
+
+async fn get_session(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+    let did = user_did(&creds)?;
+    let acct = app
+        .account(&did)
+        .await
+        .map_err(|_| invalid_request(format!("Could not find user info for account: {did}")))?;
+    let include_email =
+        !matches!(creds, Credentials::OAuth { .. }) || creds.allows_account("email", "read");
+    Ok(Json(session_info(&app, &acct, include_email)))
+}
+
+async fn refresh_session(State(app): AppState, headers: HeaderMap) -> XResult<Json<J>> {
+    let c = refresh_claims(&app, &headers, false)?;
+    let did = c.sub.clone();
+    let rid = c.jti.clone().unwrap_or_default();
+    let acct = app
+        .account(&did)
+        .await
+        .map_err(|_| invalid_request(format!("Could not find user info for account: {did}")))?;
+    if is_takendown_account(&acct) {
+        return Err(takedown_error());
+    }
+    let e = ext(&app);
+    // serializes racing refreshes of one account on this node
+    let _g = e.lock(&did).await;
+    let st: Option<RefreshState> = get_json(&app, &did, &format!("sess/{rid}")).await?;
+    // revoked (deleteSession, password change, ...) or past its grace period
+    let now = now_secs();
+    let st = st.filter(|s| s.exp >= now).ok_or_else(|| expired_token("Token has been revoked"))?;
+    ensure_loaded(&app, &e).await;
+    if e.is_revoked(&did, Some(&st.family), 0) {
+        return Err(expired_token("Token has been revoked"));
+    }
+    // Rotation as in the reference: the old token stays usable for a grace
+    // period (min(2h, its expiry)) and reuse yields the same next token id;
+    // after that it is rejected.
+    let next = st.next_id.clone().unwrap_or_else(|| random_hex(24));
+    let mut muts = vec![pmut(
+        &did,
+        &format!("sess/{rid}"),
+        Some(to_json_bytes(&RefreshState { exp: st.exp.min(now + REFRESH_GRACE), next_id: Some(next.clone()), ..st.clone() })),
+    )];
+    if app.get_private(&did, &format!("sess/{next}")).await?.is_none() {
+        let next_st = RefreshState { exp: now + REFRESH_TTL, created_at: now, next_id: None, ..st.clone() };
+        muts.push(pmut(&did, &format!("sess/{next}"), Some(to_json_bytes(&next_st))));
+    }
+    app.put_private(&did, muts).await?;
+    let (access, refresh) = issue_pair(&app, &did, &st.family, &next, &st.app_password);
+    let mut out = session_info(&app, &acct, true);
+    out["accessJwt"] = json!(access);
+    out["refreshJwt"] = json!(refresh);
+    Ok(Json(out))
+}
+
+async fn delete_session(State(app): AppState, headers: HeaderMap) -> XResult<StatusCode> {
+    let c = refresh_claims(&app, &headers, true)?;
+    let did = c.sub.clone();
+    let rid = c.jti.clone().unwrap_or_default();
+    let e = ext(&app);
+    let _g = e.lock(&did).await;
+    if let Some(st) = get_json::<RefreshState>(&app, &did, &format!("sess/{rid}")).await? {
+        // the whole session: this token, its rotations and their access tokens
+        let mut dels = vec![pmut(&did, &format!("sess/{rid}"), None)];
+        for (name, v) in scan_private(&app, &did, "sess/").await? {
+            if serde_json::from_slice::<RefreshState>(&v).is_ok_and(|o| o.family == st.family) {
+                dels.push(pmut(&did, &name, None));
+            }
+        }
+        app.put_private(&did, dels).await?;
+        revoke_families(&app, &[st.family]).await;
+    }
+    Ok(StatusCode::OK)
+}
+
+// ---------------------------------------------------------------------------
+// app passwords
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct CreateAppPasswordIn {
+    name: String,
+    #[serde(default)]
+    privileged: Option<bool>,
+}
+
+async fn create_app_password(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<CreateAppPasswordIn>,
+) -> XResult<Json<J>> {
+    let did = full_access(&creds)?;
+    let acct = app.account(&did).await?;
+    if is_takendown_account(&acct) {
+        return Err(takedown_error());
+    }
+    let name = inp.name.trim().to_string();
+    if name.is_empty() || name.len() > 256 || name.contains('\0') {
+        return Err(invalid_request("Invalid app password name"));
+    }
+    let privileged = inp.privileged.unwrap_or(false);
+    let e = ext(&app);
+    let _g = e.lock(&did).await;
+    if app
+        .get_private(&did, &format!("apppass/{name}"))
+        .await?
+        .is_some()
+    {
+        return Err(invalid_request("could not create app-specific password"));
+    }
+    let s = crate::cid::base32_encode(&rand::random::<[u8; 10]>());
+    let password = format!("{}-{}-{}-{}", &s[0..4], &s[4..8], &s[8..12], &s[12..16]);
+    let created_at = crate::events::now_rfc3339();
+    let h = app_password_hash(&did, &password);
+    let meta = json!({"name": name, "createdAt": created_at, "privileged": privileged, "hash": h});
+    app.put_private(
+        &did,
+        vec![
+            pmut(&did, &format!("apppass/{name}"), Some(to_json_bytes(&meta))),
+            pmut(
+                &did,
+                &format!("apphash/{h}"),
+                Some(name.as_bytes().to_vec()),
+            ),
+        ],
+    )
+    .await?;
+    Ok(Json(
+        json!({"name": name, "password": password, "createdAt": created_at, "privileged": privileged}),
+    ))
+}
+
+async fn list_app_passwords(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+    let did = standard_no_oauth(&creds)?;
+    let mut out: Vec<J> = scan_private(&app, &did, "apppass/")
+        .await?
+        .into_iter()
+        .filter_map(|(_, v)| serde_json::from_slice::<J>(&v).ok())
+        .map(|m| json!({"name": m["name"], "createdAt": m["createdAt"], "privileged": m["privileged"].as_bool().unwrap_or(false)}))
+        .collect();
+    out.sort_by(|a, b| b["createdAt"].as_str().cmp(&a["createdAt"].as_str()));
+    Ok(Json(json!({"passwords": out})))
+}
+
+#[derive(Deserialize)]
+struct RevokeAppPasswordIn {
+    name: String,
+}
+
+async fn revoke_app_password(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<RevokeAppPasswordIn>,
+) -> XResult<StatusCode> {
+    // app passwords can't revoke app passwords (stricter than the reference)
+    let did = full_access(&creds)?;
+    let e = ext(&app);
+    let _g = e.lock(&did).await;
+    let name = inp.name.trim().to_string();
+    if let Some(meta) = get_json::<J>(&app, &did, &format!("apppass/{name}")).await? {
+        let mut muts = vec![pmut(&did, &format!("apppass/{name}"), None)];
+        if let Some(h) = meta["hash"].as_str() {
+            muts.push(pmut(&did, &format!("apphash/{h}"), None));
+        }
+        app.put_private(&did, muts).await?;
+    }
+    revoke_app_password_sessions(&app, &did, &name).await?;
+    Ok(StatusCode::OK)
+}
+
+// ---------------------------------------------------------------------------
+// account lifecycle
+// ---------------------------------------------------------------------------
+
+/// Locked read-modify-write of an account through the repo's worker.
+pub(super) async fn update_account<F>(
+    app: &App,
+    did: &str,
+    identity_event: bool,
+    account_event: bool,
+    f: F,
+) -> XResult<Account>
+where
+    F: FnOnce(&mut Account) -> XResult<()>,
+{
+    let e = ext(app);
+    let _g = e.lock(did).await;
+    let mut a = app.account(did).await?;
+    f(&mut a)?;
+    app.account_op(
+        did,
+        AccountOp::Update {
+            account: a.clone(),
+            old_handle: None,
+            identity_event,
+            account_event,
+        },
+    )
+    .await?;
+    Ok(a)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct DeactivateIn {
+    delete_after: Option<String>,
+}
+
+pub(super) async fn set_deactivated(
+    app: &App,
+    did: &str,
+    deactivated: bool,
+    delete_after: Option<String>,
+) -> XResult<Account> {
+    update_account(app, did, !deactivated, true, |a| {
+        if deactivated {
+            if a.extra.get("deactivatedAt").is_none_or(|v| v.is_null()) {
+                set_extra(a, "deactivatedAt", json!(crate::events::now_rfc3339()));
+            }
+            set_extra(
+                a,
+                "deleteAfter",
+                delete_after.map(J::String).unwrap_or(J::Null),
+            );
+        } else {
+            if a.extra.get("takedownRef").is_some_and(|v| !v.is_null()) {
+                return Err(XrpcError::bad("AccountNotFound", "user not found"));
+            }
+            set_extra(a, "deactivatedAt", J::Null);
+            set_extra(a, "deleteAfter", J::Null);
+        }
+        recompute_status(a);
+        Ok(())
+    })
+    .await
+}
+
+async fn deactivate_account(
+    State(app): AppState,
+    Auth(creds): Auth,
+    body: Option<Json<DeactivateIn>>,
+) -> XResult<StatusCode> {
+    let did = full_or_oauth_account(&creds, "status", "manage")?;
+    let inp = body.map(|Json(b)| b).unwrap_or_default();
+    if let Some(d) = &inp.delete_after {
+        if chrono::DateTime::parse_from_rfc3339(d).is_err() {
+            return Err(invalid_request("deleteAfter must be a valid datetime"));
+        }
+    }
+    app.account(&did)
+        .await
+        .map_err(|_| invalid_request("Account not found"))?;
+    set_deactivated(&app, &did, true, inp.delete_after).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn activate_account(State(app): AppState, Auth(creds): Auth) -> XResult<StatusCode> {
+    let did = match &creds {
+        Credentials::OAuth { .. } => {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                "Forbidden",
+                "Account reactivation is not available with OAuth credentials. Sign in to your account management page to reactivate.",
+            ))
+        }
+        _ => full_access(&creds)?,
+    };
+    let e = ext(&app);
+    let _g = e.lock(&did).await;
+    let mut a = app
+        .account(&did)
+        .await
+        .map_err(|_| XrpcError::bad("AccountNotFound", "user not found"))?;
+    // a taken-down account can't be activated
+    if a.extra.get("takedownRef").is_some_and(|v| !v.is_null()) {
+        return Err(XrpcError::bad("AccountNotFound", "user not found"));
+    }
+    set_extra(&mut a, "deactivatedAt", J::Null);
+    set_extra(&mut a, "deleteAfter", J::Null);
+    recompute_status(&mut a);
+    // #account, #identity and #sync (reference sequenceAccountActivation)
+    app.account_op(&did, AccountOp::Activate { account: a }).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+    let did = user_did(&creds)?;
+    let acct = app.account(&did).await?;
+    let head = app.head(&did).await?;
+    let p = app.partition(&did)?;
+    let prefix = state::record_prefix(&did);
+    let mut iter =
+        p.db.scan(prefix.clone()..state::prefix_end(&prefix))
+            .await
+            .map_err(XrpcError::from_err)?;
+    let mut records = 0u64;
+    while iter.next().await.map_err(XrpcError::from_err)?.is_some() {
+        records += 1;
+    }
+    let bprefix = state::blob_ref_prefix(&did);
+    let mut iter =
+        p.db.scan(bprefix.clone()..state::prefix_end(&bprefix))
+            .await
+            .map_err(XrpcError::from_err)?;
+    let mut expected = HashSet::new();
+    while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
+        let rest = String::from_utf8_lossy(&kv.key[bprefix.len()..]).to_string();
+        expected.insert(rest.split('\0').next().unwrap_or("").to_string());
+    }
+    let mut imported = 0u64;
+    for cid in &expected {
+        let path =
+            object_store::path::Path::from(format!("{}/blob/{}/{}", app.store.prefix, did, cid));
+        if app.store.raw.head(&path).await.is_ok() {
+            imported += 1;
+        }
+    }
+    Ok(Json(json!({
+        "activated": acct.status.is_none(),
+        "validDid": true,
+        "repoCommit": head.commit.to_string(),
+        "repoRev": head.rev.to_string(),
+        // blocks in the repo: records + commit; MST nodes are derived (not stored)
+        "repoBlocks": records + 1,
+        "indexedRecords": records,
+        "privateStateValues": 0,
+        "expectedBlobs": expected.len(),
+        "importedBlobs": imported,
+    })))
+}
+
+async fn request_account_delete(State(app): AppState, Auth(creds): Auth) -> XResult<StatusCode> {
+    let did = full_access(&creds)?;
+    {
+        use crate::ratelimit::*;
+        check(&[&REQUEST_ACCOUNT_DELETE_DAY, &REQUEST_ACCOUNT_DELETE_HOUR], &did, 1)?;
+    }
+    let acct = app
+        .account(&did)
+        .await
+        .map_err(|_| invalid_request("account not found"))?;
+    if is_takendown_account(&acct) {
+        return Err(takedown_error());
+    }
+    let email = acct
+        .email
+        .clone()
+        .ok_or_else(|| invalid_request("account does not have an email address"))?;
+    let token = create_email_token(&app, &did, "delete_account").await?;
+    deliver(
+        &app,
+        &email,
+        "Account Deletion Request",
+        &format!("Your account deletion code is {token}"),
+        "delete_account",
+        Some(&token),
+    );
+    Ok(StatusCode::OK)
+}
+
+/// Deletes an account entirely: sessions, repo + account (#account deleted
+/// event), handle and email claims, private state.
+pub(super) async fn delete_account_fully(app: &App, did: &str) -> XResult<()> {
+    let acct = app.account(did).await.ok();
+    revoke_all_sessions(app, did).await?;
+    app.account_op(did, AccountOp::Delete).await?;
+    if let Some(a) = &acct {
+        release_handle(app, &a.handle, did).await;
+        if let Some(e) = &a.email {
+            release_email(app, e, did).await;
+        }
+    }
+    let private = scan_private(app, did, "").await?;
+    for chunk in private.chunks(500) {
+        app.put_private(
+            did,
+            chunk
+                .iter()
+                .map(|(name, _)| pmut(did, name, None))
+                .collect(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct DeleteAccountIn {
+    did: String,
+    password: String,
+    token: String,
+}
+
+async fn delete_account(
+    State(app): AppState,
+    Json(inp): Json<DeleteAccountIn>,
+) -> XResult<StatusCode> {
+    if inp.password.len() > OLD_PASSWORD_MAX_LENGTH {
+        return Err(auth_required(
+            "Password too long. Consider resetting your password.",
+        ));
+    }
+    let acct = app
+        .account(&inp.did)
+        .await
+        .map_err(|_| invalid_request("account not found"))?;
+    if !verify_password(&acct, &inp.password).await {
+        return Err(auth_required("Invalid did or password"));
+    }
+    assert_email_token(&app, &acct.did, "delete_account", &inp.token).await?;
+    delete_account_fully(&app, &acct.did).await?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize, Default)]
+struct ReserveSigningKeyIn {
+    did: Option<String>,
+}
+
+/// Reserves a fresh signing key; `admin.updateAccountSigningKey` can later
+/// install it (the PDS must hold the private key to sign commits).
+async fn reserve_signing_key(
+    State(app): AppState,
+    body: Option<Json<ReserveSigningKeyIn>>,
+) -> XResult<Json<J>> {
+    let inp = body.map(|Json(b)| b).unwrap_or_default();
+    let key = Keypair::generate();
+    let did_key = key.did_key();
+    let routing = format!("_reserved:{did_key}");
+    let rec = json!({"key": hex::encode(key.to_bytes()), "did": inp.did, "createdAt": crate::events::now_rfc3339()});
+    app.put_private(
+        &routing,
+        vec![pmut(&routing, "k", Some(to_json_bytes(&rec)))],
+    )
+    .await?;
+    Ok(Json(json!({"signingKey": did_key})))
+}
+
+/// Takes a key reserved with reserveSigningKey (by its did:key).
+pub(super) async fn take_reserved_key(app: &App, did_key: &str) -> XResult<Option<Keypair>> {
+    let routing = format!("_reserved:{did_key}");
+    let Some(rec) = get_json::<J>(app, &routing, "k").await? else {
+        return Ok(None);
+    };
+    let key = Keypair::from_bytes(
+        &hex::decode(rec["key"].as_str().unwrap_or("")).map_err(XrpcError::from_err)?,
+    )
+    .map_err(XrpcError::from_err)?;
+    app.put_private(&routing, vec![pmut(&routing, "k", None)])
+        .await?;
+    Ok(Some(key))
+}
+
+// ---------------------------------------------------------------------------
+// email flows
+// ---------------------------------------------------------------------------
+
+async fn request_email_confirmation(
+    State(app): AppState,
+    Auth(creds): Auth,
+) -> XResult<StatusCode> {
+    let did = standard_or_oauth_account(&creds, "email", "manage")?;
+    {
+        use crate::ratelimit::*;
+        check(&[&REQUEST_EMAIL_CONFIRMATION_DAY, &REQUEST_EMAIL_CONFIRMATION_HOUR], &did, 1)?;
+    }
+    let acct = app
+        .account(&did)
+        .await
+        .map_err(|_| invalid_request("account not found"))?;
+    if is_takendown_account(&acct) {
+        return Err(takedown_error());
+    }
+    let email = acct
+        .email
+        .clone()
+        .ok_or_else(|| invalid_request("account does not have an email address"))?;
+    let token = create_email_token(&app, &did, "confirm_email").await?;
+    deliver(
+        &app,
+        &email,
+        "Confirm your email",
+        &format!("Your email confirmation code is {token}"),
+        "confirm_email",
+        Some(&token),
+    );
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct ConfirmEmailIn {
+    email: String,
+    token: String,
+}
+
+async fn confirm_email(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<ConfirmEmailIn>,
+) -> XResult<StatusCode> {
+    let did = standard_or_oauth_account(&creds, "email", "manage")?;
+    let acct = app
+        .account(&did)
+        .await
+        .map_err(|_| XrpcError::bad("AccountNotFound", "user not found"))?;
+    if is_takendown_account(&acct) {
+        return Err(takedown_error());
+    }
+    if acct.email.as_deref() != Some(inp.email.trim().to_ascii_lowercase().as_str()) {
+        return Err(XrpcError::bad("InvalidEmail", "invalid email"));
+    }
+    assert_email_token(&app, &did, "confirm_email", &inp.token).await?;
+    delete_email_tokens(&app, &did, &["confirm_email"]).await?;
+    update_account(&app, &did, false, false, |a| {
+        a.email_confirmed = true;
+        set_extra(a, "emailConfirmedAt", json!(crate::events::now_rfc3339()));
+        Ok(())
+    })
+    .await?;
+    Ok(StatusCode::OK)
+}
+
+async fn request_email_update(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+    let did = full_or_oauth_account(&creds, "email", "manage")?;
+    {
+        use crate::ratelimit::*;
+        check(&[&REQUEST_EMAIL_UPDATE_DAY, &REQUEST_EMAIL_UPDATE_HOUR], &did, 1)?;
+    }
+    let acct = app
+        .account(&did)
+        .await
+        .map_err(|_| invalid_request("account not found"))?;
+    if is_takendown_account(&acct) {
+        return Err(takedown_error());
+    }
+    let email = acct
+        .email
+        .clone()
+        .ok_or_else(|| invalid_request("account does not have an email address"))?;
+    let token_required = acct.email_confirmed;
+    if token_required {
+        let token = create_email_token(&app, &did, "update_email").await?;
+        deliver(
+            &app,
+            &email,
+            "Update your email",
+            &format!("Your email update code is {token}"),
+            "update_email",
+            Some(&token),
+        );
+    }
+    Ok(Json(json!({"tokenRequired": token_required})))
+}
+
+/// Sets a new (unconfirmed) email: claims it globally, releases the old one,
+/// clears email tokens.
+pub(super) async fn set_email(app: &App, did: &str, email: &str) -> XResult<()> {
+    let email = email.trim().to_ascii_lowercase();
+    if !valid_email(&email) {
+        return Err(invalid_request(
+            "This email address is not supported, please use a different email.",
+        ));
+    }
+    let acct = app.account(did).await?;
+    if acct.email.as_deref() == Some(email.as_str()) {
+        return Ok(());
+    }
+    if !claim_email(app, &email, did).await? {
+        return Err(invalid_request(
+            "This email address is already in use, please use a different email.",
+        ));
+    }
+    let old = acct.email.clone();
+    let res = update_account(app, did, false, false, |a| {
+        a.email = Some(email.clone());
+        a.email_confirmed = false;
+        set_extra(a, "emailConfirmedAt", J::Null);
+        Ok(())
+    })
+    .await;
+    if let Err(e) = res {
+        release_email(app, &email, did).await;
+        return Err(e);
+    }
+    if let Some(o) = old {
+        release_email(app, &o, did).await;
+    }
+    delete_email_tokens(app, did, EMAIL_PURPOSES).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateEmailIn {
+    email: String,
+    token: Option<String>,
+    email_auth_factor: Option<bool>,
+}
+
+async fn update_email(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<UpdateEmailIn>,
+) -> XResult<StatusCode> {
+    // app passwords can't change the email (stricter than the reference)
+    let did = full_or_oauth_account(&creds, "email", "manage")?;
+    let acct = app
+        .account(&did)
+        .await
+        .map_err(|_| invalid_request(format!("Could not find user info for account: {did}")))?;
+    if is_takendown_account(&acct) {
+        return Err(takedown_error());
+    }
+    let email = inp.email.trim().to_ascii_lowercase();
+    if inp.email_auth_factor == Some(true) {
+        return Err(invalid_request(
+            "Email two-factor authentication is not supported by this server; use TOTP",
+        ));
+    }
+    if !valid_email(&email) {
+        return Err(invalid_request(
+            "This email address is not supported, please use a different email.",
+        ));
+    }
+    match inp.token.as_deref().filter(|t| !t.is_empty()) {
+        Some(t) => assert_email_token(&app, &did, "update_email", t).await?,
+        None if acct.email_confirmed => {
+            return Err(XrpcError::bad(
+                "TokenRequired",
+                "confirmation token required",
+            ))
+        }
+        None => {}
+    }
+    set_email(&app, &did, &email).await?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct RequestPasswordResetIn {
+    email: String,
+}
+
+async fn request_password_reset(
+    State(app): AppState,
+    Json(inp): Json<RequestPasswordResetIn>,
+) -> XResult<StatusCode> {
+    let email = inp.email.trim().to_ascii_lowercase();
+    let acct = match did_by_email(&app, &email).await? {
+        Some(did) => app
+            .account(&did)
+            .await
+            .ok()
+            .filter(|a| a.email.as_deref() == Some(email.as_str())),
+        None => None,
+    };
+    let Some(acct) = acct else {
+        return Err(invalid_request("account does not have an email address"));
+    };
+    let token = create_email_token(&app, &acct.did, "reset_password").await?;
+    deliver(
+        &app,
+        &email,
+        "Password Reset Requested",
+        &format!("Hi {}, your password reset code is {token}", acct.handle),
+        "reset_password",
+        Some(&token),
+    );
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct ResetPasswordIn {
+    token: String,
+    password: String,
+}
+
+/// Sets a new password and revokes every session.
+pub(super) async fn change_password(app: &App, did: &str, password: &str) -> XResult<()> {
+    let hash = state::hash_password(password).await;
+    update_account(app, did, false, false, |a| {
+        a.password_hash = hash.clone();
+        Ok(())
+    })
+    .await?;
+    delete_email_tokens(app, did, &["reset_password"]).await?;
+    revoke_all_sessions(app, did).await
+}
+
+async fn reset_password(
+    State(app): AppState,
+    Json(inp): Json<ResetPasswordIn>,
+) -> XResult<StatusCode> {
+    if inp.password.len() > NEW_PASSWORD_MAX_LENGTH {
+        return Err(invalid_request("Invalid password length."));
+    }
+    let token = inp.token.trim().to_ascii_uppercase();
+    let routing = format!("_reset:{token}");
+    let did = app
+        .get_private(&routing, "t")
+        .await?
+        .map(|v| String::from_utf8_lossy(&v).to_string())
+        .ok_or_else(|| invalid_token("Token is invalid"))?;
+    assert_email_token(&app, &did, "reset_password", &token).await?;
+    change_password(&app, &did, &inp.password).await?;
+    app.put_private(&routing, vec![pmut(&routing, "t", None)])
+        .await?;
+    Ok(StatusCode::OK)
+}
+
+// ---------------------------------------------------------------------------
+// invites (user side + admin creation)
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateInviteCodeIn {
+    use_count: i64,
+    for_account: Option<String>,
+}
+
+fn require_admin(creds: &Credentials) -> XResult<()> {
+    match creds {
+        Credentials::Admin => Ok(()),
+        _ => Err(auth_required("admin credentials required")),
+    }
+}
+
+async fn create_invite_code(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<CreateInviteCodeIn>,
+) -> XResult<Json<J>> {
+    require_admin(&creds)?;
+    let account = inp.for_account.unwrap_or_else(|| "admin".into());
+    let code = super::admin::gen_invite_code(&app);
+    super::admin::create_invites(
+        &app,
+        &account,
+        std::slice::from_ref(&code),
+        inp.use_count,
+        false,
+    )
+    .await?;
+    Ok(Json(json!({"code": code})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateInviteCodesIn {
+    #[serde(default = "one")]
+    code_count: usize,
+    use_count: i64,
+    for_accounts: Option<Vec<String>>,
+}
+
+fn one() -> usize {
+    1
+}
+
+async fn create_invite_codes(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<CreateInviteCodesIn>,
+) -> XResult<Json<J>> {
+    require_admin(&creds)?;
+    let accounts = inp.for_accounts.unwrap_or_else(|| vec!["admin".into()]);
+    let mut out = Vec::new();
+    for account in accounts {
+        let codes: Vec<String> = (0..inp.code_count.min(1000))
+            .map(|_| super::admin::gen_invite_code(&app))
+            .collect();
+        super::admin::create_invites(&app, &account, &codes, inp.use_count, false).await?;
+        out.push(json!({"account": account, "codes": codes}));
+    }
+    Ok(Json(json!({"codes": out})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountInviteCodesQ {
+    include_used: Option<bool>,
+    #[allow(dead_code)]
+    create_available: Option<bool>,
+}
+
+async fn get_account_invite_codes(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Query(q): Query<AccountInviteCodesQ>,
+) -> XResult<Json<J>> {
+    let did = full_access(&creds)?;
+    let acct = app
+        .account(&did)
+        .await
+        .map_err(|_| XrpcError::bad("NotFound", "Account not found"))?;
+    if is_takendown_account(&acct) {
+        return Err(takedown_error());
+    }
+    let include_used = q.include_used.unwrap_or(true);
+    let codes: Vec<J> = super::admin::account_invites(&app, &did)
+        .await?
+        .into_iter()
+        .filter(|c| !c.disabled && (include_used || (c.uses.len() as i64) < c.available))
+        .map(|c| serde_json::to_value(c).unwrap())
+        .collect();
+    Ok(Json(json!({"codes": codes})))
+}
+
+// ---------------------------------------------------------------------------
+// getServiceAuth
+// ---------------------------------------------------------------------------
+
+/// Methods that must be called directly, never via service auth (reference PROTECTED_METHODS).
+const PROTECTED_METHODS: &[&str] = &[
+    "com.atproto.admin.sendEmail",
+    "com.atproto.identity.requestPlcOperationSignature",
+    "com.atproto.identity.signPlcOperation",
+    "com.atproto.identity.updateHandle",
+    "com.atproto.server.activateAccount",
+    "com.atproto.server.confirmEmail",
+    "com.atproto.server.createAppPassword",
+    "com.atproto.server.deactivateAccount",
+    "com.atproto.server.getAccountInviteCodes",
+    "com.atproto.server.getSession",
+    "com.atproto.server.listAppPasswords",
+    "com.atproto.server.requestAccountDelete",
+    "com.atproto.server.requestEmailConfirmation",
+    "com.atproto.server.requestEmailUpdate",
+    "com.atproto.server.revokeAppPassword",
+    "com.atproto.server.updateEmail",
+];
+
+/// Methods that need a privileged credential (reference PRIVILEGED_METHODS:
+/// chat.bsky.* and createAccount).
+/// (Matched case-insensitively, like the reference's LxmSet.)
+fn privileged_method(lxm: &str) -> bool {
+    let l = lxm.to_ascii_lowercase();
+    l.starts_with("chat.bsky.") || l == "com.atproto.server.createaccount"
+}
+
+fn protected_method(lxm: &str) -> bool {
+    PROTECTED_METHODS.iter().any(|m| m.eq_ignore_ascii_case(lxm))
+}
+
+#[derive(Deserialize)]
+struct ServiceAuthQ {
+    aud: String,
+    exp: Option<i64>,
+    lxm: Option<String>,
+}
+
+async fn get_service_auth(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Query(q): Query<ServiceAuthQ>,
+) -> XResult<Json<J>> {
+    let did = user_did(&creds)?;
+    let lxm = q.lxm.as_deref().filter(|l| !l.is_empty());
+    let (aud_did, fragment) = match q.aud.split_once('#') {
+        Some((d, f)) => (d, Some(f)),
+        None => (q.aud.as_str(), None),
+    };
+    if !is_atproto_did(aud_did) || fragment.is_some_and(|f| f.is_empty()) {
+        return Err(invalid_request(
+            "aud must be a valid atproto DID or did#serviceId reference",
+        ));
+    }
+    match &creds {
+        Credentials::OAuth { .. } => creds.require(creds.allows_rpc(lxm.unwrap_or("*"), &q.aud))?,
+        Credentials::AppPassword {
+            privileged: false, ..
+        } => {
+            if let Some(l) = lxm.filter(|l| privileged_method(l)) {
+                return Err(invalid_request(format!("insufficient access to request a service auth token for the following method: {l}")));
+            }
+        }
+        _ => {}
+    }
+    let acct = app.account(&did).await?;
+    if is_takendown_account(&acct) && lxm != Some("com.atproto.server.createAccount") {
+        return Err(bad_scope());
+    }
+    let now = now_secs() as i64;
+    let ttl = match q.exp {
+        Some(exp) => {
+            let diff = exp - now;
+            if diff < 0 {
+                return Err(XrpcError::bad("BadExpiration", "expiration is in past"));
+            } else if diff > 3600 {
+                return Err(XrpcError::bad(
+                    "BadExpiration",
+                    "cannot request a token with an expiration more than an hour in the future",
+                ));
+            } else if lxm.is_none() && diff > 60 {
+                return Err(XrpcError::bad("BadExpiration", "cannot request a method-less token with an expiration more than a minute in the future"));
+            }
+            diff as u64
+        }
+        None => 60,
+    };
+    if let Some(l) = lxm.filter(|l| protected_method(l)) {
+        return Err(invalid_request(format!(
+            "cannot request a service auth token for the following protected method: {l}"
+        )));
+    }
+    let key = Keypair::from_bytes(&hex::decode(&acct.signing_key).map_err(XrpcError::from_err)?)
+        .map_err(XrpcError::from_err)?;
+    let token = crate::auth::service_auth_jwt(&key, &did, &q.aud, lxm, ttl);
+    Ok(Json(json!({"token": token})))
+}
+
+/// did:plc (24 base32 chars) or did:web without a path; a port only for
+/// localhost (reference @atproto/did isAtprotoDid).
+pub(super) fn is_atproto_did(s: &str) -> bool {
+    if let Some(id) = s.strip_prefix("did:plc:") {
+        return id.len() == 24 && id.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'));
+    }
+    if let Some(host) = s.strip_prefix("did:web:") {
+        return super::syntax::valid_did(s)
+            && !host.contains(':')
+            && (!host.contains("%3A") || host.starts_with("localhost%3A"));
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// temp.*
+// ---------------------------------------------------------------------------
+
+async fn check_signup_queue(Auth(creds): Auth) -> XResult<Json<J>> {
+    standard_no_oauth(&creds)?;
+    Ok(Json(json!({"activated": true})))
+}
+
+#[derive(Deserialize)]
+struct HandleAvailabilityQ {
+    handle: String,
+    email: Option<String>,
+}
+
+async fn handle_available(app: &App, handle: &str) -> XResult<bool> {
+    if ensure_service_handle(app, handle, false).is_err() {
+        return Ok(false);
+    }
+    Ok(app.resolve_handle(handle).await?.is_none())
+}
+
+async fn check_handle_availability(
+    State(app): AppState,
+    Query(q): Query<HandleAvailabilityQ>,
+) -> XResult<Json<J>> {
+    if let Some(e) = q.email.as_deref().filter(|e| !e.is_empty()) {
+        if !valid_email(&e.to_ascii_lowercase()) {
+            return Err(XrpcError::bad(
+                "InvalidEmail",
+                "An invalid email was provided.",
+            ));
+        }
+    }
+    let handle = normalize_handle(&q.handle)?;
+    if handle_available(&app, &handle).await? {
+        return Ok(Json(json!({
+            "handle": handle,
+            "result": {"$type": "com.atproto.temp.checkHandleAvailability#resultAvailable"},
+        })));
+    }
+    // suggestions: the first label plus random digits, under our domain
+    let suffix = format!(".{}", app.handle_domain);
+    let base: String = handle
+        .split('.')
+        .next()
+        .unwrap_or("user")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(14)
+        .collect();
+    let base = if base.len() < 3 {
+        format!("{base}user")
+    } else {
+        base
+    };
+    let mut suggestions = Vec::new();
+    for _ in 0..12 {
+        if suggestions.len() >= 3 {
+            break;
+        }
+        let cand = format!("{base}{}{suffix}", rand::random::<u16>() % 10_000);
+        if handle_available(&app, &cand).await?
+            && !suggestions.iter().any(|s: &J| s["handle"] == cand)
+        {
+            suggestions.push(json!({"handle": cand, "method": "random_digits"}));
+        }
+    }
+    Ok(Json(json!({
+        "handle": handle,
+        "result": {"$type": "com.atproto.temp.checkHandleAvailability#resultUnavailable", "suggestions": suggestions},
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// TOTP (vlpds.server.*Totp)
+// ---------------------------------------------------------------------------
+
+fn session_only(creds: &Credentials) -> XResult<String> {
+    full_access(creds)
+}
+
+async fn set_totp_flag(app: &App, did: &str, enabled: bool) -> XResult<()> {
+    update_account(app, did, false, false, |a| {
+        set_extra(a, "totpEnabled", json!(enabled));
+        Ok(())
+    })
+    .await
+    .map(|_| ())
+}
+
+async fn setup_totp(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+    let did = session_only(&creds)?;
+    let acct = app.account(&did).await?;
+    let _g = crate::totp::lock(&did).await;
+    let mut st = crate::totp::load(&app, &did).await?;
+    if st.enabled() {
+        return Err(invalid_request("TOTP is already enabled; disable it first"));
+    }
+    let secret = crate::totp::base32_encode(&crate::totp::generate_secret());
+    st.pending = Some(secret.clone());
+    crate::totp::save(&app, &did, &st).await?;
+    let issuer = app
+        .public_url
+        .split("://")
+        .nth(1)
+        .unwrap_or(&app.public_url)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("vlpds")
+        .to_string();
+    let uri = crate::totp::otpauth_uri(&secret, &issuer, &acct.handle);
+    Ok(Json(json!({"secret": secret, "uri": uri})))
+}
+
+#[derive(Deserialize)]
+struct ConfirmTotpIn {
+    code: String,
+}
+
+async fn confirm_totp(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<ConfirmTotpIn>,
+) -> XResult<Json<J>> {
+    let did = session_only(&creds)?;
+    let codes = {
+        let _g = crate::totp::lock(&did).await;
+        let mut st = crate::totp::load(&app, &did).await?;
+        if st.enabled() {
+            return Err(invalid_request("TOTP is already enabled"));
+        }
+        let pending = st.pending.clone().ok_or_else(|| {
+            invalid_request("No pending TOTP setup; call vlpds.server.setupTotp first")
+        })?;
+        let secret = crate::totp::base32_decode(&pending)
+            .ok_or_else(|| XrpcError::internal("corrupt pending TOTP secret"))?;
+        let step = crate::totp::verify_code(&secret, &inp.code, crate::totp::now_secs(), 0)
+            .ok_or_else(|| invalid_token("Token is invalid"))?;
+        let codes = crate::totp::generate_recovery_codes();
+        st.secret = Some(pending);
+        st.pending = None;
+        st.last_step = step;
+        st.recovery = codes
+            .iter()
+            .map(|c| crate::totp::hash_recovery_code(c))
+            .collect();
+        st.enabled_at = Some(crate::events::now_rfc3339());
+        // flag first: a crash between the two writes must not leave TOTP
+        // enabled with the login fast path (totpEnabled=false) skipping it
+        set_totp_flag(&app, &did, true).await?;
+        crate::totp::save(&app, &did, &st).await?;
+        codes
+    };
+    Ok(Json(json!({"enabled": true, "recoveryCodes": codes})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DisableTotpIn {
+    code: Option<String>,
+    recovery_code: Option<String>,
+    password: String,
+}
+
+async fn disable_totp(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<DisableTotpIn>,
+) -> XResult<StatusCode> {
+    let did = session_only(&creds)?;
+    let acct = app.account(&did).await?;
+    if !verify_password(&acct, &inp.password).await {
+        return Err(auth_required("Invalid password"));
+    }
+    {
+        let _g = crate::totp::lock(&did).await;
+        let mut st = crate::totp::load(&app, &did).await?;
+        if !st.enabled() {
+            return Err(invalid_request("TOTP is not enabled"));
+        }
+        let code = inp
+            .code
+            .as_deref()
+            .or(inp.recovery_code.as_deref())
+            .filter(|c| !c.trim().is_empty())
+            .ok_or_else(|| invalid_request("code or recoveryCode is required"))?;
+        crate::totp::consume(&mut st, code)?;
+        crate::totp::save(&app, &did, &crate::totp::TotpState::default()).await?;
+    }
+    set_totp_flag(&app, &did, false).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn get_totp_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+    let did = standard_no_oauth(&creds)?;
+    let st = crate::totp::load(&app, &did).await?;
+    let mut out = json!({
+        "enabled": st.enabled(),
+        "pending": st.pending.is_some(),
+        "recoveryCodesRemaining": st.recovery.len(),
+    });
+    if let Some(at) = &st.enabled_at {
+        out["enabledAt"] = json!(at);
+    }
+    Ok(Json(out))
+}
+
+/// Reserved service-domain handle labels (from the reference PDS).
+const RESERVED_HANDLES: &str = concat!(
+    "10downingstreet 10ronaldinho 3gerardpique about abuse access account accounts aclu acme activate activities ",
+    "activity ad add address adele adm admanager admin administration administrator administrators admins ads ",
+    "adsense adult advertising adwords affiliate affiliatepage affiliates afp ajax akiko_lawson akshaykumar aliaa08 ",
+    "aliciakeys all alpha amitshah analysis analytics andresiniesta8 android anon anonymous answer answers ",
+    "anushkasharma aoc ap api apis app appengine appnews apps archive archives arianagrande ariyoshihiroiki ",
+    "arrahman article arvindkejriwal asahi asdf asset assets at atp auth authentication avatar avrillavigne backup ",
+    "bank banner banners barackobama base bbcbreaking bbcworld beginners beingsalmankhan beta beyonce billgates ",
+    "billieeilish billing bin binaries binary blackberry blog blogs blogsearch bluesky board book bookmark ",
+    "bookmarks books bot bots brasildefato britneyspears brunomars bsky bts_bighit bts_twt bug bugs business buy ",
+    "buzz cache calendar call campaign cancel captcha career careers cart carterjwm catalog catalogs categories ",
+    "category cdn cgi cgi-bin championsleague changelog chart charts chat check checked checking checkout ",
+    "chrisbrown claudialeitte client cliente clients clients1 cnarne cnnbrk code coldplay comercial comment ",
+    "comments communities community company compare compras conanobrien config configuration confirm confirmation ",
+    "connect contact contact-us contact_us contacts contactus content contest contribute contributor contributors ",
+    "coppa copyright copyrights core corp correio countries country cpanel create cristiano css cssproxy customise ",
+    "customize danieltosh dashboard data davidguetta db ddlovato deepikapadukone default delete demo design ",
+    "designer desktop destroy dev devel developer developers devs diagram diary dict dictionary did die dir ",
+    "direct-messages direct_messages directory dist diversity dl dmca doc docs documentation documentations ",
+    "documents domain domains donate download downloads dozle_official drake dril e e-mail earth ecommerce edit ",
+    "editor edits edu education elisapie ellendegeneres elonmusk em_com email embed embedded eminem emmawatson ",
+    "employment employments empty enable encrypted end engine enterprise enterprises entries entry error errorlog ",
+    "errors estadao eval event example examplecommunity exampleopenid examplesyn examplesyndicated exampleusername ",
+    "exchange exit explore famima_now faq faqs favorite favorites favourite favourites fcbarcelona feature features ",
+    "feed feedback feedburner feedproxy feeds ff_xiv_jp file files finance first folder folders folha following ",
+    "forgot form forms forum forums founder foxnews free friend friends ftp fuck fujitv fun fusion gadget gadgets ",
+    "game games gazetadopovo gears general geographic get gettingstarted gift gifts gigazine gist git github gmail ",
+    "go golang goto gov graph graphs gretathunberg group groups guest guests guide guides hack hacks hajimesyacho ",
+    "handle harry_styles head help hikakin hillaryclinton home homepage host hosting hostmaster hostname how-to ",
+    "how_to howto html htrnl http httpd https i iamges iamsrk icon icons id idea ideas ihrithik im imac image ",
+    "images imap img imvkohli inbox inboxes index indexes info information inquiry instagram intranet investor ",
+    "investors invitation invitations invite invoice invoices ios ipad iphone irc irnages irng is issue issues it ",
+    "item items ivetesangalo jairbolsonaro java javascript jimmyfallon jlo job jobs jocx joebiden join ",
+    "jornaldobrasil jornaloglobo jotx js json jtimberlake jump justinbieber kaka kamalaharris kanyewest katyperry ",
+    "kb kendalljenner kevinhart4real khloekardashian kimkardashian kingjames kiyo_saiore knowledge-base ",
+    "knowledgebase kourtneykardash kremlinrussia_e kyliejenner lab labs ladygaga language languages last ",
+    "ldap-status ldap_status ldapstatus legal leomessi lex lexicon liampayne license licenses liltunechi link links ",
+    "linux list lists livejournal lj local locale location log log-in log-out log_in log_out login logout logs ",
+    "lucianohuck lulaoficial m mac mac-os mac-os-x mac_os_x macos macosx mail mailer mailing main mainichi ",
+    "maintenance manage manager manual manutd map maps marcosmion mariahcarey marketing master matsu_bouzu me media ",
+    "member members memories memory merchandise message messages messenger mg microblog microblogs mileycyrus mine ",
+    "mis misc mms mob mobile model models mohamadalarefe money movie movies mp3 mp4 msg msn music mx my mymme mysql ",
+    "name named nan naomiosaka narendramodi nasa natgeo navi navigation nba net network networks new news ",
+    "newsletter neymarjr nfl nhk niallofficial nick nickiminaj nickname nike nikkei nil nintendo none notes ",
+    "noticias notification notifications notify npr ns ns1 ns2 ns3 ns4 ns5 nsid ntv null nytimes oauth ",
+    "oauth-clients oauth_clients ocsp offer offers official old onedirection online oowareware1945 openid operator ",
+    "oprah option options order orders org organization organizations other overview owner owners p0rn pack page ",
+    "pager pages paid pamyurin panel partner partnerpage partners password patch paulocoelho pay payment pds people ",
+    "perl person phone photo photoalbum photos php phpmyadmin phppgadmin phpredisadmin pic pics picture pictures ",
+    "ping pink pitbull pixel places plan plans playstation plc plugin plugins pmoindia podcasts poke_times policies ",
+    "policy pop pop3 popular porn portal portalr7 portals post postfix postmaster posts potus pr pr0n premierleague ",
+    "premium press price pricing principles print privacy privacy-policy privacy_policy privacypolicy private ",
+    "priyankachopra prod product production products profile profiles project projects promo promotions proxies ",
+    "proxy pub public purchase purpose put python queries query radio random ranking read reader readme ",
+    "realdonaldtrump recent recruit recruitment rede_globo redirect register registration release remove replies ",
+    "repo report reports repositories repository req request requests research reset resolve resolver review ",
+    "ricky_martin rihanna rnail rnicrosoft roc rolaworld rondesantisfl root rss ruby rule sachin_rt sag sale sales ",
+    "sample samples sandbox save scholar school schools script scripts search secure security seikintv selenagomez ",
+    "self seminars send server server-info server-status server_info server_status servers service services session ",
+    "sessions setting settings setup shakira share shawnmendes shop shopping shortcut shortcuts show sign-in ",
+    "sign-up sign_in sign_up signin signout signup site sitemap sitemaps sitenews sites sketchup sky slash ",
+    "slashinvoice slut smartphone sms smtp snoopdogg soap software sorry source spec special sportscenter ",
+    "spreadsheet spreadsheets sql srbachchan src srntp ssh ssl ssladmin ssladministrator sslwebmaster ssytem staff ",
+    "stage staging starbucksjapan start stat state static statistics stats status store stores stories style ",
+    "styleguide styles stylesheet stylesheets subdomain subhisharma100 subscribe subscription subscriptions suggest ",
+    "suggestqueries support survey surveys surveytool svn swf syn sync syndicated sys sysadmin sysadministrator ",
+    "sysadmins system tablet tablets tag tags talk talkgadget task tasks taylorswift taylorswift13 tbs tbs_pr team ",
+    "teams tech telnet term terms terms-of-service terms_of_service termsofservice test testing tests text ",
+    "theeconomist theme themes therock thread threads ticket tickets tid tmp to-do to_do todo toml tool toolbar ",
+    "toolbars tools top topic topics tos tour trac trace translate translation translations translator trends ",
+    "tutorial tux tv tvasahi tvtokyo twitter txt ukraine ul undef unfollow unsubscribe update updates upgrade ",
+    "upgrades upi upload uploads url usage user username usernames users uuid validation validations ver version ",
+    "video video-stats videos virendersehwag visitor visitors voice volunteer volunteers w washingtonpost watch ",
+    "wave weather web webdisk webhook webhooks webmail webmaster webmasters webrnail website websites welcome ",
+    "whitehouse45 whm whois widget widgets wifi wiki wikis win windows wizkhalifa word work works workshop wpad ww ",
+    "wws www wwws wwww xfn xhtml xhtrnl xml xmpp xpg xrpc xxx yaml year yml yokoono yomiuri_online you yourdomain ",
+    "yourname yoursite yourusername yousuck2020 youtube zaynmalik zelenskyyua zerohora ",
+);

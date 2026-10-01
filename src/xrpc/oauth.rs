@@ -1,0 +1,1954 @@
+//! atproto OAuth authorization server (PAR, PKCE, DPoP, client metadata,
+//! token/refresh/revocation, consent UI, granular permission scopes) and
+//! DPoP verification of resource requests. Building blocks live in
+//! `crate::oauth`; see its module docs for keys, storage layout and HA notes.
+//!
+//! Endpoints:
+//! - `GET /.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`
+//! - `GET /oauth/jwks` (access-token verification key)
+//! - `POST /oauth/par`, `GET /oauth/authorize` (+ form posts under it),
+//!   `POST /oauth/token`, `POST /oauth/revoke`
+//! - `GET /oauth/account` (+ form posts): signed-in user's connected apps
+//!   (no-JS, cookie based; `/account/*` is the embedded web UI)
+//! - `vlpds.oauth.listSessions` / `vlpds.oauth.revokeSession` (XRPC, full
+//!   account session required)
+
+use super::authn::Credentials;
+use super::*;
+use crate::oauth::client::{self, Client, ClientAuth, ClientCredentials};
+use crate::oauth::jose::{self, DpopError, DpopNonces, DpopProof, ServerKey};
+use crate::oauth::scopes::{is_atproto_did, is_atproto_oauth_scope};
+use crate::oauth::store::{self, AuthParams, Device, DeviceAccount, RequestData, Session};
+use crate::oauth::util::{self as ou, now_secs};
+use crate::oauth::{
+    lexicon, ui, OAuthError, ACCESS_TOKEN_TTL, AUTHENTICATION_MAX_AGE,
+    AUTHORIZATION_INACTIVITY_TIMEOUT, PAR_EXPIRES_IN,
+};
+use axum::http::request::Parts;
+use axum::http::{HeaderName, HeaderValue};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::LazyLock;
+
+pub use crate::oauth::ScopeSet;
+
+const DEVICE_COOKIE: &str = "vlpds-device";
+const PENDING_2FA_TTL: i64 = 5 * 60;
+
+// ---------- per-secret keys ----------
+
+struct Keys {
+    server: ServerKey,
+    nonces: DpopNonces,
+    csrf: [u8; 32],
+    refresh: [u8; 32],
+}
+
+static KEYS: LazyLock<parking_lot::Mutex<HashMap<String, Arc<Keys>>>> =
+    LazyLock::new(Default::default);
+
+fn keys(app: &App) -> Arc<Keys> {
+    let secret = &app.config.jwt_secret;
+    let mut m = KEYS.lock();
+    m.entry(secret.clone())
+        .or_insert_with(|| {
+            Arc::new(Keys {
+                server: ServerKey::derive(secret),
+                nonces: DpopNonces::new(secret),
+                csrf: ou::derive_secret(secret, "csrf"),
+                refresh: ou::derive_secret(secret, "refresh-token"),
+            })
+        })
+        .clone()
+}
+
+fn issuer(app: &App) -> String {
+    app.public_url.trim_end_matches('/').to_string()
+}
+
+fn is_https(app: &App) -> bool {
+    app.public_url.starts_with("https://")
+}
+
+// ---------- routes ----------
+
+pub fn routes() -> Router<Arc<App>> {
+    Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource_metadata).options(preflight),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(authorization_server_metadata).options(preflight),
+        )
+        .route("/oauth/jwks", get(jwks).options(preflight))
+        .route("/oauth/par", post(par).options(preflight))
+        .route("/oauth/token", post(token).options(preflight))
+        .route("/oauth/revoke", post(revoke).options(preflight))
+        .route("/oauth/authorize", get(authorize))
+        .route("/oauth/authorize/sign-in", post(authorize_sign_in))
+        .route("/oauth/authorize/select", post(authorize_select))
+        .route("/oauth/authorize/consent", post(authorize_consent))
+        .route("/oauth/account", get(account_page))
+        .route("/oauth/account/sign-in", post(account_sign_in))
+        .route("/oauth/account/sign-out", post(account_sign_out))
+        .route("/oauth/account/revoke", post(account_revoke))
+        .route("/xrpc/vlpds.oauth.listSessions", get(xrpc_list_sessions))
+        .route("/xrpc/vlpds.oauth.revokeSession", post(xrpc_revoke_session))
+}
+
+// ---------- CORS / common headers ----------
+
+fn cors(h: &mut HeaderMap) {
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("DPoP-Nonce, WWW-Authenticate"),
+    );
+}
+
+async fn preflight() -> Response {
+    let mut r = StatusCode::NO_CONTENT.into_response();
+    let h = r.headers_mut();
+    cors(h);
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Content-Type, DPoP, Authorization"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("86400"),
+    );
+    r
+}
+
+/// JSON response for the AS endpoints: CORS, no-store, fresh DPoP nonce.
+fn as_json(app: &App, status: StatusCode, body: J) -> Response {
+    let mut r = (status, Json(body)).into_response();
+    finish_as(app, &mut r);
+    r
+}
+
+fn finish_as(app: &App, r: &mut Response) {
+    let h = r.headers_mut();
+    cors(h);
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    if let Ok(v) = HeaderValue::from_str(&keys(app).nonces.next()) {
+        h.insert(HeaderName::from_static("dpop-nonce"), v);
+    }
+}
+
+fn as_error(app: &App, e: OAuthError) -> Response {
+    let mut r = e.into_response();
+    finish_as(app, &mut r);
+    r
+}
+
+// ---------- metadata ----------
+
+async fn protected_resource_metadata(State(app): AppState) -> Response {
+    let iss = issuer(&app);
+    let mut r = Json(json!({
+        "resource": iss,
+        "authorization_servers": [iss],
+        "scopes_supported": [],
+        "bearer_methods_supported": ["header"],
+        "resource_documentation": "https://atproto.com",
+    }))
+    .into_response();
+    cors(r.headers_mut());
+    r
+}
+
+async fn authorization_server_metadata(State(app): AppState) -> Response {
+    let iss = issuer(&app);
+    let mut r = Json(json!({
+        "issuer": iss,
+        "scopes_supported": ["atproto", "transition:email", "transition:generic", "transition:chat.bsky"],
+        "subject_types_supported": ["public"],
+        "response_types_supported": ["code"],
+        "response_modes_supported": ["query", "fragment"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "ui_locales_supported": ["en-US"],
+        "display_values_supported": ["page", "popup", "touch"],
+        "prompt_values_supported": ["none", "login", "consent", "select_account"],
+        "authorization_response_iss_parameter_supported": true,
+        "request_parameter_supported": false,
+        "request_uri_parameter_supported": true,
+        "require_request_uri_registration": true,
+        "jwks_uri": format!("{iss}/oauth/jwks"),
+        "authorization_endpoint": format!("{iss}/oauth/authorize"),
+        "token_endpoint": format!("{iss}/oauth/token"),
+        "token_endpoint_auth_methods_supported": client::AUTH_METHODS_SUPPORTED,
+        "token_endpoint_auth_signing_alg_values_supported": jose::VERIFY_ALGS,
+        "revocation_endpoint": format!("{iss}/oauth/revoke"),
+        "pushed_authorization_request_endpoint": format!("{iss}/oauth/par"),
+        "require_pushed_authorization_requests": true,
+        "dpop_signing_alg_values_supported": jose::VERIFY_ALGS,
+        "protected_resources": [iss],
+        "client_id_metadata_document_supported": true,
+    }))
+    .into_response();
+    cors(r.headers_mut());
+    r
+}
+
+async fn jwks(State(app): AppState) -> Response {
+    let mut r = Json(json!({"keys": [keys(&app).server.public_jwk()]})).into_response();
+    cors(r.headers_mut());
+    r
+}
+
+// ---------- request parsing ----------
+
+/// Parses an urlencoded (or JSON) request body. Repeated parameters are an
+/// error (RFC 6749 §3.1).
+fn parse_params(headers: &HeaderMap, body: &[u8]) -> Result<HashMap<String, String>, OAuthError> {
+    let ct = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let mut out = HashMap::new();
+    if ct.starts_with("application/json") {
+        let j: J = serde_json::from_slice(body)
+            .map_err(|_| OAuthError::invalid_request("Invalid JSON body"))?;
+        let obj = j
+            .as_object()
+            .ok_or_else(|| OAuthError::invalid_request("Invalid JSON body"))?;
+        for (k, v) in obj {
+            let s = match v {
+                J::String(s) => s.clone(),
+                J::Number(n) => n.to_string(),
+                J::Bool(b) => b.to_string(),
+                J::Null => continue,
+                _ => {
+                    return Err(OAuthError::invalid_request(&format!(
+                        "Invalid \"{k}\" parameter"
+                    )))
+                }
+            };
+            out.insert(k.clone(), s);
+        }
+        return Ok(out);
+    }
+    let s = std::str::from_utf8(body)
+        .map_err(|_| OAuthError::invalid_request("Invalid request body"))?;
+    for (k, v) in ou::parse_form(s) {
+        if out.insert(k.clone(), v).is_some() {
+            return Err(OAuthError::invalid_request(&format!(
+                "Duplicate \"{k}\" parameter"
+            )));
+        }
+    }
+    Ok(out)
+}
+
+fn dpop_header(headers: &HeaderMap) -> Result<Option<String>, String> {
+    let mut it = headers.get_all("dpop").iter();
+    match (it.next(), it.next()) {
+        (None, _) => Ok(None),
+        (Some(v), None) => {
+            let s = v.to_str().map_err(|_| "Invalid DPoP header".to_string())?;
+            if s.is_empty() {
+                Err("DPoP header cannot be empty".into())
+            } else {
+                Ok(Some(s.to_string()))
+            }
+        }
+        _ => Err("DPoP header must contain a single proof".into()),
+    }
+}
+
+/// DPoP proof at the authorization server (PAR / token): required.
+fn check_as_dpop(app: &App, headers: &HeaderMap, path: &str) -> Result<DpopProof, OAuthError> {
+    let proof = dpop_header(headers)
+        .map_err(|e| OAuthError::invalid_dpop_proof(&e))?
+        .ok_or_else(|| OAuthError::invalid_dpop_proof("DPoP proof required"))?;
+    let htu = jose::normalize_htu(&format!("{}{path}", issuer(app)))
+        .ok_or_else(|| OAuthError::server_error("bad public_url"))?;
+    jose::check_proof(&proof, "POST", &htu, None, &keys(app).nonces).map_err(|e| match e {
+        DpopError::UseNonce(m) => OAuthError::use_dpop_nonce(&m),
+        DpopError::Invalid(m) => OAuthError::invalid_dpop_proof(&m),
+    })
+}
+
+// ---------- PAR ----------
+
+async fn par(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+    match par_inner(&app, &headers, &body).await {
+        Ok(j) => as_json(&app, StatusCode::CREATED, j),
+        Err(e) => as_error(&app, e),
+    }
+}
+
+async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAuthError> {
+    let p = parse_params(headers, body)?;
+    let proof = check_as_dpop(app, headers, "/oauth/par")?;
+    let creds = ClientCredentials::from_params(&p)?;
+    let client = client::get_client(&creds.client_id, app.config.dev_mode).await?;
+    let client_auth = client.authenticate(&creds, &issuer(app))?;
+    let params = validate_authorization_request(app, &client, &p, &proof).await?;
+    if !store::claim_code_challenge(app, &params.code_challenge).await? {
+        return Err(OAuthError::invalid_request(
+            "code_challenge was already used",
+        ));
+    }
+    let id = store::new_request_id();
+    let now = now_secs();
+    let req = RequestData {
+        client_id: client.id.clone(),
+        client_auth,
+        params,
+        created_at: now,
+        expires_at: now + PAR_EXPIRES_IN,
+        device_id: None,
+        did: None,
+        code_hash: None,
+        consumed: None,
+    };
+    store::put_request(app, &id, Some(&req)).await?;
+    Ok(json!({"request_uri": store::request_uri(&id), "expires_in": PAR_EXPIRES_IN - 1}))
+}
+
+fn is_valid_handle(h: &str) -> bool {
+    h.len() <= 253
+        && h.split('.').count() >= 2
+        && h.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        && !h
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Authorization request validation (`RequestManager.validate` + the
+/// client-side checks of `Client.validateRequest`).
+async fn validate_authorization_request(
+    app: &App,
+    client: &Client,
+    p: &HashMap<String, String>,
+    proof: &DpopProof,
+) -> Result<AuthParams, OAuthError> {
+    let g = |k: &str| p.get(k).filter(|v| !v.is_empty()).cloned();
+    for k in ["request", "request_uri"] {
+        if p.contains_key(k) {
+            return Err(OAuthError::invalid_request(&format!(
+                "\"{k}\" is not supported in pushed authorization requests"
+            )));
+        }
+    }
+    for k in ["claims", "id_token_hint", "nonce"] {
+        if p.contains_key(k) {
+            return Err(OAuthError::invalid_request(&format!(
+                "Unsupported \"{k}\" parameter"
+            )));
+        }
+    }
+    if p.contains_key("authorization_details") {
+        return Err(OAuthError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_authorization_details",
+            "Unsupported \"authorization_details\"",
+        ));
+    }
+    let response_type = g("response_type")
+        .ok_or_else(|| OAuthError::invalid_request("Missing \"response_type\""))?;
+    if response_type != "code" {
+        return Err(OAuthError::new(
+            StatusCode::BAD_REQUEST,
+            "unsupported_response_type",
+            &format!("Unsupported response_type \"{response_type}\""),
+        ));
+    }
+    // client checks
+    if !client.response_types.contains(&response_type) {
+        return Err(OAuthError::invalid_request(&format!(
+            "Invalid response_type \"{response_type}\" requested by the client"
+        )));
+    }
+    if !client.grant_types.iter().any(|g| g == "authorization_code") {
+        return Err(OAuthError::unauthorized_client(
+            "This client is not allowed to use the \"authorization_code\" grant type",
+        ));
+    }
+    let redirect_uri = match g("redirect_uri") {
+        Some(r) => {
+            if !client.allows_redirect_uri(&r) {
+                return Err(OAuthError::invalid_request(&format!(
+                    "Invalid redirect_uri {r}"
+                )));
+            }
+            r
+        }
+        None => client
+            .default_redirect_uri()
+            .map(String::from)
+            .ok_or_else(|| OAuthError::invalid_request("redirect_uri is required"))?,
+    };
+    let requested = g("scope").unwrap_or_default();
+    for s in requested.split(' ').filter(|s| !s.is_empty()) {
+        if !client.scopes.iter().any(|c| c == s) {
+            return Err(OAuthError::invalid_scope(&format!(
+                "Scope \"{s}\" is not declared in the client metadata"
+            )));
+        }
+    }
+    let mut scopes: Vec<String> = Vec::new();
+    for s in requested.split(' ').filter(|s| !s.is_empty()) {
+        if s == "openid" {
+            return Err(OAuthError::invalid_scope(
+                "OpenID Connect is not compatible with atproto",
+            ));
+        }
+        if is_atproto_oauth_scope(s) && !scopes.iter().any(|x| x == s) {
+            scopes.push(s.to_string());
+        }
+    }
+    if !scopes.iter().any(|s| s == "atproto") {
+        return Err(OAuthError::invalid_scope(
+            "The \"atproto\" scope is required",
+        ));
+    }
+    let scope = scopes.join(" ");
+    let code_challenge = g("code_challenge").ok_or_else(|| {
+        if p.contains_key("code_challenge_method") {
+            OAuthError::invalid_request(
+                "code_challenge is required when code_challenge_method is provided",
+            )
+        } else {
+            OAuthError::invalid_request("Use of PKCE is required")
+        }
+    })?;
+    let method = g("code_challenge_method").unwrap_or_else(|| "plain".into());
+    if method != "S256" {
+        return Err(OAuthError::invalid_request(
+            "atproto requires use of \"S256\" code_challenge_method",
+        ));
+    }
+    if code_challenge.len() != 43 || ou::b64u_decode(&code_challenge).map(|b| b.len()) != Some(32) {
+        return Err(OAuthError::invalid_request("Invalid code_challenge"));
+    }
+    let response_mode = g("response_mode");
+    match response_mode.as_deref() {
+        None | Some("query") | Some("fragment") => {}
+        Some(m) => {
+            return Err(OAuthError::invalid_request(&format!(
+                "Unsupported response_mode \"{m}\""
+            )))
+        }
+    }
+    let mut prompt = g("prompt");
+    match prompt.as_deref() {
+        None | Some("none") | Some("login") | Some("consent") | Some("select_account") => {}
+        Some(v) => {
+            return Err(OAuthError::invalid_request(&format!(
+                "Unsupported prompt \"{v}\""
+            )))
+        }
+    }
+    // atproto: public (unauthenticated) clients may not sign in silently and
+    // always get the consent screen.
+    if !client.is_confidential() {
+        if prompt.as_deref() == Some("none") {
+            return Err(OAuthError::new(
+                StatusCode::BAD_REQUEST,
+                "consent_required",
+                "Public clients are not allowed to use silent-sign-on",
+            ));
+        }
+        prompt = Some("consent".into());
+    }
+    let login_hint = match g("login_hint") {
+        Some(h) => {
+            let h = h.to_lowercase();
+            let h = h.strip_prefix('@').unwrap_or(&h).to_string();
+            if !is_atproto_did(&h) && !is_valid_handle(&h) {
+                return Err(OAuthError::invalid_request(&format!(
+                    "Invalid login_hint \"{h}\""
+                )));
+            }
+            Some(h)
+        }
+        None => None,
+    };
+    if let Some(jkt) = g("dpop_jkt") {
+        if jkt != proof.jkt {
+            return Err(OAuthError::invalid_dpop_proof(
+                "DPoP proof does not match the dpop_jkt parameter",
+            ));
+        }
+    }
+    // Every include: scope must resolve to a permission set.
+    lexicon::permission_sets_for_scope(app, &scope)
+        .await
+        .map_err(|e| OAuthError::invalid_scope(&e))?;
+    Ok(AuthParams {
+        client_id: client.id.clone(),
+        response_type,
+        redirect_uri,
+        scope,
+        state: g("state"),
+        code_challenge,
+        code_challenge_method: method,
+        response_mode,
+        prompt,
+        login_hint,
+        dpop_jkt: proof.jkt.clone(),
+        display: g("display"),
+        ui_locales: g("ui_locales"),
+    })
+}
+
+// ---------- authorization endpoint (UI) ----------
+
+fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    for v in headers.get_all(header::COOKIE) {
+        for part in v.to_str().ok()?.split(';') {
+            if let Some((k, val)) = part.trim().split_once('=') {
+                if k == name {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Loads (or starts) the browser device session. Returns the device and
+/// whether a cookie must be set.
+async fn device_for(app: &App, headers: &HeaderMap) -> Result<(Device, bool), OAuthError> {
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.chars().take(256).collect::<String>());
+    if let Some(id) = cookie(headers, DEVICE_COOKIE).filter(|i| store::valid_device_id(i)) {
+        if let Some(mut d) = store::get_device(app, &id).await? {
+            let now = now_secs();
+            if now - d.last_seen_at > 3600 {
+                d.last_seen_at = now;
+                store::put_device(app, &d).await?;
+            }
+            return Ok((d, false));
+        }
+    }
+    let now = now_secs();
+    let d = Device {
+        id: store::new_device_id(),
+        created_at: now,
+        last_seen_at: now,
+        user_agent: ua,
+        accounts: vec![],
+        pending_2fa: None,
+    };
+    store::put_device(app, &d).await?;
+    Ok((d, true))
+}
+
+fn device_cookie(app: &App, d: &Device) -> HeaderValue {
+    let secure = if is_https(app) { "; Secure" } else { "" };
+    HeaderValue::from_str(&format!(
+        "{DEVICE_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{secure}",
+        d.id
+    ))
+    .unwrap()
+}
+
+fn csrf_token(app: &App, device_id: &str, scope: &str) -> String {
+    ou::b64u(ou::hmac_sha256(
+        &keys(app).csrf,
+        &[device_id.as_bytes(), scope.as_bytes()],
+    ))
+}
+
+/// CSRF defence for form posts: a token bound to the device cookie and the
+/// request, plus Fetch-Metadata / Origin checks when the browser sends them.
+fn check_csrf(
+    app: &App,
+    headers: &HeaderMap,
+    device: &Device,
+    scope: &str,
+    token: Option<&String>,
+) -> bool {
+    if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        if site != "same-origin" && site != "none" {
+            return false;
+        }
+    }
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        if origin != "null"
+            && reqwest::Url::parse(&issuer(app))
+                .map(|u| u.origin().ascii_serialization())
+                .ok()
+                .as_deref()
+                != Some(origin)
+        {
+            return false;
+        }
+    }
+    match token {
+        Some(t) => ou::ct_eq(t.as_bytes(), csrf_token(app, &device.id, scope).as_bytes()),
+        None => false,
+    }
+}
+
+/// form-action source allowing the post-consent redirect to the client.
+fn redirect_source(redirect_uri: &str) -> Option<String> {
+    let u = reqwest::Url::parse(redirect_uri).ok()?;
+    match u.scheme() {
+        "http" | "https" => Some(u.origin().ascii_serialization()),
+        s => Some(format!("{s}:")),
+    }
+}
+
+fn html(
+    app: &App,
+    status: StatusCode,
+    body: String,
+    form_action: &[String],
+    set_cookie: Option<&Device>,
+) -> Response {
+    let mut r = (status, body).into_response();
+    let h = r.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_str(&ui::csp(form_action)).unwrap(),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    if let Some(d) = set_cookie {
+        h.insert(header::SET_COOKIE, device_cookie(app, d));
+    }
+    r
+}
+
+fn error_page(app: &App, status: StatusCode, title: &str, msg: &str) -> Response {
+    html(app, status, ui::error(title, msg), &[], None)
+}
+
+/// Builds the redirect back to the client (RFC 6749 §4.1.2 + RFC 9207 `iss`).
+fn client_redirect(app: &App, params: &AuthParams, mut pairs: Vec<(String, String)>) -> Response {
+    if let Some(s) = &params.state {
+        pairs.push(("state".into(), s.clone()));
+    }
+    pairs.push(("iss".into(), issuer(app)));
+    let enc = ou::form_encode(&pairs);
+    let url = if params.response_mode.as_deref() == Some("fragment") {
+        format!(
+            "{}#{enc}",
+            params.redirect_uri.split('#').next().unwrap_or("")
+        )
+    } else if params.redirect_uri.contains('?') {
+        format!("{}&{enc}", params.redirect_uri)
+    } else {
+        format!("{}?{enc}", params.redirect_uri)
+    };
+    let mut r = StatusCode::SEE_OTHER.into_response();
+    let h = r.headers_mut();
+    h.insert(
+        header::LOCATION,
+        HeaderValue::from_str(&url).unwrap_or(HeaderValue::from_static("/")),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    r
+}
+
+fn redirect_error(app: &App, params: &AuthParams, error: &str, desc: &str) -> Response {
+    client_redirect(
+        app,
+        params,
+        vec![
+            ("error".into(), error.into()),
+            ("error_description".into(), desc.into()),
+        ],
+    )
+}
+
+/// A loaded authorization request in the context of a browser device.
+struct Flow {
+    id: String,
+    uri: String,
+    req: RequestData,
+    client: Arc<Client>,
+    device: Device,
+    new_cookie: bool,
+}
+
+enum FlowError {
+    /// Show an error page (redirect target not trustworthy / unknown).
+    Page(StatusCode, String),
+    /// Redirect to the client with an OAuth error.
+    Redirect(Box<AuthParams>, &'static str, String),
+}
+
+impl FlowError {
+    fn into_response(self, app: &App) -> Response {
+        match self {
+            FlowError::Page(s, m) => error_page(app, s, "Authorization failed", &m),
+            FlowError::Redirect(p, e, m) => redirect_error(app, &p, e, &m),
+        }
+    }
+}
+
+impl From<OAuthError> for FlowError {
+    fn from(e: OAuthError) -> FlowError {
+        FlowError::Page(StatusCode::INTERNAL_SERVER_ERROR, e.description)
+    }
+}
+
+/// Loads the request named by `request_uri` and binds it to this device
+/// (`RequestManager.get`). Failed requests are deleted.
+async fn load_flow(
+    app: &App,
+    headers: &HeaderMap,
+    request_uri: Option<&str>,
+    client_id: Option<&str>,
+) -> Result<Flow, FlowError> {
+    let uri = request_uri.ok_or_else(|| {
+        FlowError::Page(
+            StatusCode::BAD_REQUEST,
+            "Pushed Authorization Request (PAR) is required: missing request_uri".into(),
+        )
+    })?;
+    let id = store::request_id_from_uri(uri)
+        .ok_or_else(|| FlowError::Page(StatusCode::BAD_REQUEST, "Invalid request_uri".into()))?
+        .to_string();
+    let (device, new_cookie) = device_for(app, headers).await?;
+    let mut req = store::get_request(app, &id)
+        .await?
+        .ok_or_else(|| FlowError::Page(StatusCode::BAD_REQUEST, "Unknown request_uri".into()))?;
+    let fail =
+        |m: &str| FlowError::Redirect(Box::new(req.params.clone()), "access_denied", m.to_string());
+    let now = now_secs();
+    let err = if req.did.is_some() || req.code_hash.is_some() || req.consumed.is_some() {
+        Some(fail("This request was already authorized"))
+    } else if req.expires_at < now {
+        Some(fail("This request has expired"))
+    } else if client_id.is_some_and(|c| c != req.client_id) {
+        Some(fail("This request was initiated for another client"))
+    } else if req.device_id.as_ref().is_some_and(|d| *d != device.id) {
+        Some(fail("This request was initiated from another device"))
+    } else {
+        None
+    };
+    if let Some(e) = err {
+        if req.consumed.is_none() {
+            store::put_request(app, &id, None).await?;
+        }
+        return Err(e);
+    }
+    req.device_id = Some(device.id.clone());
+    req.expires_at = now + AUTHORIZATION_INACTIVITY_TIMEOUT;
+    store::put_request(app, &id, Some(&req)).await?;
+    let client = client::get_client(&req.client_id, app.config.dev_mode)
+        .await
+        .map_err(|e| {
+            FlowError::Redirect(
+                Box::new(req.params.clone()),
+                "invalid_client",
+                e.description,
+            )
+        })?;
+    Ok(Flow {
+        id,
+        uri: uri.to_string(),
+        req,
+        client,
+        device,
+        new_cookie,
+    })
+}
+
+impl Flow {
+    fn csrf(&self, app: &App) -> String {
+        csrf_token(app, &self.device.id, &self.id)
+    }
+
+    fn form_action(&self) -> Vec<String> {
+        redirect_source(&self.req.params.redirect_uri)
+            .into_iter()
+            .collect()
+    }
+
+    fn page(&self, app: &App, body: String) -> Response {
+        html(
+            app,
+            StatusCode::OK,
+            body,
+            &self.form_action(),
+            self.new_cookie.then_some(&self.device),
+        )
+    }
+
+    fn ctx<'a>(&'a self, csrf: &'a str, server_name: &'a str) -> ui::Ctx<'a> {
+        ui::Ctx {
+            request_uri: &self.uri,
+            csrf,
+            client_id: &self.client.id,
+            loopback: self.client.loopback,
+            server_name,
+        }
+    }
+}
+
+fn server_name(app: &App) -> String {
+    reqwest::Url::parse(&app.public_url)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+        .unwrap_or_else(|| app.public_url.clone())
+}
+
+/// Accounts signed in on this device whose login is still fresh, with handles.
+async fn device_accounts(app: &App, d: &Device) -> Vec<(String, String)> {
+    let now = now_secs();
+    let mut out = Vec::new();
+    for a in &d.accounts {
+        if now - a.authenticated_at > AUTHENTICATION_MAX_AGE {
+            continue;
+        }
+        if let Ok(acct) = app.account(&a.did).await {
+            if acct.status.is_none() {
+                out.push((acct.did.clone(), acct.handle.clone()));
+            }
+        }
+    }
+    out
+}
+
+fn hint_matches(hint: &str, did: &str, handle: &str) -> bool {
+    hint == did || hint == handle
+}
+
+async fn consent_required(app: &App, flow: &Flow, did: &str) -> Result<bool, OAuthError> {
+    if flow.req.params.prompt.as_deref() == Some("consent") {
+        return Ok(true);
+    }
+    let Some(a) = store::get_authorization(app, did, &flow.client.id).await? else {
+        return Ok(true);
+    };
+    Ok(!flow
+        .req
+        .params
+        .scope
+        .split(' ')
+        .all(|s| a.scopes.iter().any(|x| x == s)))
+}
+
+fn login_page(
+    app: &App,
+    flow: &Flow,
+    identifier: &str,
+    error: Option<&str>,
+    totp: bool,
+    status: StatusCode,
+) -> Response {
+    let csrf = flow.csrf(app);
+    let name = server_name(app);
+    let body = ui::login(
+        Some(&flow.ctx(&csrf, &name)),
+        &ui::LoginForm {
+            action: "/oauth/authorize/sign-in",
+            identifier,
+            error,
+            totp,
+        },
+        "",
+    );
+    let mut r = flow.page(app, body);
+    *r.status_mut() = status;
+    r
+}
+
+/// After an account is chosen: show consent, or approve directly when the
+/// user already granted these scopes to this (confidential) client.
+async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
+    let acct = match app.account(did).await {
+        Ok(a) => a,
+        Err(_) => {
+            return login_page(
+                app,
+                &flow,
+                "",
+                Some("Account not found"),
+                false,
+                StatusCode::OK,
+            )
+        }
+    };
+    match consent_required(app, &flow, did).await {
+        Ok(false) => return issue_code(app, flow, did).await,
+        Ok(true) => {}
+        Err(e) => {
+            return error_page(
+                app,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Authorization failed",
+                &e.description,
+            )
+        }
+    }
+    let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope)
+        .await
+        .unwrap_or_default();
+    let perms = ui::describe_scopes(&flow.req.params.scope, &sets);
+    let csrf = flow.csrf(app);
+    let name = server_name(app);
+    let body = ui::consent(&flow.ctx(&csrf, &name), did, &acct.handle, &perms);
+    flow.page(app, body)
+}
+
+/// Binds the request to the account and redirects with the code
+/// (`RequestManager.setAuthorized`).
+async fn issue_code(app: &App, mut flow: Flow, did: &str) -> Response {
+    if let Err(e) = app.ensure_active(did).await {
+        let _ = store::put_request(app, &flow.id, None).await;
+        return redirect_error(
+            app,
+            &flow.req.params,
+            "access_denied",
+            &format!("Account unavailable: {}", e.message),
+        );
+    }
+    let code = store::new_code(&flow.id);
+    flow.req.did = Some(did.to_string());
+    flow.req.code_hash = Some(store::hash_secret(&code));
+    flow.req.expires_at = now_secs() + AUTHORIZATION_INACTIVITY_TIMEOUT;
+    if let Err(e) = store::put_request(app, &flow.id, Some(&flow.req)).await {
+        return error_page(
+            app,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Authorization failed",
+            &e.description,
+        );
+    }
+    // Remember consent (union with earlier grants).
+    let mut scopes: Vec<String> = flow.req.params.scope.split(' ').map(String::from).collect();
+    if let Ok(Some(prev)) = store::get_authorization(app, did, &flow.client.id).await {
+        for s in prev.scopes {
+            if !scopes.contains(&s) {
+                scopes.push(s);
+            }
+        }
+    }
+    let _ = store::put_authorization(
+        app,
+        did,
+        &store::Authorization {
+            client_id: flow.client.id.clone(),
+            scopes,
+            updated_at: now_secs(),
+        },
+    )
+    .await;
+    let mut r = client_redirect(app, &flow.req.params, vec![("code".into(), code)]);
+    if flow.new_cookie {
+        r.headers_mut()
+            .insert(header::SET_COOKIE, device_cookie(app, &flow.device));
+    }
+    r
+}
+
+async fn authorize(
+    State(app): AppState,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if !q.contains_key("client_id") {
+        return error_page(
+            &app,
+            StatusCode::BAD_REQUEST,
+            "Authorization failed",
+            "Missing client_id",
+        );
+    }
+    let flow = match load_flow(
+        &app,
+        &headers,
+        q.get("request_uri").map(String::as_str),
+        q.get("client_id").map(String::as_str),
+    )
+    .await
+    {
+        Ok(f) => f,
+        Err(e) => return e.into_response(&app),
+    };
+    let accounts = device_accounts(&app, &flow.device).await;
+    let params = flow.req.params.clone();
+    let hint = params.login_hint.clone().unwrap_or_default();
+    let hinted = accounts
+        .iter()
+        .find(|(d, h)| !hint.is_empty() && hint_matches(&hint, d, h))
+        .cloned();
+    match params.prompt.as_deref() {
+        Some("none") => {
+            let chosen = match (&hinted, accounts.len()) {
+                (Some(a), _) => a.clone(),
+                (None, 1) if hint.is_empty() => accounts[0].clone(),
+                (None, 0) => {
+                    return redirect_error(&app, &params, "login_required", "Login is required")
+                }
+                (None, _) if !hint.is_empty() => {
+                    return redirect_error(&app, &params, "login_required", "Login is required")
+                }
+                (None, _) => {
+                    return redirect_error(
+                        &app,
+                        &params,
+                        "account_selection_required",
+                        "Account selection is required",
+                    )
+                }
+            };
+            match consent_required(&app, &flow, &chosen.0).await {
+                Ok(false) => issue_code(&app, flow, &chosen.0).await,
+                Ok(true) => {
+                    redirect_error(&app, &params, "consent_required", "Consent is required")
+                }
+                Err(e) => redirect_error(&app, &params, "server_error", &e.description),
+            }
+        }
+        Some("login") => login_page(&app, &flow, &hint, None, false, StatusCode::OK),
+        Some("select_account") if !accounts.is_empty() => chooser_page(&app, &flow, &accounts),
+        _ => {
+            if let Some((did, _)) = hinted {
+                consent_step(&app, flow, &did).await
+            } else if !hint.is_empty() || accounts.is_empty() {
+                login_page(&app, &flow, &hint, None, false, StatusCode::OK)
+            } else {
+                chooser_page(&app, &flow, &accounts)
+            }
+        }
+    }
+}
+
+fn chooser_page(app: &App, flow: &Flow, accounts: &[(String, String)]) -> Response {
+    let csrf = flow.csrf(app);
+    let name = server_name(app);
+    flow.page(app, ui::chooser(&flow.ctx(&csrf, &name), accounts))
+}
+
+/// Loads a form-post flow and checks CSRF.
+#[allow(clippy::result_large_err)]
+async fn form_flow(
+    app: &App,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(Flow, HashMap<String, String>), Response> {
+    let f: HashMap<String, String> = ou::parse_form(std::str::from_utf8(body).unwrap_or(""))
+        .into_iter()
+        .collect();
+    let flow = load_flow(app, headers, f.get("request_uri").map(String::as_str), None)
+        .await
+        .map_err(|e| e.into_response(app))?;
+    if flow.new_cookie || !check_csrf(app, headers, &flow.device, &flow.id, f.get("csrf")) {
+        return Err(error_page(
+            app,
+            StatusCode::FORBIDDEN,
+            "Authorization failed",
+            "Invalid or missing CSRF token; please restart the sign-in from the app.",
+        ));
+    }
+    Ok((flow, f))
+}
+
+enum SignIn {
+    Ok(String),
+    /// Password accepted; authenticator code needed (handle).
+    NeedTotp(String),
+    /// Wrong authenticator code (handle, message).
+    NeedTotpErr(String, String),
+    /// (identifier to pre-fill, message)
+    Failed(String, String),
+}
+
+/// Password (+ TOTP) sign-in; records the login on the device.
+async fn sign_in(
+    app: &App,
+    device: &mut Device,
+    f: &HashMap<String, String>,
+) -> Result<SignIn, OAuthError> {
+    let now = now_secs();
+    let code = f.get("code").map(|c| c.trim()).filter(|c| !c.is_empty());
+    let did = if f.get("step").map(String::as_str) == Some("totp") {
+        // Second step: password already verified for the pending account.
+        let Some((did, _)) = device
+            .pending_2fa
+            .clone()
+            .filter(|(_, at)| now - at < PENDING_2FA_TTL)
+        else {
+            return Ok(SignIn::Failed(
+                String::new(),
+                "Your sign-in timed out. Please enter your password again.".into(),
+            ));
+        };
+        let acct = app.account(&did).await?;
+        match crate::totp::check_second_factor(app, &acct, code).await {
+            Ok(()) => did,
+            Err(e) if e.error == "AuthFactorTokenRequired" => {
+                return Ok(SignIn::NeedTotp(acct.handle))
+            }
+            Err(_) => {
+                return Ok(SignIn::NeedTotpErr(
+                    acct.handle,
+                    "Invalid authenticator code".into(),
+                ))
+            }
+        }
+    } else {
+        let ident = f
+            .get("identifier")
+            .map(|s| s.trim().trim_start_matches('@').to_lowercase())
+            .unwrap_or_default();
+        let password = f.get("password").cloned().unwrap_or_default();
+        let invalid = || SignIn::Failed(ident.clone(), "Invalid handle or password".into());
+        if ident.is_empty() || password.is_empty() {
+            return Ok(invalid());
+        }
+        let Ok(did) = app.resolve_repo(&ident).await else {
+            return Ok(invalid());
+        };
+        let Ok(acct) = app.account(&did).await else {
+            return Ok(invalid());
+        };
+        if !state::verify_password_hash(&acct.password_hash, &password).await {
+            return Ok(invalid());
+        }
+        if let Some(st) = &acct.status {
+            return Ok(SignIn::Failed(ident, format!("This account is {st}")));
+        }
+        match crate::totp::check_second_factor(app, &acct, code).await {
+            Ok(()) => acct.did.clone(),
+            Err(e) if e.error == "AuthFactorTokenRequired" => {
+                device.pending_2fa = Some((acct.did.clone(), now));
+                store::put_device(app, device).await?;
+                return Ok(SignIn::NeedTotp(acct.handle));
+            }
+            Err(_) => {
+                device.pending_2fa = Some((acct.did.clone(), now));
+                store::put_device(app, device).await?;
+                return Ok(SignIn::NeedTotpErr(
+                    acct.handle,
+                    "Invalid authenticator code".into(),
+                ));
+            }
+        }
+    };
+    device.pending_2fa = None;
+    device.accounts.retain(|a| a.did != did);
+    device.accounts.push(DeviceAccount {
+        did: did.clone(),
+        authenticated_at: now,
+    });
+    device.last_seen_at = now;
+    store::put_device(app, device).await?;
+    Ok(SignIn::Ok(did))
+}
+
+async fn authorize_sign_in(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+    let (mut flow, f) = match form_flow(&app, &headers, &body).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if f.get("action").map(String::as_str) == Some("deny") {
+        let _ = store::put_request(&app, &flow.id, None).await;
+        return redirect_error(&app, &flow.req.params, "access_denied", "Access denied");
+    }
+    match sign_in(&app, &mut flow.device, &f).await {
+        Ok(SignIn::Ok(did)) => consent_step(&app, flow, &did).await,
+        Ok(SignIn::NeedTotp(handle)) => {
+            login_page(&app, &flow, &handle, None, true, StatusCode::OK)
+        }
+        Ok(SignIn::NeedTotpErr(handle, msg)) => login_page(
+            &app,
+            &flow,
+            &handle,
+            Some(&msg),
+            true,
+            StatusCode::UNAUTHORIZED,
+        ),
+        Ok(SignIn::Failed(ident, msg)) => login_page(
+            &app,
+            &flow,
+            &ident,
+            Some(&msg),
+            false,
+            StatusCode::UNAUTHORIZED,
+        ),
+        Err(e) => error_page(
+            &app,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Sign-in failed",
+            &e.description,
+        ),
+    }
+}
+
+async fn authorize_select(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+    let (flow, f) = match form_flow(&app, &headers, &body).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let did = f.get("did").cloned().unwrap_or_default();
+    if did.is_empty() {
+        return login_page(&app, &flow, "", None, false, StatusCode::OK);
+    }
+    let accounts = device_accounts(&app, &flow.device).await;
+    match accounts.iter().find(|(d, _)| *d == did) {
+        Some(_) if flow.req.params.prompt.as_deref() != Some("login") => {
+            consent_step(&app, flow, &did).await
+        }
+        Some((_, handle)) => {
+            let h = handle.clone();
+            login_page(&app, &flow, &h, None, false, StatusCode::OK)
+        }
+        None => login_page(
+            &app,
+            &flow,
+            "",
+            Some("Please sign in again"),
+            false,
+            StatusCode::OK,
+        ),
+    }
+}
+
+async fn authorize_consent(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+    let (flow, f) = match form_flow(&app, &headers, &body).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if f.get("action").map(String::as_str) != Some("allow") {
+        let _ = store::put_request(&app, &flow.id, None).await;
+        return redirect_error(&app, &flow.req.params, "access_denied", "Access denied");
+    }
+    let did = f.get("did").cloned().unwrap_or_default();
+    let accounts = device_accounts(&app, &flow.device).await;
+    if !accounts.iter().any(|(d, _)| *d == did) {
+        return login_page(
+            &app,
+            &flow,
+            "",
+            Some("Please sign in again"),
+            false,
+            StatusCode::UNAUTHORIZED,
+        );
+    }
+    issue_code(&app, flow, &did).await
+}
+
+// ---------- token endpoint ----------
+
+async fn token(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+    match token_inner(&app, &headers, &body).await {
+        Ok(j) => as_json(&app, StatusCode::OK, j),
+        Err(e) => as_error(&app, e),
+    }
+}
+
+fn same_client_auth(a: &ClientAuth, b: &ClientAuth) -> bool {
+    match (a, b) {
+        (ClientAuth::None, ClientAuth::None) => true,
+        (
+            ClientAuth::PrivateKeyJwt {
+                alg: a1,
+                kid: k1,
+                jkt: j1,
+            },
+            ClientAuth::PrivateKeyJwt {
+                alg: a2,
+                kid: k2,
+                jkt: j2,
+            },
+        ) => a1 == a2 && k1 == k2 && j1 == j2,
+        _ => false,
+    }
+}
+
+async fn token_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAuthError> {
+    let p = parse_params(headers, body)?;
+    let proof = check_as_dpop(app, headers, "/oauth/token")?;
+    let creds = ClientCredentials::from_params(&p)?;
+    let client = client::get_client(&creds.client_id, app.config.dev_mode).await?;
+    let client_auth = client.authenticate(&creds, &issuer(app))?;
+    let grant_type = p.get("grant_type").map(String::as_str).unwrap_or("");
+    if !client.grant_types.iter().any(|g| g == grant_type)
+        && matches!(grant_type, "authorization_code" | "refresh_token")
+    {
+        return Err(OAuthError::unauthorized_client(&format!(
+            "This client is not allowed to use the \"{grant_type}\" grant type"
+        )));
+    }
+    match grant_type {
+        "authorization_code" => code_grant(app, &client, client_auth, &p, &proof).await,
+        "refresh_token" => refresh_grant(app, &client, client_auth, &p, &proof).await,
+        "" => Err(OAuthError::invalid_request("Missing \"grant_type\"")),
+        g => Err(OAuthError::unsupported_grant_type(&format!(
+            "Unsupported grant_type \"{g}\""
+        ))),
+    }
+}
+
+fn verify_pkce(verifier: &str, challenge: &str) -> bool {
+    let ok_chars = verifier
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b));
+    (43..=128).contains(&verifier.len())
+        && ok_chars
+        && ou::ct_eq(ou::sha256_b64u(verifier).as_bytes(), challenge.as_bytes())
+}
+
+async fn code_grant(
+    app: &App,
+    client: &Client,
+    client_auth: ClientAuth,
+    p: &HashMap<String, String>,
+    proof: &DpopProof,
+) -> Result<J, OAuthError> {
+    let code = p
+        .get("code")
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| OAuthError::invalid_request("Missing \"code\""))?;
+    let rid =
+        store::code_request_id(code).ok_or_else(|| OAuthError::invalid_grant("Invalid code"))?;
+    let _g = store::lock(&format!("req:{rid}")).await;
+    let mut req = store::get_request(app, &rid)
+        .await?
+        .ok_or_else(|| OAuthError::invalid_grant("Invalid code"))?;
+    let code_ok = req
+        .code_hash
+        .as_deref()
+        .is_some_and(|h| ou::ct_eq(h.as_bytes(), store::hash_secret(code).as_bytes()));
+    if !code_ok {
+        return Err(OAuthError::invalid_grant("Invalid code"));
+    }
+    if let Some((did, sid)) = &req.consumed {
+        // Code reuse: revoke everything issued from the first use.
+        store::delete_session(app, did, sid).await?;
+        return Err(OAuthError::invalid_grant("Code replayed"));
+    }
+    let did = req
+        .did
+        .clone()
+        .ok_or_else(|| OAuthError::invalid_grant("Invalid code"))?;
+    let params = req.params.clone();
+    let fail = |m: &str| OAuthError::invalid_grant(m);
+    if req.expires_at < now_secs() {
+        store::put_request(app, &rid, None).await?;
+        return Err(fail("This code has expired"));
+    }
+    if req.client_id != client.id {
+        return Err(fail("The code was not issued to this client"));
+    }
+    if !same_client_auth(&req.client_auth, &client_auth) {
+        return Err(fail("Client authentication mismatch"));
+    }
+    if p.get("redirect_uri").map(String::as_str) != Some(params.redirect_uri.as_str()) {
+        return Err(fail("Invalid redirect_uri"));
+    }
+    let verifier = p
+        .get("code_verifier")
+        .ok_or_else(|| OAuthError::invalid_grant("Missing code_verifier"))?;
+    if !verify_pkce(verifier, &params.code_challenge) {
+        return Err(fail("Invalid code_verifier"));
+    }
+    if proof.jkt != params.dpop_jkt {
+        return Err(OAuthError::invalid_dpop_proof(
+            "DPoP proof does not match the expected JKT",
+        ));
+    }
+    app.ensure_active(&did)
+        .await
+        .map_err(|e| OAuthError::invalid_grant(&e.message))?;
+    let token_scope = lexicon::build_token_scope(app, &params.scope)
+        .await
+        .map_err(|e| OAuthError::invalid_request(&e))?;
+    let now = now_secs();
+    let mut s = Session {
+        id: ou::random_id("ses-", 16),
+        did: did.clone(),
+        client_id: client.id.clone(),
+        client_auth,
+        dpop_jkt: params.dpop_jkt.clone(),
+        scope: params.scope.clone(),
+        token_scope,
+        created_at: now,
+        updated_at: now,
+        expires_at: 0,
+        token_id: String::new(),
+        refresh_gen: 0,
+        refresh_salt: ou::random_id("", 16),
+        device_id: req.device_id.clone(),
+        request_id: Some(rid.clone()),
+    };
+    req.consumed = Some((did.clone(), s.id.clone()));
+    store::put_request(app, &rid, Some(&req)).await?;
+    issue_tokens(app, client, &mut s).await
+}
+
+async fn issue_tokens(app: &App, client: &Client, s: &mut Session) -> Result<J, OAuthError> {
+    let now = now_secs();
+    let lifetime = ACCESS_TOKEN_TTL.min(s.created_at + client.session_lifetime() - now);
+    if lifetime <= 1 {
+        store::delete_session(app, &s.did, &s.id).await?;
+        return Err(OAuthError::invalid_grant("Session expired"));
+    }
+    s.token_id = ou::random_id("tok-", 16);
+    s.updated_at = now;
+    s.expires_at = now + lifetime;
+    store::put_session(app, s).await?;
+    let claims = json!({
+        "iss": issuer(app),
+        "aud": app.jwt.service_did,
+        "sub": s.did,
+        "iat": now,
+        "exp": s.expires_at,
+        "jti": s.token_id,
+        "scope": s.token_scope,
+        "client_id": s.client_id,
+        "cnf": {"jkt": s.dpop_jkt},
+        "sid": s.id,
+    });
+    let access = keys(app).server.sign("at+jwt", &claims);
+    let mut out = json!({
+        "access_token": access,
+        "token_type": "DPoP",
+        "expires_in": lifetime,
+        "scope": s.token_scope,
+        "sub": s.did,
+    });
+    if client.grant_types.iter().any(|g| g == "refresh_token") {
+        out["refresh_token"] = J::String(store::refresh_token(&keys(app).refresh, s));
+    }
+    Ok(out)
+}
+
+async fn refresh_grant(
+    app: &App,
+    client: &Client,
+    client_auth: ClientAuth,
+    p: &HashMap<String, String>,
+    proof: &DpopProof,
+) -> Result<J, OAuthError> {
+    let tok = p
+        .get("refresh_token")
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| OAuthError::invalid_request("Missing \"refresh_token\""))?;
+    let invalid = || OAuthError::invalid_grant("Invalid refresh token");
+    let parsed = store::parse_refresh_token(tok).ok_or_else(invalid)?;
+    let _g = store::lock(&format!("ses:{}", parsed.session_id)).await;
+    let mut s = store::get_session(app, &parsed.did, &parsed.session_id)
+        .await?
+        .ok_or_else(invalid)?;
+    let k = keys(app);
+    if !parsed.authentic(&k.refresh, &s) || parsed.generation > s.refresh_gen {
+        return Err(invalid());
+    }
+    if parsed.generation < s.refresh_gen {
+        // A rotated-out token was presented again: assume theft, kill the session.
+        store::delete_session(app, &s.did, &s.id).await?;
+        return Err(OAuthError::invalid_grant("Refresh token replayed"));
+    }
+    if s.client_id != client.id {
+        return Err(OAuthError::invalid_grant(
+            "Refresh token was issued to another client",
+        ));
+    }
+    if !client.has_key(&s.client_auth) {
+        // The client's authentication key is gone from its metadata: the
+        // session must be revoked.
+        store::delete_session(app, &s.did, &s.id).await?;
+        return Err(OAuthError::invalid_grant(
+            "Client authentication key no longer available",
+        ));
+    }
+    if !same_client_auth(&s.client_auth, &client_auth) {
+        return Err(OAuthError::invalid_grant("Client authentication mismatch"));
+    }
+    if proof.jkt != s.dpop_jkt {
+        return Err(OAuthError::invalid_dpop_proof(
+            "DPoP proof does not match the expected JKT",
+        ));
+    }
+    let now = now_secs();
+    if now - s.created_at > client.session_lifetime() {
+        store::delete_session(app, &s.did, &s.id).await?;
+        return Err(OAuthError::invalid_grant("Session expired"));
+    }
+    if now - s.updated_at > client.refresh_lifetime() {
+        store::delete_session(app, &s.did, &s.id).await?;
+        return Err(OAuthError::invalid_grant("Refresh token expired"));
+    }
+    app.ensure_active(&s.did)
+        .await
+        .map_err(|e| OAuthError::invalid_grant(&e.message))?;
+    s.token_scope = lexicon::build_token_scope(app, &s.scope)
+        .await
+        .map_err(|e| OAuthError::server_error(&e))?;
+    s.refresh_gen += 1;
+    issue_tokens(app, client, &mut s).await
+}
+
+// ---------- revocation (RFC 7009) ----------
+
+async fn revoke(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+    match revoke_inner(&app, &headers, &body).await {
+        Ok(()) => as_json(&app, StatusCode::OK, json!({})),
+        Err(e) => as_error(&app, e),
+    }
+}
+
+async fn revoke_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(), OAuthError> {
+    let p = parse_params(headers, body)?;
+    let tok = p
+        .get("token")
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| OAuthError::invalid_request("Missing \"token\""))?;
+    let creds = ClientCredentials::from_params(&p)?;
+    let client = client::get_client(&creds.client_id, app.config.dev_mode).await?;
+    client.authenticate(&creds, &issuer(app))?;
+    let k = keys(app);
+    // Invalid or unknown tokens are not an error (RFC 7009 §2.2).
+    if let Some(r) = store::parse_refresh_token(tok) {
+        if let Some(s) = store::get_session(app, &r.did, &r.session_id).await? {
+            if r.authentic(&k.refresh, &s) && s.client_id == client.id {
+                store::delete_session(app, &s.did, &s.id).await?;
+            }
+        }
+    } else if let Ok(jwt) = k.server.verify(tok, "at+jwt") {
+        if let (Some(did), Some(sid)) = (jwt.claim_str("sub"), jwt.claim_str("sid")) {
+            if let Some(s) = store::get_session(app, did, sid).await? {
+                if s.client_id == client.id {
+                    store::delete_session(app, did, sid).await?;
+                }
+            }
+        }
+    } else if let Some(rid) = store::code_request_id(tok) {
+        let _g = store::lock(&format!("req:{rid}")).await;
+        if let Some(req) = store::get_request(app, &rid).await? {
+            let ok = req
+                .code_hash
+                .as_deref()
+                .is_some_and(|h| ou::ct_eq(h.as_bytes(), store::hash_secret(tok).as_bytes()));
+            if ok && req.client_id == client.id {
+                if let Some((did, sid)) = &req.consumed {
+                    store::delete_session(app, did, sid).await?;
+                }
+                store::put_request(app, &rid, None).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------- resource requests (DPoP-bound access tokens) ----------
+
+tokio::task_local! {
+    /// WWW-Authenticate challenge recorded by `verify_dpop` for the response
+    /// layer (XrpcError can't carry headers).
+    static DPOP_CHALLENGE: RefCell<Option<String>>;
+}
+
+fn dpop_fail(error: &str, desc: &str) -> XrpcError {
+    let challenge = format!(
+        "DPoP algs=\"ES256\", error=\"{error}\", error_description=\"{}\"",
+        desc.replace('"', "'")
+    );
+    let _ = DPOP_CHALLENGE.try_with(|c| *c.borrow_mut() = Some(challenge));
+    XrpcError {
+        status: StatusCode::UNAUTHORIZED,
+        error: error.into(),
+        message: desc.into(),
+    }
+}
+
+/// Response layer for requests authenticated with `Authorization: DPoP`:
+/// adds a fresh `DPoP-Nonce` (RFC 9449 §8.2/§9) and, when verification
+/// failed, the `WWW-Authenticate: DPoP error=...` challenge.
+pub async fn dpop_layer(
+    State(app): State<Arc<App>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let is_dpop = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .is_some_and(|v| v.as_bytes().starts_with(b"DPoP "));
+    if !is_dpop {
+        return next.run(req).await;
+    }
+    DPOP_CHALLENGE
+        .scope(RefCell::new(None), async move {
+            let mut r = next.run(req).await;
+            let challenge = DPOP_CHALLENGE.with(|c| c.borrow_mut().take());
+            let h = r.headers_mut();
+            if let Ok(v) = HeaderValue::from_str(&keys(&app).nonces.next()) {
+                h.insert(HeaderName::from_static("dpop-nonce"), v);
+            }
+            let mut expose = "DPoP-Nonce".to_string();
+            if let Some(c) = challenge.filter(|_| r.status() == StatusCode::UNAUTHORIZED) {
+                if let Ok(v) = HeaderValue::from_str(&c) {
+                    r.headers_mut().insert(header::WWW_AUTHENTICATE, v);
+                    expose.push_str(", WWW-Authenticate");
+                }
+            }
+            if let Ok(v) = HeaderValue::from_str(&expose) {
+                r.headers_mut()
+                    .append(header::ACCESS_CONTROL_EXPOSE_HEADERS, v);
+            }
+            r
+        })
+        .await
+}
+
+/// Verifies `Authorization: DPoP <token>` on a resource request.
+pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Credentials> {
+    let k = keys(app);
+    let jwt = k
+        .server
+        .verify(token, "at+jwt")
+        .map_err(|e| dpop_fail("invalid_token", &e))?;
+    let now = now_secs();
+    let claims_ok = jwt.claim_str("iss") == Some(issuer(app).as_str())
+        && jwt.claim_str("aud") == Some(app.jwt.service_did.as_str());
+    if !claims_ok {
+        return Err(dpop_fail(
+            "invalid_token",
+            "Invalid token audience or issuer",
+        ));
+    }
+    if jwt.claim_i64("exp").is_none_or(|e| e <= now) {
+        return Err(dpop_fail("invalid_token", "Token expired"));
+    }
+    let (Some(did), Some(sid), Some(jti), Some(client_id)) = (
+        jwt.claim_str("sub"),
+        jwt.claim_str("sid"),
+        jwt.claim_str("jti"),
+        jwt.claim_str("client_id"),
+    ) else {
+        return Err(dpop_fail("invalid_token", "Malformed token"));
+    };
+    let jkt = jwt
+        .payload
+        .get("cnf")
+        .and_then(|c| c.get("jkt"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| dpop_fail("invalid_token", "Token is not DPoP-bound"))?;
+    let proof = dpop_header(&parts.headers)
+        .map_err(|e| dpop_fail("invalid_dpop_proof", &e))?
+        .ok_or_else(|| dpop_fail("invalid_dpop_proof", "DPoP proof required"))?;
+    let htu = jose::normalize_htu(&format!("{}{}", issuer(app), parts.uri.path()))
+        .ok_or_else(|| XrpcError::internal("bad public_url"))?;
+    let checked = jose::check_proof(&proof, parts.method.as_str(), &htu, Some(token), &k.nonces)
+        .map_err(|e| match e {
+            DpopError::UseNonce(m) => dpop_fail("use_dpop_nonce", &m),
+            DpopError::Invalid(m) => dpop_fail("invalid_dpop_proof", &m),
+        })?;
+    if checked.jkt != jkt {
+        return Err(dpop_fail(
+            "invalid_token",
+            "Access token is bound to another DPoP key",
+        ));
+    }
+    // Stateful check: the session must still exist and this must be its
+    // current token (rotation and revocation take effect immediately).
+    let s = store::get_session(app, did, sid)
+        .await
+        .map_err(|e| XrpcError::internal(e.description))?;
+    match s {
+        Some(s) if s.token_id == jti && s.client_id == client_id => {}
+        _ => return Err(dpop_fail("invalid_token", "Token has been revoked")),
+    }
+    let scopes = ScopeSet::new(jwt.claim_str("scope").unwrap_or(""));
+    if !scopes.has("atproto") {
+        return Err(dpop_fail(
+            "invalid_token",
+            "OAuth token does not have \"atproto\" scope",
+        ));
+    }
+    Ok(Credentials::OAuth {
+        did: did.to_string(),
+        client_id: client_id.to_string(),
+        scopes,
+    })
+}
+
+// ---------- session management: /oauth/account UI ----------
+
+fn redirect_to(path: &str) -> Response {
+    let mut r = StatusCode::SEE_OTHER.into_response();
+    r.headers_mut()
+        .insert(header::LOCATION, HeaderValue::from_str(path).unwrap());
+    r
+}
+
+fn rfc3339(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
+}
+
+fn fmt_time(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_default()
+}
+
+async fn account_page(
+    State(app): AppState,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let (device, new_cookie) = match device_for(&app, &headers).await {
+        Ok(d) => d,
+        Err(e) => {
+            return error_page(
+                &app,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error",
+                &e.description,
+            )
+        }
+    };
+    let csrf = csrf_token(&app, &device.id, "account");
+    let accounts = device_accounts(&app, &device).await;
+    let cookie = new_cookie.then_some(&device);
+    if accounts.is_empty() || q.contains_key("add") {
+        let pending = device
+            .pending_2fa
+            .as_ref()
+            .filter(|(_, at)| now_secs() - at < PENDING_2FA_TTL)
+            .is_some()
+            && q.contains_key("totp");
+        let body = ui::login(
+            None,
+            &ui::LoginForm {
+                action: "/oauth/account/sign-in",
+                identifier: "",
+                error: q.get("error").map(String::as_str),
+                totp: pending,
+            },
+            &csrf,
+        );
+        return html(&app, StatusCode::OK, body, &[], cookie);
+    }
+    let mut rows = Vec::new();
+    for (did, handle) in accounts {
+        let mut sessions = store::list_sessions(&app, &did).await.unwrap_or_default();
+        sessions.sort_by_key(|s| -s.updated_at);
+        let list = sessions
+            .into_iter()
+            .map(|s| ui::SessionRow {
+                id: s.id,
+                client_id: s.client_id,
+                scope: s.scope,
+                created_at: fmt_time(s.created_at),
+                updated_at: fmt_time(s.updated_at),
+            })
+            .collect();
+        rows.push((did, handle, list));
+    }
+    html(
+        &app,
+        StatusCode::OK,
+        ui::account_page(&csrf, &rows),
+        &[],
+        cookie,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+async fn account_form(
+    app: &App,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<(Device, HashMap<String, String>), Response> {
+    let f: HashMap<String, String> = ou::parse_form(std::str::from_utf8(body).unwrap_or(""))
+        .into_iter()
+        .collect();
+    let (device, new_cookie) = device_for(app, headers).await.map_err(|e| {
+        error_page(
+            app,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Error",
+            &e.description,
+        )
+    })?;
+    if new_cookie || !check_csrf(app, headers, &device, "account", f.get("csrf")) {
+        return Err(error_page(
+            app,
+            StatusCode::FORBIDDEN,
+            "Request failed",
+            "Invalid or missing CSRF token.",
+        ));
+    }
+    Ok((device, f))
+}
+
+async fn account_sign_in(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+    let (mut device, f) = match account_form(&app, &headers, &body).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    match sign_in(&app, &mut device, &f).await {
+        Ok(SignIn::Ok(_)) => redirect_to("/oauth/account"),
+        Ok(SignIn::NeedTotp(_)) => redirect_to("/oauth/account?add=1&totp=1"),
+        Ok(SignIn::NeedTotpErr(_, m)) => redirect_to(&format!(
+            "/oauth/account?add=1&totp=1&error={}",
+            ou::encode_uri_component(&m)
+        )),
+        Ok(SignIn::Failed(_, m)) => redirect_to(&format!(
+            "/oauth/account?add=1&error={}",
+            ou::encode_uri_component(&m)
+        )),
+        Err(e) => error_page(
+            &app,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Sign-in failed",
+            &e.description,
+        ),
+    }
+}
+
+async fn account_sign_out(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+    let (mut device, f) = match account_form(&app, &headers, &body).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let did = f.get("did").cloned().unwrap_or_default();
+    device.accounts.retain(|a| a.did != did);
+    if let Err(e) = store::put_device(&app, &device).await {
+        return error_page(
+            &app,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Error",
+            &e.description,
+        );
+    }
+    redirect_to("/oauth/account")
+}
+
+async fn account_revoke(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+    let (device, f) = match account_form(&app, &headers, &body).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    let did = f.get("did").cloned().unwrap_or_default();
+    let sid = f.get("session").cloned().unwrap_or_default();
+    let signed_in = device_accounts(&app, &device)
+        .await
+        .iter()
+        .any(|(d, _)| *d == did);
+    if !signed_in {
+        return error_page(
+            &app,
+            StatusCode::FORBIDDEN,
+            "Request failed",
+            "You are not signed in to that account on this device.",
+        );
+    }
+    if let Err(e) = store::delete_session(&app, &did, &sid).await {
+        return error_page(
+            &app,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Error",
+            &e.description,
+        );
+    }
+    redirect_to("/oauth/account")
+}
+
+// ---------- session management: XRPC ----------
+
+/// Only full account sessions (password login) may manage OAuth grants.
+fn full_session(creds: &Credentials) -> XResult<String> {
+    match creds {
+        Credentials::Session { did } => Ok(did.clone()),
+        _ => Err(XrpcError {
+            status: StatusCode::FORBIDDEN,
+            error: "InsufficientScope".into(),
+            message: "a full account session is required".into(),
+        }),
+    }
+}
+
+async fn xrpc_list_sessions(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+    let did = full_session(&creds)?;
+    let mut sessions = store::list_sessions(&app, &did)
+        .await
+        .map_err(|e| XrpcError::internal(e.description))?;
+    sessions.sort_by_key(|s| -s.updated_at);
+    let out: Vec<J> = sessions
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "clientId": s.client_id,
+                "scope": s.scope,
+                "createdAt": rfc3339(s.created_at),
+                "updatedAt": rfc3339(s.updated_at),
+                "accessExpiresAt": rfc3339(s.expires_at),
+            })
+        })
+        .collect();
+    Ok(Json(json!({"sessions": out})))
+}
+
+#[derive(Deserialize)]
+struct RevokeSessionIn {
+    id: String,
+}
+
+async fn xrpc_revoke_session(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<RevokeSessionIn>,
+) -> XResult<Json<J>> {
+    let did = full_session(&creds)?;
+    if store::get_session(&app, &did, &inp.id)
+        .await
+        .map_err(|e| XrpcError::internal(e.description))?
+        .is_none()
+    {
+        return Err(XrpcError::bad("SessionNotFound", "no such OAuth session"));
+    }
+    store::delete_session(&app, &did, &inp.id)
+        .await
+        .map_err(|e| XrpcError::internal(e.description))?;
+    Ok(Json(json!({})))
+}
