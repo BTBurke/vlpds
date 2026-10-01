@@ -26,6 +26,10 @@ Under a light load it uses ~450 MB and a few % of one core.
   7100-7105 (bench.py `cluster_up`, hactl), and 7700-7705 (hactl container nodes).
   Ports with nothing listening show up as `up == 0`, which is fine. Each node's
   `instance` label is `127.0.0.1:<port>`.
+  The bench scripts serve `/metrics` on the app port (the default). A node run
+  with `--metrics-listen <addr>` serves `/metrics` and `/debug/pprof` only there
+  (404 on the app port): add that port to `targets/vlpds.json` instead, and point
+  `profile.sh` at it.
 - **MinIO**: the native one on :9200 (bench.py) and the compose one on :9000
   (`just bench`), from `/minio/v2/metrics/cluster` every 5 s. The bearer token is the
   JWT that `mc admin prometheus generate` would print, built from

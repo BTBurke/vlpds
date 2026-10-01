@@ -15,6 +15,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 struct Args {
     #[arg(long, env = "VLPDS_LISTEN", default_value = "0.0.0.0:2583")]
     listen: String,
+    /// Serve /metrics and /debug/pprof on this address only (e.g.
+    /// 127.0.0.1:9583), not on --listen. Unset = on the app port.
+    #[arg(long, env = "VLPDS_METRICS_LISTEN")]
+    metrics_listen: Option<String>,
     #[arg(
         long,
         env = "VLPDS_PUBLIC_URL",
@@ -69,22 +73,35 @@ struct Args {
     /// Number of shards (hash-slot ranges); fixed for the lifetime of a bucket prefix.
     #[arg(long, env = "VLPDS_SHARDS", default_value_t = 256)]
     shards: u16,
-    /// Repo worker threads (MST + signing).
-    #[arg(long, env = "VLPDS_WORKERS", default_value_t = 8)]
-    workers: usize,
-    /// Tokio threads (HTTP, sequencers, storage IO).
-    #[arg(long, env = "VLPDS_IO_THREADS", default_value_t = 6)]
-    io_threads: usize,
+    /// Repo worker threads (MST + signing). Default: half the available
+    /// cores (min 1); the request runtime does the rest of the CPU work.
+    #[arg(long, env = "VLPDS_WORKERS")]
+    workers: Option<usize>,
+    /// Tokio threads (HTTP, JSON/CBOR, sequencers, storage IO). Default: the
+    /// available cores (cgroup/affinity aware); fewer pinned the proxy-heavy
+    /// benchbox bench at 600% CPU with 6 (16 threads: 155k -> 204k req/s).
+    #[arg(long, env = "VLPDS_IO_THREADS")]
+    io_threads: Option<usize>,
     /// Cached repos per worker.
     #[arg(long, default_value_t = 50_000)]
     cache_per_worker: usize,
-    #[arg(long, default_value_t = 8)]
-    max_segment_mb: usize,
+    /// Segment size cap (MiB; fractions allow small segments in HA tests, so
+    /// K PUTs are in flight at modest load).
+    #[arg(long, default_value_t = 8.0)]
+    max_segment_mb: f64,
     /// Segment PUTs in flight per node log (finalized in ordinal order).
     #[arg(long, env = "VLPDS_LOG_INFLIGHT", default_value_t = vlpds::nodelog::DEFAULT_LOG_INFLIGHT)]
     log_inflight: usize,
+    /// Byte budget of the node log's live ring of sealed segments (MiB); a
+    /// peer follower that falls behind it catches up from S3.
+    #[arg(long, env = "VLPDS_LIVE_RING_MB", default_value_t = 128.0)]
+    live_ring_mb: f64,
     #[arg(long, default_value_t = 512)]
     firehose_ring_mb: usize,
+    /// Byte budget of the firehose merger's queues (MiB) before it spills a
+    /// log to S3 read-back (small values exercise spills in HA tests).
+    #[arg(long, env = "VLPDS_FIREHOSE_MERGE_QUEUE_MB", default_value_t = 256.0)]
+    firehose_merge_queue_mb: f64,
     /// Threads serving subscribeRepos connections, apart from the request
     /// runtime (0 = share it).
     #[arg(long, env = "VLPDS_FIREHOSE_THREADS", default_value_t = 4)]
@@ -111,6 +128,19 @@ struct Args {
     /// the meta/index cache gets a quarter of this on top).
     #[arg(long, env = "VLPDS_BLOCK_CACHE_MB", default_value_t = 4096)]
     block_cache_mb: u64,
+    /// SlateDB SST block compression: none, lz4 or zstd.
+    #[arg(long, env = "VLPDS_SST_COMPRESSION", default_value = "zstd")]
+    sst_compression: String,
+    /// SlateDB GC: compacted SSTs no longer in the manifest are deleted once
+    /// this old (e.g. 24h, 30m). Long scans (a 10M-record getRepo) may still
+    /// be reading them.
+    #[arg(long, env = "VLPDS_SLATEDB_GC_MIN_AGE", default_value = "24h")]
+    slatedb_gc_min_age: String,
+    /// Log segment retention: the firehose backfill window (e.g. 72h, 30m;
+    /// "off" keeps every segment). Older segments no replay can need are
+    /// deleted; older cursors get OutdatedCursor.
+    #[arg(long, env = "VLPDS_LOG_RETENTION", default_value = "72h")]
+    log_retention: String,
     /// Default AppView for proxied requests: "<url>,<service did>".
     #[arg(long, env = "VLPDS_APPVIEW")]
     appview: Option<String>,
@@ -190,6 +220,71 @@ fn url_did(v: &Option<String>) -> anyhow::Result<Option<(String, String)>> {
         .transpose()
 }
 
+/// Fractional MiB to bytes (at least `min`).
+fn mib(v: f64, min: usize) -> usize {
+    ((v * (1u64 << 20) as f64) as usize).max(min)
+}
+
+fn cores() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
+}
+
+fn default_workers() -> usize {
+    (cores() / 2).max(1)
+}
+
+/// Raises the soft open-files limit to the hard limit: every client, peer and
+/// S3 connection is a descriptor, and Linux's default soft limit of 1024
+/// broke benchbox runs. (macOS caps it at kern.maxfilesperproc.) No libc
+/// dependency, as in metrics.rs: rlim_t is 64-bit on both targets.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn raise_nofile_limit() {
+    #[repr(C)]
+    struct Rlimit {
+        cur: u64,
+        max: u64,
+    }
+    extern "C" {
+        fn getrlimit(resource: i32, rlim: *mut Rlimit) -> i32;
+        fn setrlimit(resource: i32, rlim: *const Rlimit) -> i32;
+    }
+    #[cfg(target_os = "linux")]
+    const RLIMIT_NOFILE: i32 = 7;
+    #[cfg(target_os = "macos")]
+    const RLIMIT_NOFILE: i32 = 8;
+    let mut r = Rlimit { cur: 0, max: 0 };
+    if unsafe { getrlimit(RLIMIT_NOFILE, &mut r) } != 0 {
+        tracing::warn!("getrlimit(RLIMIT_NOFILE) failed: {}", std::io::Error::last_os_error());
+        return;
+    }
+    let mut want = r.max;
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn sysctlbyname(name: *const std::ffi::c_char, old: *mut std::ffi::c_void, oldlen: *mut usize, new: *mut std::ffi::c_void, newlen: usize) -> i32;
+        }
+        let (mut v, mut len) = (0i32, std::mem::size_of::<i32>());
+        let name = c"kern.maxfilesperproc";
+        if unsafe { sysctlbyname(name.as_ptr(), &mut v as *mut i32 as *mut _, &mut len, std::ptr::null_mut(), 0) } == 0 && v > 0 {
+            want = want.min(v as u64);
+        }
+    }
+    if want <= r.cur {
+        tracing::info!(soft = r.cur, hard = r.max, "open-files limit (RLIMIT_NOFILE)");
+        return;
+    }
+    let from = r.cur;
+    r.cur = want;
+    if unsafe { setrlimit(RLIMIT_NOFILE, &r) } != 0 {
+        tracing::warn!(soft = from, want, "raising RLIMIT_NOFILE failed: {}", std::io::Error::last_os_error());
+    } else {
+        tracing::info!(from, to = want, hard = r.max, "raised open-files soft limit (RLIMIT_NOFILE)");
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn raise_nofile_limit() {}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -198,6 +293,7 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    raise_nofile_limit();
     let node_id = args.node_id.clone().unwrap_or_else(|| "single".into());
     let rev = vlpds::profiling::git_rev();
     vlpds::metrics::BUILD_INFO
@@ -208,8 +304,10 @@ fn main() -> anyhow::Result<()> {
         vlpds::profiling::start_pyroscope(url, &node_id, &rev)?;
         tracing::info!(url, node_id, rev, "pushing CPU profiles to Pyroscope");
     }
+    let io_threads = args.io_threads.unwrap_or_else(cores).max(1);
+    tracing::info!(io_threads, workers = args.workers.unwrap_or_else(default_workers), cores = cores(), "threads");
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.io_threads)
+        .worker_threads(io_threads)
         .enable_all()
         .build()?;
     rt.block_on(run(args))
@@ -227,6 +325,12 @@ fn secret(v: &Option<String>, dev_mode: bool, dev_default: &str) -> String {
 
 async fn run(args: Args) -> anyhow::Result<()> {
     vlpds::partition::set_block_cache_bytes(args.block_cache_mb << 20);
+    vlpds::partition::set_sst_compression(args.sst_compression.parse()?);
+    vlpds::partition::set_gc_min_age(vlpds::retention::parse_duration(&args.slatedb_gc_min_age)?);
+    let log_retention = match args.log_retention.as_str() {
+        "off" | "none" => None,
+        v => Some(vlpds::retention::Config { window: vlpds::retention::parse_duration(v)?, ..Default::default() }),
+    };
     let cfg = Config {
         public_url: args.public_url.clone(),
         handle_domain: args.handle_domain.clone(),
@@ -244,9 +348,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
         prefix: args.prefix.clone(),
         inject_latency: args.inject_put_ms.map(|m| (m, args.inject_sigma)),
         shards: args.shards,
-        workers: args.workers,
+        workers: args.workers.unwrap_or_else(default_workers).max(1),
         cache_per_worker: args.cache_per_worker,
-        max_segment_bytes: args.max_segment_mb << 20,
+        max_segment_bytes: mib(args.max_segment_mb, 4096),
+        log_inflight: args.log_inflight.max(1),
+        live_ring_bytes: mib(args.live_ring_mb, 1),
+        firehose_merge_queue_bytes: mib(args.firehose_merge_queue_mb, 1),
         firehose_ring_bytes: args.firehose_ring_mb << 20,
         firehose_threads: args.firehose_threads,
         firehose_max_lag_bytes: args.firehose_max_lag_mb << 20,
@@ -280,6 +387,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
             clock_offset_ms: 0,
         }),
         memory_store: None,
+        metrics_listen: args.metrics_listen.clone(),
+        log_retention,
     };
     cfg.check_secrets()?;
     if args.lease_ttl_ms < 10_000 && !args.dev_mode {
@@ -289,16 +398,27 @@ async fn run(args: Args) -> anyhow::Result<()> {
         );
     }
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
-    vlpds::nodelog::set_log_inflight(args.log_inflight);
+    let metrics_listener = match &args.metrics_listen {
+        Some(a) => Some(tokio::net::TcpListener::bind(a).await?),
+        None => None,
+    };
     let app = server::build(cfg).await?;
     server::spawn_reporters(&app);
-    tracing::info!(listen = %args.listen, "vlpds serving");
+    tracing::info!(listen = %args.listen, metrics_listen = args.metrics_listen.as_deref().unwrap_or("(app port)"), "vlpds serving");
+    if let Some(l) = metrics_listener {
+        let r = server::metrics_router(&app);
+        tokio::spawn(async move {
+            if let Err(e) = server::serve(l, r).await {
+                tracing::error!("metrics server exited: {e:#}");
+            }
+        });
+    }
     // background services
     vlpds::xrpc::spawn_blob_gc(app.clone());
     vlpds::xrpc::spawn_reserved_key_gc(app.clone());
     vlpds::oauth::gc::spawn_gc(app.clone());
     tokio::spawn(vlpds::xrpc::request_crawl(app.clone()));
-    let router = server::with_forwarding(&app, vlpds::xrpc::router(app.clone()));
+    let router = server::router(&app);
     tokio::select! {
         r = server::serve(listener, router) => r,
         _ = shutdown_signal() => {

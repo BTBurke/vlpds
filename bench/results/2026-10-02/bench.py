@@ -7,7 +7,12 @@ into the experiment's .jsonl file next to this script.
 
     python3 bench/results/2026-10-02/bench.py grid <name> <total> <active> <inject_ms|0> <rate,rate,...>
     python3 bench/results/2026-10-02/bench.py hot <name> <inject_ms|0> <hot_rate>
+    python3 bench/results/2026-10-02/bench.py proxy <active,active,...> <concurrency,...>
     python3 bench/results/2026-10-02/bench.py cleanup <prefix>
+
+proxy env: PROXY_TOTAL (bulk accounts, 1000000), PROXY_IO_THREADS (cores),
+PROXY_STUB_THREADS / PROXY_LG_THREADS (cores/4, min 4 / 6), PROXY_CONNECTIONS
+(loadgen h2 connections, 64), PROXY_SECS (15), PROFILE_PROXY ("active:conc,...").
 """
 import json
 import os
@@ -50,7 +55,8 @@ def disk_free_gb():
     return st.f_bavail * st.f_frsize / 1e9
 
 
-def check_disk(min_gb=150):
+def check_disk(min_gb=None):
+    min_gb = min_gb or float(os.environ.get("MIN_FREE_GB", "150"))
     f = disk_free_gb()
     if f < min_gb:
         raise SystemExit(f"disk free {f:.0f} GB < {min_gb} GB, refusing to continue")
@@ -291,19 +297,50 @@ def bulk(nodes, total, records=5):
     return secs
 
 
+def start_profile(node, tag, delay, secs=None):
+    """CPU profile (pprof protobuf) of `node` via GET /debug/pprof/profile
+    (needs the --features profiling build: BIN_DIR=target-prof on benchbox),
+    `delay` s from now. Saved under OUTDIR/prof/<tag>.pb; returns the thread."""
+    secs = secs or int(os.environ.get("PROFILE_SECS", "10"))
+    path = os.path.join(OUTDIR, "prof", re.sub(r"[^A-Za-z0-9_.=-]+", "_", tag) + ".pb")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def go():
+        time.sleep(delay)
+        try:
+            _, body = http("GET", f"{node.url}/debug/pprof/profile?seconds={secs}", headers={"Authorization": f"Bearer {ADMIN}"}, timeout=secs + 30)
+            open(path, "wb").write(body)
+            log(f"profile saved: {path} ({len(body)} B)")
+        except Exception as e:
+            log(f"profile {tag} failed: {e}")
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.path = path
+    return t
+
+
+def profile_rates():
+    return {int(x) for x in os.environ.get("PROFILE_RATES", "").split(",") if x}
+
+
 def grid_step(node, out, shape, rate, total, active, inject, duration=20, hot=200):
     check_disk()
     t0 = time.time()
     m0 = metrics(node.url)
     lg = run_loadgen(node.url, rate, total, active, duration=duration, hot=hot, tag=f"{shape}-{rate}")
+    prof = start_profile(node, f"{shape}-{rate}", 15) if rate in profile_rates() else None
     with Sampler([node.p.pid, lg.pid]) as s:
         text, _ = lg.communicate()
+    if prof:
+        prof.join(30)
     m1 = metrics(node.url)
     r = parse_loadgen(text)
     rec = {"shape": shape, "total": total, "active": active, "inject_put_ms": inject, "rate": rate, "hot_rate": hot,
            "duration_s": duration, **r, "server": s.summary(node.p.pid), "loadgen": s.summary(lg.pid),
            "metrics_delta": mdelta(m0, m1), "server_stats_tail": node.stat_lines(2)[-1:],
-           "jemalloc": {k.split('"')[1]: v for k, v in m1.items() if k.startswith("vlpds_jemalloc_bytes")}}
+           "jemalloc": {k.split('"')[1]: v for k, v in m1.items() if k.startswith("vlpds_jemalloc_bytes")},
+           "vlpds_extra": os.environ.get("VLPDS_EXTRA", "") + " " + " ".join(node.args[node.args.index("--dev-mode") + 1:]),
+           "profile": os.path.basename(prof.path) if prof else None}
     write_jsonl(out, rec)
     a = r.get("all", {})
     log(f"{shape} rate={rate}: achieved {r.get('achieved')} err {r.get('errors')} drop {r.get('dropped')} p50 {a.get('p50')} p99 {a.get('p99')} p99.9 {a.get('p999')} | srv cpu {rec['server']['cpu_pct_avg']}% rss {rec['server']['rss_gb_max']}GB")
@@ -344,10 +381,15 @@ def cmd_suite(total, actives, injects, rates, duration=20):
     prefix = f"bench-grid-{total}"
     out = os.path.join(OUTDIR, os.environ.get("OUT", "grid.jsonl"))
     check_disk()
+    # VARIANTS="--log-inflight 1|--log-inflight 4 --max-segment-mb 32": one
+    # server config per entry (same bulk), shape tagged with the variant
+    variants = [v.strip() for v in os.environ.get("VARIANTS", "").split("|")] or [""]
+    combos = [(v, i) for v in variants for i in injects]
     try:
-        for k, inject in enumerate(injects):
+        for k, (variant, inject) in enumerate(combos):
+            vtag = ("/" + variant.replace("--", "").replace(" ", "")) if variant else ""
             name = f"grid-{total}-inj{int(inject)}"
-            node = Node(name, prefix, inject=inject)
+            node = Node(name, prefix, inject=inject, extra=variant.split())
             node.cache = os.path.join(SCRATCH, f"cache-grid-{total}")
             node.args[node.args.index("--cache-dir") + 1] = node.cache
             t = time.time()
@@ -359,7 +401,7 @@ def cmd_suite(total, actives, injects, rates, duration=20):
                 for active in actives:
                     if active > total:
                         continue
-                    shape = f"{total}/{active}/inj{int(inject)}"
+                    shape = f"{total}/{active}/inj{int(inject)}{vtag}"
                     for rate in rates:
                         rec = grid_step(node, out, shape, rate, total, active, inject, duration=duration)
                         if saturated(rec):
@@ -601,12 +643,27 @@ def cmd_sweep(sizes, extra=()):
         cleanup_prefix(prefix)
 
 
-def cmd_proxy(actives, concs, total=1000000, body=2048, extra=()):
+def cmd_proxy(actives, concs, total=int(os.environ.get("PROXY_TOTAL", "1000000")), body=2048, extra=()):
+    """Proxied reads (loadgen proxy) through one node to a stub AppView.
+    Sized to the box: the node gets --io-threads = cores (PROXY_IO_THREADS),
+    the stub and loadgen a quarter of the cores each (PROXY_STUB_THREADS,
+    PROXY_LG_THREADS). Per step: req/s, latency, CPU per proxied request
+    (process CPU / requests over the step, from the node's metrics)."""
     out = os.path.join(OUTDIR, os.environ.get("OUT", "proxy.jsonl"))
     prefix = "bench-proxy"
-    stub = subprocess.Popen([LOADGEN, "--threads", "4", "stub-appview", "--listen", "127.0.0.1:2700", "--body-bytes", str(body)],
+    cores = os.cpu_count() or 8
+    io = os.environ.get("PROXY_IO_THREADS", str(cores))
+    stub_t = os.environ.get("PROXY_STUB_THREADS", str(max(4, cores // 4)))
+    lgt = os.environ.get("PROXY_LG_THREADS", str(max(6, cores // 4)))
+    conns = os.environ.get("PROXY_CONNECTIONS", "64")
+    secs = os.environ.get("PROXY_SECS", "15")
+    stub = subprocess.Popen([LOADGEN, "--threads", stub_t, "stub-appview", "--listen", "127.0.0.1:2700", "--body-bytes", str(body)],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    node = Node("proxy", prefix, extra=["--appview", "http://127.0.0.1:2700,did:web:stub.test"] + list(extra)).start()
+    args = ["--appview", "http://127.0.0.1:2700,did:web:stub.test"] + list(extra)
+    if "--io-threads" not in args + os.environ.get("VLPDS_EXTRA", "").split():
+        args += ["--io-threads", io]
+    node = Node("proxy", prefix, extra=args).start()
+    prof_at = set(os.environ.get("PROFILE_PROXY", "").split(","))  # "active:conc"
     try:
         bulk([node], total)
         for active in actives:
@@ -614,17 +671,27 @@ def cmd_proxy(actives, concs, total=1000000, body=2048, extra=()):
                 jo = os.path.join(SCRATCH, "proxy.json")
                 m0 = metrics(node.url)
                 with Sampler([node.p.pid, stub.pid]) as s:
-                    lg = subprocess.Popen([LOADGEN, "--host", node.url, "--threads", "6", "proxy", "--active", str(active), "--concurrency", str(conc),
-                                           "--seconds", "15", "--json-out", jo], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                    prof = start_profile(node, f"proxy-{active}-{conc}-{'_'.join(extra)}", 4) if f"{active}:{conc}" in prof_at else None
+                    lg = subprocess.Popen([LOADGEN, "--host", node.url, "--threads", lgt, "proxy", "--active", str(active), "--concurrency", str(conc),
+                                           "--connections", conns, "--seconds", secs, "--json-out", jo], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                     s.pids.append(lg.pid); s.samples[lg.pid] = []
                     text, _ = lg.communicate()
+                if prof:
+                    prof.join(30)
                 m1 = metrics(node.url)
                 r = json.load(open(jo))
                 cache = {k.split('"')[1]: msum(m1, k) - msum(m0, k) for k in m1 if k.startswith("vlpds_proxy_cache_total")}
+                # one service-JWT lookup per proxied request (warmup included, like the CPU)
+                reqs = cache.get("jwt_hit", 0) + cache.get("jwt_miss", 0)
+                cpu = msum(m1, "vlpds_process_cpu_seconds_total") - msum(m0, "vlpds_process_cpu_seconds_total")
                 rec = {**r, "body_bytes": body, "server": s.summary(node.p.pid), "stub": s.summary(stub.pid), "client": s.summary(lg.pid),
-                       "proxy_cache": cache, "extra": list(extra), "upstream_h2c": os.environ.get("VLPDS_PROXY_H2C") == "1"}
+                       "server_cpu_us_per_req": round(cpu * 1e6 / reqs, 1) if reqs else None,
+                       "proxy_cache": cache, "extra": list(extra), "vlpds_args": node.args[node.args.index("--dev-mode") + 1:],
+                       "stub_threads": int(stub_t), "loadgen_threads": int(lgt), "connections": int(conns), "cores": cores,
+                       "profile": os.path.basename(prof.path) if prof else None}
                 write_jsonl(out, rec)
-                log(f"proxy active={active} conc={conc}: {r['req_per_s']:.0f} req/s p50 {r['p50_ms']:.2f} p99 {r['p99_ms']:.2f} err {r['errors']} | cpu srv {rec['server']['cpu_pct_avg']} stub {rec['stub']['cpu_pct_avg']} client {rec['client']['cpu_pct_avg']} | {cache}")
+                log(f"proxy active={active} conc={conc}: {r['req_per_s']:.0f} req/s p50 {r['p50_ms']:.2f} p99 {r['p99_ms']:.2f} err {r['errors']} | "
+                    f"{rec['server_cpu_us_per_req']} us cpu/req | cpu srv {rec['server']['cpu_pct_avg']} stub {rec['stub']['cpu_pct_avg']} client {rec['client']['cpu_pct_avg']} | {cache}")
     finally:
         node.stop()
         node.wipe_cache()
@@ -640,6 +707,7 @@ def snapshot(node, label):
     m = metrics(node.url)
     r = subprocess.run(["ps", "-o", "rss=,%cpu=", "-p", str(node.p.pid)], capture_output=True, text=True).stdout.split()
     return {"label": label, "rss_gb": round(int(r[0]) * 1024 / 1e9, 2), "jemalloc_gb": jem(m),
+            "cache_metrics": {k: v for k, v in m.items() if "cache" in k and not k.startswith("vlpds_proxy_cache")},
             "cached_repos": msum(m, "vlpds_cached_repos"), "firehose_ring_gb": round(msum(m, "vlpds_firehose_ring_bytes") / 1e9, 3),
             "live_ring_gb": round(msum(m, "vlpds_log_live_ring_bytes") / 1e9, 3)}
 
@@ -671,6 +739,39 @@ def cmd_resource(total=10000000, active=50000, rate=50000, inject=25):
         log(json.dumps(run["snapshots"]))
     shutil.rmtree(os.path.join(SCRATCH, "cache-resource"), ignore_errors=True)
     cleanup_prefix(prefix)
+
+
+def cmd_resource2(total, actives, rate, inject):
+    """One bulk of `total`; per active window a fresh server: snapshots
+    (started / idle / after 70 s at `rate`), CPU and RSS during the load.
+    RESOURCE_EXTRA: extra server flags."""
+    out = os.path.join(OUTDIR, "resource.jsonl")
+    prefix = "bench-resource"
+    cache = os.path.join(SCRATCH, "cache-resource")
+    extra = os.environ.get("RESOURCE_EXTRA", "").split()
+    try:
+        for k, active in enumerate(actives):
+            node = Node(f"resource-{active}", prefix, inject=inject, extra=extra)
+            node.cache = cache
+            node.args[node.args.index("--cache-dir") + 1] = node.cache
+            node.start(timeout=600)
+            run = {"total": total, "active": active, "rate": rate, "inject_put_ms": inject, "extra": extra, "snapshots": [snapshot(node, "started")]}
+            try:
+                if k == 0:
+                    run["bulk_s"] = round(bulk([node], total))
+                    run["snapshots"].append(snapshot(node, "after bulk"))
+                time.sleep(15)
+                run["snapshots"].append(snapshot(node, "idle"))
+                rec = grid_step(node, os.path.join(OUTDIR, "resource-grid.jsonl"), f"resource {total}/{active}/inj{int(inject)}", rate, total, active, inject, duration=60)
+                run["load"] = {k2: rec.get(k2) for k2 in ("achieved", "errors", "all", "server", "jemalloc")}
+                run["snapshots"].append(snapshot(node, "after 70 s load"))
+            finally:
+                node.stop()
+            write_jsonl(out, run)
+            log(json.dumps(run["snapshots"]))
+    finally:
+        shutil.rmtree(cache, ignore_errors=True)
+        cleanup_prefix(prefix)
 
 
 def cmd_hot(hot_rates, injects):
@@ -706,6 +807,9 @@ if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "hot":
         cmd_hot([int(x) for x in sys.argv[2].split(",")], [float(x) for x in sys.argv[3].split(",")])
+    elif cmd == "resource" and len(sys.argv) > 2:
+        # resource <total> <active,active> <rate> <inject>
+        cmd_resource2(int(sys.argv[2]), [int(x) for x in sys.argv[3].split(",")], int(sys.argv[4]), float(sys.argv[5]))
     elif cmd == "resource":
         cmd_resource()
     elif cmd == "proxy":

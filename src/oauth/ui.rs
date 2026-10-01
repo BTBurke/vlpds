@@ -29,7 +29,12 @@ a{color:var(--accent);text-underline-offset:3px}
 .muted{color:var(--ink2);font-size:13.5px}
 .client{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:12.5px;overflow-wrap:anywhere;background:var(--paper);border:1px solid var(--rule);border-left:3px solid var(--accent);border-radius:4px;padding:9px 11px;margin:10px 0}
 label{display:block;font-size:13.5px;font-weight:600;margin:16px 0 5px}
-input[type=text],input[type=password]{width:100%;padding:10px 12px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);font:inherit;font-size:15px}
+input[type=text],input[type=password],input[type=email]{width:100%;padding:10px 12px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);font:inherit;font-size:15px}
+.affix{display:flex;align-items:stretch}
+.affix input{border-radius:5px 0 0 5px;min-width:0}
+.affix span{display:flex;align-items:center;padding:0 11px;border:1px solid var(--rule);border-left:0;border-radius:0 5px 5px 0;background:var(--sheet);color:var(--ink2);font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:13px;white-space:nowrap}
+.hint{color:var(--ink2);font-size:12.5px;margin:5px 0 0}
+.alt{margin:18px 0 0;padding-top:14px;border-top:1px solid var(--rule);font-size:14px;color:var(--ink2)}
 input:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
 button{font:inherit;font-weight:600;border-radius:5px;padding:9px 16px;border:1px solid var(--rule);background:var(--sheet);color:var(--ink);cursor:pointer}
 button:hover{border-color:var(--ink2)}
@@ -218,7 +223,78 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
         );
     }
     b.push_str("<button type=\"submit\" class=\"primary\" name=\"action\" value=\"sign-in\">Sign in</button></div></form>");
+    if let (Some(c), false) = (ctx, f.totp) {
+        b.push_str(&format!(
+            "<p class=\"alt\">New to {}? <a href=\"{}\">Create an account</a></p>",
+            e(c.server_name),
+            e(&screen_url(c, "sign-up"))
+        ));
+    }
     page("Sign in", &b)
+}
+
+/// The authorization page of this request showing `screen` ("sign-in" or
+/// "sign-up").
+fn screen_url(c: &Ctx, screen: &str) -> String {
+    format!(
+        "/oauth/authorize?client_id={}&request_uri={}&screen={screen}",
+        super::util::encode_uri_component(c.client_id),
+        super::util::encode_uri_component(c.request_uri)
+    )
+}
+
+pub struct SignupForm<'a> {
+    /// The handle's first label (the account gets `{handle}.{domain}`).
+    pub handle: &'a str,
+    pub domain: &'a str,
+    pub email: &'a str,
+    pub invite_code: &'a str,
+    pub invite_required: bool,
+    pub error: Option<&'a str>,
+}
+
+/// Account creation inside the authorization flow (prompt=create, or "Create
+/// an account" on the sign-in page). Posts to `/oauth/authorize/sign-up`;
+/// the new account is signed in on the device and continues to consent.
+pub fn signup(ctx: &Ctx, f: &SignupForm) -> String {
+    let mut b = format!(
+        "<h1>Create an account on {}</h1><p class=\"muted\">to continue to</p>{}",
+        e(ctx.server_name),
+        client_block(ctx)
+    );
+    if let Some(err) = f.error {
+        b.push_str(&format!("<p class=\"err\" role=\"alert\">{}</p>", e(err)));
+    }
+    b.push_str("<form method=\"post\" action=\"/oauth/authorize/sign-up\">");
+    b.push_str(&hidden(ctx));
+    b.push_str(&format!(
+        "<label for=\"handle\">Handle</label>\
+<div class=\"affix\"><input type=\"text\" id=\"handle\" name=\"handle\" value=\"{}\" autocomplete=\"username\" autocapitalize=\"none\" spellcheck=\"false\" minlength=\"3\" maxlength=\"18\" required autofocus><span>.{}</span></div>\
+<p class=\"hint\">3 to 18 letters, digits or hyphens. You can switch to your own domain later.</p>\
+<label for=\"email\">Email</label>\
+<input type=\"email\" id=\"email\" name=\"email\" value=\"{}\" autocomplete=\"email\" required>\
+<label for=\"password\">Password</label>\
+<input type=\"password\" id=\"password\" name=\"password\" autocomplete=\"new-password\" minlength=\"8\" maxlength=\"256\" required>",
+        e(f.handle),
+        e(f.domain),
+        e(f.email)
+    ));
+    if f.invite_required {
+        b.push_str(&format!(
+            "<label for=\"invite\">Invite code</label>\
+<input type=\"text\" id=\"invite\" name=\"invite_code\" value=\"{}\" autocapitalize=\"none\" spellcheck=\"false\" required>",
+            e(f.invite_code)
+        ));
+    }
+    b.push_str(
+        "<div class=\"row\"><button type=\"submit\" name=\"action\" value=\"deny\" formnovalidate>Cancel</button>\
+<button type=\"submit\" class=\"primary\" name=\"action\" value=\"sign-up\">Create account</button></div></form>",
+    );
+    b.push_str(&format!(
+        "<p class=\"alt\">Already have an account? <a href=\"{}\">Sign in</a></p>",
+        e(&screen_url(ctx, "sign-in"))
+    ));
+    page("Create an account", &b)
 }
 
 pub fn chooser(ctx: &Ctx, accounts: &[(String, String)]) -> String {

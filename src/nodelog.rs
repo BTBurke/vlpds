@@ -177,12 +177,6 @@ impl Drop for LiveSub {
 
 /// Default segment PUTs in flight per log (`--log-inflight`).
 pub const DEFAULT_LOG_INFLIGHT: usize = 4;
-static LOG_INFLIGHT: AtomicUsize = AtomicUsize::new(DEFAULT_LOG_INFLIGHT);
-
-/// Sets K, the segment PUTs in flight for logs started from now on.
-pub fn set_log_inflight(k: usize) {
-    LOG_INFLIGHT.store(k.max(1), Ordering::Relaxed);
-}
 
 pub fn seq_floor(now_us: u64) -> i64 {
     (now_us as i64) << 8
@@ -262,23 +256,105 @@ pub struct ShardSink {
     pub apply_lock: Arc<tokio::sync::RwLock<()>>,
 }
 
-#[derive(Default)]
 pub struct ShardSinks {
     map: RwLock<HashMap<u16, Arc<ShardSink>>>,
+    /// The log's last durable ordinal (`NodeLog::durable_ordinal`).
+    durable: Arc<AtomicU64>,
+    retain: Mutex<Retain>,
+}
+
+/// How long a closed shard still holds back this log's replay floor: a
+/// close that fails after its sink is removed fail-stops the node well
+/// within it, and a successor then replays from the shard's durable marker.
+const RETIRED_GRACE: Duration = Duration::from_secs(120);
+
+/// What retention (retention.rs) may delete from this log, and what this
+/// log's owner has certified (DESIGN.md "Log retention").
+#[derive(Default)]
+struct Retain {
+    /// shard -> (replay floor, insert floor). The replay floor is the lowest
+    /// ordinal of this log a crash replay of the shard could still need: the
+    /// insert floor (the log's next ordinal when the sink was inserted:
+    /// none of the shard's entries at this epoch are below it) until a
+    /// checkpoint at or past the insert floor is durable, then its ordinal + 1.
+    floors: HashMap<u16, (u64, u64)>,
+    /// replay floors of recently closed shards (see RETIRED_GRACE)
+    retired: Vec<(u64, Instant)>,
+    /// shard -> highest epoch opened here. Opening replays and flushes every
+    /// earlier span, so from then on the shard's durable state never replays
+    /// a span from before that epoch.
+    opened: std::collections::BTreeMap<u16, u64>,
+}
+
+impl Default for ShardSinks {
+    fn default() -> Self {
+        ShardSinks::new(Arc::new(AtomicU64::new(u64::MAX)))
+    }
 }
 
 impl ShardSinks {
+    pub fn new(durable: Arc<AtomicU64>) -> ShardSinks {
+        ShardSinks { map: RwLock::default(), durable, retain: Mutex::default() }
+    }
     pub fn get(&self, id: u16) -> Option<Arc<ShardSink>> {
         self.map.read().get(&id).cloned()
     }
+    /// A shard opened (replayed and flushed) at `s.epoch`: it starts applying.
     pub fn insert(&self, s: Arc<ShardSink>) {
+        let floor = self.durable.load(Ordering::Acquire).wrapping_add(1);
+        {
+            let mut r = self.retain.lock();
+            r.floors.insert(s.id, (floor, floor));
+            let e = r.opened.entry(s.id).or_default();
+            *e = (*e).max(s.epoch);
+        }
         self.map.write().insert(s.id, s);
     }
     pub fn remove(&self, id: u16) -> Option<Arc<ShardSink>> {
+        let mut r = self.retain.lock();
+        if let Some((floor, _)) = r.floors.remove(&id) {
+            r.retired.push((floor, Instant::now()));
+        }
+        drop(r);
         self.map.write().remove(&id)
     }
     pub fn all(&self) -> Vec<Arc<ShardSink>> {
         self.map.read().values().cloned().collect()
+    }
+
+    /// The ordinal a checkpoint marker for `shard` must reach (its insert
+    /// floor): a marker below it is ambiguous (it can name the end of an
+    /// earlier span of this log for the shard, and replay would start there).
+    fn insert_floor(&self, shard: u16) -> Option<u64> {
+        self.retain.lock().floors.get(&shard).map(|f| f.1)
+    }
+
+    /// A checkpoint marker at `ordinal` is durable for `shard`.
+    fn checkpointed(&self, shard: u16, ordinal: u64) {
+        if let Some(f) = self.retain.lock().floors.get_mut(&shard) {
+            if ordinal >= f.1 {
+                f.0 = f.0.max(ordinal + 1);
+            }
+        }
+    }
+
+    /// Every ordinal of this log below this may be deleted as far as replay
+    /// is concerned: no shard applying from it (or closed within
+    /// RETIRED_GRACE) can need it after a crash. Never past the last durable
+    /// segment, which is kept so fencing finds the end of the log.
+    pub fn replay_floor(&self) -> u64 {
+        let durable = self.durable.load(Ordering::Acquire);
+        if durable == u64::MAX {
+            return 0;
+        }
+        let mut r = self.retain.lock();
+        r.retired.retain(|(_, at)| at.elapsed() < RETIRED_GRACE);
+        r.floors.values().map(|f| f.0).chain(r.retired.iter().map(|f| f.0)).fold(durable, u64::min)
+    }
+
+    /// shard -> highest epoch this log's owner has opened it at.
+    pub fn opened(&self) -> std::collections::BTreeMap<u16, u64> {
+        self.retain.lock().opened.clone()
     }
 }
 
@@ -370,8 +446,10 @@ pub async fn first_free(store: &Store, log_id: &str) -> anyhow::Result<(u64, boo
         }
     }
     listed.sort_unstable();
-    // the highest segment: everything listed above it is a fence (or gone)
-    let mut free = 0;
+    // the highest segment: everything listed above it is a fence (or gone).
+    // With none (retention pruned a dead log down to its fence) the end is
+    // the lowest object left.
+    let mut free = listed.first().copied().unwrap_or(0);
     for &ord in listed.iter().rev() {
         if let Head::Segment(h) = read_head(store, log_id, ord).await? {
             free = prefix_hole(store, &h, listed[0]).await?.unwrap_or(ord + 1);
@@ -401,7 +479,7 @@ impl NodeLog {
     /// Starts a fresh log (a node never reopens an old log: a restarted node
     /// gets a new log id; its previous log is fenced and replayed by owners).
     pub fn start(store: Store, cfg: NodeLogConfig, merger_tx: mpsc::UnboundedSender<LogBatch>) -> Arc<NodeLog> {
-        Self::start_with_inflight(store, cfg, LOG_INFLIGHT.load(Ordering::Relaxed), merger_tx)
+        Self::start_with_inflight(store, cfg, DEFAULT_LOG_INFLIGHT, merger_tx)
     }
 
     /// [`NodeLog::start`] with `inflight` segment PUTs at once.
@@ -410,8 +488,8 @@ impl NodeLog {
         let (tx, rx) = mpsc::channel(64 * 1024);
         let (fin_tx, fin_rx) = mpsc::channel(4);
         let live = LiveRing::new(DEFAULT_LIVE_RING_BYTES);
-        let sinks: Arc<ShardSinks> = Arc::default();
         let durable_ordinal = Arc::new(AtomicU64::new(u64::MAX));
+        let sinks = Arc::new(ShardSinks::new(durable_ordinal.clone()));
         let log_id: Arc<str> = cfg.log_id.clone().into();
         let seq_cfg = SeqConfig { log_id: cfg.log_id.clone(), max_segment_bytes: cfg.max_segment_bytes, inflight: inflight.max(1), hedge_after: cfg.hedge_after };
         tokio::spawn(run_sequencer(store, seq_cfg, cfg.lease_ok.clone(), wm.clone(), sinks.clone(), rx, fin_tx));
@@ -444,14 +522,24 @@ impl NodeLog {
         // HA tests (bench/ha kill9-mid-checkpoint) key off this line.
         tracing::info!(ordinal = ord, shards = self.sinks.all().len(), "checkpoint start");
         for s in self.sinks.all() {
+            // Nothing of the shard is in this log before its insert floor; a
+            // marker below it could also name the end of an earlier span of
+            // this log for the shard (A -> B -> A), and replay would start
+            // there (DESIGN.md "Log retention"). Its replay marker stands.
+            if self.sinks.insert_floor(s.id).is_none_or(|f| ord < f) {
+                continue;
+            }
             let _g = s.apply_lock.write().await;
             // the finalizer has applied every segment <= ord (it updates
             // durable_ordinal only after applying)
             let mut wb = WriteBatch::new();
             wb.put(META_APPLIED, encode_marker(&self.log_id, ord));
-            let _ = s.db.write(wb).await;
+            let written = s.db.write(wb).await.is_ok();
             drop(_g);
-            let _ = s.db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await;
+            let flushed = s.db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await;
+            if written && flushed.is_ok() {
+                self.sinks.checkpointed(s.id, ord);
+            }
         }
     }
 }
@@ -475,8 +563,8 @@ struct Open {
 }
 
 impl Open {
-    fn new() -> Open {
-        Open { seg: SegmentBuilder::new(), frames: Vec::new(), muts: BTreeMap::new(), acks: Vec::new() }
+    fn new(log_id: &str) -> Open {
+        Open { seg: SegmentBuilder::for_log(log_id), frames: Vec::new(), muts: BTreeMap::new(), acks: Vec::new() }
     }
 
     fn push(&mut self, wm: &Watermark, sinks: &ShardSinks, mut e: LogEntry) {
@@ -496,14 +584,14 @@ impl Open {
         };
         if e.frames.is_empty() {
             // private-state write: an entry with an empty frame (skipped by the firehose)
-            e.frames.push(Frame { prefix: Vec::new(), suffix: Vec::new() });
+            e.frames.push(Frame { prefix: Vec::new(), suffix: Vec::new(), derived_muts: 0 });
         }
         let n = e.frames.len();
         for (i, f) in e.frames.iter().enumerate() {
             let seq = wm.assign();
-            let muts: &[Mutation] = if i + 1 == n { &e.muts } else { &[] };
+            let (muts, derived): (&[Mutation], usize) = if i + 1 == n { (&e.muts, f.derived_muts) } else { (&[], 0) };
             let empty = f.prefix.is_empty() && f.suffix.is_empty();
-            let range = self.seg.push(seq, e.shard, epoch, |out| if !empty { f.finish(seq, out) }, muts);
+            let range = self.seg.push_derived(seq, e.shard, epoch, |out| if !empty { f.finish(seq, out) }, muts, derived);
             self.frames.push((seq, range));
         }
         self.muts.entry(e.shard).or_default().append(&mut e.muts);
@@ -544,7 +632,7 @@ async fn run_sequencer(
     // Every ordinal below this has been PUT (the oldest PUT not yet taken
     // from `inflight`): the `prefix_end` recorded in each sealed header.
     let mut prefix_end = 0u64;
-    let mut open = Open::new();
+    let mut open = Open::new(&log_id);
     let mut inflight: FuturesOrdered<tokio::task::JoinHandle<Sealed>> = FuturesOrdered::new();
     let mut closed = false;
     loop {
@@ -586,23 +674,23 @@ async fn run_sequencer(
                     std::process::exit(5);
                 }
             }
-            let o = std::mem::replace(&mut open, Open::new());
+            let o = std::mem::replace(&mut open, Open::new(&log_id));
             metrics::SEGMENT_EVENTS.observe(o.frames.len() as f64);
             metrics::COMMIT_STAGE.with_label_values(&["seal_wait"]).observe(o.acks.first().map_or(0.0, |a| a.2.elapsed().as_secs_f64()));
             if inflight.is_empty() {
                 prefix_end = ordinal;
             }
-            let header = o.seg.sealed_header(&log_id, ordinal, prefix_end);
-            let off = header.len();
-            let mut data = header;
-            data.extend_from_slice(&o.seg.body);
+            // the header goes into the room the builder left: no copy of
+            // the body, and entry ranges are already object offsets
+            let last_seq = o.seg.last_seq;
+            let data = o.seg.seal(&log_id, ordinal, prefix_end);
             let sealed = Sealed {
                 ordinal,
                 data: Bytes::from(data),
-                frames: o.frames.into_iter().map(|(s, r)| (s, r.start + off..r.end + off)).collect(),
+                frames: o.frames,
                 muts: o.muts,
                 acks: o.acks,
-                last_seq: o.seg.last_seq,
+                last_seq,
                 put_secs: 0.0,
             };
             ordinal += 1;
@@ -902,7 +990,13 @@ pub async fn replay_many(store: &Store, shards: &[(u16, &Db, &[Span])]) -> anyho
             }
         }
         for (log_id, members) in by_log {
-            let lo = members.iter().map(|m| m.2).min().unwrap_or(0);
+            let mut lo = members.iter().map(|m| m.2).min().unwrap_or(0);
+            // Retention may have pruned the log's head. What it pruned holds
+            // nothing these spans still need (no entries of their shard and
+            // epoch, or entries already durable): DESIGN.md "Log retention".
+            if let Some(first) = crate::backfill::first_ordinal(store, &log_id).await? {
+                lo = lo.max(first);
+            }
             let hi = if members.iter().any(|m| m.1.end.is_none()) { u64::MAX } else { members.iter().filter_map(|m| m.1.end).max().unwrap_or(0) };
             let fetch = |ord: u64| {
                 let (store, path) = (store.clone(), segment_path(store, &log_id, ord));
@@ -1169,7 +1263,7 @@ mod tests {
     fn entry(shard: u16, key: String, val_len: usize, ack: Option<AckFn>) -> LogEntry {
         LogEntry {
             shard,
-            frames: vec![Frame { prefix: key.clone().into_bytes(), suffix: Vec::new() }],
+            frames: vec![Frame { prefix: key.clone().into_bytes(), suffix: Vec::new(), derived_muts: 0 }],
             muts: vec![Mutation { key: Bytes::from(key), val: Some(Bytes::from(vec![7u8; val_len])) }],
             ack,
             pending: None,

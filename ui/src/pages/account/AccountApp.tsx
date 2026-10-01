@@ -10,6 +10,7 @@ import { Collections, Records, RecordView } from './Repo'
 import { Blobs } from './Blobs'
 import { Export, Preferences } from './Data'
 import { Danger } from './Danger'
+import { SignUp } from './SignUp'
 
 const NAV = [
   { to: '/account', label: 'Overview' },
@@ -25,11 +26,12 @@ export function AccountApp({ path }: { path: string }) {
   const s = useSession()
   const p = path.replace(/\/+$/, '') || '/account'
   if (p === '/account/reset') return <PasswordReset />
+  if (p === '/account/signup' && !s) return <SignUp />
   if (!s) return <SignIn />
 
   let page: JSX.Element
   let m: Record<string, string> | null
-  if (p === '/account') page = <Overview />
+  if (p === '/account' || p === '/account/signup') page = <Overview />
   else if (p === '/account/identity') page = <Identity />
   else if (p === '/account/security') page = <Security />
   else if (p === '/account/repo') page = <Collections />
@@ -174,6 +176,11 @@ function SignIn() {
                 </button>
               </div>
             </form>
+            {!needCode && (
+              <p className="alt">
+                New here? <Link to="/account/signup">Create an account</Link>
+              </p>
+            )}
           </div>
         </div>
       </main>

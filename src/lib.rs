@@ -21,6 +21,7 @@ pub mod partitions;
 pub mod profiling;
 pub mod ratelimit;
 pub mod remote;
+pub mod retention;
 pub mod segment;
 pub mod slots;
 pub mod server;

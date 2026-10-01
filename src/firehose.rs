@@ -587,6 +587,17 @@ impl Firehose {
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 continue;
             }
+            // older than what log retention deleted: OutdatedCursor, then the
+            // oldest events left (retention.rs raises this before deleting)
+            match crate::retention::retained_floor(&reader.store).await {
+                Ok(pruned) if *last < pruned => {
+                    out.send(&info_frame("OutdatedCursor", "cursor is older than the retained history; starting from the oldest available event")).await?;
+                    *last = pruned;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("reading the retained floor failed: {e:#}"),
+            }
             let (tx, mut rx) = mpsc::channel(4096);
             let (r, from) = (reader.clone(), *last);
             let mut job = AbortOnDrop(tokio::spawn(async move { crate::backfill::backfill_with(&r, from, floor, &tx).await }));
@@ -608,6 +619,15 @@ impl Firehose {
             }
             match (&mut job.0).await {
                 Ok(Ok(_)) => *last = (*last).max(floor), // everything <= floor that exists was sent
+                // retention deleted segments ahead of us mid-read: the floor
+                // check above moves us past them
+                Ok(Err(e)) if e.downcast_ref::<crate::backfill::Pruned>().is_some() => {
+                    if crate::retention::retained_floor(&reader.store).await.is_ok_and(|p| *last < p) {
+                        continue;
+                    }
+                    tracing::warn!(from, floor, "firehose backfill failed: {e:#}");
+                    return Ok(false);
+                }
                 Ok(Err(e)) => {
                     tracing::warn!(from, floor, "firehose backfill failed: {e:#}");
                     return Ok(false);

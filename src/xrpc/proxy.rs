@@ -20,7 +20,7 @@ use super::*;
 use crate::did_resolver;
 use axum::extract::Request;
 use axum::http::{Method, Uri};
-use futures::StreamExt;
+use std::borrow::Cow;
 use std::time::Duration;
 
 /// Private-state name of the stored `app.bsky` preferences (JSON array).
@@ -36,6 +36,7 @@ const APPEAL_ACTIONED_SUBJECT: &str = "tools.ozone.inbox.appealActionedSubject";
 
 /// TS proxy defaults: headersTimeout 10s, bodyTimeout 30s, maxResponseSize 10MB.
 const HEADERS_TIMEOUT: Duration = Duration::from_secs(10);
+const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 10 << 20;
 const SERVICE_JWT_TTL_SECS: u64 = 60;
 
@@ -79,10 +80,21 @@ const PRIVILEGED_METHODS: &[&str] = &[
 ];
 
 /// Response headers forwarded from upstream (besides content-* headers).
-const RES_HEADERS_TO_FORWARD: &[&str] = &[
-    "atproto-repo-rev",
-    "atproto-content-labelers",
-    "retry-after",
+const RES_HEADERS_TO_FORWARD: [header::HeaderName; 3] = [
+    header::HeaderName::from_static("atproto-repo-rev"),
+    header::HeaderName::from_static("atproto-content-labelers"),
+    header::RETRY_AFTER,
+];
+
+/// Response headers of a successful upstream response that are passed on.
+const RES_HEADERS: [header::HeaderName; 7] = [
+    header::CONTENT_LENGTH,
+    header::CONTENT_ENCODING,
+    header::CONTENT_TYPE,
+    header::CONTENT_LANGUAGE,
+    header::HeaderName::from_static("atproto-repo-rev"),
+    header::HeaderName::from_static("atproto-content-labelers"),
+    header::RETRY_AFTER,
 ];
 
 pub fn routes() -> Router<Arc<App>> {
@@ -121,18 +133,18 @@ fn valid_nsid(s: &str) -> bool {
 // Target selection
 // ----------------
 
-/// A resolved proxy target.
-struct Target {
+/// A resolved proxy target (configured ones borrow the config).
+struct Target<'a> {
     /// Service endpoint (only its origin is used; the path comes from the request).
-    url: String,
+    url: Cow<'a, str>,
     /// Bare service DID: the service-auth JWT audience.
-    did: String,
-    service_id: String,
+    did: Cow<'a, str>,
+    service_id: Cow<'a, str>,
     /// Operator-configured (AppView / report service): exempt from SSRF checks.
     trusted: bool,
 }
 
-impl Target {
+impl Target<'_> {
     /// `did#service_id`, the audience used for scope checks.
     fn scope_aud(&self) -> String {
         format!("{}#{}", self.did, self.service_id)
@@ -149,18 +161,18 @@ fn proxy_header(headers: &HeaderMap) -> XResult<Option<&str>> {
     }
 }
 
-fn configured(svc: &Option<(String, String)>, service_id: &str) -> Option<Target> {
+fn configured<'a>(svc: &'a Option<(String, String)>, service_id: &'static str) -> Option<Target<'a>> {
     svc.as_ref().map(|(url, did)| Target {
-        url: url.clone(),
-        did: did.clone(),
-        service_id: service_id.into(),
+        url: Cow::Borrowed(url),
+        did: Cow::Borrowed(did),
+        service_id: Cow::Borrowed(service_id),
         trusted: true,
     })
 }
 
 /// Default service for a method without an atproto-proxy header:
 /// Ok(None) = not proxyable (501).
-fn default_target(app: &App, lxm: &str) -> XResult<Option<Target>> {
+fn default_target<'a>(app: &'a App, lxm: &str) -> XResult<Option<Target<'a>>> {
     let no_service =
         || XrpcError::bad("InvalidRequest", format!("No service configured for {lxm}"));
     if lxm == CREATE_REPORT {
@@ -196,7 +208,7 @@ fn compute_proxy_to(app: &App, headers: &HeaderMap, lxm: &str) -> XResult<String
 }
 
 /// Parses and resolves `atproto-proxy: <did>#<service id>`.
-async fn parse_proxy_header(app: &App, proxy_to: &str) -> XResult<Target> {
+async fn parse_proxy_header<'a>(app: &'a App, proxy_to: &str) -> XResult<Target<'a>> {
     let bad = |m: &str| XrpcError::bad("InvalidRequest", m);
     let hash = match proxy_to.find('#') {
         Some(0) => return Err(bad("no did specified in proxy header")),
@@ -217,9 +229,9 @@ async fn parse_proxy_header(app: &App, proxy_to: &str) -> XResult<Target> {
     if let Some((url, av_did)) = &app.config.appview {
         if did == av_did && service_id == "bsky_appview" {
             return Ok(Target {
-                url: url.clone(),
-                did: did.into(),
-                service_id: service_id.into(),
+                url: Cow::Borrowed(url),
+                did: Cow::Borrowed(av_did),
+                service_id: Cow::Borrowed("bsky_appview"),
                 trusted: true,
             });
         }
@@ -230,9 +242,9 @@ async fn parse_proxy_header(app: &App, proxy_to: &str) -> XResult<Target> {
     let url = did_resolver::service_endpoint(&doc, service_id)
         .ok_or_else(|| bad("could not resolve proxy did service url"))?;
     Ok(Target {
-        url,
-        did: did.into(),
-        service_id: service_id.into(),
+        url: Cow::Owned(url),
+        did: Cow::Owned(did.into()),
+        service_id: Cow::Owned(service_id.into()),
         trusted: false,
     })
 }
@@ -274,7 +286,7 @@ fn local_did_doc(app: &App, acct: &Account) -> Option<J> {
 /// client; endpoints taken from DID documents use the SSRF-guarded one.
 fn proxy_http(app: &App, trusted: bool) -> &'static reqwest::Client {
     if trusted {
-        crate::http::public()
+        crate::http::proxy()
     } else {
         crate::http::guarded(app.config.dev_mode)
     }
@@ -285,41 +297,32 @@ fn upstream_failure(message: &str) -> XrpcError {
 }
 
 /// Request headers passed to the upstream service (TS allow-list).
-fn forward_headers(src: &HeaderMap, with_body: bool, authorization: Option<String>) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    let copy = |out: &mut HeaderMap, name: &str| {
+fn forward_headers(src: &HeaderMap, with_body: bool, authorization: Option<&str>) -> HeaderMap {
+    const ACCEPT_LANGUAGE: header::HeaderName = header::ACCEPT_LANGUAGE;
+    const ACCEPT_LABELERS: header::HeaderName = header::HeaderName::from_static("atproto-accept-labelers");
+    const BSKY_TOPICS: header::HeaderName = header::HeaderName::from_static("x-bsky-topics");
+    let mut out = HeaderMap::with_capacity(8);
+    let copy = |out: &mut HeaderMap, name: &header::HeaderName| {
         for v in src.get_all(name) {
-            out.append(
-                header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
-                v.clone(),
-            );
+            out.append(name.clone(), v.clone());
         }
     };
-    match src.get(header::ACCEPT_ENCODING) {
-        Some(v) => {
-            out.insert(header::ACCEPT_ENCODING, v.clone());
-        }
-        None => {
-            out.insert(
-                header::ACCEPT_ENCODING,
-                header::HeaderValue::from_static("identity"),
-            );
-        }
-    }
-    copy(&mut out, "accept-language");
-    copy(&mut out, "atproto-accept-labelers");
+    let ae = src.get(header::ACCEPT_ENCODING).cloned();
+    out.insert(header::ACCEPT_ENCODING, ae.unwrap_or(header::HeaderValue::from_static("identity")));
+    copy(&mut out, &ACCEPT_LANGUAGE);
+    copy(&mut out, &ACCEPT_LABELERS);
     for name in src.keys() {
         if name.as_str().starts_with("x-atproto-") {
-            copy(&mut out, name.as_str());
+            copy(&mut out, name);
         }
     }
-    copy(&mut out, "x-bsky-topics");
+    copy(&mut out, &BSKY_TOPICS);
     if with_body {
-        copy(&mut out, "content-type");
-        copy(&mut out, "content-encoding");
-        copy(&mut out, "content-length");
+        copy(&mut out, &header::CONTENT_TYPE);
+        copy(&mut out, &header::CONTENT_ENCODING);
+        copy(&mut out, &header::CONTENT_LENGTH);
     }
-    if let Some(Ok(v)) = authorization.map(|a| header::HeaderValue::from_str(&a)) {
+    if let Some(Ok(v)) = authorization.map(|a| header::HeaderValue::from_str(&format!("Bearer {a}"))) {
         out.insert(header::AUTHORIZATION, v);
     }
     out
@@ -378,8 +381,8 @@ fn response_type_str(status: u16) -> Option<&'static str> {
 /// Re-raises an upstream error response (TS PipethroughUpstreamError):
 /// status passes through except 500 -> 502; error/message come from the
 /// upstream JSON body when present; only the forwardable headers are kept.
-async fn upstream_error(resp: reqwest::Response) -> Response {
-    let upstream_status = resp.status().as_u16();
+async fn upstream_error(resp: axum::http::response::Parts, body: Body) -> Response {
+    let upstream_status = resp.status.as_u16();
     let status = if upstream_status == 500 {
         502
     } else {
@@ -387,35 +390,24 @@ async fn upstream_error(resp: reqwest::Response) -> Response {
     };
     let mut fwd = HeaderMap::new();
     for name in RES_HEADERS_TO_FORWARD {
-        if let Some(v) = resp.headers().get(*name) {
-            fwd.insert(*name, v.clone());
+        if let Some(v) = resp.headers.get(&name) {
+            fwd.insert(name, v.clone());
         }
     }
     let json_body = resp
-        .headers()
+        .headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(is_json_content_type);
     let encoded = resp
-        .headers()
+        .headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|e| !e.trim().is_empty() && !e.trim().eq_ignore_ascii_case("identity"));
     let (mut error, mut message) = (None, None);
     if json_body && !encoded {
-        let mut buf = Vec::new();
-        let mut s = resp.bytes_stream();
-        let mut ok = true;
-        while let Some(chunk) = s.next().await {
-            match chunk {
-                Ok(c) if buf.len() + c.len() <= MAX_RESPONSE_BYTES => buf.extend_from_slice(&c),
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if ok {
+        let buf = axum::body::to_bytes(body, usize::MAX).await;
+        if let Ok(buf) = buf {
             if let Ok(v) = serde_json::from_slice::<J>(&buf) {
                 error = v.get("error").and_then(|e| e.as_str()).map(String::from);
                 message = v.get("message").and_then(|e| e.as_str()).map(String::from);
@@ -442,7 +434,7 @@ struct Forward<'a> {
     /// Path and query, forwarded verbatim (TS uses req.originalUrl).
     path_and_query: &'a str,
     headers: &'a HeaderMap,
-    body: Option<reqwest::Body>,
+    body: Option<Body>,
     /// Service-auth issuer; None forwards without credentials.
     iss: Option<&'a str>,
     lxm: &'a str,
@@ -454,34 +446,58 @@ struct Forward<'a> {
 // it). Per request it would otherwise cost two account reads + JSON parse, a
 // key parse, and a ~25 µs ES256K signature. Instead:
 // - account signing key + status are cached for ACCT_TTL (status changes such
-//   as takedowns apply within that window);
-// - minted service JWTs are reused per (iss, aud, lxm) until half their
-//   lifetime has passed, so an active account signs ~2×/min per method.
+//   as takedowns apply within that window), read once per request;
+// - minted service JWTs are reused per (iss, aud, lxm, signing key) until
+//   half their lifetime has passed, so an active account signs ~2×/min per
+//   method. The key is part of the cache key: after a rotation or migration
+//   the next account refresh (within ACCT_TTL) brings the new key, and with
+//   it fresh tokens, instead of reusing ones signed by the old key.
+// Lookups don't allocate: the account cache is keyed by DID (borrowed
+// lookups), the JWT cache by a hash of (iss, aud, lxm, key id) with the full
+// key stored and compared on every hit.
 
 const ACCT_TTL: Duration = Duration::from_secs(2);
 const JWT_REUSE: Duration = Duration::from_secs(SERVICE_JWT_TTL_SECS / 2);
 const CACHE_SHARDS: usize = 64;
 const CACHE_CAP_PER_SHARD: usize = 32_768;
 
+type Shard<K, V> = parking_lot::Mutex<std::collections::HashMap<K, (V, std::time::Instant)>>;
+
 struct TtlCache<K, V> {
-    shards: Vec<parking_lot::Mutex<std::collections::HashMap<K, (V, std::time::Instant)>>>,
+    shards: Vec<Shard<K, V>>,
 }
 
-impl<K: std::hash::Hash + Eq + Clone, V: Clone> TtlCache<K, V> {
+/// Fixed-key hash (the same key always picks the same shard).
+fn fixed_hash<Q: std::hash::Hash + ?Sized>(k: &Q) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::hash::DefaultHasher::new();
+    k.hash(&mut h);
+    h.finish()
+}
+
+impl<K: std::hash::Hash + Eq, V: Clone> TtlCache<K, V> {
     fn new() -> Self {
         TtlCache { shards: (0..CACHE_SHARDS).map(|_| parking_lot::Mutex::new(Default::default())).collect() }
     }
-    fn shard(&self, k: &K) -> &parking_lot::Mutex<std::collections::HashMap<K, (V, std::time::Instant)>> {
-        use std::hash::Hasher;
-        // fixed-key hasher: the same key must always pick the same shard
-        let mut fx = std::hash::DefaultHasher::new();
-        k.hash(&mut fx);
-        &self.shards[(fx.finish() as usize) % CACHE_SHARDS]
+    fn shard<Q: std::hash::Hash + ?Sized>(&self, k: &Q) -> &Shard<K, V> {
+        &self.shards[(fixed_hash(k) as usize) % CACHE_SHARDS]
     }
     /// Value if inserted less than `max_age` ago.
-    fn get(&self, k: &K, max_age: Duration) -> Option<V> {
+    fn get<Q>(&self, k: &Q, max_age: Duration) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.get_aged(k).filter(|(_, age)| *age < max_age).map(|(v, _)| v)
+    }
+    /// Value and age, however old.
+    fn get_aged<Q>(&self, k: &Q) -> Option<(V, Duration)>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
         let m = self.shard(k).lock();
-        m.get(k).filter(|(_, t)| t.elapsed() < max_age).map(|(v, _)| v.clone())
+        m.get(k).map(|(v, t)| (v.clone(), t.elapsed()))
     }
     fn put(&self, k: K, v: V, max_age: Duration) {
         let mut m = self.shard(&k).lock();
@@ -498,112 +514,261 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TtlCache<K, V> {
 #[derive(Clone)]
 struct CachedAcct {
     key: Arc<Keypair>,
+    /// Identifies the signing key (a hash of it): part of the JWT cache key.
+    key_id: u64,
     status: Option<String>,
 }
 
+/// A minted service JWT and the (iss, aud, lxm, key id) it was minted for.
+type CachedJwt = Arc<(String, String, String, u64, Arc<str>)>;
+
 static ACCTS: std::sync::LazyLock<TtlCache<String, CachedAcct>> = std::sync::LazyLock::new(TtlCache::new);
-static JWTS: std::sync::LazyLock<TtlCache<(String, String, String), Arc<str>>> = std::sync::LazyLock::new(TtlCache::new);
+static JWTS: std::sync::LazyLock<TtlCache<u64, CachedJwt>> = std::sync::LazyLock::new(TtlCache::new);
 
 async fn cached_account(app: &App, did: &str) -> XResult<CachedAcct> {
-    if let Some(a) = ACCTS.get(&did.to_string(), ACCT_TTL) {
-        crate::metrics::PROXY_CACHE.with_label_values(&["account_hit"]).inc();
-        return Ok(a);
-    }
+    let prev = match ACCTS.get_aged(did) {
+        Some((a, age)) if age < ACCT_TTL => {
+            crate::metrics::PROXY_CACHE.with_label_values(&["account_hit"]).inc();
+            return Ok(a);
+        }
+        prev => prev.map(|(a, _)| a),
+    };
     crate::metrics::PROXY_CACHE.with_label_values(&["account_miss"]).inc();
-    let acct = app.account(did).await?;
-    let key = Keypair::from_bytes(&hex::decode(&acct.signing_key).map_err(XrpcError::from_err)?)
-        .map_err(XrpcError::from_err)?;
-    let c = CachedAcct { key: Arc::new(key), status: acct.status.clone() };
+    // the two fields used here, borrowed: a full `Account` parse (its
+    // flattened extension map buffers the whole document) cost more than
+    // the read at 1M active accounts, where ~half the lookups miss
+    #[derive(serde::Deserialize)]
+    struct KeyAndStatus<'a> {
+        #[serde(borrow)]
+        signing_key: std::borrow::Cow<'a, str>,
+        #[serde(default, borrow)]
+        status: Option<std::borrow::Cow<'a, str>>,
+    }
+    let raw = app
+        .partition(did)?
+        .db
+        .get(state::account_key(did))
+        .await
+        .map_err(XrpcError::from_err)?
+        .ok_or_else(|| XrpcError::bad("AccountNotFound", format!("no account {did}")))?;
+    let acct: KeyAndStatus = serde_json::from_slice(&raw).map_err(XrpcError::from_err)?;
+    let key_id = fixed_hash(&*acct.signing_key);
+    // an unchanged key keeps its parsed form
+    let key = match prev.filter(|p| p.key_id == key_id) {
+        Some(p) => p.key,
+        None => Arc::new(
+            Keypair::from_bytes(&hex::decode(&*acct.signing_key).map_err(XrpcError::from_err)?)
+                .map_err(XrpcError::from_err)?,
+        ),
+    };
+    let c = CachedAcct { key, key_id, status: acct.status.map(Into::into) };
     ACCTS.put(did.to_string(), c.clone(), ACCT_TTL);
     Ok(c)
 }
 
 fn service_jwt(acct: &CachedAcct, iss: &str, aud: &str, lxm: &str) -> Arc<str> {
-    let k = (iss.to_string(), aud.to_string(), lxm.to_string());
-    if let Some(j) = JWTS.get(&k, JWT_REUSE) {
+    let h = fixed_hash(&(iss, aud, lxm, acct.key_id));
+    let hit = |j: &CachedJwt| j.0 == iss && j.1 == aud && j.2 == lxm && j.3 == acct.key_id;
+    if let Some(j) = JWTS.get(&h, JWT_REUSE).filter(hit) {
         crate::metrics::PROXY_CACHE.with_label_values(&["jwt_hit"]).inc();
-        return j;
+        return j.4.clone();
     }
     crate::metrics::PROXY_CACHE.with_label_values(&["jwt_miss"]).inc();
     let j: Arc<str> = crate::auth::service_auth_jwt(&acct.key, iss, aud, Some(lxm), SERVICE_JWT_TTL_SECS).into();
-    JWTS.put(k, j.clone(), JWT_REUSE);
+    JWTS.put(h, Arc::new((iss.into(), aud.into(), lxm.into(), acct.key_id, j.clone())), JWT_REUSE);
     j
 }
 
+/// A service endpoint as the proxy uses it.
+#[derive(Clone)]
+struct Endpoint {
+    /// `scheme://host[:port]`
+    origin: Arc<str>,
+    /// `host:port` of a plain `http://` endpoint (the HTTP/1.1 fast path).
+    h1: Option<Arc<str>>,
+}
+
+/// The parsed form of a service endpoint URL. The last one per thread is
+/// kept: proxied calls nearly always go to the one AppView.
+fn endpoint(url: &str) -> XResult<Endpoint> {
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(String, Endpoint)>> = const { std::cell::RefCell::new(None) };
+    }
+    if let Some(e) = LAST.with_borrow(|l| l.as_ref().filter(|(u, _)| u == url).map(|(_, e)| e.clone())) {
+        return Ok(e);
+    }
+    let base = reqwest::Url::parse(url).map_err(|_| XrpcError::bad("InvalidRequest", "invalid service endpoint"))?;
+    let h1 = match (base.scheme(), base.host_str(), base.port_or_known_default()) {
+        ("http", Some(host), Some(port)) => Some(format!("{host}:{port}").into()),
+        _ => None,
+    };
+    let e = Endpoint { origin: base.origin().ascii_serialization().into(), h1 };
+    LAST.set(Some((url.to_string(), e.clone())));
+    Ok(e)
+}
+
+/// Upstream response body, passed through with the reference's limits: at
+/// most [`MAX_RESPONSE_BYTES`], and [`BODY_TIMEOUT`] without progress fails
+/// it. The idle timer is armed only while the upstream keeps us waiting, so
+/// a response that arrived with its head (the common case) costs no timer
+/// (each tokio timer operation takes the runtime's one timer-wheel lock).
+struct UpstreamBody<B> {
+    inner: B,
+    seen: usize,
+    idle: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    progressed: bool,
+}
+
+impl<B> UpstreamBody<B> {
+    fn new(inner: B) -> Self {
+        UpstreamBody { inner, seen: 0, idle: None, progressed: false }
+    }
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+impl<B> hyper::body::Body for UpstreamBody<B>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+        use std::task::Poll;
+        let this = &mut *self;
+        match std::pin::Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(f))) => {
+                if let Some(d) = f.data_ref() {
+                    this.seen += d.len();
+                    if this.seen > MAX_RESPONSE_BYTES {
+                        return Poll::Ready(Some(Err("upstream response too large".into())));
+                    }
+                }
+                this.progressed = true;
+                Poll::Ready(Some(Ok(f)))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                let deadline = tokio::time::Instant::now() + BODY_TIMEOUT;
+                let progressed = std::mem::take(&mut this.progressed);
+                let idle = match &mut this.idle {
+                    Some(s) => {
+                        if progressed {
+                            s.as_mut().reset(deadline);
+                        }
+                        s
+                    }
+                    None => this.idle.insert(Box::pin(tokio::time::sleep_until(deadline))),
+                };
+                if std::future::Future::poll(idle.as_mut(), cx).is_ready() {
+                    return Poll::Ready(Some(Err("upstream body timeout".into())));
+                }
+                Poll::Pending
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// Sends the request to `target` with a (cached) service-auth token (when
-/// there is an issuer) and streams the response back.
-async fn forward(app: &App, target: &Target, f: Forward<'_>) -> XResult<Response> {
+/// there is an issuer, whose account `acct` is) and streams the response
+/// back.
+async fn forward(app: &App, target: &Target<'_>, f: Forward<'_>, acct: Option<&CachedAcct>) -> XResult<Response> {
     let authorization = match f.iss {
         Some(iss) => {
-            let acct = cached_account(app, iss).await?;
+            let fetched;
+            let acct = match acct {
+                Some(a) => a,
+                None => {
+                    fetched = cached_account(app, iss).await?;
+                    &fetched
+                }
+            };
             // Phase 1 of service-auth updates: the outbound JWT aud is the bare DID.
-            Some(format!("Bearer {}", service_jwt(&acct, iss, &target.did, f.lxm)))
+            Some(service_jwt(acct, iss, &target.did, f.lxm))
         }
         None => None,
     };
 
-    let base = reqwest::Url::parse(&target.url)
-        .map_err(|_| XrpcError::bad("InvalidRequest", "invalid service endpoint"))?;
     if !target.trusted {
+        let base = reqwest::Url::parse(&target.url)
+            .map_err(|_| XrpcError::bad("InvalidRequest", "invalid service endpoint"))?;
         if let Err(e) = did_resolver::check_outbound_url(&base, app.config.dev_mode) {
             tracing::warn!(endpoint = %target.url, "proxy target refused: {e}");
             return Err(upstream_failure("Upstream service unreachable"));
         }
     }
-    let url = format!(
-        "{}{}",
-        base.origin().ascii_serialization(),
-        f.path_and_query
-    );
+    let ep = endpoint(&target.url)?;
     let with_body = f.body.is_some();
-    let mut rb = proxy_http(app, target.trusted)
-        .request(f.method, &url)
-        .headers(forward_headers(f.headers, with_body, authorization));
-    if let Some(b) = f.body {
-        rb = rb.body(b);
-    }
-    let resp = match tokio::time::timeout(HEADERS_TIMEOUT, rb.send()).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            tracing::warn!(url = %url, "proxy upstream error: {e}");
-            return Err(upstream_failure("Upstream service unreachable"));
+    let headers = forward_headers(f.headers, with_body, authorization.as_deref());
+    let sent = match ep.h1.as_ref().filter(|_| target.trusted) {
+        // operator-configured plain-HTTP upstream: the HTTP/1.1 fast path
+        Some(authority) => {
+            let mut req = axum::http::Request::new(f.body.unwrap_or_default());
+            *req.method_mut() = f.method;
+            *req.uri_mut() = axum::http::Uri::try_from(f.path_and_query)
+                .map_err(|_| XrpcError::bad("InvalidRequest", "invalid xrpc path"))?;
+            *req.headers_mut() = headers;
+            let send = crate::http::h1::send("public", authority, req);
+            match tokio::time::timeout(HEADERS_TIMEOUT, send).await {
+                Ok(Ok(r)) => {
+                    let (parts, body) = r.into_parts();
+                    Ok((parts, Body::new(UpstreamBody::new(body))))
+                }
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("headers timeout".to_string()),
+            }
         }
-        Err(_) => {
-            tracing::warn!(url = %url, "proxy upstream headers timeout");
+        None => {
+            let mut url = String::with_capacity(ep.origin.len() + f.path_and_query.len());
+            url.push_str(&ep.origin);
+            url.push_str(f.path_and_query);
+            let mut rb = proxy_http(app, target.trusted).request(f.method, &url).headers(headers);
+            if let Some(b) = f.body {
+                rb = rb.body(reqwest::Body::wrap_stream(b.into_data_stream()));
+            }
+            match tokio::time::timeout(HEADERS_TIMEOUT, rb.send()).await {
+                Ok(Ok(r)) => {
+                    let (parts, body) = axum::http::Response::from(r).into_parts();
+                    Ok((parts, Body::new(UpstreamBody::new(body))))
+                }
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("headers timeout".to_string()),
+            }
+        }
+    };
+    let (parts, body) = match sent {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(endpoint = %target.url, path = f.path_and_query, "proxy upstream error: {e}");
             return Err(upstream_failure("Upstream service unreachable"));
         }
     };
-    if resp.status().as_u16() >= 400 {
-        return Ok(upstream_error(resp).await);
+    if parts.status.as_u16() >= 400 {
+        return Ok(upstream_error(parts, body).await);
     }
-
-    let mut out = Response::builder().status(resp.status().as_u16());
-    for name in [
-        "content-length",
-        "content-encoding",
-        "content-type",
-        "content-language",
-    ]
-    .iter()
-    .chain(RES_HEADERS_TO_FORWARD)
-    {
-        for v in resp.headers().get_all(*name) {
-            out = out.header(*name, v.clone());
+    let mut out = Response::new(body);
+    *out.status_mut() = parts.status;
+    let headers = out.headers_mut();
+    for name in RES_HEADERS {
+        for v in parts.headers.get_all(&name) {
+            headers.append(name.clone(), v.clone());
         }
     }
-    let mut seen = 0usize;
-    let stream = resp.bytes_stream().map(
-        move |r| -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
-            let b = r?;
-            seen += b.len();
-            if seen > MAX_RESPONSE_BYTES {
-                return Err("upstream response too large".into());
-            }
-            Ok(b)
-        },
-    );
-    out.body(Body::from_stream(stream))
-        .map_err(XrpcError::from_err)
+    Ok(out)
 }
 
 /// Unauthenticated pipethrough of a GET to the `atproto-proxy` target or the
@@ -633,13 +798,14 @@ pub(super) async fn pipethrough_unauthed(
             iss: None,
             lxm,
         },
+        None,
     )
     .await
 }
 
 /// Account checks shared by every proxied call: loads the account and
 /// rejects taken-down accounts unless the method allows them.
-async fn check_takedown(app: &App, did: &str, allow_takendown: bool) -> XResult<()> {
+async fn check_takedown(app: &App, did: &str, allow_takendown: bool) -> XResult<CachedAcct> {
     let acct = cached_account(app, did).await.map_err(|_| {
         xerr(
             StatusCode::FORBIDDEN,
@@ -654,7 +820,7 @@ async fn check_takedown(app: &App, did: &str, allow_takendown: bool) -> XResult<
             "Account has been taken down",
         ));
     }
-    Ok(())
+    Ok(acct)
 }
 
 fn user_did(creds: &Credentials) -> XResult<&str> {
@@ -708,7 +874,7 @@ async fn proxy_request(app: &App, req: Request) -> XResult<Response> {
 
     let (parts, body) = req.into_parts();
     let creds = super::authn::authenticate(app, &parts).await?;
-    let did = user_did(&creds)?.to_string();
+    let did = user_did(&creds)?;
 
     let target = match (header, default) {
         (Some(h), _) => parse_proxy_header(app, &h).await?,
@@ -726,10 +892,9 @@ async fn proxy_request(app: &App, req: Request) -> XResult<Response> {
     {
         return Err(XrpcError::bad("InvalidToken", "Bad token method"));
     }
-    check_takedown(app, &did, lxm == APPEAL_ACTIONED_SUBJECT).await?;
+    let acct = check_takedown(app, did, lxm == APPEAL_ACTIONED_SUBJECT).await?;
 
-    let body =
-        (method == Method::POST).then(|| reqwest::Body::wrap_stream(body.into_data_stream()));
+    let body = (method == Method::POST).then_some(body);
     let pq = parts
         .uri
         .path_and_query()
@@ -743,9 +908,10 @@ async fn proxy_request(app: &App, req: Request) -> XResult<Response> {
             path_and_query: pq,
             headers: &parts.headers,
             body,
-            iss: Some(&did),
+            iss: Some(did),
             lxm: &lxm,
         },
+        Some(&acct),
     )
     .await
 }
@@ -763,12 +929,12 @@ fn local_prefs_aud(app: &App) -> String {
 
 /// Scope audience and, when the request names a different AppView, the
 /// target to pipe through to instead of serving locally.
-async fn prefs_target(
-    app: &App,
+async fn prefs_target<'a>(
+    app: &'a App,
     creds: &Credentials,
     headers: &HeaderMap,
     lxm: &str,
-) -> XResult<Option<Target>> {
+) -> XResult<Option<Target<'a>>> {
     let local = local_prefs_aud(app);
     let aud = match proxy_header(headers)? {
         Some(h) => h.to_string(),
@@ -844,6 +1010,7 @@ async fn get_preferences(
                 iss: Some(&did),
                 lxm: GET_PREFERENCES,
             },
+            None,
         )
         .await;
     }
@@ -881,11 +1048,11 @@ async fn put_preferences(
             method: Method::POST,
             path_and_query: pq,
             headers: &headers,
-            body: Some(body.into()),
+            body: Some(Body::from(body)),
             iss: Some(&did),
             lxm: PUT_PREFERENCES,
         };
-        return forward(&app, &target, fwd).await;
+        return forward(&app, &target, fwd, None).await;
     }
     check_takedown(&app, &did, false).await?;
 
@@ -1002,7 +1169,7 @@ async fn create_report(
         ));
     }
     // Taken-down accounts may still report (appeals).
-    check_takedown(&app, &did, true).await?;
+    let acct = check_takedown(&app, &did, true).await?;
 
     let target = match proxy_header(&headers)? {
         Some(h) => parse_proxy_header(&app, h).await?,
@@ -1028,10 +1195,11 @@ async fn create_report(
             method: Method::POST,
             path_and_query: &path,
             headers: &fwd_headers,
-            body: Some(body.into()),
+            body: Some(Body::from(body)),
             iss: Some(&did),
             lxm: CREATE_REPORT,
         },
+        Some(&acct),
     )
     .await
 }

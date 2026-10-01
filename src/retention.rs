@@ -1,0 +1,602 @@
+//! Log segment retention (DESIGN.md "Log retention").
+//!
+//! Node logs are both the WAL and the firehose history, so without this they
+//! grow forever (~3.5 KB per commit). A segment is deleted once
+//!
+//! - no replay can need it: below its log's *replay floor* (live log: every
+//!   shard applying from it has a durable checkpoint past it; dead log: every
+//!   shard with a span in it has been opened by a later owner, which replayed
+//!   and flushed that span), and
+//! - it is older than the firehose backfill window (`--log-retention`,
+//!   default 72 h); a cursor older than what was deleted gets
+//!   `OutdatedCursor` and continues from the oldest event left.
+//!
+//! One node deletes from a given log: its owner while it lives, and for dead
+//! (fenced) logs the owner of the lowest-numbered shard. Deletes are
+//! idempotent, so two nodes briefly both believing they lead is harmless.
+//! Each pass deletes at most `max_deletes` objects, oldest first.
+//!
+//! Every node publishes `retain/{log_id}`: the shards its log's owner opened
+//! (with epochs: permanent facts, so a stale copy is merely conservative) and
+//! the highest seq it deleted (the retained floor is the max over reports).
+//! A dead log keeps its fence object: it is what makes a zombie of that
+//! incarnation fail-stop, whatever the zombie's clock says.
+
+use crate::cluster::Assignment;
+use crate::metrics;
+use crate::nodelog::{self, NodeLog};
+use crate::store::Store;
+use futures::StreamExt;
+use object_store::path::Path;
+use object_store::{ObjectStoreExt, PutPayload};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+pub const DEFAULT_WINDOW: Duration = Duration::from_secs(72 * 3600);
+pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+pub const DEFAULT_MAX_DELETES: usize = 10_000;
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// Firehose backfill window: segments younger than this are kept.
+    pub window: Duration,
+    /// Time between passes.
+    pub interval: Duration,
+    /// Objects deleted per pass at most (all logs together).
+    pub max_deletes: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config { window: DEFAULT_WINDOW, interval: DEFAULT_INTERVAL, max_deletes: DEFAULT_MAX_DELETES }
+    }
+}
+
+/// `retain/{log_id}`, written by that log's owner.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Report {
+    /// shard -> highest epoch the log's owner opened it at
+    pub opened: BTreeMap<u16, u64>,
+    /// highest seq deleted by this node (including reports of dead logs it
+    /// folded in when it deleted them)
+    pub pruned_seq: i64,
+}
+
+fn report_path(store: &Store, log_id: &str) -> Path {
+    Path::from(format!("{}/retain/{}", store.prefix, log_id))
+}
+
+/// Every retention report, by log id.
+pub async fn read_reports(store: &Store) -> anyhow::Result<HashMap<String, Report>> {
+    let prefix = Path::from(format!("{}/retain", store.prefix));
+    let names: Vec<String> = store
+        .raw
+        .list(Some(&prefix))
+        .filter_map(|m| async move { m.ok().and_then(|m| m.location.filename().map(String::from)) })
+        .collect()
+        .await;
+    let got: Vec<anyhow::Result<Option<(String, Report)>>> = futures::stream::iter(names)
+        .map(|log| async move {
+            match store.raw.get(&report_path(store, &log)).await {
+                Ok(r) => Ok(Some((log, serde_json::from_slice(&r.bytes().await?)?))),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .buffer_unordered(16)
+        .collect()
+        .await;
+    let mut out = HashMap::new();
+    for r in got {
+        if let Some((log, rep)) = r? {
+            out.insert(log, rep);
+        }
+    }
+    Ok(out)
+}
+
+/// The retained floor: every event deleted from any log has seq <= this,
+/// so a cursor at or past it is served in full. Raised before each delete.
+pub async fn retained_floor(store: &Store) -> anyhow::Result<i64> {
+    Ok(read_reports(store).await?.values().map(|r| r.pruned_seq).max().unwrap_or(0))
+}
+
+/// What retention needs from the cluster.
+pub struct Membership {
+    /// Log ids of live nodes (ours included).
+    pub live_logs: Box<dyn Fn() -> HashSet<String> + Send + Sync>,
+    /// Whether this node prunes dead logs (owns the lowest-numbered shard).
+    pub leader: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+/// Objects and bytes one pass deleted.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Pass {
+    pub objects: usize,
+    pub bytes: u64,
+}
+
+pub struct Retention {
+    store: Store,
+    log: Arc<NodeLog>,
+    cfg: Config,
+    members: Membership,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    pruned_seq: i64,
+    /// last report written
+    written: Option<Report>,
+    /// dead logs found fenced: log -> fence ordinal (permanent)
+    fenced: HashMap<String, u64>,
+    /// dead logs pruned down to their fence (and report deleted)
+    retired: HashSet<String>,
+}
+
+/// A log object's ordinal, from its path.
+fn ordinal_of(p: &Path) -> Option<u64> {
+    p.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse().ok())
+}
+
+impl Retention {
+    pub fn new(store: Store, log: Arc<NodeLog>, cfg: Config, members: Membership) -> Arc<Retention> {
+        Arc::new(Retention { store, log, cfg, members, state: Mutex::default() })
+    }
+
+    /// Runs a pass every `interval`, forever.
+    pub fn spawn(self: &Arc<Self>) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(me.cfg.interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // the first tick is immediate: skip it
+            loop {
+                tick.tick().await;
+                match me.pass().await {
+                    Ok(p) => {
+                        metrics::RETENTION_TICKS.with_label_values(&["ok"]).inc();
+                        if p.objects > 0 {
+                            tracing::info!(objects = p.objects, bytes = p.bytes, "log retention pass");
+                        }
+                    }
+                    Err(e) => {
+                        metrics::RETENTION_TICKS.with_label_values(&["error"]).inc();
+                        tracing::warn!("log retention pass failed: {e:#}");
+                    }
+                }
+            }
+        });
+    }
+
+    /// One pass: our own log, our report, then (as leader) dead logs.
+    pub async fn pass(&self) -> anyhow::Result<Pass> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::from_std(self.cfg.window)?;
+        let mut budget = self.cfg.max_deletes;
+        let mut pass = Pass::default();
+        let floor = self.log.sinks.replay_floor();
+        let durable = self.log.durable_ordinal.load(std::sync::atomic::Ordering::Acquire);
+        if durable != u64::MAX {
+            metrics::RETENTION_REPLAY_HOLD.set(durable.saturating_sub(floor) as i64);
+        }
+        let n = self.prune(&self.log.log_id, floor, cutoff, &mut budget, "own").await?;
+        pass.objects += n.objects;
+        pass.bytes += n.bytes;
+        self.publish().await?;
+        if budget > 0 && (self.members.leader)() {
+            let n = self.prune_dead(cutoff, &mut budget).await?;
+            pass.objects += n.objects;
+            pass.bytes += n.bytes;
+        }
+        Ok(pass)
+    }
+
+    /// Writes our report if it changed.
+    async fn publish(&self) -> anyhow::Result<()> {
+        let rep = Report { opened: self.log.sinks.opened(), pruned_seq: self.state.lock().pruned_seq };
+        if self.state.lock().written.as_ref() == Some(&rep) {
+            return Ok(());
+        }
+        let body = PutPayload::from(serde_json::to_vec(&rep)?);
+        self.store.raw.put(&report_path(&self.store, &self.log.log_id), body).await?;
+        metrics::RETENTION_PRUNED_SEQ.set(rep.pruned_seq);
+        self.state.lock().written = Some(rep);
+        Ok(())
+    }
+
+    /// Raises our published floor to `seq` (before deleting anything at or
+    /// below it, so a reader that checked the floor first never misses data
+    /// silently).
+    async fn raise_floor(&self, seq: i64) -> anyhow::Result<()> {
+        {
+            let mut st = self.state.lock();
+            if seq <= st.pruned_seq {
+                return Ok(());
+            }
+            st.pruned_seq = seq;
+        }
+        self.publish().await
+    }
+
+    /// Deletes `log_id`'s oldest segments: ordinals below `limit` last
+    /// modified before `cutoff`, at most `budget` of them.
+    async fn prune(&self, log_id: &str, limit: u64, cutoff: chrono::DateTime<chrono::Utc>, budget: &mut usize, kind: &str) -> anyhow::Result<Pass> {
+        let prefix = Path::from(format!("{}/log/{}", self.store.prefix, log_id));
+        let mut doomed: Vec<(u64, Path, u64)> = Vec::new();
+        {
+            // listings are in key order and ordinals zero-padded: oldest first
+            let mut list = self.store.raw.list(Some(&prefix));
+            while let Some(m) = list.next().await {
+                let m = m?;
+                let Some(ord) = ordinal_of(&m.location) else { continue };
+                if ord >= limit || m.last_modified >= cutoff || doomed.len() >= *budget {
+                    break;
+                }
+                doomed.push((ord, m.location, m.size));
+            }
+        }
+        let Some((last, ..)) = doomed.last() else { return Ok(Pass::default()) };
+        // Below a replay floor (or a fence) every object is a segment. One
+        // already gone was deleted by another node, which raised its own
+        // floor first.
+        if let nodelog::Head::Segment(h) = nodelog::read_head(&self.store, log_id, *last).await? {
+            self.raise_floor(h.last_seq).await?;
+        }
+        self.delete(doomed.into_iter().map(|(_, p, n)| (p, n)).collect(), budget, kind).await
+    }
+
+    async fn delete(&self, objs: Vec<(Path, u64)>, budget: &mut usize, kind: &str) -> anyhow::Result<Pass> {
+        let sizes: HashMap<Path, u64> = objs.iter().cloned().collect();
+        let paths = futures::stream::iter(objs.into_iter().map(|(p, _)| Ok(p))).boxed();
+        let mut pass = Pass::default();
+        let mut deleted = self.store.raw.delete_stream(paths);
+        while let Some(r) = deleted.next().await {
+            match r {
+                Ok(p) => {
+                    pass.objects += 1;
+                    pass.bytes += sizes.get(&p).copied().unwrap_or(0);
+                }
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        *budget = budget.saturating_sub(pass.objects);
+        metrics::RETENTION_DELETED_OBJECTS.with_label_values(&[kind]).inc_by(pass.objects as u64);
+        metrics::RETENTION_DELETED_BYTES.with_label_values(&[kind]).inc_by(pass.bytes);
+        Ok(pass)
+    }
+
+    /// Dead logs (no live node writes them): once fenced and fully applied by
+    /// their shards' successors, deletes their segments past the window,
+    /// then the garbage past the fence and their report. The fence stays.
+    async fn prune_dead(&self, cutoff: chrono::DateTime<chrono::Utc>, budget: &mut usize) -> anyhow::Result<Pass> {
+        let live = (self.members.live_logs)();
+        let logs = crate::backfill::list_logs(&self.store).await?;
+        let dead: Vec<String> = {
+            let st = self.state.lock();
+            logs.into_iter().filter(|l| !live.contains(l) && *l != *self.log.log_id && !st.retired.contains(l)).collect()
+        };
+        let mut pass = Pass::default();
+        let mut known: Option<Known> = None;
+        for x in dead {
+            if *budget == 0 {
+                break;
+            }
+            let cached = self.state.lock().fenced.get(&x).copied();
+            let fence = match cached {
+                Some(f) => f,
+                None => match nodelog::first_free(&self.store, &x).await? {
+                    // not fenced: its owner may be alive but unseen (joining),
+                    // or dead with its shards not taken yet
+                    (_, false) => continue,
+                    (f, true) => {
+                        self.state.lock().fenced.insert(x.clone(), f);
+                        f
+                    }
+                },
+            };
+            if known.is_none() {
+                known = Some((read_assignments(&self.store).await?, read_reports(&self.store).await?));
+            }
+            let (assigns, reports) = known.as_ref().unwrap();
+            if let Some(s) = needed_by(&x, assigns, reports) {
+                tracing::debug!(log = %x, shard = s, "dead log still needed for replay");
+                continue;
+            }
+            let n = self.prune(&x, fence, cutoff, budget, "dead").await?;
+            pass.objects += n.objects;
+            pass.bytes += n.bytes;
+            // everything below the fence gone: retire it
+            if crate::backfill::first_ordinal(&self.store, &x).await? == Some(fence) {
+                let n = self.retire(&x, fence, cutoff, budget).await?;
+                pass.objects += n.objects;
+                pass.bytes += n.bytes;
+            }
+        }
+        Ok(pass)
+    }
+
+    /// A dead log pruned down to its fence: deletes the garbage past the
+    /// fence (segments a crash left in flight, never read) and its report,
+    /// folding the report's floor into ours first.
+    async fn retire(&self, x: &str, fence: u64, cutoff: chrono::DateTime<chrono::Utc>, budget: &mut usize) -> anyhow::Result<Pass> {
+        let prefix = Path::from(format!("{}/log/{}", self.store.prefix, x));
+        let mut garbage = Vec::new();
+        let mut list = self.store.raw.list(Some(&prefix));
+        while let Some(m) = list.next().await {
+            let m = m?;
+            if ordinal_of(&m.location).is_some_and(|o| o > fence) {
+                if m.last_modified >= cutoff {
+                    return Ok(Pass::default());
+                }
+                garbage.push((m.location, m.size));
+            }
+        }
+        drop(list);
+        let pass = self.delete(garbage, budget, "dead").await?;
+        match self.store.raw.get(&report_path(&self.store, x)).await {
+            Ok(r) => {
+                let rep: Report = serde_json::from_slice(&r.bytes().await?)?;
+                self.raise_floor(rep.pruned_seq).await?;
+                self.store.raw.delete(&report_path(&self.store, x)).await?;
+            }
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(e.into()),
+        }
+        tracing::info!(log = x, fence, "dead log retired (pruned to its fence)");
+        self.state.lock().retired.insert(x.to_string());
+        Ok(pass)
+    }
+}
+
+/// Assignments (index = shard) and every log's report.
+type Known = (Vec<Option<Assignment>>, HashMap<String, Report>);
+
+/// Every shard assignment (index = shard).
+async fn read_assignments(store: &Store) -> anyhow::Result<Vec<Option<Assignment>>> {
+    let prefix = Path::from(format!("{}/assign", store.prefix));
+    let names: Vec<u16> = store
+        .raw
+        .list(Some(&prefix))
+        .filter_map(|m| async move { m.ok().and_then(|m| m.location.filename().and_then(|f| f.parse::<u16>().ok())) })
+        .collect()
+        .await;
+    let n = names.iter().copied().max().map_or(0, |m| m as usize + 1);
+    let mut out = vec![None; n];
+    let got: Vec<anyhow::Result<(u16, Option<Assignment>)>> = futures::stream::iter(names)
+        .map(|s| async move {
+            match store.raw.get(&Path::from(format!("{}/assign/{s:03}", store.prefix))).await {
+                Ok(r) => Ok((s, Some(serde_json::from_slice(&r.bytes().await?)?))),
+                Err(object_store::Error::NotFound { .. }) => Ok((s, None)),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .buffer_unordered(32)
+        .collect()
+        .await;
+    for r in got {
+        let (s, a) = r?;
+        out[s as usize] = a;
+    }
+    Ok(out)
+}
+
+/// A shard whose replay may still read dead log `x`: its history has a span
+/// in `x`, and no later owner (higher epoch) has reported opening it. An
+/// open replays and flushes every earlier span, and durable markers only
+/// move forward, so once that is reported `x` is never read for the shard.
+fn needed_by(x: &str, assigns: &[Option<Assignment>], reports: &HashMap<String, Report>) -> Option<u16> {
+    for (s, a) in assigns.iter().enumerate() {
+        let Some(a) = a else { continue };
+        let Some(last) = a.history.iter().filter(|sp| sp.log_id == x).map(|sp| sp.epoch).max() else { continue };
+        let s = s as u16;
+        if !reports.values().any(|r| r.opened.get(&s).is_some_and(|&e| e > last)) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Parses a duration like `72h`, `30m`, `90s`, `3d` or `500ms` (a bare
+/// number is seconds).
+pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
+    let s = s.trim();
+    let split = s.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let v: f64 = num.parse().map_err(|_| anyhow::anyhow!("bad duration {s:?}"))?;
+    let secs = match unit {
+        "" | "s" => v,
+        "ms" => v / 1000.0,
+        "m" => v * 60.0,
+        "h" => v * 3600.0,
+        "d" => v * 86400.0,
+        _ => anyhow::bail!("bad duration unit in {s:?} (ms, s, m, h, d)"),
+    };
+    anyhow::ensure!(secs.is_finite() && secs >= 0.0, "bad duration {s:?}");
+    Ok(Duration::from_secs_f64(secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nodelog::{segment_path, NodeLogConfig, ShardSink, Span};
+    use crate::segment::{fence_object, Mutation, SegmentBuilder};
+    use bytes::Bytes;
+
+    #[test]
+    fn durations() {
+        assert_eq!(parse_duration("72h").unwrap(), Duration::from_secs(72 * 3600));
+        assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("1.5m").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
+        assert_eq!(parse_duration("3d").unwrap(), Duration::from_secs(3 * 86400));
+        assert!(parse_duration("3w").is_err() && parse_duration("h").is_err());
+    }
+
+    /// A one-entry segment sealed with `prefix_end`.
+    async fn put_seg(store: &Store, log: &str, ord: u64, prefix_end: u64, shard: u16, epoch: u64, seq: i64) {
+        let mut b = SegmentBuilder::new();
+        let m = Mutation { key: Bytes::from(format!("{log}/{ord}")), val: Some(Bytes::from_static(b"v")) };
+        b.push(seq, shard, epoch, |o| o.extend_from_slice(b"frame"), &[m]);
+        let mut obj = b.sealed_header(log, ord, prefix_end);
+        obj.extend_from_slice(&b.body);
+        store.raw.put(&segment_path(store, log, ord), PutPayload::from(obj)).await.unwrap();
+    }
+
+    async fn ordinals(store: &Store, log: &str) -> Vec<u64> {
+        let prefix = Path::from(format!("{}/log/{log}", store.prefix));
+        store.raw.list(Some(&prefix)).filter_map(|m| async move { ordinal_of(&m.unwrap().location) }).collect().await
+    }
+
+    fn members(live: &[&str], leader: bool) -> Membership {
+        let live: HashSet<String> = live.iter().map(|s| s.to_string()).collect();
+        Membership { live_logs: Box::new(move || live.clone()), leader: Box::new(move || leader) }
+    }
+
+    fn cfg(window: Duration) -> Config {
+        Config { window, interval: Duration::from_secs(3600), max_deletes: 1000 }
+    }
+
+    async fn put_assign(store: &Store, shard: u16, history: Vec<Span>) {
+        let a = Assignment { epoch: history.last().map_or(0, |s| s.epoch), history, ..Default::default() };
+        store.raw.put(&Path::from(format!("{}/assign/{shard:03}", store.prefix)), PutPayload::from(serde_json::to_vec(&a).unwrap())).await.unwrap();
+    }
+
+    /// Our own log: nothing young, nothing a crash replay could need, and
+    /// never the last durable segment; the floor is published first.
+    #[tokio::test]
+    async fn own_log_respects_window_and_replay_floor() {
+        let store = Store::memory(None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ncfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(10), lease_ok: None };
+        let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
+        let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, 3, None).await.unwrap());
+        log.sinks.insert(Arc::new(ShardSink { id: 3, epoch: 7, db, apply_lock: Default::default() }));
+        let send = |i: usize| {
+            let log = log.clone();
+            async move {
+                let (atx, arx) = tokio::sync::oneshot::channel();
+                let e = nodelog::LogEntry {
+                    shard: 3,
+                    frames: vec![crate::events::Frame { prefix: format!("e{i}").into_bytes(), suffix: Vec::new(), derived_muts: 0 }],
+                    muts: vec![Mutation { key: Bytes::from(format!("k{i}")), val: Some(Bytes::from_static(b"v")) }],
+                    ack: Some(Box::new(move |r| {
+                        let _ = atx.send(r.is_ok());
+                    })),
+                    pending: None,
+                    enqueued: std::time::Instant::now(),
+                };
+                log.tx.send(e).await.ok().unwrap();
+                assert!(arx.await.unwrap());
+            }
+        };
+        for i in 0..6 {
+            send(i).await;
+        }
+        assert_eq!(ordinals(&store, "L").await, (0..6).collect::<Vec<_>>());
+        let r = Retention::new(store.clone(), log.clone(), cfg(Duration::ZERO), members(&["L"], true));
+        // no checkpoint yet: the shard's insert floor (0) holds everything
+        assert_eq!(r.pass().await.unwrap(), Pass::default());
+        log.checkpoint_all().await; // marker (L, 5) durable: replay starts at 6
+        let p = r.pass().await.unwrap();
+        assert_eq!(p.objects, 5, "everything but the last durable segment");
+        assert_eq!(ordinals(&store, "L").await, vec![5]);
+        assert!(p.bytes > 0);
+        // the floor went out before the deletes, and fencing still finds the end
+        let floor = retained_floor(&store).await.unwrap();
+        let nodelog::Head::Segment(h5) = nodelog::read_head(&store, "L", 5).await.unwrap() else { panic!() };
+        assert!(floor > 0 && floor < h5.first_seq, "floor {floor} = last seq of segment 4");
+        assert_eq!(nodelog::first_free(&store, "L").await.unwrap(), (6, false));
+        assert_eq!(r.state.lock().written.as_ref().unwrap().opened.get(&3), Some(&7));
+        // the window holds young segments regardless
+        send(6).await;
+        send(7).await;
+        log.checkpoint_all().await;
+        let r2 = Retention::new(store.clone(), log.clone(), cfg(Duration::from_secs(3600)), members(&["L"], true));
+        assert_eq!(r2.pass().await.unwrap(), Pass::default());
+        // a closed shard holds the floor for a grace period
+        log.sinks.remove(3);
+        assert_eq!(log.sinks.replay_floor(), 7);
+    }
+
+    /// A checkpoint below the insert floor would be ambiguous (it can name
+    /// the end of an earlier span of this log): it is skipped.
+    #[tokio::test]
+    async fn checkpoint_skips_markers_below_the_insert_floor() {
+        let store = Store::memory(None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ncfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(10), lease_ok: None };
+        let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
+        log.durable_ordinal.store(4, std::sync::atomic::Ordering::Release); // as if 0..=4 were durable
+        let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, 1, None).await.unwrap());
+        log.sinks.insert(Arc::new(ShardSink { id: 1, epoch: 2, db: db.clone(), apply_lock: Default::default() }));
+        log.checkpoint_all().await;
+        assert!(db.get(nodelog::META_APPLIED).await.unwrap().is_none(), "no marker at 4 < insert floor 5");
+        assert_eq!(log.sinks.replay_floor(), 4, "capped at the last durable segment");
+        log.durable_ordinal.store(5, std::sync::atomic::Ordering::Release);
+        log.checkpoint_all().await;
+        assert_eq!(nodelog::decode_marker(&db.get(nodelog::META_APPLIED).await.unwrap().unwrap()), Some(("L".into(), 5)));
+        assert_eq!(log.sinks.replay_floor(), 5);
+    }
+
+    /// A dead log: kept while unfenced or while a shard with a span in it has
+    /// no later opener; then pruned to its fence (garbage past the fence and
+    /// its report deleted, its floor folded into ours); and replay over the
+    /// pruned head reads nothing it doesn't need.
+    #[tokio::test]
+    async fn dead_log_pruned_after_successors_open() {
+        let store = Store::memory(None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ncfg = NodeLogConfig { log_id: "B".into(), writer: 2, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(10), lease_ok: None };
+        let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
+        // dead log D: shard 0 (epoch 1) in 0..4, a crash hole at 4, garbage at 5
+        for ord in 0..4 {
+            put_seg(&store, "D", ord, ord, 0, 1, 100 + ord as i64).await;
+        }
+        put_seg(&store, "D", 5, 4, 0, 1, 105).await; // sealed while 4 was in flight
+        let rep = Report { opened: [(0, 1)].into(), pruned_seq: 42 };
+        store.raw.put(&report_path(&store, "D"), PutPayload::from(serde_json::to_vec(&rep).unwrap())).await.unwrap();
+        put_assign(&store, 0, vec![Span { log_id: "D".into(), epoch: 1, start: 0, end: Some(4) }, Span { log_id: "B".into(), epoch: 2, start: 0, end: None }]).await;
+        let r = Retention::new(store.clone(), log.clone(), cfg(Duration::ZERO), members(&["B"], true));
+        assert_eq!(r.pass().await.unwrap(), Pass::default(), "not fenced: left alone");
+        store.raw.put(&segment_path(&store, "D", 4), PutPayload::from_bytes(fence_object("B"))).await.unwrap();
+        assert_eq!(r.pass().await.unwrap(), Pass::default(), "fenced, but B hasn't opened shard 0 yet");
+        assert_eq!(ordinals(&store, "D").await, vec![0, 1, 2, 3, 4, 5]);
+        // not the leader: never touches dead logs
+        let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, 0, None).await.unwrap());
+        log.sinks.insert(Arc::new(ShardSink { id: 0, epoch: 2, db: db.clone(), apply_lock: Default::default() }));
+        let follower = Retention::new(store.clone(), log.clone(), cfg(Duration::ZERO), members(&["B"], false));
+        assert_eq!(follower.pass().await.unwrap(), Pass::default());
+        let p = r.pass().await.unwrap();
+        assert_eq!(p.objects, 5, "segments 0..4 and the garbage at 5");
+        assert_eq!(ordinals(&store, "D").await, vec![4], "the fence stays");
+        assert!(!read_reports(&store).await.unwrap().contains_key("D"), "its report is gone");
+        assert!(retained_floor(&store).await.unwrap() >= 103, "the deleted seqs are covered");
+        assert!(r.state.lock().pruned_seq >= 103);
+        // a fence-only log still fences at the same place, and a replay of
+        // its (applied) span reads nothing and doesn't fail
+        assert_eq!(nodelog::first_free(&store, "D").await.unwrap(), (4, true));
+        let history = vec![Span { log_id: "D".into(), epoch: 1, start: 0, end: Some(4) }];
+        assert_eq!(nodelog::replay_shard(&store, 0, &db, &history).await.unwrap(), 0);
+        assert_eq!(r.pass().await.unwrap(), Pass::default(), "retired");
+    }
+
+    #[test]
+    fn needed_by_requires_a_later_opener() {
+        let sp = |log: &str, epoch| Span { log_id: log.into(), epoch, start: 0, end: None };
+        let a = |h: Vec<Span>| Some(Assignment { history: h, ..Default::default() });
+        let assigns = vec![a(vec![sp("X", 1), sp("Y", 2)]), a(vec![sp("Y", 3)]), None, a(vec![sp("X", 4), sp("Z", 5), sp("X", 6)])];
+        let mut reports = HashMap::new();
+        reports.insert("Y".to_string(), Report { opened: [(0, 2)].into(), pruned_seq: 0 });
+        assert_eq!(needed_by("X", &assigns, &reports), Some(3), "X holds shard 3's last span");
+        reports.insert("Z".to_string(), Report { opened: [(3, 5)].into(), pruned_seq: 0 });
+        assert_eq!(needed_by("X", &assigns, &reports), Some(3), "Z opened it before X's second span");
+        reports.insert("W".to_string(), Report { opened: [(3, 7)].into(), pruned_seq: 0 });
+        assert_eq!(needed_by("X", &assigns, &reports), None);
+        assert_eq!(needed_by("Q", &assigns, &HashMap::new()), None);
+    }
+}

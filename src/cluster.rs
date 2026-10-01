@@ -473,8 +473,12 @@ impl Cluster {
         while ord > 0 {
             ord -= 1;
             self.count("get");
-            if let crate::nodelog::Head::Segment(h) = crate::nodelog::read_head(&self.store, log_id, ord).await? {
-                return Ok(h.last_seq);
+            match crate::nodelog::read_head(&self.store, log_id, ord).await? {
+                crate::nodelog::Head::Segment(h) => return Ok(h.last_seq),
+                // below a fence only retention removes segments, and only
+                // ones past its window: their seqs are long behind any clock
+                crate::nodelog::Head::Missing => break,
+                crate::nodelog::Head::Fence => {}
             }
         }
         Ok(0)

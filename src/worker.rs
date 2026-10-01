@@ -140,7 +140,8 @@ pub enum AccountOp {
         identity_event: bool,
         account_event: bool,
     },
-    /// Replace the whole repo contents (importRepo / reset): new commit, #sync.
+    /// Replace the whole repo contents (importRepo / reset): new commit, #sync
+    /// (none while the account is deactivated: activation emits it).
     /// Records are (path, cid, bytes, blob refs).
     ReplaceRepo {
         records: Vec<(String, Cid, Bytes, Vec<Cid>)>,
@@ -193,6 +194,10 @@ pub enum WorkerMsg {
         did: Arc<str>,
         res: anyhow::Result<Option<RepoState>>,
     },
+    /// The last [`Workers`] handle is gone: finish the batch and exit (each
+    /// worker holds a sender to its own channel for `Loaded`, so the channel
+    /// alone never disconnects).
+    Shutdown,
 }
 
 /// The repo as of its latest *durable* commit: what exports and proofs serve.
@@ -244,7 +249,25 @@ fn new_view(head: &Head, tree: &Tree, nodes: &crate::mst::SharedNodeIndex) -> Vi
 
 #[derive(Clone)]
 pub struct Workers {
-    pub senders: Arc<Vec<Sender<WorkerMsg>>>,
+    pub senders: Arc<WorkerSenders>,
+}
+
+/// The workers' channels. Dropping the last handle stops the threads.
+pub struct WorkerSenders(Vec<Sender<WorkerMsg>>);
+
+impl std::ops::Deref for WorkerSenders {
+    type Target = Vec<Sender<WorkerMsg>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for WorkerSenders {
+    fn drop(&mut self) {
+        for tx in &self.0 {
+            let _ = tx.send(WorkerMsg::Shutdown);
+        }
+    }
 }
 
 impl Workers {
@@ -279,7 +302,7 @@ pub fn spawn(
             .unwrap();
     }
     Workers {
-        senders: Arc::new(senders),
+        senders: Arc::new(WorkerSenders(senders)),
     }
 }
 
@@ -297,6 +320,8 @@ struct Worker {
     /// the next commit on a durable head that lacks them: a fork.
     draining: HashMap<Arc<str>, RepoState>,
     clock_id: u64,
+    /// Got [`WorkerMsg::Shutdown`]: exit after this batch.
+    stop: bool,
 }
 
 impl Worker {
@@ -317,6 +342,7 @@ impl Worker {
             loading: HashMap::new(),
             draining: HashMap::new(),
             clock_id: rand::random::<u64>() & 0x3ff,
+            stop: false,
         }
     }
 
@@ -401,6 +427,9 @@ impl Worker {
             metrics::CACHED_REPOS
                 .with_label_values(&[&self.label])
                 .set(self.cache.len() as i64);
+            if self.stop {
+                break;
+            }
         }
     }
 
@@ -458,6 +487,7 @@ impl Worker {
                         }
                     }
                     WorkerMsg::CreateRepo(req) => self.create_repo(req),
+                    WorkerMsg::Shutdown => self.stop = true,
                     WorkerMsg::DropPartition(p, done) => {
                         let drop: Vec<Arc<str>> = self
                             .cache
@@ -557,6 +587,13 @@ impl Worker {
     }
 
     fn create_repo(&mut self, req: CreateRepoReq) {
+        // a deleted repo's cached state doesn't block its DID coming back
+        // (migration in), once nothing of it is in flight
+        if self.cache.peek(&req.did).is_some_and(|st| {
+            st.account.status.as_deref() == Some("deleted") && st.pending.load(Ordering::Acquire) == 0
+        }) {
+            self.cache.pop(&req.did);
+        }
         if self.cache.contains(&req.did) || self.loading.contains_key(&req.did) {
             let _ = req
                 .reply
@@ -595,11 +632,24 @@ impl Worker {
         let mut car_bytes = Vec::with_capacity(commit_block.len() + 128);
         car::write_header(&mut car_bytes, &commit);
         car::write_block(&mut car_bytes, &commit, &commit_block);
-        let frames = vec![
-            events::identity_frame(&req.did, &req.handle, &time),
-            events::account_frame(&req.did, true, None, &time),
-            events::sync_frame(&req.did, &rev.to_string(), &car_bytes, &time),
-        ];
+        let account: state::Account = match serde_json::from_slice(&req.account_json) {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = req.reply.send(Err(WriteError::Internal(format!("bad account json: {e}"))));
+                return;
+            }
+        };
+        // An account created inactive (migration in) is announced only when
+        // activated (reference createAccount: no events when deactivated).
+        let frames = if account.status.is_some() {
+            Vec::new()
+        } else {
+            vec![
+                events::identity_frame(&req.did, &req.handle, &time),
+                events::account_frame(&req.did, true, None, &time),
+                events::sync_frame(&req.did, &rev.to_string(), &car_bytes, &time),
+            ]
+        };
         let mut muts = Vec::with_capacity(3 + req.records.len());
         let mut colls = HashSet::new();
         for (path, cid, bytes) in &req.records {
@@ -647,13 +697,6 @@ impl Worker {
             })),
             pending: Some(pending.clone()),
             enqueued: Instant::now(),
-        };
-        let account: state::Account = match serde_json::from_slice(&req.account_json) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::error!("bad account json: {e}");
-                return;
-            }
         };
         let mut collections = HashMap::new();
         for (path, _, _) in &req.records {
@@ -1047,6 +1090,10 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
     for (c, b) in &mst_blocks {
         car::write_block(&mut car_bytes, c, b);
     }
+    // `muts` gets what replay can rebuild from the #commit frame (record CID
+    // index keys, records, head: segment::derive_commit_muts), `extra` the
+    // rest (collection index, blob refs); the segment stores only `extra`
+    let mut extra = Vec::new();
     let mut written: HashSet<Cid> = HashSet::new();
     for (path, (prev, new)) in &batch.ops {
         if prev == new {
@@ -1067,7 +1114,7 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
             prev.is_some(),
             new.is_some(),
             batch.blobs.get(path.as_str()),
-            &mut muts,
+            &mut extra,
         );
         let key = Bytes::from(state::record_key(&st.did, path));
         if let Some(p) = prev {
@@ -1100,9 +1147,11 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
         key: state::head_key(&st.did).into(),
         val: Some(head.encode()),
     });
+    let derived = muts.len();
+    muts.append(&mut extra);
 
     let time = events::now_rfc3339();
-    let frame = events::commit_frame(&events::CommitFrame {
+    let mut frame = events::commit_frame(&events::CommitFrame {
         repo: &st.did,
         rev: &rev_s,
         since: Some(&since_s),
@@ -1112,6 +1161,17 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
         ops: &ops,
         time: &time,
     });
+    frame.derived_muts = derived;
+    #[cfg(debug_assertions)]
+    {
+        let mut f = Vec::new();
+        frame.finish(0, &mut f);
+        let d = crate::segment::derive_commit_muts(&f).expect("derive commit muts");
+        assert!(
+            d.len() == derived && d.iter().zip(&muts).all(|(a, b)| a.key == b.key && a.val == b.val),
+            "muts derived from the #commit frame differ from the commit's"
+        );
+    }
     STATS.commits.fetch_add(1, Ordering::Relaxed);
     STATS.ops.fetch_add(ops.len() as u64, Ordering::Relaxed);
     metrics::COMMITS.inc();
@@ -1388,15 +1448,19 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
             }
             let data = tree.root_cid()?;
             let (commit, commit_block) = sign_commit(&st.did, &rev.to_string(), &data, &st.key);
-            let mut car_bytes = Vec::with_capacity(commit_block.len() + 64);
-            car::write_header(&mut car_bytes, &commit);
-            car::write_block(&mut car_bytes, &commit, &commit_block);
-            frames.push(events::sync_frame(
-                &st.did,
-                &rev.to_string(),
-                &car_bytes,
-                &time,
-            ));
+            // a deactivated account (mid-migration) is announced with #sync
+            // when activated (reference importRepo sequences nothing)
+            if st.account.status.is_none() {
+                let mut car_bytes = Vec::with_capacity(commit_block.len() + 64);
+                car::write_header(&mut car_bytes, &commit);
+                car::write_block(&mut car_bytes, &commit, &commit_block);
+                frames.push(events::sync_frame(
+                    &st.did,
+                    &rev.to_string(),
+                    &car_bytes,
+                    &time,
+                ));
+            }
             st.tree = tree;
             st.head = Head {
                 commit,
@@ -1531,5 +1595,20 @@ mod tests {
         // now it reloads (from a state that never got the commits applied here)
         let r = tokio::time::timeout(Duration::from_secs(5), third).await.unwrap().unwrap();
         assert!(r.is_err());
+    }
+
+    /// Dropping the last `Workers` handle ends the threads (each holds a
+    /// sender to its own channel, so disconnection alone never would).
+    #[tokio::test]
+    async fn workers_exit_when_dropped() {
+        let workers = spawn(2, 10, Arc::new(|_: &str| None), tokio::runtime::Handle::current());
+        let probes: Vec<_> = workers.senders.iter().cloned().collect();
+        drop(workers);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // a worker's receiver is dropped when its thread returns
+        while probes.iter().any(|p| p.send(WorkerMsg::Shutdown).is_ok()) {
+            assert!(Instant::now() < deadline, "repo workers still running");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }

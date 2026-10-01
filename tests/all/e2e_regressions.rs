@@ -288,22 +288,20 @@ async fn admin_account_calls_reach_the_owner() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unowned_shard_is_unavailable_not_missing() {
     let store = Arc::new(object_store::memory::InMemory::new());
+    // A alone, so once it shuts down nothing owns its shards: the window is
+    // deterministic instead of racing a peer's (now sub-second) takeover.
     let a = node("e2e-un-a", &store).await;
-    let b = node("e2e-un-b", &store).await;
-    balanced(&[&a, &b]).await;
+    balanced(&[&a]).await;
     let acct = a.create_account("un").await;
     vlpds::server::shutdown(&a.app).await;
-    let mut unavailable = 0;
-    for _ in 0..20 {
+    for _ in 0..5 {
         let r = a.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", &acct.handle)], &Auth::None).await;
-        assert!(matches!(r.status, 200 | 503), "resolveHandle: {} {}", r.status, r.text());
+        assert_eq!(r.status, 503, "resolveHandle on an unowned shard: {}", r.text());
         let s = a.create_session(&acct.handle, &acct.password).await;
-        assert!(matches!(s.status, 200 | 503), "createSession: {} {}", s.status, s.text());
-        unavailable += (r.status == 503) as u32 + (s.status == 503) as u32;
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(s.status, 503, "createSession on an unowned shard: {}", s.text());
     }
-    assert!(unavailable > 0, "the released shards were never unowned here");
-    // the survivor takes them over and serves the account
+    // a new node takes them over and serves the account
+    let b = node("e2e-un-b", &store).await;
     for _ in 0..200 {
         let r = b.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", &acct.handle)], &Auth::None).await;
         if r.status == 200 {

@@ -224,7 +224,7 @@ struct UpdateHandleIn {
 /// control with `https://{handle}/.well-known/atproto-did`. In dev mode the
 /// external proof is skipped. (DNS TXT `_atproto` verification isn't
 /// implemented: no DNS resolver dependency.)
-async fn check_new_handle(app: &App, handle: &str, did: &str) -> XResult<()> {
+pub(super) async fn check_new_handle(app: &App, handle: &str, did: &str) -> XResult<()> {
     if !super::syntax::valid_handle(handle) {
         return Err(XrpcError::bad(
             "InvalidHandle",

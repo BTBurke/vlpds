@@ -7,7 +7,11 @@
 #     -e VLPDS_ADMIN_TOKEN=... -e VLPDS_INTERNAL_TOKEN=... vlpds:local
 #
 # Configuration is all VLPDS_* env vars (see `vlpds --help`). Prometheus
-# metrics are served at /metrics on the app port.
+# metrics are served at /metrics on the app port, or only on
+# VLPDS_METRICS_LISTEN (e.g. 0.0.0.0:9583) when set. Thread pools default to
+# the container's CPUs (cgroup quota aware): --io-threads = cores, --workers =
+# cores/2. vlpds raises its soft open-files limit to the hard limit at startup
+# (docker run --ulimit nofile=1048576:1048576 sets the hard limit).
 
 # --- web UI -----------------------------------------------------------------
 FROM node:22-bookworm-slim AS ui
@@ -33,6 +37,10 @@ COPY lexicons ./lexicons
 # the manifest declares the test binary; it is never built here
 RUN mkdir -p tests/all && touch tests/all/main.rs
 COPY --from=ui /src/ui/dist ./ui/dist
+# no debug info in the image (Cargo.toml keeps debug = 1 for local profiling;
+# with debug = 0 cargo also strips std's): ~half the image. Symbols stay, so
+# panics and backtraces still name functions.
+ENV CARGO_PROFILE_RELEASE_DEBUG=0
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \

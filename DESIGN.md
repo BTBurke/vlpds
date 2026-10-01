@@ -107,8 +107,8 @@ the repo head.
 - Segment format: concatenated length-prefixed firehose frames + footer index
   (seq → offset), so serving the firehose is a byte copy and cursor seeks are one
   range GET.
-- Retention: e.g. 72 h (firehose backfill window), never deleting past state's
-  durable `applied_seq`.
+- Retention: 72 h (firehose backfill window), never deleting what a replay
+  could need (see "Log retention" under HA).
 
 ### 4. Materialized state: SlateDB with its WAL disabled
 Why an LSM at all: state needs point reads (heads, `getRecord`), ordered range
@@ -135,6 +135,22 @@ swappable.
   - `meta/applied_seq`
 - Reads (`getRecord`, `listRecords`, `describeRepo`) → SlateDB (memtable → block
   cache → local disk cache → S3).
+- SST blocks (16 KiB) are zstd-compressed (`--sst-compression none|lz4|zstd`;
+  each SST records its codec). On a real repo's rows (43,649 records of one
+  user's repo, R/ values + c/ keys, ×8 repos): SSTs 131.5 MiB uncompressed,
+  68.0 MiB lz4 (1.9×), 52.4 MiB zstd (2.5×). Write + flush CPU +20 % (about
+  0.35 µs per row); cold scans and gets showed no difference above noise (the
+  block cache holds decoded blocks, so only misses decompress, and the local
+  disk cache holds 2.5× more).
+- Each shard's compactor (coordinator + one worker writing the same SST
+  format) starts after the DB opens rather than inside the open, so a
+  takeover or handback serves ~11 store round trips sooner. Its outputs
+  aren't written into the local disk cache (reads fill it).
+- SlateDB GC deletes SSTs compaction replaced once they are
+  `--slatedb-gc-min-age` old (24 h; SlateDB's default is 5 min). A long scan
+  (a 10M-record getRepo, listRepos) reads the SSTs of the manifest it started
+  with, so a day of compaction output is kept as garbage; it is linear in
+  the write rate, not cumulative.
 
 ### 5. Firehose
 - Live: after durability, a node's sealed segments go to a byte-bounded live ring
@@ -163,6 +179,34 @@ swappable.
 `uploadBlob` streams to `blob/{did}/{cid}` (multipart if large). This is off the
 commit hot path.
 
+- **References.** `b/{did}\0{cid}\0{record path}` rows, written with the
+  commit that adds or removes the reference.
+- **GC** (`blobs::sweep_blobs`, owned partitions only). A blob unreferenced
+  for longer than `--blob-gc-grace-secs` is moved to `blob-gc/{did}/{cid}`,
+  not deleted. A write checks that its blob exists before it is sequenced, so
+  a write that checked just before the move can apply its reference just
+  after it. After a settle time (60 s, or the grace period if shorter) the
+  references are checked again: if one appeared, the blob is moved back;
+  otherwise it is deleted. A write that checks after the move fails with
+  `BlobNotFound`, as it would for any missing blob.
+- **Aborted multipart uploads.** Large uploads go through a multipart upload
+  to `blob-tmp/{did}/{random}`. A failed upload is aborted. A completed temp
+  object left behind by a crash is deleted by the GC after 24 h. But the
+  parts of an upload whose process died mid-way are invisible to LIST, and
+  object_store can't list or configure them. So the bucket needs a lifecycle
+  rule that aborts incomplete multipart uploads. They are billed until then.
+  For S3:
+  ```json
+  {"Rules": [{"ID": "abort-incomplete-mpu", "Status": "Enabled",
+              "Filter": {"Prefix": ""},
+              "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 1}}]}
+  ```
+  Apply it with `aws s3api put-bucket-lifecycle-configuration --bucket B
+  --lifecycle-configuration file://rule.json`. MinIO needs no rule: it
+  aborts stale uploads itself (`api stale_uploads_expiry`, 24 h by
+  default). The rule only touches uploads that were
+  never completed, so an empty prefix (the whole bucket) is safe.
+
 ### 7. HTTP
 Every outbound client is built once in `src/http.rs`, per role, and shared
 (no per-request clients). No client follows redirects. New outbound
@@ -172,7 +216,8 @@ load it should stay flat (a rising rate means pool churn).
 | Role | Used for | Settings |
 |---|---|---|
 | peer | forwarding, internal calls | h2c prior knowledge; 4 MiB stream / 64 MiB conn windows; PING every 10 s (also idle), dead after 5 s; TCP keepalive 30 s; nodelay; connect 1 s; `--peer-connections` (default 4) connections per peer, round-robin |
-| public | AppView / report service proxy, PLC, requestCrawl | h2 by ALPN on https, HTTP/1.1 on http with 1,024 idle per host; idle close 60 s; h2 PING 20 s / 10 s; TCP keepalive; connect 5 s, read 30 s |
+| public | PLC, requestCrawl | h2 by ALPN on https, HTTP/1.1 on http with 1,024 idle per host; idle close 60 s; h2 PING 20 s / 10 s; TCP keepalive; connect 5 s, read 30 s |
+| proxy | configured AppView / report service | `http://`: hyper HTTP/1.1 connections in per-IO-thread pools (32 idle per thread, overflow to a shared pool of 1,024), idle close 60 s, retry once if a reused connection was closed before the request went out; `https://`: public's settings as one client per IO thread. No read timeout: the proxy arms a 10 s head deadline and a 30 s body-idle timer only while the upstream makes it wait |
 | guarded | user-derived URLs: did:web, handle `.well-known`, OAuth client metadata, lexicons, DID-doc service endpoints | public's settings, 32 idle per host, plus a resolver that drops non-public addresses (outside dev mode); pair with `check_outbound_url` |
 | S3 (object_store) | log and state stores (separate pools) | HTTP/1.1 only, 256 idle per host, idle close 15 s (S3 closes at ~20 s), connect 2 s, 30 s total |
 
@@ -183,7 +228,9 @@ connection black-holes forwards. Several connections per peer keep a single
 connection (and its driver task, and its 1,024-stream limit at the receiver)
 from being the bottleneck or the single point of failure. The AppView stays
 on pooled HTTP/1.1 over plaintext: one multiplexed h2c connection was slower
-(bench 2026-10-02 §6).
+(bench 2026-10-02 §6). The proxy's pools are per IO thread because a shared
+pool's mutex (taken at checkout and return) and the timers reqwest arms per
+read (tokio has one timer-wheel lock) were ~20% of the proxy's CPU.
 
 Server (`server::serve`, HTTP/1.1 + h2c auto): h1 header read timeout 30 s
 (slowloris; also the idle keep-alive bound), h2 windows as above, 1,024
@@ -275,9 +322,10 @@ the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
   failed release, not a handoff). Every other peer gets an empty nudge so
   its routing follows at once. Graceful shutdown first marks its lease
   `draining` (peers stop counting it toward fair shares or handing it
-  shards), then hands its shards out the same way. Release → serving is the joiner's SlateDB open (~22 sequential
-  store calls, ~450 ms at 20 ms per call; it was a step interval plus a
-  step plus the open, ~3 s at TTL 10 s).
+  shards), then hands its shards out the same way. Release → serving is the joiner's SlateDB open (~11 sequential
+  store calls, ~220 ms at 20 ms per call: the shard's compactor starts after
+  the open, which halved it from ~450 ms; it was a step interval plus a step
+  plus the open, ~3 s at TTL 10 s).
 - **Global firehose order with no global sequencer.**
   `seq = unix_micros × 256 + writer`, strictly increasing within a log. Each
   log carries a watermark (every event ≤ W is durable); every node k-way
@@ -346,6 +394,78 @@ acking any of it needs its own segment F durable first (acks are in order),
 and its PUT at F collides with the fence, so it fail-stops instead (exit 3). Its PUTs at F+1 … F+K−1 may still
 land, but nothing reads past F. Garbage is left in place; it's bounded by
 K − 1 segments per crash.
+
+### Log retention (`src/retention.rs`)
+
+Without it the logs grow forever (~3.5 KB per commit, a new prefix per node
+restart). A segment is deleted once **(a)** no replay can need it and **(b)**
+it is older than the backfill window (`--log-retention`, default 72 h, by the
+object's last-modified time). Each pass deletes at most 10,000 objects,
+oldest first (one paged LIST from the log's head, one batched DELETE), so
+storage is bounded by window × write rate plus a fence object per dead
+incarnation.
+
+*Who deletes.* A live log only by its owner. Dead logs (not a live lease's
+log) only by the owner of the lowest-numbered shard, and only once fenced.
+Deletes are idempotent: two nodes briefly both leading is harmless.
+
+*(a) for a live log L: the replay floor.* For each shard the log applies
+into, `nodelog::ShardSinks` keeps the lowest ordinal of L a crash replay
+could read: its *insert floor* (L's next ordinal when the shard was opened)
+until a checkpoint at or past the insert floor is durable (memtable
+flushed), then that ordinal + 1. The log's floor is the minimum over its
+shards (and shards closed in the last 2 min), capped at the last durable
+segment, which is always kept so `first_free` finds the end of the log.
+
+*(a) for a dead log X: successors opened every shard.* Each node publishes
+`retain/{log_id}`: the shards its log's owner opened, with epochs. X is
+deletable once, for every shard whose assignment history has a span in X,
+some report shows it opened at an epoch above X's last span for it.
+
+*Replay never reads a pruned range.* Replay of shard s starts at its durable
+marker m = (log, ord) and reads forward through the spans after it
+(`marker_span`, earliest span covering m). Three facts:
+
+1. *Markers are unambiguous and only move forward.* Markers come from the
+   finalizer and checkpoints (ordinals at or past the shard's insert floor,
+   which is at or past its span start; checkpoints below the insert floor
+   are skipped, since a marker at `start − 1` could name the end of an
+   earlier span of the same log, A → B → A, and replay would restart there),
+   the close barrier (a segment written after the open), and replay (an
+   ordinal inside the span it read). Each names a position inside the span
+   it was written for, and every later write names a later span or ordinal.
+2. *An open leaves nothing before its span to read.* `open_many` replays
+   every earlier span and flushes before it serves. Afterwards the durable
+   marker lies at or past the end of each earlier span (or, with nothing
+   read, the earlier spans hold nothing to read), so by fact 1 no later
+   replay of s reads a span from before an epoch it was opened at. That is
+   what a report certifies, and it stays true: a stale report is just
+   conservative.
+3. *A live floor is below every unapplied entry.* Under L, shard s has no
+   entries below its insert floor. Below a durable checkpoint everything is
+   applied, so replay starts past it. A released shard's marker is at its
+   span's end. So every ordinal of L below the floor is, for every shard
+   whose replay reaches L, either before its entries or already applied.
+
+Replay starts each log at its lowest stored object (`first_ordinal`), so a
+span start inside a pruned head (e.g. between a span's start and the
+shard's insert floor, which hold nothing of it) is skipped, not an error. A
+hole above the lowest object is still an error inside a closed span.
+
+*Fences stay.* A dead log is pruned down to its fence: the segments below it,
+the K − 1 garbage segments past it, and its report go. The fence stays,
+because it is what makes a zombie of that incarnation fail-stop whatever
+its clock says (a suspended VM waking days later). `first_free` on a
+fence-only log returns the fence, and `last_seq_before` treats a pruned
+predecessor as "long ago".
+
+*Readers.* Before deleting, the pruner raises its report's `pruned_seq` to
+the last seq it deletes: the *retained floor* (max over reports) bounds every
+deleted event. A cursor below it gets `#info OutdatedCursor` and continues
+from the floor (the protocol's "oldest available"). A reader that finds a
+segment missing below the log's lowest object was overtaken by retention
+(`backfill::Pruned`): it re-reads the floor and jumps with OutdatedCursor. A
+peer follower draining a dead log skips to the lowest object it finds.
 
 ### Liveness: observed lease changes on the observer's monotonic clock
 
@@ -586,7 +706,10 @@ proxy traffic and concurrently active repos).
 - **SlateDB state** sits on S3 Standard with each node's NVMe as the SST
   disk cache.
 - **Log retention** is ~72 h for firehose backfill: ~1.5 TB today, ~150 TB at
-  100×.
+  100× (`src/retention.rs`, "Log retention" above). Single-record commits
+  take ~2.3–3.3 KB of segment (repos of 300–500 records; the MST path nodes
+  in the CAR dominate): the record and head values aren't stored twice, they
+  are rebuilt from the commit's CAR at replay (`segment::derive_commit_muts`).
 
 ### Separate tiers
 - **Read/proxy tier**: stateless, behind the load balancer.

@@ -39,11 +39,33 @@ pub async fn list_logs(store: &Store) -> anyhow::Result<Vec<String>> {
     Ok(r.common_prefixes.iter().filter_map(|p| p.filename().map(String::from)).collect())
 }
 
+/// Retention deleted segments a reader was about to read (the reader is
+/// behind the retained floor: per the protocol it gets `OutdatedCursor` and
+/// continues from the oldest event still stored).
+#[derive(Debug, thiserror::Error)]
+#[error("log {log_id} was pruned past ordinal {ordinal} while being read")]
+pub struct Pruned {
+    pub log_id: String,
+    pub ordinal: u64,
+}
+
+/// A non-segment at `ordinal` that retention made: it is below the lowest
+/// object left in the log (a hole or a fence never is).
+async fn pruned_at(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result<Option<Pruned>> {
+    Ok(first_ordinal(store, log_id).await?.is_none_or(|f| f > ordinal).then(|| Pruned { log_id: log_id.to_string(), ordinal }))
+}
+
 /// First ordinal of `log_id` whose segment has events with seq > `after`
 /// (None if the log has nothing past it).
 async fn first_ordinal_after(store: &Store, log_id: &str, after: i64) -> anyhow::Result<Option<u64>> {
     let o = seek(store, log_id, after).await?;
-    Ok(seg_header(store, log_id, o).await?.map(|_| o))
+    if seg_header(store, log_id, o).await?.is_some() {
+        return Ok(Some(o));
+    }
+    match pruned_at(store, log_id, o).await? {
+        Some(p) => Err(p.into()),
+        None => Ok(None),
+    }
 }
 
 /// The lowest ordinal of `log_id` still in the store (None = no objects).
@@ -83,7 +105,10 @@ pub async fn seek(store: &Store, log_id: &str, after: i64) -> anyhow::Result<u64
     // the search saw o - 1 as a segment <= after
     match read_head(store, log_id, o - 1).await? {
         Head::Segment(h) => Ok(prefix_hole(store, &h, base).await?.unwrap_or(o)),
-        Head::Missing | Head::Fence => anyhow::bail!("log {log_id}: segment {} vanished", o - 1),
+        Head::Missing | Head::Fence => match pruned_at(store, log_id, o - 1).await? {
+            Some(p) => Err(p.into()),
+            None => anyhow::bail!("log {log_id}: segment {} vanished", o - 1),
+        },
     }
 }
 
@@ -287,7 +312,8 @@ struct LogCursor {
     log_id: Arc<str>,
     /// next ordinal to request
     next: u64,
-    ahead: VecDeque<Ahead>,
+    /// (ordinal, its GET)
+    ahead: VecDeque<(u64, Ahead)>,
     seg: Option<Arc<Seg>>,
     pos: usize,
     /// saw the end of the prefix: request nothing more
@@ -312,7 +338,7 @@ impl LogCursor {
         let avg = (self.read_bytes / self.reads.max(1)).max(1);
         while !self.end && self.ahead.len() < MAX_AHEAD && (self.ahead.is_empty() || (self.ahead.len() + 1) * avg <= budget) {
             let (r, log_id, ord) = (r.clone(), self.log_id.clone(), self.next);
-            self.ahead.push_back(Ahead(tokio::spawn(async move { r.cache.get(&r.store, &log_id, ord).await })));
+            self.ahead.push_back((ord, Ahead(tokio::spawn(async move { r.cache.get(&r.store, &log_id, ord).await }))));
             self.next += 1;
         }
     }
@@ -330,7 +356,7 @@ impl LogCursor {
             }
             self.seg = None;
             self.top_up(r, budget);
-            let Some(mut a) = self.ahead.pop_front() else { return Ok(None) };
+            let Some((ord, mut a)) = self.ahead.pop_front() else { return Ok(None) };
             match (&mut a.0).await?? {
                 Fetched::Seg(s) => {
                     self.reads += 1;
@@ -342,6 +368,10 @@ impl LogCursor {
                 Fetched::End => {
                     self.end = true;
                     self.ahead.clear(); // past the hole: never read
+                    // not the end of the log: retention deleted it under us
+                    if let Some(p) = pruned_at(&r.store, &self.log_id, ord).await? {
+                        return Err(p.into());
+                    }
                     return Ok(None);
                 }
             }

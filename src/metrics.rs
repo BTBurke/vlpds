@@ -79,6 +79,13 @@ lazy!(FIREHOSE_BACKFILL_EVENTS: IntCounter = register_int_counter!("vlpds_fireho
 lazy!(LOG_LIVE_BYTES: IntGauge = register_int_gauge!("vlpds_log_live_ring_bytes", "Segment bytes pinned by the node log's live ring (peer streams)"));
 lazy!(LOG_STREAM_LAGGED: IntCounter = register_int_counter!("vlpds_log_stream_lagged_total", "Peer log streams dropped for falling behind the live ring (they catch up from S3)"));
 
+// ---- log retention (retention.rs) ----
+lazy!(RETENTION_DELETED_OBJECTS: IntCounterVec = register_int_counter_vec!("vlpds_retention_deleted_objects_total", "Log objects deleted by retention, by log (own, dead)", &["log"]));
+lazy!(RETENTION_DELETED_BYTES: IntCounterVec = register_int_counter_vec!("vlpds_retention_deleted_bytes_total", "Log bytes deleted by retention, by log (own, dead)", &["log"]));
+lazy!(RETENTION_PRUNED_SEQ: IntGauge = register_int_gauge!("vlpds_retention_pruned_seq", "Highest seq this node has deleted from any log (older cursors get OutdatedCursor)"));
+lazy!(RETENTION_REPLAY_HOLD: IntGauge = register_int_gauge!("vlpds_retention_replay_hold_segments", "Segments of our log kept only because a crash replay could still need them (durable ordinal - replay floor)"));
+lazy!(RETENTION_TICKS: IntCounterVec = register_int_counter_vec!("vlpds_retention_ticks_total", "Retention passes by result", &["result"]));
+
 // ---- proxy ----
 lazy!(PROXY_CACHE: IntCounterVec = register_int_counter_vec!("vlpds_proxy_cache_total", "Proxy fast-path cache lookups", &["result"]));
 
@@ -294,6 +301,13 @@ pub fn with_slatedb_metrics<P: Into<slatedb::object_store::path::Path>>(
     #[cfg(feature = "slatedb-metrics")]
     let b = b.with_metrics_recorder(slatedb_bridge::RECORDER.clone());
     b
+}
+
+/// The SlateDB metrics bridge, for components built outside a `DbBuilder`
+/// (the deferred compactor in partition.rs).
+#[cfg(feature = "slatedb-metrics")]
+pub fn slatedb_recorder() -> std::sync::Arc<dyn slatedb_common::metrics::MetricsRecorder> {
+    slatedb_bridge::RECORDER.clone()
 }
 
 /// SlateDB's metrics recorder, bridged into the default registry as

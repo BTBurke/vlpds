@@ -7,6 +7,7 @@ use crate::firehose::Firehose;
 use crate::nodelog::{NodeLog, NodeLogConfig};
 use crate::store::{S3Config, Store};
 use crate::{auth, state, stats, worker, xrpc};
+use axum::response::IntoResponse;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +31,14 @@ pub struct Config {
     pub workers: usize,
     pub cache_per_worker: usize,
     pub max_segment_bytes: usize,
+    /// Segment PUTs in flight per node log (DESIGN.md "Pipelined segment PUTs").
+    pub log_inflight: usize,
+    /// Byte budget of the node log's live ring (sealed segments for peer
+    /// followers and the merger; a follower behind it catches up from S3).
+    pub live_ring_bytes: usize,
+    /// Byte budget of the firehose merger's per-log queues; a log over it is
+    /// read back from S3 instead.
+    pub firehose_merge_queue_bytes: usize,
     pub firehose_ring_bytes: usize,
     /// Threads of the process-wide firehose runtime that serves
     /// subscribeRepos connections (0 = serve them on the request runtime).
@@ -81,6 +90,12 @@ pub struct Config {
     /// one, so several in-process nodes form one cluster (tests; may be
     /// wrapped, e.g. in a `ThrottledStore` for object-store latency).
     pub memory_store: Option<Arc<dyn object_store::ObjectStore>>,
+    /// Serve /metrics and /debug/pprof on a separate listener (the binary's
+    /// `--metrics-listen`) and not on the app port. None = on the app port.
+    pub metrics_listen: Option<String>,
+    /// Log segment retention (src/retention.rs; `--log-retention`). None = keep
+    /// every segment forever.
+    pub log_retention: Option<crate::retention::Config>,
 }
 
 /// Well-known secrets: only accepted with `dev_mode` (see [`Config::check_secrets`]).
@@ -136,6 +151,9 @@ impl Default for Config {
             workers: 2,
             cache_per_worker: 10_000,
             max_segment_bytes: 8 << 20,
+            log_inflight: crate::nodelog::DEFAULT_LOG_INFLIGHT,
+            live_ring_bytes: crate::nodelog::DEFAULT_LIVE_RING_BYTES,
+            firehose_merge_queue_bytes: crate::firehose::DEFAULT_MERGE_QUEUE_BYTES,
             firehose_ring_bytes: 64 << 20,
             firehose_threads: 2,
             firehose_max_lag_bytes: crate::firehose::DEFAULT_MAX_LAG_BYTES,
@@ -159,6 +177,8 @@ impl Default for Config {
             rate_limit_bypass_key: None,
             resolve_lexicons: None,
             memory_store: None,
+            metrics_listen: None,
+            log_retention: Some(crate::retention::Config::default()),
         }
     }
 }
@@ -184,6 +204,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         backfill_cache_bytes: cfg.backfill_cache_bytes,
         runtime: (cfg.firehose_threads > 0).then(|| crate::firehose::runtime(cfg.firehose_threads)),
     });
+    firehose.set_max_queue_bytes(cfg.firehose_merge_queue_bytes.max(1));
     let (merger_tx, merger_rx) = tokio::sync::mpsc::unbounded_channel();
     let n = cfg.shards;
     let table = crate::partitions::PartitionTable::new(n);
@@ -196,7 +217,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let started = std::time::Instant::now();
     let cluster = Cluster::join(cc, state_store.clone()).await?;
     let lease = cluster.clone();
-    let log = NodeLog::start(
+    let log = NodeLog::start_with_inflight(
         store.clone(),
         NodeLogConfig {
             log_id: cluster.log_id.clone(),
@@ -205,8 +226,10 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
             hedge_after: cfg.hedge_after,
             lease_ok: Some(Arc::new(move || lease.lease_valid())),
         },
+        cfg.log_inflight,
         merger_tx.clone(),
     );
+    log.live.set_max_bytes(cfg.live_ring_bytes);
     firehose.set_source(&log.log_id, Some(crate::firehose::Source::Local(log.wm.clone())));
     *firehose.store.write() = Some(store.clone());
     {
@@ -251,6 +274,15 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     // above the new position; the ones below it would be lost).
     firehose.spawn_merger(merger_rx);
     cluster.spawn(host);
+    if let Some(rc) = cfg.log_retention.clone() {
+        let (c, l) = (cluster.clone(), cluster.clone());
+        let members = crate::retention::Membership {
+            live_logs: Box::new(move || c.peers().into_iter().map(|p| p.log_id).chain([c.log_id.clone()]).collect()),
+            // dead logs are pruned by the owner of the lowest-numbered shard
+            leader: Box::new(move || (0..n).find_map(|s| l.owner_of(s)).is_some_and(|(o, _)| o == l.cfg.node_id)),
+        };
+        crate::retention::Retention::new(store.clone(), log.clone(), rc, members).spawn();
+    }
     tracing::info!(
         node = %cluster.cfg.node_id, log = %cluster.log_id, writer = cluster.writer, shards = n,
         owned = cluster.owned().len(), elapsed_ms = started.elapsed().as_millis() as u64, "node ready"
@@ -303,13 +335,51 @@ pub async fn spawn(
 ) -> anyhow::Result<(Arc<xrpc::App>, std::net::SocketAddr)> {
     let app = build(cfg).await?;
     let addr = listener.local_addr()?;
-    let router = with_forwarding(&app, xrpc::router(app.clone()));
+    let router = router(&app);
     tokio::spawn(async move {
         if let Err(e) = serve(listener, router).await {
             tracing::error!("server exited: {e:#}");
         }
     });
+    if let Some(m) = &app.config.metrics_listen {
+        let l = tokio::net::TcpListener::bind(m).await?;
+        let r = metrics_router(&app);
+        tokio::spawn(async move {
+            if let Err(e) = serve(l, r).await {
+                tracing::error!("metrics server exited: {e:#}");
+            }
+        });
+    }
     Ok((app, addr))
+}
+
+/// Paths served only by [`metrics_router`] when `metrics_listen` is set.
+const METRICS_PATHS: [&str; 2] = ["/metrics", "/debug/pprof/"];
+
+/// The app port's router: XRPC, OAuth, web UI and /internal, with cluster
+/// forwarding; /metrics and /debug/pprof too unless `metrics_listen` moves
+/// them to [`metrics_router`].
+pub fn router(app: &Arc<xrpc::App>) -> axum::Router {
+    let r = with_forwarding(app, xrpc::router(app.clone()));
+    if app.config.metrics_listen.is_none() {
+        return r;
+    }
+    r.layer(axum::middleware::from_fn(|req: axum::extract::Request, next: axum::middleware::Next| async move {
+        let p = req.uri().path();
+        if METRICS_PATHS.iter().any(|m| p == *m || (m.ends_with('/') && p.starts_with(m))) {
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
+        next.run(req).await
+    }))
+}
+
+/// The `--metrics-listen` router: Prometheus /metrics, and the on-demand CPU
+/// profiler (/debug/pprof/profile, admin token; `--features profiling`).
+pub fn metrics_router(app: &Arc<xrpc::App>) -> axum::Router {
+    axum::Router::new()
+        .route("/metrics", axum::routing::get(|| async { crate::metrics::render() }))
+        .merge(crate::profiling::routes())
+        .with_state(app.clone())
 }
 
 /// HTTP/1.1 + HTTP/2 (h2c) server. axum::serve doesn't expose HTTP/2 settings,
@@ -498,5 +568,26 @@ mod tests {
         assert!(prod(&a, &"b".repeat(31), &c).check_secrets().is_err());
         let e = prod(&a, &b, &b).check_secrets().unwrap_err();
         assert!(e.to_string().contains("must differ"), "{e}");
+    }
+
+    /// `metrics_listen` moves /metrics and /debug/pprof off the app port.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_listen_splits_routes() {
+        use tower::ServiceExt;
+        let status = |r: axum::Router, path: &'static str| async move {
+            let req = axum::http::Request::get(path)
+                .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 1))))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            r.oneshot(req).await.unwrap().status().as_u16()
+        };
+        let app = build(Config::default()).await.unwrap();
+        assert_eq!(status(router(&app), "/metrics").await, 200, "default: on the app port");
+        let app = build(Config { metrics_listen: Some("127.0.0.1:0".into()), ..Config::default() }).await.unwrap();
+        assert_eq!(status(router(&app), "/metrics").await, 404);
+        assert_eq!(status(router(&app), "/debug/pprof/profile").await, 404);
+        assert_eq!(status(router(&app), "/xrpc/_health").await, 200);
+        assert_eq!(status(metrics_router(&app), "/metrics").await, 200);
+        assert_ne!(status(metrics_router(&app), "/debug/pprof/profile").await, 404);
     }
 }

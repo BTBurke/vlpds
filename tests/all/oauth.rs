@@ -1077,6 +1077,12 @@ async fn resource_dpop_checks() {
     let proof = key.proof_with("POST", &url, Some(&t.access), Some(&nonce));
     assert_eq!(send(Some(proof.clone())).await.unwrap().status(), 200);
     assert_eq!(send(Some(proof)).await.unwrap().status(), 401);
+    // resource-request claims live in the owner's memory only (no log write
+    // per request; HA notes in src/oauth/mod.rs)
+    let part = s.app.partition(&acct.did).ok().unwrap();
+    let prefix = vlpds::state::private_key(&acct.did, vlpds::oauth::util::REPLAY_ROW);
+    let mut rows = part.db.scan(prefix.clone()..vlpds::state::prefix_end(&prefix)).await.unwrap();
+    assert!(rows.next().await.unwrap().is_none(), "resource-request DPoP claim persisted");
     // stale iat
     let header = json!({"typ": "dpop+jwt", "alg": "ES256", "jwk": key.jwk()});
     let payload = json!({"jti": rand_str(8), "htm": "POST", "htu": url, "iat": now() - 3600, "nonce": nonce, "ath": b64(Sha256::digest(&t.access))});
@@ -2263,13 +2269,13 @@ async fn response_modes_form_post_and_fragment() {
     assert_eq!(r.status, 400, "{}", r.body);
 }
 
-/// prompt=create: no sign-up exists in the authorization UI, so it falls
-/// back to sign-in / account choice (the reference without user domains),
-/// still with consent for public clients.
+/// prompt=create: the sign-up page. Creating an account there signs it in
+/// on the device and continues to consent; the two pages link to each
+/// other; form errors keep the values entered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn prompt_create_falls_back_to_sign_in() {
+async fn prompt_create_signs_up() {
     let s = spawn().await;
-    let acct = create_account(&s, "creator").await;
+    let taken = create_account(&s, "taken").await;
     let m: J = s
         .http
         .get(format!("{}/.well-known/oauth-authorization-server", s.base))
@@ -2285,42 +2291,141 @@ async fn prompt_create_falls_back_to_sign_in() {
         .contains(&json!("create")));
     let key = DpopKey::new();
     let redirect = "http://127.0.0.1/callback";
-    let cid = loopback_client_id("atproto", redirect);
-    let mut f = Flow::new(&cid, redirect, "atproto", &key);
+    let cid = loopback_client_id("atproto transition:generic", redirect);
+    let mut f = Flow::new(&cid, redirect, "atproto transition:generic", &key);
     f.extra = vec![("prompt".into(), "create".into())];
     let mut b = Browser::default();
-    let par = f.par(&s, &pkce(), "c1").await;
+    let p = pkce();
+    let par = f.par(&s, &p, "c1").await;
     assert_eq!(par.status, 201, "{}", par.body);
     let ru = par.body["request_uri"].as_str().unwrap().to_string();
     let (st, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
     assert_eq!(st, 200);
-    assert!(
-        html.contains("name=\"password\""),
-        "sign-in expected: {html}"
-    );
-    // sign in, then the public client still gets the consent page
-    let (st, h, body) = browser_consent(&s, &mut b, &f, &acct, &ru, &[]).await;
-    assert_eq!(st, 303, "{body}");
-    assert!(location_params(&h).1.contains_key("code"));
+    assert!(html.contains("Create an account") && html.contains("name=\"email\""), "sign-up expected: {html}");
+    assert!(!html.contains("name=\"invite_code\""), "invites are optional here: {html}");
+    // the "Sign in" link shows the sign-in page, which links back
+    let link = |html: &str, screen: &str| {
+        let at = html.find(&format!("screen={screen}")).expect("screen link");
+        let start = html[..at].rfind("href=\"").unwrap() + 6;
+        format!("{}{}", s.base, html[start..at + 7 + screen.len()].replace("&amp;", "&"))
+    };
+    let (st, _, signin) = b.get(&s, &link(&html, "sign-in")).await;
+    assert_eq!(st, 200);
+    assert!(signin.contains("name=\"identifier\""), "{signin}");
+    let (_, _, html) = b.get(&s, &link(&signin, "sign-up")).await;
+    assert!(html.contains("name=\"email\""), "{html}");
 
-    // signed in on this device: the chooser, not straight to consent
+    // a taken handle: the form again, with the error and the values kept
+    let name = format!("new{}", rand::random::<u32>() % 100000);
+    let email = format!("{name}@example.com");
+    let taken_label = taken.handle.split('.').next().unwrap().to_string();
+    let csrf = csrf_of(&html);
+    let sign_up = |handle: &str, csrf: &str| {
+        vec![
+            ("request_uri".to_string(), ru.clone()),
+            ("csrf".to_string(), csrf.to_string()),
+            ("handle".to_string(), handle.to_string()),
+            ("email".to_string(), email.clone()),
+            ("password".to_string(), PASSWORD.to_string()),
+            ("action".to_string(), "sign-up".to_string()),
+        ]
+    };
+    let pairs = sign_up(&taken_label, &csrf);
+    let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-up", &pairs).await;
+    assert_eq!(st, 400, "{html}");
+    assert!(html.contains("Handle already taken") && html.contains(&email), "{html}");
+    // a CSRF token is required
+    let pairs = sign_up(&name, "bogus");
+    let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (st, _, _) = b.post(&s, "/oauth/authorize/sign-up", &pairs).await;
+    assert_eq!(st, 403);
+
+    // success: signed in on the device, then consent (public client)
+    let pairs = sign_up(&name, &csrf_of(&html));
+    let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-up", &pairs).await;
+    assert_eq!(st, 200, "{html}");
+    assert!(html.contains("Authorize access"), "consent expected: {html}");
+    let handle = format!("{name}.vlpds.test");
+    let did = hidden_field(&html, "did").expect("did on the consent form");
+    let (st, h, body) = b
+        .post(
+            &s,
+            "/oauth/authorize/consent",
+            &[("request_uri", &ru), ("csrf", &csrf_of(&html)), ("did", &did), ("action", "allow")],
+        )
+        .await;
+    assert_eq!(st, 303, "{body}");
+    let code = location_params(&h).1.get("code").expect("code").clone();
+    let t = tokens(&exchange(&s, &f, &code, &p, &[]).await);
+    let r = create_post(&s, &key, &t.access, &did, "app.bsky.feed.post").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    // a real account: the password works for createSession too
+    let r = s
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.createSession", s.base))
+        .json(&json!({"identifier": handle, "password": PASSWORD}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+
+    // the device now knows the account: a later prompt=create still offers
+    // sign-up, and the sign-in page offers it as well
     let par = f.par(&s, &pkce(), "c2").await;
     let ru = par.body["request_uri"].as_str().unwrap().to_string();
     let (_, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
-    assert!(html.contains("Choose an account"), "{html}");
-    // with a matching login_hint: sign-in pre-filled (no hint shortcut)...
-    f.extra.push(("login_hint".into(), acct.handle.clone()));
+    assert!(html.contains("name=\"email\""), "{html}");
+    f.extra.clear();
     let par = f.par(&s, &pkce(), "c3").await;
     let ru = par.body["request_uri"].as_str().unwrap().to_string();
-    let (_, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
-    assert!(html.contains("name=\"password\""), "{html}");
-    assert!(html.contains(&acct.handle), "{html}");
-    // ...whereas without prompt=create the hint goes to consent
-    f.extra.remove(0);
-    let par = f.par(&s, &pkce(), "c4").await;
+    let (_, _, html) = b.get(&s, &format!("{}&screen=sign-in", f.authorize_url(&s, &ru))).await;
+    assert!(html.contains("Create an account"), "{html}");
+}
+
+/// With invites required, the sign-up page asks for a code and enforces it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_up_page_with_required_invites() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let cfg = vlpds::server::Config { dev_mode: true, public_url: base.clone(), invite_required: true, ..Default::default() };
+    let (app, _) = vlpds::server::spawn(cfg, listener).await.unwrap();
+    let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let s = Srv { app, base, http };
+    let key = DpopKey::new();
+    let redirect = "http://127.0.0.1/callback";
+    let cid = loopback_client_id("atproto", redirect);
+    let mut f = Flow::new(&cid, redirect, "atproto", &key);
+    f.extra = vec![("prompt".into(), "create".into())];
+    let mut b = Browser::default();
+    let par = f.par(&s, &pkce(), "i1").await;
     let ru = par.body["request_uri"].as_str().unwrap().to_string();
     let (_, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
-    assert!(html.contains("Authorize access"), "{html}");
+    assert!(html.contains("name=\"invite_code\""), "{html}");
+    let name = format!("inv{}", rand::random::<u32>() % 100000);
+    let email = format!("{name}@example.com");
+    let post = |csrf: String, code: &'static str| {
+        vec![
+            ("request_uri".to_string(), ru.clone()),
+            ("csrf".to_string(), csrf),
+            ("handle".to_string(), name.clone()),
+            ("email".to_string(), email.clone()),
+            ("password".to_string(), PASSWORD.to_string()),
+            ("invite_code".to_string(), code.to_string()),
+            ("action".to_string(), "sign-up".to_string()),
+        ]
+    };
+    let pairs = post(csrf_of(&html), "");
+    let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-up", &pairs).await;
+    assert_eq!(st, 400, "{html}");
+    assert!(html.contains("No invite code provided"), "{html}");
+    let pairs = post(csrf_of(&html), "bogus-code");
+    let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-up", &pairs).await;
+    assert_eq!(st, 400, "{html}");
+    assert!(html.contains("invite code not available"), "{html}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2552,4 +2657,61 @@ async fn gc_work_is_bounded_per_tick() {
         }
     }
     assert_eq!(removed, 3);
+}
+
+/// Latency of DPoP-authenticated resource requests (the proof's replay
+/// claim is on this path):
+/// `cargo test --profile dev-release --test all oauth::bench_dpop_resource_requests -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn bench_dpop_resource_requests() {
+    // BENCH_INJECT_MS: segment PUT latency (S3-like), e.g. 25
+    let inject = std::env::var("BENCH_INJECT_MS").ok().and_then(|v| v.parse::<f64>().ok());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let cfg = vlpds::server::Config {
+        dev_mode: true,
+        public_url: base.clone(),
+        inject_latency: inject.map(|ms| (ms, 0.0)),
+        ..Default::default()
+    };
+    let (app, _) = vlpds::server::spawn(cfg, listener).await.unwrap();
+    let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let s = Srv { app, base, http };
+    let acct = create_account(&s, "benchy").await;
+    let key = DpopKey::new();
+    let redirect = "http://127.0.0.1/cb";
+    let cid = loopback_client_id("atproto transition:generic", redirect);
+    let f = Flow::new(&cid, redirect, "atproto transition:generic", &key);
+    let mut b = Browser::default();
+    let p = pkce();
+    let code = authorize_interactive(&s, &mut b, &f, &acct, &p).await;
+    let t = tokens(&exchange(&s, &f, &code, &p, &[]).await);
+    let nsid = "app.bsky.actor.getPreferences";
+    assert_eq!(xrpc_dpop(&s, &key, &t.access, "GET", nsid, None).await.status, 200);
+    let url = format!("{}/xrpc/{nsid}", s.base);
+    let n = if inject.is_some() { 200 } else { 2000 };
+    // proofs are signed up front: only the server's work is timed
+    let proofs: Vec<String> = (0..n).map(|_| key.proof("GET", &url, Some(&t.access))).collect();
+    let send = |proof: String| {
+        let rb = s.http.get(&url).header("authorization", format!("DPoP {}", t.access)).header("dpop", proof);
+        async move {
+            let r = rb.send().await.unwrap();
+            assert_eq!(r.status(), 200);
+            r.bytes().await.unwrap();
+        }
+    };
+    let t0 = std::time::Instant::now();
+    for p in proofs[..n / 2].iter().cloned() {
+        send(p).await;
+    }
+    let seq = t0.elapsed().as_secs_f64() * 1e6 / (n / 2) as f64;
+    let t0 = std::time::Instant::now();
+    use futures::StreamExt;
+    futures::stream::iter(proofs[n / 2..].iter().cloned().map(send))
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+    let par = t0.elapsed().as_secs_f64() * 1e6 / (n / 2) as f64;
+    println!("DPoP resource request: {seq:.0} us sequential, {par:.0} us/request at 16 in flight");
 }

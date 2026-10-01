@@ -91,6 +91,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/oauth/revoke", post(revoke).options(preflight))
         .route("/oauth/authorize", get(authorize))
         .route("/oauth/authorize/sign-in", post(authorize_sign_in))
+        .route("/oauth/authorize/sign-up", post(authorize_sign_up))
         .route("/oauth/authorize/select", post(authorize_select))
         .route("/oauth/authorize/consent", post(authorize_consent))
         .route("/oauth/account", get(account_page))
@@ -147,7 +148,9 @@ pub async fn route_key(
                 ou::parse_form(query.unwrap_or("")).into_iter().collect();
             request(q.get("request_uri"))
         }
-        "/oauth/authorize/select" | "/oauth/authorize/consent" => {
+        // sign-up mints the DID on the node that runs it; the request row's
+        // owner, like the steps after it
+        "/oauth/authorize/select" | "/oauth/authorize/consent" | "/oauth/authorize/sign-up" => {
             request(params().get("request_uri"))
         }
         // sign-in: the account's owner (its rate limits, 2FA lockout and
@@ -1261,6 +1264,12 @@ async fn authorize(
         .iter()
         .find(|(d, h)| !hint.is_empty() && hint_matches(&hint, d, h))
         .cloned();
+    // the sign-in <-> sign-up links between the two pages
+    match q.get("screen").map(String::as_str) {
+        Some("sign-up") => return signup_page(&app, &flow, &SignupValues::default(), None, StatusCode::OK),
+        Some("sign-in") => return login_page(&app, &flow, &hint, None, false, StatusCode::OK),
+        _ => {}
+    }
     match params.prompt.as_deref() {
         Some("none") => {
             let chosen = match (&hinted, accounts.len()) {
@@ -1290,14 +1299,8 @@ async fn authorize(
             }
         }
         Some("login") => login_page(&app, &flow, &hint, None, false, StatusCode::OK),
-        // prompt=create: there is no sign-up in the authorization UI (account
-        // creation is createAccount only), so this behaves like the
-        // reference without available user domains: the sign-in / account
-        // chooser, without the login_hint shortcut to consent.
-        Some("create") if hint.is_empty() && !accounts.is_empty() => {
-            chooser_page(&app, &flow, &accounts)
-        }
-        Some("create") => login_page(&app, &flow, &hint, None, false, StatusCode::OK),
+        // prompt=create: the sign-up page (which links to sign-in)
+        Some("create") => signup_page(&app, &flow, &SignupValues::default(), None, StatusCode::OK),
         Some("select_account") if !accounts.is_empty() => chooser_page(&app, &flow, &accounts),
         _ => {
             if let Some((did, _)) = hinted {
@@ -1561,6 +1564,83 @@ async fn authorize_sign_in(State(app): AppState, headers: HeaderMap, body: AxByt
             &e.description,
         ),
     }
+}
+
+/// What the sign-up form keeps when it is shown again after an error.
+#[derive(Default)]
+struct SignupValues {
+    handle: String,
+    email: String,
+    invite_code: String,
+}
+
+fn signup_page(app: &App, flow: &Flow, v: &SignupValues, error: Option<&str>, status: StatusCode) -> Response {
+    let csrf = flow.csrf(app);
+    let name = server_name(app);
+    let body = ui::signup(
+        &flow.ctx(&csrf, &name),
+        &ui::SignupForm {
+            handle: &v.handle,
+            domain: &app.handle_domain,
+            email: &v.email,
+            invite_code: &v.invite_code,
+            invite_required: app.config.invite_required,
+            error,
+        },
+    );
+    let mut r = flow.page(app, body);
+    *r.status_mut() = status;
+    r
+}
+
+/// The sign-up form: creates the account (as createAccount does, without a
+/// legacy session), signs it in on this device and continues to consent.
+/// Rate limited like createAccount (per IP).
+async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+    use crate::ratelimit as rl;
+    let (mut flow, f) = match form_flow(&app, &headers, &body).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if f.get("action").map(String::as_str) == Some("deny") {
+        let _ = store::put_request(&app, &flow.id, None).await;
+        return redirect_error(&app, &flow.req.params, "access_denied", "Access denied");
+    }
+    let field = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
+    let v = SignupValues {
+        handle: field("handle").trim_start_matches('@').to_ascii_lowercase(),
+        email: field("email"),
+        invite_code: field("invite_code"),
+    };
+    if rl::check_ip(&[&rl::CREATE_ACCOUNT], 1).is_err() {
+        let msg = "Too many sign-up attempts. Please try again later.";
+        return signup_page(&app, &flow, &v, Some(msg), StatusCode::TOO_MANY_REQUESTS);
+    }
+    // the form asks for the first label; a full handle under our domain is fine too
+    let suffix = format!(".{}", app.handle_domain);
+    let handle = if v.handle.ends_with(&suffix) { v.handle.clone() } else { format!("{}{suffix}", v.handle) };
+    let inp = super::server::CreateAccountIn {
+        handle,
+        email: Some(v.email.clone()),
+        password: f.get("password").cloned().filter(|p| !p.is_empty()),
+        invite_code: Some(v.invite_code.clone()).filter(|c| !c.is_empty()),
+        ..Default::default()
+    };
+    let acct = match super::server::create_account_inner(&app, inp, None).await {
+        Ok(a) => a,
+        Err(e) if e.status.is_server_error() => {
+            return error_page(&app, StatusCode::INTERNAL_SERVER_ERROR, "Sign-up failed", &e.message)
+        }
+        Err(e) => return signup_page(&app, &flow, &v, Some(&e.message), StatusCode::BAD_REQUEST),
+    };
+    let now = now_secs();
+    flow.device.accounts.retain(|a| a.did != acct.did);
+    flow.device.accounts.push(DeviceAccount { did: acct.did.clone(), authenticated_at: now });
+    flow.device.last_seen_at = now;
+    if let Err(e) = store::put_device(&app, &flow.device).await {
+        return error_page(&app, StatusCode::INTERNAL_SERVER_ERROR, "Sign-up failed", &e.description);
+    }
+    consent_step(&app, flow, &acct.did).await
 }
 
 async fn authorize_select(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
@@ -2082,9 +2162,12 @@ pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Crede
         ));
     }
     // single use, claimed at the token DID's owner (normally this node: the
-    // request was routed by that DID); `ath` binds the proof to this token
+    // request was routed by that DID); `ath` binds the proof to this token.
+    // In the owner's memory only, like the reference's replay store: a
+    // durable claim would put a log write on every resource request (HA
+    // notes in crate::oauth for the residual risk)
     let replay = checked.replay(did.to_string());
-    match super::internal::claim_replay_anywhere(app, &replay.routing, &replay.key, replay.until).await {
+    match super::internal::claim_transient_anywhere(app, &replay.routing, &replay.key, replay.until).await {
         Ok(true) => {}
         Ok(false) => return Err(dpop_fail("invalid_dpop_proof", "DPoP proof replayed")),
         Err(e) => return Err(e),

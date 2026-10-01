@@ -170,7 +170,7 @@ pub async fn claim_code_challenge(app: &App, challenge: &str) -> Result<bool, OA
     }
     // guards the window between the read above and the put (released after)
     let key = format!("cc:{routing}");
-    if !crate::xrpc::internal::claim_replay_anywhere(app, &routing, &key, now + 60).await? {
+    if !crate::xrpc::internal::claim_transient_anywhere(app, &routing, &key, now + 60).await? {
         return Ok(false);
     }
     let r = put(app, &routing, "oauth/cc", Some(&now)).await;

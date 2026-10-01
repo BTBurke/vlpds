@@ -196,3 +196,147 @@ pub async fn authed_repo(app: &App, creds: &Credentials, repo: &str) -> XResult<
     }
     Ok(target)
 }
+
+// ---------------------------------------------------------------------------
+// inbound service auth (reference xrpc-server verifyJwt + AuthVerifier
+// verifyServiceJwt)
+// ---------------------------------------------------------------------------
+
+/// A verified inter-service JWT: `iss` is a DID (optionally `#service`).
+#[derive(Clone, Debug)]
+pub struct ServiceAuth {
+    pub iss: String,
+}
+
+impl ServiceAuth {
+    /// The issuing DID, without a `#service` fragment.
+    pub fn did(&self) -> &str {
+        self.iss.split('#').next().unwrap_or("")
+    }
+}
+
+fn service_auth_err(error: &str, message: &str) -> XrpcError {
+    XrpcError {
+        status: StatusCode::UNAUTHORIZED,
+        error: error.into(),
+        message: message.into(),
+    }
+}
+
+/// The `#atproto` (or `#atproto_label` for a `#atproto_labeler` issuer)
+/// signing key of `iss`, as multibase. Accounts hosted here use their local
+/// document; others resolve through the DID resolver (`fresh` skips its cache).
+async fn issuer_key(app: &App, iss: &str, fresh: bool) -> XResult<String> {
+    let (did, service) = iss.split_once('#').unwrap_or((iss, ""));
+    let key_id = if service == "atproto_labeler" { "atproto_label" } else { "atproto" };
+    if key_id == "atproto" {
+        if let Ok(a) = app.account(did).await {
+            let k = Keypair::from_bytes(&hex::decode(&a.signing_key).map_err(XrpcError::from_err)?)
+                .map_err(XrpcError::from_err)?;
+            return Ok(k.public_multibase());
+        }
+    }
+    if fresh {
+        app.did_resolver.invalidate(did);
+    }
+    let doc = app
+        .did_resolver
+        .resolve(did)
+        .await
+        .map_err(|_| service_auth_err("AuthenticationRequired", "could not resolve iss did"))?;
+    let full = format!("{did}#{key_id}");
+    let short = format!("#{key_id}");
+    doc.get("verificationMethod")
+        .and_then(|v| v.as_array())
+        .and_then(|ms| {
+            ms.iter().find_map(|m| {
+                let id = m.get("id")?.as_str()?;
+                (id == full || id == short).then(|| m.get("publicKeyMultibase")?.as_str().map(String::from))?
+            })
+        })
+        .ok_or_else(|| service_auth_err("AuthenticationRequired", "missing or bad key in did doc"))
+}
+
+/// Verifies an inter-service JWT addressed to this PDS (`aud` = our service
+/// DID) for method `lxm` (required to match when given), signed by its
+/// issuer's current key (retried once with a fresh DID document, for a
+/// recent key rotation). Errors are the reference's (BadJwt, JwtExpired,
+/// BadJwtAudience, BadJwtLexiconMethod, BadJwtIss, BadJwtSignature).
+pub async fn verify_service_jwt(app: &App, token: &str, lxm: Option<&str>) -> XResult<ServiceAuth> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use base64::Engine;
+    let parts: Vec<&str> = token.split('.').collect();
+    let [h, p, s] = parts[..] else {
+        return Err(service_auth_err("BadJwt", "poorly formatted jwt"));
+    };
+    let decode = |x: &str| -> XResult<J> {
+        let b = B64.decode(x).map_err(|_| service_auth_err("BadJwt", "poorly formatted jwt"))?;
+        serde_json::from_slice(&b).map_err(|_| service_auth_err("BadJwt", "poorly formatted jwt"))
+    };
+    let header = decode(h)?;
+    let payload = decode(p)?;
+    if let Some(t @ ("at+jwt" | "refresh+jwt" | "dpop+jwt")) = header["typ"].as_str() {
+        return Err(service_auth_err("BadJwtType", &format!("Invalid jwt type \"{t}\"")));
+    }
+    let exp = payload["exp"].as_f64().ok_or_else(|| service_auth_err("BadJwt", "poorly formatted jwt"))?;
+    if (crate::tid::now_micros() as f64) / 1e6 > exp {
+        return Err(service_auth_err("JwtExpired", "jwt expired"));
+    }
+    if payload["aud"].as_str() != Some(app.jwt.service_did.as_str()) {
+        return Err(service_auth_err("BadJwtAudience", "jwt audience does not match service did"));
+    }
+    if let Some(lxm) = lxm {
+        match payload["lxm"].as_str() {
+            Some(l) if l == lxm => {}
+            Some(_) => {
+                return Err(service_auth_err(
+                    "BadJwtLexiconMethod",
+                    &format!("bad jwt lexicon method (\"lxm\"). must match: {lxm}"),
+                ))
+            }
+            None => {
+                return Err(service_auth_err(
+                    "BadJwtLexiconMethod",
+                    &format!("missing jwt lexicon method (\"lxm\"). must match: {lxm}"),
+                ))
+            }
+        }
+    }
+    let iss = payload["iss"].as_str().unwrap_or("");
+    let did_ok = {
+        let did = iss.split('#').next().unwrap_or("");
+        super::syntax::valid_did(did)
+    };
+    if !did_ok {
+        return Err(service_auth_err("BadJwtIss", "jwt iss is not a valid did"));
+    }
+    let msg = format!("{h}.{p}");
+    let sig = B64.decode(s).map_err(|_| service_auth_err("BadJwtSignature", "could not verify jwt signature"))?;
+    let check = |key: &str| {
+        crate::oauth::lexicon::verify_sig(key, msg.as_bytes(), &sig)
+            .map_err(|_| service_auth_err("BadJwtSignature", "could not verify jwt signature"))
+    };
+    let key = issuer_key(app, iss, false).await?;
+    if !check(&key)? {
+        // a fresh document, in case the key was just rotated
+        let fresh = issuer_key(app, iss, true).await?;
+        if fresh == key || !check(&fresh)? {
+            return Err(service_auth_err("BadJwtSignature", "jwt signature does not match jwt issuer"));
+        }
+    }
+    Ok(ServiceAuth { iss: iss.to_string() })
+}
+
+/// Optional service auth (reference `userServiceAuthOptional`): a Bearer
+/// token must be a valid service JWT for `lxm`; anything else (no
+/// Authorization header, another scheme) is unauthenticated.
+pub async fn optional_service_auth(app: &App, headers: &HeaderMap, lxm: &str) -> XResult<Option<ServiceAuth>> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match bearer {
+        Some(tok) => verify_service_jwt(app, tok.trim(), Some(lxm)).await.map(Some),
+        None => Ok(None),
+    }
+}

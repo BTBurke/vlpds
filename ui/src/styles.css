@@ -1056,6 +1056,29 @@ dialog.modal h2 {
   font-size: 13.5px;
   margin-top: 16px;
 }
+/* An input with a fixed suffix (the handle domain on sign-up). */
+.affix {
+  display: flex;
+  align-items: stretch;
+}
+.affix > input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.affix > span {
+  display: flex;
+  align-items: center;
+  padding: 0 11px;
+  border: 1px solid var(--rule);
+  border-left: 0;
+  border-radius: 0 5px 5px 0;
+  background: var(--sunk);
+  color: var(--ink2);
+  font-size: 13px;
+  white-space: nowrap;
+}
 
 /* TOTP */
 .totp-setup {

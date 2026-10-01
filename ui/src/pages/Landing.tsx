@@ -35,9 +35,14 @@ export function Landing() {
                 Open your account
               </Link>
             ) : (
-              <Link to="/account" className="btn primary">
-                Sign in to manage your account
-              </Link>
+              <>
+                <Link to="/account" className="btn primary">
+                  Sign in to manage your account
+                </Link>
+                <Link to="/account/signup" className="btn">
+                  Create an account
+                </Link>
+              </>
             )}
             <Link to="/admin" className="btn">
               Operator console

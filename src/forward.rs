@@ -1,7 +1,10 @@
 //! HA request routing: any node accepts any request; requests for a DID whose
 //! partition is owned by another node are proxied to that owner.
 //!
-//! XRPC: the routing DID comes from (in order) the `repo` / `did` /
+//! XRPC: methods outside `com.atproto.*` / `vlpds.*` (proxied to the
+//! AppView and other services, or the app.bsky preferences) route by the
+//! bearer token's `sub` alone. Otherwise the routing DID comes from (in
+//! order) the `repo` / `did` /
 //! `handle` / `identifier` query parameter (handles resolved), the bearer
 //! token's `sub` (when that is ours the body is never parsed), then the
 //! `repo` / `did` / `identifier` field of a JSON body (handles and emails
@@ -371,7 +374,16 @@ async fn xrpc_target(
     app: Option<&crate::xrpc::App>,
     req: Request,
 ) -> Result<(Request, Option<String>), Response> {
-    let admin = req.uri().path().starts_with("/xrpc/com.atproto.admin.");
+    let nsid = req.uri().path().strip_prefix("/xrpc/").unwrap_or("");
+    if !nsid.starts_with("com.atproto.") && !nsid.starts_with("vlpds.") {
+        // app.bsky.* / chat.bsky.* / tools.ozone.* / ...: proxied (or the
+        // app.bsky preferences), on behalf of the caller, whose account (and
+        // signing key) is at its owner, whatever DIDs the parameters name
+        // (e.g. tools.ozone.moderation.getRepo?did=). Nothing else to parse.
+        let sub = token_sub(&req);
+        return Ok((req, sub));
+    }
+    let admin = nsid.starts_with("com.atproto.admin.");
     match query_target(req.uri().query(), admin) {
         (Some(d), _) => return Ok((req, Some(d))),
         (None, Some(h)) => {
@@ -682,6 +694,27 @@ mod tests {
         assert_eq!(token_sub(&req(format!("Bearer {tok}"))), None);
     }
 
+    #[tokio::test]
+    async fn proxied_methods_route_by_the_caller() {
+        let b64 = |j: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(j);
+        let tok = format!("Bearer h.{}.s", b64(r#"{"sub":"did:plc:me"}"#));
+        let target = |uri: &str, auth: bool| {
+            let mut b = Request::builder().uri(uri);
+            if auth {
+                b = b.header("authorization", tok.clone());
+            }
+            let req = b.body(Body::empty()).unwrap();
+            async move { xrpc_target(&Fixed(None), None, req).await.ok().unwrap().1 }
+        };
+        let me = Some("did:plc:me".to_string());
+        assert_eq!(target("/xrpc/tools.ozone.moderation.getRepo?did=did:plc:subject", true).await, me);
+        assert_eq!(target("/xrpc/app.bsky.feed.getTimeline?limit=5&repo=did:plc:x", true).await, me);
+        assert_eq!(target("/xrpc/app.bsky.feed.getTimeline", false).await, None);
+        // com.atproto.* still routes by the repo it names
+        let subject = Some("did:plc:subject".to_string());
+        assert_eq!(target("/xrpc/com.atproto.repo.getRecord?repo=did:plc:subject", true).await, subject);
+    }
+
     struct Fixed(Option<String>);
 
     #[async_trait::async_trait]
@@ -767,7 +800,7 @@ mod tests {
         let http = reqwest::Client::new();
         // a forged marker does not make b serve locally, nor reach a's handler
         let r = http
-            .get(format!("{b}/xrpc/x.y?repo=did:plc:x"))
+            .get(format!("{b}/xrpc/com.atproto.repo.getRecord?repo=did:plc:x"))
             .header(FORWARDED_HEADER, "guess")
             .send()
             .await

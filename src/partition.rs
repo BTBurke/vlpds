@@ -51,6 +51,63 @@ fn shared_db_cache() -> Arc<dyn slatedb::db_cache::DbCache> {
         .clone()
 }
 
+/// SST block compression for shard DBs (`--sst-compression`). Each SST
+/// records its codec, so a DB written with another one stays readable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SstCompression {
+    None,
+    Lz4,
+    Zstd,
+}
+
+impl std::str::FromStr for SstCompression {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        Ok(match s {
+            "none" | "off" => SstCompression::None,
+            "lz4" => SstCompression::Lz4,
+            "zstd" => SstCompression::Zstd,
+            _ => anyhow::bail!("unknown SST compression {s:?} (none, lz4, zstd)"),
+        })
+    }
+}
+
+impl SstCompression {
+    fn codec(self) -> Option<slatedb::config::CompressionCodec> {
+        match self {
+            SstCompression::None => None,
+            SstCompression::Lz4 => Some(slatedb::config::CompressionCodec::Lz4),
+            SstCompression::Zstd => Some(slatedb::config::CompressionCodec::Zstd),
+        }
+    }
+}
+
+static SST_COMPRESSION: parking_lot::RwLock<SstCompression> = parking_lot::RwLock::new(SstCompression::Zstd);
+
+/// Codec for shard DBs opened from now on (and their compaction output).
+pub fn set_sst_compression(c: SstCompression) {
+    *SST_COMPRESSION.write() = c;
+}
+
+/// SlateDB GC: how old an SST compaction replaced must be before it is
+/// deleted (`--slatedb-gc-min-age`). SlateDB's default is 5 min; a long scan
+/// (a 10M-record getRepo, listRepos) reads SSTs from the manifest it started
+/// with, so keep a day of them.
+static GC_MIN_AGE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(24 * 3600);
+
+pub fn set_gc_min_age(d: Duration) {
+    GC_MIN_AGE_SECS.store(d.as_secs(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn gc_options() -> slatedb::config::GarbageCollectorOptions {
+    use slatedb::config::{GarbageCollectorDirectoryOptions, GarbageCollectorOptions};
+    let min_age = Duration::from_secs(GC_MIN_AGE_SECS.load(std::sync::atomic::Ordering::Relaxed));
+    GarbageCollectorOptions {
+        compacted_options: Some(GarbageCollectorDirectoryOptions { min_age, ..Default::default() }),
+        ..Default::default()
+    }
+}
+
 pub async fn open_db(
     store: &Store,
     partition: u16,
@@ -85,6 +142,11 @@ pub async fn open_db(
         l0_max_ssts_per_key: 32,
         // room for the active memtable plus l0_flush_parallelism (4) uploads
         max_unflushed_bytes: 128 << 20,
+        compression_codec: SST_COMPRESSION.read().codec(),
+        garbage_collector_options: Some(gc_options()),
+        // started after the open (`spawn_compactor`): half of an open's
+        // sequential store calls were the embedded compactor's startup
+        compactor_options: None,
         ..Default::default()
     };
     if let Some(dir) = cache_dir {
@@ -104,10 +166,241 @@ pub async fn open_db(
         path.hash(&mut h);
         h.finish()
     };
-    Ok(crate::metrics::with_slatedb_metrics(Db::builder(path, store.raw.clone()))
+    let codec = settings.compression_codec;
+    let db = crate::metrics::with_slatedb_metrics(Db::builder(path.clone(), store.raw.clone()))
         .with_settings(settings)
         .with_db_cache(shared_db_cache(), cache_id)
-        .with_sst_block_size(slatedb::SstBlockSize::Block16Kib)
+        .with_sst_block_size(SST_BLOCK_SIZE)
         .build()
-        .await?)
+        .await?;
+    spawn_compactor(&db, path, store.raw.clone(), codec);
+    Ok(db)
+}
+
+const SST_BLOCK_SIZE: slatedb::SstBlockSize = slatedb::SstBlockSize::Block16Kib;
+
+/// Runs a shard's compactor (coordinator + one worker writing the DB's SST
+/// format) until the DB closes. Started after the open instead of inside it:
+/// the embedded compactor's startup (~12 sequential store calls) doubled the
+/// time from a takeover or handback to serving (tests/all/rebalance_handback.rs;
+/// `open_calls` below: 465 -> 225 ms at 20 ms per call). L0 SSTs flushed
+/// meanwhile wait for it, like any compaction cycle. Its outputs aren't
+/// written into the local SST disk cache (`cache_on_compaction`); reads
+/// cache them.
+fn spawn_compactor(db: &Db, path: String, raw: Arc<dyn object_store::ObjectStore>, codec: Option<slatedb::config::CompressionCodec>) {
+    use slatedb::config::{CompactionWorkerOptions, CompactorOptions};
+    let mut status = db.subscribe();
+    tokio::spawn(async move {
+        let mut opts = CompactorOptions { worker: None, ..Default::default() };
+        let mut worker_opts = CompactionWorkerOptions { compression_codec: codec, ..Default::default() };
+        if cfg!(test) {
+            // unit tests wait for compactions
+            opts.poll_interval = Duration::from_millis(100);
+            worker_opts.compactions_poll_interval = Duration::from_millis(100);
+        }
+        let compactor = slatedb::CompactorBuilder::new(path.clone(), raw.clone()).with_options(opts);
+        let worker = slatedb::CompactionWorkerBuilder::new(path.clone(), raw).with_options(worker_opts).with_sst_block_size(SST_BLOCK_SIZE);
+        #[cfg(feature = "slatedb-metrics")]
+        let (compactor, worker) = (compactor.with_metrics_recorder(crate::metrics::slatedb_recorder()), worker.with_metrics_recorder(crate::metrics::slatedb_recorder()));
+        let compactor = compactor.build();
+        let worker = match worker.build().await {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::error!(%path, "compaction worker failed to start: {e}");
+                return;
+            }
+        };
+        let closed = async {
+            while status.borrow_and_update().close_reason.is_none() {
+                if status.changed().await.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            r = compactor.run() => if let Err(e) = r { tracing::warn!(%path, "compactor exited: {e}") },
+            r = worker.run() => if let Err(e) = r { tracing::warn!(%path, "compaction worker exited: {e}") },
+            _ = closed => {}
+        }
+        let _ = compactor.stop().await;
+        let _ = worker.stop().await;
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Process CPU time (user + system), so contention on a busy machine
+    /// inflates the wall times below but not these.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn cpu() -> Duration {
+        #[repr(C)]
+        struct Timeval {
+            sec: i64,
+            #[cfg(target_os = "macos")]
+            usec: i32,
+            #[cfg(target_os = "linux")]
+            usec: i64,
+        }
+        #[repr(C)]
+        struct Rusage {
+            utime: Timeval,
+            stime: Timeval,
+            rest: [i64; 14],
+        }
+        extern "C" {
+            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+        }
+        let mut r: Rusage = unsafe { std::mem::zeroed() };
+        unsafe { getrusage(0, &mut r) };
+        let t = |v: &Timeval| Duration::from_secs(v.sec as u64) + Duration::from_micros(v.usec as u64);
+        t(&r.utime) + t(&r.stime)
+    }
+
+    /// SST bytes and read/write time per codec on real records: a repo CAR
+    /// (`VLPDS_BENCH_CAR`, e.g. a getRepo export) written as `VLPDS_BENCH_COPIES`
+    /// repos (default 4) of state rows (R/ value + c/ index key, as the worker
+    /// writes them), flushed to L0 SSTs, then reopened cold and read back.
+    /// `VLPDS_BENCH_CAR=~/repo.car cargo test --lib partition::tests::compression -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn compression() {
+        use crate::cid::Cid;
+        use std::collections::HashMap;
+        let path = std::env::var("VLPDS_BENCH_CAR").expect("VLPDS_BENCH_CAR=path/to/repo.car");
+        let copies: usize = std::env::var("VLPDS_BENCH_COPIES").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let car = std::fs::read(path).unwrap();
+        let (roots, blocks) = crate::car::read_car(&car).unwrap();
+        let blocks: HashMap<Cid, Vec<u8>> = blocks.into_iter().map(|(c, b)| (c, b.to_vec())).collect();
+        let commit = crate::cbor::Value::decode(&blocks[&roots[0]]).unwrap();
+        let Some(crate::cbor::Value::Link(data)) = commit.get("data") else { panic!("no data in commit") };
+        let tree = crate::mst::Tree::load_from_blocks(&blocks, *data).unwrap();
+        let mut records = Vec::new();
+        tree.walk(&mut |k, c| records.push((String::from_utf8(k.to_vec()).unwrap(), c)));
+        let raw: usize = records.iter().map(|(_, c)| blocks[c].len()).sum();
+        println!("{} records x {copies} repos, {:.1} MiB of record bytes per repo", records.len(), raw as f64 / (1 << 20) as f64);
+        for codec in [SstCompression::None, SstCompression::Lz4, SstCompression::Zstd] {
+            set_sst_compression(codec);
+            // two copies: one read by a scan, one by point gets, each cold
+            let mut stores = Vec::new();
+            let (mut write, mut sst, mut logical) = (Duration::ZERO, 0u64, 0usize);
+            for half in ["scan", "get"] {
+                let store = Store { prefix: format!("bench-{codec:?}-{half}"), ..Store::memory(None) };
+                let db = open_db(&store, 0, None).await.unwrap();
+                let t = cpu();
+                logical = 0;
+                for r in 0..copies {
+                    let did = crate::state::bulk_did(r as u64);
+                    for chunk in records.chunks(2000) {
+                        let mut wb = slatedb::WriteBatch::new();
+                        for (path, cid) in chunk {
+                            let v = crate::state::record_value(cid, 1, &blocks[cid]);
+                            let k = crate::state::record_key(&did, path);
+                            let ck = crate::state::record_cid_key(&did, cid, path);
+                            logical += k.len() + v.len() + ck.len();
+                            wb.put(&k, &v);
+                            wb.put(&ck, b"");
+                        }
+                        db.write(wb).await.unwrap();
+                    }
+                }
+                db.close().await.unwrap();
+                write = cpu() - t;
+                sst = 0;
+                let prefix = object_store::path::Path::from(format!("{}/state/000", store.prefix));
+                let mut list = store.raw.list(Some(&prefix));
+                use futures::StreamExt;
+                while let Some(m) = list.next().await {
+                    let m = m.unwrap();
+                    if m.location.as_ref().ends_with(".sst") {
+                        sst += m.size;
+                    }
+                }
+                stores.push(store);
+            }
+            let db = open_db(&stores[0], 0, None).await.unwrap();
+            let t = cpu();
+            let mut n = 0;
+            let mut it = db.scan(b"R/".to_vec()..b"R0".to_vec()).await.unwrap();
+            while let Some(_kv) = it.next().await.unwrap() {
+                n += 1;
+            }
+            let scan = cpu() - t;
+            drop(it);
+            db.close().await.unwrap();
+            let db = open_db(&stores[1], 0, None).await.unwrap();
+            let step = (records.len() / 5000).max(1);
+            let t = cpu();
+            let mut gets = 0;
+            for r in 0..copies {
+                let did = crate::state::bulk_did(r as u64);
+                for (path, _) in records.iter().skip(r).step_by(step * copies) {
+                    assert!(db.get(crate::state::record_key(&did, path)).await.unwrap().is_some());
+                    gets += 1;
+                }
+            }
+            let get = cpu() - t;
+            db.close().await.unwrap();
+            println!(
+                "{codec:?}: SST {:.1} MiB ({:.2}x of {:.1} MiB of rows); CPU: write+flush {:.0} ms, cold scan of {n} rows {:.0} ms, {gets} cold gets {:.1} us/get",
+                sst as f64 / (1 << 20) as f64,
+                logical as f64 / sst as f64,
+                logical as f64 / (1 << 20) as f64,
+                write.as_secs_f64() * 1e3,
+                scan.as_secs_f64() * 1e3,
+                get.as_secs_f64() * 1e6 / gets as f64,
+            );
+        }
+        set_sst_compression(SstCompression::Zstd);
+    }
+
+    /// The compactor started after the open compacts L0 into sorted runs
+    /// that read back (in the DB's SST format), and stops with the DB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn deferred_compactor_compacts() {
+        let store = Store { prefix: "compact".into(), ..Store::memory(None) };
+        let db = open_db(&store, 0, None).await.unwrap();
+        for i in 0..8u32 {
+            for j in 0..200u32 {
+                db.put(format!("k{j:04}"), format!("value {i} {j} {}", "x".repeat(100))).await.unwrap();
+            }
+            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
+        }
+        let t = std::time::Instant::now();
+        loop {
+            let m = db.manifest();
+            if m.l0().len() < 8 && !m.compacted().is_empty() {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(30), "no compaction: {} L0s", m.l0().len());
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        db.close().await.unwrap();
+        let db = open_db(&store, 0, None).await.unwrap();
+        assert_eq!(db.get(b"k0123").await.unwrap().as_deref(), Some(format!("value 7 123 {}", "x".repeat(100)).as_bytes()));
+        db.close().await.unwrap();
+    }
+
+    /// Object-store calls (sequential round trips) a shard open makes: a
+    /// fresh DB, then a reopen of one with data, on a store that takes 20 ms
+    /// per call. `cargo test --lib partition::tests::open_calls -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn open_calls() {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let d = Duration::from_millis(20);
+        let cfg = ThrottleConfig { wait_get_per_call: d, wait_put_per_call: d, wait_list_per_call: d, wait_delete_per_call: d, ..Default::default() };
+        let store = Store { raw: Arc::new(ThrottledStore::new(mem, cfg)), ..Store::memory(None) };
+        for round in ["fresh", "reopen"] {
+            let t = std::time::Instant::now();
+            let db = open_db(&store, 0, None).await.unwrap();
+            let open = t.elapsed();
+            db.put(b"k", b"v").await.unwrap();
+            db.close().await.unwrap();
+            println!("{round}: open {:.0} ms (~{:.0} calls at 20 ms)", open.as_secs_f64() * 1e3, open.as_secs_f64() / 0.02);
+        }
+    }
+
 }

@@ -198,6 +198,9 @@ struct ReplayIn {
     /// release an earlier claim instead
     #[serde(default)]
     release: bool,
+    /// a guard released right after: memory only (see `claim_replay_owned`)
+    #[serde(default)]
+    transient: bool,
 }
 
 /// Single-use check-and-set of an OAuth replay key (DPoP proof / client
@@ -209,7 +212,7 @@ async fn claim_replay(State(app): AppState, headers: HeaderMap, axum::Json(inp):
         crate::oauth::util::release_replay_local(&app, &inp.key);
         return Ok(Json(json!({})));
     }
-    let fresh = crate::oauth::util::claim_replay_local(&app, &inp.key, inp.until);
+    let fresh = crate::oauth::util::claim_replay_owned(&app, &inp.routing, &inp.key, inp.until, !inp.transient).await?;
     Ok(Json(json!({"fresh": fresh})))
 }
 
@@ -273,26 +276,33 @@ pub async fn account_anywhere(app: &App, did: &str) -> XResult<Account> {
 }
 
 /// Single-use claim of an OAuth replay `key` until `until` (unix secs), made
-/// at the owner of `routing` so every node agrees. Ok(false) = replayed.
+/// at the owner of `routing` so every node agrees, and persisted in its
+/// partition so a later owner agrees too. Ok(false) = replayed.
 pub async fn claim_replay_anywhere(app: &App, routing: &str, key: &str, until: i64) -> XResult<bool> {
-    replay_call(app, routing, key, until, false).await
+    replay_call(app, routing, key, until, false, false).await
 }
 
-/// Releases a claim made with [`claim_replay_anywhere`].
+/// [`claim_replay_anywhere`] for a short guard that is released right after
+/// (in memory at the owner only).
+pub async fn claim_transient_anywhere(app: &App, routing: &str, key: &str, until: i64) -> XResult<bool> {
+    replay_call(app, routing, key, until, false, true).await
+}
+
+/// Releases a claim made with [`claim_transient_anywhere`].
 pub async fn release_replay_anywhere(app: &App, routing: &str, key: &str) -> XResult<()> {
-    replay_call(app, routing, key, 0, true).await.map(|_| ())
+    replay_call(app, routing, key, 0, true, true).await.map(|_| ())
 }
 
-async fn replay_call(app: &App, routing: &str, key: &str, until: i64, release: bool) -> XResult<bool> {
+async fn replay_call(app: &App, routing: &str, key: &str, until: i64, release: bool, transient: bool) -> XResult<bool> {
     let Some(owner) = app.remote_owner(routing) else {
         app.partition(routing)?;
         if release {
             crate::oauth::util::release_replay_local(app, key);
             return Ok(true);
         }
-        return Ok(crate::oauth::util::claim_replay_local(app, key, until));
+        return crate::oauth::util::claim_replay_owned(app, routing, key, until, !transient).await;
     };
-    let body = ReplayIn { routing: routing.into(), key: key.into(), until, release };
+    let body = ReplayIn { routing: routing.into(), key: key.into(), until, release, transient };
     let r = app
         .http
         .post(format!("{owner}/internal/v1/oauth/replay"))

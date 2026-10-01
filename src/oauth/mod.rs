@@ -61,18 +61,29 @@
 //!   on that node (`store::lock`), so concurrent uses that hit different
 //!   nodes are serialized there: exactly one wins.
 //! - DPoP proof, client-assertion and request-object (JAR) `jti`s are claimed
-//!   at the owner of a routing key (`xrpc::internal::claim_replay_anywhere`,
-//!   an in-memory TTL set per node): a resource request's proof under the
-//!   access token's DID (`ath` binds it to that token, and the request was
-//!   routed there, so this is normally local), an authorization-server proof
-//!   under its key (`oauth:jkt:{jkt}`), assertions and request objects under
-//!   the client (`oauth:client:{hash}`). PKCE `code_challenge` reuse: the
-//!   durable 24 h marker plus a short claim at its owner for concurrent PARs.
-//! - Residual: the replay sets are memory only. When a partition moves, its
-//!   new owner starts with an empty set, so a proof captured in the last few
-//!   minutes (its validity window; nonces bound it further) could be
-//!   replayed once against the new owner. Codes and refresh tokens are not
-//!   affected (their state is durable rows).
+//!   at the owner of a routing key (`xrpc::internal::claim_replay_anywhere`):
+//!   a resource request's proof under the access token's DID (`ath` binds it
+//!   to that token, and the request was routed there, so this is normally
+//!   local), an authorization-server proof under its key (`oauth:jkt:{jkt}`),
+//!   assertions and request objects under the client (`oauth:client:{hash}`).
+//!   The owner's in-memory TTL set settles concurrent claims. Claims at the
+//!   authorization server (token endpoint and PAR proofs, client assertions,
+//!   request objects) are also persisted as `oauth/replay/{hash}` in that
+//!   partition (awaited before the claim counts) and a claim missing from
+//!   memory is checked there, so the owner after a failover or handoff,
+//!   starting with an empty set, still refuses a proof its predecessor
+//!   accepted. The rows are dropped by the GC once past their validity
+//!   window. PKCE `code_challenge` reuse: the durable 24 h marker plus a
+//!   short, memory-only claim at its owner for concurrent PARs.
+//! - Resource-request proofs are claimed in the owner's memory only, like
+//!   the reference's in-memory replay store: a durable claim would put a log
+//!   write (an S3 segment PUT) on every authenticated request, AppView
+//!   proxying included. Residual risk: right after a failover or handoff the
+//!   new owner starts with an empty set, so a proof captured from a request
+//!   the old owner served could be replayed once, within the proof's `iat`
+//!   window and only while its nonce is still accepted (nonce rotation
+//!   bounds it), and only together with the access token it is bound to
+//!   (`ath`), which itself stays revocable and short-lived.
 
 pub mod client;
 pub mod gc;

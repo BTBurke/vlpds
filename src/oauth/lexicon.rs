@@ -282,7 +282,7 @@ pub fn verify_record_proof(
 }
 
 /// atproto multikey (secp256k1 or P-256, compressed) signature check.
-fn verify_sig(multibase: &str, msg: &[u8], sig: &[u8]) -> Result<bool, String> {
+pub(crate) fn verify_sig(multibase: &str, msg: &[u8], sig: &[u8]) -> Result<bool, String> {
     let raw = bs58::decode(multibase.strip_prefix('z').ok_or("unsupported multibase")?)
         .into_vec()
         .map_err(|e| e.to_string())?;

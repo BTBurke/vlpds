@@ -1,4 +1,5 @@
-//! Periodic cleanup of expired OAuth rows in the partitions this node owns:
+//! Periodic cleanup of expired private rows (mostly OAuth) in the partitions
+//! this node owns:
 //! - `oauth:req:{id}` authorization (PAR) requests and codes past their
 //!   expiry; consumed requests (code-reuse tombstones) are kept
 //!   [`CONSUMED_REQUEST_RETENTION`] longer so a replayed code still revokes
@@ -9,8 +10,12 @@
 //!   (every login on them has expired);
 //! - `{did}` / `oauth/ses/{id}` sessions past their client's session or
 //!   refresh-token lifetime;
-//! - and the in-memory `jti` replay caches (DPoP proofs, client assertions,
-//!   request objects).
+//! - `oauth/replay/{hash}` persisted single-use claims (DPoP proof, client
+//!   assertion and request-object `jti`s) past their `until`, and the
+//!   in-memory replay caches;
+//! - and, not OAuth but the same walk over every private row, `sec/rvk/`
+//!   session revocations of an account (deleted or not) once every token
+//!   they revoke has expired (`xrpc::revocation_expired`).
 //!
 //! Each tick examines at most a fixed number of keys per partition and
 //! deletes at most a fixed number of rows, resuming from a per-partition
@@ -47,6 +52,8 @@ enum Kind {
     CodeChallenge,
     Device,
     Session,
+    Replay,
+    Revocation,
 }
 
 fn classify(routing: &str, name: &str) -> Option<Kind> {
@@ -58,6 +65,10 @@ fn classify(routing: &str, name: &str) -> Option<Kind> {
         Some(Kind::Device)
     } else if routing.starts_with("did:") && name.starts_with("oauth/ses/") {
         Some(Kind::Session)
+    } else if name.starts_with(super::util::REPLAY_ROW) {
+        Some(Kind::Replay)
+    } else if crate::xrpc::revocation_expired(routing, name, b"", 0).is_some() {
+        Some(Kind::Revocation)
     } else {
         None
     }
@@ -79,8 +90,12 @@ fn session_expired(s: &Session, now: i64) -> bool {
 }
 
 /// Whether the stored value is expired. Unparseable rows count as expired.
-fn expired(kind: Kind, val: &[u8], now: i64) -> bool {
+fn expired(kind: Kind, routing: &str, name: &str, val: &[u8], now: i64) -> bool {
     match kind {
+        Kind::Replay => serde_json::from_slice::<i64>(val).map(|until| until <= now).unwrap_or(true),
+        Kind::Revocation => {
+            crate::xrpc::revocation_expired(routing, name, val, now.max(0) as u64).unwrap_or(false)
+        }
         Kind::Request => serde_json::from_slice::<RequestData>(val)
             .map(|r| request_expired(&r, now))
             .unwrap_or(true),
@@ -105,7 +120,7 @@ fn lock_key(kind: Kind, routing: &str, name: &str) -> String {
     match kind {
         Kind::Request => format!("req:{}", routing.trim_start_matches("oauth:req:")),
         Kind::Session => format!("ses:{}", name.trim_start_matches("oauth/ses/")),
-        Kind::CodeChallenge | Kind::Device => routing.to_string(),
+        Kind::CodeChallenge | Kind::Device | Kind::Replay | Kind::Revocation => routing.to_string(),
     }
 }
 
@@ -121,10 +136,15 @@ async fn delete_if_expired(
     let Some(val) = app.get_private(routing, name).await? else {
         return Ok(false);
     };
-    if !expired(kind, &val, now) {
+    if !expired(kind, routing, name, &val, now) {
         return Ok(false);
     }
-    store::put::<()>(app, routing, name, None).await?;
+    if kind == Kind::Revocation {
+        // through server.rs, which drops its cached view of the account
+        crate::xrpc::drop_revocation(app, routing, name).await?;
+    } else {
+        store::put::<()>(app, routing, name, None).await?;
+    }
     Ok(true)
 }
 
@@ -136,6 +156,9 @@ pub struct SweepStats {
     pub removed: usize,
     /// Expired replay-cache entries dropped.
     pub replay_entries: usize,
+    /// Expired persisted single-use claims and session revocations deleted
+    /// (counted apart from `removed`; both count against the delete budget).
+    pub claims_removed: usize,
 }
 
 /// Sweep state: where each partition's scan resumes.
@@ -170,7 +193,7 @@ impl Sweeper {
             let mut examined = 0;
             let mut resume = None;
             while let Some(kv) = it.next().await.map_err(server_err)? {
-                if examined >= scan_budget || st.removed >= delete_budget {
+                if examined >= scan_budget || st.removed + st.claims_removed >= delete_budget {
                     resume = Some(kv.key.to_vec());
                     break;
                 }
@@ -182,10 +205,13 @@ impl Sweeper {
                 let Some(kind) = classify(routing, name) else {
                     continue;
                 };
-                if expired(kind, &kv.value, now)
+                if expired(kind, routing, name, &kv.value, now)
                     && delete_if_expired(app, kind, routing, name, now).await?
                 {
-                    st.removed += 1;
+                    match kind {
+                        Kind::Replay | Kind::Revocation => st.claims_removed += 1,
+                        _ => st.removed += 1,
+                    }
                 }
             }
             st.scanned += examined;
@@ -207,8 +233,8 @@ pub fn spawn_gc(app: Arc<App>) -> tokio::task::JoinHandle<()> {
             tick.tick().await;
             let now = super::util::now_secs();
             match sweeper.tick(&app, now, SCAN_BUDGET, DELETE_BUDGET).await {
-                Ok(s) if s.removed > 0 => {
-                    tracing::info!(removed = s.removed, scanned = s.scanned, "oauth gc")
+                Ok(s) if s.removed + s.claims_removed > 0 => {
+                    tracing::info!(removed = s.removed, claims = s.claims_removed, scanned = s.scanned, "oauth gc")
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!("oauth gc: {}", e.description),
@@ -239,6 +265,11 @@ mod tests {
         assert_eq!(classify("did:plc:x", "oauth/authz/h"), None);
         assert_eq!(classify("oauth:lex:com.example.x", "oauth/lex"), None);
         assert_eq!(classify("_reserved:x", "key"), None);
+        assert_eq!(classify("did:plc:x", "oauth/replay/abc"), Some(Kind::Replay));
+        assert_eq!(classify("oauth:jkt:j", "oauth/replay/abc"), Some(Kind::Replay));
+        assert_eq!(classify("did:plc:x", "sec/rvk/d/0000000000000001"), Some(Kind::Revocation));
+        assert_eq!(classify("did:plc:x", "sec/rvk/f/fam"), Some(Kind::Revocation));
+        assert_eq!(classify("did:plc:x", "sec/td/rec/a/b"), None);
         assert_eq!(
             lock_key(Kind::Request, "oauth:req:req-1", "oauth/req"),
             "req:req-1"
@@ -252,15 +283,21 @@ mod tests {
     #[test]
     fn expiry_rules() {
         let now = 1_000_000_000;
-        assert!(!expired(Kind::CodeChallenge, b"999999999", now));
-        assert!(expired(
+        let x = |kind, val: &[u8]| expired(kind, "oauth:x", "n", val, now);
+        assert!(!x(Kind::CodeChallenge, b"999999999"));
+        assert!(x(
             Kind::CodeChallenge,
             (now - CODE_CHALLENGE_REPLAY_TIMEFRAME)
                 .to_string()
                 .as_bytes(),
-            now
         ));
-        assert!(expired(Kind::Request, b"not json", now));
+        assert!(x(Kind::Request, b"not json"));
+        assert!(!x(Kind::Replay, (now + 1).to_string().as_bytes()));
+        assert!(x(Kind::Replay, now.to_string().as_bytes()));
+        let rvk = |val: &[u8]| expired(Kind::Revocation, "did:plc:x", "sec/rvk/f/fam", val, now);
+        assert!(!rvk(format!("{{\"exp\":{now}}}").as_bytes()));
+        assert!(rvk(format!("{{\"exp\":{}}}", now - 1).as_bytes()));
+        assert!(rvk(b"garbage"));
         let s = Session {
             id: "ses-1".into(),
             did: "did:plc:x".into(),

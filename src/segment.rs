@@ -18,11 +18,17 @@ pub struct Mutation {
 // a *fence* object written at its next ordinal (If-None-Match), after which
 // the writer can never append again.
 //
-// "VLSEG03\n"
+// "VLSEG04\n"
 // header: log_id_len u16 | log_id | ordinal u64 | prefix_end u64
 //         | first_seq i64 | last_seq i64 | count u32
 // entry:  seq i64 | shard u16 | epoch u64 | frame_len u32 | frame
 //         | mut_count u32 | (key_len u16 | key | val_len u32 (MAX = delete) | val)*
+//
+// mut_count with its top bit set: bits 0-15 count the muts stored, bits
+// 16-30 the muts *derived* from the #commit frame, which come first (see
+// `derive_commit_muts`). A commit's record and head values repeat the record
+// blocks and the signed commit its CAR already carries; storing them again
+// cost ~20% of a single-record commit's segment bytes.
 //
 // "VLFENCE\n" | fenced_by (utf8)
 //
@@ -34,7 +40,10 @@ pub struct Mutation {
 // with a bounded number of probes (see `nodelog::in_prefix`).
 // ---------------------------------------------------------------------------
 
-pub const MAGIC: &[u8; 8] = b"VLSEG03\n";
+pub const MAGIC: &[u8; 8] = b"VLSEG04\n";
+
+/// mut_count flag: derived muts precede the stored ones.
+const DERIVED: u32 = 1 << 31;
 pub const FENCE_MAGIC: &[u8; 8] = b"VLFENCE\n";
 
 #[derive(Clone, Debug)]
@@ -66,6 +75,8 @@ pub struct SegmentBuilder {
     pub first_seq: i64,
     pub last_seq: i64,
     pub count: u32,
+    /// Bytes reserved at the start of `body` for the header (`for_log`).
+    header_room: usize,
 }
 
 impl Default for SegmentBuilder {
@@ -76,7 +87,17 @@ impl Default for SegmentBuilder {
 
 impl SegmentBuilder {
     pub fn new() -> Self {
-        SegmentBuilder { body: Vec::with_capacity(1 << 20), first_seq: 0, last_seq: 0, count: 0 }
+        SegmentBuilder { body: Vec::with_capacity(1 << 20), first_seq: 0, last_seq: 0, count: 0, header_room: 0 }
+    }
+
+    /// A builder whose body starts with room for `log_id`'s header, so
+    /// `seal` writes it in place instead of copying the body behind it.
+    /// Entry ranges from `push` are then offsets into the sealed object.
+    pub fn for_log(log_id: &str) -> Self {
+        let room = header_len(log_id);
+        let mut body = Vec::with_capacity(1 << 20);
+        body.resize(room, 0);
+        SegmentBuilder { body, first_seq: 0, last_seq: 0, count: 0, header_room: room }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -95,6 +116,23 @@ impl SegmentBuilder {
         write_frame: impl FnOnce(&mut Vec<u8>),
         muts: &[Mutation],
     ) -> std::ops::Range<usize> {
+        self.push_derived(seq, shard, epoch, write_frame, muts, 0)
+    }
+
+    /// [`push`](Self::push) where the first `derived` muts are left out:
+    /// replay rebuilds them from the #commit frame (`derive_commit_muts`).
+    pub fn push_derived(
+        &mut self,
+        seq: i64,
+        shard: u16,
+        epoch: u64,
+        write_frame: impl FnOnce(&mut Vec<u8>),
+        muts: &[Mutation],
+        derived: usize,
+    ) -> std::ops::Range<usize> {
+        let stored = &muts[derived.min(muts.len())..];
+        let derived = if derived > 0 && derived <= muts.len() && derived < 1 << 15 && stored.len() < 1 << 16 { derived } else { 0 };
+        let stored = &muts[derived..];
         if self.count == 0 {
             self.first_seq = seq;
         }
@@ -109,8 +147,12 @@ impl SegmentBuilder {
         write_frame(&mut self.body);
         let end = self.body.len();
         self.body[len_at..start].copy_from_slice(&((end - start) as u32).to_be_bytes());
-        self.body.put_u32(muts.len() as u32);
-        for m in muts {
+        if derived > 0 {
+            self.body.put_u32(DERIVED | (derived as u32) << 16 | stored.len() as u32);
+        } else {
+            self.body.put_u32(stored.len() as u32);
+        }
+        for m in stored {
             self.body.put_u16(m.key.len() as u16);
             self.body.put_slice(&m.key);
             match &m.val {
@@ -130,11 +172,25 @@ impl SegmentBuilder {
         self.sealed_header(log_id, ordinal, ordinal)
     }
 
+    /// The sealed object: the header written into the room `for_log` left
+    /// (no copy), or prepended.
+    pub fn seal(self, log_id: &str, ordinal: u64, prefix_end: u64) -> Vec<u8> {
+        let h = self.sealed_header(log_id, ordinal, prefix_end);
+        if self.header_room == h.len() {
+            let mut body = self.body;
+            body[..h.len()].copy_from_slice(&h);
+            return body;
+        }
+        let mut obj = h;
+        obj.extend_from_slice(&self.body[self.header_room..]);
+        obj
+    }
+
     /// Header bytes; entry ranges returned by `push` are relative to the body,
     /// so add the header length to address the full object.
     pub fn sealed_header(&self, log_id: &str, ordinal: u64, prefix_end: u64) -> Vec<u8> {
         debug_assert!(prefix_end <= ordinal);
-        let mut h = Vec::with_capacity(48 + log_id.len());
+        let mut h = Vec::with_capacity(header_len(log_id));
         h.put_slice(MAGIC);
         h.put_u16(log_id.len() as u16);
         h.put_slice(log_id.as_bytes());
@@ -145,6 +201,10 @@ impl SegmentBuilder {
         h.put_u32(self.count);
         h
     }
+}
+
+fn header_len(log_id: &str) -> usize {
+    MAGIC.len() + 2 + log_id.len() + 36
 }
 
 pub fn fence_object(by: &str) -> Bytes {
@@ -200,10 +260,15 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<u16>) -> anyhow::Result
         need(pos, flen + 4)?;
         let frame = data.slice(pos..pos + flen);
         pos += flen;
-        let nm = u32::from_be_bytes(data[pos..pos + 4].try_into()?) as usize;
+        let nm = u32::from_be_bytes(data[pos..pos + 4].try_into()?);
         pos += 4;
+        let (derived, nm) = if nm & DERIVED != 0 { (((nm & !DERIVED) >> 16) as usize, (nm & 0xffff) as usize) } else { (0, nm as usize) };
         let keep = shard.is_none_or(|s| s == sh);
         let mut muts = Vec::new();
+        if derived > 0 && with_muts && keep {
+            muts = derive_commit_muts(&frame)?;
+            anyhow::ensure!(muts.len() == derived, "segment entry {seq}: {} muts derived from its frame, {derived} expected", muts.len());
+        }
         for _ in 0..nm {
             need(pos, 2)?;
             let kl = u16::from_be_bytes(data[pos..pos + 2].try_into()?) as usize;
@@ -232,6 +297,53 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<u16>) -> anyhow::Result
     Ok(LogObject::Segment(h, out))
 }
 
+/// The state mutations of a #commit, rebuilt from its frame: for each op,
+/// the record CID index keys (delete the previous, put the new), the record
+/// (`R/`: cid | rev | the block from the commit's CAR) or its delete; then
+/// the head (`h/`). Exactly what the repo worker writes for a commit, in
+/// the same order; the worker checks the two agree (debug builds).
+pub fn derive_commit_muts(frame: &[u8]) -> anyhow::Result<Vec<Mutation>> {
+    use crate::cbor::Value;
+    use crate::cid::Cid;
+    use crate::state;
+    let (header, n) = Value::decode_prefix(frame)?;
+    anyhow::ensure!(header.get("t").and_then(Value::as_str) == Some("#commit"), "not a #commit frame");
+    let body = Value::decode(&frame[n..])?;
+    let text = |k: &str| body.get(k).and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("#commit without {k}"));
+    let link = |v: Option<&Value>| match v {
+        Some(Value::Link(c)) => Some(*c),
+        _ => None,
+    };
+    let did = text("repo")?;
+    let rev = crate::tid::Tid::parse(text("rev")?).ok_or_else(|| anyhow::anyhow!("bad #commit rev"))?;
+    let commit = link(body.get("commit")).ok_or_else(|| anyhow::anyhow!("#commit without commit"))?;
+    let Some(Value::Bytes(car)) = body.get("blocks") else { anyhow::bail!("#commit without blocks") };
+    let (_, blocks) = crate::car::read_car(car)?;
+    let block = |c: &Cid| blocks.iter().find(|(b, _)| b == c).map(|(_, d)| *d).ok_or_else(|| anyhow::anyhow!("#commit CAR lacks block {c}"));
+    let Some(Value::Array(ops)) = body.get("ops") else { anyhow::bail!("#commit without ops") };
+    let mut muts = Vec::with_capacity(ops.len() * 3 + 1);
+    for op in ops {
+        let path = op.get("path").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("op without path"))?;
+        let (prev, new) = (link(op.get("prev")), link(op.get("cid")));
+        if let Some(p) = &prev {
+            muts.push(Mutation { key: state::record_cid_key(did, p, path).into(), val: None });
+        }
+        if let Some(c) = &new {
+            muts.push(Mutation { key: state::record_cid_key(did, c, path).into(), val: Some(Bytes::new()) });
+        }
+        let key = Bytes::from(state::record_key(did, path));
+        muts.push(match &new {
+            Some(c) => Mutation { key, val: Some(state::record_value(c, rev.0, block(c)?)) },
+            None => Mutation { key, val: None },
+        });
+    }
+    let commit_block = block(&commit)?;
+    let data = link(Value::decode(commit_block)?.get("data")).ok_or_else(|| anyhow::anyhow!("commit block without data"))?;
+    let head = state::Head { commit, data, rev, commit_block: Bytes::copy_from_slice(commit_block) };
+    muts.push(Mutation { key: state::head_key(did).into(), val: Some(head.encode()) });
+    Ok(muts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,4 +369,67 @@ mod tests {
         assert_eq!(only3.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![10, 12]);
         assert!(matches!(parse(fence_object("node-b"), false, None).unwrap(), LogObject::Fence { by } if by == "node-b"));
     }
+
+    /// A builder made `for_log` seals in place (same bytes as prepending the
+    /// header), and an entry's derived muts are left out of the segment and
+    /// rebuilt from its #commit frame on parse.
+    #[test]
+    fn seal_in_place_and_derived_muts() {
+        use crate::cid::Cid;
+        let did = "did:plc:abc";
+        let rec = crate::cid::Cid::dag_cbor(b"\xa1aa\x01");
+        let mut rec_block = Vec::new();
+        rec_block.extend_from_slice(b"\xa1aa\x01");
+        let mut commit_block = Vec::new();
+        crate::cbor::Value::Map(vec![("did".into(), crate::cbor::Value::Text(did.into())), ("data".into(), crate::cbor::Value::Link(rec))]).encode(&mut commit_block);
+        let commit = Cid::dag_cbor(&commit_block);
+        let mut car = Vec::new();
+        crate::car::write_header(&mut car, &commit);
+        crate::car::write_block(&mut car, &commit, &commit_block);
+        crate::car::write_block(&mut car, &rec, &rec_block);
+        let rev = crate::tid::Tid::parse("3l3qo2vutsw2b").unwrap();
+        let ops = [crate::events::RepoOp { action: "update", path: "app.bsky.feed.post/1", cid: Some(rec), prev: Some(commit) }];
+        let frame = crate::events::commit_frame(&crate::events::CommitFrame {
+            repo: did,
+            rev: &rev.to_string(),
+            since: None,
+            commit,
+            prev_data: None,
+            blocks: &car,
+            ops: &ops,
+            time: "2026-10-01T00:00:00.000Z",
+        });
+        let mut bytes = Vec::new();
+        frame.finish(5, &mut bytes);
+        let derived = derive_commit_muts(&bytes).unwrap();
+        let keys: Vec<&[u8]> = derived.iter().map(|m| &m.key[..2]).collect();
+        assert_eq!(keys, vec![b"c/" as &[u8], b"c/", b"R/", b"h/"]);
+        assert_eq!(derived[2].val.as_deref(), Some(&crate::state::record_value(&rec, rev.0, &rec_block)[..]));
+        let head = crate::state::Head::decode(derived[3].val.as_ref().unwrap()).unwrap();
+        assert_eq!((head.commit, head.data, head.rev.0, &head.commit_block[..]), (commit, rec, rev.0, &commit_block[..]));
+
+        let extra = Mutation { key: Bytes::from_static(b"C/x"), val: Some(Bytes::new()) };
+        let mut all = derived.clone();
+        all.push(extra);
+        for in_place in [false, true] {
+            let mut b = if in_place { SegmentBuilder::for_log("L") } else { SegmentBuilder::new() };
+            let r = b.push_derived(5, 1, 2, |o| frame.finish(5, o), &all, derived.len());
+            b.push(6, 1, 2, |o| o.extend_from_slice(b"plain"), &all[..1]);
+            let obj = b.seal("L", 9, 9);
+            let off = if in_place { 0 } else { header_len("L") };
+            assert_eq!(&obj[r.start + off..r.end + off], &bytes[..]);
+            let LogObject::Segment(h, entries) = parse(Bytes::from(obj.clone()), true, None).unwrap() else { panic!() };
+            assert_eq!((h.ordinal, h.count), (9, 2));
+            assert_eq!(entries[0].muts.len(), all.len(), "derived + stored");
+            for (a, b) in entries[0].muts.iter().zip(&all) {
+                assert!(a.key == b.key && a.val == b.val);
+            }
+            assert_eq!(entries[1].muts.len(), 1);
+            // the derived muts aren't stored: the record and commit blocks
+            // appear once (in the frame's CAR)
+            let n = obj.windows(commit_block.len()).filter(|w| *w == &commit_block[..]).count();
+            assert_eq!(n, 1);
+        }
+    }
+
 }

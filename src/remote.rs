@@ -187,7 +187,15 @@ async fn catch_up(
     loop {
         let data = match store.raw.get(&segment_path(store, log_id, *next)).await {
             Ok(r) => r.bytes().await?,
-            Err(object_store::Error::NotFound { .. }) => return Ok(false),
+            Err(object_store::Error::NotFound { .. }) => match crate::backfill::first_ordinal(store, log_id).await? {
+                // log retention deleted it (we are a whole window behind)
+                Some(first) if first > *next => {
+                    tracing::warn!(%log_id, from = *next, to = first, "log pruned ahead of its follower; skipping");
+                    *next = first;
+                    continue;
+                }
+                _ => return Ok(false),
+            },
             Err(e) => return Err(e.into()),
         };
         match segment::parse(data, false, None)? {

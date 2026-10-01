@@ -27,10 +27,10 @@ Two Go checkers ran with `-strict -reconnect`:
 | Email confirm / update, password reset (dev mail sink) | pass after fix 3 | The dev mailbox is per node. Mail lands on the node that served the request, which is the owner after routing. |
 | Deactivate/activate, requestAccountDelete/deleteAccount, admin deleteAccount | pass | Checked on all 3 nodes. |
 | Handle change, reserveSigningKey (reused per DID across nodes), getServiceAuth | pass | |
-| Invite codes | pass | Covered with invites optional, and on a separate `--invite-required` node. The use is not recorded when invites are optional (see notes). |
+| Invite codes | pass | Covered with invites optional, and on a separate `--invite-required` node. A code passed while invites are optional is now checked and its use recorded, as in the reference (`tests/all/invites_optional.rs`). |
 | Repo CRUD, swapCommit/swapRecord, applyWrites atomicity, validate true/false/unknown | pass | |
 | 900 KB record, over 1 MB rejected, listRecords paging both directions | pass | |
-| importRepo | pass | Exported, changed, then re-imported: every node shows the snapshot again. A CAR of another DID is refused (see notes). |
+| importRepo | pass | Exported, changed, then re-imported: every node shows the snapshot again. A CAR of another DID is now accepted and re-signed for the caller, as in the reference. Migration in is covered by `tests/all/migration.rs`. |
 | Blobs: upload (incl. 12 MB), reference, getBlob, listBlobs, mime mismatch, GC after dereference | pass | GC ran with `--blob-gc-grace-secs 20`. Dereferenced and orphan blobs disappeared on every node, and referenced ones survived. |
 | Sync: getRepo (full, since), getLatestCommit, getRecord proofs, getBlocks, getRepoStatus | pass | Byte-identical CAR blocks from every node. |
 | listRepos / listReposByCollection | pass after fix 1 | They used to 500 on every node of a cluster. |
@@ -101,7 +101,5 @@ Regression tests are in `tests/all/e2e_regressions.rs` unless noted.
 
 ## Not fixed / notes
 
-- **Invite uses are not recorded when invites are optional.** When an optional `inviteCode` is passed while invites aren't required, vlpds ignores it; the reference records the use. LOW.
-- **importRepo refuses a CAR whose commit is for another DID.** The reference doesn't check the DID. This is deliberate in vlpds: there is no migration-in yet (TODO "createAccount with existing did").
 - **Dev mailbox is per node.** `vlpds.admin.getDevMail` only sees mail sent by the node it asks. This is dev-only; tooling has to ask every node.
 - **Proxied request bodies are sent chunked, without content-length.** Upstreams must accept chunked bodies; the stub AppView had to.

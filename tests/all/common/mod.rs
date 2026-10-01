@@ -267,9 +267,31 @@ impl TestServer {
     /// after this call are delivered. (A cursor-less live subscription may
     /// still receive events for writes acked just before it connected: the
     /// broadcast waits for every partition's watermark, which can trail acks.)
+    ///
+    /// The cursor is a seq, not an event: every event acked before this call
+    /// is at or below this node log's durable watermark (or the clock, for
+    /// other nodes' logs), and the call returns once the firehose has settled
+    /// past it. (It used to replay from 0 and take the highest seq seen
+    /// within 400 ms of idleness, which a slow backfill start or emission
+    /// lag under load turned into cursor 0: the account creation's events
+    /// were then replayed to tests expecting only later ones.)
     pub async fn subscribe_from_now(&self) -> Sub {
-        let head = self.current_seq().await;
+        let head = self.settled_now().await;
         self.subscribe(Some(head)).await
+    }
+
+    /// A firehose cursor after every event acked before this call, once the
+    /// firehose has settled up to it (events at or below it are never sent
+    /// to a subscriber with this cursor; everything above it is).
+    pub async fn settled_now(&self) -> i64 {
+        let clock = vlpds::nodelog::seq_floor(vlpds::tid::now_micros()) - 1;
+        let target = self.app.log.wm.get().max(clock);
+        let deadline = tokio::time::Instant::now() + FH_TIMEOUT;
+        while self.app.firehose.position() < target {
+            assert!(tokio::time::Instant::now() < deadline, "firehose never settled past {target}");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        target
     }
 
     /// Waits until every subscription in `subs` is live, without a fixed sleep:

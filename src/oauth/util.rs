@@ -248,14 +248,60 @@ pub(crate) fn node_state(app: &crate::xrpc::App) -> std::sync::Arc<NodeState> {
     n
 }
 
-/// Claims `key` in this node's replay set (we own its routing key's
-/// partition). False = already claimed (a replay).
-pub fn claim_replay_local(app: &crate::xrpc::App, key: &str, until: i64) -> bool {
-    node_state(app).replays.insert_unique(key, until)
+/// Private-row name prefix of persisted single-use claims
+/// (`p/{routing}\0oauth/replay/{sha256(key)}` -> `until`, JSON).
+pub const REPLAY_ROW: &str = "oauth/replay/";
+
+fn replay_row(key: &str) -> String {
+    format!("{REPLAY_ROW}{}", sha256_b64u(key))
 }
 
-/// Releases a claim made with [`claim_replay_local`] (a guard whose durable
-/// record is now written).
+/// Claims `key` (single use until `until`, unix secs) at this node, which
+/// owns `routing`'s partition. False = already claimed (a replay).
+///
+/// The in-memory set is the fast path and settles concurrent claims here.
+/// A `durable` claim is also written to the partition (and awaited) before
+/// it counts, and a claim missing from memory is checked against the
+/// partition first, so a new owner after a failover (empty set) still sees
+/// the claims its predecessor accepted. Expired rows are removed by the
+/// OAuth GC (`gc.rs`). Transient claims (a guard released right after,
+/// with a durable record of its own) skip both.
+pub async fn claim_replay_owned(
+    app: &crate::xrpc::App,
+    routing: &str,
+    key: &str,
+    until: i64,
+    durable: bool,
+) -> Result<bool, crate::xrpc::XrpcError> {
+    if !node_state(app).replays.insert_unique(key, until) {
+        return Ok(false);
+    }
+    if !durable {
+        return Ok(true);
+    }
+    let name = replay_row(key);
+    if let Some(v) = app.get_private(routing, &name).await? {
+        let prev: i64 = serde_json::from_slice(&v).unwrap_or(i64::MAX);
+        if prev > now_secs() {
+            return Ok(false);
+        }
+    }
+    let m = crate::segment::Mutation {
+        key: crate::state::private_key(routing, &name).into(),
+        val: Some(serde_json::to_vec(&until).unwrap().into()),
+    };
+    app.put_private(routing, vec![m]).await?;
+    Ok(true)
+}
+
+/// Forgets the in-memory claims of this node (tests: what a node that just
+/// took over a partition starts with).
+pub fn forget_replays(app: &crate::xrpc::App) {
+    node_state(app).replays.inner.lock().0.clear();
+}
+
+/// Releases a transient claim made with [`claim_replay_owned`] (a guard
+/// whose durable record is now written).
 pub fn release_replay_local(app: &crate::xrpc::App, key: &str) {
     node_state(app).replays.inner.lock().0.remove(key);
 }
@@ -266,7 +312,7 @@ pub fn sweep_replays(app: &crate::xrpc::App) -> usize {
 }
 
 /// Simple TTL set used for replay detection (DPoP proof `jti`s, client
-/// assertion `jti`s): [`claim_replay_local`].
+/// assertion `jti`s): [`claim_replay_owned`].
 pub struct ReplayCache {
     inner: parking_lot::Mutex<(std::collections::HashMap<String, i64>, i64)>,
     max: usize,

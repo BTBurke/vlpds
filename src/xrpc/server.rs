@@ -172,7 +172,11 @@ pub(super) const OLD_PASSWORD_MAX_LENGTH: usize = 512;
 
 /// Private-name prefix of an account's revocations and takedowns.
 pub(super) const SEC: &str = "sec/";
-const REVOKED_ALL: &str = "sec/rvk/d";
+/// `sec/rvk/d/{before:016x}`: every session issued at or before `before`
+/// (micros) is revoked until `exp`. One immutable row per revocation (the
+/// newest dominates), so the GC can delete an expired one without racing a
+/// newer revocation.
+const REVOKED_ALL: &str = "sec/rvk/d/";
 const REVOKED_FAMILY: &str = "sec/rvk/f/";
 /// Takedown entries: `sec/td/rec/{collection}/{rkey}`, `sec/td/blob/{cid}`.
 pub(super) const TAKEDOWN: &str = "sec/td/";
@@ -531,8 +535,11 @@ async fn load_sets(app: &App, did: &str, local: Option<(u16, u64)>) -> XResult<C
         if exp < now {
             continue;
         }
-        if name == REVOKED_ALL {
-            c.before = Some((j["before"].as_u64().unwrap_or(0), exp));
+        if name.starts_with(REVOKED_ALL) {
+            let before = j["before"].as_u64().unwrap_or(0);
+            if c.before.is_none_or(|(b, _)| before > b) {
+                c.before = Some((before, exp));
+            }
         } else if let Some(f) = name.strip_prefix(REVOKED_FAMILY) {
             c.families.insert(f.to_string(), exp);
         }
@@ -1032,12 +1039,33 @@ pub(super) async fn revoke_all_sessions(app: &App, did: &str) -> XResult<()> {
         did,
         vec![pmut(
             did,
-            REVOKED_ALL,
+            &format!("{REVOKED_ALL}{before:016x}"),
             Some(to_json_bytes(&json!({"before": before, "exp": exp}))),
         )],
     )
     .await?;
     revoke_refresh_tokens(app, did).await
+}
+
+/// For the private-row GC (`crate::oauth::gc`, which sweeps every `p/` row
+/// of the partitions this node owns): Some(expired) for a session
+/// revocation row (`sec/rvk/...`) of `routing`, None for any other row. A
+/// revocation is expired once every token it revokes has (`exp`: issued
+/// before it, so access-token lifetime + slack); unparseable rows count as
+/// expired. Deleted accounts keep these rows until then, so a DID that comes
+/// back can't revive old tokens; past it they are dropped like any other.
+pub fn revocation_expired(routing: &str, name: &str, val: &[u8], now: u64) -> Option<bool> {
+    if !routing.starts_with("did:") || !(name.starts_with(REVOKED_ALL) || name.starts_with(REVOKED_FAMILY)) {
+        return None;
+    }
+    Some(serde_json::from_slice::<J>(val).ok().and_then(|j| j["exp"].as_u64()).is_none_or(|exp| exp < now))
+}
+
+/// Deletes an expired revocation row (see [`revocation_expired`]). Rows are
+/// never rewritten once expired (a new revocation is a new `d/` row; a family
+/// is revoked once, after its sessions are gone), so no lock is needed.
+pub async fn drop_revocation(app: &App, did: &str, name: &str) -> XResult<()> {
+    put_sec(app, did, vec![pmut(did, name, None)]).await
 }
 
 /// Deletes every refresh token (session) of `did`; outstanding access tokens
@@ -1184,28 +1212,81 @@ async fn describe_server(State(app): AppState) -> Json<J> {
     }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct CreateAccountIn {
-    handle: String,
-    email: Option<String>,
-    password: Option<String>,
-    invite_code: Option<String>,
-    did: Option<String>,
-    plc_op: Option<J>,
+pub(super) struct CreateAccountIn {
+    pub handle: String,
+    pub email: Option<String>,
+    pub password: Option<String>,
+    pub invite_code: Option<String>,
+    pub did: Option<String>,
+    pub plc_op: Option<J>,
 }
 
+/// Account extension flag: the DID was brought from elsewhere (migration
+/// in), so its document is not ours to generate: activation and
+/// checkAccountStatus check the resolved one.
+pub(super) const EXTERNAL_DID: &str = "externalDid";
+
+pub(super) fn has_external_did(a: &Account) -> bool {
+    a.extra.get(EXTERNAL_DID).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// createAccount, with the reference's optional service auth
+/// (`userServiceAuthOptional`): a Bearer token must be a service JWT for
+/// this method, and its issuer may then bring its own DID (migration in).
 async fn create_account(
     State(app): AppState,
+    headers: HeaderMap,
     Json(inp): Json<CreateAccountIn>,
 ) -> XResult<Json<J>> {
+    const LXM: &str = "com.atproto.server.createAccount";
+    let requester = super::authn::optional_service_auth(&app, &headers, LXM).await?;
+    let acct = create_account_inner(&app, inp, requester.as_ref().map(|r| r.did())).await?;
+    let (access, refresh) = create_session_tokens(&app, &acct.did, None).await?;
+    let mut out = json!({
+        "handle": acct.handle,
+        "did": acct.did,
+        "accessJwt": access,
+        "refreshJwt": refresh,
+    });
+    if let Some(doc) = account_did_doc(&app, &acct).await {
+        out["didDoc"] = doc;
+    }
+    Ok(Json(out))
+}
+
+/// The DID document to report for an account (reference safeResolveDidDoc
+/// with a forced refresh): the resolved one for a DID brought here, ours
+/// otherwise.
+async fn account_did_doc(app: &App, a: &Account) -> Option<J> {
+    if has_external_did(a) {
+        app.did_resolver.invalidate(&a.did);
+        return app.did_resolver.resolve(&a.did).await.ok().map(|d| (*d).clone());
+    }
+    super::identity::did_doc(app, a).ok()
+}
+
+/// Account creation (createAccount, which then starts a session, and the
+/// OAuth sign-up page), as the reference's local-PDS path
+/// (validateInputsForLocalPds + createAccount):
+/// - `plcOp` is refused; there is no PLC registration here.
+/// - Without `did`, a DID is minted and the handle must be under our domain.
+/// - With `did` (migration in), `requester` (the verified service-auth
+///   issuer) must be that DID. The account starts deactivated with an empty
+///   repo, a fresh signing key and no firehose events; the user then imports
+///   the repo and blobs, points the DID document here and activates it
+///   (activateAccount checks the document). The handle may be external
+///   (checked to resolve to the DID).
+/// - An invite code, when given, must be available and its use is recorded,
+///   whether or not invites are required.
+pub(super) async fn create_account_inner(
+    app: &App,
+    inp: CreateAccountIn,
+    requester: Option<&str>,
+) -> XResult<Account> {
     if inp.plc_op.is_some() {
         return Err(invalid_request("Unsupported input: \"plcOp\""));
-    }
-    if inp.did.is_some() {
-        return Err(invalid_request(
-            "Creating an account with an existing DID is not supported",
-        ));
     }
     let password = inp
         .password
@@ -1221,7 +1302,7 @@ async fn create_account(
         .map(str::trim)
         .filter(|c| !c.is_empty())
         .map(str::to_string);
-    if invites_required(&app) && invite.is_none() {
+    if invites_required(app) && invite.is_none() {
         return Err(XrpcError::bad(
             "InvalidInviteCode",
             "No invite code provided",
@@ -1246,23 +1327,41 @@ async fn create_account(
         }
     };
     let handle = normalize_handle(&inp.handle)?;
-    ensure_service_handle(&app, &handle, false)?;
-    let did = app.mint_local_did()?;
-    // Atomic use of the invite code (a conditional-create claim per use).
-    let claim = match (&invite, invites_required(&app)) {
-        (Some(code), true) => Some(super::admin::claim_invite_use(&app, code, &did).await?),
-        _ => None,
-    };
-    let release = |claim: Option<super::admin::InviteClaim>| {
-        let app = app.clone();
-        async move {
-            if let Some(c) = claim {
-                super::admin::release_invite_use(&app, c).await;
+    let (did, external) = match inp.did.as_deref() {
+        Some(d) => {
+            // (checked before the handle, whose proof may be fetched)
+            if requester != Some(d) {
+                return Err(auth_required(&format!(
+                    "Missing auth to create account with did: {d}"
+                )));
             }
+            if !is_atproto_did(d) {
+                return Err(invalid_request("Invalid DID"));
+            }
+            // the handle may be external if it resolves to the DID
+            super::identity::check_new_handle(app, &handle, d).await?;
+            if account_if_exists(app, d).await?.is_some() {
+                return Err(invalid_request("Account already exists"));
+            }
+            (d.to_string(), true)
+        }
+        None => {
+            ensure_service_handle(app, &handle, false)?;
+            (app.mint_local_did()?, false)
+        }
+    };
+    // Atomic use of the invite code (a conditional-create claim per use).
+    let claim = match &invite {
+        Some(code) => Some(super::admin::claim_invite_use(app, code, &did).await?),
+        None => None,
+    };
+    let release = |claim: Option<super::admin::InviteClaim>| async move {
+        if let Some(c) = claim {
+            super::admin::release_invite_use(app, c).await;
         }
     };
     // Global handle uniqueness across nodes: conditional create of handle/{handle}.
-    let claimed = match claim_handle(&app, &handle, &did).await {
+    let claimed = match claim_handle(app, &handle, &did).await {
         Ok(c) => c,
         Err(e) => {
             release(claim).await;
@@ -1273,9 +1372,9 @@ async fn create_account(
         release(claim).await;
         return Err(XrpcError::bad("HandleNotAvailable", format!("Handle already taken: {handle}")));
     }
-    let r = claim_email(&app, &email, &did).await;
+    let r = claim_email(app, &email, &did).await;
     if !matches!(r, Ok(true)) {
-        release_handle(&app, &handle, &did).await;
+        release_handle(app, &handle, &did).await;
         release(claim).await;
         r?;
         return Err(invalid_request(format!("Email already taken: {email}")));
@@ -1293,6 +1392,13 @@ async fn create_account(
     set_extra(&mut acct, "totpEnabled", json!(false));
     if let Some(code) = &invite {
         set_extra(&mut acct, "invitedBy", json!(code));
+    }
+    if external {
+        // deactivated until the migration completes (activateAccount); the
+        // worker sequences no events for an account created inactive
+        set_extra(&mut acct, EXTERNAL_DID, json!(true));
+        set_extra(&mut acct, "deactivatedAt", json!(crate::events::now_rfc3339()));
+        recompute_status(&mut acct);
     }
     let did_arc: Arc<str> = did.clone().into();
     let (tx, rx) = oneshot::channel();
@@ -1315,22 +1421,17 @@ async fn create_account(
         Err(e) => Err(XrpcError::from_err(e)),
     };
     if let Err(e) = created {
-        release_handle(&app, &handle, &did).await;
-        release_email(&app, &email, &did).await;
+        release_handle(app, &handle, &did).await;
+        release_email(app, &email, &did).await;
         release(claim).await;
         return Err(e);
     }
     if let Some(c) = &claim {
-        if let Err(e) = super::admin::record_invite_use(&app, c, &did).await {
+        if let Err(e) = super::admin::record_invite_use(app, c, &did).await {
             tracing::warn!(%did, "recording invite use failed: {}", e.message);
         }
     }
-    let (access, refresh) = create_session_tokens(&app, &did, None).await?;
-    let mut out = json!({"handle": handle, "did": did, "accessJwt": access, "refreshJwt": refresh});
-    if let Ok(doc) = super::identity::did_doc(&app, &acct) {
-        out["didDoc"] = doc;
-    }
-    Ok(Json(out))
+    Ok(acct)
 }
 
 // ---------------------------------------------------------------------------
@@ -1712,9 +1813,11 @@ async fn activate_account(State(app): AppState, Auth(creds): Auth) -> XResult<St
         }
         _ => full_access(&creds)?,
     };
-    app.account(&did)
+    let acct = app
+        .account(&did)
         .await
         .map_err(|_| XrpcError::bad("AccountNotFound", "user not found"))?;
+    assert_valid_did_doc(&app, &acct).await?;
     // #account, #identity and #sync (reference sequenceAccountActivation)
     app.mutate_account(&did, true, true, true, |a| {
         // a taken-down account can't be activated
@@ -1730,10 +1833,47 @@ async fn activate_account(State(app): AppState, Auth(creds): Auth) -> XResult<St
     Ok(StatusCode::OK)
 }
 
+/// Reference assertValidDidDocumentForService: the account's DID document
+/// names this PDS and the account's signing key. A DID minted here is
+/// documented by this server (it is never registered elsewhere), so only a
+/// DID brought here (migration in) is resolved and checked. There is no
+/// rotation-key check: this PDS holds no PLC rotation key.
+async fn assert_valid_did_doc(app: &App, a: &Account) -> XResult<()> {
+    if !has_external_did(a) {
+        return Ok(());
+    }
+    app.did_resolver.invalidate(&a.did);
+    let doc = app
+        .did_resolver
+        .resolve(&a.did)
+        .await
+        .map_err(|_| invalid_request("Could not resolve DID"))?;
+    let pds = crate::did_resolver::service_endpoint(&doc, "atproto_pds");
+    if pds.as_deref().map(|p| p.trim_end_matches('/')) != Some(app.public_url.trim_end_matches('/')) {
+        return Err(invalid_request(
+            "DID document atproto_pds service endpoint does not match PDS public url",
+        ));
+    }
+    let key = Keypair::from_bytes(&hex::decode(&a.signing_key).map_err(XrpcError::from_err)?)
+        .map_err(XrpcError::from_err)?;
+    if crate::did_resolver::signing_key_multibase(&doc).as_deref() != Some(key.public_multibase().as_str()) {
+        return Err(invalid_request(
+            "DID document verification method does not match expected signing key",
+        ));
+    }
+    Ok(())
+}
+
+/// Migration progress (reference checkAccountStatus): `repoBlocks` counts
+/// the commit, the MST nodes and the distinct record blocks; `expectedBlobs`
+/// the distinct blobs the records reference; `importedBlobs` the blobs
+/// stored for the account (uploaded, referenced or not yet).
 async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let did = user_did(&creds)?;
     let acct = app.account(&did).await?;
-    let head = app.head(&did).await?;
+    let (view, _) = app.repo_view(&did).await?;
+    let mut nodes = HashMap::new();
+    view.tree.node_refs(&mut nodes).map_err(XrpcError::from_err)?;
     let p = app.partition(&did)?;
     let prefix = state::record_prefix(&did);
     let mut iter =
@@ -1741,8 +1881,12 @@ async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResul
             .await
             .map_err(XrpcError::from_err)?;
     let mut records = 0u64;
-    while iter.next().await.map_err(XrpcError::from_err)?.is_some() {
+    let mut record_blocks = HashSet::new();
+    while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
         records += 1;
+        if let Ok((cid, _)) = state::decode_record_value(&kv.value) {
+            record_blocks.insert(cid);
+        }
     }
     let bprefix = state::blob_ref_prefix(&did);
     let mut iter =
@@ -1754,21 +1898,20 @@ async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResul
         let rest = String::from_utf8_lossy(&kv.key[bprefix.len()..]).to_string();
         expected.insert(rest.split('\0').next().unwrap_or("").to_string());
     }
+    let blob_dir = object_store::path::Path::from(format!("{}/blob/{}", app.store.prefix, did));
     let mut imported = 0u64;
-    for cid in &expected {
-        let path =
-            object_store::path::Path::from(format!("{}/blob/{}/{}", app.store.prefix, did, cid));
-        if app.store.raw.head(&path).await.is_ok() {
-            imported += 1;
-        }
+    let mut list = app.store.raw.list(Some(&blob_dir));
+    while let Some(meta) = futures::StreamExt::next(&mut list).await {
+        meta.map_err(XrpcError::from_err)?;
+        imported += 1;
     }
+    let valid_did = assert_valid_did_doc(&app, &acct).await.is_ok();
     Ok(Json(json!({
         "activated": acct.status.is_none(),
-        "validDid": true,
-        "repoCommit": head.commit.to_string(),
-        "repoRev": head.rev.to_string(),
-        // blocks in the repo: records + commit; MST nodes are derived (not stored)
-        "repoBlocks": records + 1,
+        "validDid": valid_did,
+        "repoCommit": view.head.commit.to_string(),
+        "repoRev": view.head.rev.to_string(),
+        "repoBlocks": 1 + nodes.len() + record_blocks.len(),
         "indexedRecords": records,
         "privateStateValues": 0,
         "expectedBlobs": expected.len(),

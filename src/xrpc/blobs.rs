@@ -6,6 +6,8 @@
 //! multipart upload to `{prefix}/blob-tmp/{did}/{random}` (the CID is only
 //! known at the end), then are copied into place. References live in
 //! SlateDB as `b/{did}\0{cid}\0{record path}`, maintained at commit time.
+//! The GC moves unreferenced blobs to `{prefix}/blob-gc/{did}/{cid}` and
+//! deletes them after a re-check ([`sweep_blobs_settle`]).
 
 use super::sync::assert_available;
 use super::*;
@@ -524,13 +526,53 @@ fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// One GC pass. Returns (blobs scanned, objects deleted).
-///
-/// Race: a record referencing a blob committed between the reference check
-/// and the delete loses the blob (listMissingBlobs then reports it). The
-/// grace period makes this require a client to reference a blob it uploaded
-/// more than `grace` ago that was unreferenced for that whole time.
+/// How long a collected blob stays quarantined before it is deleted for
+/// good (capped by the grace period): longer than any write that checked
+/// the blob (repo.rs `check_blobs`) takes to apply its reference.
+pub const QUARANTINE_SETTLE: Duration = Duration::from_secs(60);
+
+fn quarantine_path(app: &App, did: &str, cid: &str) -> object_store::path::Path {
+    object_store::path::Path::from(format!("{}/blob-gc/{}/{}", app.store.prefix, did, cid))
+}
+
+/// Whether any record of `did` references blob `cid` (`b/{did}\0{cid}\0...`).
+async fn referenced(p: &Partition, did: &str, cid: &str) -> anyhow::Result<bool> {
+    let prefix = [state::blob_ref_prefix(did).as_slice(), cid.as_bytes(), b"\0"].concat();
+    let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await?;
+    Ok(iter.next().await?.is_some())
+}
+
+/// (did, cid) of a `.../{did}/{cid}` object path.
+fn did_cid(path: &object_store::path::Path) -> Option<(String, String)> {
+    let parts: Vec<String> = path.parts().map(|p| pct_decode(p.as_ref())).collect();
+    let n = parts.len();
+    (n >= 2).then(|| (parts[n - 2].clone(), parts[n - 1].clone()))
+}
+
+/// One GC pass with the default settle time (`min(grace, QUARANTINE_SETTLE)`).
+/// Returns (blobs scanned, objects deleted).
 pub async fn sweep_blobs(app: &App, grace: Duration) -> anyhow::Result<(usize, usize)> {
+    sweep_blobs_settle(app, grace, grace.min(QUARANTINE_SETTLE)).await
+}
+
+/// One GC pass. Returns (blobs scanned, objects deleted), where a blob moved
+/// to quarantine counts as deleted (it is no longer served).
+///
+/// The race: a write checks that its blob exists (`check_blobs`) and is
+/// applied a little later; a sweep that read "no reference" in between would
+/// delete the blob under it. So a collected blob is not deleted at once:
+/// 1. an unreferenced blob older than `grace` is moved to
+///    `{prefix}/blob-gc/{did}/{cid}` (copy, then delete the original). From
+///    then on writes referencing it fail their check (BlobNotFound), as for
+///    any missing blob;
+/// 2. once it has sat there for `settle` (any write that passed its check
+///    before the move has applied by then), the references are checked
+///    again: if one appeared, the blob is moved back; otherwise the
+///    quarantined copy is deleted.
+///
+/// Orphaned multipart uploads can't be listed through object_store; see
+/// DESIGN.md ("6. Blobs") for the bucket lifecycle rule that aborts them.
+pub async fn sweep_blobs_settle(app: &App, grace: Duration, settle: Duration) -> anyhow::Result<(usize, usize)> {
     let now = chrono::Utc::now();
     let cutoff = now - chrono::Duration::from_std(grace)?;
     let store = app.store.raw.clone();
@@ -544,33 +586,53 @@ pub async fn sweep_blobs(app: &App, grace: Duration) -> anyhow::Result<(usize, u
         if meta.last_modified > cutoff {
             continue;
         }
-        let parts: Vec<String> = meta
-            .location
-            .parts()
-            .map(|p| pct_decode(p.as_ref()))
-            .collect();
-        let n = parts.len();
-        if n < 2 {
+        let Some((did, cid)) = did_cid(&meta.location) else { continue };
+        let Ok(p) = app.partition(&did) else { continue };
+        if referenced(&p, &did, &cid).await? {
             continue;
         }
-        let (did, cid) = (&parts[n - 2], &parts[n - 1]);
-        let Ok(p) = app.partition(did) else { continue };
-        let prefix = [
-            state::blob_ref_prefix(did).as_slice(),
-            cid.as_bytes(),
-            b"\0",
-        ]
-        .concat();
-        let mut iter =
-            p.db.scan(prefix.clone()..state::prefix_end(&prefix))
-                .await?;
-        if iter.next().await?.is_some() {
+        // the copy's last-modified time starts the settle period
+        if let Err(e) = store.copy(&meta.location, &quarantine_path(app, &did, &cid)).await {
+            if !matches!(e, object_store::Error::NotFound { .. }) {
+                tracing::warn!(path = %meta.location, "blob gc quarantine: {e}");
+            }
             continue;
         }
         match store.delete(&meta.location).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => deleted += 1,
             Err(e) => tracing::warn!(path = %meta.location, "blob gc delete: {e}"),
         }
+    }
+
+    let settled = now - chrono::Duration::from_std(settle)?;
+    let gc_root = object_store::path::Path::from(format!("{}/blob-gc", app.store.prefix));
+    let mut list = store.list(Some(&gc_root));
+    let (mut restored, mut purged) = (0usize, 0usize);
+    while let Some(meta) = list.next().await {
+        let meta = meta?;
+        if meta.last_modified > settled {
+            continue;
+        }
+        let Some((did, cid)) = did_cid(&meta.location) else { continue };
+        let Ok(p) = app.partition(&did) else { continue };
+        if referenced(&p, &did, &cid).await? {
+            // a write that checked the blob before the move: put it back
+            let Ok(c) = Cid::parse(&cid) else { continue };
+            if let Err(e) = store.copy(&meta.location, &blob_path(app, &did, &c)).await {
+                tracing::warn!(path = %meta.location, "blob gc restore: {e}");
+                continue;
+            }
+            restored += 1;
+            tracing::warn!(%did, %cid, "blob gc: a reference appeared during quarantine; restored");
+        } else {
+            purged += 1;
+        }
+        if let Err(e) = store.delete(&meta.location).await {
+            tracing::warn!(path = %meta.location, "blob gc purge: {e}");
+        }
+    }
+    if restored + purged > 0 {
+        tracing::debug!(restored, purged, "blob gc quarantine");
     }
 
     let tmp_cutoff = now - chrono::Duration::from_std(TMP_GRACE.max(grace))?;

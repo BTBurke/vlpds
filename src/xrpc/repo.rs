@@ -66,7 +66,7 @@ fn encode_record(
     collection: &str,
     rkey: &str,
     validate: Option<bool>,
-    resolved: Option<&J>,
+    resolved: Option<&crate::lexicon::Lexicons>,
 ) -> XResult<Encoded> {
     if !matches!(v, JsonValue::Object(_)) {
         return Err(XrpcError::bad("InvalidRequest", "record must be an object"));
@@ -494,7 +494,7 @@ async fn apply_writes(
     let mut statuses = Vec::with_capacity(inp.writes.len());
     let mut decls = Vec::new();
     // dynamically resolved lexicons, once per collection
-    let mut schemas: std::collections::HashMap<String, Option<Arc<J>>> = Default::default();
+    let mut schemas: std::collections::HashMap<String, Option<Arc<crate::lexicon::Lexicons>>> = Default::default();
     for w in inp.writes.iter_mut() {
         let t = w.get("$type").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let collection = w
@@ -801,11 +801,13 @@ async fn describe_repo(State(app): AppState, Query(q): Query<RepoQ>) -> XResult<
     })))
 }
 
-/// Replaces the caller's repo with the contents of a CAR (one root: a signed
-/// commit whose `did` is the caller). The MST is loaded from the CAR and
-/// checked complete; every record block must hash to its CID. Emits `#sync`
-/// via the worker (new rev, re-signed with our key). Like the reference, the
-/// imported commit's signature isn't checked: only its contents are used.
+/// Replaces the caller's repo with the contents of a CAR (one root: a
+/// commit). The MST is loaded from the CAR and checked complete; every
+/// record block must hash to its CID. The worker writes a new commit (new
+/// rev, signed with our key) and emits `#sync` unless the account is
+/// deactivated (migration in: activation announces it). Like the reference,
+/// neither the imported commit's signature nor its `did` is checked: only
+/// its contents are used, re-signed for the caller's DID.
 async fn import_repo(
     State(app): AppState,
     Auth(creds): Auth,
@@ -827,7 +829,7 @@ async fn import_repo(
             message: "Account has been taken down".into(),
         });
     }
-    let records = tokio::task::spawn_blocking(move || parse_import(&body, &did).map(|r| (did, r)))
+    let records = tokio::task::spawn_blocking(move || parse_import(&body).map(|r| (did, r)))
         .await
         .map_err(XrpcError::from_err)?;
     let (did, records) = records?;
@@ -838,7 +840,7 @@ async fn import_repo(
 
 type ImportedRecord = (String, Cid, Bytes, Vec<Cid>);
 
-fn parse_import(body: &[u8], did: &str) -> XResult<Vec<ImportedRecord>> {
+fn parse_import(body: &[u8]) -> XResult<Vec<ImportedRecord>> {
     let bad = |m: String| XrpcError::bad("InvalidRequest", m);
     let (roots, blocks) = car::read_car(body).map_err(|e| bad(format!("invalid CAR: {e}")))?;
     if roots.len() != 1 {
@@ -861,10 +863,6 @@ fn parse_import(body: &[u8], did: &str) -> XResult<Vec<ImportedRecord>> {
         .get(&roots[0])
         .ok_or_else(|| bad("missing commit block".into()))?;
     let commit = Value::decode(commit_bytes).map_err(|e| bad(format!("invalid commit: {e}")))?;
-    let commit_did = commit.get("did").and_then(|v| v.as_str()).unwrap_or("");
-    if commit_did != did {
-        return Err(bad(format!("commit is for {commit_did}, not {did}")));
-    }
     match commit.get("version") {
         Some(Value::Int(2 | 3)) => {}
         _ => return Err(bad("unsupported commit version".into())),

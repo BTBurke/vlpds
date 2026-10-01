@@ -11,6 +11,10 @@ use crate::cid::Cid;
 pub struct Frame {
     pub prefix: Vec<u8>,
     pub suffix: Vec<u8>,
+    /// How many of the log entry's leading mutations replay rebuilds from
+    /// this #commit frame (`segment::derive_commit_muts`), so the segment
+    /// doesn't store them twice. 0 = all stored.
+    pub derived_muts: usize,
 }
 
 impl Frame {
@@ -104,6 +108,7 @@ pub fn commit_frame(c: &CommitFrame) -> Frame {
     Frame {
         prefix: p,
         suffix: s,
+        derived_muts: 0,
     }
 }
 
@@ -124,6 +129,7 @@ pub fn sync_frame(did: &str, rev: &str, blocks: &[u8], time: &str) -> Frame {
     Frame {
         prefix: p,
         suffix: s,
+        derived_muts: 0,
     }
 }
 
@@ -142,6 +148,7 @@ pub fn identity_frame(did: &str, handle: &str, time: &str) -> Frame {
     Frame {
         prefix: p,
         suffix: s,
+        derived_muts: 0,
     }
 }
 
@@ -164,6 +171,7 @@ pub fn account_frame(did: &str, active: bool, status: Option<&str>, time: &str) 
     Frame {
         prefix: p,
         suffix: s,
+        derived_muts: 0,
     }
 }
 

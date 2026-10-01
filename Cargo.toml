@@ -20,7 +20,8 @@ profiling = ["dep:pyroscope", "dep:prost", "dep:inferno"]
 slatedb-metrics = ["dep:slatedb-common"]
 
 [dependencies]
-slatedb = { version = "0.17", features = ["aws", "wal_disable"] }
+# zstd/lz4: SST block compression (--sst-compression, default zstd)
+slatedb = { version = "0.17", features = ["aws", "wal_disable", "zstd", "lz4"] }
 object_store = { version = "0.14", features = ["aws"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }
@@ -57,7 +58,7 @@ prost = { version = "0.14", optional = true }
 inferno = { version = "0.11", default-features = false, optional = true }
 slatedb-common = { version = "0.17", optional = true }
 prometheus = { version = "0.14", default-features = false }
-hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 bs58 = "0.5"
 hex = "0.4"
