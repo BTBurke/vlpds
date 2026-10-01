@@ -465,12 +465,13 @@ struct Forward<'a> {
 const ACCT_TTL: Duration = Duration::from_secs(60);
 const JWT_REUSE: Duration = Duration::from_secs(SERVICE_JWT_TTL_SECS / 2);
 const CACHE_SHARDS: usize = 64;
-const CACHE_CAP_PER_SHARD: usize = 32_768;
 
 type Shard<K, V> = parking_lot::Mutex<std::collections::HashMap<K, (V, std::time::Instant)>>;
 
+/// Capped by `kind`'s [`crate::caches`] cap (sized from the memory budget).
 struct TtlCache<K, V> {
     shards: Vec<Shard<K, V>>,
+    kind: crate::caches::Cache,
     /// per shard, bumped (under its lock) by every [`TtlCache::invalidate`]:
     /// a load that raced one is not cached
     gens: Vec<std::sync::atomic::AtomicU64>,
@@ -484,11 +485,18 @@ fn fixed_hash<Q: std::hash::Hash + ?Sized>(k: &Q) -> u64 {
     h.finish()
 }
 
+impl<K: Send, V: Send> crate::caches::Len for TtlCache<K, V> {
+    fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.lock().len()).sum()
+    }
+}
+
 impl<K: std::hash::Hash + Eq, V: Clone> TtlCache<K, V> {
-    fn new() -> Self {
+    fn new(kind: crate::caches::Cache) -> Self {
         TtlCache {
             shards: (0..CACHE_SHARDS).map(|_| parking_lot::Mutex::new(Default::default())).collect(),
             gens: (0..CACHE_SHARDS).map(|_| Default::default()).collect(),
+            kind,
         }
     }
     fn shard_of<Q: std::hash::Hash + ?Sized>(k: &Q) -> usize {
@@ -538,13 +546,14 @@ impl<K: std::hash::Hash + Eq, V: Clone> TtlCache<K, V> {
     /// was taken.
     fn put_unless_changed(&self, k: K, v: V, max_age: Duration, gen: Option<u64>) {
         let i = Self::shard_of(&k);
+        let cap = crate::caches::cap(self.kind).div_ceil(CACHE_SHARDS).max(1);
         let mut m = self.shards[i].lock();
         if gen.is_some_and(|g| g != self.gens[i].load(std::sync::atomic::Ordering::SeqCst)) {
             return;
         }
-        if m.len() >= CACHE_CAP_PER_SHARD {
+        if m.len() >= cap {
             m.retain(|_, (_, t)| t.elapsed() < max_age);
-            if m.len() >= CACHE_CAP_PER_SHARD {
+            if m.len() >= cap {
                 m.clear();
             }
         }
@@ -565,8 +574,14 @@ struct CachedAcct {
 /// A minted service JWT and the (iss, aud, lxm, key id) it was minted for.
 type CachedJwt = Arc<(String, String, String, u64, Arc<str>)>;
 
-static ACCTS: std::sync::LazyLock<TtlCache<String, CachedAcct>> = std::sync::LazyLock::new(TtlCache::new);
-static JWTS: std::sync::LazyLock<TtlCache<u64, CachedJwt>> = std::sync::LazyLock::new(TtlCache::new);
+static ACCTS: std::sync::LazyLock<Arc<TtlCache<String, CachedAcct>>> = std::sync::LazyLock::new(|| {
+    use crate::caches::{track, Cache};
+    track(Cache::ProxyAccounts, Arc::new(TtlCache::new(Cache::ProxyAccounts)))
+});
+static JWTS: std::sync::LazyLock<Arc<TtlCache<u64, CachedJwt>>> = std::sync::LazyLock::new(|| {
+    use crate::caches::{track, Cache};
+    track(Cache::ProxyJwts, Arc::new(TtlCache::new(Cache::ProxyJwts)))
+});
 
 /// Drops `did`'s cached account. Its worker calls this once an account
 /// change is applied (before acking it).

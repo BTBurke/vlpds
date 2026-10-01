@@ -17,29 +17,51 @@ pub struct Jwt {
 }
 
 const TOKEN_CACHE_SHARDS: usize = 64;
-/// Legacy access tokens cached: ~400 B each with their claims, enough for
-/// the tokens of a million active accounts.
-const SESSION_TOKENS_CACHED: usize = 1 << 20;
 
 /// Verified bearer tokens: what a token proves by itself (signature checked,
 /// claims parsed), kept until its `exp`, so a token pays for verification
 /// and parsing once instead of on every request. Only signed tokens are put
 /// here, and a hit compares the whole token. Revocation, sessions and
 /// account status are not cached: callers check them on every request.
-/// Bounded: a full shard drops its expired entries, then all of them.
+/// Bounded by its [`crate::caches`] cap (sized from the memory budget): a
+/// full shard drops its expired entries, then all of them.
 pub struct TokenCache<V> {
     /// signature segment -> (whole token, value, exp unix secs)
     shards: Vec<parking_lot::Mutex<HashMap<Box<str>, (Box<str>, V, u64)>>>,
-    cap_per_shard: usize,
+    kind: crate::caches::Cache,
+    /// A cap of its own instead of the process-wide one (tests).
+    fixed_cap: Option<usize>,
+}
+
+impl<V: Send> crate::caches::Len for TokenCache<V> {
+    fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.lock().len()).sum()
+    }
+}
+
+impl<V: Clone + Send + 'static> TokenCache<V> {
+    /// A cache capped at `kind`'s process-wide cap, counted in its metrics.
+    pub fn tracked(kind: crate::caches::Cache) -> Arc<Self> {
+        crate::caches::track(kind, Arc::new(Self::build(kind, None)))
+    }
 }
 
 impl<V: Clone> TokenCache<V> {
-    /// A cache of about `capacity` tokens.
-    pub fn new(capacity: usize) -> Self {
+    /// A cache of about `capacity` tokens (untracked).
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::build(crate::caches::Cache::SessionTokens, Some(capacity))
+    }
+
+    fn build(kind: crate::caches::Cache, fixed_cap: Option<usize>) -> Self {
         TokenCache {
             shards: (0..TOKEN_CACHE_SHARDS).map(|_| Default::default()).collect(),
-            cap_per_shard: capacity.div_ceil(TOKEN_CACHE_SHARDS).max(1),
+            kind,
+            fixed_cap,
         }
+    }
+
+    fn cap_per_shard(&self) -> usize {
+        self.fixed_cap.unwrap_or_else(|| crate::caches::cap(self.kind)).div_ceil(TOKEN_CACHE_SHARDS).max(1)
     }
 
     /// (shard, signature segment). The signature is random-looking, so its
@@ -65,10 +87,11 @@ impl<V: Clone> TokenCache<V> {
             return;
         }
         let (shard, sig) = self.slot(token);
+        let cap = self.cap_per_shard();
         let mut m = shard.lock();
-        if m.len() >= self.cap_per_shard {
+        if m.len() >= cap {
             m.retain(|_, (_, _, e)| *e >= now);
-            if m.len() >= self.cap_per_shard {
+            if m.len() >= cap {
                 m.clear();
             }
         }
@@ -94,7 +117,7 @@ impl Jwt {
         Jwt {
             secret: secret.as_bytes().to_vec(),
             service_did: service_did.to_string(),
-            verified: Arc::new(TokenCache::new(SESSION_TOKENS_CACHED)),
+            verified: TokenCache::tracked(crate::caches::Cache::SessionTokens),
         }
     }
 
@@ -243,7 +266,7 @@ mod tests {
 
     #[test]
     fn token_cache() {
-        let c: TokenCache<u32> = TokenCache::new(TOKEN_CACHE_SHARDS * 2);
+        let c: TokenCache<u32> = TokenCache::with_capacity(TOKEN_CACHE_SHARDS * 2);
         c.put("h.p.sig", 1, 100, 50);
         assert_eq!(c.get("h.p.sig", 50), Some(1));
         assert_eq!(c.get("h.p.sig", 100), Some(1));

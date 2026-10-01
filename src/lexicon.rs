@@ -202,8 +202,6 @@ pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 const RESOLVED_TTL: Duration = Duration::from_secs(600);
 /// How long a failed resolution is remembered (negative cache).
 const NEGATIVE_TTL: Duration = Duration::from_secs(60);
-/// Most cached resolutions (resolved or failed).
-const MAX_RESOLVED: usize = 4096;
 
 type Resolution = futures::future::Shared<futures::future::BoxFuture<'static, Option<Arc<Lexicons>>>>;
 
@@ -222,8 +220,10 @@ impl Slot {
     }
 }
 
-static RESOLVED: LazyLock<parking_lot::Mutex<HashMap<String, Slot>>> =
-    LazyLock::new(Default::default);
+/// Resolutions (resolved, failed or in flight), at most the `lexicons` cap
+/// ([`crate::caches`]).
+static RESOLVED: LazyLock<Arc<parking_lot::Mutex<HashMap<String, Slot>>>> =
+    LazyLock::new(|| crate::caches::track(crate::caches::Cache::Lexicons, Default::default()));
 
 /// The dynamically resolved (and compiled) lexicon for a record type, when
 /// resolution is enabled, validation isn't skipped and no schema is bundled.
@@ -249,7 +249,7 @@ pub async fn resolve_record_schema(
                     Some(Slot::Done { doc, .. }) => doc.clone(),
                     _ => None,
                 };
-                if m.len() >= MAX_RESOLVED {
+                if m.len() >= crate::caches::cap(crate::caches::Cache::Lexicons) {
                     evict(&mut m);
                 }
                 let fut = spawn_resolution(app.clone(), collection.to_string(), prev.clone());
@@ -267,7 +267,7 @@ pub async fn resolve_record_schema(
 /// Drops expired entries, then the oldest finished one if still full.
 fn evict(m: &mut HashMap<String, Slot>) {
     m.retain(|_, s| s.fresh());
-    if m.len() >= MAX_RESOLVED {
+    if m.len() >= crate::caches::cap(crate::caches::Cache::Lexicons) {
         let oldest = m
             .iter()
             .filter_map(|(k, s)| match s {

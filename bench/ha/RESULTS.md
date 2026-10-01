@@ -38,6 +38,8 @@ python3 bench/ha/hactl.py list         # scenario catalogue
 | `VLPDS_HA_TTL_MS` | 3000 | Lease TTL. |
 | `VLPDS_HA_RATE` | 150 | Writes/s per loadgen. |
 | `VLPDS_HA_PROBES` | 32 | Probe writers, each on a shard sampled at random with a fixed seed. |
+| `VLPDS_HA_INJECT_PUT_MS` | 25 | Injected median latency on every node's segment PUTs (`--inject-put-ms`), so PUTs overlap. 0 turns it off. |
+| `VLPDS_HA_LOG_INFLIGHT` | 4 | Segment PUTs in flight per node log (`--log-inflight`). |
 | `VLPDS_HA_CLEANUP` | 1 | Delete the scenario's bucket prefix once its results are recorded. Deletion runs through `mc` in `vlpds-minio:local`. |
 | `VLPDS_HA_INTERNAL_TOKEN` | `dev-internal-token` | The `x-vlpds-internal` token. It falls back to the admin token on 401, for older dev-mode builds. |
 | `VLPDS_HA_BASE_PORT`, `VLPDS_BIN_DIR`, `VLPDS_HA_S3`, `VLPDS_HA_IMAGE`, `VLPDS_HA_DOCKER_S3` | | As before. |
@@ -75,6 +77,294 @@ These are as before:
 5. **Merged-history agreement (new):** every node that stayed up emits the identical commit sequence, both in the replay and in the live audit.
 6. **Availability:** probe outage windows. A probe is bad if it failed or took more than 2 s.
 7. **Exit codes:** these are recorded, and expected codes are checked where a scenario sets them.
+
+## Pipelined segment PUTs round (`k2*`, `k3*` runs): commit 2e64422, K = 4
+
+This round validates 2e64422 (K segment PUTs in flight per node log, VLSEG03
+`prefix_end`, the hole rule and fence at the first hole, handback to a joiner
+with nudges and draining leases).
+
+- **Binaries:** built from a clean export of 2e64422 (`git archive`) plus two
+  test-only CLI knobs: `--max-segment-mb` takes fractions, and
+  `--firehose-merge-queue-mb` sets the merger's spill budget. Wave C
+  (748039d) has both. The working tree was being edited by other agents during
+  the run, and one of them rebuilt `target/agent-tests` in the middle of a
+  first pass (`k1`, discarded). Every run here used the isolated binaries.
+  `k3*` adds the N10 fix below.
+- **Setup:** the same as O3, plus 25 ms injected median latency on every
+  segment PUT (`--inject-put-ms 25`, lognormal sigma 0.5; the harness default
+  is now `VLPDS_HA_INJECT_PUT_MS=25`) and `--log-inflight 4`
+  (`VLPDS_HA_LOG_INFLIGHT`).
+  - The container image is rebuilt from the same tree.
+  - Another agent's storage benchmark ran on the host the whole time, using
+    about 1.2 cores. Load average was 7–14.
+- **New harness pieces:**
+  - a SigV4 S3 client (`s3_list` / `s3_get`) and a VLSEG03 parser;
+  - `audit_dead_log`;
+  - `kill_on_hole`, which polls a node's log LIST every 5 ms and kill -9s it
+    the moment ordinal n is missing while a later one has landed;
+  - `stop_with_puts_held`;
+  - handoff timing from the node logs;
+  - PUT/hedge counters;
+  - a Prometheus query.
+
+**Result: after the N10 fix, every scenario passes.**
+- On 2e64422 itself, 37 of 39 runs passed. The two failures, `s3-slow-all` and
+  `rolling-restart` at 256 shards, were both bug N10: duplicate firehose
+  events on nodes that had restarted.
+- No acked write was lost in any run.
+- Across the K scenarios there were 6 kill -9 / zombie dead logs. In every one,
+  the fence sat at the first hole and the garbage past it never reached a
+  firehose.
+
+### Native, 64 shards (`k2`, 2e64422)
+
+| Scenario | Verdict | Acked / lost | Max shard outage (o3) | Exits | Notes |
+|---|---|---|---|---|---|
+| baseline-2 | PASS | 19342 / **0** | 0.0 s (0.0) | – |  |
+| baseline-3 | PASS | 23967 / **0** | 0.0 s (0.0) | – |  |
+| baseline-5 | PASS | 32992 / **0** | 0.0 s (0.0) | – |  |
+| kill9-1of3 | PASS | 41870 / **0** | 4.76 s (4.55) | n2 -9 |  |
+| kill9-2of5 | PASS | 55531 / **0** | 4.84 s (5.1) | n3 -9, n4 -9 |  |
+| sigterm | PASS | 35991 / **0** | 0.11 s (1.14) | n2 0 |  |
+| rolling-restart | PASS | 38700 / **0** | 0.21 s (1.85) | n1 0, n2 0, n3 0 |  |
+| zombie | PASS | 41019 / **0** | 6.0 s (6.01) | n2 5 |  |
+| zombie-short | PASS | 38143 / **0** | 4.69 s (5.3) | n2 5 |  |
+| s3-partition | PASS | 38377 / **0** | 4.58 s (4.89) | n2 5 |  |
+| peer-partition | PASS | 36532 / **0** | 12.03 s (12.02) | – |  |
+| full-partition | PASS | 38214 / **0** | 6.29 s (6.0) | n2 5 |  |
+| s3-slow | PASS | 41139 / **0** | 1.34 s (1.76) | n2 -9 |  |
+| s3-slow-all | FAIL | 22801 / **0** | 21.61 s (22.07) | n1 5, n2 5, n3 5 | 1373 duplicate events on rejoined nodes' firehoses (bug N10) |
+| s3-5xx | PASS | 43355 / **0** | 4.14 s (4.97) | n2 5 |  |
+| add-remove | PASS | 36730 / **0** | 4.55 s (4.54) | n3 -9, n4 0 |  |
+| cas-contention | PASS | 7200 / **0** | converged in 1.82 s | – | |
+| handoff-firehose | PASS | 40755 / **0** | 4.54 s (4.76) | n2 0, n3 -9, n4 0 |  |
+| kill9-rebalance-drainer | PASS | 39285 / **0** | 4.24 s (4.37) | n2 -9 |  |
+| kill9-rebalance-joiner | PASS | 42410 / **0** | 4.75 s (5.94) | n4 -9 |  |
+| kill9-rebalance-joiner-after-writes | PASS | 34515 / **0** | 4.9 s (4.86) | n4 -9 |  |
+| zombie-check | PASS | 29725 / **0** | 6.0 s (6.01) | n2 5 |  |
+| grow-1-to-3 | PASS | 16084 / **0** | 0.22 s (1.16) | – |  |
+| s3-5xx-all | PASS | 37813 / **0** | 0.0 s (0.0) | – |  |
+| s3-slow-one-long | PASS | 35129 / **0** | 6.89 s (7.2) | n2 5 |  |
+| kill9-mid-checkpoint | PASS | 44315 / **0** | 4.42 s (4.55) | n2 -9/-9 |  |
+| k-kill9-holes | PASS | 30967 / **0** | 5.14 s (new) | n2 -9/-9 | fence 219 = first hole 219; garbage ordinals [220, 221, 222] (34 events, 0 on any FH); 22 spans and fencers ['n1', 'n3'] all end at 219; fence 186 = first hole 186; garbage ordinals [187] (5 events, 0 on any FH); 20 spans and fencers ['n1', 'n3'] all end at 186 |
+| k-zombie-inflight | PASS | 27956 / **0** | 6.01 s (new) | n2 5 | fence 533 = first hole 533; garbage ordinals [534, 535] (10 events, 0 on any FH); 22 spans and fencers ['n1', 'n3'] all end at 533 |
+| k-sigterm-saturated | PASS | 56526 / **0** | 0.22 s (new) | n2 0 |  |
+| k-s3-slow-lowload | PASS | 2395 / **0** | 0.0 s (new) | – |  |
+| k-spill-holes | PASS | 18045 / **0** | 4.78 s (new) | n2 -9 | fence 234 = first hole 234; garbage ordinals [235, 236] (25 events, 0 on any FH); 20 spans and fencers ['n1', 'n3'] all end at 234 |
+
+### 256 shards (`k2-256`, 2e64422)
+
+| Scenario | Verdict | Acked / lost | Max shard outage (o3) | Exits | Notes |
+|---|---|---|---|---|---|
+| baseline-5 | PASS | 33081 / **0** | 0.0 s (0.0) | – |  |
+| sigterm | PASS | 35853 / **0** | 0.74 s (1.64) | n2 0 |  |
+| rolling-restart | FAIL | 38304 / **0** | 0.82 s (2.37) | n1 0, n2 0, n3 0 | checker FAIL; 3906 duplicate events on rejoined nodes' firehoses (bug N10) |
+| grow-1-to-3 | PASS | 18559 / **0** | 0.85 s (1.63) | – |  |
+| kill9-2of5 | PASS | 56054 / **0** | 4.51 s (5.41) | n3 -9, n4 -9 |  |
+
+### Containers (`k2-ctr`, 2e64422)
+
+| Scenario | Verdict | Acked / lost | Max shard outage (o3) | Exits | Notes |
+|---|---|---|---|---|---|
+| ctr-baseline-3 | PASS | 21603 / **0** | 0.0 s (0.0) | – |  |
+| ctr-partition | PASS | 31321 / **0** | 6.12 s (4.73) | n2 5 |  |
+| ctr-pause | PASS | 33989 / **0** | 6.05 s (5.09) | n2 5 |  |
+| ctr-skew-small | PASS | 32422 / **0** | 4.54 s (4.95) | n2 137 |  |
+| ctr-skew-large | PASS | 33218 / **0** | 5.28 s (5.31) | n2 137 |  |
+| ctr-skew-steady | PASS | 21508 / **0** | 0.0 s (0.0) | – |  |
+
+### Re-run with the N10 fix (`k3`, `k3-rep`, `k3-256`, `k3-256-rep`, `k3-ctr`)
+
+These are the scenarios where a node restarts at the same address, plus both
+N10 failures (each twice), plus the K scenarios.
+
+| Scenario | Verdict | Acked / lost | Max shard outage (o3) | Exits | Notes |
+|---|---|---|---|---|---|
+| s3-slow-all | PASS | 22828 / **0** | 21.56 s (22.07) | n1 5, n2 5, n3 5 |  |
+| rolling-restart | PASS | 38989 / **0** | 0.11 s (1.85) | n1 0, n2 0, n3 0 |  |
+| kill9-1of3 | PASS | 42276 / **0** | 4.63 s (4.55) | n2 -9 |  |
+| kill9-2of5 | PASS | 55982 / **0** | 5.42 s (5.1) | n3 -9, n4 -9 |  |
+| sigterm | PASS | 36237 / **0** | 0.11 s (1.14) | n2 0 |  |
+| zombie-short | PASS | 38427 / **0** | 4.79 s (5.3) | n2 5 |  |
+| handoff-firehose | PASS | 41158 / **0** | 4.31 s (4.76) | n2 0, n3 -9, n4 0 |  |
+| kill9-mid-checkpoint | PASS | 43929 / **0** | 4.52 s (4.55) | n2 -9/-9 |  |
+| grow-1-to-3 | PASS | 16967 / **0** | 0.21 s (1.16) | – |  |
+| k-kill9-holes | PASS | 31718 / **0** | 4.35 s (new) | n2 -9/-9 | fence 245 = first hole 245; garbage ordinals [246, 247] (25 events, 0 on any FH); 21 spans and fencers ['n1', 'n3'] all end at 245; fence 228 = first hole 228; garbage ordinals [230] (5 events, 0 on any FH); 20 spans and fencers ['n1', 'n3'] all end at 228 |
+| k-zombie-inflight | PASS | 27807 / **0** | 6.0 s (new) | n2 5 | fence 535 = first hole 535; garbage ordinals [536, 537] (11 events, 0 on any FH); 20 spans and fencers ['n1', 'n3'] all end at 535 |
+
+| Scenario | Verdict | Acked / lost | Max shard outage (o3) | Exits | Notes |
+|---|---|---|---|---|---|
+| s3-slow-all | PASS | 22725 / **0** | 21.56 s (22.07) | n1 5, n2 5, n3 5 |  |
+| rolling-restart | PASS | 38644 / **0** | 0.21 s (1.85) | n1 0, n2 0, n3 0 |  |
+
+| Scenario | Verdict | Acked / lost | Max shard outage (o3) | Exits | Notes |
+|---|---|---|---|---|---|
+| rolling-restart | PASS | 38297 / **0** | 0.63 s (2.37) | n1 0, n2 0, n3 0 |  |
+| sigterm | PASS | 35773 / **0** | 0.58 s (1.64) | n2 0 |  |
+
+| Scenario | Verdict | Acked / lost | Max shard outage (o3) | Exits | Notes |
+|---|---|---|---|---|---|
+| rolling-restart | PASS | 38292 / **0** | 0.62 s (2.37) | n1 0, n2 0, n3 0 |  |
+
+| Scenario | Verdict | Acked / lost | Max shard outage (o3) | Exits | Notes |
+|---|---|---|---|---|---|
+| ctr-skew-small | PASS | 35076 / **0** | 4.63 s (4.95) | n2 137 |  |
+| ctr-partition | PASS | 33740 / **0** | 6.06 s (4.73) | n2 5 |  |
+
+All 18 `k3*` runs pass. Every replay and start audit has 0 duplicates, and
+history agrees on every node.
+
+### New K-in-flight scenarios: what each checks
+
+Every scenario below also runs the standard checks: verify, `-strict`
+checker, live, replay and start audits, and cross-node history agreement.
+
+**`k-kill9-holes` (a).** Setup:
+- segments ~52 KB, so they seal at ~13 KB while a PUT is in flight;
+- 150 ms median injected PUT latency with sigma 1.0, so PUTs complete out of
+  order;
+- `vlpds_segment_puts_inflight` peaks at 6–8 attempts per node;
+- n2 is killed with kill -9 the instant its S3 listing shows a hole, then
+  restarted, twice per run.
+
+`audit_dead_log` reads the dead log back from S3 and checks:
+1. Exactly one fence, at the first non-segment ordinal.
+2. Every `assign/*` span of that log ends there (20–22 shards).
+3. Every fencer's `fenced dead node's log fence_ordinal=` agrees (n1 and n3).
+4. No seq from a segment past the fence appears in any firehose audit: live,
+   replay or start.
+5. The prefix's last 20 seqs are on every survivor's firehose, so check 4
+   isn't vacuous.
+
+Results:
+
+| Run | Holes seen at kill | Fence = first hole | Garbage past the fence | On any firehose |
+|---|---|---|---|---|
+| k2 | 219 (220–222 landed); 186 (187 landed) | 219; 186 | 220–222 (34 ev); 187 (5 ev) | 0 |
+| k3 | 245; 228 | 245; 228 | 246–247 (25 ev); 230 (5 ev) | 0 |
+
+**`k-zombie-inflight` (b).** Steps:
+1. n2's S3 is blackholed until at least 4 segment PUT attempts hang (two
+   ordinals plus their hedges).
+2. n2 gets SIGSTOP for 4 × TTL. n1 and n3 fence its log at the first missing
+   ordinal (533 in `k2`, 535 in `k3`).
+3. The proxy is healed while n2 is still stopped, so its held PUTs reach
+   MinIO. The PUT at the fence ordinal collides. The PUTs above it land as
+   garbage (534–535 with 10 events, and 536–537 with 11).
+4. SIGCONT.
+
+Results:
+- No acked write is lost, and no garbage event is on any firehose.
+- **n2 exits 5, not 3.** At wake-up, the lease watchdog (`node lease lapsed
+  past takeover`) fires before the 412 at the fence is processed. Both are
+  fail-stops and nothing is acked: the finalizer checks the lease before any
+  ack. Exit 3 (fence collision) would need the PUT response to win that race.
+
+**`k-sigterm-saturated` (c).** Setup: 300 writes/s per node, 100 ms PUT
+latency and small segments. n2 already had 4 PUT attempts in flight at
+SIGTERM.
+
+| Event | Handed | Close + barrier (ms) | Release → serving on the receiver (ms) |
+|---|---|---|---|
+| n4 joins: n1, n2 and n3 hand it 4–6 shards each | 16 | 187–247 | 17–55 |
+| SIGTERM n2 (draining lease): n1, n3 and n4 | 16 | 247 | 98–109 |
+| n2 restarts: n1, n3 and n4 hand back | 16 | 142–235 | 39–90 |
+
+- Nudges: 15 sent and 21 received, with no lost nudge or fallback step.
+- The 503 windows on probes are 0.2–0.4 s per move. In O3 they were 1.1–1.9 s
+  (handback waited for a step).
+
+**`k-s3-slow-lowload` (d).** Setup: 5 writes/s per node plus 4 probes. S3 on
+n2 gets 400 ± 400 ms for 20 s.
+
+| Window | Segments/s | Hedges | PUT requests/s | PUTs per segment |
+|---|---|---|---|---|
+| Before (10 s) | 14.8 | 0 | 14.8 | 1.0 |
+| Slow S3 (20 s) | 1.65 | 34 for 33 segments (+1 in flight) | 3.35 | 2.03 |
+
+- At most one hedge per ordinal.
+- At low load, only one PUT is in flight, so the PUT rate falls with latency
+  instead of exploding.
+
+**`k-spill-holes` (e).** Setup: the `k-kill9-holes` settings plus a 0.25 MiB
+merger budget.
+
+Results:
+- The survivors' mergers spill all the time: 40–43 spills per node, and
+  226–233 segments read back after the kill.
+- n2 is killed at a hole: the fence is at 234 and 235–236 are garbage.
+- Followers drain to the fence, and spilled read-back stops at the hole or
+  fence.
+- The audits are complete, no garbage is emitted, and history agrees.
+
+### Outages compared with O3
+
+- **Handback gap: gone.**
+  - sigterm: 0.11 s (64 shards), 0.58–0.74 s (256), versus 1.14 / 1.64 s.
+  - rolling-restart: 0.11–0.21 s (64), 0.6–0.8 s (256), versus 1.85 / 2.37 s.
+  - grow-1-to-3: 0.21 s, versus 1.16 s.
+- **kill -9: still TTL + skew.**
+  - kill9-1of3 4.6–4.8 s, kill9-2of5 4.8–5.4 s, kill9-mid-checkpoint
+    4.4–4.5 s, versus 4.4–5.4 s.
+  - The K scenarios are 4.3–5.1 s even with 150 ms PUTs.
+- **Unchanged:** zombie, zombie-check, full-partition and ctr-pause are 6.0 s
+  (TTL + skew + the forward deadline). peer-partition is 12 s (O2).
+  s3-slow-all is 21.6 s (every node fail-stops, then the harness restarts
+  them).
+- **ctr-partition: 6.1 s, versus 4.7 s in O3.** It now matches the other
+  hung-forward cases (zombie, ctr-pause), and every write was still acked.
+
+### Bugs found and fixed in this round
+
+**N10: a follower of a restarted node's previous log streamed the new log under the old id, duplicating firehose events.** Severity: high (firehose correctness). Files: `src/remote.rs`, `src/xrpc/internal.rs`.
+
+- **Cause:**
+  - `/internal/v1/log/stream` always served the node's *current* log, and the
+    follower didn't say which log it wanted.
+  - A peer that started following X's old log (from a lease read before X's
+    new incarnation rewrote it) connected to X's unchanged address. It got the
+    new log's batches labeled with the old log id.
+  - Once the new log's ordinals passed the old log's fence ordinal, the
+    follower accepted them. The merger queued every such event under both log
+    ids and emitted it twice.
+  - `stream_live` also ignored that its S3 catch-up had reached the fence.
+- **Evidence:**
+  - `k2/s3-slow-all`: all three nodes restarted at once. The n1 replay had 488
+    identical (seq, did, rev) duplicates, all n3's writer, starting ~16 s after
+    the restart, which is when n3's new log passed old fence 468. The n2
+    replay had 885 duplicates. n3, which followed only new logs, had 0.
+  - `k2-256/rolling-restart`: 1,953 duplicates on n2. Its cursor checker
+    failed with `seq_reorder` and `chain_*`.
+  - This is a latent bug of the per-node-log design: it depends on lease-read
+    timing at restart.
+- **Fix:**
+  - The follower names the log (`?log=<id>`), and the owner refuses any other
+    log (400 `WrongLog`).
+  - A follower whose catch-up reaches the fence stops streaming. Its next
+    round drains and retires the log.
+- **Test:** `tests/all/firehose_startup.rs::log_stream_serves_only_the_named_log`.
+- **After the fix:** the `k3*` runs pass. That includes s3-slow-all ×2 and
+  256-shard rolling-restart ×2, with 0 duplicates anywhere.
+
+**Not a bug: zombie exit code.** With PUTs in flight, the lease watchdog
+fail-stops a woken zombie (5) before the fence collision can (3). Both are
+safe. The `k-zombie-inflight` scenario accepts either.
+
+### Code changes in this round
+
+| File | Change |
+|---|---|
+| `src/remote.rs` | N10: the follower names the log it follows, and stops streaming once its catch-up has reached the fence. |
+| `src/xrpc/internal.rs` | N10: `/internal/v1/log/stream?log=` refuses any log other than the node's current one. |
+| `src/main.rs` | `--max-segment-mb` takes fractions; new `--firehose-merge-queue-mb`. Both are in 748039d. |
+| `tests/all/firehose_startup.rs` | `log_stream_serves_only_the_named_log`. |
+| `bench/ha/hactl.py` | `VLPDS_HA_INJECT_PUT_MS` (25) and `VLPDS_HA_LOG_INFLIGHT` (4) on every node; per-scenario node flags, env and probe count; the S3 client and log audit; `k-kill9-holes`, `k-zombie-inflight`, `k-sigterm-saturated`, `k-s3-slow-lowload`, `k-spill-holes`. |
+
+On the clean 2e64422 tree with the fix: `cargo test` gives 92 lib tests and
+331 in `tests/all`, all passing. In the shared working tree, the lib builds
+with the fix, but the bin doesn't compile because of other agents'
+unfinished `server::Config` fields.
 
 ## O3–O6 round (`o3*` runs): clock-free liveness, cheap control plane, batched drains
 

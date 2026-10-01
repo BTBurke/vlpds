@@ -47,22 +47,37 @@ struct Keys {
     refresh: [u8; 32],
 }
 
-static KEYS: LazyLock<parking_lot::Mutex<HashMap<String, Arc<Keys>>>> =
+/// Keys of the first secret seen: a production process has one, so the
+/// per-request lookup (every DPoP request) is a compare against it,
+/// lock-free and without cloning the secret.
+static FIRST_KEYS: std::sync::OnceLock<(Box<str>, Keys)> = std::sync::OnceLock::new();
+/// Further secrets (in-process tests run servers with several); their keys
+/// are leaked once each, to live as long as the first's.
+static OTHER_KEYS: LazyLock<parking_lot::Mutex<HashMap<Box<str>, &'static Keys>>> =
     LazyLock::new(Default::default);
 
-fn keys(app: &App) -> Arc<Keys> {
-    let secret = &app.config.jwt_secret;
-    let mut m = KEYS.lock();
-    m.entry(secret.clone())
-        .or_insert_with(|| {
-            Arc::new(Keys {
-                server: ServerKey::derive(secret),
-                nonces: DpopNonces::new(secret),
-                csrf: ou::derive_secret(secret, "csrf"),
-                refresh: ou::derive_secret(secret, "refresh-token"),
-            })
-        })
-        .clone()
+fn derive_keys(secret: &str) -> Keys {
+    Keys {
+        server: ServerKey::derive(secret),
+        nonces: DpopNonces::new(secret),
+        csrf: ou::derive_secret(secret, "csrf"),
+        refresh: ou::derive_secret(secret, "refresh-token"),
+    }
+}
+
+fn keys(app: &App) -> &'static Keys {
+    let secret = app.config.jwt_secret.as_str();
+    let (first, k) = FIRST_KEYS.get_or_init(|| (secret.into(), derive_keys(secret)));
+    if **first == *secret {
+        return k;
+    }
+    let mut m = OTHER_KEYS.lock();
+    if let Some(k) = m.get(secret) {
+        return k;
+    }
+    let k: &'static Keys = Box::leak(Box::new(derive_keys(secret)));
+    m.insert(secret.into(), k);
+    k
 }
 
 fn issuer(app: &App) -> String {

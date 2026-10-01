@@ -5,6 +5,7 @@
 //! n/{handle}              -> did
 //! R/{did}\0{coll}/{rkey}  -> record cid | rev | record bytes
 //! c/{did}\0{cid8}{path}   -> empty (record CID index for getBlocks)
+//! L/{did}                 -> record count u64 (large repos: preloaded on shard open)
 
 use crate::cid::{Cid, CID_BYTES_LEN};
 use crate::tid::Tid;
@@ -57,6 +58,16 @@ pub fn private_key(did: &str, name: &str) -> Vec<u8> {
 pub fn private_prefix(did: &str) -> Vec<u8> {
     [b"p/", did.as_bytes(), b"\0"].concat()
 }
+
+/// Large-repo index: one key per repo with at least the pin threshold of
+/// records (written with the commit that crosses it, deleted below half of
+/// it), so a new owner finds the repos to preload with one short scan. A
+/// hint: a stale key only costs a load.
+pub fn large_repo_key(did: &str) -> Vec<u8> {
+    [LARGE_REPO_PREFIX, did.as_bytes()].concat()
+}
+
+pub const LARGE_REPO_PREFIX: &[u8] = b"L/";
 
 pub fn record_prefix(did: &str) -> Vec<u8> {
     [b"R/", did.as_bytes(), b"\0"].concat()

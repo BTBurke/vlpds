@@ -553,6 +553,8 @@ struct Sealed {
     acks: Vec<(Option<AckFn>, Option<Arc<AtomicU32>>, Instant)>,
     last_seq: i64,
     put_secs: f64,
+    /// Size of the stored (compressed) object.
+    stored_bytes: usize,
 }
 
 struct Open {
@@ -692,13 +694,34 @@ async fn run_sequencer(
                 acks: o.acks,
                 last_seq,
                 put_secs: 0.0,
+                stored_bytes: 0,
             };
             ordinal += 1;
             let (store, log_id) = (store.clone(), log_id.clone());
             inflight.push_back(tokio::spawn(async move {
                 let mut sealed = sealed;
+                // the stored form: body zstd-compressed off the runtime (a
+                // few ms for a full segment); the finalizer keeps slicing
+                // frames out of the uncompressed `data`
+                let raw = sealed.data.clone();
+                let put = tokio::task::spawn_blocking(move || {
+                    let t = Instant::now();
+                    let z = segment::compress(&raw, segment::compression_level());
+                    metrics::SEGMENT_COMPRESS.observe(t.elapsed().as_secs_f64());
+                    match z {
+                        Ok(Some(z)) => Bytes::from(z),
+                        Ok(None) => raw,
+                        Err(e) => {
+                            tracing::error!("segment compression failed, storing it uncompressed: {e:#}");
+                            raw
+                        }
+                    }
+                })
+                .await
+                .expect("segment compression task");
+                sealed.stored_bytes = put.len();
                 let t = Instant::now();
-                upload(&store, &log_id, sealed.ordinal, sealed.data.clone(), hedge_after).await;
+                upload(&store, &log_id, sealed.ordinal, put, hedge_after).await;
                 sealed.put_secs = t.elapsed().as_secs_f64();
                 sealed
             }));
@@ -907,6 +930,7 @@ async fn run_finalizer(
         metrics::SEGMENTS.with_label_values(&["node"]).inc();
         metrics::SEGMENT_BYTES.observe(s.data.len() as f64);
         metrics::SEGMENT_BYTES_TOTAL.inc_by(s.data.len() as u64);
+        metrics::SEGMENT_STORED_BYTES_TOTAL.inc_by(s.stored_bytes as u64);
         metrics::PUT_DURATION.with_label_values(&["node"]).observe(s.put_secs);
         metrics::COMMIT_STAGE.with_label_values(&["put"]).observe(s.put_secs);
         let n = s.acks.len();
@@ -1002,7 +1026,12 @@ pub async fn replay_many(store: &Store, shards: &[(u16, &Db, &[Span])]) -> anyho
                 let (store, path) = (store.clone(), segment_path(store, &log_id, ord));
                 async move {
                     match store.raw.get(&path).await {
-                        Ok(r) => r.bytes().await.map(Some).map_err(anyhow::Error::from),
+                        // decompress here, so the 16 reads in flight
+                        // decompress in parallel ahead of the apply loop
+                        Ok(r) => {
+                            let data = r.bytes().await?;
+                            tokio::task::spawn_blocking(move || segment::decode(data)).await?.map(Some)
+                        }
                         Err(object_store::Error::NotFound { .. }) => Ok(None),
                         Err(e) => Err(e.into()),
                     }

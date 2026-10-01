@@ -30,6 +30,12 @@ pub struct Config {
     pub shards: u16,
     pub workers: usize,
     pub cache_per_worker: usize,
+    /// Approximate heap budget of the node's unpinned cached repos (split
+    /// across workers; 0 = bounded by count only).
+    pub repo_cache_bytes: usize,
+    /// Repos with at least this many records stay cached and are preloaded
+    /// on shard open (0 = none; see worker::CacheLimits).
+    pub pin_repo_records: u64,
     pub max_segment_bytes: usize,
     /// Segment PUTs in flight per node log (DESIGN.md "Pipelined segment PUTs").
     pub log_inflight: usize,
@@ -96,6 +102,12 @@ pub struct Config {
     /// Log segment retention (src/retention.rs; `--log-retention`). None = keep
     /// every segment forever.
     pub log_retention: Option<crate::retention::Config>,
+    /// Memory budget of the in-memory caches (verified tokens, proxy
+    /// accounts, DID documents, ...; src/caches.rs), split between them by
+    /// weight. None = 10% of physical RAM or the cgroup limit.
+    pub cache_budget_bytes: Option<u64>,
+    /// Entry caps overriding the budget's, per cache.
+    pub cache_entries: Vec<(crate::caches::Cache, usize)>,
 }
 
 /// Well-known secrets: only accepted with `dev_mode` (see [`Config::check_secrets`]).
@@ -150,6 +162,8 @@ impl Default for Config {
             shards: 8,
             workers: 2,
             cache_per_worker: 10_000,
+            repo_cache_bytes: 4 << 30,
+            pin_repo_records: crate::worker::DEFAULT_PIN_RECORDS,
             max_segment_bytes: 8 << 20,
             log_inflight: crate::nodelog::DEFAULT_LOG_INFLIGHT,
             live_ring_bytes: crate::nodelog::DEFAULT_LIVE_RING_BYTES,
@@ -179,6 +193,8 @@ impl Default for Config {
             memory_store: None,
             metrics_listen: None,
             log_retention: Some(crate::retention::Config::default()),
+            cache_budget_bytes: None,
+            cache_entries: Vec::new(),
         }
     }
 }
@@ -186,6 +202,14 @@ impl Default for Config {
 /// Opens storage, joins the cluster, starts the node log, acquires shards,
 /// and starts the firehose merger and repo workers.
 pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
+    let (caps, budget) = crate::caches::resolve(cfg.cache_budget_bytes, &cfg.cache_entries);
+    crate::caches::apply(&caps);
+    tracing::info!(
+        budget_mb = budget >> 20,
+        memory_mb = crate::caches::memory_bytes().map(|m| m >> 20),
+        full_mb = caps.total_bytes() >> 20,
+        "cache caps: {caps}"
+    );
     // Separate clients (connection pools) for the commit log and everything else.
     let (store, state_store) = match &cfg.s3 {
         None => {
@@ -210,7 +234,8 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let table = crate::partitions::PartitionTable::new(n);
     let lookup_parts = table.clone();
     let lookup: worker::PartitionLookup = Arc::new(move |did: &str| lookup_parts.get(state::partition_of(did, n) as usize));
-    let workers = worker::spawn(cfg.workers, cfg.cache_per_worker, lookup, tokio::runtime::Handle::current());
+    let limits = worker::CacheLimits { entries: cfg.cache_per_worker, bytes: cfg.repo_cache_bytes / cfg.workers.max(1), pin_records: cfg.pin_repo_records };
+    let workers = worker::spawn(cfg.workers, limits, lookup, tokio::runtime::Handle::current());
 
     let mut cc = cfg.cluster.clone().unwrap_or_else(|| ClusterConfig { node_id: "single".into(), addr: cfg.public_url.clone(), ..Default::default() });
     cc.shards = n;

@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod backfill;
 pub mod car;
+pub mod caches;
 pub mod cbor;
 pub mod cid;
 pub mod cluster;

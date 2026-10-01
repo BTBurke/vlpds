@@ -18,11 +18,21 @@ pub struct Mutation {
 // a *fence* object written at its next ordinal (If-None-Match), after which
 // the writer can never append again.
 //
-// "VLSEG04\n"
+// "VLSEG05\n"
 // header: log_id_len u16 | log_id | ordinal u64 | prefix_end u64
-//         | first_seq i64 | last_seq i64 | count u32
+//         | first_seq i64 | last_seq i64 | count u32 | codec u8 | body_len u32
+// body:   entry* (codec 0), or one zstd frame of them (codec 1)
 // entry:  seq i64 | shard u16 | epoch u64 | frame_len u32 | frame
 //         | mut_count u32 | (key_len u16 | key | val_len u32 (MAX = delete) | val)*
+//
+// The header is never compressed, so header-only reads (`parse_header` on
+// a small range GET: prefix_end, seq ranges) work on either codec.
+// `body_len` is the uncompressed body length. The writer keeps the
+// uncompressed object in memory (codec 0: the live ring and the merger
+// slice frames out of it) and stores `compress(obj)`; readers `decode` the
+// stored object back to exactly those bytes (codec byte reset to 0), so
+// entry offsets are the same in both. Real commits compress ~1.9-2.7x at
+// zstd level 1 in segments of 256 KiB and up (DESIGN.md "Log compression").
 //
 // mut_count with its top bit set: bits 0-15 count the muts stored, bits
 // 16-30 the muts *derived* from the #commit frame, which come first (see
@@ -40,7 +50,25 @@ pub struct Mutation {
 // with a bounded number of probes (see `nodelog::in_prefix`).
 // ---------------------------------------------------------------------------
 
-pub const MAGIC: &[u8; 8] = b"VLSEG04\n";
+pub const MAGIC: &[u8; 8] = b"VLSEG05\n";
+
+/// Body codecs (the header's codec byte).
+pub const CODEC_NONE: u8 = 0;
+pub const CODEC_ZSTD: u8 = 1;
+
+/// zstd level for stored segment bodies (`--log-compression`); 0 = off.
+static ZSTD_LEVEL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(DEFAULT_ZSTD_LEVEL);
+pub const DEFAULT_ZSTD_LEVEL: i32 = 1;
+
+/// Sets the zstd level segments are stored with from now on (0 = store
+/// them uncompressed). Readers handle either.
+pub fn set_compression_level(level: i32) {
+    ZSTD_LEVEL.store(level, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn compression_level() -> i32 {
+    ZSTD_LEVEL.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// mut_count flag: derived muts precede the stored ones.
 const DERIVED: u32 = 1 << 31;
@@ -55,6 +83,10 @@ pub struct SegHeader {
     pub first_seq: i64,
     pub last_seq: i64,
     pub count: u32,
+    /// Body codec ([`CODEC_NONE`] or [`CODEC_ZSTD`]).
+    pub codec: u8,
+    /// Uncompressed body length.
+    pub body_len: u32,
 }
 
 pub struct SegEntry {
@@ -172,8 +204,8 @@ impl SegmentBuilder {
         self.sealed_header(log_id, ordinal, ordinal)
     }
 
-    /// The sealed object: the header written into the room `for_log` left
-    /// (no copy), or prepended.
+    /// The sealed (uncompressed) object: the header written into the room
+    /// `for_log` left (no copy), or prepended. [`compress`] makes the stored form.
     pub fn seal(self, log_id: &str, ordinal: u64, prefix_end: u64) -> Vec<u8> {
         let h = self.sealed_header(log_id, ordinal, prefix_end);
         if self.header_room == h.len() {
@@ -199,12 +231,82 @@ impl SegmentBuilder {
         h.put_i64(self.first_seq);
         h.put_i64(self.last_seq);
         h.put_u32(self.count);
+        h.put_u8(CODEC_NONE);
+        h.put_u32((self.body.len() - self.header_room) as u32);
         h
     }
 }
 
+/// Header bytes after the log id.
+const HEADER_TAIL: usize = 41;
+
 fn header_len(log_id: &str) -> usize {
-    MAGIC.len() + 2 + log_id.len() + 36
+    MAGIC.len() + 2 + log_id.len() + HEADER_TAIL
+}
+
+thread_local! {
+    static ZCTX: std::cell::RefCell<Option<(i32, zstd::bulk::Compressor<'static>)>> = const { std::cell::RefCell::new(None) };
+    static DCTX: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The stored form of a sealed, uncompressed segment `obj`: its body as one
+/// zstd frame at `level` (header unchanged but for the codec byte). None if
+/// `level` is 0 or compression doesn't make it smaller: store `obj` as is.
+pub fn compress(obj: &[u8], level: i32) -> anyhow::Result<Option<Vec<u8>>> {
+    if level == 0 {
+        return Ok(None);
+    }
+    let Some((h, hl)) = parse_header(obj)? else { return Ok(None) };
+    anyhow::ensure!(h.codec == CODEC_NONE && hl + h.body_len as usize == obj.len(), "compress: not a sealed uncompressed segment");
+    let body = &obj[hl..];
+    let mut out = Vec::with_capacity(hl + zstd::zstd_safe::compress_bound(body.len()));
+    out.extend_from_slice(&obj[..hl]);
+    out[hl - 5] = CODEC_ZSTD;
+    out.resize(out.capacity(), 0);
+    let n = ZCTX.with(|c| -> anyhow::Result<usize> {
+        let mut c = c.borrow_mut();
+        if c.as_ref().is_none_or(|(l, _)| *l != level) {
+            *c = Some((level, zstd::bulk::Compressor::new(level)?));
+        }
+        Ok(c.as_mut().unwrap().1.compress_to_buffer(body, &mut out[hl..])?)
+    })?;
+    if n >= body.len() {
+        return Ok(None);
+    }
+    out.truncate(hl + n);
+    Ok(Some(out))
+}
+
+/// A stored log object in the form the writer sealed it: a compressed
+/// segment's body decompressed (and its codec byte reset), so entry offsets
+/// match the writer's in-memory object. Fences and uncompressed segments
+/// come back as they are (no copy).
+pub fn decode(data: Bytes) -> anyhow::Result<Bytes> {
+    let Some((h, hl)) = parse_header(&data)? else { return Ok(data) };
+    let body_len = h.body_len as usize;
+    match h.codec {
+        CODEC_NONE => {
+            anyhow::ensure!(data.len() == hl + body_len, "segment {} body is {} bytes, header says {body_len}", h.ordinal, data.len() - hl);
+            Ok(data)
+        }
+        CODEC_ZSTD => {
+            let mut out = Vec::with_capacity(hl + body_len);
+            out.extend_from_slice(&data[..hl]);
+            out[hl - 5] = CODEC_NONE;
+            out.resize(hl + body_len, 0);
+            let n = DCTX.with(|d| -> anyhow::Result<usize> {
+                let mut d = d.borrow_mut();
+                if d.is_none() {
+                    *d = Some(zstd::bulk::Decompressor::new()?);
+                }
+                Ok(d.as_mut().unwrap().decompress_to_buffer(&data[hl..], &mut out[hl..])?)
+            })?;
+            anyhow::ensure!(n == body_len, "segment {} decompressed to {n} bytes, header says {body_len}", h.ordinal);
+            crate::metrics::SEGMENT_DECODES.inc();
+            Ok(out.into())
+        }
+        c => anyhow::bail!("segment {} has unknown codec {c}", h.ordinal),
+    }
 }
 
 pub fn fence_object(by: &str) -> Bytes {
@@ -223,7 +325,7 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<Option<(SegHeader, usize)>> {
     anyhow::ensure!(data.len() >= 10 && data.starts_with(MAGIC), "bad segment magic");
     let idlen = u16::from_be_bytes(data[8..10].try_into()?) as usize;
     let pos = 10 + idlen;
-    anyhow::ensure!(data.len() >= pos + 36, "truncated segment header");
+    anyhow::ensure!(data.len() >= pos + HEADER_TAIL, "truncated segment header");
     let rd8 = |p: usize| -> [u8; 8] { data[p..p + 8].try_into().unwrap() };
     let h = SegHeader {
         log_id: String::from_utf8(data[10..pos].to_vec())?,
@@ -232,14 +334,19 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<Option<(SegHeader, usize)>> {
         first_seq: i64::from_be_bytes(rd8(pos + 16)),
         last_seq: i64::from_be_bytes(rd8(pos + 24)),
         count: u32::from_be_bytes(data[pos + 32..pos + 36].try_into()?),
+        codec: data[pos + 36],
+        body_len: u32::from_be_bytes(data[pos + 37..pos + 41].try_into()?),
     };
     anyhow::ensure!(h.prefix_end <= h.ordinal, "segment {} has prefix_end {} past it", h.ordinal, h.prefix_end);
-    Ok(Some((h, pos + 36)))
+    Ok(Some((h, pos + HEADER_TAIL)))
 }
 
-/// Parses a log object (segment or fence). With `shard` set, only that
-/// shard's entries are returned (handoff replay).
+/// Parses a stored log object (segment or fence), decompressing it if
+/// needed ([`decode`]): frames and values are slices of the uncompressed
+/// object. With `shard` set, only that shard's entries are returned
+/// (handoff replay).
 pub fn parse(data: Bytes, with_muts: bool, shard: Option<u16>) -> anyhow::Result<LogObject> {
+    let data = decode(data)?;
     let Some((h, mut pos)) = parse_header(&data)? else {
         return Ok(LogObject::Fence { by: String::from_utf8_lossy(&data[8..]).into_owned() });
     };
@@ -432,4 +539,46 @@ mod tests {
         }
     }
 
+
+    /// A compressed segment keeps its header readable on its own, decodes
+    /// to exactly the bytes the writer sealed (so frame ranges from `push`
+    /// address both), and parses like the uncompressed one.
+    #[test]
+    fn compressed_roundtrip() {
+        let mut b = SegmentBuilder::for_log("node-a.7");
+        let mut ranges = Vec::new();
+        for i in 0..200u32 {
+            let m = Mutation { key: Bytes::from(format!("R/did:plc:aaaa{}\0app.bsky.feed.like/{i:08}", i % 7)), val: Some(Bytes::from(vec![b'v'; 40])) };
+            ranges.push(b.push(1000 + i as i64, (i % 3) as u16, 2, |o| o.extend_from_slice(format!("frame {i} {}", "x".repeat(64)).as_bytes()), &[m]));
+        }
+        let sealed = b.seal("node-a.7", 5, 3);
+        let stored = compress(&sealed, 1).unwrap().expect("compressible");
+        assert!(stored.len() * 3 < sealed.len(), "{} -> {}", sealed.len(), stored.len());
+        // header-only read of the stored object
+        let (h, hl) = parse_header(&stored[..64]).unwrap().unwrap();
+        assert_eq!((h.ordinal, h.prefix_end, h.first_seq, h.last_seq, h.count, h.codec), (5, 3, 1000, 1199, 200, CODEC_ZSTD));
+        assert_eq!((h.body_len as usize, hl), (sealed.len() - hl, header_len("node-a.7")));
+        let decoded = decode(Bytes::from(stored.clone())).unwrap();
+        assert_eq!(&decoded[..], &sealed[..]);
+        let LogObject::Segment(h2, entries) = parse(Bytes::from(stored), true, Some(1)).unwrap() else { panic!() };
+        assert_eq!(h2.codec, CODEC_NONE);
+        assert_eq!(entries.len(), 67);
+        for e in &entries {
+            let i = (e.seq - 1000) as usize;
+            assert_eq!(&e.frame[..], &sealed[ranges[i].clone()]);
+            assert_eq!(e.muts.len(), 1);
+        }
+        // level 0, fences and incompressible bodies are stored as they are
+        assert!(compress(&sealed, 0).unwrap().is_none());
+        assert!(compress(&fence_object("x"), 1).unwrap().is_none());
+        let mut b = SegmentBuilder::new();
+        let noise: Vec<u8> = (0..4096).map(|_| rand::random::<u8>()).collect();
+        b.push(1, 0, 0, |o| o.extend_from_slice(&noise), &[]);
+        assert!(compress(&b.seal("L", 0, 0), 1).unwrap().is_none());
+        // a corrupt body is an error, not a short segment
+        let mut bad = compress(&sealed, 1).unwrap().unwrap();
+        let n = bad.len();
+        bad.truncate(n - 8);
+        assert!(decode(Bytes::from(bad)).is_err());
+    }
 }

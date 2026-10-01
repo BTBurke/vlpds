@@ -170,7 +170,7 @@ enum Fetched {
 /// (log, ordinal); segments are immutable once written (conditional
 /// creates), so a cached one never goes stale. Missing ordinals and fences
 /// aren't cached (a missing one may still land). Concurrent readers of the
-/// same segment share one GET. Bounded by object bytes, evicted oldest first
+/// same segment share one GET. Bounded by (decompressed) object bytes, evicted oldest first
 /// (replays are sequential).
 pub struct SegCache {
     max_bytes: usize,
@@ -272,6 +272,9 @@ async fn fetch(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result<Fetc
         Err(e) => return Err(e.into()),
     };
     metrics::FIREHOSE_BACKFILL_GETS.inc();
+    // the cache and read-ahead hold the decompressed object (frames are
+    // slices of it), so that's what they count
+    let data = segment::decode(data)?;
     let bytes = data.len();
     match segment::parse(data, false, None)? {
         LogObject::Fence { .. } => Ok(Fetched::End),
@@ -288,7 +291,7 @@ async fn fetch(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result<Fetc
 pub struct Reader {
     pub store: Store,
     pub cache: Arc<SegCache>,
-    /// Read-ahead budget per backfill (all logs together), in object bytes.
+    /// Read-ahead budget per backfill (all logs together), in decompressed object bytes.
     pub readahead_bytes: usize,
     /// Only events whose repo is in this slot range (a sharded subscriber).
     pub shard: Option<SlotRange>,

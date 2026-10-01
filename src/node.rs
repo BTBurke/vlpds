@@ -177,11 +177,13 @@ impl ShardHost for Node {
             .buffer_unordered(32)
             .collect()
             .await;
+        let mut preload = Vec::new();
         for (shard, epoch, db, r) in flushed {
             if let Err(e) = r {
                 results.push((shard, Err(e)));
                 continue;
             }
+            preload.push((shard, db.clone()));
             let apply_lock = Arc::new(tokio::sync::RwLock::new(()));
             self.log.sinks.insert(Arc::new(ShardSink { id: shard, epoch, db: db.clone(), apply_lock: apply_lock.clone() }));
             self.table.set(
@@ -201,6 +203,8 @@ impl ShardHost for Node {
         }
         crate::metrics::OWNED_PARTITIONS.set(self.table.owned().len() as i64);
         tracing::info!(shards = n, segments_replayed = replayed, opened_ms, replayed_ms, elapsed_ms = started.elapsed().as_millis() as u64, "shards opened");
+        // 4. warm the shards' large repos (served already; loads in the background)
+        crate::worker::spawn_preload(&self.workers, preload);
         results
     }
 

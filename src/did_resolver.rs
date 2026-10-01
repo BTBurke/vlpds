@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const CACHE_TTL: Duration = Duration::from_secs(600);
-const CACHE_MAX: usize = 100_000;
 const MAX_DOC_BYTES: usize = 256 << 10;
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -36,7 +35,8 @@ pub struct DidResolver {
     http: reqwest::Client,
     /// Client for the operator-configured PLC directory (may be local).
     plc_http: reqwest::Client,
-    cache: Mutex<HashMap<String, (Instant, Arc<J>)>>,
+    /// Capped by the `did_docs` cap ([`crate::caches`]).
+    cache: Arc<Mutex<HashMap<String, (Instant, Arc<J>)>>>,
 }
 
 impl DidResolver {
@@ -46,7 +46,7 @@ impl DidResolver {
             allow_insecure,
             http: crate::http::guarded(allow_insecure).clone(),
             plc_http: crate::http::public().clone(),
-            cache: Mutex::new(HashMap::new()),
+            cache: crate::caches::track(crate::caches::Cache::DidDocs, Default::default()),
         }
     }
 
@@ -102,10 +102,11 @@ impl DidResolver {
             ));
         }
         let doc = Arc::new(doc);
+        let cap = crate::caches::cap(crate::caches::Cache::DidDocs);
         let mut c = self.cache.lock();
-        if c.len() >= CACHE_MAX {
+        if c.len() >= cap {
             c.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
-            if c.len() >= CACHE_MAX {
+            if c.len() >= cap {
                 c.clear();
             }
         }

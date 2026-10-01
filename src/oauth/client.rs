@@ -36,7 +36,6 @@ const METADATA_MAX_BYTES: usize = 64 << 10;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Client metadata / JWKS are re-fetched at least this often.
 const CACHE_TTL: Duration = Duration::from_secs(600);
-const CACHE_MAX: usize = 10_000;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(tag = "method")]
@@ -659,8 +658,15 @@ pub async fn fetch_json(url: &str, dev_mode: bool, max_bytes: usize) -> Result<J
     serde_json::from_slice(&buf).map_err(|e| format!("invalid JSON: {e}"))
 }
 
+/// Capped by the `oauth_clients` cap ([`crate::caches`]).
 struct Cache<T> {
     map: parking_lot::Mutex<HashMap<String, (Instant, T)>>,
+}
+
+impl<T: Send> crate::caches::Len for Cache<T> {
+    fn len(&self) -> usize {
+        self.map.lock().len()
+    }
 }
 
 impl<T: Clone> Cache<T> {
@@ -677,10 +683,11 @@ impl<T: Clone> Cache<T> {
             .map(|(_, v)| v.clone())
     }
     fn put(&self, k: &str, v: T) {
+        let cap = crate::caches::cap(crate::caches::Cache::OAuthClients);
         let mut m = self.map.lock();
-        if m.len() >= CACHE_MAX {
+        if m.len() >= cap {
             m.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
-            if m.len() >= CACHE_MAX {
+            if m.len() >= cap {
                 m.clear();
             }
         }
@@ -688,7 +695,8 @@ impl<T: Clone> Cache<T> {
     }
 }
 
-static CLIENTS: LazyLock<Cache<Arc<Client>>> = LazyLock::new(Cache::new);
+static CLIENTS: LazyLock<Arc<Cache<Arc<Client>>>> =
+    LazyLock::new(|| crate::caches::track(crate::caches::Cache::OAuthClients, Arc::new(Cache::new())));
 
 /// Resolves and validates a client (cached for 10 minutes, so metadata and
 /// keys are re-fetched periodically).

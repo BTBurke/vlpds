@@ -198,6 +198,21 @@ pub enum WorkerMsg {
     /// worker holds a sender to its own channel for `Loaded`, so the channel
     /// alone never disconnects).
     Shutdown,
+    /// Load a large repo ahead of its first request (after a shard open);
+    /// `done` gets whether a load was started and cached it.
+    Preload { did: Arc<str>, done: oneshot::Sender<bool> },
+    /// What the worker holds for a repo (None = not cached).
+    CacheInfo { did: Arc<str>, reply: oneshot::Sender<Option<CachedRepo>> },
+}
+
+/// A cached repo, as [`WorkerMsg::CacheInfo`] reports it.
+#[derive(Clone, Debug)]
+pub struct CachedRepo {
+    pub records: u64,
+    /// Pinned as a large repo.
+    pub large: bool,
+    /// Bytes charged to the cache budget.
+    pub charge: usize,
 }
 
 /// The repo as of its latest *durable* commit: what exports and proofs serve.
@@ -231,11 +246,53 @@ pub struct RepoState {
     pub blob_refs: HashMap<String, Vec<Cid>>,
     pub view: ViewCell,
     pub nodes: crate::mst::SharedNodeIndex,
+    /// Large (pinned in the cache, `L/` index key written); see `Worker::settle`.
+    pub large: bool,
+    /// Approximate heap charged to the worker's cache ([`repo_bytes`]).
+    pub charge: usize,
 }
 
 impl RepoState {
     fn durable_view(&self) -> Arc<DurableView> {
         Arc::new(DurableView { head: self.head.clone(), tree: self.tree.clone(), nodes: self.nodes.clone() })
+    }
+
+    /// Records in the repo (from the per-collection counts).
+    pub fn records(&self) -> u64 {
+        self.collections.values().map(|n| *n as u64).sum()
+    }
+}
+
+/// In-memory MST bytes per record: 220-250 B measured on real repos
+/// (bench/results/storage-2026-10-02, jemalloc deltas of cold loads).
+pub const MST_BYTES_PER_RECORD: usize = 240;
+/// Per-repo overhead outside the tree (account, key, head, views, maps).
+const REPO_BASE_BYTES: usize = 2048;
+
+/// Approximate heap of a cached repo: what the cache budget counts.
+pub fn repo_bytes(st: &RepoState, records: u64) -> usize {
+    REPO_BASE_BYTES + records as usize * MST_BYTES_PER_RECORD + st.blob_refs.len() * 96
+}
+
+/// Repo cache limits, per worker.
+#[derive(Clone, Copy, Debug)]
+pub struct CacheLimits {
+    /// Unpinned repos held (LRU).
+    pub entries: usize,
+    /// Approximate heap of unpinned repos ([`repo_bytes`]); 0 = unbounded.
+    pub bytes: usize,
+    /// Repos with at least this many records are pinned: never evicted by
+    /// the LRU, indexed under `L/` and preloaded when their shard opens
+    /// (a 5M-record repo is ~1.2 GB of heap and ~8 s of cold load). They
+    /// stay pinned until they drop below half of it. 0 = pin nothing.
+    pub pin_records: u64,
+}
+
+pub const DEFAULT_PIN_RECORDS: u64 = 500_000;
+
+impl From<usize> for CacheLimits {
+    fn from(entries: usize) -> CacheLimits {
+        CacheLimits { entries, bytes: 0, pin_records: DEFAULT_PIN_RECORDS }
     }
 }
 
@@ -281,10 +338,11 @@ pub type PartitionLookup = Arc<dyn Fn(&str) -> Option<Arc<Partition>> + Send + S
 
 pub fn spawn(
     n: usize,
-    cache_per_worker: usize,
+    limits: impl Into<CacheLimits>,
     partitions: PartitionLookup,
     rt: tokio::runtime::Handle,
 ) -> Workers {
+    let limits = limits.into();
     let mut senders = Vec::with_capacity(n);
     let mut receivers = Vec::with_capacity(n);
     for _ in 0..n {
@@ -298,7 +356,7 @@ pub fn spawn(
         let rt = rt.clone();
         std::thread::Builder::new()
             .name(format!("repo-worker-{i}"))
-            .spawn(move || Worker::new(i, me, partitions, rt, cache_per_worker).run(rx))
+            .spawn(move || Worker::new(i, me, partitions, rt, limits).run(rx))
             .unwrap();
     }
     Workers {
@@ -312,8 +370,14 @@ struct Worker {
     partitions: PartitionLookup,
     rt: tokio::runtime::Handle,
     cache: lru::LruCache<Arc<str>, RepoState>,
-    cap: usize,
+    limits: CacheLimits,
+    /// Sum of the cached repos' charges, and the pinned (large) share.
+    bytes: usize,
+    pinned: usize,
+    pinned_bytes: usize,
     loading: HashMap<Arc<str>, Vec<Queued>>,
+    /// Preloads in flight (their `loading` entry starts empty).
+    preloads: HashMap<Arc<str>, oneshot::Sender<bool>>,
     /// Repos whose commit failed while earlier commits were still in flight:
     /// held out of the cache (their requests buffer in `loading`) until those
     /// commits are durable, then reloaded. Reloading any sooner would build
@@ -330,7 +394,7 @@ impl Worker {
         me: Sender<WorkerMsg>,
         partitions: PartitionLookup,
         rt: tokio::runtime::Handle,
-        cap: usize,
+        limits: CacheLimits,
     ) -> Worker {
         Worker {
             label: idx.to_string(),
@@ -338,8 +402,12 @@ impl Worker {
             partitions,
             rt,
             cache: lru::LruCache::unbounded(),
-            cap,
+            limits,
+            bytes: 0,
+            pinned: 0,
+            pinned_bytes: 0,
             loading: HashMap::new(),
+            preloads: HashMap::new(),
             draining: HashMap::new(),
             clock_id: rand::random::<u64>() & 0x3ff,
             stop: false,
@@ -420,13 +488,17 @@ impl Worker {
                     // reload from durable state, once nothing is in flight.
                     tracing::error!(%did, "commit failed, evicting repo: {e:#}");
                     self.discard(did);
+                    continue;
                 }
+                self.settle(&did);
             }
             self.release_drained();
             self.evict();
             metrics::CACHED_REPOS
                 .with_label_values(&[&self.label])
                 .set(self.cache.len() as i64);
+            metrics::REPO_CACHE_BYTES.with_label_values(&[&self.label]).set(self.bytes as i64);
+            metrics::PINNED_REPOS.with_label_values(&[&self.label]).set(self.pinned as i64);
             if self.stop {
                 break;
             }
@@ -445,6 +517,18 @@ impl Worker {
                     WorkerMsg::Write(_) | WorkerMsg::Account(_) | WorkerMsg::Snapshot(_) => unreachable!(),
                     WorkerMsg::Loaded { did, res } => {
                         let buffered = self.loading.remove(&did).unwrap_or_default();
+                        let preload = self.preloads.remove(&did);
+                        let preloaded = preload.is_some();
+                        let cached = matches!(&res, Ok(Some(st)) if (self.partitions)(&did).is_some_and(|p| Arc::ptr_eq(&p, &st.partition)));
+                        if let Some(done) = preload {
+                            metrics::REPO_PRELOADS.with_label_values(&[match &res {
+                                _ if cached => "loaded",
+                                Ok(Some(_)) => "stale",
+                                Ok(None) => "not_found",
+                                Err(_) => "error",
+                            }]).inc();
+                            let _ = done.send(cached);
+                        }
                         match res {
                             // The shard closed (and maybe reopened) while the load
                             // was in flight: the state belongs to an ownership that
@@ -463,10 +547,14 @@ impl Worker {
                                     }
                                 }
                             }
-                            Ok(Some(st)) => {
+                            Ok(Some(mut st)) => {
                                 STATS.repo_loads.fetch_add(1, Ordering::Relaxed);
                                 metrics::REPO_LOADS.with_label_values(&["ok"]).inc();
-                                self.cache.put(did.clone(), st);
+                                // preloaded: found in the L/ index, so the key
+                                // exists (settle deletes it if it's stale)
+                                st.large |= preloaded;
+                                self.cache_put(did.clone(), st);
+                                self.settle(&did);
                                 order.push(did.clone());
                                 groups.insert(did, buffered);
                             }
@@ -488,6 +576,19 @@ impl Worker {
                     }
                     WorkerMsg::CreateRepo(req) => self.create_repo(req),
                     WorkerMsg::Shutdown => self.stop = true,
+                    WorkerMsg::CacheInfo { did, reply } => {
+                        let _ = reply.send(self.cache.peek(&did).map(|st| CachedRepo { records: st.records(), large: st.large, charge: st.charge }));
+                    }
+                    WorkerMsg::Preload { did, done } => {
+                        if self.cache.contains(&did) || self.loading.contains_key(&did) || self.draining.contains_key(&did) {
+                            metrics::REPO_PRELOADS.with_label_values(&["cached"]).inc();
+                            let _ = done.send(false);
+                        } else {
+                            self.loading.insert(did.clone(), Vec::new());
+                            self.preloads.insert(did.clone(), done);
+                            self.spawn_load(did);
+                        }
+                    }
                     WorkerMsg::DropPartition(p, done) => {
                         let drop: Vec<Arc<str>> = self
                             .cache
@@ -496,7 +597,7 @@ impl Worker {
                             .map(|(d, _)| d.clone())
                             .collect();
                         for d in drop {
-                            self.cache.pop(&d);
+                            self.cache_pop(&d);
                         }
                         // the shard is unrouted (and its close barrier settles
                         // the in-flight commits): buffered requests go through a
@@ -517,7 +618,7 @@ impl Worker {
     /// Drops a repo's in-memory state; it reloads from durable state on the
     /// next write, but only once its in-flight commits are durable.
     fn discard(&mut self, did: Arc<str>) {
-        let Some(st) = self.cache.pop(&did) else { return };
+        let Some(st) = self.cache_pop(&did) else { return };
         if st.pending.load(Ordering::Acquire) > 0 {
             self.loading.entry(did.clone()).or_default();
             self.draining.insert(did, st);
@@ -548,6 +649,12 @@ impl Worker {
     fn start_load(&mut self, req: Queued) {
         let did = req.did().clone();
         self.loading.insert(did.clone(), vec![req]);
+        self.spawn_load(did);
+    }
+
+    /// Loads `did` in the background (its `loading` entry is set); the
+    /// result comes back as [`WorkerMsg::Loaded`].
+    fn spawn_load(&mut self, did: Arc<str>) {
         metrics::LOADING_REPOS.inc();
         let me = self.me.clone();
         let Some(partition) = (self.partitions)(&did) else {
@@ -565,24 +672,102 @@ impl Worker {
                 .lock()
                 .record(t.elapsed().as_micros().max(1) as u64);
             metrics::REPO_LOAD_DURATION.observe(t.elapsed().as_secs_f64());
+            if let Ok(Some(st)) = &res {
+                metrics::REPO_LOAD_BY_SIZE.with_label_values(&[size_bucket(st.records())]).observe(t.elapsed().as_secs_f64());
+            }
             metrics::LOADING_REPOS.dec();
             let _ = me.send(WorkerMsg::Loaded { did, res });
         });
     }
 
-    fn evict(&mut self) {
-        let mut skipped = 0;
-        while self.cache.len() > self.cap && skipped < 64 {
-            let Some((did, st)) = self.cache.pop_lru() else {
-                break;
+    /// Inserts a repo, keeping the byte and pin counts.
+    fn cache_put(&mut self, did: Arc<str>, st: RepoState) {
+        self.count(&st, true);
+        if let Some(old) = self.cache.put(did, st) {
+            self.count(&old, false);
+        }
+    }
+
+    fn cache_pop(&mut self, did: &Arc<str>) -> Option<RepoState> {
+        let st = self.cache.pop(did)?;
+        self.count(&st, false);
+        Some(st)
+    }
+
+    fn count(&mut self, st: &RepoState, add: bool) {
+        let sign = |v: &mut usize, n: usize| if add { *v += n } else { *v -= n };
+        sign(&mut self.bytes, st.charge);
+        if st.large {
+            sign(&mut self.pinned, 1);
+            sign(&mut self.pinned_bytes, st.charge);
+        }
+    }
+
+    /// Re-charges a cached repo after it changed, and pins or unpins it by
+    /// size. Crossing the threshold also writes or deletes its `L/` index
+    /// key (a private-state log entry), so the next owner preloads it.
+    fn settle(&mut self, did: &Arc<str>) {
+        let pin = self.limits.pin_records;
+        let Some(st) = self.cache.peek_mut(did) else { return };
+        let records = st.records();
+        let large = pin > 0 && records >= if st.large { pin / 2 } else { pin };
+        let charge = repo_bytes(st, records);
+        let (was_large, was_charge) = (st.large, st.charge);
+        if charge == was_charge && large == was_large {
+            return;
+        }
+        st.charge = charge;
+        st.large = large;
+        if large != was_large {
+            let key = Bytes::from(state::large_repo_key(&st.did));
+            let val = large.then(|| Bytes::copy_from_slice(&records.to_be_bytes()));
+            let entry = LogEntry {
+                shard: st.partition.id,
+                frames: Vec::new(),
+                muts: vec![Mutation { key, val }],
+                ack: None,
+                pending: Some(st.pending.clone()),
+                enqueued: Instant::now(),
             };
-            if st.pending.load(Ordering::Acquire) > 0 {
-                // still has commits in flight: durable state lags memory; keep it
-                self.cache.put(did, st);
-                skipped += 1;
-            } else {
-                metrics::REPO_EVICTIONS.inc();
+            if let Err(e) = send_entry(st, entry) {
+                tracing::warn!(%did, "large-repo index update not logged: {e}");
             }
+        }
+        self.bytes = self.bytes + charge - was_charge;
+        if was_large {
+            self.pinned -= 1;
+            self.pinned_bytes -= was_charge;
+        }
+        if large {
+            self.pinned += 1;
+            self.pinned_bytes += charge;
+        }
+    }
+
+    /// Evicts least recently used repos while the unpinned ones exceed the
+    /// entry or byte budget. Pinned (large) repos and repos with commits in
+    /// flight (durable state lags memory) are skipped.
+    fn evict(&mut self) {
+        let over = |n: usize, b: usize, l: &CacheLimits| n > l.entries || (l.bytes > 0 && b > l.bytes);
+        let (mut n, mut b) = (self.cache.len() - self.pinned, self.bytes - self.pinned_bytes);
+        if !over(n, b, &self.limits) {
+            return;
+        }
+        let mut victims = Vec::new();
+        for (scanned, (did, st)) in self.cache.iter().rev().enumerate() {
+            if !over(n, b, &self.limits) || scanned > self.pinned + 1024 {
+                break;
+            }
+            if st.large || st.pending.load(Ordering::Acquire) > 0 {
+                continue;
+            }
+            n -= 1;
+            b -= st.charge;
+            victims.push(did.clone());
+        }
+        for did in victims {
+            self.cache_pop(&did);
+            metrics::REPO_EVICTIONS.inc();
         }
     }
 
@@ -592,7 +777,7 @@ impl Worker {
         if self.cache.peek(&req.did).is_some_and(|st| {
             st.account.status.as_deref() == Some("deleted") && st.pending.load(Ordering::Acquire) == 0
         }) {
-            self.cache.pop(&req.did);
+            self.cache_pop(&req.did);
         }
         if self.cache.contains(&req.did) || self.loading.contains_key(&req.did) {
             let _ = req
@@ -718,12 +903,70 @@ impl Worker {
             blob_refs: HashMap::new(),
             view,
             nodes,
+            large: false,
+            charge: 0,
         };
-        self.cache.put(req.did, st);
+        let did = req.did.clone();
+        self.cache_put(req.did, st);
         if partition.tx.blocking_send(entry).is_err() {
             tracing::error!("partition sequencer gone");
         }
+        self.settle(&did);
     }
+}
+
+/// Large-repo preloads in flight per node: each is a full repo scan (a 1M-
+/// record repo is ~1.5 s of CPU and ~240 MB), so a takeover of many shards
+/// doesn't starve request-driven loads.
+const PRELOAD_CONCURRENCY: usize = 4;
+
+/// Preloads the large repos (`L/` index) of freshly opened shards in the
+/// background, [`PRELOAD_CONCURRENCY`] at a time, so their first write
+/// doesn't pay the cold load. Stops early if the workers shut down; a shard
+/// closed meanwhile just fails its loads (the worker drops stale ones).
+pub fn spawn_preload(workers: &Workers, shards: Vec<(u16, Arc<slatedb::Db>)>) {
+    use futures::StreamExt;
+    let senders = Arc::downgrade(&workers.senders);
+    tokio::spawn(async move {
+        let t = Instant::now();
+        let mut dids: Vec<Arc<str>> = Vec::new();
+        for (shard, db) in shards {
+            let r: anyhow::Result<()> = async {
+                let mut it = db.scan(state::LARGE_REPO_PREFIX.to_vec()..state::prefix_end(state::LARGE_REPO_PREFIX)).await?;
+                while let Some(kv) = it.next().await? {
+                    dids.push(String::from_utf8_lossy(&kv.key[state::LARGE_REPO_PREFIX.len()..]).into());
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(e) = r {
+                tracing::warn!(shard, "large-repo index scan failed: {e:#}");
+            }
+        }
+        if dids.is_empty() {
+            return;
+        }
+        let n = dids.len();
+        let loaded = futures::stream::iter(dids)
+            .map(|did| {
+                let senders = senders.clone();
+                async move {
+                    let tx = {
+                        let senders = senders.upgrade()?;
+                        let (tx, rx) = oneshot::channel();
+                        let w = Workers { senders };
+                        w.route(&did).send(WorkerMsg::Preload { did, done: tx }).ok()?;
+                        rx
+                    };
+                    tx.await.ok()
+                }
+            })
+            .buffer_unordered(PRELOAD_CONCURRENCY)
+            .filter(|r| std::future::ready(*r == Some(true)))
+            .count()
+            .await;
+        tracing::info!(repos = n, loaded, elapsed_ms = t.elapsed().as_millis() as u64, "large repos preloaded");
+    });
 }
 
 pub fn sign_commit(did: &str, rev: &str, data: &Cid, key: &Keypair) -> (Cid, Bytes) {
@@ -840,7 +1083,20 @@ fn finish_load(
         blob_refs: HashMap::new(),
         view,
         nodes,
+        large: false,
+        charge: 0,
     })
+}
+
+/// Size label for the cold-load histogram.
+fn size_bucket(records: u64) -> &'static str {
+    match records {
+        0..1_000 => "<1k",
+        1_000..10_000 => "1k-10k",
+        10_000..100_000 => "10k-100k",
+        100_000..1_000_000 => "100k-1M",
+        _ => ">=1M",
+    }
 }
 
 /// Net change per path within one commit: (value before the commit, value after).
@@ -1599,6 +1855,90 @@ mod tests {
         // now it reloads (from a state that never got the commits applied here)
         let r = tokio::time::timeout(Duration::from_secs(5), third).await.unwrap().unwrap();
         assert!(r.is_err());
+    }
+
+    /// The cache evicts by approximate bytes as well as count; a repo past
+    /// the pin threshold is never evicted and gets an `L/` index entry, and
+    /// below half the threshold it is unpinned (entry deleted) and evictable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_pins_large_repos_and_evicts_by_bytes() {
+        let store = crate::store::Store::memory(None);
+        let db = Arc::new(crate::partition::open_db(&store, 0, None).await.unwrap());
+        let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
+        let log = NodeLog::start(
+            store.clone(),
+            NodeLogConfig { log_id: "t".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(1), lease_ok: None },
+            merger_tx,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(16);
+        let part = Arc::new(Partition { id: 0, epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone() });
+        let repo = |name: &str, records: u32| {
+            let did: Arc<str> = format!("did:plc:{name}").into();
+            let key = Keypair::generate();
+            let mut tree = Tree::new();
+            for i in 0..records {
+                tree.insert_no_proof(format!("c.x/{i:04}").as_bytes(), Cid::dag_cbor(&i.to_be_bytes())).unwrap();
+            }
+            let root = tree.root_cid().unwrap();
+            let head = Head { commit: root, data: root, rev: Tid(1), commit_block: Bytes::new() };
+            let acct: state::Account = serde_json::from_value(serde_json::json!({
+                "did": &*did, "handle": "t.test", "signing_key": hex::encode(key.to_bytes()), "password_hash": "", "created_at": "",
+            }))
+            .unwrap();
+            let mut st = finish_load(part.clone(), did.clone(), tree, head, key, acct).unwrap();
+            if records > 0 {
+                st.collections.insert("c.x".into(), records);
+            }
+            (did, st)
+        };
+        let small_bytes = REPO_BASE_BYTES + 10 * MST_BYTES_PER_RECORD;
+        let limits = CacheLimits { entries: 100, bytes: 3 * small_bytes, pin_records: 50 };
+        let (me, _rx) = crossbeam_channel::unbounded();
+        let mut w = Worker::new(0, me, Arc::new(|_: &str| None), tokio::runtime::Handle::current(), limits);
+        let big = repo("big", 60);
+        let smalls: Vec<_> = (0..5).map(|i| repo(&format!("small{i}"), 10)).collect();
+        let big_did = big.0.clone();
+        let w = tokio::task::spawn_blocking(move || {
+            w.cache_put(big.0.clone(), big.1);
+            w.settle(&big.0);
+            for (did, st) in smalls {
+                w.cache_put(did.clone(), st);
+                w.settle(&did);
+                w.evict();
+            }
+            w
+        })
+        .await
+        .unwrap();
+        let entry = rx.recv().await.unwrap();
+        assert_eq!(entry.muts[0].key, state::large_repo_key(&big_did));
+        assert_eq!(entry.muts[0].val.as_deref(), Some(&60u64.to_be_bytes()[..]));
+        settle(entry);
+        let cached = |w: &Worker| w.cache.iter().map(|(d, _)| d.to_string()).collect::<std::collections::BTreeSet<_>>();
+        assert!(w.cache.contains(&big_did), "the large repo stays");
+        assert_eq!((w.pinned, w.cache.len()), (1, 4), "{:?}", cached(&w));
+        assert!(!w.cache.contains("did:plc:small0") && !w.cache.contains("did:plc:small1"), "oldest small repos evicted");
+        assert_eq!(w.bytes - w.pinned_bytes, 3 * small_bytes);
+        assert_eq!(w.pinned_bytes, REPO_BASE_BYTES + 60 * MST_BYTES_PER_RECORD);
+        // shrinks to 30 records: still pinned (above half); to 20: unpinned
+        let w = tokio::task::spawn_blocking(move || {
+            let mut w = w;
+            for n in [30, 20] {
+                w.cache.peek_mut(&big_did).unwrap().collections.insert("c.x".into(), n);
+                w.settle(&big_did);
+                assert_eq!(w.pinned, (n == 30) as usize);
+            }
+            (w, big_did)
+        })
+        .await
+        .unwrap();
+        let (mut w, big_did) = w;
+        let entry = rx.recv().await.unwrap();
+        assert!(entry.muts[0].key == state::large_repo_key(&big_did) && entry.muts[0].val.is_none());
+        settle(entry);
+        w.evict();
+        assert!(!w.cache.contains(&big_did), "unpinned, the least recently used goes first: {:?}", cached(&w));
+        assert_eq!(w.bytes, 3 * small_bytes);
     }
 
     /// Dropping the last `Workers` handle ends the threads (each holds a

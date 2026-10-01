@@ -89,14 +89,35 @@ pub fn set_sst_compression(c: SstCompression) {
     *SST_COMPRESSION.write() = c;
 }
 
-/// SlateDB GC: how old an SST compaction replaced must be before it is
-/// deleted (`--slatedb-gc-min-age`). SlateDB's default is 5 min; a long scan
-/// (a 10M-record getRepo, listRepos) reads SSTs from the manifest it started
-/// with, so keep a day of them.
-static GC_MIN_AGE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(24 * 3600);
+/// SlateDB GC (`--slatedb-gc-min-age`): an SST no manifest or checkpoint
+/// references is deleted once it is this old, counted from its *creation*.
+/// It only guards SSTs written but not yet in a manifest (SlateDB also caps
+/// the cutoff at the oldest running compaction and the newest L0), so it
+/// doesn't protect reads: an SST created long ago and replaced now passes
+/// any min age at once. Reads are protected by the compactor's checkpoint
+/// lifetime below. (It was 24 h, which kept every SST a bulk import
+/// replaced, ~3x the live bytes, for a day; see DESIGN.md §4.)
+static GC_MIN_AGE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10 * 60);
 
 pub fn set_gc_min_age(d: Duration) {
     GC_MIN_AGE_SECS.store(d.as_secs(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Compactor checkpoint lifetime (`--slatedb-checkpoint-lifetime`). Before
+/// each manifest update that replaces SSTs, the compactor writes a
+/// checkpoint of the old manifest that lives this long, so GC keeps the
+/// replaced SSTs for reads that started on it: a scan or snapshot (a
+/// 10M-record getRepo streaming to a slow client, listRepos) must finish
+/// within it. SlateDB's default is 15 min. It also bounds how long a bulk
+/// import's replaced SSTs linger after each compaction.
+static CHECKPOINT_LIFETIME_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3600);
+
+pub fn set_checkpoint_lifetime(d: Duration) {
+    CHECKPOINT_LIFETIME_SECS.store(d.as_secs().max(60), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn checkpoint_lifetime() -> Duration {
+    Duration::from_secs(CHECKPOINT_LIFETIME_SECS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn gc_options() -> slatedb::config::GarbageCollectorOptions {
@@ -191,7 +212,7 @@ fn spawn_compactor(db: &Db, path: String, raw: Arc<dyn object_store::ObjectStore
     use slatedb::config::{CompactionWorkerOptions, CompactorOptions};
     let mut status = db.subscribe();
     tokio::spawn(async move {
-        let mut opts = CompactorOptions { worker: None, ..Default::default() };
+        let mut opts = CompactorOptions { worker: None, checkpoint_lifetime: checkpoint_lifetime(), ..Default::default() };
         let mut worker_opts = CompactionWorkerOptions { compression_codec: codec, ..Default::default() };
         if cfg!(test) {
             // unit tests wait for compactions
@@ -376,6 +397,12 @@ mod tests {
             assert!(t.elapsed() < Duration::from_secs(30), "no compaction: {} L0s", m.l0().len());
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        // the manifest update that replaced the L0s carries the compactor's
+        // checkpoint of the old manifest, with our lifetime (what keeps the
+        // replaced SSTs for in-flight reads, and nothing longer)
+        let m = db.manifest();
+        let cp = m.checkpoints().iter().filter_map(|c| Some(c.expire_time? - c.create_time)).max().expect("compactor checkpoint");
+        assert_eq!(cp.num_seconds() as u64, checkpoint_lifetime().as_secs());
         db.close().await.unwrap();
         let db = open_db(&store, 0, None).await.unwrap();
         assert_eq!(db.get(b"k0123").await.unwrap().as_deref(), Some(format!("value 7 123 {}", "x".repeat(100)).as_bytes()));

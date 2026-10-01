@@ -85,6 +85,16 @@ struct Args {
     /// Cached repos per worker.
     #[arg(long, default_value_t = 50_000)]
     cache_per_worker: usize,
+    /// Approximate heap budget for cached repos on this node (MiB; in-memory
+    /// MSTs at ~240 B per record). Least recently used repos are evicted past
+    /// it or past --cache-per-worker; pinned repos don't count. 0 = no byte bound.
+    #[arg(long, env = "VLPDS_REPO_CACHE_MB", default_value_t = 16384)]
+    repo_cache_mb: usize,
+    /// Repos with at least this many records are pinned in the repo cache
+    /// and preloaded when their shard opens (a takeover or handback), so a
+    /// first write doesn't wait out a multi-second cold load. 0 = off.
+    #[arg(long, env = "VLPDS_PIN_REPO_RECORDS", default_value_t = vlpds::worker::DEFAULT_PIN_RECORDS)]
+    pin_repo_records: u64,
     /// Segment size cap (MiB; fractions allow small segments in HA tests, so
     /// K PUTs are in flight at modest load).
     #[arg(long, default_value_t = 8.0)]
@@ -131,11 +141,22 @@ struct Args {
     /// SlateDB SST block compression: none, lz4 or zstd.
     #[arg(long, env = "VLPDS_SST_COMPRESSION", default_value = "zstd")]
     sst_compression: String,
-    /// SlateDB GC: compacted SSTs no longer in the manifest are deleted once
-    /// this old (e.g. 24h, 30m). Long scans (a 10M-record getRepo) may still
-    /// be reading them.
-    #[arg(long, env = "VLPDS_SLATEDB_GC_MIN_AGE", default_value = "24h")]
+    /// Log segment body compression: zstd level (0 = store segments
+    /// uncompressed). Level 1 stores real commits ~2x smaller for ~4-6 µs
+    /// of CPU per commit (DESIGN.md "Log compression").
+    #[arg(long, env = "VLPDS_LOG_COMPRESSION", default_value_t = vlpds::segment::DEFAULT_ZSTD_LEVEL, allow_hyphen_values = true)]
+    log_compression: i32,
+    /// SlateDB GC: SSTs no manifest or checkpoint references are deleted
+    /// once this old (from creation; e.g. 10m, 1h). Guards SSTs not yet in
+    /// a manifest; reads are protected by --slatedb-checkpoint-lifetime.
+    #[arg(long, env = "VLPDS_SLATEDB_GC_MIN_AGE", default_value = "10m")]
     slatedb_gc_min_age: String,
+    /// How long SSTs a compaction replaced stay readable (the compactor's
+    /// checkpoint lifetime): a scan or snapshot (a big getRepo to a slow
+    /// client) must finish within it. Also how long a bulk import's
+    /// replaced SSTs linger (DESIGN.md §4).
+    #[arg(long, env = "VLPDS_SLATEDB_CHECKPOINT_LIFETIME", default_value = "1h")]
+    slatedb_checkpoint_lifetime: String,
     /// Log segment retention: the firehose backfill window (e.g. 72h, 30m;
     /// "off" keeps every segment). Older segments no replay can need are
     /// deleted; older cursors get OutdatedCursor.
@@ -202,6 +223,17 @@ struct Args {
     /// `x-ratelimit-bypass` header value that skips rate limits.
     #[arg(long, env = "VLPDS_RATE_LIMIT_BYPASS_KEY")]
     rate_limit_bypass_key: Option<String>,
+    /// Memory budget of the in-memory caches (verified tokens, proxy
+    /// accounts and service JWTs, DID documents, lexicons, OAuth clients),
+    /// split between them by weight (MiB). Default: 10% of physical RAM or
+    /// the cgroup limit. The chosen caps are logged at startup.
+    #[arg(long, env = "VLPDS_CACHE_BUDGET_MB")]
+    cache_budget_mb: Option<u64>,
+    /// Entry caps overriding the budget's split, comma-separated
+    /// `<cache>=<entries>` (session_tokens, oauth_tokens, proxy_accounts,
+    /// proxy_jwts, did_docs, lexicons, oauth_clients, permission_sets).
+    #[arg(long, env = "VLPDS_CACHE_ENTRIES", value_delimiter = ',')]
+    cache_entries: Vec<String>,
     /// Push continuous CPU profiles (100 Hz) to this Pyroscope server, tagged
     /// with the node id and git revision (needs `--features profiling`;
     /// bench/obs runs one on http://127.0.0.1:4040).
@@ -327,6 +359,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     vlpds::partition::set_block_cache_bytes(args.block_cache_mb << 20);
     vlpds::partition::set_sst_compression(args.sst_compression.parse()?);
     vlpds::partition::set_gc_min_age(vlpds::retention::parse_duration(&args.slatedb_gc_min_age)?);
+    vlpds::partition::set_checkpoint_lifetime(vlpds::retention::parse_duration(&args.slatedb_checkpoint_lifetime)?);
+    vlpds::segment::set_compression_level(args.log_compression);
     let log_retention = match args.log_retention.as_str() {
         "off" | "none" => None,
         v => Some(vlpds::retention::Config { window: vlpds::retention::parse_duration(v)?, ..Default::default() }),
@@ -350,6 +384,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         shards: args.shards,
         workers: args.workers.unwrap_or_else(default_workers).max(1),
         cache_per_worker: args.cache_per_worker,
+        repo_cache_bytes: args.repo_cache_mb << 20,
+        pin_repo_records: args.pin_repo_records,
         max_segment_bytes: mib(args.max_segment_mb, 4096),
         log_inflight: args.log_inflight.max(1),
         live_ring_bytes: mib(args.live_ring_mb, 1),
@@ -389,6 +425,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         memory_store: None,
         metrics_listen: args.metrics_listen.clone(),
         log_retention,
+        cache_budget_bytes: args.cache_budget_mb.map(|m| m << 20),
+        cache_entries: vlpds::caches::parse_overrides(&args.cache_entries)?,
     };
     cfg.check_secrets()?;
     if args.lease_ttl_ms < 10_000 && !args.dev_mode {

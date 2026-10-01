@@ -44,7 +44,9 @@ uploading, ack both in order), and **no per-commit MST storage churn**.
 
 ### 1. Repo shards (CPU path)
 - DID → shard by hash. A shard owns its repos' in-memory state:
-  `RepoState { head: commit cid + rev, mst: Arc<Node>, key: SigningKey }`, LRU-bounded by bytes.
+  `RepoState { head: commit cid + rev, mst: Arc<Node>, key: SigningKey }`, LRU-bounded by
+  count (`--cache-per-worker`) and approximate bytes (`--repo-cache-mb`; ~240 B of MST
+  heap per record). Large repos are pinned and preloaded (§2).
 - Writes to one repo are processed in order. A write does not wait for the
   previous commit to be durable; it builds on the in-memory head. Writes are
   acked in log order, so a client never sees commit N+1 acked before N.
@@ -82,8 +84,20 @@ The MST is fully determined by the set of `(key, record CID)` pairs. So:
   commit's written nodes. It covers a rev range, so a miss inside that range
   is final. A broken commit chain (importRepo) or too many stale entries drops
   it, and the next request rebuilds it. Nothing is persisted.
-- Escape hatch for very large repos (≥1M records): periodically write an MST snapshot
-  object so a cold load doesn't need an O(n) rebuild. Not needed for v1.
+- **Large repos are pinned.** A cold load costs ~1.5 µs of CPU and ~240 B of
+  heap per record (real repos: 594k records, 0.9 s, 130 MB; a 5–10 M-record
+  repo is 1–2 GB and 8–15 s). Repos with at least `--pin-repo-records`
+  (500k) records are never evicted by the LRU (they don't count toward its
+  entry or byte budget; they unpin below half the threshold). Crossing the
+  threshold logs a private-state entry `L/{did}` → record count, so when a
+  shard opens (startup, takeover, handback) its new owner scans `L/` and
+  preloads those repos in the background, 4 at a time per node, before
+  their first write. The key is a hint: a stale one costs a load.
+  Metrics: `vlpds_repo_cache_bytes`, `vlpds_repo_cache_pinned`,
+  `vlpds_repo_load_by_size_seconds{records}`, `vlpds_repo_preloads_total`.
+- Escape hatch if even preloads are too slow (≥10M records): periodically
+  write an MST snapshot object so a cold load doesn't need an O(n) rebuild.
+  Not needed for v1.
 
 Persisted state per commit drops from ~15 KV operations to about 2: the record and
 the repo head.
@@ -104,9 +118,10 @@ the repo head.
   idempotent key makes this safe). If it is unrecoverable, the process exits and
   recovery replays from durable state. Unacked in-memory commits are discarded,
   which is safe because they were never acknowledged or broadcast.
-- Segment format: concatenated length-prefixed firehose frames + footer index
-  (seq → offset), so serving the firehose is a byte copy and cursor seeks are one
-  range GET.
+- Segment format: a header (uncompressed, so header-only range GETs work)
+  and a body of length-prefixed entries (firehose frame + state mutations),
+  stored zstd-compressed (see "Log compression" under HA). Serving the
+  firehose is a byte copy out of the decompressed body.
 - Retention: 72 h (firehose backfill window), never deleting what a replay
   could need (see "Log retention" under HA).
 
@@ -146,11 +161,27 @@ swappable.
   format) starts after the DB opens rather than inside the open, so a
   takeover or handback serves ~11 store round trips sooner. Its outputs
   aren't written into the local disk cache (reads fill it).
-- SlateDB GC deletes SSTs compaction replaced once they are
-  `--slatedb-gc-min-age` old (24 h; SlateDB's default is 5 min). A long scan
-  (a 10M-record getRepo, listRepos) reads the SSTs of the manifest it started
-  with, so a day of compaction output is kept as garbage; it is linear in
-  the write rate, not cumulative.
+- **What keeps replaced SSTs.** A scan or snapshot reads the SSTs of the
+  manifest it started with. Before each manifest update that replaces SSTs,
+  SlateDB's compactor writes a *checkpoint* of the old manifest that expires
+  after `--slatedb-checkpoint-lifetime` (vlpds: 1 h; SlateDB's default 15 min),
+  and GC never deletes an SST a live checkpoint references. That lifetime is
+  the read guarantee: a scan (a 10M-record getRepo to a slow client) must
+  finish within it. vlpds creates no checkpoints of its own (its
+  "checkpoints" are applied markers + memtable flushes). Separately, GC
+  skips SSTs younger than `--slatedb-gc-min-age` (10 min), counted from the
+  SST's *creation*: that only guards SSTs not yet in a manifest. It was
+  24 h, which protected nothing extra (an SST created long ago and replaced
+  now passes it at once) but kept every SST written in the last day.
+- **Bulk import space.** Importing the storage sample (6.94 GB live) wrote
+  28 GB of SSTs (4.0x: size-tiered compaction rewrites each row ~3 times).
+  Replaced SSTs are now deleted ~checkpoint lifetime after their
+  replacement, so peak transient space is the compaction output of the last
+  hour (up to ~4x live while an import runs, ~1x of the largest run in
+  steady state), not of the last 24 h. Shortening the lifetime after an
+  import isn't safe in general (it is what in-flight exports rely on);
+  lower `--slatedb-checkpoint-lifetime` for a dedicated import window
+  instead.
 
 ### 5. Firehose
 - Live: after durability, a node's sealed segments go to a byte-bounded live ring
@@ -411,10 +442,50 @@ and its PUT at F collides with the fence, so it fail-stops instead (exit 3). Its
 land, but nothing reads past F. Garbage is left in place; it's bounded by
 K − 1 segments per crash.
 
+### Log compression (`VLSEG05`, `--log-compression`)
+
+Segments are ~5.4 KB per single-record commit on real data, ~85% of it the
+firehose frame (MST proof blocks dominate). The sealed body is stored as one
+zstd frame (level 1 by default, 0 = off) behind an uncompressed header
+(`codec` byte + uncompressed `body_len`), so header-only reads
+(`read_head`, `prefix_end`, fencing) are unchanged.
+
+- **Writer.** The finalizer keeps the *uncompressed* sealed object: the live
+  ring, the merger and peers' live streams get zero-copy slices of it, as
+  before. Compression runs in the segment's upload task on the blocking
+  pool (a few ms per full segment), and hedges/retries PUT the same
+  compressed bytes (conflict resolution compares those).
+- **Readers.** `segment::decode` restores exactly the bytes the writer sealed
+  (codec byte reset), so entry offsets agree; `segment::parse` decodes
+  first, so replay (decompressing its 16 read-ahead GETs in parallel),
+  follower catch-up, the merger's spill read-back and fencing all handle
+  either codec. Backfill decodes once per GET and caches the decompressed
+  segment (its cache and read-ahead budgets count decompressed bytes), so
+  many subscribers on one range cost one decode.
+
+Measured (`bench/results/storage-2026-10-02` method: 300k real records from
+815 repos replayed as single-record commits, 4.2 KB/entry, entries re-packed
+into segments of each size; one M-series core):
+
+| segment | log order (per-repo runs) | shuffled repos | one entry per repo |
+|---|---|---|---|
+| 16 KiB | 1.60x | 1.57x | — |
+| 256 KiB | 3.84x | 1.95x | 1.95x |
+| 1 MiB | 5.15x | 2.04x | — |
+| 8 MiB | 5.61x | 2.07x | — |
+
+(zstd 1; level 3 adds 3–30% for ~1.7x the CPU, level −1 loses ~8%.) Under
+load segments are 0.5–8 MiB and mix many repos, so expect ~2x: commits
+share DIDs, NSIDs, CBOR keys and, within a repo, upper MST nodes. CPU:
+compress 0.7–1.0 GB/s (4.3–5.9 µs per 4.2 KB commit), decompress 2.3–3.8
+GB/s (1.1–1.8 µs). At 75k commits/s (~80 µs of node CPU each) that's
+~0.35 core, ~5%, and it halves PUT bytes (~400 → ~200 MB/s), upload time
+and the retention window's storage.
+
 ### Log retention (`src/retention.rs`)
 
-Without it the logs grow forever (~3.5 KB per commit, a new prefix per node
-restart). A segment is deleted once **(a)** no replay can need it and **(b)**
+Without it the logs grow forever (~2.5 KB per commit stored, ~5 KB before
+compression; a new prefix per node restart). A segment is deleted once **(a)** no replay can need it and **(b)**
 it is older than the backfill window (`--log-retention`, default 72 h, by the
 object's last-modified time). Each pass deletes at most 10,000 objects,
 oldest first (one paged LIST from the log's head, one batched DELETE), so
@@ -730,7 +801,8 @@ proxy traffic and concurrently active repos).
 - **SlateDB state** sits on S3 Standard with each node's NVMe as the SST
   disk cache.
 - **Log retention** is ~72 h for firehose backfill: ~1.5 TB today, ~150 TB at
-  100× (`src/retention.rs`, "Log retention" above). Single-record commits
+  100× before compression, about half that stored (`src/retention.rs`,
+  "Log retention" and "Log compression" above). Single-record commits
   take ~2.3–3.3 KB of segment (repos of 300–500 records; the MST path nodes
   in the CAR dominate): the record and head values aren't stored twice, they
   are rebuilt from the commit's CAR at replay (`segment::derive_commit_muts`).

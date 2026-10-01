@@ -22,6 +22,8 @@ slatedb-metrics = ["dep:slatedb-common"]
 [dependencies]
 # zstd/lz4: SST block compression (--sst-compression, default zstd)
 slatedb = { version = "0.17", features = ["aws", "wal_disable", "zstd", "lz4"] }
+# log segment body compression (src/segment.rs; the same zstd SlateDB links)
+zstd = "0.13"
 object_store = { version = "0.14", features = ["aws"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }

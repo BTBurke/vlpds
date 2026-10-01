@@ -82,6 +82,19 @@ pub fn verify_k256(pubkey_sec1: &[u8], msg: &[u8], sig: &[u8]) -> anyhow::Result
         .is_ok())
 }
 
+/// [`verify_k256`], also accepting the high-S form of a signature: the
+/// reference's `allowMalleableSig`, used for inter-service JWTs only (commits
+/// and records stay low-S).
+pub fn verify_k256_malleable(pubkey_sec1: &[u8], msg: &[u8], sig: &[u8]) -> anyhow::Result<bool> {
+    let pk = PublicKey::from_slice(pubkey_sec1)?;
+    let mut sig = Signature::from_compact(sig)?;
+    sig.normalize_s();
+    let digest: [u8; 32] = Sha256::digest(msg).into();
+    Ok(SECP256K1
+        .verify_ecdsa(&Message::from_digest(digest), &sig, &pk)
+        .is_ok())
+}
+
 pub fn random_plc_did() -> String {
     let b: [u8; 15] = rand::random();
     format!("did:plc:{}", crate::cid::base32_encode(&b))

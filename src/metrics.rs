@@ -46,13 +46,20 @@ lazy!(REPO_LOADS: IntCounterVec = register_int_counter_vec!("vlpds_repo_loads_to
 lazy!(REPO_LOAD_DURATION: Histogram = register_histogram!("vlpds_repo_load_seconds", "Cold repo load latency (scan + MST rebuild + verify)", latency_buckets()));
 lazy!(REPO_LOAD_RECORDS: Histogram = register_histogram!("vlpds_repo_load_records", "Records per cold-loaded repo", exponential_buckets(1.0, 4.0, 12).unwrap()));
 lazy!(REPO_EVICTIONS: IntCounter = register_int_counter!("vlpds_repo_evictions_total", "Repos evicted from worker caches"));
+lazy!(REPO_CACHE_BYTES: IntGaugeVec = register_int_gauge_vec!("vlpds_repo_cache_bytes", "Approximate heap of the repos a worker holds (MST ~ records x per-record bytes)", &["worker"]));
+lazy!(PINNED_REPOS: IntGaugeVec = register_int_gauge_vec!("vlpds_repo_cache_pinned", "Large repos pinned in a worker's cache (not evicted by the LRU)", &["worker"]));
+lazy!(REPO_LOAD_BY_SIZE: HistogramVec = register_histogram_vec!("vlpds_repo_load_by_size_seconds", "Cold repo load latency by repo size (records)", &["records"], latency_buckets()));
+lazy!(REPO_PRELOADS: IntCounterVec = register_int_counter_vec!("vlpds_repo_preloads_total", "Large-repo preloads after a shard open, by result", &["result"]));
 
 // ---- partitions / log ----
 lazy!(SEQ_QUEUE: IntGaugeVec = register_int_gauge_vec!("vlpds_sequencer_queue_depth", "Log entries waiting for the sequencer", &["partition"]));
 lazy!(SEGMENTS: IntCounterVec = register_int_counter_vec!("vlpds_segments_total", "Segments made durable", &["partition"]));
 lazy!(SEGMENT_BYTES: Histogram = register_histogram!("vlpds_segment_bytes", "Segment object size", exponential_buckets(1024.0, 2.0, 14).unwrap()));
 lazy!(SEGMENT_EVENTS: Histogram = register_histogram!("vlpds_segment_events", "Firehose events per segment", exponential_buckets(1.0, 2.0, 16).unwrap()));
-lazy!(SEGMENT_BYTES_TOTAL: IntCounter = register_int_counter!("vlpds_segment_bytes_total", "Bytes written to the log"));
+lazy!(SEGMENT_BYTES_TOTAL: IntCounter = register_int_counter!("vlpds_segment_bytes_total", "Bytes written to the log (uncompressed segments)"));
+lazy!(SEGMENT_STORED_BYTES_TOTAL: IntCounter = register_int_counter!("vlpds_segment_stored_bytes_total", "Bytes of segment objects PUT (after compression)"));
+lazy!(SEGMENT_COMPRESS: Histogram = register_histogram!("vlpds_segment_compress_seconds", "CPU time to zstd one segment body before its PUT", latency_buckets()));
+lazy!(SEGMENT_DECODES: IntCounter = register_int_counter!("vlpds_segment_decodes_total", "Compressed segments decompressed by readers (replay, follower catch-up, backfill, merger read-back)"));
 lazy!(PUT_DURATION: HistogramVec = register_histogram_vec!("vlpds_segment_put_seconds", "Segment PUT latency until durable (incl. hedges/retries)", &["partition"], latency_buckets()));
 lazy!(PUT_ATTEMPTS: IntCounterVec = register_int_counter_vec!("vlpds_segment_put_attempts_total", "Segment PUT attempts by result", &["result"]));
 lazy!(PUT_HEDGES: IntCounter = register_int_counter!("vlpds_segment_put_hedges_total", "Hedged (duplicate) segment PUTs started"));
@@ -88,6 +95,11 @@ lazy!(RETENTION_TICKS: IntCounterVec = register_int_counter_vec!("vlpds_retentio
 
 // ---- proxy ----
 lazy!(PROXY_CACHE: IntCounterVec = register_int_counter_vec!("vlpds_proxy_cache_total", "Proxy fast-path cache lookups", &["result"]));
+
+// ---- in-memory caches (caches.rs) ----
+lazy!(CACHE_ENTRIES: IntGaugeVec = register_int_gauge_vec!("vlpds_cache_entries", "Entries held per in-memory cache", &["cache"]));
+lazy!(CACHE_BYTES: IntGaugeVec = register_int_gauge_vec!("vlpds_cache_bytes", "Approximate bytes held per in-memory cache (entries x estimated entry size)", &["cache"]));
+lazy!(CACHE_CAPACITY: IntGaugeVec = register_int_gauge_vec!("vlpds_cache_capacity_entries", "Entry cap per in-memory cache (--cache-budget-mb, --cache-entries)", &["cache"]));
 
 // ---- cluster ----
 lazy!(FORWARDED: IntCounter = register_int_counter!("vlpds_requests_forwarded_total", "Requests proxied to the partition owner"));
@@ -149,6 +161,7 @@ pub fn render() -> String {
     refresh_jemalloc();
     refresh_process();
     refresh_tokio();
+    crate::caches::refresh_metrics();
     let mut buf = Vec::new();
     TextEncoder::new()
         .encode(&prometheus::gather(), &mut buf)

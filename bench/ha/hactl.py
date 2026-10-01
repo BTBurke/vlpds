@@ -63,6 +63,18 @@ BASE_PORT = int(os.environ.get("VLPDS_HA_BASE_PORT", "7100"))
 # exists, convergence is not observed (scenarios still run; verdicts rest on
 # verify / checker / firehose audits).
 OWNED_METRICS = os.environ.get("VLPDS_HA_OWNED_METRICS", "vlpds_owned_shards,vlpds_owned_partitions").split(",")
+# Injected median latency (ms) on every node's segment PUTs (--inject-put-ms,
+# lognormal sigma 0.5), so segment PUTs overlap and K > 1 is exercised; 0 = off.
+INJECT_PUT_MS = float(os.environ.get("VLPDS_HA_INJECT_PUT_MS", "25"))
+# Segment PUTs in flight per node log (--log-inflight).
+LOG_INFLIGHT = int(os.environ.get("VLPDS_HA_LOG_INFLIGHT", "4"))
+
+
+def base_env():
+    e = {"VLPDS_LOG_INFLIGHT": str(LOG_INFLIGHT)}
+    if INJECT_PUT_MS > 0:
+        e["VLPDS_INJECT_PUT_MS"] = str(INJECT_PUT_MS)
+    return e
 
 PROCS = []
 
@@ -174,6 +186,7 @@ class Node:
             s3=f"http://127.0.0.1:{BASE_PORT + 2300 + self.idx}", prefix=self.prefix, id=self.id,
             ttl_ms=TTL_MS, partitions=PARTITIONS).split() + self.extra
         env = {"RUST_LOG": "info,slatedb=warn", "VLPDS_NO_RATE_LIMITS": "true"}  # load tests
+        env.update(base_env())
         env.update(self.env)
         self.proc = spawn(args, os.path.join(self.outdir, f"{self.id}.log"), env)
         self.started_at = time.time()
@@ -296,7 +309,7 @@ class CNode(Node):
         args = NODE_ARGS.format(listen="0.0.0.0:2583", url=self.url, advertise=self.advertise, s3=DOCKER_S3,
                                 prefix=self.prefix, id=self.id, ttl_ms=TTL_MS, partitions=PARTITIONS).split() + self.extra
         env = []
-        for k, v in self.env.items():
+        for k, v in {**base_env(), **self.env}.items():
             env += ["-e", f"{k}={v}"]
         if self.skew:
             env += ["-e", f"LD_PRELOAD={FAKETIME_LIB}", "-e", f"FAKETIME={self.skew}", "-e", "DONT_FAKE_MONOTONIC=1"]
@@ -501,7 +514,7 @@ class Prober:
     """Writes to one account per partition through `node` every `interval`,
     recording each outcome: a precise per-partition availability timeline."""
 
-    def __init__(self, nodes, accts, outdir, interval=0.1):
+    def __init__(self, nodes, accts, outdir, interval=0.1, probes=None):
         self.nodes = nodes  # candidates (first alive one is used)
         self.interval = interval
         self.outdir = outdir
@@ -515,7 +528,7 @@ class Prober:
         # minted them (on its own shards), so "the first N" probed only n1/n2
         picks = list(by_p.values())
         random.Random(1).shuffle(picks)
-        self.accts = picks[:PROBES]
+        self.accts = picks[:PROBES if probes is None else probes]
         self.tokens = {}
         self.lock = threading.Lock()
         self.threads = [threading.Thread(target=self.loop, args=(a,), daemon=True) for a in self.accts]
@@ -809,10 +822,10 @@ def teardown(ctx):
 
 
 def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_final=None, per_node=30, rate=RATE,
-                      extra_checkers=None, start_nodes=None):
+                      extra_checkers=None, start_nodes=None, node_extra=None, node_env=None, probes=None):
     """Generic shape: cluster up -> accounts -> checker + probes + load on all
     nodes -> `actions` [(at_s, fn(ctx))] -> drain -> verify -> results."""
-    nodes = make_cluster(ctx, n_nodes, start=False)
+    nodes = make_cluster(ctx, n_nodes, start=False, extra=node_extra, env=node_env)
     for nd in nodes[: (start_nodes or n_nodes)]:
         nd.start()
     wait_ready(nodes[: (start_nodes or n_nodes)])
@@ -826,7 +839,7 @@ def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_fina
     audits = {nd.id: FhAudit(nd, ctx.outdir) for nd in live}
     time.sleep(1)
     probe_nodes = [nodes[checker_on]] + [n for n in nodes if n is not nodes[checker_on]]
-    prober = Prober(probe_nodes, accts, ctx.outdir).start()
+    prober = Prober(probe_nodes, accts, ctx.outdir, probes=probes).start()
     lgs = [Loadgen(nd, accounts_file, ctx.outdir, duration, rate=rate) for nd in live]
     fault_at = None
     extra = []
@@ -974,6 +987,8 @@ def judge(res, allow_lost=0):
         if res.get(k) and not res[k].get("agree", True):
             ok = False
     if res.get("unexpected_exits"):
+        ok = False
+    if res.get("k_fail"):  # K-in-flight scenario invariants (see k_* scenarios)
         ok = False
     # e.g. a zombie must fail-stop (3 = fenced log, 5 = lease lapsed) before any restart
     for nid, allowed in (res.get("expect_exit") or {}).items():
@@ -1345,6 +1360,524 @@ def s_k9_ckpt(ctx):
             (27, watch_log_then(1, "checkpoint start", k, "kill -9 n2 mid-checkpoint (2nd)", delay=0.01)),
             (50, restart(1))]
     return run_load_scenario(ctx, 3, 65, acts)
+
+
+# ---- K segment PUTs in flight (pipelined log): holes, fences, garbage
+
+S3_KEY, S3_SECRET, S3_BUCKET, S3_REGION = "minioadmin", "minioadmin", "vlpds", "us-east-1"
+
+
+def s3_req(method, key="", query=None, headers=None, timeout=10.0):
+    """Minimal SigV4 S3 request against MinIO (path style). Returns (status, body)."""
+    import hmac
+    from urllib.parse import quote
+    now = time.gmtime()
+    amz = time.strftime("%Y%m%dT%H%M%SZ", now)
+    day = amz[:8]
+    path = "/" + S3_BUCKET + ("/" + quote(key, safe="/~") if key else "")
+    q = sorted((query or {}).items())
+    qs = "&".join(f"{quote(k, safe='~')}={quote(str(v), safe='~')}" for k, v in q)
+    payload = hashlib.sha256(b"").hexdigest()
+    hdrs = {"host": S3, "x-amz-date": amz, "x-amz-content-sha256": payload}
+    for k, v in (headers or {}).items():
+        hdrs[k.lower()] = v
+    signed = sorted(hdrs)
+    creq = "\n".join([method, path, qs, "".join(f"{k}:{hdrs[k]}\n" for k in signed), ";".join(signed), payload])
+    scope = f"{day}/{S3_REGION}/s3/aws4_request"
+    sts = "\n".join(["AWS4-HMAC-SHA256", amz, scope, hashlib.sha256(creq.encode()).hexdigest()])
+    k = ("AWS4" + S3_SECRET).encode()
+    for part in (day, S3_REGION, "s3", "aws4_request"):
+        k = hmac.new(k, part.encode(), hashlib.sha256).digest()
+    sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
+    req = urllib.request.Request(f"http://{S3}{path}" + (f"?{qs}" if qs else ""), method=method)
+    for h, v in hdrs.items():
+        if h != "host":
+            req.add_header(h, v)
+    req.add_header("authorization", f"AWS4-HMAC-SHA256 Credential={S3_KEY}/{scope}, SignedHeaders={';'.join(signed)}, Signature={sig}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def s3_list(prefix, start_after=None):
+    import re
+    keys, token = [], None
+    while True:
+        q = {"list-type": "2", "prefix": prefix, "max-keys": "1000"}
+        if token:
+            q["continuation-token"] = token
+        elif start_after:
+            q["start-after"] = start_after
+        st, body = s3_req("GET", "", q)
+        if st != 200:
+            raise RuntimeError(f"s3 list {prefix}: {st} {body[:200]}")
+        txt = body.decode()
+        keys += re.findall(r"<Key>([^<]+)</Key>", txt)
+        m = re.search(r"<NextContinuationToken>([^<]+)</NextContinuationToken>", txt)
+        if "<IsTruncated>true</IsTruncated>" not in txt or not m:
+            return keys
+        token = m.group(1)
+
+
+def s3_get(key):
+    st, body = s3_req("GET", key)
+    return body if st == 200 else None
+
+
+def parse_log_object(b):
+    """VLSEG03 segment -> {'kind': 'segment', ordinal, prefix_end, first_seq, last_seq, seqs}; VLFENCE -> {'kind': 'fence', by}."""
+    import struct
+    if b[:8] == b"VLFENCE\n":
+        return {"kind": "fence", "by": b[8:].decode(errors="replace")}
+    if b[:8] != b"VLSEG03\n":
+        return {"kind": "unknown"}
+    o = 8
+    (n,) = struct.unpack_from(">H", b, o)
+    o += 2
+    log_id = b[o:o + n].decode()
+    o += n
+    ordinal, prefix_end, first_seq, last_seq, count = struct.unpack_from(">QQqqI", b, o)
+    o += 36
+    seqs = []
+    for _ in range(count):
+        seq, _shard, _epoch, flen = struct.unpack_from(">qHQI", b, o)
+        o += 22 + flen
+        (mc,) = struct.unpack_from(">I", b, o)
+        o += 4
+        for _ in range(mc):
+            (kl,) = struct.unpack_from(">H", b, o)
+            o += 2 + kl
+            (vl,) = struct.unpack_from(">I", b, o)
+            o += 4 + (0 if vl == 0xFFFFFFFF else vl)
+        if flen:
+            seqs.append(seq)
+    return {"kind": "segment", "log_id": log_id, "ordinal": ordinal, "prefix_end": prefix_end,
+            "first_seq": first_seq, "last_seq": last_seq, "seqs": seqs}
+
+
+def log_ordinals(prefix, log_id, start_after=None):
+    out = []
+    for k in s3_list(f"{prefix}/log/{log_id}/", start_after):
+        f = k.rsplit("/", 1)[1]
+        if f.endswith(".seg"):
+            out.append(int(f[:-4]))
+    return sorted(out)
+
+
+def first_hole(ords):
+    """(first missing ordinal, ordinals listed above it) of a sorted listing."""
+    have = set(ords)
+    lo = ords[0] if ords else 0
+    n = lo
+    while n in have:
+        n += 1
+    return n, [o for o in ords if o > n]
+
+
+ANSI = None
+
+
+def strip_ansi(line):
+    import re
+    global ANSI
+    ANSI = ANSI or re.compile(r"\x1b\[[0-9;]*m")
+    return ANSI.sub("", line)
+
+
+def audit_dead_log(prefix, log_id, survivors_logs, fh_files, dead_node=None):
+    """Checks a dead log's end state in S3 against the hole rule:
+    - exactly one fence, at the first ordinal that isn't a segment (the first hole);
+    - every assignment span of that log ends at the fence (all fencers agree);
+    - survivors that logged 'fenced dead node's log' name the same ordinal;
+    - no seq of a segment past the fence (garbage) is on any firehose audit
+      (live, cursor replay, start audits), while the prefix's last seqs are
+      (so the comparison isn't vacuous)."""
+    import re
+    ords = log_ordinals(prefix, log_id)
+    objs = {o: parse_log_object(s3_get(f"{prefix}/log/{log_id}/{o:012}.seg") or b"") for o in ords}
+    fences = [o for o, v in objs.items() if v["kind"] == "fence"]
+    segs = [o for o, v in objs.items() if v["kind"] == "segment"]
+    lo = min(ords) if ords else 0
+    hole = lo
+    while hole in objs and objs[hole]["kind"] == "segment":
+        hole += 1
+    garbage = [o for o in segs if o > hole]
+    garbage_seqs = {s for o in garbage for s in objs[o]["seqs"]}
+    prefix_seqs = [s for o in segs if o < hole for s in objs[o]["seqs"]]
+    tail = set(prefix_seqs[-20:])
+    # spans in every assignment
+    span_ends = {}
+    for k in s3_list(f"{prefix}/assign/"):
+        b = s3_get(k)
+        try:
+            a = json.loads(b)
+        except Exception:
+            continue
+        for sp in a.get("history", []):
+            if sp.get("log_id") == log_id:
+                span_ends.setdefault(str(sp.get("end")), []).append(k.rsplit("/", 1)[1])
+    # fencers' log lines
+    fencers = {}
+    for nid, path in survivors_logs.items():
+        try:
+            for line in open(path, errors="replace"):
+                line = strip_ansi(line)
+                if "fenced dead node's log" in line and log_id in line:
+                    m = re.search(r"fence_ordinal=(\d+)", line)
+                    if m:
+                        fencers.setdefault(nid, []).append(int(m.group(1)))
+        except FileNotFoundError:
+            pass
+    on_fh, tail_seen = {}, {}
+    for f in fh_files:
+        try:
+            d = json.load(open(f))
+        except Exception:
+            continue
+        seqs = {c["s"] if isinstance(c, dict) else c[0] for c in d.get("commits") or []}
+        name = os.path.basename(f)
+        on_fh[name] = len(seqs & garbage_seqs)
+        # a live audit on the dead node itself ends when it dies
+        live_on_dead = dead_node and name in (f"fhaudit-{dead_node}.json", f"fhaudit-{dead_node}-start.json")
+        if seqs and min(seqs) <= min(tail, default=0) and not live_on_dead:
+            tail_seen[name] = len(seqs & tail)
+    closed_ends = {e for e in span_ends if e != "None"}
+    out = {
+        "log_id": log_id, "objects": len(ords), "first_ordinal": lo, "fence_ordinals": fences, "first_hole": hole,
+        "fenced_by": [objs[o].get("by") for o in fences],
+        "garbage_ordinals": garbage, "garbage_events": len(garbage_seqs),
+        "span_ends": {e: len(v) for e, v in span_ends.items()}, "fencer_logs": fencers,
+        "garbage_on_firehose": on_fh, "prefix_tail_seen": tail_seen,
+    }
+    fails = []
+    if fences != [hole]:
+        fails.append(f"fence {fences} not exactly at first hole {hole}")
+    if any(e != str(hole) for e in closed_ends):
+        fails.append(f"span ends {sorted(closed_ends)} != fence {hole}")
+    if "None" in span_ends:
+        fails.append(f"open spans of a dead log: {span_ends['None']}")
+    if any(v != [hole] * len(v) for v in fencers.values()):
+        fails.append(f"fencers disagree: {fencers}")
+    if any(on_fh.values()):
+        fails.append(f"garbage on firehose: {on_fh}")
+    if tail and tail_seen and not all(v == len(tail) for v in tail_seen.values()):
+        fails.append(f"prefix tail missing from a firehose: {tail_seen}")
+    out["fails"] = fails
+    return out
+
+
+def prom(query):
+    """Instant PromQL query against the local obs stack; None if unavailable."""
+    from urllib.parse import quote
+    try:
+        _, raw = http("GET", f"http://127.0.0.1:9090/api/v1/query?query={quote(query)}", timeout=5)
+        return [(r["metric"], float(r["value"][1])) for r in json.loads(raw)["data"]["result"]]
+    except Exception:
+        return None
+
+
+def metric_sum(m, name, **labels):
+    tot = 0.0
+    for k, v in m.items():
+        if k == name or k.startswith(name + "{"):
+            if all(f'{lk}="{lv}"' in k for lk, lv in labels.items()):
+                tot += v
+    return tot
+
+
+def put_counters(node):
+    try:
+        m = node.metrics()
+    except Exception:
+        return None
+    return {"segments": metric_sum(m, "vlpds_segments_total"), "hedges": metric_sum(m, "vlpds_segment_put_hedges_total"),
+            "attempts": metric_sum(m, "vlpds_segment_put_attempts_total"),
+            "attempt_errors": metric_sum(m, "vlpds_segment_put_attempts_total", result="error"),
+            "already_exists": metric_sum(m, "vlpds_segment_put_attempts_total", result="already_exists"),
+            "inflight": metric_sum(m, "vlpds_segment_puts_inflight"), "t": time.time(),
+            "nudges_sent": metric_sum(m, "vlpds_cluster_nudges_total", dir="sent"),
+            "nudges_received": metric_sum(m, "vlpds_cluster_nudges_total", dir="received"),
+            "spills": metric_sum(m, "vlpds_firehose_merge_spills_total"),
+            "spill_segments": metric_sum(m, "vlpds_firehose_merge_spill_segments_total")}
+
+
+def kill_on_hole(idx, label, timeout=15.0, sig=signal.SIGKILL):
+    """Polls node idx's current log in S3 and kill -9s it the moment a hole is
+    visible (ordinal n missing while a later one landed: K PUTs in flight,
+    completing out of order). Records the dead log id for the audit."""
+    def f(ctx):
+        n = ctx.nodes[idx]
+        log_id = n.status()["log"]
+        end = time.time() + timeout
+        polls, after = 0, None
+        while time.time() < end:
+            ords = log_ordinals(ctx.prefix, log_id, after)
+            polls += 1
+            if ords:
+                hole, above = first_hole(ords)
+                if above:
+                    n.signal(sig)
+                    ctx.mark(f"{label}: kill -9 {n.id} with a hole at {hole}, {len(above)} later segment(s) landed {above[:4]} (poll {polls})")
+                    ctx.dead_logs.append((n.id, log_id))
+                    return "fault"
+                after = f"{ctx.prefix}/log/{log_id}/{max(ords[0], hole - 1):012}.seg"
+            time.sleep(0.005)
+        n.signal(sig)
+        ctx.mark(f"{label}: no hole seen in {timeout}s ({polls} polls); kill -9 {n.id} anyway")
+        ctx.dead_logs.append((n.id, log_id))
+        return "fault"
+    return f
+
+
+def k_audits(ctx, res):
+    """Runs audit_dead_log for every log killed in this scenario."""
+    import glob
+    logs = {n.id: os.path.join(ctx.outdir, f"{n.id}.log") for n in ctx.nodes}
+    fh = glob.glob(os.path.join(ctx.outdir, "fhaudit-*.json"))
+    res["dead_logs"] = []
+    for nid, log_id in ctx.dead_logs:
+        a = audit_dead_log(ctx.prefix, log_id, logs, fh, dead_node=nid)  # a restarted incarnation may fence too
+        a["node"] = nid
+        res["dead_logs"].append(a)
+        for f in a["fails"]:
+            res.setdefault("k_fail", []).append(f"{log_id}: {f}")
+    return res
+
+
+# ~52 KB segments, sealed at ~13 KB with K = 4 while a PUT is in flight: several
+# ordinals in flight at harness load (8 MB segments never fill at 150 writes/s)
+K_SMALL_SEGS = ["--max-segment-mb", "0.05"]
+
+
+@scenario("k-kill9-holes", "K=4, small segments, 150 ms lognormal(1.0) PUT latency: kill -9 n2 the instant its log shows a hole "
+          "(twice, restarting in between); fence at the first hole, garbage never on any firehose, survivors agree")
+def s_k_kill9(ctx):
+    ctx.dead_logs = []
+    extra = K_SMALL_SEGS + ["--inject-sigma", "1.0"]
+    acts = [(15, kill_on_hole(1, "1st", timeout=8)), (30, restart(1)), (40, kill_on_hole(1, "2nd", timeout=8)), (55, restart(1))]
+    res = run_load_scenario(ctx, 3, 65, acts, node_extra=extra, node_env={"VLPDS_INJECT_PUT_MS": "150"})
+    return k_audits(ctx, res)
+
+
+def stop_with_puts_held(idx, min_inflight=4, timeout=5.0):
+    """Blackholes node idx's S3 (its PUTs hang at the proxy), waits until at
+    least `min_inflight` segment PUT attempts are in flight (>= 2 ordinals even
+    counting one hedge each), then SIGSTOPs it."""
+    def f(ctx):
+        n = ctx.nodes[idx]
+        log_id = n.status()["log"]
+        ctx.dead_logs.append((n.id, log_id))
+        n.s3.set(blackhole=1)
+        ctx.mark(f"S3 blackhole -> {n.id} (PUTs held at the proxy)")
+        end, seen = time.time() + timeout, 0
+        while time.time() < end:
+            c = put_counters(n)
+            seen = c["inflight"] if c else seen
+            if seen >= min_inflight:
+                break
+            time.sleep(0.01)
+        n.signal(signal.SIGSTOP)
+        try:
+            _, raw = http("GET", f"http://{n.s3.ctl}/stats")
+            ctx.k_info["proxy_at_stop"] = json.loads(raw)
+        except Exception:
+            pass
+        ctx.k_info["log_at_stop"] = log_ordinals(ctx.prefix, log_id)[-3:]
+        ctx.mark(f"SIGSTOP {n.id} with {seen:.0f} segment PUT attempts in flight")
+        ctx.k_info["inflight_at_stop"] = seen
+        return "fault"
+    return f
+
+
+@scenario("k-zombie-inflight", "K=4, small segments: n2's S3 blackholed until >= 4 PUT attempts hang, SIGSTOP 4x TTL; "
+          "release its held PUTs into the fenced log, then SIGCONT: it must fail-stop (3/5); garbage past the fence harmless")
+def s_k_zombie(ctx):
+    ctx.dead_logs, ctx.k_info = [], {}
+
+    def release(ctx):
+        n = ctx.nodes[1]
+        n.s3.clear()
+        time.sleep(0.5)
+        log_id = ctx.dead_logs[0][1]
+        ctx.k_info["log_after_release"] = log_ordinals(ctx.prefix, log_id)[-6:]
+        ctx.mark(f"heal S3 -> {n.id} (its held PUTs land while it is still stopped): log tail {ctx.k_info['log_after_release']}")
+
+    def wake(ctx):
+        n = ctx.nodes[1]
+        ctx.mark(f"SIGCONT {n.id}")
+        n.signal(signal.SIGCONT)
+        n.wait_exit(10)
+        ctx.mark(f"{n.id} exit codes {n.exit_codes()}")
+    acts = [(15, stop_with_puts_held(1)), (15 + 4 * TTL_MS / 1000, release), (16.5 + 4 * TTL_MS / 1000, wake)]
+    res = run_load_scenario(ctx, 3, 45, acts, node_extra=K_SMALL_SEGS, node_env={"VLPDS_INJECT_PUT_MS": "60"})
+    res["expect_exit"] = {"n2": [3, 5]}
+    res["k_info"] = ctx.k_info
+    try:
+        txt = open(os.path.join(ctx.outdir, "n2.log"), errors="replace").read()
+        res["k_info"]["zombie_exit_reason"] = [l[-160:] for l in txt.splitlines() if "fail-stop" in l][:3]
+    except Exception:
+        pass
+    k_audits(ctx, res)
+    for a in res["dead_logs"]:
+        if not a["garbage_ordinals"]:
+            res["k_info"]["note"] = "no zombie PUT landed past the fence"
+    return res
+
+
+def log_events(path, needles):
+    """[(epoch s, needle, line)] for lines containing any needle (tracing's RFC 3339 timestamps)."""
+    import datetime
+    out = []
+    try:
+        for line in open(path, errors="replace"):
+            line = strip_ansi(line)
+            for nd in needles:
+                if nd in line:
+                    ts = line.split()[0]
+                    try:
+                        t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                    except ValueError:
+                        t = None
+                    out.append((t, nd, line.strip()[-220:]))
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def handoff_timing(ctx):
+    """release -> serving per handoff: a releaser's 'closed and released shards'
+    to the first 'shards opened' after it on a node that adopted handed shards."""
+    import re
+    rel, adopt = [], []
+    for n in ctx.nodes:
+        for t, nd, line in log_events(os.path.join(ctx.outdir, f"{n.id}.log"),
+                                      ["closed and released shards", "adopting shards handed to us", "shards opened"]):
+            if t is None:
+                continue
+            if nd == "closed and released shards":
+                m = re.search(r"handed=(\d+)", line)
+                e = re.search(r"elapsed_ms=(\d+)", line)
+                rel.append({"node": n.id, "t": t, "handed": int(m.group(1)) if m else None, "close_ms": int(e.group(1)) if e else None})
+            else:
+                adopt.append((t, n.id, nd, line))
+    out = []
+    for r in rel:
+        if not r["handed"]:
+            continue
+        opened = {}
+        pending = set()
+        for t, nid, nd, line in sorted(adopt):
+            if t < r["t"] - 0.05 or t > r["t"] + 10 or nid == r["node"]:
+                continue
+            if nd == "adopting shards handed to us":
+                pending.add(nid)
+            elif nid in pending and nid not in opened:
+                opened[nid] = round((t - r["t"]) * 1000)
+        out.append({"releaser": r["node"], "at_s": round(r["t"] - ctx.t0, 2), "handed": r["handed"], "close_ms": r["close_ms"],
+                    "release_to_serving_ms": opened})
+    return out
+
+
+def scrape_inflight(idx, key):
+    def f(ctx):
+        c = put_counters(ctx.nodes[idx])
+        ctx.k_info.setdefault(key, []).append(c and c["inflight"])
+    return f
+
+
+@scenario("k-sigterm-saturated", "K=4, small segments, 100 ms PUT latency, 300 writes/s per node: n4 joins (handback + nudge), "
+          "SIGTERM n2 at saturation (draining lease, barrier behind K PUTs), restart n2; release->serving and 503 windows")
+def s_k_sigterm(ctx):
+    ctx.k_info = {}
+    grace = 2 * TTL_MS / 5000
+
+    def term(ctx):
+        c = put_counters(ctx.nodes[1])
+        ctx.k_info["n2_inflight_at_sigterm"] = c and c["inflight"]
+        return kill(1, signal.SIGTERM)(ctx)
+    acts = [(12, start_node(3)), (12 + grace - 0.3, scrape_inflight(0, "n1_inflight_before_handback")), (25, term), (38, restart(1))]
+    res = run_load_scenario(ctx, 4, 55, acts, start_nodes=3, expect_final=4, rate=300,
+                            node_extra=K_SMALL_SEGS, node_env={"VLPDS_INJECT_PUT_MS": "100"})
+    res["k_info"] = ctx.k_info
+    res["handoffs"] = handoff_timing(ctx)
+    res["nudges"] = {n.id: {k: v for k, v in (put_counters(n) or {}).items() if k.startswith("nudges")} for n in ctx.nodes if n.alive()}
+    pm = prom('max_over_time(vlpds_segment_puts_inflight{instance=~"127.0.0.1:710[1-4]"}[2m])')
+    res["prom_max_inflight"] = {m.get("instance"): v for m, v in pm} if pm else None
+    return res
+
+
+@scenario("k-s3-slow-lowload", "K=4, low load (5 writes/s per node, 4 probes): S3 400+-400 ms on n2 for 20 s; "
+          "hedges <= 1 per ordinal, PUT attempts per segment <= 2, PUT rate no higher than before the fault")
+def s_k_slow(ctx):
+    ctx.k_info = {}
+    snaps = {}
+
+    def snap(key):
+        def f(ctx):
+            snaps[key] = put_counters(ctx.nodes[1])
+            ctx.mark(f"n2 PUT counters @{key}: {snaps[key]}")
+        return f
+    acts = [(5, snap("base0")), (15, snap("base1")), (15.01, fault(1, "s3", "S3 latency 400ms+400ms jitter", latency_ms=400, jitter_ms=400)),
+            (35, snap("slow1")), (35.01, heal(1, ("s3",)))]
+    res = run_load_scenario(ctx, 3, 45, acts, rate=5, probes=4)
+
+    def rate(a, b):
+        dt = snaps[b]["t"] - snaps[a]["t"]
+        d = {k: snaps[b][k] - snaps[a][k] for k in ("segments", "hedges", "attempts", "attempt_errors")}
+        # PUT requests started: one per segment, plus hedges, plus retries after
+        # errors (the attempts counter only sees attempts that finished; a
+        # hedge's loser is dropped)
+        d["puts_started"] = d["segments"] + d["hedges"] + d["attempt_errors"]
+        d["segments_per_s"] = round(d["segments"] / dt, 2)
+        d["puts_per_s"] = round(d["puts_started"] / dt, 2)
+        d["puts_per_segment"] = round(d["puts_started"] / max(d["segments"], 1), 2)
+        return d
+    if all(snaps.get(k) for k in ("base0", "base1", "slow1")):
+        base, slow = rate("base0", "base1"), rate("base1", "slow1")
+        res["k_info"] = {"baseline": base, "slow": slow}
+        fails = []
+        # one hedge per ordinal at most: hedges <= segments sealed (+ the <= K still in flight)
+        if slow["hedges"] > slow["segments"] + LOG_INFLIGHT:
+            fails.append(f"hedges {slow['hedges']} > segments {slow['segments']} + K")
+        if slow["puts_per_s"] > max(base["puts_per_s"], 1) * 1.5:
+            fails.append(f"PUT rate exploded: {slow['puts_per_s']}/s vs {base['puts_per_s']}/s before")
+        if fails:
+            res["k_fail"] = fails
+    else:
+        res["k_fail"] = ["metrics snapshots missing"]
+    return res
+
+
+@scenario("k-spill-holes", "K=4, small segments, 150 ms lognormal(1.0) PUT latency, merger queue budget 0.25 MiB: kill -9 n2 "
+          "at a hole while survivors' mergers spill to S3 read-back; followers drain to the fence, spills read back across it")
+def s_k_spill(ctx):
+    ctx.dead_logs, ctx.k_info = [], {}
+    extra = K_SMALL_SEGS + ["--inject-sigma", "1.0", "--firehose-merge-queue-mb", "0.25"]
+    before = {}
+
+    def snap(ctx):
+        for n in ctx.nodes:
+            before[n.id] = put_counters(n)
+    acts = [(14, snap), (15, kill_on_hole(1, "kill"))]
+    res = run_load_scenario(ctx, 3, 40, acts, node_extra=extra, node_env={"VLPDS_INJECT_PUT_MS": "150"})
+    res["expect_exit"] = {"n2": [-9]}
+    spills = {}
+    for n in ctx.nodes:
+        if n.id == "n2" or not n.alive():
+            continue
+        c = put_counters(n)
+        b = before.get(n.id) or {}
+        spills[n.id] = {"spills": c["spills"] - b.get("spills", 0), "spill_segments": c["spill_segments"] - b.get("spill_segments", 0),
+                        "spills_total": c["spills"]}
+    res["k_info"] = {"spills_after_kill": spills,
+                     "spill_log_lines": {n.id: len(log_events(os.path.join(ctx.outdir, f"{n.id}.log"), ["spilling log to S3 read-back"]))
+                                         for n in ctx.nodes}}
+    k_audits(ctx, res)
+    if not any(v["spill_segments"] > 0 for v in spills.values()):
+        res.setdefault("k_fail", []).append("no survivor's merger spilled after the kill (scenario did not exercise read-back)")
+    return res
 
 
 # ---- container scenarios

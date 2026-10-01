@@ -21,15 +21,18 @@ use crate::cid::Cid;
 use crate::xrpc::App;
 use serde_json::Value as J;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 const REFRESH: Duration = Duration::from_secs(300);
 const LEXICON_COLLECTION: &str = "com.atproto.lexicon.schema";
 const MAX_CAR_BYTES: usize = 1 << 20;
 
-static CACHE: LazyLock<parking_lot::Mutex<HashMap<String, (Instant, J)>>> =
-    LazyLock::new(Default::default);
+/// Permission sets by NSID, at most the `permission_sets` cap
+/// ([`crate::caches`]); stale entries are the fallback while a publisher is
+/// unreachable.
+static CACHE: LazyLock<Arc<parking_lot::Mutex<HashMap<String, (Instant, J)>>>> =
+    LazyLock::new(|| crate::caches::track(crate::caches::Cache::PermissionSets, Default::default()));
 static OVERRIDES: LazyLock<parking_lot::Mutex<HashMap<String, String>>> =
     LazyLock::new(Default::default);
 static DNS: LazyLock<Option<hickory_resolver::TokioResolver>> = LazyLock::new(|| {
@@ -72,9 +75,7 @@ pub async fn permission_set(app: &App, nsid: &str) -> Result<J, String> {
     match resolve(app, nsid).await {
         Ok((uri, doc)) => {
             main_def(nsid, &doc)?;
-            CACHE
-                .lock()
-                .insert(nsid.to_string(), (Instant::now(), doc.clone()));
+            cache_put(nsid, Instant::now(), doc.clone());
             let stored = StoredLexicon {
                 uri,
                 doc: doc.clone(),
@@ -91,18 +92,25 @@ pub async fn permission_set(app: &App, nsid: &str) -> Result<J, String> {
                 return main_def(nsid, doc);
             }
             if let Ok(Some(l)) = store::get_lexicon(app, nsid).await {
-                CACHE.lock().insert(
-                    nsid.to_string(),
-                    (
-                        Instant::now() - REFRESH + Duration::from_secs(30),
-                        l.doc.clone(),
-                    ),
-                );
+                cache_put(nsid, Instant::now() - REFRESH + Duration::from_secs(30), l.doc.clone());
                 return main_def(nsid, &l.doc);
             }
             Err(e)
         }
     }
+}
+
+/// Caches `doc` for `nsid`; a full cache drops its stale entries, then all.
+fn cache_put(nsid: &str, at: Instant, doc: J) {
+    let cap = crate::caches::cap(crate::caches::Cache::PermissionSets);
+    let mut m = CACHE.lock();
+    if m.len() >= cap && !m.contains_key(nsid) {
+        m.retain(|_, (at, _)| at.elapsed() < REFRESH);
+        if m.len() >= cap {
+            m.clear();
+        }
+    }
+    m.insert(nsid.to_string(), (at, doc));
 }
 
 fn main_def(nsid: &str, doc: &J) -> Result<J, String> {
@@ -281,19 +289,40 @@ pub fn verify_record_proof(
     check_record_type(rec.to_json())
 }
 
-/// atproto multikey (secp256k1 or P-256, compressed) signature check.
+/// atproto multikey (secp256k1 or P-256, compressed) signature check, for
+/// commits and records: compact 64-byte signatures, low-S only (a high-S
+/// signature is Ok(false), as in the reference's default verification).
 pub(crate) fn verify_sig(multibase: &str, msg: &[u8], sig: &[u8]) -> Result<bool, String> {
+    verify_multikey(multibase, msg, sig, false)
+}
+
+/// [`verify_sig`] that also accepts high-S signatures: inter-service JWTs
+/// only (the reference verifies them with `allowMalleableSig: true`).
+pub(crate) fn verify_sig_malleable(multibase: &str, msg: &[u8], sig: &[u8]) -> Result<bool, String> {
+    verify_multikey(multibase, msg, sig, true)
+}
+
+fn verify_multikey(multibase: &str, msg: &[u8], sig: &[u8], allow_high_s: bool) -> Result<bool, String> {
     let raw = bs58::decode(multibase.strip_prefix('z').ok_or("unsupported multibase")?)
         .into_vec()
         .map_err(|e| e.to_string())?;
     match raw.as_slice() {
-        [0xe7, 0x01, key @ ..] => {
-            crate::crypto::verify_k256(key, msg, sig).map_err(|e| e.to_string())
+        [0xe7, 0x01, key @ ..] => if allow_high_s {
+            crate::crypto::verify_k256_malleable(key, msg, sig)
+        } else {
+            crate::crypto::verify_k256(key, msg, sig)
         }
+        .map_err(|e| e.to_string()),
         [0x80, 0x24, key @ ..] => {
             use p256::ecdsa::signature::Verifier;
             let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(key).map_err(|e| e.to_string())?;
             let s = p256::ecdsa::Signature::from_slice(sig).map_err(|e| e.to_string())?;
+            // `p256` itself accepts both forms; Some = it was high-S
+            let s = match s.normalize_s() {
+                Some(_) if !allow_high_s => return Ok(false),
+                Some(low) => low,
+                None => s,
+            };
             Ok(vk.verify(msg, &s).is_ok())
         }
         _ => Err("unsupported key type".into()),
@@ -338,6 +367,40 @@ pub async fn build_token_scope(app: &App, scope: &str) -> Result<String, String>
 
 #[cfg(test)]
 mod tests {
+    /// Record proofs (commit signatures) take low-S only; service-auth JWTs
+    /// also take the high-S form, for both curves.
+    #[test]
+    fn signature_malleability() {
+        let msg = b"signed bytes";
+        // P-256
+        let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let mut mk = vec![0x80, 0x24];
+        mk.extend_from_slice(sk.verifying_key().to_encoded_point(true).as_bytes());
+        let p256_key = format!("z{}", bs58::encode(mk).into_string());
+        let sig: p256::ecdsa::Signature = p256::ecdsa::signature::Signer::sign(&sk, msg);
+        let low = sig.normalize_s().unwrap_or(sig);
+        let high = p256::ecdsa::Signature::from_scalars(low.r(), -*low.s()).unwrap();
+        assert!(high.normalize_s().is_some(), "high-S form");
+        for (key, low, high) in [
+            (p256_key, low.to_bytes().to_vec(), high.to_bytes().to_vec()),
+            {
+                // K-256
+                let kp = crate::crypto::Keypair::generate();
+                let low = kp.sign(msg);
+                let s = k256::ecdsa::Signature::from_slice(&low).unwrap();
+                let high = k256::ecdsa::Signature::from_scalars(s.r(), -*s.s()).unwrap();
+                (kp.public_multibase(), low.to_vec(), high.to_bytes().to_vec())
+            },
+        ] {
+            assert_eq!(super::verify_sig(&key, msg, &low), Ok(true));
+            assert_eq!(super::verify_sig(&key, msg, &high), Ok(false), "record proofs reject high-S");
+            assert_eq!(super::verify_sig_malleable(&key, msg, &low), Ok(true));
+            assert_eq!(super::verify_sig_malleable(&key, msg, &high), Ok(true), "service auth tolerates high-S");
+            assert_eq!(super::verify_sig_malleable(&key, b"other", &high), Ok(false));
+            assert_eq!(super::verify_sig(&key, b"other", &low), Ok(false));
+        }
+    }
+
     #[test]
     fn authority() {
         assert_eq!(super::nsid_authority("app.bsky.feed.post"), "feed.bsky.app");

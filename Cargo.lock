@@ -4404,6 +4404,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",
+ "zstd",
 ]
 
 [[package]]

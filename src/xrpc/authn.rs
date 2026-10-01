@@ -163,9 +163,9 @@ pub fn verify_access_token(
     token: &str,
 ) -> Result<Arc<crate::oauth::jose::DecodedJwt>, String> {
     type Verified = (Arc<str>, Arc<crate::oauth::jose::DecodedJwt>);
-    // ~1.5 KB each (token + decoded header and payload)
-    static CACHE: std::sync::LazyLock<crate::auth::TokenCache<Verified>> =
-        std::sync::LazyLock::new(|| crate::auth::TokenCache::new(1 << 18));
+    // capped by the memory budget (crate::caches; ~1.5 KB each)
+    static CACHE: std::sync::LazyLock<Arc<crate::auth::TokenCache<Verified>>> =
+        std::sync::LazyLock::new(|| crate::auth::TokenCache::tracked(crate::caches::Cache::OAuthTokens));
     let now = crate::tid::now_micros() / 1_000_000;
     if let Some((kid, jwt)) = CACHE.get(token, now) {
         if *kid == *server.kid {
@@ -287,8 +287,10 @@ async fn issuer_key(app: &App, iss: &str, fresh: bool) -> XResult<String> {
 /// Verifies an inter-service JWT addressed to this PDS (`aud` = our service
 /// DID) for method `lxm` (required to match when given), signed by its
 /// issuer's current key (retried once with a fresh DID document, for a
-/// recent key rotation). Errors are the reference's (BadJwt, JwtExpired,
-/// BadJwtAudience, BadJwtLexiconMethod, BadJwtIss, BadJwtSignature).
+/// recent key rotation). High-S signatures are accepted, as the reference
+/// does for service JWTs (`allowMalleableSig`). Errors are the reference's
+/// (BadJwt, JwtExpired, BadJwtAudience, BadJwtLexiconMethod, BadJwtIss,
+/// BadJwtSignature).
 pub async fn verify_service_jwt(app: &App, token: &str, lxm: Option<&str>) -> XResult<ServiceAuth> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
     use base64::Engine;
@@ -340,7 +342,7 @@ pub async fn verify_service_jwt(app: &App, token: &str, lxm: Option<&str>) -> XR
     let msg = format!("{h}.{p}");
     let sig = B64.decode(s).map_err(|_| service_auth_err("BadJwtSignature", "could not verify jwt signature"))?;
     let check = |key: &str| {
-        crate::oauth::lexicon::verify_sig(key, msg.as_bytes(), &sig)
+        crate::oauth::lexicon::verify_sig_malleable(key, msg.as_bytes(), &sig)
             .map_err(|_| service_auth_err("BadJwtSignature", "could not verify jwt signature"))
     };
     let key = issuer_key(app, iss, false).await?;
