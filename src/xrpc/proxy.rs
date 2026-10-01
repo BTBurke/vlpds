@@ -445,18 +445,24 @@ struct Forward<'a> {
 // Proxying is the hottest path a PDS serves (every AppView read goes through
 // it). Per request it would otherwise cost two account reads + JSON parse, a
 // key parse, and a ~25 µs ES256K signature. Instead:
-// - account signing key + status are cached for ACCT_TTL (status changes such
-//   as takedowns apply within that window), read once per request;
+// - account signing key + status are cached, read once per request. Only
+//   the DID's owner caches (requests are routed to it), and an entry is
+//   valid only in the partition epoch it was read in, so changes another
+//   node made while it owned the DID never show through a stale entry.
+//   Every account change goes through the owner's worker, which drops the
+//   entry once the change is applied ([`account_changed`]): takedowns and
+//   key rotations apply to the next request. ACCT_TTL only bounds an
+//   entry's life (memory, and a backstop);
 // - minted service JWTs are reused per (iss, aud, lxm, signing key) until
 //   half their lifetime has passed, so an active account signs ~2×/min per
 //   method. The key is part of the cache key: after a rotation or migration
-//   the next account refresh (within ACCT_TTL) brings the new key, and with
-//   it fresh tokens, instead of reusing ones signed by the old key.
+//   the account reload brings the new key, and with it fresh tokens,
+//   instead of reusing ones signed by the old key.
 // Lookups don't allocate: the account cache is keyed by DID (borrowed
 // lookups), the JWT cache by a hash of (iss, aud, lxm, key id) with the full
 // key stored and compared on every hit.
 
-const ACCT_TTL: Duration = Duration::from_secs(2);
+const ACCT_TTL: Duration = Duration::from_secs(60);
 const JWT_REUSE: Duration = Duration::from_secs(SERVICE_JWT_TTL_SECS / 2);
 const CACHE_SHARDS: usize = 64;
 const CACHE_CAP_PER_SHARD: usize = 32_768;
@@ -465,6 +471,9 @@ type Shard<K, V> = parking_lot::Mutex<std::collections::HashMap<K, (V, std::time
 
 struct TtlCache<K, V> {
     shards: Vec<Shard<K, V>>,
+    /// per shard, bumped (under its lock) by every [`TtlCache::invalidate`]:
+    /// a load that raced one is not cached
+    gens: Vec<std::sync::atomic::AtomicU64>,
 }
 
 /// Fixed-key hash (the same key always picks the same shard).
@@ -477,10 +486,33 @@ fn fixed_hash<Q: std::hash::Hash + ?Sized>(k: &Q) -> u64 {
 
 impl<K: std::hash::Hash + Eq, V: Clone> TtlCache<K, V> {
     fn new() -> Self {
-        TtlCache { shards: (0..CACHE_SHARDS).map(|_| parking_lot::Mutex::new(Default::default())).collect() }
+        TtlCache {
+            shards: (0..CACHE_SHARDS).map(|_| parking_lot::Mutex::new(Default::default())).collect(),
+            gens: (0..CACHE_SHARDS).map(|_| Default::default()).collect(),
+        }
+    }
+    fn shard_of<Q: std::hash::Hash + ?Sized>(k: &Q) -> usize {
+        (fixed_hash(k) as usize) % CACHE_SHARDS
     }
     fn shard<Q: std::hash::Hash + ?Sized>(&self, k: &Q) -> &Shard<K, V> {
-        &self.shards[(fixed_hash(k) as usize) % CACHE_SHARDS]
+        &self.shards[Self::shard_of(k)]
+    }
+    /// Taken before reading what will be cached under `k`; pass to
+    /// [`TtlCache::put_unless_changed`].
+    fn generation<Q: std::hash::Hash + ?Sized>(&self, k: &Q) -> u64 {
+        self.gens[Self::shard_of(k)].load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Drops `k`, and keeps loads that began before this from caching what
+    /// they read.
+    fn invalidate<Q>(&self, k: &Q)
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let i = Self::shard_of(k);
+        let mut m = self.shards[i].lock();
+        self.gens[i].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        m.remove(k);
     }
     /// Value if inserted less than `max_age` ago.
     fn get<Q>(&self, k: &Q, max_age: Duration) -> Option<V>
@@ -500,7 +532,16 @@ impl<K: std::hash::Hash + Eq, V: Clone> TtlCache<K, V> {
         m.get(k).map(|(v, t)| (v.clone(), t.elapsed()))
     }
     fn put(&self, k: K, v: V, max_age: Duration) {
-        let mut m = self.shard(&k).lock();
+        self.put_unless_changed(k, v, max_age, None)
+    }
+    /// [`TtlCache::put`], skipped if `k`'s shard was invalidated since `gen`
+    /// was taken.
+    fn put_unless_changed(&self, k: K, v: V, max_age: Duration, gen: Option<u64>) {
+        let i = Self::shard_of(&k);
+        let mut m = self.shards[i].lock();
+        if gen.is_some_and(|g| g != self.gens[i].load(std::sync::atomic::Ordering::SeqCst)) {
+            return;
+        }
         if m.len() >= CACHE_CAP_PER_SHARD {
             m.retain(|_, (_, t)| t.elapsed() < max_age);
             if m.len() >= CACHE_CAP_PER_SHARD {
@@ -517,6 +558,8 @@ struct CachedAcct {
     /// Identifies the signing key (a hash of it): part of the JWT cache key.
     key_id: u64,
     status: Option<String>,
+    /// (partition, epoch) it was read in: valid only while still owned in it
+    part: (u16, u64),
 }
 
 /// A minted service JWT and the (iss, aud, lxm, key id) it was minted for.
@@ -525,9 +568,16 @@ type CachedJwt = Arc<(String, String, String, u64, Arc<str>)>;
 static ACCTS: std::sync::LazyLock<TtlCache<String, CachedAcct>> = std::sync::LazyLock::new(TtlCache::new);
 static JWTS: std::sync::LazyLock<TtlCache<u64, CachedJwt>> = std::sync::LazyLock::new(TtlCache::new);
 
+/// Drops `did`'s cached account. Its worker calls this once an account
+/// change is applied (before acking it).
+pub(crate) fn account_changed(did: &str) {
+    ACCTS.invalidate(did);
+}
+
 async fn cached_account(app: &App, did: &str) -> XResult<CachedAcct> {
+    let part = app.partition(did)?;
     let prev = match ACCTS.get_aged(did) {
-        Some((a, age)) if age < ACCT_TTL => {
+        Some((a, age)) if age < ACCT_TTL && a.part == (part.id, part.epoch) => {
             crate::metrics::PROXY_CACHE.with_label_values(&["account_hit"]).inc();
             return Ok(a);
         }
@@ -544,8 +594,8 @@ async fn cached_account(app: &App, did: &str) -> XResult<CachedAcct> {
         #[serde(default, borrow)]
         status: Option<std::borrow::Cow<'a, str>>,
     }
-    let raw = app
-        .partition(did)?
+    let gen = ACCTS.generation(did);
+    let raw = part
         .db
         .get(state::account_key(did))
         .await
@@ -561,8 +611,8 @@ async fn cached_account(app: &App, did: &str) -> XResult<CachedAcct> {
                 .map_err(XrpcError::from_err)?,
         ),
     };
-    let c = CachedAcct { key, key_id, status: acct.status.map(Into::into) };
-    ACCTS.put(did.to_string(), c.clone(), ACCT_TTL);
+    let c = CachedAcct { key, key_id, status: acct.status.map(Into::into), part: (part.id, part.epoch) };
+    ACCTS.put_unless_changed(did.to_string(), c.clone(), ACCT_TTL, Some(gen));
     Ok(c)
 }
 

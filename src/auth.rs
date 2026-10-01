@@ -1,14 +1,79 @@
-//! HS256 session JWTs (access + refresh).
+//! HS256 session JWTs (access + refresh), and the verified-token cache
+//! shared with OAuth access tokens.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Jwt {
     secret: Vec<u8>,
     pub service_did: String,
+    /// Tokens whose signature this secret verified, with their claims.
+    verified: Arc<TokenCache<Arc<Claims>>>,
+}
+
+const TOKEN_CACHE_SHARDS: usize = 64;
+/// Legacy access tokens cached: ~400 B each with their claims, enough for
+/// the tokens of a million active accounts.
+const SESSION_TOKENS_CACHED: usize = 1 << 20;
+
+/// Verified bearer tokens: what a token proves by itself (signature checked,
+/// claims parsed), kept until its `exp`, so a token pays for verification
+/// and parsing once instead of on every request. Only signed tokens are put
+/// here, and a hit compares the whole token. Revocation, sessions and
+/// account status are not cached: callers check them on every request.
+/// Bounded: a full shard drops its expired entries, then all of them.
+pub struct TokenCache<V> {
+    /// signature segment -> (whole token, value, exp unix secs)
+    shards: Vec<parking_lot::Mutex<HashMap<Box<str>, (Box<str>, V, u64)>>>,
+    cap_per_shard: usize,
+}
+
+impl<V: Clone> TokenCache<V> {
+    /// A cache of about `capacity` tokens.
+    pub fn new(capacity: usize) -> Self {
+        TokenCache {
+            shards: (0..TOKEN_CACHE_SHARDS).map(|_| Default::default()).collect(),
+            cap_per_shard: capacity.div_ceil(TOKEN_CACHE_SHARDS).max(1),
+        }
+    }
+
+    /// (shard, signature segment). The signature is random-looking, so its
+    /// last bytes pick the shard without hashing the token.
+    fn slot<'t>(&self, token: &'t str) -> (&parking_lot::Mutex<HashMap<Box<str>, (Box<str>, V, u64)>>, &'t str) {
+        let sig = token.rsplit_once('.').map_or(token, |(_, s)| s);
+        let b = sig.as_bytes();
+        let tail = b[b.len().saturating_sub(4)..].iter().fold(0usize, |h, &x| h.wrapping_mul(131).wrapping_add(x as usize));
+        (&self.shards[tail % self.shards.len()], sig)
+    }
+
+    /// The value cached for exactly `token`, unless it expired before `now`.
+    pub fn get(&self, token: &str, now: u64) -> Option<V> {
+        let (shard, sig) = self.slot(token);
+        let m = shard.lock();
+        let (tok, v, exp) = m.get(sig)?;
+        (**tok == *token && *exp >= now).then(|| v.clone())
+    }
+
+    /// Caches `v` for `token` (whose signature the caller verified) until `exp`.
+    pub fn put(&self, token: &str, v: V, exp: u64, now: u64) {
+        if exp < now {
+            return;
+        }
+        let (shard, sig) = self.slot(token);
+        let mut m = shard.lock();
+        if m.len() >= self.cap_per_shard {
+            m.retain(|_, (_, _, e)| *e >= now);
+            if m.len() >= self.cap_per_shard {
+                m.clear();
+            }
+        }
+        m.insert(sig.into(), (token.into(), v, exp));
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -29,6 +94,7 @@ impl Jwt {
         Jwt {
             secret: secret.as_bytes().to_vec(),
             service_did: service_did.to_string(),
+            verified: Arc::new(TokenCache::new(SESSION_TOKENS_CACHED)),
         }
     }
 
@@ -87,6 +153,19 @@ impl Jwt {
         mac.verify_slice(&sig).ok()?;
         let (_, payload) = signing_input.split_once('.')?;
         serde_json::from_slice(&B64.decode(payload).ok()?).ok()
+    }
+
+    /// [`Jwt::verify_signature`] through the verified-token cache: the
+    /// signature is checked and the claims parsed once per token (until its
+    /// expiry); expiry, scope and revocation stay the caller's to check.
+    pub fn verify_signature_cached(&self, token: &str) -> Option<Arc<Claims>> {
+        let now = crate::tid::now_micros() / 1_000_000;
+        if let Some(c) = self.verified.get(token, now) {
+            return Some(c);
+        }
+        let c = Arc::new(self.verify_signature(token)?);
+        self.verified.put(token, c.clone(), c.exp, now);
+        Some(c)
     }
 
     /// Returns the DID of a valid access token.
@@ -161,6 +240,34 @@ pub fn basic_admin_ok(b64: &str, admin_token: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_cache() {
+        let c: TokenCache<u32> = TokenCache::new(TOKEN_CACHE_SHARDS * 2);
+        c.put("h.p.sig", 1, 100, 50);
+        assert_eq!(c.get("h.p.sig", 50), Some(1));
+        assert_eq!(c.get("h.p.sig", 100), Some(1));
+        assert_eq!(c.get("h.p.sig", 101), None, "expired");
+        assert_eq!(c.get("h.other.sig", 50), None, "same signature, another token");
+        c.put("h.p.old", 2, 10, 50);
+        assert_eq!(c.get("h.p.old", 5), None, "already expired when put");
+        // bounded: a full shard drops its expired entries, then everything
+        for i in 0..10_000 {
+            c.put(&format!("h.p.{i:08}"), i, 100, 50);
+        }
+        let n: usize = c.shards.iter().map(|s| s.lock().len()).sum();
+        assert!(n <= TOKEN_CACHE_SHARDS * 2, "{n} entries");
+
+        let jwt = Jwt::new("secret", "did:web:pds.test");
+        let tok = jwt.access("did:plc:abc");
+        assert_eq!(jwt.verify_signature_cached(&tok).unwrap().sub, "did:plc:abc");
+        assert_eq!(jwt.verify_signature_cached(&tok).unwrap().sub, "did:plc:abc");
+        let other = Jwt::new("other secret", "did:web:pds.test");
+        assert!(other.verify_signature_cached(&tok).is_none(), "cached per secret");
+        let (input, _) = tok.rsplit_once('.').unwrap();
+        let (_, sig) = other.access("did:plc:abc").rsplit_once('.').map(|(a, b)| (a.to_string(), b.to_string())).unwrap();
+        assert!(jwt.verify_signature_cached(&format!("{input}.{sig}")).is_none());
+    }
 
     #[test]
     fn token_compare() {

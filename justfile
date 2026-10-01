@@ -50,6 +50,10 @@ bench name rate *args:
 checker host="http://127.0.0.1:2620" *args:
     cd checker && go build -o checker . && ./checker -host {{host}} {{args}}
 
+# Build the Rust sync 1.1 checker (checker-rs, on shrike) and run it against a vlpds (extra flags e.g. -cursor 0 -strict)
+checker-rs host="http://127.0.0.1:2620" *args:
+    cd checker-rs && cargo run --release --quiet -- -host {{host}} {{args}}
+
 # Production image (Dockerfile: UI build, release build, slim non-root runtime)
 docker-build tag="vlpds:local":
     docker build -t {{tag}} .

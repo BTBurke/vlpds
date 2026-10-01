@@ -1,0 +1,28 @@
+[package]
+name = "vlpds-checker-rs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Independent sync 1.1 firehose verifier for vlpds, built on shrike"
+
+# standalone: not a member of any workspace (vlpds has none; this keeps it so)
+[workspace]
+
+[[bin]]
+name = "checker-rs"
+path = "src/main.rs"
+
+[dependencies]
+# a second atproto implementation: frame parsing, CAR, MST, commits, the
+# sync 1.1 Verifier (pinned; see ../bench/results/differential/SHRIKE_ISSUES.md)
+shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "cbor", "crypto", "mst", "car", "repo", "identity", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tokio-tungstenite = "0.26"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1"
+async-trait = "0.1"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3

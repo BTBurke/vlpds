@@ -1138,14 +1138,17 @@ impl Tree {
         }
     }
 
-    /// Node blocks on the path from the root to `key` (inclusion or exclusion proof).
+    /// Node blocks on the path from the root to `key` (inclusion or exclusion
+    /// proof). The path follows key order down to the node holding `key` or
+    /// to the bottom, like the reference's `cidsForPath`: verifiers search by
+    /// key order alone, so an absent key's proof must reach the lowest node
+    /// it would sort into, even below the key's own height.
     pub fn proof_blocks(&self, key: &[u8]) -> Result<Vec<(Cid, Vec<u8>)>> {
-        let height = height_for_key(key);
         let mut out = Vec::new();
         let mut n: &Node = &self.root;
         loop {
             out.push((n.cid.ok_or(MstError::Invalid("unwritten node"))?, n.block()?.into_owned()));
-            if height >= n.height {
+            if n.find_existing_entry(key).is_some() {
                 return Ok(out);
             }
             match n.find_existing_child(key) {
@@ -1645,6 +1648,45 @@ mod tests {
         // a commit that doesn't chain drops it
         cell.commit(200, 201, Vec::new());
         assert!(cell.index.is_none());
+    }
+
+    #[test]
+    fn proof_blocks_follow_key_order_to_the_bottom() {
+        // A verifier searches the proof by key order alone (reference
+        // cidsForPath / verifyProofs), so an absent key's proof must reach the
+        // lowest node it sorts into, not stop at the key's own height.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let mut t = Tree::new();
+        let keys: Vec<String> = (0..400).map(|_| rand_key(&mut rng)).collect();
+        for k in &keys {
+            t.insert(k.as_bytes(), leaf()).unwrap();
+        }
+        let root = t.root_cid().unwrap();
+        let probes: Vec<String> = keys.iter().take(50).cloned().chain((0..200).map(|_| rand_key(&mut rng))).collect();
+        let mut deep_absent = 0;
+        for k in &probes {
+            let proof: HashMap<Cid, Vec<u8>> = t.proof_blocks(k.as_bytes()).unwrap().into_iter().collect();
+            // walk the proof by key order, never by height
+            let mut c = root;
+            let found = loop {
+                let n = decode_node(&proof[&c], c).unwrap();
+                if let Some(i) = n.find_existing_entry(k.as_bytes()) {
+                    break match &n.entries[i] {
+                        Entry::Value { val, .. } => Some(*val),
+                        _ => unreachable!(),
+                    };
+                }
+                match n.find_existing_child(k.as_bytes()).map(|i| &n.entries[i]) {
+                    Some(Entry::Child { cid: Some(cc), .. }) => c = *cc,
+                    _ => break None,
+                }
+            };
+            assert_eq!(found, t.get(k.as_bytes()).unwrap(), "{k}");
+            if found.is_none() && proof.len() as i32 > t.root.height - height_for_key(k.as_bytes()) + 1 {
+                deep_absent += 1;
+            }
+        }
+        assert!(deep_absent > 0, "no absent key below its own height was probed");
     }
 
     #[test]

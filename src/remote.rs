@@ -228,7 +228,8 @@ async fn stream_live(
     next: &mut Option<u64>,
     stop: &AtomicBool,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/internal/v1/log/stream", base.replacen("http", "ws", 1));
+    // name the log: the address may already serve a later incarnation's log
+    let url = format!("{}/internal/v1/log/stream?log={log_id}", base.replacen("http", "ws", 1));
     let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str())?;
     req.headers_mut().insert("x-vlpds-internal", token.parse()?);
     let (mut ws, _) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, tokio_tungstenite::connect_async(req))
@@ -240,7 +241,10 @@ async fn stream_live(
     // batch landing in between, which the first heartbeat already covers.
     let Some(first) = next_msg(&mut ws, log_id, base).await? else { return Ok(()) };
     let mut first = Some(first);
-    catch_up(log_id, store, floor, merger_tx, wm, next).await?;
+    if catch_up(log_id, store, floor, merger_tx, wm, next).await? {
+        // fenced: whatever this address streams now isn't this log
+        return Ok(());
+    }
     let n = next.as_mut().expect("resolved by catch_up");
     // HA fix: an idle timeout. The owner heartbeats every 5 ms, so silence
     // means a dead or partitioned peer. Without it, a half-open connection

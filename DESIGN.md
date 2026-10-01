@@ -174,6 +174,22 @@ swappable.
   floor. Readers stop at a log's first non-segment (hole rule).
 - Events: `#commit` (sync 1.1), `#sync` (account creation / repo reset),
   `#identity`, `#account`.
+- Sharded subscriptions (vlpds extension):
+  `subscribeRepos?cursor=..&shard=k/n` (0 <= k < n <= 65,536) carries only
+  the events whose repo DID (`repo` of a #commit, `did` of the others) hashes
+  into slice k of n of the 65,536 hash slots: slots s with s·n/65536 = k,
+  so for n dividing the cluster's shard count (or vice versa) a slice is a
+  whole set of cluster shards. Seqs, order and cursors are the full
+  stream's: a cursor from either works on the other, OutdatedCursor /
+  FutureCursor / ConsumerTooSlow behave the same, and the union of the n
+  streams is the full stream. A bad `shard` is 400 InvalidRequest.
+  Filtering is cheap: a batch's per-event slots are computed once (read
+  straight from the frame's CBOR, then sha256 of the DID), lazily by the
+  first sharded subscriber and shared by the rest; a subscriber writes only
+  the matching events as slices of the shared batch bytes, one slice per
+  run of consecutive matches, in one vectored write. Backfill filters the
+  same way, with the slots cached alongside each segment in the backfill
+  cache.
 
 ### 6. Blobs
 `uploadBlob` streams to `blob/{did}/{cid}` (multipart if large). This is off the
@@ -647,12 +663,20 @@ differently:
      stale-tolerant reads.
    - *Firehose fan-out nodes*: consume the node logs, serve subscribers, and
      offer cursor backfill straight from S3 segments. They also serve sharded
-     subscriptions (`?shard=k/n` by DID hash) for consumers that can't take the
-     full ~750 MB/s.
+     subscriptions (`?shard=k/n` by DID hash, implemented: §5) for consumers
+     that can't take the full ~750 MB/s.
 7. **Global indexes at 5 B scale.**
    - Handles: S3 objects for uniqueness, plus a cache.
-   - listRepos: scatter-gather over shards, plus periodic per-shard repo-list
-     snapshots so relays can backfill without scanning 5 B heads live.
+   - listRepos (implemented): the cursor is `{shard}:{last DID}` and a page
+     is served by that shard's owner from its own SlateDB (one snapshot per
+     shard; heads merge-joined with accounts), continuing through the
+     following shards it owns and hopping to the next owner only to fill
+     the page. Any node accepts the cursor and forwards the page to the
+     owner (`/internal/v1/sync/listRepos`, body passed through unparsed),
+     so a page costs one shard scan instead of a scan on every node plus a
+     merge. Per-shard DID order is a stable key order: a repo that exists
+     for the whole enumeration is listed exactly once. 1M repos over 64
+     shards / 3 in-process nodes: see TODO.md.
    - Rate limits and abuse controls per shard.
 
 The current implementation (per-partition logs, P = 16–64, per-partition

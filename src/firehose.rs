@@ -17,6 +17,7 @@ use crate::events;
 use crate::metrics;
 use crate::nodelog::{LogBatch, Watermark};
 use crate::segment::{self, LogObject};
+use crate::slots::SlotRange;
 use crate::stats::STATS;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -62,6 +63,9 @@ pub struct MergedBatch {
     wire: Bytes,
     /// start of each event's message in `wire`
     offs: Vec<usize>,
+    /// Each event's repo hash slot, computed by the first sharded subscriber
+    /// to read the batch and shared by the rest (see [`event_slot`]).
+    slots: OnceLock<Vec<u16>>,
 }
 
 impl MergedBatch {
@@ -85,6 +89,7 @@ impl MergedBatch {
             events,
             wire,
             offs,
+            slots: OnceLock::new(),
         }
     }
 
@@ -96,6 +101,114 @@ impl MergedBatch {
     fn wire_from(&self, i: usize) -> Bytes {
         self.wire.slice(self.offs[i]..)
     }
+
+    fn slots(&self) -> &[u16] {
+        self.slots.get_or_init(|| self.events.iter().map(|(_, f)| event_slot(f)).collect())
+    }
+
+    /// The messages of the events from index `i` on whose repo is in
+    /// `range`: one slice of `wire` per run of consecutive matching events.
+    /// Returns the slices and the number of events.
+    fn wire_runs(&self, i: usize, range: &SlotRange) -> (Vec<std::io::IoSlice<'_>>, usize) {
+        let slots = self.slots();
+        let end = |j: usize| self.offs.get(j).copied().unwrap_or(self.wire.len());
+        let (mut runs, mut n, mut j) = (Vec::new(), 0, i);
+        while j < slots.len() {
+            if !range.contains(slots[j]) {
+                j += 1;
+                continue;
+            }
+            let a = j;
+            while j < slots.len() && range.contains(slots[j]) {
+                j += 1;
+            }
+            n += j - a;
+            runs.push(std::io::IoSlice::new(&self.wire[self.offs[a]..end(j)]));
+        }
+        (runs, n)
+    }
+}
+
+/// The hash slot of an event's repo (`repo` of a #commit, `did` of the
+/// others), read straight from the frame's DAG-CBOR without decoding it. A
+/// frame without one (none are produced) counts as slot 0, so a sharded
+/// stream union still carries it exactly once.
+pub fn event_slot(frame: &[u8]) -> u16 {
+    frame_did(frame).map(crate::slots::slot_of_bytes).unwrap_or(0)
+}
+
+/// `repo` / `did` of the body map following the header map.
+fn frame_did(f: &[u8]) -> Option<&[u8]> {
+    let mut i = 0;
+    cbor_skip(f, &mut i, 0)?; // header
+    let (major, n) = cbor_head(f, &mut i)?;
+    if major != 5 {
+        return None;
+    }
+    for _ in 0..n {
+        let key = cbor_text(f, &mut i)?;
+        if key == b"repo" || key == b"did" {
+            return cbor_text(f, &mut i);
+        }
+        cbor_skip(f, &mut i, 0)?;
+    }
+    None
+}
+
+/// (major type, argument) of the item at `i`; definite lengths only (DAG-CBOR).
+fn cbor_head(f: &[u8], i: &mut usize) -> Option<(u8, u64)> {
+    let b = *f.get(*i)?;
+    *i += 1;
+    let n = match b & 0x1f {
+        n @ 0..=23 => return Some((b >> 5, n as u64)),
+        24 => 1,
+        25 => 2,
+        26 => 4,
+        27 => 8,
+        _ => return None,
+    };
+    let bytes = f.get(*i..*i + n)?;
+    *i += n;
+    Some((b >> 5, bytes.iter().fold(0u64, |a, x| a << 8 | *x as u64)))
+}
+
+fn cbor_text<'a>(f: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
+    let (major, n) = cbor_head(f, i)?;
+    if major != 3 {
+        return None;
+    }
+    let s = f.get(*i..i.checked_add(usize::try_from(n).ok()?)?)?;
+    *i += s.len();
+    Some(s)
+}
+
+fn cbor_skip(f: &[u8], i: &mut usize, depth: u32) -> Option<()> {
+    if depth > 64 {
+        return None;
+    }
+    let (major, n) = cbor_head(f, i)?;
+    match major {
+        2 | 3 => {
+            let end = i.checked_add(usize::try_from(n).ok()?)?;
+            if end > f.len() {
+                return None;
+            }
+            *i = end;
+        }
+        4 => {
+            for _ in 0..n {
+                cbor_skip(f, i, depth + 1)?;
+            }
+        }
+        5 => {
+            for _ in 0..n.checked_mul(2)? {
+                cbor_skip(f, i, depth + 1)?;
+            }
+        }
+        6 => cbor_skip(f, i, depth + 1)?,
+        _ => {}
+    }
+    Some(())
 }
 
 /// Subscriber serving settings.
@@ -442,7 +555,12 @@ impl Firehose {
     /// pre-built websocket messages (`MergedBatch::wire`), one write per
     /// batch shared byte-for-byte by every subscriber, instead of a framing
     /// pass, a sink send and a flush per event per subscriber.
-    pub fn upgrade(self: &Arc<Self>, mut req: axum::extract::Request, cursor: Option<i64>) -> Response {
+    ///
+    /// `shard` (vlpds extension, `?shard=k/n`): only events whose repo hashes
+    /// into that slice of the slot space. Same seqs, order and cursors as the
+    /// full stream (a cursor from either works on the other); the union of
+    /// the n streams is the full stream.
+    pub fn upgrade(self: &Arc<Self>, mut req: axum::extract::Request, cursor: Option<i64>, shard: Option<SlotRange>) -> Response {
         let accept = match handshake(req.headers()) {
             Ok(a) => a,
             Err(e) => return e.into_response(),
@@ -451,7 +569,7 @@ impl Firehose {
         let fh = self.clone();
         self.runtime.spawn(async move {
             match on_upgrade.await {
-                Ok(up) => fh.serve(up, cursor).await,
+                Ok(up) => fh.serve(up, cursor, shard).await,
                 Err(e) => tracing::debug!("subscribeRepos upgrade failed: {e}"),
             }
         });
@@ -462,7 +580,7 @@ impl Firehose {
             .into_response()
     }
 
-    async fn serve(self: Arc<Self>, up: hyper::upgrade::Upgraded, cursor: Option<i64>) {
+    async fn serve(self: Arc<Self>, up: hyper::upgrade::Upgraded, cursor: Option<i64>, shard: Option<SlotRange>) {
         use hyper_util::rt::TokioIo;
         use tokio::net::TcpStream;
         metrics::FIREHOSE_SUBSCRIBERS.inc();
@@ -472,7 +590,7 @@ impl Firehose {
             Ok(parts) => match parts.io.into_inner().into_std().and_then(TcpStream::from_std) {
                 Ok(tcp) => {
                     let (r, w) = tcp.into_split();
-                    self.serve_conn(std::io::Cursor::new(parts.read_buf).chain(r), w, cursor).await
+                    self.serve_conn(std::io::Cursor::new(parts.read_buf).chain(r), w, cursor, shard).await
                 }
                 Err(e) => {
                     tracing::debug!("subscribeRepos socket: {e}");
@@ -482,14 +600,14 @@ impl Firehose {
             Err(up) => {
                 tracing::debug!("subscribeRepos: upgraded connection isn't a plain TCP stream; serving it through hyper's IO");
                 let (r, w) = tokio::io::split(TokioIo::new(up));
-                self.serve_conn(r, w, cursor).await
+                self.serve_conn(r, w, cursor, shard).await
             }
         };
         metrics::FIREHOSE_SUBSCRIBERS.dec();
         metrics::FIREHOSE_DISCONNECTS.with_label_values(&[reason]).inc();
     }
 
-    async fn serve_conn<R, W>(&self, r: R, w: W, cursor: Option<i64>) -> &'static str
+    async fn serve_conn<R, W>(&self, r: R, w: W, cursor: Option<i64>, shard: Option<SlotRange>) -> &'static str
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin,
@@ -497,7 +615,7 @@ impl Firehose {
         let (ctl_tx, ctl) = mpsc::channel(8);
         let reader = tokio::spawn(read_client(r, ctl_tx));
         let mut out = Out { w, ctl };
-        let reason = match self.stream(&mut out, cursor).await {
+        let reason = match self.stream(&mut out, cursor, shard).await {
             Ok(()) => "shutdown",
             Err(reason) => reason,
         };
@@ -505,7 +623,7 @@ impl Firehose {
         reason
     }
 
-    async fn stream<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>, cursor: Option<i64>) -> Result<(), &'static str> {
+    async fn stream<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>, cursor: Option<i64>, shard: Option<SlotRange>) -> Result<(), &'static str> {
         let mut head = self.head.subscribe();
         let mut last = match cursor {
             Some(c) => c,
@@ -523,7 +641,7 @@ impl Firehose {
             // older than the ring: stream it from the S3 segments first, until
             // the ring reaches back to it (it moves while we backfill)
             loop {
-                if !self.backfill_to_ring(out, &mut last).await? {
+                if !self.backfill_to_ring(out, &mut last, shard).await? {
                     out.send(&info_frame("OutdatedCursor", "cursor is older than the retained history; starting from the oldest available event")).await?;
                     last = last.max(self.ring_floor.load(Ordering::Acquire));
                 }
@@ -560,8 +678,23 @@ impl Firehose {
                 if i == b.events.len() {
                     continue;
                 }
-                out.send_live(&b.wire_from(i), &mut head, b.start(), allowance).await?;
-                metrics::FIREHOSE_SENT.inc_by((b.events.len() - i) as u64);
+                let sent = match &shard {
+                    None => {
+                        let wire = b.wire_from(i);
+                        out.send_live(&mut [std::io::IoSlice::new(&wire)], &mut head, b.start(), allowance).await?;
+                        b.events.len() - i
+                    }
+                    // only the matching events: each run of them is one
+                    // slice of the shared bytes, all written in one go
+                    Some(range) => {
+                        let (mut runs, n) = b.wire_runs(i, range);
+                        if n > 0 {
+                            out.send_live(&mut runs, &mut head, b.start(), allowance).await?;
+                        }
+                        n
+                    }
+                };
+                metrics::FIREHOSE_SENT.inc_by(sent as u64);
                 last = b.last;
                 while let Ok(c) = out.ctl.try_recv() {
                     out.control(Some(c)).await?;
@@ -573,9 +706,9 @@ impl Firehose {
     /// Sends the events in (`last`, ring floor] from S3, once every log is
     /// durable up to the floor. Ok(false) = the backfill failed (or there's
     /// no store): the caller skips to the ring.
-    async fn backfill_to_ring<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>, last: &mut i64) -> Result<bool, &'static str> {
+    async fn backfill_to_ring<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>, last: &mut i64, shard: Option<SlotRange>) -> Result<bool, &'static str> {
         let Some(store) = self.store.read().clone() else { return Ok(false) };
-        let reader = Reader { store, cache: self.backfill_cache.clone(), readahead_bytes: self.readahead_bytes };
+        let reader = Reader { store, cache: self.backfill_cache.clone(), readahead_bytes: self.readahead_bytes, shard };
         loop {
             let floor = self.ring_floor.load(Ordering::Acquire);
             if *last >= floor {
@@ -846,9 +979,10 @@ impl<W: AsyncWrite + Unpin> Out<W> {
     /// `allowance` bytes behind the head the subscriber is dropped with
     /// ConsumerTooSlow, so a stalled reader holds nothing but its place in
     /// the shared ring and can't slow anyone else.
-    async fn send_live(&mut self, data: &[u8], head: &mut watch::Receiver<u64>, pos: u64, allowance: u64) -> Result<(), &'static str> {
+    async fn send_live(&mut self, data: &mut [std::io::IoSlice<'_>], head: &mut watch::Receiver<u64>, pos: u64, allowance: u64) -> Result<(), &'static str> {
+        let len: usize = data.iter().map(|d| d.len()).sum();
         let too_slow = {
-            let mut write = std::pin::pin!(self.w.write_all(data));
+            let mut write = std::pin::pin!(write_all_vectored(&mut self.w, data));
             loop {
                 tokio::select! {
                     r = &mut write => {
@@ -874,7 +1008,7 @@ impl<W: AsyncWrite + Unpin> Out<W> {
                 }
             }
         };
-        metrics::FIREHOSE_SENT_BYTES.inc_by(data.len() as u64);
+        metrics::FIREHOSE_SENT_BYTES.inc_by(len as u64);
         if too_slow {
             self.finish(&events::error_frame("ConsumerTooSlow", "fell too far behind the stream; reconnect with a cursor")).await;
             return Err("too_slow");
@@ -914,6 +1048,23 @@ impl<W: AsyncWrite + Unpin> Out<W> {
     }
 }
 
+/// Most slices per vectored write (IOV_MAX is 1024 on Linux and macOS).
+const MAX_IOV: usize = 1024;
+
+/// `write_all` over several slices: one writev per call where the socket
+/// supports it (a single slice is a plain write).
+async fn write_all_vectored<W: AsyncWrite + Unpin>(w: &mut W, mut bufs: &mut [std::io::IoSlice<'_>]) -> std::io::Result<()> {
+    std::io::IoSlice::advance_slices(&mut bufs, 0);
+    while !bufs.is_empty() {
+        let n = w.write_vectored(&bufs[..bufs.len().min(MAX_IOV)]).await?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        std::io::IoSlice::advance_slices(&mut bufs, n);
+    }
+    Ok(())
+}
+
 /// Aborts a task when its handle is dropped (a subscriber that went away).
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
@@ -944,6 +1095,108 @@ mod tests {
     use super::*;
     use crate::segment::SegmentBuilder;
     use object_store::{ObjectStoreExt, PutPayload};
+
+    /// event_slot finds the repo of every event kind (a #commit's `repo`
+    /// sits after its ops), and wire_runs writes exactly the matching
+    /// events' messages, one slice per run.
+    #[test]
+    fn event_slots_and_runs() {
+        let cid = crate::cid::Cid::dag_cbor(b"x");
+        let dids: Vec<String> = (0..64).map(crate::state::bulk_did).collect();
+        let frame = |i: usize| -> Bytes {
+            let did = dids[i].as_str();
+            let f = match i % 4 {
+                0 => {
+                    let ops = [
+                        events::RepoOp { action: "create", path: "app.bsky.feed.post/3k", cid: Some(cid), prev: None },
+                        events::RepoOp { action: "update", path: "app.bsky.feed.like/3j", cid: Some(cid), prev: Some(cid) },
+                    ];
+                    events::commit_frame(&events::CommitFrame {
+                        repo: did,
+                        rev: "3kabc",
+                        since: Some("3kabb"),
+                        commit: cid,
+                        prev_data: Some(cid),
+                        blocks: &[7u8; 300],
+                        ops: &ops,
+                        time: "2026-01-01T00:00:00Z",
+                    })
+                }
+                1 => events::sync_frame(did, "3kabc", &[1, 2, 3], "t"),
+                2 => events::identity_frame(did, "a.test", "t"),
+                _ => events::account_frame(did, false, Some("takendown"), "t"),
+            };
+            let mut out = Vec::new();
+            f.finish(1000 + i as i64, &mut out);
+            Bytes::from(out)
+        };
+        let evs: Vec<(i64, Bytes)> = (0..dids.len()).map(|i| (1000 + i as i64, frame(i))).collect();
+        for (i, (_, f)) in evs.iter().enumerate() {
+            assert_eq!(event_slot(f), crate::slots::slot_of(&dids[i]), "event {i}");
+        }
+        assert_eq!(event_slot(b"\xa0"), 0);
+        assert_eq!(event_slot(&evs[0].1[..20]), 0);
+        let batch = MergedBatch::new(evs.clone(), 0);
+        for n in [1u32, 2, 5] {
+            for k in 0..n {
+                let range = SlotRange::new(k, n).unwrap();
+                for from in [0, 17] {
+                    let (runs, count) = batch.wire_runs(from, &range);
+                    let got: Vec<u8> = runs.iter().flat_map(|r| r.to_vec()).collect();
+                    let want: Vec<(i64, Bytes)> = evs[from..].iter().filter(|(_, f)| range.contains(event_slot(f))).cloned().collect();
+                    let mut buf = Vec::new();
+                    for (_, f) in &want {
+                        push_message(&mut buf, OP_BINARY, f);
+                    }
+                    assert_eq!((got, count), (buf, want.len()), "{k}/{n} from {from}");
+                    assert!(runs.len() <= count);
+                }
+            }
+        }
+    }
+
+    /// Sharded fan-out cost per event (ignored; --ignored --nocapture):
+    /// computing a batch's slots once, then each of 16 sharded subscribers
+    /// picking its runs.
+    #[test]
+    #[ignore]
+    fn sharded_filter_cost() {
+        let cid = crate::cid::Cid::dag_cbor(b"x");
+        let ops = [events::RepoOp { action: "create", path: "app.bsky.feed.post/3kabcdefghij2", cid: Some(cid), prev: None }];
+        let evs: Vec<(i64, Bytes)> = (0..2000u64)
+            .map(|i| {
+                let did = crate::state::bulk_did(i);
+                let f = events::commit_frame(&events::CommitFrame {
+                    repo: &did,
+                    rev: "3kabc",
+                    since: Some("3kabb"),
+                    commit: cid,
+                    prev_data: Some(cid),
+                    blocks: &[7u8; 1200],
+                    ops: &ops,
+                    time: "2026-01-01T00:00:00.000Z",
+                });
+                let mut out = Vec::new();
+                f.finish(i as i64, &mut out);
+                (i as i64, Bytes::from(out))
+            })
+            .collect();
+        let rounds = 50;
+        let (mut slots_t, mut runs_t) = (Duration::ZERO, Duration::ZERO);
+        for _ in 0..rounds {
+            let b = MergedBatch::new(evs.clone(), 0);
+            let t = std::time::Instant::now();
+            std::hint::black_box(b.slots());
+            slots_t += t.elapsed();
+            let t = std::time::Instant::now();
+            for k in 0..16 {
+                std::hint::black_box(b.wire_runs(0, &SlotRange::new(k, 16).unwrap()));
+            }
+            runs_t += t.elapsed();
+        }
+        let per = |d: Duration| d.as_nanos() as f64 / (rounds * evs.len()) as f64;
+        eprintln!("slots: {:.0} ns/event once per batch; runs for 16 sharded subscribers: {:.0} ns/event total", per(slots_t), per(runs_t));
+    }
 
     /// The next emitted batches after `last` (advanced past them).
     async fn next_batches(fh: &Firehose, sub: &mut watch::Receiver<u64>, last: &mut i64) -> Vec<Arc<MergedBatch>> {

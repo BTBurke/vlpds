@@ -1504,10 +1504,14 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
         ack: Some({
             let inner = head_ack(req.reply, st.head.clone());
             let (view, snap) = (st.view.clone(), st.durable_view());
+            let did = st.did.clone();
             Box::new(move |r| {
                 if r.is_ok() {
                     *view.write() = snap;
                 }
+                // applied (acks follow the state apply): drop cached copies
+                // of the account (status, signing key)
+                crate::xrpc::proxy::account_changed(&did);
                 inner(r)
             })
         }),

@@ -75,7 +75,7 @@ async fn rotated_signing_key_stops_service_jwt_reuse() {
     let k2 = repo_key(&s, &a.did).await;
     assert_ne!(k1, k2);
 
-    // within the account cache's freshness window (2 s) the new key signs
+    // the new key signs (at once: the rotation drops the cached account)
     let t0 = Instant::now();
     loop {
         let t = timeline().await;

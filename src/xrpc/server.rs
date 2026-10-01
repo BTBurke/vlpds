@@ -1107,11 +1107,12 @@ async fn revoke_app_password_sessions(app: &App, did: &str, name: &str) -> XResu
 }
 
 /// Verifies a legacy Bearer token (session or app-password access JWT).
-/// Hot path: signature + in-memory revocation check, no storage reads.
+/// Hot path: cached signature check + claims ([`crate::auth::TokenCache`])
+/// and the in-memory revocation check on every request, no storage reads.
 pub async fn verify_bearer(app: &App, token: &str) -> XResult<Credentials> {
     let c = app
         .jwt
-        .verify_signature(token)
+        .verify_signature_cached(token)
         .ok_or_else(|| invalid_token("Token could not be verified"))?;
     if c.aud != app.jwt.service_did || !c.sub.starts_with("did:") {
         return Err(invalid_token("Malformed token"));

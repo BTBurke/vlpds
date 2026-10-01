@@ -105,9 +105,26 @@ pub fn internal_token_ok(cfg: &crate::server::Config, t: &str) -> bool {
         || (cfg.dev_mode && crate::auth::token_eq(&cfg.admin_token, t))
 }
 
+#[derive(Deserialize)]
+struct StreamQ {
+    /// The log the follower is following.
+    log: Option<String>,
+}
+
 /// Streams this node's log (durable batches + watermark heartbeats) to a peer.
-async fn stream(State(app): AppState, headers: HeaderMap, ws: WebSocketUpgrade) -> XResult<Response> {
+async fn stream(State(app): AppState, headers: HeaderMap, Query(q): Query<StreamQ>, ws: WebSocketUpgrade) -> XResult<Response> {
     check(&app, &headers)?;
+    // HA fix: serve only the log the follower asked for. A restarted node keeps
+    // its address, so a peer still following its previous (dead) log reached
+    // the new incarnation and got the *new* log's batches labeled with the old
+    // log id. Past the old log's fence ordinal they were merged twice (once
+    // per label): duplicate events on the merged firehose (bench/ha
+    // s3-slow-all, every node restarted at once).
+    if let Some(want) = &q.log {
+        if **want != *app.log.log_id {
+            return Err(XrpcError::bad("WrongLog", format!("this node serves log {}, not {want}", app.log.log_id)));
+        }
+    }
     let log = app.log.clone();
     Ok(ws.on_upgrade(move |socket| crate::remote::serve_stream(socket, log)))
 }
@@ -395,15 +412,43 @@ async fn admin_invite_codes(
     Ok(Json(json!({"owned": owned, "codes": codes})))
 }
 
-/// The local half of sync.listRepos on this node's shards, for a peer's merge.
+/// A sync.listRepos page from this node's shards only (the cursor's shard
+/// must be ours: 503 otherwise, never forwarded again), in the public
+/// response shape. Peers call it with the owner of their cursor's shard.
 async fn sync_list_repos(
     State(app): AppState,
     headers: HeaderMap,
-    Query(q): Query<super::sync::ListReposQ>,
-) -> XResult<Json<J>> {
+    Query(q): Query<ListPageQ>,
+) -> XResult<Response> {
     check(&app, &headers)?;
-    let (repos, owned) = super::sync::list_repos_local(&app, &q).await?;
-    Ok(Json(json!({"owned": owned, "repos": repos})))
+    let pos = super::sync::parse_list_cursor(&q.cursor, app.partitions.len())?;
+    let limit = super::extract::limit_param(Some(q.limit), 500, 1, 1000)?;
+    let (repos, next) = super::sync::list_repos_local(&app, pos, limit).await?;
+    let page = super::sync::ReposPage::new(repos, next);
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_vec(&page).map_err(XrpcError::from_err)?).into_response())
+}
+
+#[derive(Deserialize)]
+struct ListPageQ {
+    cursor: String,
+    limit: i64,
+}
+
+/// GETs a listRepos page from the shard owner at `owner` (its raw body).
+pub async fn owner_list_repos(app: &App, owner: &str, cursor: &str, limit: usize) -> XResult<Bytes> {
+    let r = app
+        .http
+        .get(format!("{}/internal/v1/sync/listRepos", owner.trim_end_matches('/')))
+        .header(HDR, &app.config.internal_token)
+        .query(&[("cursor", cursor), ("limit", &limit.to_string())])
+        .timeout(GATHER_TIMEOUT)
+        .send()
+        .await
+        .map_err(upstream)?;
+    if !r.status().is_success() {
+        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
+    }
+    r.bytes().await.map_err(upstream)
 }
 
 /// The local half of sync.listReposByCollection, for a peer's merge.

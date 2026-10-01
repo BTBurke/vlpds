@@ -8,7 +8,7 @@ pub mod authn;
 pub mod blobs;
 mod identity;
 pub mod oauth;
-mod proxy;
+pub(crate) mod proxy;
 mod repo;
 mod server;
 mod sync;

@@ -2115,9 +2115,7 @@ pub async fn dpop_layer(
 /// Verifies `Authorization: DPoP <token>` on a resource request.
 pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Credentials> {
     let k = keys(app);
-    let jwt = k
-        .server
-        .verify(token, "at+jwt")
+    let jwt = super::authn::verify_access_token(&k.server, token)
         .map_err(|e| dpop_fail("invalid_token", &e))?;
     let now = now_secs();
     let claims_ok = jwt.claim_str("iss") == Some(issuer(app).as_str())

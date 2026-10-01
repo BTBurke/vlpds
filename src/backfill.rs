@@ -14,6 +14,7 @@
 use crate::metrics;
 use crate::nodelog::{prefix_hole, read_head, segment_path, Head};
 use crate::segment::{self, LogObject};
+use crate::slots::SlotRange;
 use crate::store::Store;
 use bytes::Bytes;
 use object_store::path::Path;
@@ -144,6 +145,15 @@ pub struct Seg {
     pub events: Vec<(i64, Bytes)>,
     /// object size
     pub bytes: usize,
+    /// Each event's repo hash slot, computed by the first sharded reader and
+    /// cached with the segment.
+    slots: std::sync::OnceLock<Vec<u16>>,
+}
+
+impl Seg {
+    fn slot(&self, i: usize) -> u16 {
+        self.slots.get_or_init(|| self.events.iter().map(|(_, f)| crate::firehose::event_slot(f)).collect())[i]
+    }
 }
 
 /// What occupies an ordinal, as a sequential reader sees it.
@@ -268,7 +278,7 @@ async fn fetch(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result<Fetc
         LogObject::Segment(h, entries) => {
             anyhow::ensure!(h.log_id == log_id && h.ordinal == ordinal, "log object {log_id}/{ordinal} has header {}/{}", h.log_id, h.ordinal);
             let events = entries.into_iter().filter(|e| !e.frame.is_empty()).map(|e| (e.seq, e.frame)).collect();
-            Ok(Fetched::Seg(Arc::new(Seg { events, bytes })))
+            Ok(Fetched::Seg(Arc::new(Seg { events, bytes, slots: Default::default() })))
         }
     }
 }
@@ -280,12 +290,14 @@ pub struct Reader {
     pub cache: Arc<SegCache>,
     /// Read-ahead budget per backfill (all logs together), in object bytes.
     pub readahead_bytes: usize,
+    /// Only events whose repo is in this slot range (a sharded subscriber).
+    pub shard: Option<SlotRange>,
 }
 
 impl Reader {
     /// A reader with its own cache and the default read-ahead.
     pub fn new(store: Store) -> Reader {
-        Reader { store, cache: SegCache::new(DEFAULT_CACHE_BYTES), readahead_bytes: DEFAULT_READAHEAD_BYTES }
+        Reader { store, cache: SegCache::new(DEFAULT_CACHE_BYTES), readahead_bytes: DEFAULT_READAHEAD_BYTES, shard: None }
     }
 }
 
@@ -332,6 +344,14 @@ impl LogCursor {
         self.seg.as_ref().and_then(|s| s.events.get(self.pos))
     }
 
+    /// The current event is one the reader wants (its shard filter).
+    fn wanted(&self, r: &Reader) -> bool {
+        match (&r.shard, &self.seg) {
+            (Some(range), Some(s)) => range.contains(s.slot(self.pos)),
+            _ => true,
+        }
+    }
+
     /// Keeps GETs in flight: at least one, then while the in-flight bytes
     /// (estimated from the sizes seen so far) fit in `budget`.
     fn top_up(&mut self, r: &Reader, budget: usize) {
@@ -343,12 +363,13 @@ impl LogCursor {
         }
     }
 
-    /// Advances to the next event with seq > `after`, reading segments as
-    /// needed; None once the log's durable prefix is exhausted.
+    /// Advances to the next event with seq > `after` (that the reader's shard
+    /// filter takes), reading segments as needed; None once the log's
+    /// durable prefix is exhausted.
     async fn advance(&mut self, r: &Reader, budget: usize, after: i64) -> anyhow::Result<Option<i64>> {
         loop {
             if let Some((seq, _)) = self.head() {
-                if *seq > after {
+                if *seq > after && self.wanted(r) {
                     return Ok(Some(*seq));
                 }
                 self.pos += 1;
@@ -568,7 +589,7 @@ mod tests {
         want.sort_unstable();
 
         for readahead in [1, 400, 64 << 20] {
-            let r = Reader { store: store.clone(), cache: SegCache::new(if readahead == 1 { 0 } else { 1 << 20 }), readahead_bytes: readahead };
+            let r = Reader { store: store.clone(), cache: SegCache::new(if readahead == 1 { 0 } else { 1 << 20 }), readahead_bytes: readahead, shard: None };
             let (last, got) = collect(&r, -1, i64::MAX).await;
             let seqs: Vec<i64> = got.iter().map(|(s, _)| *s).collect();
             assert_eq!(seqs, want, "readahead {readahead}");
@@ -585,7 +606,7 @@ mod tests {
 
         // two concurrent readers of the same range share one cache: the
         // second costs (almost) no GETs
-        let r = Reader { store: store.clone(), cache: SegCache::new(64 << 20), readahead_bytes: 64 << 20 };
+        let r = Reader { store: store.clone(), cache: SegCache::new(64 << 20), readahead_bytes: 64 << 20, shard: None };
         let gets = || metrics::FIREHOSE_BACKFILL_GETS.get();
         let before = gets();
         let (a, b) = tokio::join!(collect(&r, -1, i64::MAX), collect(&r, -1, i64::MAX));

@@ -152,6 +152,33 @@ pub async fn authenticate(app: &App, parts: &Parts) -> XResult<Credentials> {
     Err(XrpcError::auth("unsupported authorization scheme"))
 }
 
+/// OAuth access tokens verified by the server's ES256 key: signature and
+/// `typ` checked and the token decoded once per token (until its `exp`), as
+/// [`crate::auth::Jwt::verify_signature_cached`] does for legacy tokens.
+/// Entries remember the key that verified them (one process can run several
+/// servers, each with its own key). Claims, the DPoP proof and the session
+/// are still checked per request by `oauth::verify_dpop`.
+pub fn verify_access_token(
+    server: &crate::oauth::jose::ServerKey,
+    token: &str,
+) -> Result<Arc<crate::oauth::jose::DecodedJwt>, String> {
+    type Verified = (Arc<str>, Arc<crate::oauth::jose::DecodedJwt>);
+    // ~1.5 KB each (token + decoded header and payload)
+    static CACHE: std::sync::LazyLock<crate::auth::TokenCache<Verified>> =
+        std::sync::LazyLock::new(|| crate::auth::TokenCache::new(1 << 18));
+    let now = crate::tid::now_micros() / 1_000_000;
+    if let Some((kid, jwt)) = CACHE.get(token, now) {
+        if *kid == *server.kid {
+            return Ok(jwt);
+        }
+    }
+    let jwt = Arc::new(server.verify(token, "at+jwt")?);
+    if let Some(exp) = jwt.claim_i64("exp").and_then(|e| u64::try_from(e).ok()) {
+        CACHE.put(token, (server.kid.as_str().into(), jwt.clone()), exp, now);
+    }
+    Ok(jwt)
+}
+
 /// Extractor: authenticated request.
 pub struct Auth(pub Credentials);
 

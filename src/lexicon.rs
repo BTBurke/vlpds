@@ -1156,11 +1156,18 @@ pub fn valid_uri(s: &str) -> bool {
         && !rest.chars().any(char::is_whitespace)
 }
 
-/// Strict AT URI: `at://AUTHORITY[/NSID[/RKEY]]`.
+/// Strict AT URI: `at://AUTHORITY[/NSID[/RKEY]][#/JSON-POINTER]`, as
+/// @atproto/syntax `isAtUriString` checks it (the fragment is a `/`-rooted
+/// JSON pointer in its URI charset, with valid percent-encoding).
 pub fn valid_at_uri(s: &str) -> bool {
     if s.len() > 8192 || !s.is_ascii() {
         return false;
     }
+    let s = match s.split_once('#') {
+        Some((uri, frag)) if valid_at_uri_fragment(frag) => uri,
+        Some(_) => return false,
+        None => s,
+    };
     let Some(rest) = s.strip_prefix("at://") else {
         return false;
     };
@@ -1177,19 +1184,146 @@ pub fn valid_at_uri(s: &str) -> bool {
     }
 }
 
-/// BCP 47 language tag shape (@atproto/syntax isLanguageString, simplified).
+fn valid_at_uri_fragment(f: &str) -> bool {
+    if !f.starts_with('/') || !f.bytes().all(|b| b.is_ascii_alphanumeric() || b"._~:@!$&'()*+,;=%[]/-".contains(&b)) {
+        return false;
+    }
+    // percent-escapes must decode to UTF-8 (decodeURIComponent)
+    let mut out = Vec::with_capacity(f.len());
+    let mut b = f.bytes();
+    while let Some(c) = b.next() {
+        if c != b'%' {
+            out.push(c);
+            continue;
+        }
+        let hex = |c: Option<u8>| c.and_then(|c| (c as char).to_digit(16));
+        match (hex(b.next()), hex(b.next())) {
+            (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
+            _ => return false,
+        }
+    }
+    std::str::from_utf8(&out).is_ok()
+}
+
+/// A well-formed BCP 47 language tag, as @atproto/syntax `parseLanguageString`
+/// (lex-schema's `isLanguageString`) checks it: the RFC 5646 grammar
+/// (langtag, private use, the grandfathered tags), a lowercase 2-3 letter
+/// primary subtag, and no repeated variant or extension singleton.
 pub fn valid_language(s: &str) -> bool {
-    let mut parts = s.split('-');
-    let first = parts.next().unwrap_or("");
-    let first_ok = first == "i"
-        || first == "x"
-        || ((2..=3).contains(&first.len()) && first.bytes().all(|b| b.is_ascii_alphabetic()));
-    first_ok && parts.all(|p| (1..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
+    const GRANDFATHERED: &[&str] = &[
+        "en-GB-oed", "i-ami", "i-bnn", "i-default", "i-enochian", "i-hak", "i-klingon", "i-lux",
+        "i-mingo", "i-navajo", "i-pwn", "i-tao", "i-tay", "i-tsu", "sgn-BE-FR", "sgn-BE-NL",
+        "sgn-CH-DE", "art-lojban", "cel-gaulish", "no-bok", "no-nyn", "zh-guoyu", "zh-hakka",
+        "zh-min", "zh-min-nan", "zh-xiang",
+    ];
+    if GRANDFATHERED.contains(&s) {
+        return true;
+    }
+    let tags: Vec<&str> = s.split('-').collect();
+    let alnum = |t: &str, lo: usize, hi: usize| {
+        (lo..=hi).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_alphanumeric())
+    };
+    let alpha = |t: &str, n: usize| t.len() == n && t.bytes().all(|b| b.is_ascii_alphabetic());
+    // privateuse: x-1*8alphanum ...
+    let private_use = |rest: &[&str]| !rest.is_empty() && rest.iter().all(|t| alnum(t, 1, 8));
+    if tags[0].eq_ignore_ascii_case("x") {
+        return private_use(&tags[1..]);
+    }
+    let primary = tags[0];
+    if !(2..=3).contains(&primary.len()) || !primary.bytes().all(|b| b.is_ascii_lowercase()) {
+        return false;
+    }
+    let mut i = 1;
+    // extlang: up to three 3-letter subtags
+    while i < tags.len() && i <= 3 && alpha(tags[i], 3) {
+        i += 1;
+    }
+    if i < tags.len() && alpha(tags[i], 4) {
+        i += 1; // script
+    }
+    if i < tags.len()
+        && (alpha(tags[i], 2) || (tags[i].len() == 3 && tags[i].bytes().all(|b| b.is_ascii_digit())))
+    {
+        i += 1; // region
+    }
+    let mut variants: Vec<String> = Vec::new();
+    while i < tags.len()
+        && (alnum(tags[i], 5, 8) || (tags[i].len() == 4 && tags[i].as_bytes()[0].is_ascii_digit() && alnum(tags[i], 4, 4)))
+    {
+        let v = tags[i].to_ascii_lowercase();
+        if variants.contains(&v) {
+            return false;
+        }
+        variants.push(v);
+        i += 1;
+    }
+    let mut singletons: Vec<u8> = Vec::new();
+    while i < tags.len() && tags[i].len() == 1 && alnum(tags[i], 1, 1) && !tags[i].eq_ignore_ascii_case("x") {
+        let c = tags[i].as_bytes()[0].to_ascii_lowercase();
+        if singletons.contains(&c) {
+            return false;
+        }
+        singletons.push(c);
+        i += 1;
+        let start = i;
+        while i < tags.len() && alnum(tags[i], 2, 8) {
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+    }
+    if i < tags.len() && tags[i].eq_ignore_ascii_case("x") {
+        return private_use(&tags[i + 1..]);
+    }
+    i == tags.len()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn languages_like_the_reference() {
+        // @atproto/syntax parseLanguageString (and the interop fixtures)
+        for ok in [
+            "ja", "ban", "pt-BR", "hy-Latn-IT-arevela", "zh-Hant", "sgn-BE-NL", "es-419",
+            "en-GB-boont-r-extended-sequence-x-private", "zh-hakka", "i-default", "de-CH-1901",
+            "qaa-Qaaa-QM-x-southern", "X-fr-CH", "x-foo", "de-X-foo", "sl-rozaj-biske",
+            "en-u-co-phonebk-t-en-US", "zh-yue-HK",
+        ] {
+            assert!(valid_language(ok), "{ok}");
+        }
+        for bad in [
+            "", "jaja", ".", "123", "JA", "j", "ja-", "a-DE", "x", "i", "i-foo", "enU-9", "en--US",
+            "en-a", "en-a-bb-a-cc", "sl-rozaj-rozaj", "en-US-abc", "en-x", "de-419-DE",
+        ] {
+            assert!(!valid_language(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn at_uri_fragments() {
+        for ok in [
+            "at://did:plc:abc/app.bsky.feed.post/3jzfcijpj2z2a#/text",
+            "at://did:plc:abc#/a/b~0c",
+            "at://alice.test/app.bsky.feed.post#/%C3%A9",
+        ] {
+            assert!(valid_at_uri(ok), "{ok}");
+        }
+        for bad in [
+            "at://did:plc:abc#",
+            "at://did:plc:abc#frag",
+            "at://did:plc:abc#/a#/b",
+            "at://did:plc:abc#/a b",
+            "at://did:plc:abc#/%FF",
+            "at://did:plc:abc#/%G0",
+            "at://did:plc:abc/app.bsky.feed.post/rkey/#/frag",
+            "at://did:plc:abc?q#/frag",
+        ] {
+            assert!(!valid_at_uri(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn datetimes() {

@@ -6,6 +6,24 @@ use crate::cid::{Cid, CID_BYTES_LEN};
 use base64::Engine;
 use std::borrow::Cow;
 
+/// Decodes a `$bytes` string as the reference's `@atproto/lex-data`
+/// `fromBase64` does: standard alphabet, padding optional (up to two `=`,
+/// never past the padded length: `"AQ="` is `[1]`, `"AQID="` is invalid),
+/// and non-zero trailing bits accepted (`"AR"` is `[1]`).
+fn decode_bytes(s: &str) -> Result<Vec<u8>, ()> {
+    const LENIENT: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true)
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::RequireNone),
+    );
+    let body = s.strip_suffix("==").or_else(|| s.strip_suffix('=')).unwrap_or(s);
+    if s.len() > body.len().div_ceil(4) * 4 {
+        return Err(());
+    }
+    LENIENT.decode(body).map_err(|_| ())
+}
+
 // ---------- low-level encoding ----------
 
 #[inline]
@@ -205,8 +223,7 @@ impl Value {
                 if let Some(b) = o.get("$bytes") {
                     return match (b, o.len()) {
                         (serde_json::Value::String(s), 1) => {
-                            base64::engine::general_purpose::STANDARD_NO_PAD
-                                .decode(s.trim_end_matches('='))
+                            decode_bytes(s)
                                 .map(Value::Bytes)
                                 .map_err(|_| dm("bad $bytes"))
                         }
@@ -217,12 +234,17 @@ impl Value {
                     None => {}
                     Some(serde_json::Value::String(t)) if !t.is_empty() => {
                         if t == "blob" {
-                            let ok = matches!(o.get("ref"), Some(serde_json::Value::Object(r)) if r.len() == 1 && r.get("$link").is_some())
-                                && o.get("mimeType").is_some_and(|m| m.is_string())
-                                && o.get("size").is_some_and(|n| n.is_i64() || n.is_u64());
+                            let link = match o.get("ref") {
+                                Some(serde_json::Value::Object(r)) if r.len() == 1 => r.get("$link").and_then(|l| l.as_str()),
+                                _ => None,
+                            };
+                            let ok = o.len() == 4
+                                && link.is_some_and(blob_link_ok)
+                                && o.get("mimeType").and_then(|m| m.as_str()).is_some_and(blob_mime_ok)
+                                && o.get("size").and_then(|n| n.as_i64()).is_some_and(blob_size_ok);
                             if !ok {
                                 return Err(dm(
-                                    "blob needs ref ($link), mimeType (string) and size (integer)",
+                                    "blob needs exactly ref ($link to a raw CID), mimeType (non-empty string) and size (integer >= 0)",
                                 ));
                             }
                         }
@@ -327,6 +349,23 @@ impl RecordRefs {
 
 /// Largest integer a JSON float may carry into a record (JS's safe range).
 const MAX_SAFE_INT: f64 = 9_007_199_254_740_991.0;
+
+// A typed blob ref, as @atproto/lex-data's strict `isTypedBlobRef` checks
+// it: exactly `$type`, `ref`, `mimeType` and `size`; `ref` a raw-codec CID,
+// `size` a safe non-negative integer. The reference also wants a `/` in
+// `mimeType`; the data model only asks for a non-empty string, and records
+// with `"mimeType": "jpeg"` are on the network, so vlpds takes them.
+fn blob_link_ok(link: &str) -> bool {
+    Cid::parse(link).is_ok_and(|c| c.codec == crate::cid::CODEC_RAW)
+}
+
+fn blob_mime_ok(mime: &str) -> bool {
+    !mime.is_empty()
+}
+
+fn blob_size_ok(size: i64) -> bool {
+    (0..=MAX_SAFE_INT as i64).contains(&size)
+}
 
 fn obj_get<'v, 'a>(m: &'v [(Cow<'a, str>, JsonValue<'a>)], key: &str) -> Option<&'v JsonValue<'a>> {
     m.binary_search_by(|(k, _)| key_cmp(k, key))
@@ -446,9 +485,7 @@ impl<'a> JsonValue<'a> {
                 if let Some(b) = obj_get(m, "$bytes") {
                     return match (b, m.len()) {
                         (JsonValue::Str(s), 1) => {
-                            let b = base64::engine::general_purpose::STANDARD_NO_PAD
-                                .decode(s.trim_end_matches('='))
-                                .map_err(|_| ())?;
+                            let b = decode_bytes(s).map_err(|_| ())?;
                             write_bytes(out, &b);
                             Ok(())
                         }
@@ -474,6 +511,9 @@ impl<'a> JsonValue<'a> {
                                 return Err(());
                             };
                             let JsonValue::Str(link) = link else { return Err(()) };
+                            if m.len() != 4 || !blob_link_ok(link) || !blob_mime_ok(mime) || !blob_size_ok(*size) {
+                                return Err(());
+                            }
                             let c = Cid::parse(link).map_err(|_| ())?;
                             refs.blobs.push((c, Some(mime.to_string()), Some(*size)));
                         }
@@ -867,6 +907,71 @@ mod tests {
         if let Value::Map(m) = &v {
             let keys: Vec<_> = m.iter().map(|(k, _)| k.as_str()).collect();
             assert_eq!(keys, vec!["n", "text", "$type", "createdAt"]);
+        }
+    }
+
+    #[test]
+    fn bytes_base64_like_the_reference() {
+        // @atproto/lex-data fromBase64: padding optional (partial padding
+        // too, never past the padded length), trailing bits ignored
+        for (s, want) in [
+            ("", Some(vec![])),
+            ("AQID", Some(vec![1, 2, 3])),
+            ("AQ", Some(vec![1])),
+            ("AQ==", Some(vec![1])),
+            ("AQ=", Some(vec![1])),
+            ("AR", Some(vec![1])),
+            ("AQI", Some(vec![1, 2])),
+            ("AQJ=", Some(vec![1, 2])),
+            ("AQID=", None),
+            ("AQ===", None),
+            ("A", None),
+            ("_-8", None),
+            ("AQ ID", None),
+        ] {
+            assert_eq!(decode_bytes(s).ok(), want, "{s:?}");
+            let j = serde_json::json!({"b": {"$bytes": s}});
+            let tree = Value::from_json(&j).ok().map(|v| v.to_cbor());
+            let text = j.to_string();
+            let mut out = Vec::new();
+            let one_pass = JsonValue::parse(text.as_bytes())
+                .unwrap()
+                .encode_record(&mut out, &mut RecordRefs::default())
+                .ok()
+                .map(|()| out);
+            assert_eq!(tree, one_pass, "{s:?}");
+            assert_eq!(tree.is_some(), want.is_some(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn blob_refs_like_the_reference() {
+        // @atproto/lex-data strict isTypedBlobRef
+        let raw = Cid::raw(b"x").to_string();
+        let dag = Cid::dag_cbor(b"x").to_string();
+        let blob = |link: &str, mime: serde_json::Value, size: serde_json::Value| {
+            serde_json::json!({"$type": "blob", "ref": {"$link": link}, "mimeType": mime, "size": size})
+        };
+        let mut extra = blob(&raw, "image/png".into(), 1.into());
+        extra["alt"] = "x".into();
+        for (j, ok) in [
+            (blob(&raw, "image/png".into(), 0.into()), true),
+            (blob(&raw, "image/png".into(), 9_007_199_254_740_991i64.into()), true),
+            (blob(&raw, "image/png".into(), (-1).into()), false),
+            (blob(&raw, "image/png".into(), 9_007_199_254_740_992i64.into()), false),
+            (blob(&raw, "jpeg".into(), 1.into()), true),
+            (blob(&raw, "".into(), 1.into()), false),
+            (blob(&dag, "image/png".into(), 1.into()), false),
+            (blob(&raw, "image/png".into(), "1".into()), false),
+            (extra, false),
+            (serde_json::json!({"$type": "blob", "ref": {"$link": raw}, "mimeType": "image/png"}), false),
+        ] {
+            let rec = serde_json::json!({"img": j});
+            let text = rec.to_string();
+            let mut out = Vec::new();
+            let one_pass = JsonValue::parse(text.as_bytes()).unwrap().encode_record(&mut out, &mut RecordRefs::default());
+            assert_eq!(Value::from_json(&rec).is_ok(), ok, "{text}");
+            assert_eq!(one_pass.is_ok(), ok, "{text}");
         }
     }
 

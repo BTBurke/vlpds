@@ -56,6 +56,31 @@ fn collect(mut sub: Sub, target: Arc<AtomicI64>) -> tokio::task::JoinHandle<Vec<
     })
 }
 
+/// A node streams only the log a follower names: a peer following a dead
+/// incarnation's log at the same address must not get the new log's batches
+/// (they were merged under the old log's id too: duplicate firehose events).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_stream_serves_only_the_named_log() {
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let a = node("ls-a", &store).await;
+    let rb = a.xrpc.http.get(format!("{}/internal/v1/cluster", a.url)).header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN);
+    let log = a.xrpc.send(rb).await.ok()["log"].as_str().expect("log id").to_string();
+    let connect = |log: String| {
+        let url = format!("{}/internal/v1/log/stream?log={log}", a.url.replacen("http", "ws", 1));
+        async move {
+            let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str()).unwrap();
+            req.headers_mut().insert("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN.parse().unwrap());
+            tokio_tungstenite::connect_async(req).await
+        }
+    };
+    let (mut ws, _) = connect(log.clone()).await.expect("own log streams");
+    use futures::StreamExt;
+    let first = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("a heartbeat").expect("open").expect("message");
+    assert!(first.is_binary());
+    let old = format!("{}.1", log.split('.').next().unwrap());
+    assert!(connect(old).await.is_err(), "another incarnation's log must be refused");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn staggered_starts_under_load_lose_no_events() {
     let store = Arc::new(object_store::memory::InMemory::new());

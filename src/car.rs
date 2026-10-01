@@ -50,19 +50,21 @@ pub fn read_car(b: &[u8]) -> anyhow::Result<(Vec<Cid>, Vec<(Cid, &[u8])>)> {
         anyhow::bail!("short car");
     }
     let mut pos = n + hlen as usize;
+    // CARv1 header: {version: 1, roots: [CID...]} (as go-car and the
+    // reference require; a v2 or rootless header is not a CARv1)
     let header = cbor::Value::decode(&b[n..pos])?;
+    if header.get("version") != Some(&cbor::Value::Int(1)) {
+        anyhow::bail!("car header version must be 1");
+    }
     let roots = match header.get("roots") {
         Some(cbor::Value::Array(a)) => a
             .iter()
-            .filter_map(|v| {
-                if let cbor::Value::Link(c) = v {
-                    Some(*c)
-                } else {
-                    None
-                }
+            .map(|v| match v {
+                cbor::Value::Link(c) => Ok(*c),
+                _ => Err(anyhow::anyhow!("car root is not a CID")),
             })
-            .collect(),
-        _ => vec![],
+            .collect::<anyhow::Result<Vec<Cid>>>()?,
+        _ => anyhow::bail!("car header has no roots array"),
     };
     let mut blocks = Vec::new();
     while pos < b.len() {
@@ -102,5 +104,33 @@ mod tests {
         car.extend_from_slice(&[0; 40]);
         assert!(read_car(&car).is_err());
         assert!(read_car(&[0x05, 0xa0]).is_err());
+    }
+
+    #[test]
+    fn header_must_be_carv1() {
+        let c = Cid::dag_cbor(b"x");
+        let car = |h: cbor::Value| {
+            let hb = h.to_cbor();
+            let mut out = Vec::new();
+            write_varint(&mut out, hb.len() as u64);
+            out.extend_from_slice(&hb);
+            write_block(&mut out, &c, b"x");
+            out
+        };
+        let roots = cbor::Value::Array(vec![cbor::Value::Link(c)]);
+        let ok = car(cbor::Value::Map(vec![("roots".into(), roots.clone()), ("version".into(), cbor::Value::Int(1))]));
+        assert_eq!(read_car(&ok).unwrap().0, vec![c]);
+        for h in [
+            cbor::Value::Map(vec![("roots".into(), roots.clone())]),
+            cbor::Value::Map(vec![("roots".into(), roots.clone()), ("version".into(), cbor::Value::Int(2))]),
+            cbor::Value::Map(vec![("version".into(), cbor::Value::Int(1))]),
+            cbor::Value::Map(vec![("roots".into(), cbor::Value::Int(1)), ("version".into(), cbor::Value::Int(1))]),
+            cbor::Value::Map(vec![
+                ("roots".into(), cbor::Value::Array(vec![cbor::Value::Null])),
+                ("version".into(), cbor::Value::Int(1)),
+            ]),
+        ] {
+            assert!(read_car(&car(h.clone())).is_err(), "{h:?}");
+        }
     }
 }

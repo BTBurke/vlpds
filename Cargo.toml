@@ -116,3 +116,6 @@ opt-level = 2
 [dev-dependencies]
 # tests cross-check libsecp256k1 signatures against RustCrypto
 k256 = { version = "0.13", features = ["ecdsa"] }
+# differential tests (tests/all/differential_shrike.rs): a second atproto
+# implementation (DAG-CBOR, CID, CAR, MST, proofs, crypto, syntax, lexicon)
+shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "cbor", "crypto", "mst", "repo", "car", "lexicon"] }
