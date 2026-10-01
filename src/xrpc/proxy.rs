@@ -270,22 +270,13 @@ fn local_did_doc(app: &App, acct: &Account) -> Option<J> {
 // Forwarding
 // ----------
 
-fn proxy_http(app: &App, trusted: bool) -> reqwest::Client {
-    static TRUSTED: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+/// Configured upstreams (AppView, report service) use the shared public
+/// client; endpoints taken from DID documents use the SSRF-guarded one.
+fn proxy_http(app: &App, trusted: bool) -> &'static reqwest::Client {
     if trusted {
-        TRUSTED
-            .get_or_init(|| {
-                reqwest::Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .connect_timeout(Duration::from_secs(5))
-                    .read_timeout(Duration::from_secs(30))
-                    .pool_idle_timeout(Duration::from_secs(60))
-                    .build()
-                    .expect("reqwest client")
-            })
-            .clone()
+        crate::http::public()
     } else {
-        app.did_resolver.http().clone()
+        crate::http::guarded(app.config.dev_mode)
     }
 }
 

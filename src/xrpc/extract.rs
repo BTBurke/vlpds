@@ -7,7 +7,7 @@
 //!   (axum would answer 400/415/422 in plain text);
 //! - JSON bodies over 150 KiB: 413 `PayloadTooLarge` (reference
 //!   `jsonLimit: 150 * 1024`, packages/pds/src/index.ts); record writes
-//!   (`RecordJson`) allow 1,000,000 bytes like the reference's
+//!   (`RecordBody`) allow 1,000,000 bytes like the reference's
 //!   createRecord/putRecord/applyWrites;
 //! - params whose lexicon format is fixed everywhere they appear (`did`,
 //!   `repo` (at-identifier), `cid`, `handle`) are syntax-checked, so a bad
@@ -17,6 +17,8 @@
 //!   validated against their lexicons (src/lexicon.rs), with the
 //!   reference's `Params ...` / `Input ...` messages. A checked body is
 //!   parsed once into a JSON value, validated, then converted to `T`.
+//!   Record writes ([`RecordBody`]) parse into a borrowed [`JsonValue`]
+//!   instead, which the handler validates and encodes records from.
 //!   [`debug_output_layer`] checks responses in debug builds.
 
 use super::syntax;
@@ -26,6 +28,7 @@ use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
+use crate::cbor::JsonValue;
 use serde::de::DeserializeOwned;
 
 /// Largest JSON request body (reference: 150kb).
@@ -103,7 +106,7 @@ fn check_content_type(req: &Request) -> Result<(), XrpcError> {
     }
 }
 
-fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, XrpcError> {
+fn parse<'a, T: serde::Deserialize<'a>>(body: &'a [u8]) -> Result<T, XrpcError> {
     serde_json::from_slice(body).map_err(|e| {
         if e.is_eof() && body.iter().all(|b| b.is_ascii_whitespace()) {
             invalid("Request body is required")
@@ -123,6 +126,8 @@ fn input_nsid(req: &Request) -> Option<String> {
 }
 
 /// [`parse`], validating against the method's input schema if it has one.
+/// (Validating a borrowed [`JsonValue`] and then parsing `T` from the bytes
+/// measured no faster for these small bodies: 1.08 us either way.)
 fn parse_input<T: DeserializeOwned>(nsid: Option<&str>, body: &[u8]) -> Result<T, XrpcError> {
     let Some(nsid) = nsid else {
         return parse(body);
@@ -143,17 +148,40 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for Json<T> {
     }
 }
 
-/// `Json` with the record-write body limit ([`RECORD_JSON_LIMIT`]).
-pub struct RecordJson<T>(pub T);
+/// A record-write JSON body (createRecord / putRecord / applyWrites) with
+/// the record-write limit ([`RECORD_JSON_LIMIT`]). The handler parses it
+/// once into a [`JsonValue`] borrowing from the body ([`RecordBody::parse`])
+/// and encodes records straight from that tree.
+pub struct RecordBody {
+    body: Vec<u8>,
+    nsid: Option<String>,
+}
 
-impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for RecordJson<T> {
+impl RecordBody {
+    /// Parses the body, validated against the method's input schema.
+    pub fn parse(&self) -> Result<JsonValue<'_>, XrpcError> {
+        let v: JsonValue = parse(&self.body)?;
+        if let Some(nsid) = &self.nsid {
+            crate::lexicon::validate_input(nsid, &v).map_err(invalid)?;
+        }
+        Ok(v)
+    }
+
+    #[cfg(test)]
+    pub fn new(nsid: &str, body: Vec<u8>) -> RecordBody {
+        let nsid = crate::lexicon::has_input_schema(nsid).then(|| nsid.to_string());
+        RecordBody { body, nsid }
+    }
+}
+
+impl<S: Send + Sync> FromRequest<S> for RecordBody {
     type Rejection = XrpcError;
 
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
         check_content_type(&req)?;
         let nsid = input_nsid(&req);
         let body = read_body(req, RECORD_JSON_LIMIT).await?;
-        parse_input(nsid.as_deref(), &body).map(RecordJson)
+        Ok(RecordBody { body, nsid })
     }
 }
 

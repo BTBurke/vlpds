@@ -22,7 +22,8 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-BIN = os.path.join(PKG, "target", "bench", "release")
+# BENCH_BIN: another build's release dir (A/B against a baseline binary)
+BIN = os.environ.get("BENCH_BIN") or os.path.join(PKG, "target", "bench", "release")
 VLPDS = os.path.join(BIN, "vlpds")
 LOADGEN = os.path.join(BIN, "loadgen")
 S3 = "http://127.0.0.1:9200"
@@ -30,6 +31,13 @@ SCRATCH = os.environ.get("BENCH_SCRATCH", "/tmp/scratch/bench")
 os.makedirs(SCRATCH, exist_ok=True)
 ADMIN = "dev-admin-token"
 INTERNAL = "dev-internal-token"
+# Remote hosts (bench/benchbox): BENCH_OUT_DIR = where the JSONL goes (default:
+# next to this script); BENCH_MINIO_DATA = MinIO's data dir on local disk, so
+# cleanup deletes the prefix directory directly (no aws CLI needed) and empties
+# that MinIO's .trash.
+OUTDIR = os.environ.get("BENCH_OUT_DIR") or HERE
+os.makedirs(OUTDIR, exist_ok=True)
+MINIO_DATA = os.environ.get("BENCH_MINIO_DATA", "")
 ENV = dict(os.environ, AWS_ACCESS_KEY_ID="minioadmin", AWS_SECRET_ACCESS_KEY="minioadmin", AWS_DEFAULT_REGION="us-east-1")
 
 
@@ -51,6 +59,14 @@ def check_disk(min_gb=150):
 
 def cleanup_prefix(prefix):
     t = time.time()
+    if MINIO_DATA:
+        if prefix and "/" not in prefix.strip("/") and ".." not in prefix:
+            shutil.rmtree(os.path.join(MINIO_DATA, "vlpds", prefix.strip("/")), ignore_errors=True)
+        trash = os.path.join(MINIO_DATA, ".minio.sys", "tmp", ".trash")
+        if os.path.isdir(trash):
+            subprocess.run(f"find '{trash}' -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +", shell=True, check=False)
+        log(f"deleted {MINIO_DATA}/vlpds/{prefix}/ in {time.time()-t:.0f}s; disk free {disk_free_gb():.0f} GB")
+        return
     subprocess.run(["aws", "--endpoint-url", S3, "s3", "rm", "--recursive", "--only-show-errors", f"s3://vlpds/{prefix}/"], env=ENV, check=False)
     # native MinIO moves deleted objects to .minio.sys/tmp/.trash and did not
     # purge it during these runs (73 GB piled up): empty it ourselves
@@ -85,6 +101,21 @@ def metrics(url):
 
 def msum(m, prefix):
     return sum(v for k, v in m.items() if k == prefix or k.startswith(prefix + "{"))
+
+
+# bench/obs (just obs-up): each step becomes a region annotation on the vlpds
+# Grafana dashboard. No-op when Grafana isn't running; GRAFANA_URL="" disables.
+GRAFANA = os.environ.get("GRAFANA_URL", "http://127.0.0.1:3300")
+
+
+def annotate(t0, text, tags=()):
+    if not GRAFANA:
+        return
+    body = json.dumps({"time": int(t0 * 1000), "timeEnd": int(time.time() * 1000), "tags": ["vlpds-bench", *tags], "text": text})
+    try:
+        http("POST", GRAFANA + "/api/annotations", body.encode(), {"Content-Type": "application/json"}, timeout=2)
+    except Exception:
+        pass
 
 
 class Node:
@@ -149,6 +180,8 @@ class Sampler:
         self.t = threading.Thread(target=self.run, daemon=True)
 
     def run(self):
+        if os.path.exists("/proc/self/stat"):
+            return self.run_proc()
         while not self._stop.wait(self.every):
             for p in self.pids:
                 r = subprocess.run(["ps", "-o", "%cpu=,rss=", "-p", str(p)], capture_output=True, text=True)
@@ -157,6 +190,31 @@ class Sampler:
                     self.samples[p].append((float(cpu), int(rss) * 1024))
                 except ValueError:
                     pass
+
+    def run_proc(self):
+        """Linux: `ps %cpu` is the lifetime average, so use /proc tick deltas."""
+        hz, page = os.sysconf("SC_CLK_TCK"), os.sysconf("SC_PAGE_SIZE")
+        last = {}
+
+        def ticks(p):
+            f = open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()
+            return int(f[11]) + int(f[12])
+        for p in list(self.pids):
+            try:
+                last[p] = (time.time(), ticks(p))
+            except (OSError, ValueError, IndexError):
+                pass
+        while not self._stop.wait(self.every):
+            for p in list(self.pids):
+                try:
+                    now, tk = time.time(), ticks(p)
+                    rss = int(open(f"/proc/{p}/statm").read().split()[1]) * page
+                except (OSError, ValueError, IndexError):
+                    continue
+                if p in last:
+                    t0, k0 = last[p]
+                    self.samples.setdefault(p, []).append((round(100.0 * (tk - k0) / hz / max(1e-3, now - t0), 1), rss))
+                last[p] = (now, tk)
 
     def __enter__(self):
         self.t.start()
@@ -195,7 +253,9 @@ def parse_loadgen(text):
 METRIC_KEYS = ["vlpds_commits_total", "vlpds_ops_total", "vlpds_segments_total", "vlpds_segment_bytes_total",
                "vlpds_segment_put_attempts_total", "vlpds_segment_put_hedges_total", "vlpds_repo_loads_total",
                "vlpds_repo_evictions_total", "vlpds_cluster_store_requests_total", "vlpds_writes_shed_total",
-               "vlpds_requests_forwarded_total", "vlpds_firehose_events_total", "vlpds_commit_requests_sum", "vlpds_commit_requests_count", "vlpds_commit_ops_sum", "vlpds_commit_ops_count"]
+               "vlpds_requests_forwarded_total", "vlpds_firehose_events_total", "vlpds_commit_requests_sum", "vlpds_commit_requests_count", "vlpds_commit_ops_sum", "vlpds_commit_ops_count",
+               'vlpds_http_client_connects_total{role="peer"}', 'vlpds_http_client_connects_total{role="public"}',
+               "vlpds_http_server_connections_total"]
 
 
 def mdelta(a, b):
@@ -233,6 +293,7 @@ def bulk(nodes, total, records=5):
 
 def grid_step(node, out, shape, rate, total, active, inject, duration=20, hot=200):
     check_disk()
+    t0 = time.time()
     m0 = metrics(node.url)
     lg = run_loadgen(node.url, rate, total, active, duration=duration, hot=hot, tag=f"{shape}-{rate}")
     with Sampler([node.p.pid, lg.pid]) as s:
@@ -246,6 +307,7 @@ def grid_step(node, out, shape, rate, total, active, inject, duration=20, hot=20
     write_jsonl(out, rec)
     a = r.get("all", {})
     log(f"{shape} rate={rate}: achieved {r.get('achieved')} err {r.get('errors')} drop {r.get('dropped')} p50 {a.get('p50')} p99 {a.get('p99')} p99.9 {a.get('p999')} | srv cpu {rec['server']['cpu_pct_avg']}% rss {rec['server']['rss_gb_max']}GB")
+    annotate(t0, f"{shape} rate={rate}: achieved {r.get('achieved')} p99 {a.get('p99')} ms", (shape,))
     return rec
 
 
@@ -257,7 +319,7 @@ def saturated(rec):
 
 def cmd_grid(name, total, active, inject, rates, prefix=None, keep=False, duration=20):
     """Fresh prefix, bulk `total` accounts, then stair-step rates until saturation."""
-    out = os.path.join(HERE, os.environ.get("OUT", f"grid-{name}.jsonl"))
+    out = os.path.join(OUTDIR, os.environ.get("OUT", f"grid-{name}.jsonl"))
     prefix = prefix or f"bench-{name}"
     check_disk()
     node = Node(name, prefix, inject=inject).start()
@@ -280,7 +342,7 @@ def cmd_suite(total, actives, injects, rates, duration=20):
     """One prefix per total: bulk once, then for each inject mode a server
     restart and a stair per active window."""
     prefix = f"bench-grid-{total}"
-    out = os.path.join(HERE, os.environ.get("OUT", "grid.jsonl"))
+    out = os.path.join(OUTDIR, os.environ.get("OUT", "grid.jsonl"))
     check_disk()
     try:
         for k, inject in enumerate(injects):
@@ -360,6 +422,7 @@ def cluster_step(nodes, out, shape, rate, total, active, inject, duration=20, ev
     """One loadgen per node at rate/len(nodes) (requests not routed: ~2/3 forwarded).
     The hot repo + firehose consumer run on the first loadgen only."""
     check_disk()
+    t0 = time.time()
     m0 = [metrics(n.url) for n in nodes]
     lgs = []
     for i, nd in enumerate(nodes):
@@ -386,12 +449,13 @@ def cluster_step(nodes, out, shape, rate, total, active, inject, duration=20, ev
     rec["all_p999_max"] = max((p.get("all") or {}).get("p999", 0) for p in parsed)
     write_jsonl(out, rec)
     log(f"{shape} rate={rate}: achieved {agg['achieved']} err {agg['errors']} drop {agg['dropped']} p50<= {rec['all_p50_max']} p99<= {rec['all_p99_max']} p99.9<= {rec['all_p999_max']} | cpu {[x['cpu_pct_avg'] for x in rec['servers']]}")
+    annotate(t0, f"{shape} rate={rate}: achieved {agg['achieved']} p99<= {rec['all_p99_max']} ms", (shape,))
     return rec
 
 
 def cmd_cluster(total, active, inject, rates, duration=20, failover_rate=None):
     prefix = f"bench-cluster-{total}"
-    out = os.path.join(HERE, "cluster.jsonl")
+    out = os.path.join(OUTDIR, os.environ.get("OUT", "cluster.jsonl"))
     nodes = cluster_up(prefix, 3, inject)
     try:
         bulk(nodes, total)
@@ -446,7 +510,7 @@ def fanout(url, subs, seconds, cursor=None, threads=8):
 
 
 def cmd_firehose(inject=0):
-    out = os.path.join(HERE, "firehose.jsonl")
+    out = os.path.join(OUTDIR, "firehose.jsonl")
     prefix = "bench-firehose"
     node = Node("firehose", prefix, inject=inject, extra=["--firehose-ring-mb", "64"]).start()
     try:
@@ -485,7 +549,7 @@ def cmd_firehose(inject=0):
 
 
 def cmd_methods(inject=0, only=""):
-    out = os.path.join(HERE, "methods.jsonl")
+    out = os.path.join(OUTDIR, "methods.jsonl")
     prefix = f"bench-methods-{int(inject)}"
     node = Node(f"methods-{int(inject)}", prefix, inject=inject).start()
     acc = os.path.join(SCRATCH, f"methods-accounts-{int(inject)}.json")
@@ -514,7 +578,7 @@ def cmd_methods(inject=0, only=""):
 def cmd_sweep(sizes, extra=()):
     """One server; one fresh repo per size, filled via applyWrites (200 creates
     per call, 16 in flight), then the read methods + getRepo export."""
-    out = os.path.join(HERE, "sweep.jsonl")
+    out = os.path.join(OUTDIR, "sweep.jsonl")
     prefix = "bench-sweep"
     node = Node("sweep", prefix, extra=list(extra)).start()
     try:
@@ -538,7 +602,7 @@ def cmd_sweep(sizes, extra=()):
 
 
 def cmd_proxy(actives, concs, total=1000000, body=2048, extra=()):
-    out = os.path.join(HERE, "proxy.jsonl")
+    out = os.path.join(OUTDIR, os.environ.get("OUT", "proxy.jsonl"))
     prefix = "bench-proxy"
     stub = subprocess.Popen([LOADGEN, "--threads", "4", "stub-appview", "--listen", "127.0.0.1:2700", "--body-bytes", str(body)],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -581,7 +645,7 @@ def snapshot(node, label):
 
 
 def cmd_resource(total=10000000, active=50000, rate=50000, inject=25):
-    out = os.path.join(HERE, "resource.json")
+    out = os.path.join(OUTDIR, "resource.json")
     prefix = "bench-resource"
     res = {"total": total, "active": active, "rate": rate, "inject_put_ms": inject, "runs": []}
     for k, cpw in enumerate([50000, 6250]):
@@ -596,7 +660,7 @@ def cmd_resource(total=10000000, active=50000, rate=50000, inject=25):
                 run["snapshots"].append(snapshot(node, "after bulk"))
             time.sleep(15)
             run["snapshots"].append(snapshot(node, "idle"))
-            out_g = os.path.join(HERE, "resource-grid.jsonl")
+            out_g = os.path.join(OUTDIR, "resource-grid.jsonl")
             rec = grid_step(node, out_g, f"resource cpw={cpw}", rate, total, active, inject, duration=60)
             run["load"] = {k2: rec.get(k2) for k2 in ("achieved", "errors", "all", "server", "jemalloc")}
             run["snapshots"].append(snapshot(node, "after 70 s load"))
@@ -611,7 +675,7 @@ def cmd_resource(total=10000000, active=50000, rate=50000, inject=25):
 
 def cmd_hot(hot_rates, injects):
     """Single hot repo, no fleet: latency and coalescing (requests/commit)."""
-    out = os.path.join(HERE, "hot.jsonl")
+    out = os.path.join(OUTDIR, "hot.jsonl")
     for inject in injects:
         prefix = f"bench-hot-{int(inject)}"
         node = Node(f"hot-{int(inject)}", prefix, inject=inject).start()

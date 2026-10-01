@@ -8,7 +8,7 @@ use super::util::{client_routing, now_secs, parse_form, Replay};
 use super::OAuthError;
 use serde_json::{json, Value as J};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -597,50 +597,6 @@ pub fn parse_client_id(id: &str, dev_mode: bool) -> Result<ClientIdKind, OAuthEr
 
 // ---------- fetching ----------
 
-/// DNS resolver that refuses non-public addresses (SSRF protection).
-struct PublicOnlyResolver;
-
-impl reqwest::dns::Resolve for PublicOnlyResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
-                .await?
-                .filter(|a| crate::did_resolver::is_public_ip(a.ip()))
-                .collect();
-            if addrs.is_empty() {
-                return Err(format!("{host} did not resolve to a public unicast address").into());
-            }
-            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
-}
-
-fn build_client(strict: bool) -> reqwest::Client {
-    let mut b = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(FETCH_TIMEOUT)
-        .user_agent("vlpds-oauth");
-    if strict {
-        b = b.dns_resolver(Arc::new(PublicOnlyResolver));
-    }
-    b.build().expect("reqwest client")
-}
-
-static STRICT_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| build_client(true));
-static DEV_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| build_client(false));
-
-/// Hardened HTTP client for user-controlled URLs: no redirects, timeouts and
-/// (outside dev mode) a resolver that refuses non-public addresses.
-pub fn http_client(dev_mode: bool) -> &'static reqwest::Client {
-    if dev_mode {
-        &DEV_HTTP
-    } else {
-        &STRICT_HTTP
-    }
-}
-
 /// Hardened GET of a JSON document from a user-controlled URL: https only and
 /// public addresses only (both relaxed in dev mode), no redirects, timeouts,
 /// a size cap, and a JSON content type.
@@ -662,10 +618,10 @@ pub async fn fetch_json(url: &str, dev_mode: bool, max_bytes: usize) -> Result<J
     } else if !matches!(u.scheme(), "http" | "https") {
         return Err(format!("Forbidden protocol \"{}:\"", u.scheme()));
     }
-    let http = http_client(dev_mode);
-    let resp = http
+    let resp = crate::http::guarded(dev_mode)
         .get(u)
         .header("accept", "application/json")
+        .timeout(FETCH_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("fetch failed: {e}"))?;

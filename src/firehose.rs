@@ -12,19 +12,22 @@
 //! backfilled from S3 (backfill.rs). A log followed later starts at the
 //! merger's position at that moment, so nothing above it is skipped either.
 
+use crate::backfill::{Reader, SegCache};
 use crate::events;
 use crate::metrics;
 use crate::nodelog::{LogBatch, Watermark};
 use crate::segment::{self, LogObject};
 use crate::stats::STATS;
-use axum::extract::ws::{Message, WebSocket};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{mpsc, watch};
 
 /// Where a log's watermark comes from: our own log, or a peer stream / S3
 /// drain (the last watermark it reported).
@@ -46,12 +49,107 @@ impl Source {
 pub struct MergedBatch {
     pub first: i64,
     pub last: i64,
+    /// (seq, frame); each frame is a slice of `wire`
     pub events: Vec<(i64, Bytes)>,
+    /// `wire` bytes
     pub bytes: usize,
+    /// Wire bytes emitted through this batch since startup (subscriber lag
+    /// is measured in these).
+    pub end: u64,
+    /// The events as consecutive binary websocket messages, written as-is
+    /// to every subscriber. Built once by the merger; the frames are copied
+    /// out of their segments, so the ring doesn't pin whole segment bodies.
+    wire: Bytes,
+    /// start of each event's message in `wire`
+    offs: Vec<usize>,
+}
+
+impl MergedBatch {
+    /// `events` in seq order; `emitted` = wire bytes emitted before it.
+    fn new(events: Vec<(i64, Bytes)>, emitted: u64) -> MergedBatch {
+        let mut buf = Vec::with_capacity(events.iter().map(|(_, f)| f.len() + 10).sum());
+        let mut offs = Vec::with_capacity(events.len());
+        let mut payload = Vec::with_capacity(events.len());
+        for (_, f) in &events {
+            offs.push(buf.len());
+            push_message(&mut buf, OP_BINARY, f);
+            payload.push(buf.len() - f.len());
+        }
+        let wire = Bytes::from(buf);
+        let events: Vec<(i64, Bytes)> = events.iter().zip(payload).map(|((seq, f), at)| (*seq, wire.slice(at..at + f.len()))).collect();
+        MergedBatch {
+            first: events[0].0,
+            last: events[events.len() - 1].0,
+            bytes: wire.len(),
+            end: emitted + wire.len() as u64,
+            events,
+            wire,
+            offs,
+        }
+    }
+
+    fn start(&self) -> u64 {
+        self.end - self.bytes as u64
+    }
+
+    /// The websocket messages of the events from index `i` on.
+    fn wire_from(&self, i: usize) -> Bytes {
+        self.wire.slice(self.offs[i]..)
+    }
+}
+
+/// Subscriber serving settings.
+#[derive(Clone)]
+pub struct Options {
+    /// Bytes of merged batches kept in memory for cursors and slow readers.
+    pub ring_bytes: usize,
+    /// A live subscriber further than this behind the stream head gets
+    /// ConsumerTooSlow and is closed (it resumes from its cursor).
+    pub max_lag_bytes: usize,
+    /// Read-ahead per cursor backfill, across all logs.
+    pub readahead_bytes: usize,
+    /// Segments cached for backfills replaying the same range.
+    pub backfill_cache_bytes: usize,
+    /// Runtime subscriber connections run on (None = the caller's).
+    pub runtime: Option<tokio::runtime::Handle>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            ring_bytes: 64 << 20,
+            max_lag_bytes: DEFAULT_MAX_LAG_BYTES,
+            readahead_bytes: crate::backfill::DEFAULT_READAHEAD_BYTES,
+            backfill_cache_bytes: crate::backfill::DEFAULT_CACHE_BYTES,
+            runtime: None,
+        }
+    }
+}
+
+/// Default bound on a live subscriber's lag behind the head.
+pub const DEFAULT_MAX_LAG_BYTES: usize = 128 << 20;
+
+/// The process-wide runtime for subscriber connections (subscribeRepos
+/// fan-out, cursor backfills): their socket writes and frame copies stay off
+/// the request runtime, so heavy fan-out can't stall writes. The first
+/// caller's thread count wins.
+pub fn runtime(threads: usize) -> tokio::runtime::Handle {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(threads.max(1))
+            .thread_name("firehose")
+            .enable_all()
+            .build()
+            .expect("firehose runtime")
+    })
+    .handle()
+    .clone()
 }
 
 pub struct Firehose {
-    pub tx: broadcast::Sender<Arc<MergedBatch>>,
+    /// Bytes emitted so far (the newest batch's `end`): subscribers wait on it.
+    head: watch::Sender<u64>,
     ring: RwLock<VecDeque<Arc<MergedBatch>>>,
     ring_bytes: AtomicI64,
     max_ring_bytes: i64,
@@ -71,17 +169,20 @@ pub struct Firehose {
     pub store: RwLock<Option<crate::store::Store>>,
     max_queue_bytes: AtomicUsize,
     queued_bytes: AtomicUsize,
+    runtime: tokio::runtime::Handle,
+    max_lag_bytes: u64,
+    readahead_bytes: usize,
+    backfill_cache: Arc<SegCache>,
 }
 
 impl Firehose {
-    pub fn new(max_ring_bytes: usize) -> Arc<Firehose> {
-        let (tx, _) = broadcast::channel(4096);
+    pub fn new(opts: Options) -> Arc<Firehose> {
         let floor = crate::nodelog::seq_floor(crate::tid::now_micros());
         Arc::new(Firehose {
-            tx,
+            head: watch::channel(0).0,
             ring: RwLock::new(VecDeque::new()),
             ring_bytes: AtomicI64::new(0),
-            max_ring_bytes: max_ring_bytes as i64,
+            max_ring_bytes: opts.ring_bytes as i64,
             last_emitted: AtomicI64::new(0),
             sources: RwLock::new(HashMap::new()),
             ring_floor: AtomicI64::new(floor),
@@ -90,7 +191,16 @@ impl Firehose {
             store: RwLock::new(None),
             max_queue_bytes: AtomicUsize::new(DEFAULT_MERGE_QUEUE_BYTES),
             queued_bytes: AtomicUsize::new(0),
+            runtime: opts.runtime.unwrap_or_else(tokio::runtime::Handle::current),
+            max_lag_bytes: opts.max_lag_bytes as u64,
+            readahead_bytes: opts.readahead_bytes,
+            backfill_cache: SegCache::new(opts.backfill_cache_bytes),
         })
+    }
+
+    /// Changes whenever a batch is emitted (its value: bytes emitted so far).
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.head.subscribe()
     }
 
     pub fn min_watermark(&self) -> Option<i64> {
@@ -161,6 +271,7 @@ impl Firehose {
             let mut tick = tokio::time::interval(Duration::from_millis(2));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut behind = false;
+            let mut pushed = 0u64;
             loop {
                 if !behind {
                     tick.tick().await;
@@ -237,6 +348,8 @@ impl Firehose {
                                 }
                                 // not written: every event <= w of this log was
                                 // PUT before w was published, so all are loaded
+                                // (w only covers the log's gap-free prefix: a
+                                // later ordinal that landed early is past it)
                                 Ok(None) => caught_up = true,
                                 Err(e) => {
                                     tracing::warn!(%log_id, ordinal = sp.next, "firehose merger: reading back a spilled log failed: {e:#}");
@@ -279,18 +392,14 @@ impl Firehose {
                     continue;
                 }
                 out.sort_unstable_by_key(|(s, _)| *s);
-                let bytes = out.iter().map(|(_, b)| b.len()).sum();
-                let batch = Arc::new(MergedBatch {
-                    first: out[0].0,
-                    last: out[out.len() - 1].0,
-                    events: out,
-                    bytes,
-                });
+                let batch = Arc::new(MergedBatch::new(out, pushed));
+                pushed = batch.end;
                 STATS
                     .firehose_events
                     .fetch_add(batch.events.len() as u64, Ordering::Relaxed);
                 metrics::FIREHOSE_EVENTS.inc_by(batch.events.len() as u64);
                 metrics::FIREHOSE_BATCH.observe(batch.events.len() as f64);
+                metrics::FIREHOSE_EMIT_DELAY.observe(crate::tid::now_micros().saturating_sub((batch.first >> 8) as u64) as f64 / 1e6);
                 fh.push(batch);
             }
         });
@@ -311,116 +420,202 @@ impl Firehose {
         }
         metrics::FIREHOSE_RING_BYTES.set(self.ring_bytes.load(Ordering::Relaxed));
         self.last_emitted.store(batch.last, Ordering::Release);
-        let _ = self.tx.send(batch);
+        self.head.send_replace(batch.end);
     }
 
-    /// Events with seq > `after` currently in the ring, and whether the ring
-    /// still reaches back to `after` (false = some were already dropped).
-    fn from_ring(&self, after: i64) -> (Vec<Arc<MergedBatch>>, bool) {
+    /// Batches with events with seq > `after` currently in the ring, and
+    /// whether the ring still reaches back to `after` (false = some were
+    /// already dropped).
+    pub fn from_ring(&self, after: i64) -> (Vec<Arc<MergedBatch>>, bool) {
         let ring = self.ring.read();
         // seqs are gappy: completeness is about what was evicted, not adjacency.
         let complete = after >= self.ring_floor.load(Ordering::Acquire);
-        let out = ring.iter().filter(|b| b.last > after).cloned().collect();
-        (out, complete)
+        let i = ring.partition_point(|b| b.last <= after);
+        (ring.range(i..).cloned().collect(), complete)
     }
 
-    pub async fn serve(self: Arc<Self>, ws: WebSocket, cursor: Option<i64>) {
+    /// subscribeRepos: answers the websocket handshake and serves the
+    /// connection on the firehose runtime (see [`runtime`]).
+    ///
+    /// The upgrade is done by hand rather than with axum's `WebSocket` so a
+    /// subscriber owns its raw socket: every event goes out as the batch's
+    /// pre-built websocket messages (`MergedBatch::wire`), one write per
+    /// batch shared byte-for-byte by every subscriber, instead of a framing
+    /// pass, a sink send and a flush per event per subscriber.
+    pub fn upgrade(self: &Arc<Self>, mut req: axum::extract::Request, cursor: Option<i64>) -> Response {
+        let accept = match handshake(req.headers()) {
+            Ok(a) => a,
+            Err(e) => return e.into_response(),
+        };
+        let on_upgrade = hyper::upgrade::on(&mut req);
+        let fh = self.clone();
+        self.runtime.spawn(async move {
+            match on_upgrade.await {
+                Ok(up) => fh.serve(up, cursor).await,
+                Err(e) => tracing::debug!("subscribeRepos upgrade failed: {e}"),
+            }
+        });
+        (
+            StatusCode::SWITCHING_PROTOCOLS,
+            [(header::CONNECTION, "upgrade".to_string()), (header::UPGRADE, "websocket".to_string()), (header::SEC_WEBSOCKET_ACCEPT, accept)],
+        )
+            .into_response()
+    }
+
+    async fn serve(self: Arc<Self>, up: hyper::upgrade::Upgraded, cursor: Option<i64>) {
+        use hyper_util::rt::TokioIo;
+        use tokio::net::TcpStream;
         metrics::FIREHOSE_SUBSCRIBERS.inc();
-        let reason = self.serve_inner(ws, cursor).await;
+        // Move the socket onto this runtime's reactor (it was accepted on
+        // the request runtime), so its readiness events are ours too.
+        let reason = match hyper_util::server::conn::auto::upgrade::downcast::<TokioIo<TcpStream>>(up) {
+            Ok(parts) => match parts.io.into_inner().into_std().and_then(TcpStream::from_std) {
+                Ok(tcp) => {
+                    let (r, w) = tcp.into_split();
+                    self.serve_conn(std::io::Cursor::new(parts.read_buf).chain(r), w, cursor).await
+                }
+                Err(e) => {
+                    tracing::debug!("subscribeRepos socket: {e}");
+                    "client_gone"
+                }
+            },
+            Err(up) => {
+                tracing::debug!("subscribeRepos: upgraded connection isn't a plain TCP stream; serving it through hyper's IO");
+                let (r, w) = tokio::io::split(TokioIo::new(up));
+                self.serve_conn(r, w, cursor).await
+            }
+        };
         metrics::FIREHOSE_SUBSCRIBERS.dec();
-        metrics::FIREHOSE_DISCONNECTS
-            .with_label_values(&[reason])
-            .inc();
+        metrics::FIREHOSE_DISCONNECTS.with_label_values(&[reason]).inc();
     }
 
-    async fn serve_inner(self: Arc<Self>, mut ws: WebSocket, cursor: Option<i64>) -> &'static str {
-        let mut rx = self.tx.subscribe();
+    async fn serve_conn<R, W>(&self, r: R, w: W, cursor: Option<i64>) -> &'static str
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin,
+    {
+        let (ctl_tx, ctl) = mpsc::channel(8);
+        let reader = tokio::spawn(read_client(r, ctl_tx));
+        let mut out = Out { w, ctl };
+        let reason = match self.stream(&mut out, cursor).await {
+            Ok(()) => "shutdown",
+            Err(reason) => reason,
+        };
+        reader.abort();
+        reason
+    }
+
+    async fn stream<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>, cursor: Option<i64>) -> Result<(), &'static str> {
+        let mut head = self.head.subscribe();
         let mut last = match cursor {
             Some(c) => c,
-            None => self.last_emitted.load(Ordering::Acquire),
+            // the ring holds everything above its floor
+            None => self.last_emitted.load(Ordering::Acquire).max(self.ring_floor.load(Ordering::Acquire)),
         };
         if let Some(c) = cursor {
             // seqs are time-based: a cursor beyond both the stream head and the
             // current clock can't have been issued by us
             let now = crate::nodelog::seq_floor(crate::tid::now_micros()) | 0xff;
             if c > self.last_emitted.load(Ordering::Acquire).max(now) {
-                let _ = ws.send(Message::Binary(events::error_frame("FutureCursor", "cursor in the future").into())).await;
-                let _ = ws.send(Message::Close(None)).await;
-                return "future_cursor";
+                out.finish(&events::error_frame("FutureCursor", "cursor in the future")).await;
+                return Err("future_cursor");
             }
-        }
-        if cursor.is_some() {
-            // older than the ring: stream it from the S3 segments first
-            let store = self.store.read().clone();
-            if let Some(store) = store {
-                loop {
-                    // backfill up to the ring floor, once every log is durable
-                    // up to it (right after startup the start floor can be
-                    // ahead of a peer's watermark: its events <= F may not be
-                    // in S3 yet)
-                    let floor = self.ring_floor.load(Ordering::Acquire);
-                    if last >= floor {
-                        break;
-                    }
-                    if self.settled.load(Ordering::Acquire) < floor {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                        continue;
-                    }
-                    let (tx, mut brx) = mpsc::channel(4096);
-                    let (st, from) = (store.clone(), last);
-                    let job = tokio::spawn(async move { crate::backfill::backfill(&st, from, floor, &tx).await });
-                    while let Some((seq, frame)) = brx.recv().await {
-                        if ws.send(Message::Binary(frame)).await.is_err() {
-                            job.abort();
-                            return "client_gone";
-                        }
-                        metrics::FIREHOSE_SENT.inc();
-                        last = seq;
-                    }
-                    match job.await {
-                        Ok(Ok(_)) => {}
-                        _ => break,
-                    }
-                    last = last.max(floor); // everything <= floor that exists was sent
+            // older than the ring: stream it from the S3 segments first, until
+            // the ring reaches back to it (it moves while we backfill)
+            loop {
+                if !self.backfill_to_ring(out, &mut last).await? {
+                    out.send(&info_frame("OutdatedCursor", "cursor is older than the retained history; starting from the oldest available event")).await?;
+                    last = last.max(self.ring_floor.load(Ordering::Acquire));
+                }
+                if last >= self.ring_floor.load(Ordering::Acquire) {
+                    break;
                 }
             }
+        }
+        // Live. A subscriber more than `allowance` bytes behind the head is
+        // dropped: the configured bound, or (a cursor replaying the ring)
+        // what it started with, so it may catch up but not fall further back.
+        let mut allowance = None;
+        loop {
+            head.borrow_and_update();
             let (batches, complete) = self.from_ring(last);
             if !complete {
-                let _ = ws.send(Message::Binary(info_frame("OutdatedCursor", "cursor is older than the retained history; starting from the oldest available event").into())).await;
+                out.finish(&events::error_frame("ConsumerTooSlow", "fell behind the in-memory window")).await;
+                return Err("too_slow");
             }
-            if send_batches(&mut ws, &batches, &mut last).await.is_err() {
-                return "client_gone";
+            if batches.is_empty() {
+                tokio::select! {
+                    r = head.changed() => {
+                        if r.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    c = out.ctl.recv() => out.control(c).await?,
+                }
+                continue;
+            }
+            let allowance = *allowance.get_or_insert_with(|| self.max_lag_bytes.max(self.head.borrow().saturating_sub(batches[0].start())));
+            for b in &batches {
+                let i = b.events.partition_point(|(seq, _)| *seq <= last);
+                if i == b.events.len() {
+                    continue;
+                }
+                out.send_live(&b.wire_from(i), &mut head, b.start(), allowance).await?;
+                metrics::FIREHOSE_SENT.inc_by((b.events.len() - i) as u64);
+                last = b.last;
+                while let Ok(c) = out.ctl.try_recv() {
+                    out.control(Some(c)).await?;
+                }
             }
         }
+    }
+
+    /// Sends the events in (`last`, ring floor] from S3, once every log is
+    /// durable up to the floor. Ok(false) = the backfill failed (or there's
+    /// no store): the caller skips to the ring.
+    async fn backfill_to_ring<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>, last: &mut i64) -> Result<bool, &'static str> {
+        let Some(store) = self.store.read().clone() else { return Ok(false) };
+        let reader = Reader { store, cache: self.backfill_cache.clone(), readahead_bytes: self.readahead_bytes };
         loop {
-            match rx.recv().await {
-                Ok(b) => {
-                    if send_batches(&mut ws, std::slice::from_ref(&b), &mut last)
-                        .await
-                        .is_err()
-                    {
-                        return "client_gone";
-                    }
+            let floor = self.ring_floor.load(Ordering::Acquire);
+            if *last >= floor {
+                return Ok(true);
+            }
+            // right after startup the start floor can be ahead of a peer's
+            // watermark: its events <= F may not be in S3 yet
+            if self.settled.load(Ordering::Acquire) < floor {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            let (tx, mut rx) = mpsc::channel(4096);
+            let (r, from) = (reader.clone(), *last);
+            let mut job = AbortOnDrop(tokio::spawn(async move { crate::backfill::backfill_with(&r, from, floor, &tx).await }));
+            let mut chunk = Vec::with_capacity(1024);
+            let mut buf = Vec::new();
+            while rx.recv_many(&mut chunk, 1024).await > 0 {
+                buf.clear();
+                for (_, f) in &chunk {
+                    push_message(&mut buf, OP_BINARY, f);
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let (batches, complete) = self.from_ring(last);
-                    if !complete {
-                        let _ = ws
-                            .send(Message::Binary(
-                                events::error_frame(
-                                    "ConsumerTooSlow",
-                                    "fell behind the in-memory window",
-                                )
-                                .into(),
-                            ))
-                            .await;
-                        return "too_slow";
-                    }
-                    if send_batches(&mut ws, &batches, &mut last).await.is_err() {
-                        return "client_gone";
-                    }
+                out.write(&buf).await?;
+                metrics::FIREHOSE_SENT.inc_by(chunk.len() as u64);
+                metrics::FIREHOSE_BACKFILL_EVENTS.inc_by(chunk.len() as u64);
+                *last = chunk.last().expect("non-empty").0;
+                chunk.clear();
+                while let Ok(c) = out.ctl.try_recv() {
+                    out.control(Some(c)).await?;
                 }
-                Err(broadcast::error::RecvError::Closed) => return "shutdown",
+            }
+            match (&mut job.0).await {
+                Ok(Ok(_)) => *last = (*last).max(floor), // everything <= floor that exists was sent
+                Ok(Err(e)) => {
+                    tracing::warn!(from, floor, "firehose backfill failed: {e:#}");
+                    return Ok(false);
+                }
+                Err(e) => {
+                    tracing::warn!(from, floor, "firehose backfill task failed: {e}");
+                    return Ok(false);
+                }
             }
         }
     }
@@ -504,25 +699,208 @@ async fn read_segment(store: &crate::store::Store, log_id: &str, ordinal: u64) -
     Ok(Some(obj))
 }
 
-async fn send_batches(
-    ws: &mut WebSocket,
-    batches: &[Arc<MergedBatch>],
-    last: &mut i64,
-) -> Result<(), axum::Error> {
-    for b in batches {
-        if b.last <= *last {
-            continue;
+// ---- subscriber connections (a minimal RFC 6455 server) ----
+
+const OP_BINARY: u8 = 0x2;
+const OP_CLOSE: u8 = 0x8;
+const OP_PING: u8 = 0x9;
+const OP_PONG: u8 = 0xa;
+
+/// How long a subscriber being dropped gets to take its final frames.
+const FINAL_GRACE: Duration = Duration::from_secs(10);
+
+/// Largest client data message we skip over (subscribeRepos takes none).
+const MAX_CLIENT_MESSAGE: u64 = 1 << 20;
+
+/// Appends one unmasked, final websocket message (server to client).
+fn push_message(out: &mut Vec<u8>, op: u8, payload: &[u8]) {
+    out.push(0x80 | op);
+    match payload.len() {
+        n if n < 126 => out.push(n as u8),
+        n if n <= u16::MAX as usize => {
+            out.push(126);
+            out.extend_from_slice(&(n as u16).to_be_bytes());
         }
-        for (seq, frame) in &b.events {
-            if *seq <= *last {
-                continue;
-            }
-            ws.send(Message::Binary(frame.clone())).await?;
-            metrics::FIREHOSE_SENT.inc();
-            *last = *seq;
+        n => {
+            out.push(127);
+            out.extend_from_slice(&(n as u64).to_be_bytes());
         }
     }
-    Ok(())
+    out.extend_from_slice(payload);
+}
+
+/// Validates a websocket upgrade request; returns the Sec-WebSocket-Accept value.
+fn handshake(h: &HeaderMap) -> Result<String, (StatusCode, &'static str)> {
+    let has = |name: header::HeaderName, token: &str| {
+        h.get_all(name).iter().any(|v| v.to_str().is_ok_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token))))
+    };
+    if !has(header::CONNECTION, "upgrade") || !has(header::UPGRADE, "websocket") {
+        return Err((StatusCode::BAD_REQUEST, "expected a websocket upgrade"));
+    }
+    if h.get(header::SEC_WEBSOCKET_VERSION).is_none_or(|v| v != "13") {
+        return Err((StatusCode::UPGRADE_REQUIRED, "Sec-WebSocket-Version must be 13"));
+    }
+    let key = h.get(header::SEC_WEBSOCKET_KEY).ok_or((StatusCode::BAD_REQUEST, "missing Sec-WebSocket-Key"))?;
+    Ok(tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes()))
+}
+
+/// What the client sent that the writer must answer.
+enum Ctl {
+    Ping(Vec<u8>),
+    Close,
+}
+
+/// Reads the client's side: answers pings (via the writer), ends on a close
+/// frame, EOF or a protocol error. Dropping `ctl` tells the writer the
+/// client is gone.
+async fn read_client<R: AsyncRead + Unpin>(mut r: R, ctl: mpsc::Sender<Ctl>) {
+    let res: std::io::Result<()> = async {
+        loop {
+            let mut h = [0u8; 2];
+            r.read_exact(&mut h).await?;
+            let op = h[0] & 0x0f;
+            let len = match h[1] & 0x7f {
+                126 => r.read_u16().await? as u64,
+                127 => r.read_u64().await?,
+                n => n as u64,
+            };
+            let mut mask = [0u8; 4];
+            if h[1] & 0x80 != 0 {
+                r.read_exact(&mut mask).await?;
+            }
+            if op & 0x8 != 0 {
+                if len > 125 {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+                let mut p = vec![0u8; len as usize];
+                r.read_exact(&mut p).await?;
+                for (i, b) in p.iter_mut().enumerate() {
+                    *b ^= mask[i % 4];
+                }
+                match op {
+                    OP_CLOSE => {
+                        let _ = ctl.try_send(Ctl::Close);
+                        return Ok(());
+                    }
+                    OP_PING => {
+                        let _ = ctl.try_send(Ctl::Ping(p));
+                    }
+                    _ => {}
+                }
+            } else {
+                if len > MAX_CLIENT_MESSAGE {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+                tokio::io::copy(&mut (&mut r).take(len), &mut tokio::io::sink()).await?;
+            }
+        }
+    }
+    .await;
+    if let Err(e) = res {
+        tracing::trace!("subscriber read side ended: {e}");
+    }
+}
+
+/// A subscriber's write side plus what its read side asks of it.
+struct Out<W> {
+    w: W,
+    ctl: mpsc::Receiver<Ctl>,
+}
+
+impl<W: AsyncWrite + Unpin> Out<W> {
+    async fn write(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        self.w.write_all(data).await.map_err(|_| "client_gone")?;
+        metrics::FIREHOSE_SENT_BYTES.inc_by(data.len() as u64);
+        Ok(())
+    }
+
+    /// One binary message.
+    async fn send(&mut self, payload: &[u8]) -> Result<(), &'static str> {
+        let mut m = Vec::with_capacity(payload.len() + 10);
+        push_message(&mut m, OP_BINARY, payload);
+        self.write(&m).await
+    }
+
+    /// Writes live data that starts at stream offset `pos`. While the write
+    /// waits on the socket, every new batch re-checks the lag: past
+    /// `allowance` bytes behind the head the subscriber is dropped with
+    /// ConsumerTooSlow, so a stalled reader holds nothing but its place in
+    /// the shared ring and can't slow anyone else.
+    async fn send_live(&mut self, data: &[u8], head: &mut watch::Receiver<u64>, pos: u64, allowance: u64) -> Result<(), &'static str> {
+        let too_slow = {
+            let mut write = std::pin::pin!(self.w.write_all(data));
+            loop {
+                tokio::select! {
+                    r = &mut write => {
+                        r.map_err(|_| "client_gone")?;
+                        break false;
+                    }
+                    r = head.changed() => {
+                        if r.is_err() {
+                            // the stream is shutting down: just finish
+                            (&mut write).await.map_err(|_| "client_gone")?;
+                            break false;
+                        }
+                        if head.borrow_and_update().saturating_sub(pos) <= allowance {
+                            continue;
+                        }
+                        // finish the message in flight so the error frame
+                        // can follow it
+                        match tokio::time::timeout(FINAL_GRACE, &mut write).await {
+                            Ok(Ok(())) => break true,
+                            _ => return Err("too_slow"),
+                        }
+                    }
+                }
+            }
+        };
+        metrics::FIREHOSE_SENT_BYTES.inc_by(data.len() as u64);
+        if too_slow {
+            self.finish(&events::error_frame("ConsumerTooSlow", "fell too far behind the stream; reconnect with a cursor")).await;
+            return Err("too_slow");
+        }
+        Ok(())
+    }
+
+    /// Best effort: a last message and a close frame, then the caller drops
+    /// the connection.
+    async fn finish(&mut self, payload: &[u8]) {
+        let mut m = Vec::with_capacity(payload.len() + 12);
+        push_message(&mut m, OP_BINARY, payload);
+        push_message(&mut m, OP_CLOSE, &1000u16.to_be_bytes());
+        let _ = tokio::time::timeout(FINAL_GRACE, async {
+            self.w.write_all(&m).await?;
+            self.w.shutdown().await
+        })
+        .await;
+    }
+
+    /// Answers the read side: a pong, or the close handshake (None = the
+    /// client is gone).
+    async fn control(&mut self, c: Option<Ctl>) -> Result<(), &'static str> {
+        let mut m = Vec::new();
+        match c {
+            Some(Ctl::Ping(p)) => {
+                push_message(&mut m, OP_PONG, &p);
+                self.write(&m).await
+            }
+            Some(Ctl::Close) => {
+                push_message(&mut m, OP_CLOSE, &1000u16.to_be_bytes());
+                let _ = tokio::time::timeout(FINAL_GRACE, self.w.write_all(&m)).await;
+                Err("client_closed")
+            }
+            None => Err("client_gone"),
+        }
+    }
+}
+
+/// Aborts a task when its handle is dropped (a subscriber that went away).
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn info_frame(name: &str, message: &str) -> Vec<u8> {
@@ -547,6 +925,19 @@ mod tests {
     use crate::segment::SegmentBuilder;
     use object_store::{ObjectStoreExt, PutPayload};
 
+    /// The next emitted batches after `last` (advanced past them).
+    async fn next_batches(fh: &Firehose, sub: &mut watch::Receiver<u64>, last: &mut i64) -> Vec<Arc<MergedBatch>> {
+        loop {
+            sub.borrow_and_update();
+            let (b, _) = fh.from_ring(*last);
+            if let Some(l) = b.last() {
+                *last = l.last;
+                return b;
+            }
+            tokio::time::timeout(Duration::from_secs(5), sub.changed()).await.expect("merged stream stalled").unwrap();
+        }
+    }
+
     async fn put_seg(store: &crate::store::Store, log: &str, ord: u64, seq: i64, frame_len: usize) -> LogBatch {
         let frame = Bytes::from(vec![ord as u8; frame_len]);
         let mut b = SegmentBuilder::new();
@@ -564,13 +955,14 @@ mod tests {
     #[tokio::test]
     async fn merger_queue_is_bounded_while_a_log_stalls() {
         let store = crate::store::Store::memory(None);
-        let fh = Firehose::new(64 << 20);
+        let fh = Firehose::new(Options::default());
         fh.set_max_queue_bytes(2000);
         *fh.store.write() = Some(store.clone());
         let (_, wa) = fh.add_remote("A");
         let (_, wb) = fh.add_remote("B");
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut sub = fh.tx.subscribe();
+        let mut sub = fh.subscribe();
+        let mut last = i64::MIN;
         fh.spawn_merger(rx);
         let base = fh.position();
         let seq = |k: i64| base + k * 256 + 1;
@@ -592,15 +984,16 @@ mod tests {
         wa.store(seq(2 * n), Ordering::Release);
         let mut got = Vec::new();
         while got.len() < 2 * n as usize {
-            let b = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await.expect("merged stream stalled").unwrap();
-            got.extend(b.events.iter().map(|(s, _)| *s));
+            for b in next_batches(&fh, &mut sub, &mut last).await {
+                got.extend(b.events.iter().map(|(s, _)| *s));
+            }
         }
         assert_eq!(got, (0..2 * n).map(seq).collect::<Vec<_>>());
         // B rejoins the live stream after the read-back
         tx.send(put_seg(&store, "B", n as u64, seq(2 * n + 1), 200).await).unwrap();
         wb.store(seq(2 * n + 1), Ordering::Release);
         wa.store(seq(2 * n + 1), Ordering::Release);
-        let b = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await.unwrap().unwrap();
-        assert_eq!(b.events[0].0, seq(2 * n + 1));
+        let b = next_batches(&fh, &mut sub, &mut last).await;
+        assert_eq!(b[0].events[0].0, seq(2 * n + 1));
     }
 }

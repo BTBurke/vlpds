@@ -1,5 +1,6 @@
-use super::extract::RecordJson;
+use super::extract::RecordBody;
 use super::*;
+use crate::cbor::{JsonValue, RecordRefs};
 
 pub fn routes() -> Router<Arc<App>> {
     let r = Router::new()
@@ -54,78 +55,49 @@ type Encoded = (Cid, Bytes, Vec<Cid>, crate::lexicon::ValidationStatus, Vec<Blob
 /// A blob ref as the record declares it: (cid, mimeType, size).
 type BlobDecl = (Cid, Option<String>, Option<i64>);
 
-/// Every `{"$type": "blob"}` ref in the record with its declared metadata
-/// (repeats kept: each declaration is checked).
-fn blob_decls(v: &Value, out: &mut Vec<BlobDecl>) {
-    match v {
-        Value::Map(m) => {
-            if v.get("$type").and_then(|t| t.as_str()) == Some("blob") {
-                if let Some(Value::Link(c)) = v.get("ref") {
-                    let mime = v.get("mimeType").and_then(|m| m.as_str()).map(String::from);
-                    let size = match v.get("size") {
-                        Some(Value::Int(n)) => Some(*n),
-                        _ => None,
-                    };
-                    out.push((*c, mime, size));
-                }
-            }
-            for (_, child) in m {
-                blob_decls(child, out);
-            }
-        }
-        Value::Array(a) => a.iter().for_each(|c| blob_decls(c, out)),
-        _ => {}
-    }
-}
-
 /// JSON record -> DAG-CBOR, as the reference's prepareWrite: a missing
 /// `$type` defaults to the collection and any other value must equal it,
 /// then known lexicons are validated (record key included); `resolved` is
-/// the dynamically resolved lexicon of `collection`, if any.
+/// the dynamically resolved lexicon of `collection`, if any. One pass over
+/// the parsed tree writes the canonical bytes and collects blob refs (and
+/// legacy blob refs); validation then reads the same tree.
 fn encode_record(
-    v: &J,
+    v: &mut JsonValue,
     collection: &str,
     rkey: &str,
     validate: Option<bool>,
     resolved: Option<&J>,
 ) -> XResult<Encoded> {
-    let J::Object(o) = v else {
+    if !matches!(v, JsonValue::Object(_)) {
         return Err(XrpcError::bad("InvalidRequest", "record must be an object"));
-    };
-    let defaulted;
-    let v = match o.get("$type") {
-        None => {
-            let mut o = o.clone();
-            o.insert("$type".into(), J::String(collection.into()));
-            defaulted = J::Object(o);
-            &defaulted
-        }
-        Some(J::String(t)) if t == collection => v,
+    }
+    match v.get("$type") {
+        None => v.insert("$type", JsonValue::Str(collection.to_string().into())),
+        Some(JsonValue::Str(t)) if t == collection => {}
         Some(t) => {
             return Err(XrpcError::bad(
                 "InvalidRequest",
-                format!("Invalid $type: expected {collection}, got {t}"),
+                format!("Invalid $type: expected {collection}, got {}", t.to_json()),
             ))
         }
-    };
-    let val = Value::from_json(v).map_err(|e| XrpcError::bad("InvalidRequest", e.to_string()))?;
-    let status = crate::lexicon::validate_record(collection, rkey, &val, validate, resolved)
+    }
+    let mut bytes = Vec::with_capacity(512);
+    let mut refs = RecordRefs::default();
+    v.encode_record(&mut bytes, &mut refs)
+        .map_err(|e| XrpcError::bad("InvalidRequest", e.to_string()))?;
+    let status = crate::lexicon::validate_record(collection, rkey, &*v, validate, resolved)
         .map_err(|e| XrpcError::bad("InvalidRequest", e))?;
-    if let Some(c) = legacy_blob(&val) {
+    if let Some(c) = refs.legacy {
         return Err(XrpcError::bad(
             "InvalidRequest",
             format!("Legacy blobs are not allowed ({c})"),
         ));
     }
-    let bytes = val.to_cbor();
     if bytes.len() > 1_000_000 {
         return Err(XrpcError::bad("InvalidRequest", "record too large"));
     }
-    let mut blobs = Vec::new();
-    blob_refs(&val, &mut blobs);
-    let mut decls = Vec::new();
-    blob_decls(&val, &mut decls);
-    Ok((Cid::dag_cbor(&bytes), Bytes::from(bytes), blobs, status, decls))
+    let blobs = refs.cids();
+    Ok((Cid::dag_cbor(&bytes), Bytes::from(bytes), blobs, status, refs.blobs))
 }
 
 /// Adds `validationStatus` unless validation was skipped.
@@ -136,23 +108,38 @@ fn with_status(mut out: J, status: crate::lexicon::ValidationStatus) -> J {
     out
 }
 
-/// A legacy blob ref (`{"cid": "<cid>", "mimeType": "..."}`) anywhere in the
-/// record; the reference refuses to create new ones (prepare.ts).
-fn legacy_blob(v: &Value) -> Option<String> {
-    match v {
-        Value::Map(m) => {
-            if v.get("$type").is_none() {
-                if let (Some(Value::Text(c)), Some(Value::Text(_))) = (v.get("cid"), v.get("mimeType")) {
-                    if Cid::parse(c).is_ok() {
-                        return Some(c.clone());
-                    }
-                }
-            }
-            m.iter().find_map(|(_, c)| legacy_blob(c))
-        }
-        Value::Array(a) => a.iter().find_map(legacy_blob),
-        _ => None,
+/// Input fields of a record write, read from the validated body tree (the
+/// input lexicon has already checked their types; the errors below are
+/// what the old serde structs reported).
+fn field_err(m: String) -> XrpcError {
+    XrpcError::bad("InvalidRequest", format!("Invalid JSON body: {m}"))
+}
+
+fn opt_str(v: &JsonValue, k: &str) -> XResult<Option<String>> {
+    match v.get(k) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Str(s)) => Ok(Some(s.to_string())),
+        Some(_) => Err(field_err(format!("invalid type for `{k}`, expected a string"))),
     }
+}
+
+fn req_str(v: &JsonValue, k: &str) -> XResult<String> {
+    opt_str(v, k)?.ok_or_else(|| field_err(format!("missing field `{k}`")))
+}
+
+fn opt_bool(v: &JsonValue, k: &str) -> XResult<Option<bool>> {
+    match v.get(k) {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(field_err(format!("invalid type for `{k}`, expected a boolean"))),
+    }
+}
+
+/// Moves `k` out of the body tree.
+fn take<'a>(v: &mut JsonValue<'a>, k: &str) -> XResult<JsonValue<'a>> {
+    v.get_mut(k)
+        .map(|x| std::mem::replace(x, JsonValue::Null))
+        .ok_or_else(|| field_err(format!("missing field `{k}`")))
 }
 
 /// Every blob a write references must have been uploaded by the repo and not
@@ -249,22 +236,34 @@ fn uri(did: &str, path: &str) -> String {
     format!("at://{did}/{path}")
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateRecordIn {
+struct CreateRecordIn<'a> {
     repo: String,
     collection: String,
     rkey: Option<String>,
-    record: J,
+    record: JsonValue<'a>,
     swap_commit: Option<String>,
     validate: Option<bool>,
+}
+
+impl<'a> CreateRecordIn<'a> {
+    fn from_tree(mut v: JsonValue<'a>) -> XResult<Self> {
+        Ok(CreateRecordIn {
+            repo: req_str(&v, "repo")?,
+            collection: req_str(&v, "collection")?,
+            rkey: opt_str(&v, "rkey")?,
+            swap_commit: opt_str(&v, "swapCommit")?,
+            validate: opt_bool(&v, "validate")?,
+            record: take(&mut v, "record")?,
+        })
+    }
 }
 
 async fn create_record(
     State(app): AppState,
     Auth(creds): Auth,
-    RecordJson(inp): RecordJson<CreateRecordIn>,
+    body: RecordBody,
 ) -> XResult<Json<J>> {
+    let mut inp = CreateRecordIn::from_tree(body.parse()?)?;
     crate::ratelimit::check_repo_write(creds.did(), crate::ratelimit::CREATE_POINTS)?;
     let did = authed_repo(&app, &creds, &inp.repo).await?;
     creds.require(creds.allows_repo(&inp.collection, "create"))?;
@@ -273,7 +272,7 @@ async fn create_record(
     let rkey = inp.rkey.unwrap_or_else(|| app.tids.next().to_string());
     let schema = crate::lexicon::resolve_record_schema(&app, &inp.collection, inp.validate).await;
     let (cid, bytes, blobs, status, decls) =
-        encode_record(&inp.record, &inp.collection, &rkey, inp.validate, schema.as_deref())?;
+        encode_record(&mut inp.record, &inp.collection, &rkey, inp.validate, schema.as_deref())?;
     check_blobs(&app, &did, &decls).await?;
     let swap = parse_cid_opt(&inp.swap_commit)?;
     let path = format!("{}/{}", inp.collection, rkey);
@@ -300,22 +299,32 @@ async fn create_record(
     )))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PutRecordIn {
+struct PutRecordIn<'a> {
     repo: String,
     collection: String,
     rkey: String,
-    record: J,
-    #[serde(default, deserialize_with = "nullable")]
+    record: JsonValue<'a>,
+    /// None = absent, Some(None) = an explicit null.
     swap_record: Option<Option<String>>,
     swap_commit: Option<String>,
     validate: Option<bool>,
 }
 
-/// Distinguishes an absent field (None) from an explicit null (Some(None)).
-fn nullable<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<String>>, D::Error> {
-    Ok(Some(Option::<String>::deserialize(d)?))
+impl<'a> PutRecordIn<'a> {
+    fn from_tree(mut v: JsonValue<'a>) -> XResult<Self> {
+        Ok(PutRecordIn {
+            repo: req_str(&v, "repo")?,
+            collection: req_str(&v, "collection")?,
+            rkey: req_str(&v, "rkey")?,
+            swap_record: match v.get("swapRecord") {
+                None => None,
+                Some(_) => Some(opt_str(&v, "swapRecord")?),
+            },
+            swap_commit: opt_str(&v, "swapCommit")?,
+            validate: opt_bool(&v, "validate")?,
+            record: take(&mut v, "record")?,
+        })
+    }
 }
 
 fn parse_swap_record(v: &Option<Option<String>>) -> XResult<Option<Option<Cid>>> {
@@ -333,8 +342,9 @@ fn parse_swap_record(v: &Option<Option<String>>) -> XResult<Option<Option<Cid>>>
 async fn put_record(
     State(app): AppState,
     Auth(creds): Auth,
-    RecordJson(inp): RecordJson<PutRecordIn>,
+    body: RecordBody,
 ) -> XResult<Json<J>> {
+    let mut inp = PutRecordIn::from_tree(body.parse()?)?;
     crate::ratelimit::check_repo_write(creds.did(), crate::ratelimit::UPDATE_POINTS)?;
     let did = authed_repo(&app, &creds, &inp.repo).await?;
     creds.require(
@@ -344,7 +354,7 @@ async fn put_record(
     check_path(&inp.collection, Some(&inp.rkey))?;
     let schema = crate::lexicon::resolve_record_schema(&app, &inp.collection, inp.validate).await;
     let (cid, bytes, blobs, status, decls) =
-        encode_record(&inp.record, &inp.collection, &inp.rkey, inp.validate, schema.as_deref())?;
+        encode_record(&mut inp.record, &inp.collection, &inp.rkey, inp.validate, schema.as_deref())?;
     let swap = parse_cid_opt(&inp.swap_commit)?;
     let swap_record = parse_swap_record(&inp.swap_record)?;
     let path = format!("{}/{}", inp.collection, inp.rkey);
@@ -432,20 +442,33 @@ async fn delete_record(
     Ok(Json(json!({"commit": commit_json(&ack)})))
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ApplyWritesIn {
+struct ApplyWritesIn<'a> {
     repo: String,
-    writes: Vec<J>,
+    writes: Vec<JsonValue<'a>>,
     swap_commit: Option<String>,
     validate: Option<bool>,
+}
+
+impl<'a> ApplyWritesIn<'a> {
+    fn from_tree(mut v: JsonValue<'a>) -> XResult<Self> {
+        Ok(ApplyWritesIn {
+            repo: req_str(&v, "repo")?,
+            swap_commit: opt_str(&v, "swapCommit")?,
+            validate: opt_bool(&v, "validate")?,
+            writes: match take(&mut v, "writes")? {
+                JsonValue::Array(a) => a,
+                _ => return Err(field_err("invalid type for `writes`, expected a sequence".into())),
+            },
+        })
+    }
 }
 
 async fn apply_writes(
     State(app): AppState,
     Auth(creds): Auth,
-    RecordJson(inp): RecordJson<ApplyWritesIn>,
+    body: RecordBody,
 ) -> XResult<Json<J>> {
+    let mut inp = ApplyWritesIn::from_tree(body.parse()?)?;
     {
         use crate::ratelimit::*;
         let points = inp
@@ -472,15 +495,15 @@ async fn apply_writes(
     let mut decls = Vec::new();
     // dynamically resolved lexicons, once per collection
     let mut schemas: std::collections::HashMap<String, Option<Arc<J>>> = Default::default();
-    for w in &inp.writes {
-        let t = w.get("$type").and_then(|v| v.as_str()).unwrap_or("");
+    for w in inp.writes.iter_mut() {
+        let t = w.get("$type").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let collection = w
             .get("collection")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
         let rkey = w.get("rkey").and_then(|v| v.as_str()).map(String::from);
-        let action = match t {
+        let action = match t.as_str() {
             "com.atproto.repo.applyWrites#create" => "create",
             "com.atproto.repo.applyWrites#update" => "update",
             _ => "delete",
@@ -492,11 +515,12 @@ async fn apply_writes(
             schemas.insert(collection.clone(), s);
         }
         let schema = schemas.get(&collection).cloned().flatten();
-        match t {
+        let mut value = w.get_mut("value").map(|x| std::mem::replace(x, JsonValue::Null)).unwrap_or(JsonValue::Null);
+        match t.as_str() {
             "com.atproto.repo.applyWrites#create" => {
                 let rkey = rkey.unwrap_or_else(|| app.tids.next().to_string());
                 let (cid, bytes, blobs, status, d) =
-                    encode_record(w.get("value").unwrap_or(&J::Null), &collection, &rkey, inp.validate, schema.as_deref())?;
+                    encode_record(&mut value, &collection, &rkey, inp.validate, schema.as_deref())?;
                 statuses.push(status);
                 decls.extend(d);
                 writes.push(Write::Create {
@@ -511,7 +535,7 @@ async fn apply_writes(
                 let rkey =
                     rkey.ok_or_else(|| XrpcError::bad("InvalidRequest", "update requires rkey"))?;
                 let (cid, bytes, blobs, status, d) =
-                    encode_record(w.get("value").unwrap_or(&J::Null), &collection, &rkey, inp.validate, schema.as_deref())?;
+                    encode_record(&mut value, &collection, &rkey, inp.validate, schema.as_deref())?;
                 statuses.push(status);
                 decls.extend(d);
                 writes.push(Write::Update {
@@ -885,4 +909,236 @@ fn parse_import(body: &[u8], did: &str) -> XResult<Vec<ImportedRecord>> {
         out.push((path, cid, Bytes::from(bytes.clone()), blobs));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The record path before `JsonValue` (body -> `serde_json::Value` ->
+    /// input lexicon -> serde struct -> `Value::from_json` -> lexicon ->
+    /// three walks -> `to_cbor`), kept as the oracle for the new one.
+    mod legacy {
+        use super::super::*;
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        pub struct CreateRecordIn {
+            pub collection: String,
+            pub rkey: Option<String>,
+            pub record: J,
+            pub validate: Option<bool>,
+        }
+
+        fn blob_decls(v: &Value, out: &mut Vec<BlobDecl>) {
+            match v {
+                Value::Map(m) => {
+                    if v.get("$type").and_then(|t| t.as_str()) == Some("blob") {
+                        if let Some(Value::Link(c)) = v.get("ref") {
+                            let mime = v.get("mimeType").and_then(|m| m.as_str()).map(String::from);
+                            let size = match v.get("size") {
+                                Some(Value::Int(n)) => Some(*n),
+                                _ => None,
+                            };
+                            out.push((*c, mime, size));
+                        }
+                    }
+                    for (_, child) in m {
+                        blob_decls(child, out);
+                    }
+                }
+                Value::Array(a) => a.iter().for_each(|c| blob_decls(c, out)),
+                _ => {}
+            }
+        }
+
+        fn legacy_blob(v: &Value) -> Option<String> {
+            match v {
+                Value::Map(m) => {
+                    if v.get("$type").is_none() {
+                        if let (Some(Value::Text(c)), Some(Value::Text(_))) = (v.get("cid"), v.get("mimeType")) {
+                            if Cid::parse(c).is_ok() {
+                                return Some(c.clone());
+                            }
+                        }
+                    }
+                    m.iter().find_map(|(_, c)| legacy_blob(c))
+                }
+                Value::Array(a) => a.iter().find_map(legacy_blob),
+                _ => None,
+            }
+        }
+
+        pub fn encode_record(v: &J, collection: &str, rkey: &str, validate: Option<bool>) -> XResult<Encoded> {
+            let J::Object(o) = v else {
+                return Err(XrpcError::bad("InvalidRequest", "record must be an object"));
+            };
+            let defaulted;
+            let v = match o.get("$type") {
+                None => {
+                    let mut o = o.clone();
+                    o.insert("$type".into(), J::String(collection.into()));
+                    defaulted = J::Object(o);
+                    &defaulted
+                }
+                Some(J::String(t)) if t == collection => v,
+                Some(t) => {
+                    return Err(XrpcError::bad(
+                        "InvalidRequest",
+                        format!("Invalid $type: expected {collection}, got {t}"),
+                    ))
+                }
+            };
+            let val = Value::from_json(v).map_err(|e| XrpcError::bad("InvalidRequest", e.to_string()))?;
+            let status = crate::lexicon::validate_record(collection, rkey, &val, validate, None)
+                .map_err(|e| XrpcError::bad("InvalidRequest", e))?;
+            if let Some(c) = legacy_blob(&val) {
+                return Err(XrpcError::bad("InvalidRequest", format!("Legacy blobs are not allowed ({c})")));
+            }
+            let bytes = val.to_cbor();
+            if bytes.len() > 1_000_000 {
+                return Err(XrpcError::bad("InvalidRequest", "record too large"));
+            }
+            let mut blobs = Vec::new();
+            blob_refs(&val, &mut blobs);
+            let mut decls = Vec::new();
+            blob_decls(&val, &mut decls);
+            Ok((Cid::dag_cbor(&bytes), Bytes::from(bytes), blobs, status, decls))
+        }
+
+        /// createRecord body -> encoded record, the old way.
+        pub fn create(body: &[u8]) -> XResult<Encoded> {
+            let nsid = "com.atproto.repo.createRecord";
+            let v: J = serde_json::from_slice(body)
+                .map_err(|e| XrpcError::bad("InvalidRequest", format!("Invalid JSON body: {e}")))?;
+            crate::lexicon::validate_input(nsid, &v).map_err(|e| XrpcError::bad("InvalidRequest", e))?;
+            let inp: CreateRecordIn = serde_json::from_value(v)
+                .map_err(|e| XrpcError::bad("InvalidRequest", format!("Invalid JSON body: {e}")))?;
+            let rkey = inp.rkey.unwrap_or_else(|| "3jui7kd54zh2y".into());
+            encode_record(&inp.record, &inp.collection, &rkey, inp.validate)
+        }
+    }
+
+    /// createRecord body -> encoded record, as the handler does it.
+    fn create(body: &RecordBody) -> XResult<Encoded> {
+        let mut inp = CreateRecordIn::from_tree(body.parse()?)?;
+        let rkey = inp.rkey.take().unwrap_or_else(|| "3jui7kd54zh2y".into());
+        encode_record(&mut inp.record, &inp.collection, &rkey, inp.validate, None)
+    }
+
+    fn same(a: &XResult<Encoded>, b: &XResult<Encoded>) -> bool {
+        match (a, b) {
+            (Ok(a), Ok(b)) => a == b,
+            (Err(a), Err(b)) => (a.status, &a.error, &a.message) == (b.status, &b.error, &b.message),
+            _ => false,
+        }
+    }
+
+    fn show(r: &XResult<Encoded>) -> String {
+        match r {
+            Ok(e) => format!("ok {} {:?} {:?}", e.0, e.3, e.4),
+            Err(e) => format!("{} {}: {}", e.status, e.error, e.message),
+        }
+    }
+
+    const POST: &str = r#"{"$type":"app.bsky.feed.post","text":"Check out this thing @alice.bsky.social wrote about merkle search trees https://example.com/mst — really neat","createdAt":"2026-10-01T12:34:56.789Z","langs":["en"],"facets":[{"index":{"byteStart":15,"byteEnd":34},"features":[{"$type":"app.bsky.richtext.facet#mention","did":"did:plc:ewvi7nxzyoun6zhxrhs64oiz"}]},{"index":{"byteStart":75,"byteEnd":99},"features":[{"$type":"app.bsky.richtext.facet#link","uri":"https://example.com/mst"}]}],"reply":{"root":{"uri":"at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/3l3qo2vuowo2b","cid":"bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"},"parent":{"uri":"at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/3l3qo2vuowo2b","cid":"bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"}},"embed":{"$type":"app.bsky.embed.images","images":[{"alt":"a diagram of a tree","image":{"$type":"blob","ref":{"$link":"bafkreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"},"mimeType":"image/jpeg","size":123456},"aspectRatio":{"width":1200,"height":800}}]}}"#;
+    const LIKE: &str = r#"{"$type":"app.bsky.feed.like","subject":{"uri":"at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/3l3qo2vuowo2b","cid":"bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"},"createdAt":"2026-10-01T12:34:56.789Z"}"#;
+
+    fn body(collection: &str, record: &str, extra: &str) -> Vec<u8> {
+        format!(r#"{{"repo":"did:plc:ewvi7nxzyoun6zhxrhs64oiz","collection":"{collection}"{extra},"record":{record}}}"#).into_bytes()
+    }
+
+    /// The handler path against the oracle: same CID, bytes, blob refs,
+    /// declarations and validation status, or the same error.
+    #[test]
+    fn record_path_matches_legacy() {
+        let post_no_type = POST.replacen(r#""$type":"app.bsky.feed.post","#, "", 1);
+        let cases: Vec<(&str, String, &str)> = vec![
+            ("app.bsky.feed.post", POST.into(), ""),
+            ("app.bsky.feed.like", LIKE.into(), ""),
+            ("app.bsky.feed.post", post_no_type.clone(), ""),
+            ("app.bsky.feed.like", POST.into(), ""),
+            ("app.bsky.feed.post", post_no_type.replace("2026-10-01T12:34:56.789Z", "yesterday"), ""),
+            ("app.bsky.feed.post", POST.replace("image/jpeg", "text/html"), ""),
+            ("app.bsky.feed.post", POST.replace("123456", "123456.0"), ""),
+            ("app.bsky.feed.post", POST.replace("123456", "1.5"), ""),
+            ("app.bsky.feed.post", POST.replace(r#""langs":["en"]"#, r#""langs":["en"],"langs":[5]"#), ""),
+            ("app.bsky.feed.post", POST.replace(r#""langs":["en"]"#, r#""langs":[5],"langs":["en"]"#), ""),
+            ("app.bsky.feed.post", POST.replace(r#""alt":"a diagram of a tree""#, r#""alt":"x","legacy":{"cid":"bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm","mimeType":"image/png"}"#), ""),
+            ("app.bsky.feed.post", POST.replace("bafkreie5737", "bafkreiX5737"), ""),
+            ("app.bsky.feed.post", POST.into(), r#","validate":false"#),
+            ("app.bsky.feed.post", POST.into(), r#","validate":true"#),
+            ("com.example.thing", r#"{"a":1.0,"b":{"$bytes":"AQID"},"c":{"$link":"bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"}}"#.into(), ""),
+            ("com.example.thing", r#"{"a":1.0}"#.into(), r#","validate":true"#),
+            ("com.example.thing", r#"{"$type":5}"#.into(), ""),
+            ("com.example.thing", r#"{"$type":"com.example.other"}"#.into(), ""),
+            ("com.example.thing", r#""text""#.into(), ""),
+            ("com.example.thing", r#"[]"#.into(), ""),
+            ("com.example.thing", r#"{"x":{"$link":"bad","y":1}}"#.into(), ""),
+            ("com.example.thing", r#"{"x":9223372036854775808}"#.into(), ""),
+            ("com.example.thing", r#"{"x":{"$type":"blob","ref":{"$link":"bafkreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"},"mimeType":"a/b","size":18446744073709551615}}"#.into(), ""),
+            ("com.example.thing", r#"{"z":1.5,"a":{"$link":"bad"}}"#.into(), ""),
+            ("com.example.thing", format!(r#"{{"big":"{}"}}"#, "x".repeat(1_000_001)), ""),
+        ];
+        for (coll, rec, extra) in &cases {
+            let b = body(coll, rec, extra);
+            let old = legacy::create(&b);
+            let new = create(&RecordBody::new("com.atproto.repo.createRecord", b.clone()));
+            assert!(same(&old, &new), "{coll} {extra} {}:\n old {}\n new {}", &rec[..rec.len().min(200)], show(&old), show(&new));
+        }
+        // input-level failures read the same too
+        for b in [
+            &br#"{"repo":1,"collection":"a.b.c","record":{}}"#[..],
+            br#"{"repo":"did:plc:abc","record":{}}"#,
+            br#"{"repo":"did:plc:abc","collection":"a.b.c","record":{},"validate":"yes"}"#,
+            br#"{"repo":"did:plc:abc","collection":"a.b.c","record":{"#,
+            br#"[]"#,
+        ] {
+            let old = legacy::create(b);
+            let new = create(&RecordBody::new("com.atproto.repo.createRecord", b.to_vec()));
+            assert!(same(&old, &new), "{}:\n old {}\n new {}", String::from_utf8_lossy(b), show(&old), show(&new));
+        }
+    }
+
+    /// `cargo test --profile dev-release --lib xrpc::repo::tests::bench_record_path -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_record_path() {
+        let n = 300_000u32;
+        let run = |name: &str, f: &dyn Fn() -> usize| {
+            let mut sink = 0;
+            for _ in 0..n / 10 {
+                sink += f();
+            }
+            let t = Instant::now();
+            for _ in 0..n {
+                sink += f();
+            }
+            let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+            println!("{name:44} {us:6.2} us/op ({})", sink % 7);
+        };
+        for (name, coll, rec) in [("post", "app.bsky.feed.post", POST), ("like", "app.bsky.feed.like", LIKE)] {
+            let b = body(coll, rec, "");
+            let rb = RecordBody::new("com.atproto.repo.createRecord", b.clone());
+            assert!(same(&legacy::create(&b), &create(&rb)));
+            run(&format!("{name} createRecord body -> record: old"), &|| legacy::create(&b).ok().unwrap().1.len());
+            run(&format!("{name} createRecord body -> record: new"), &|| create(&rb).ok().unwrap().1.len());
+            run(&format!("{name}   parse body tree"), &|| rb.parse().ok().unwrap().get("record").is_some() as usize);
+            run(&format!("{name}   parse + input lexicon"), &|| CreateRecordIn::from_tree(rb.parse().ok().unwrap()).ok().unwrap().repo.len());
+            let mut rec = CreateRecordIn::from_tree(rb.parse().ok().unwrap()).ok().unwrap().record;
+            let mut out = Vec::new();
+            rec.encode_record(&mut out, &mut Default::default()).unwrap();
+            run(&format!("{name}   encode only"), &|| {
+                let mut r = rec.clone();
+                let mut out = Vec::with_capacity(512);
+                r.encode_record(&mut out, &mut Default::default()).unwrap();
+                out.len()
+            });
+            run(&format!("{name}   clone only"), &|| matches!(rec.clone(), JsonValue::Object(_)) as usize);
+            run(&format!("{name}   record lexicon only"), &|| {
+                crate::lexicon::validate_record(coll, "3jui7kd54zh2y", &rec, None, None).unwrap().unwrap().len()
+            });
+            run(&format!("{name}   sha256 cid only"), &|| Cid::dag_cbor(&out).digest[0] as usize);
+        }
+    }
 }

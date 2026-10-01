@@ -3,10 +3,15 @@
 //!
 //! Nodes are `Arc`-shared and mutated copy-on-write (`Arc::make_mut`), so a
 //! snapshot of the root (for exports, or inverting a commit) costs one refcount.
+//! Keys are `Arc<[u8]>`, so copying a node on write bumps refcounts instead of
+//! copying every key.
 //!
-//! `dirty` means "this node's CID must be (re)computed and its block emitted in
-//! the next diff". Mutations mark the nodes they rewrite; `prove_mutation` also
-//! marks neighbouring nodes that a verifier needs to invert the operation.
+//! `dirty` means "this node's block must be emitted in the next diff".
+//! Mutations mark the nodes they rewrite (and drop their cached encoding);
+//! `prove_mutation` also marks neighbouring nodes that a verifier needs to
+//! invert the operation, whose cached encoding stays valid. Written internal
+//! nodes keep their encoded block (`bytes`), so exports, proofs and getBlocks
+//! copy those blocks instead of re-encoding them (leaves re-encode).
 
 use crate::cbor;
 use crate::cid::Cid;
@@ -44,12 +49,17 @@ pub struct Node {
     pub dirty: bool,
     /// Placeholder for a node known only by CID (partial trees).
     pub stub: bool,
+    /// The node's encoded block (hashing to `cid`), kept from its last write
+    /// while its content is unchanged. Only internal nodes (height >= 1)
+    /// keep one: leaves are ~3/4 of the nodes and bytes, and every proof
+    /// path has just one.
+    pub bytes: Option<Arc<[u8]>>,
 }
 
 #[derive(Clone, Debug)]
 pub enum Entry {
     Value {
-        key: Box<[u8]>,
+        key: Arc<[u8]>,
         val: Cid,
     },
     /// `node` is None in partial trees; `cid` is authoritative only then
@@ -113,6 +123,34 @@ impl Node {
             cid: None,
             dirty: true,
             stub: false,
+            bytes: None,
+        }
+    }
+
+    /// Marks a content change: re-encode and emit in the next diff.
+    fn touch(&mut self) {
+        self.dirty = true;
+        self.bytes = None;
+    }
+
+    /// The node's block: the cached encoding, or a fresh one.
+    fn block(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
+        if let Some(b) = &self.bytes {
+            return Ok(std::borrow::Cow::Borrowed(b));
+        }
+        let mut buf = Vec::with_capacity(64 + self.entries.len() * 80);
+        encode_node(self, &mut buf)?;
+        Ok(std::borrow::Cow::Owned(buf))
+    }
+
+    /// The smallest key in this subtree (None for an empty or partial one).
+    fn first_key(&self) -> Option<&Arc<[u8]>> {
+        let mut n = self;
+        loop {
+            match n.entries.first()? {
+                Entry::Value { key, .. } => return Some(key),
+                Entry::Child { node, .. } => n = node.as_ref()?,
+            }
         }
     }
 
@@ -355,13 +393,13 @@ fn insert(
         };
         let prev = *existing;
         *existing = val;
-        nm.dirty = true;
+        nm.touch();
         return Ok((n, Some(prev)));
     }
 
     let (idx, split) = n.find_insertion_index(key)?;
     let nm = Arc::make_mut(&mut n);
-    nm.dirty = true;
+    nm.touch();
     if prove {
         ignore_partial(prove_mutation(nm, key))?;
     }
@@ -466,7 +504,7 @@ fn insert_child(
         if prev == Some(val) {
             return Ok((n, Some(val)));
         }
-        nm.dirty = true;
+        nm.touch();
         return Ok((n, prev));
     }
     let (idx, split) = n.find_insertion_index(key)?;
@@ -474,7 +512,7 @@ fn insert_child(
         return Err(MstError::Invalid("unexpected split when inserting child"));
     }
     let nm = Arc::make_mut(&mut n);
-    nm.dirty = true;
+    nm.touch();
     let (new_child, _) = insert(
         Arc::new(Node::empty(nm.height - 1)),
         key,
@@ -507,7 +545,7 @@ fn remove(
         return Ok((n, None));
     };
     let nm = Arc::make_mut(&mut n);
-    nm.dirty = true;
+    nm.touch();
     let Entry::Value { val: prev, .. } = nm.entries[idx] else {
         unreachable!()
     };
@@ -548,6 +586,7 @@ fn remove(
                     cid: Some(*c),
                     dirty: false,
                     stub: true,
+                    bytes: None,
                 }),
                 (None, None) => return Err(MstError::Partial),
             };
@@ -583,30 +622,23 @@ fn remove_child(
     height: i32,
     prove: bool,
 ) -> Result<(Arc<Node>, Option<Cid>)> {
+    // the key exists below (checked once by Tree::remove_inner, so a no-op
+    // delete doesn't copy-on-write the path)
     let Some(idx) = n.find_existing_child(key) else {
         return Ok((n, None));
     };
-    match &n.entries[idx] {
-        Entry::Child { node: Some(c), .. } => {
-            // cheap pre-check so a no-op delete doesn't copy-on-write the path
-            if c.get(key, height)?.is_none() {
-                return Ok((n, None));
-            }
-        }
-        _ => return Err(MstError::Partial),
-    }
     let nm = Arc::make_mut(&mut n);
     let Entry::Child { node, .. } = &mut nm.entries[idx] else {
         unreachable!()
     };
     let child = node.take().ok_or(MstError::Partial)?;
     let (new_child, prev) = remove(child, key, Some(height), prove)?;
-    nm.dirty = true;
     if !new_child.is_empty() {
         *node = Some(new_child);
     } else {
         nm.entries.remove(idx);
     }
+    nm.touch();
     Ok((n, prev))
 }
 
@@ -667,10 +699,13 @@ pub fn encode_node(n: &Node, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// Recomputes CIDs of dirty nodes, emitting their blocks into `out`.
+/// Recomputes CIDs of dirty nodes, emitting their blocks into `out`. A node
+/// marked only as proof (content and children's CIDs unchanged) emits its
+/// cached block without re-encoding or re-hashing it.
 fn write_blocks(
     n: &mut Arc<Node>,
     out: &mut Option<&mut Vec<(Cid, Vec<u8>)>>,
+    refs: &mut Option<&mut Vec<(Cid, NodeRef)>>,
     depth: usize,
 ) -> Result<Cid> {
     if depth > MAX_DEPTH {
@@ -685,22 +720,46 @@ fn write_blocks(
         }
     }
     let nm = Arc::make_mut(n);
+    let mut children_changed = false;
     for e in nm.entries.iter_mut() {
         if let Entry::Child { node: Some(c), cid } = e {
-            if c.dirty || c.cid.is_none() {
-                *cid = Some(write_blocks(c, out, depth + 1)?);
+            let new = if c.dirty || c.cid.is_none() {
+                write_blocks(c, out, refs, depth + 1)?
             } else {
-                *cid = c.cid;
-            }
+                c.cid.ok_or(MstError::Invalid("child without cid"))?
+            };
+            children_changed |= *cid != Some(new);
+            *cid = Some(new);
         }
     }
-    let mut buf = Vec::with_capacity(64 + nm.entries.len() * 80);
-    encode_node(nm, &mut buf)?;
-    let c = Cid::dag_cbor(&buf);
-    nm.cid = Some(c);
+    if children_changed {
+        nm.bytes = None;
+    }
+    let c = match (nm.cid, &nm.bytes) {
+        (Some(c), Some(b)) => {
+            if let Some(out) = out.as_mut() {
+                out.push((c, b.to_vec()));
+            }
+            c
+        }
+        _ => {
+            let mut buf = Vec::with_capacity(64 + nm.entries.len() * 80);
+            encode_node(nm, &mut buf)?;
+            let c = Cid::dag_cbor(&buf);
+            nm.cid = Some(c);
+            // leaves (most nodes, most bytes) re-encode on demand
+            if nm.height >= 1 {
+                nm.bytes = Some(Arc::from(&buf[..]));
+            }
+            if let Some(out) = out.as_mut() {
+                out.push((c, buf));
+            }
+            c
+        }
+    };
     nm.dirty = false;
-    if let Some(out) = out.as_mut() {
-        out.push((c, buf));
+    if let (Some(refs), Some(k)) = (refs.as_mut(), nm.first_key()) {
+        refs.push((c, (k.clone(), nm.height)));
     }
     Ok(c)
 }
@@ -794,6 +853,7 @@ pub fn decode_node(data: &[u8], c: Cid) -> std::result::Result<Node, MstError> {
         cid: Some(c),
         dirty: false,
         stub: false,
+        bytes: None,
     })
 }
 
@@ -927,6 +987,9 @@ impl Tree {
         if !valid_key(key) {
             return Err(MstError::InvalidKey);
         }
+        if self.root.get(key, height_for_key(key))?.is_none() {
+            return Ok(None);
+        }
         let root = self.root.clone();
         let (r, prev) = remove(root, key, None, prove)?;
         self.root = r;
@@ -951,12 +1014,43 @@ impl Tree {
                 return Ok(c);
             }
         }
-        write_blocks(&mut self.root, &mut None, 0)
+        write_blocks(&mut self.root, &mut None, &mut None, 0)
     }
 
     /// Computes the root CID and returns every dirty block (new nodes + proof nodes).
     pub fn write_diff_blocks(&mut self, out: &mut Vec<(Cid, Vec<u8>)>) -> Result<Cid> {
-        write_blocks(&mut self.root, &mut Some(out), 0)
+        write_blocks(&mut self.root, &mut Some(out), &mut None, 0)
+    }
+
+    /// [`Tree::write_diff_blocks`], also reporting where each emitted node
+    /// sits (for [`NodeIndex::advance`]).
+    pub fn write_diff_blocks_with_refs(
+        &mut self,
+        out: &mut Vec<(Cid, Vec<u8>)>,
+        refs: &mut Vec<(Cid, NodeRef)>,
+    ) -> Result<Cid> {
+        write_blocks(&mut self.root, &mut Some(out), &mut Some(refs), 0)
+    }
+
+    /// Where every node of a fully written tree sits (cid -> first key,
+    /// height); an empty root has no key and is left out.
+    pub fn node_refs(&self, out: &mut HashMap<Cid, NodeRef>) -> Result<()> {
+        fn rec(n: &Node, out: &mut HashMap<Cid, NodeRef>, depth: usize) -> Result<()> {
+            if depth > MAX_DEPTH {
+                return Err(MstError::Invalid("tree too deep"));
+            }
+            let c = n.cid.ok_or(MstError::Invalid("unwritten node"))?;
+            if let Some(k) = n.first_key() {
+                out.insert(c, (k.clone(), n.height));
+            }
+            for e in &n.entries {
+                if let Entry::Child { node: Some(c), .. } = e {
+                    rec(c, out, depth + 1)?;
+                }
+            }
+            Ok(())
+        }
+        rec(&self.root, out, 0)
     }
 
     /// Loads a (possibly partial) tree from a block set.
@@ -994,10 +1088,15 @@ impl Tree {
             if depth > MAX_DEPTH {
                 return Err(MstError::Invalid("tree too deep"));
             }
-            buf.clear();
-            encode_node(n, buf)?;
             let c = n.cid.ok_or(MstError::Invalid("unwritten node"))?;
-            f(c, buf);
+            match &n.bytes {
+                Some(b) if !n.dirty => f(c, b),
+                _ => {
+                    buf.clear();
+                    encode_node(n, buf)?;
+                    f(c, buf);
+                }
+            }
             for e in &n.entries {
                 if let Entry::Child { node: Some(c), .. } = e {
                     rec(c, buf, f, depth + 1)?;
@@ -1009,54 +1108,34 @@ impl Tree {
         rec(&self.root, &mut buf, f, 0)
     }
 
-    /// One pass over a fully written tree for `wanted` CIDs: encodes only the
-    /// matching node blocks (into `nodes`) and records one key per matching
-    /// record CID (into `records`); stops once everything wanted is found.
-    /// getBlocks used walk_blocks + walk, which re-encoded every node of the
-    /// repo per request (106 req/s at 1M records).
-    pub fn find_cids(
-        &self,
-        wanted: &std::collections::HashSet<Cid>,
-        nodes: &mut std::collections::HashMap<Cid, Vec<u8>>,
-        records: &mut std::collections::HashMap<Cid, Vec<u8>>,
-    ) -> Result<()> {
-        fn rec(
-            n: &Node,
-            wanted: &std::collections::HashSet<Cid>,
-            nodes: &mut std::collections::HashMap<Cid, Vec<u8>>,
-            records: &mut std::collections::HashMap<Cid, Vec<u8>>,
-            depth: usize,
-        ) -> Result<bool> {
-            if depth > MAX_DEPTH {
-                return Err(MstError::Invalid("tree too deep"));
-            }
-            let c = n.cid.ok_or(MstError::Invalid("unwritten node"))?;
-            if wanted.contains(&c) && !nodes.contains_key(&c) {
-                let mut buf = Vec::with_capacity(512);
-                encode_node(n, &mut buf)?;
-                nodes.insert(c, buf);
-            }
-            for e in &n.entries {
-                match e {
-                    Entry::Value { key, val } => {
-                        if wanted.contains(val) && !records.contains_key(val) {
-                            records.insert(*val, key.to_vec());
-                        }
-                    }
-                    Entry::Child { node: Some(c), .. } => {
-                        if rec(c, wanted, nodes, records, depth + 1)? {
-                            return Ok(true);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ok(nodes.len() + records.len() >= wanted.len())
+    /// The block of node `cid`, looked up in `index` (which must cover this
+    /// tree's version for a None to be final).
+    pub fn find_node(&self, cid: &Cid, index: &NodeIndex) -> Result<Option<Vec<u8>>> {
+        if self.root.cid == Some(*cid) {
+            return Ok(Some(self.root.block()?.into_owned()));
         }
-        if wanted.is_empty() {
-            return Ok(());
+        match index.get(cid) {
+            Some((key, height)) => self.node_block(cid, key, *height),
+            None => Ok(None),
         }
-        rec(&self.root, wanted, nodes, records, 0).map(|_| ())
+    }
+
+    /// The block of the node at `height` on the path to `key`, if that
+    /// node's CID is `cid` (the tree must be fully written).
+    pub fn node_block(&self, cid: &Cid, key: &[u8], height: i32) -> Result<Option<Vec<u8>>> {
+        let mut n: &Node = &self.root;
+        loop {
+            if n.height <= height {
+                return match n.height == height && n.cid == Some(*cid) {
+                    true => Ok(Some(n.block()?.into_owned())),
+                    false => Ok(None),
+                };
+            }
+            match n.find_existing_child(key).map(|i| &n.entries[i]) {
+                Some(Entry::Child { node: Some(c), .. }) => n = c,
+                _ => return Ok(None),
+            }
+        }
     }
 
     /// Node blocks on the path from the root to `key` (inclusion or exclusion proof).
@@ -1065,9 +1144,7 @@ impl Tree {
         let mut out = Vec::new();
         let mut n: &Node = &self.root;
         loop {
-            let mut buf = Vec::new();
-            encode_node(n, &mut buf)?;
-            out.push((n.cid.ok_or(MstError::Invalid("unwritten node"))?, buf));
+            out.push((n.cid.ok_or(MstError::Invalid("unwritten node"))?, n.block()?.into_owned()));
             if height >= n.height {
                 return Ok(out);
             }
@@ -1081,6 +1158,105 @@ impl Tree {
         }
     }
 }
+
+// ---------- node index (getBlocks) ----------
+
+/// Where a node sits: a key in its subtree (the first) and its height. The
+/// node is the one at that height on the path from the root to the key.
+pub type NodeRef = (Arc<[u8]>, i32);
+
+/// Node CID -> [`NodeRef`] for one repo, so getBlocks finds MST nodes by
+/// CID in O(depth) instead of walking the tree. Built from a tree version
+/// (one walk), then advanced by each commit's written nodes; it only grows,
+/// so it covers every version in `from..=to` (revs) and a miss for one of
+/// those is final. Entries of replaced nodes linger until a rebuild;
+/// lookups check the CID against the tree they read.
+pub struct NodeIndex {
+    map: HashMap<Cid, NodeRef>,
+    pub from: u64,
+    pub to: u64,
+    /// Nodes at the last build: rebuild once stale entries outnumber them.
+    live: usize,
+}
+
+impl NodeIndex {
+    pub fn build(tree: &Tree, rev: u64) -> Result<NodeIndex> {
+        let mut map = HashMap::new();
+        tree.node_refs(&mut map)?;
+        let live = map.len();
+        Ok(NodeIndex { map, from: rev, to: rev, live })
+    }
+
+    pub fn covers(&self, rev: u64) -> bool {
+        (self.from..=self.to).contains(&rev)
+    }
+
+    pub fn get(&self, cid: &Cid) -> Option<&NodeRef> {
+        self.map.get(cid)
+    }
+
+    /// Adds the nodes written by commit `prev -> rev`. False (unchanged) if
+    /// the index doesn't end at `prev`.
+    pub fn advance(&mut self, prev: u64, rev: u64, written: &[(Cid, NodeRef)]) -> bool {
+        if self.to != prev || rev < prev {
+            return false;
+        }
+        self.map.extend(written.iter().cloned());
+        self.to = rev;
+        true
+    }
+
+    /// Mostly stale entries: drop and rebuild on the next miss.
+    pub fn bloated(&self) -> bool {
+        self.map.len() > 2 * self.live + 4096
+    }
+}
+
+/// A repo's node index, shared by the repo worker (which advances it per
+/// commit once anyone has asked for it) and getBlocks (which builds it).
+#[derive(Default)]
+pub struct NodeIndexCell {
+    pub index: Option<NodeIndex>,
+    /// Set by the first getBlocks that needed node blocks: from then on the
+    /// worker reports each commit's written nodes.
+    pub wanted: bool,
+    /// The latest commits' written nodes (prev rev, rev, refs) while there
+    /// is no index to advance, so a build from an older view can catch up.
+    pub recent: std::collections::VecDeque<(u64, u64, Vec<(Cid, NodeRef)>)>,
+}
+
+/// Commits kept in [`NodeIndexCell::recent`].
+const RECENT_COMMITS: usize = 64;
+
+impl NodeIndexCell {
+    /// Worker side: records a commit's written nodes.
+    pub fn commit(&mut self, prev: u64, rev: u64, written: Vec<(Cid, NodeRef)>) {
+        if let Some(ix) = &mut self.index {
+            if ix.advance(prev, rev, &written) && !ix.bloated() {
+                return;
+            }
+            self.index = None;
+        }
+        if self.recent.len() >= RECENT_COMMITS {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((prev, rev, written));
+    }
+
+    /// getBlocks side: installs an index built from a view, caught up with
+    /// the commits recorded since, unless the current one reaches further.
+    pub fn install(&mut self, mut ix: NodeIndex) {
+        for (prev, rev, written) in &self.recent {
+            ix.advance(*prev, *rev, written);
+        }
+        if self.index.as_ref().is_none_or(|cur| cur.to < ix.to) {
+            self.recent.clear();
+            self.index = Some(ix);
+        }
+    }
+}
+
+pub type SharedNodeIndex = Arc<parking_lot::Mutex<NodeIndexCell>>;
 
 #[cfg(test)]
 mod tests {
@@ -1288,6 +1464,187 @@ mod tests {
             t.walk(&mut |k, v| walked.push((String::from_utf8(k.to_vec()).unwrap(), v)));
             assert_eq!(walked, model.into_iter().collect::<Vec<_>>());
         }
+    }
+
+    fn rss_mb() -> f64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap_or(0.0) / 1024.0
+    }
+
+    /// Build, commit-shaped insert/delete (snapshot clone + insert + diff
+    /// blocks per op, as the repo worker does), getRepo walk and proofs on
+    /// an n-key tree.
+    fn tree_bench(entries: &[(String, Cid)], fresh: &[(String, Cid)], probes: &[&(String, Cid)]) -> Tree {
+        use std::time::Instant;
+        let rss0 = rss_mb();
+        let t = Instant::now();
+        let mut tree = Tree::new();
+        for (k, v) in entries {
+            tree.insert_no_proof(k.as_bytes(), *v).unwrap();
+        }
+        let build = t.elapsed();
+        let t = Instant::now();
+        tree.root_cid().unwrap();
+        let rc = t.elapsed();
+        let rss = rss_mb() - rss0;
+        let mut snap = tree.clone();
+        let t = Instant::now();
+        for (k, v) in fresh {
+            tree.insert(k.as_bytes(), *v).unwrap();
+            let mut out = Vec::new();
+            tree.write_diff_blocks(&mut out).unwrap();
+            snap = tree.clone();
+        }
+        let ins = t.elapsed();
+        let t = Instant::now();
+        for (k, _) in fresh {
+            tree.remove(k.as_bytes()).unwrap();
+            let mut out = Vec::new();
+            tree.write_diff_blocks(&mut out).unwrap();
+            snap = tree.clone();
+        }
+        let del = t.elapsed();
+        drop(snap);
+        let t = Instant::now();
+        let mut bytes = 0usize;
+        tree.walk_blocks(&mut |_, b| bytes += b.len()).unwrap();
+        let walk = t.elapsed();
+        let t = Instant::now();
+        let mut pb = 0;
+        for (k, _) in probes {
+            pb += tree.proof_blocks(k.as_bytes()).unwrap().len();
+        }
+        let proof = t.elapsed().as_secs_f64() * 1e6 / probes.len() as f64;
+        let ops = fresh.len() as f64;
+        println!(
+            "build {:.2}s + root {:?} (rss +{:.0} MB) | commit ops: insert {:.0}/s delete {:.0}/s | getRepo walk {:.1} MB {:?} | proof {:.2} us ({pb})",
+            build.as_secs_f64(), rc, rss, ops / ins.as_secs_f64(), ops / del.as_secs_f64(),
+            bytes as f64 / 1e6, walk, proof
+        );
+        tree
+    }
+
+    /// Plus node-index build and getBlocks node lookups. Run alone (RSS):
+    /// `cargo test --profile dev-release --lib mst::tests::bench_mst -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_mst() {
+        use std::time::Instant;
+        let n: usize = std::env::var("MST_BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let entries: Vec<(String, Cid)> = (0..n).map(|_| (rand_key(&mut rng), rand_cid(&mut rng))).collect();
+        let fresh: Vec<(String, Cid)> = (0..20_000).map(|_| (rand_key(&mut rng), rand_cid(&mut rng))).collect();
+        let probes: Vec<&(String, Cid)> = (0..10_000).map(|_| &entries[rng.gen_range(0..n)]).collect();
+        let tree = tree_bench(&entries, &fresh, &probes);
+        let t = Instant::now();
+        let ix = NodeIndex::build(&tree, 1).unwrap();
+        println!("node index build: {:?} ({} nodes)", t.elapsed(), ix.map.len());
+        let mut node_cids = Vec::new();
+        tree.walk_blocks(&mut |c, _| node_cids.push(c)).unwrap();
+        let t = Instant::now();
+        for i in 0..10_000 {
+            let c = node_cids[(i * 7919) % node_cids.len()];
+            assert!(tree.find_node(&c, &ix).unwrap().is_some());
+        }
+        println!("getBlocks node lookup: {:.2} us/cid", t.elapsed().as_secs_f64() * 1e6 / 10_000.0);
+    }
+
+    /// Every node's cached block is its fresh encoding and hashes to its
+    /// CID, through random inserts/removes with snapshots held (copy on
+    /// write) and proof marking (cached blocks reused).
+    fn assert_blocks_fresh(t: &Tree) {
+        fn rec(n: &Node) {
+            let mut fresh = Vec::new();
+            encode_node(n, &mut fresh).unwrap();
+            assert_eq!(n.block().unwrap().as_ref(), &fresh[..]);
+            assert_eq!(Some(Cid::dag_cbor(&fresh)), n.cid);
+            for e in &n.entries {
+                if let Entry::Child { node: Some(c), cid } = e {
+                    assert_eq!(*cid, c.cid);
+                    rec(c);
+                }
+            }
+        }
+        rec(&t.root);
+    }
+
+    /// The node index, advanced commit by commit, finds every node of every
+    /// version it covers (and nothing else), in that version's tree.
+    #[test]
+    fn node_index_tracks_commits() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(21);
+        let mut t = Tree::new();
+        let mut model: Vec<String> = Vec::new();
+        for _ in 0..500 {
+            let k = rand_key(&mut rng);
+            t.insert_no_proof(k.as_bytes(), rand_cid(&mut rng)).unwrap();
+            model.push(k);
+        }
+        t.root_cid().unwrap();
+        let mut ix = NodeIndex::build(&t, 1).unwrap();
+        let mut versions: Vec<(u64, Tree)> = vec![(1, t.clone())];
+        for rev in 2..120u64 {
+            for _ in 0..rng.gen_range(1..6) {
+                if rng.gen_bool(0.6) || model.is_empty() {
+                    let k = rand_key(&mut rng);
+                    t.insert(k.as_bytes(), rand_cid(&mut rng)).unwrap();
+                    model.push(k);
+                } else if rng.gen_bool(0.5) {
+                    let k = model.swap_remove(rng.gen_range(0..model.len()));
+                    t.remove(k.as_bytes()).unwrap();
+                } else {
+                    let k = &model[rng.gen_range(0..model.len())];
+                    t.insert(k.as_bytes(), rand_cid(&mut rng)).unwrap();
+                }
+            }
+            let (mut blocks, mut refs) = (Vec::new(), Vec::new());
+            let root = t.write_diff_blocks_with_refs(&mut blocks, &mut refs).unwrap();
+            assert_eq!(blocks.len(), refs.len() + t.root.first_key().is_none() as usize);
+            for (c, b) in &blocks {
+                assert_eq!(Cid::dag_cbor(b), *c);
+            }
+            assert!(ix.advance(rev - 1, rev, &refs));
+            assert!(!ix.advance(rev - 1, rev, &refs), "advanced twice");
+            assert_eq!(t.root.cid, Some(root));
+            assert_blocks_fresh(&t);
+            versions.push((rev, t.clone()));
+        }
+        for (rev, v) in versions.iter().step_by(7) {
+            assert!(ix.covers(*rev));
+            let mut nodes = Vec::new();
+            v.walk_blocks(&mut |c, b| nodes.push((c, b.to_vec()))).unwrap();
+            for (c, b) in &nodes {
+                assert_eq!(v.find_node(c, &ix).unwrap().as_ref(), Some(b), "rev {rev}");
+            }
+            // another version's nodes and record CIDs are not this tree's
+            let other = &versions[0].1;
+            let mut theirs = Vec::new();
+            other.walk_blocks(&mut |c, _| theirs.push(c)).unwrap();
+            for c in theirs.iter().filter(|c| !nodes.iter().any(|(n, _)| n == *c)) {
+                assert_eq!(v.find_node(c, &ix).unwrap(), None);
+            }
+            assert_eq!(v.find_node(&rand_cid(&mut rng), &ix).unwrap(), None);
+        }
+        // a cell catches a late build up through its recent commits
+        let mut cell = NodeIndexCell { wanted: true, ..Default::default() };
+        let base = versions[100].1.clone();
+        let mut t2 = base.clone();
+        for rev in 101..105u64 {
+            t2.insert(rand_key(&mut rng).as_bytes(), rand_cid(&mut rng)).unwrap();
+            let (mut blocks, mut refs) = (Vec::new(), Vec::new());
+            t2.write_diff_blocks_with_refs(&mut blocks, &mut refs).unwrap();
+            cell.commit(rev - 1, rev, refs);
+        }
+        cell.install(NodeIndex::build(&base, 100).unwrap());
+        let ix = cell.index.as_ref().unwrap();
+        assert!(ix.covers(100) && ix.covers(104) && !ix.covers(105));
+        t2.walk_blocks(&mut |c, b| assert_eq!(t2.find_node(&c, ix).unwrap().as_deref(), Some(b))).unwrap();
+        // a commit that doesn't chain drops it
+        cell.commit(200, 201, Vec::new());
+        assert!(cell.index.is_none());
     }
 
     #[test]

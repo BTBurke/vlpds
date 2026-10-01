@@ -18,6 +18,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/internal/v1/account", get(get_account))
         .route("/internal/v1/oauth/replay", post(claim_replay))
         .route("/internal/v1/cluster", get(cluster_status))
+        .route("/internal/v1/cluster/nudge", post(cluster_nudge))
         .route("/internal/v1/admin/searchAccounts", get(admin_search_accounts))
         .route("/internal/v1/admin/inviteCodes", get(admin_invite_codes))
         .route("/internal/v1/sync/listRepos", get(sync_list_repos))
@@ -49,6 +50,43 @@ async fn cluster_status(State(app): AppState, headers: HeaderMap) -> XResult<Jso
         "firehose_last_emitted": app.firehose.last_emitted.load(std::sync::atomic::Ordering::Acquire),
         "firehose_min_watermark": app.firehose.min_watermark(),
     })))
+}
+
+#[derive(serde::Serialize, Deserialize, Default)]
+struct NudgeIn {
+    /// Shards the sender handed us (`cluster::Handoff`).
+    #[serde(default)]
+    handoffs: Vec<crate::cluster::Handoff>,
+}
+
+/// A peer handed us shards (adopt them now, no control-plane read) or
+/// released some / left the cluster (step now instead of on the next tick).
+async fn cluster_nudge(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<NudgeIn>) -> XResult<Json<J>> {
+    check(&app, &headers)?;
+    if let Some(c) = &app.cluster {
+        c.nudge(inp.handoffs);
+    }
+    Ok(Json(json!({})))
+}
+
+/// Sends each `(addr, handoffs)` nudge (see [`cluster_nudge`]). Best effort
+/// and bounded: a peer that misses one finds its handoffs on its next step.
+pub async fn nudge_peers(http: &reqwest::Client, token: &str, nudges: Vec<(String, Vec<crate::cluster::Handoff>)>) {
+    let sends = nudges.into_iter().map(|(addr, handoffs)| async move {
+        let r = http
+            .post(format!("{}/internal/v1/cluster/nudge", addr.trim_end_matches('/')))
+            .header(HDR, token)
+            .json(&NudgeIn { handoffs })
+            .timeout(std::time::Duration::from_secs(1))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status());
+        if let Err(e) = r {
+            crate::metrics::CLUSTER_NUDGES.with_label_values(&["failed"]).inc();
+            tracing::warn!(%addr, "nudge failed: {e}");
+        }
+    });
+    futures::future::join_all(sends).await;
 }
 
 fn check(app: &App, headers: &HeaderMap) -> XResult<()> {

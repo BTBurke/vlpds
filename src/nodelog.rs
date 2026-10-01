@@ -2,15 +2,22 @@
 //! node owns. Group commit across shards means segment size and PUT rate
 //! scale with node throughput, not with shard count.
 //!
-//! workers ──LogEntry{shard}──► sequencer ──(one PUT in flight)──► finalizer
-//!                               assign seq, append            per touched shard:
-//!                               (shard, epoch)-tagged         SlateDB batch + applied
-//!                               entries                       marker, then acks,
-//!                                                             firehose, watermark
+//! workers ──LogEntry{shard}──► sequencer ──(K PUTs in flight)──► finalizer
+//!                               assign seq, append  completions    per touched shard:
+//!                               (shard, epoch)-     taken in       SlateDB batch + applied
+//!                               tagged entries      ordinal order  marker, then acks,
+//!                                                                  firehose, watermark
 //!
 //! Segments go to `log/{log_id}/{ordinal:012}.seg` with If-None-Match on dense
-//! ordinals. A dead node's log is closed by a fence object at its next ordinal
-//! (see cluster.rs), so a zombie's next PUT collides and it fail-stops.
+//! ordinals, up to `inflight` (K) PUTs at once. Ordinals are assigned at seal
+//! time; the finalizer takes completed PUTs strictly in ordinal order, so acks,
+//! apply, the live ring and the watermark only ever cover a gap-free prefix.
+//! A crash can leave holes (n missing, n+1 present): the log's *durable
+//! prefix* ends at its first missing ordinal, nothing past it was acked, and a
+//! dead node's log is closed by a fence object at that first hole (see
+//! `first_free` and cluster.rs), so a zombie's PUT there collides and it
+//! fail-stops. Objects past the fence are garbage no reader ever reaches.
+//! DESIGN.md "Pipelined segment PUTs" has the argument.
 
 use crate::events::Frame;
 use crate::metrics;
@@ -168,6 +175,15 @@ impl Drop for LiveSub {
     }
 }
 
+/// Default segment PUTs in flight per log (`--log-inflight`).
+pub const DEFAULT_LOG_INFLIGHT: usize = 4;
+static LOG_INFLIGHT: AtomicUsize = AtomicUsize::new(DEFAULT_LOG_INFLIGHT);
+
+/// Sets K, the segment PUTs in flight for logs started from now on.
+pub fn set_log_inflight(k: usize) {
+    LOG_INFLIGHT.store(k.max(1), Ordering::Relaxed);
+}
+
 pub fn seq_floor(now_us: u64) -> i64 {
     (now_us as i64) << 8
 }
@@ -288,6 +304,84 @@ pub fn segment_path(store: &Store, log_id: &str, ordinal: u64) -> Path {
     Path::from(format!("{}/log/{}/{:012}.seg", store.prefix, log_id, ordinal))
 }
 
+/// What occupies one ordinal of a log.
+#[derive(Debug)]
+pub enum Head {
+    Missing,
+    Fence,
+    Segment(segment::SegHeader),
+}
+
+impl Head {
+    pub fn is_segment(&self) -> bool {
+        matches!(self, Head::Segment(_))
+    }
+}
+
+/// The header of the object at `log_id/ordinal`, via one small range GET. A
+/// segment's header must name the log and ordinal it was read from.
+pub async fn read_head(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result<Head> {
+    use object_store::{GetOptions, GetRange};
+    let opts = GetOptions { range: Some(GetRange::Bounded(0..4096)), ..Default::default() };
+    let data = match store.raw.get_opts(&segment_path(store, log_id, ordinal), opts).await {
+        Ok(r) => r.bytes().await?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(Head::Missing),
+        Err(e) => return Err(e.into()),
+    };
+    let Some((h, _)) = segment::parse_header(&data)? else { return Ok(Head::Fence) };
+    anyhow::ensure!(
+        h.log_id == log_id && h.ordinal == ordinal,
+        "log object {log_id}/{ordinal} has header {}/{}",
+        h.log_id,
+        h.ordinal
+    );
+    Ok(Head::Segment(h))
+}
+
+/// The first ordinal below segment `h` that isn't a segment (missing, or a
+/// fence), or None if `h` is inside its log's gap-free prefix. Only
+/// [h.prefix_end, h.ordinal) needs probing (at most K - 1 small GETs): the
+/// writer had every ordinal below prefix_end durable when it sealed `h`.
+/// A segment past a hole is garbage (never acked: acks are in order), and
+/// past a fence it can only be a zombie's. Ordinals below `floor` (the
+/// lowest still stored: retention prunes a log's head) aren't probed.
+pub async fn prefix_hole(store: &Store, h: &segment::SegHeader, floor: u64) -> anyhow::Result<Option<u64>> {
+    for ord in h.prefix_end.max(floor)..h.ordinal {
+        if !read_head(store, &h.log_id, ord).await?.is_segment() {
+            return Ok(Some(ord));
+        }
+    }
+    Ok(None)
+}
+
+/// The end of `log_id`'s durable prefix: its first ordinal that isn't a
+/// segment, and whether a fence is there already. Every segment below it
+/// exists; everything above it is garbage (or, on a live log, not acked yet).
+/// Probes the highest segment's header and its prefix_end window, so it
+/// costs one LIST plus a few small GETs however long the log is.
+pub async fn first_free(store: &Store, log_id: &str) -> anyhow::Result<(u64, bool)> {
+    use futures::StreamExt;
+    let prefix = Path::from(format!("{}/log/{}", store.prefix, log_id));
+    let mut listed = Vec::new();
+    let mut list = store.raw.list(Some(&prefix));
+    while let Some(meta) = list.next().await {
+        if let Some(ord) = meta?.location.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse::<u64>().ok()) {
+            listed.push(ord);
+        }
+    }
+    listed.sort_unstable();
+    // the highest segment: everything listed above it is a fence (or gone)
+    let mut free = 0;
+    for &ord in listed.iter().rev() {
+        if let Head::Segment(h) = read_head(store, log_id, ord).await? {
+            free = prefix_hole(store, &h, listed[0]).await?.unwrap_or(ord + 1);
+            break;
+        }
+    }
+    let fenced = matches!(read_head(store, log_id, free).await?, Head::Fence);
+    Ok((free, fenced))
+}
+
 pub fn encode_marker(log_id: &str, ordinal: u64) -> Vec<u8> {
     let mut b = Vec::with_capacity(10 + log_id.len());
     b.extend_from_slice(&(log_id.len() as u16).to_be_bytes());
@@ -307,6 +401,11 @@ impl NodeLog {
     /// Starts a fresh log (a node never reopens an old log: a restarted node
     /// gets a new log id; its previous log is fenced and replayed by owners).
     pub fn start(store: Store, cfg: NodeLogConfig, merger_tx: mpsc::UnboundedSender<LogBatch>) -> Arc<NodeLog> {
+        Self::start_with_inflight(store, cfg, LOG_INFLIGHT.load(Ordering::Relaxed), merger_tx)
+    }
+
+    /// [`NodeLog::start`] with `inflight` segment PUTs at once.
+    pub fn start_with_inflight(store: Store, cfg: NodeLogConfig, inflight: usize, merger_tx: mpsc::UnboundedSender<LogBatch>) -> Arc<NodeLog> {
         let wm = Arc::new(Watermark::new(cfg.writer, seq_floor(crate::tid::now_micros())));
         let (tx, rx) = mpsc::channel(64 * 1024);
         let (fin_tx, fin_rx) = mpsc::channel(4);
@@ -314,7 +413,8 @@ impl NodeLog {
         let sinks: Arc<ShardSinks> = Arc::default();
         let durable_ordinal = Arc::new(AtomicU64::new(u64::MAX));
         let log_id: Arc<str> = cfg.log_id.clone().into();
-        tokio::spawn(run_sequencer(store, cfg.log_id.clone(), cfg.max_segment_bytes, cfg.hedge_after, cfg.lease_ok.clone(), wm.clone(), sinks.clone(), rx, fin_tx));
+        let seq_cfg = SeqConfig { log_id: cfg.log_id.clone(), max_segment_bytes: cfg.max_segment_bytes, inflight: inflight.max(1), hedge_after: cfg.hedge_after };
+        tokio::spawn(run_sequencer(store, seq_cfg, cfg.lease_ok.clone(), wm.clone(), sinks.clone(), rx, fin_tx));
         tokio::spawn(run_finalizer(
             log_id.clone(),
             sinks.clone(),
@@ -411,40 +511,59 @@ impl Open {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_sequencer(
-    store: Store,
+struct SeqConfig {
     log_id: String,
     max_segment_bytes: usize,
+    /// K: segment PUTs in flight at once.
+    inflight: usize,
     hedge_after: Duration,
+}
+
+/// Seals segments and keeps up to K PUTs in flight. Completions are taken in
+/// ordinal order (a later segment that lands first waits for the earlier
+/// ones), so the finalizer sees a gap-free ordinal sequence.
+///
+/// A segment is sealed when a slot is free and either nothing is in flight
+/// (the K = 1 behavior: whatever queued during a PUT is the next segment) or
+/// it holds at least max_segment_bytes / K. Extra concurrent PUTs therefore
+/// only start under load, so the PUT rate at low load stays one per PUT
+/// latency while the ceiling is K full segments per PUT latency.
+async fn run_sequencer(
+    store: Store,
+    cfg: SeqConfig,
     lease_ok: Option<LeaseCheck>,
     wm: Arc<Watermark>,
     sinks: Arc<ShardSinks>,
     mut rx: mpsc::Receiver<LogEntry>,
     fin_tx: mpsc::Sender<Sealed>,
 ) {
+    use futures::stream::{FuturesOrdered, StreamExt};
+    let SeqConfig { log_id, max_segment_bytes, inflight: k, hedge_after } = cfg;
+    let concurrent_fill = (max_segment_bytes / k).max(1);
     let mut ordinal = 0u64;
+    // Every ordinal below this has been PUT (the oldest PUT not yet taken
+    // from `inflight`): the `prefix_end` recorded in each sealed header.
+    let mut prefix_end = 0u64;
     let mut open = Open::new();
-    let mut inflight: Option<tokio::task::JoinHandle<Sealed>> = None;
+    let mut inflight: FuturesOrdered<tokio::task::JoinHandle<Sealed>> = FuturesOrdered::new();
     let mut closed = false;
     loop {
         let can_recv = !closed && open.seg.len() < max_segment_bytes;
         tokio::select! {
             biased;
-            res = async { inflight.as_mut().unwrap().await }, if inflight.is_some() => {
-                inflight = None;
-                match res {
-                    Ok(sealed) => {
-                        if fin_tx.send(sealed).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(%log_id, "segment upload task failed: {e}; exiting");
-                        std::process::exit(2);
+            res = inflight.next(), if !inflight.is_empty() => match res {
+                Some(Ok(sealed)) => {
+                    prefix_end = sealed.ordinal + 1;
+                    if fin_tx.send(sealed).await.is_err() {
+                        return;
                     }
                 }
-            }
+                Some(Err(e)) => {
+                    tracing::error!(%log_id, "segment upload task failed: {e}; exiting");
+                    std::process::exit(2);
+                }
+                None => {}
+            },
             e = rx.recv(), if can_recv => match e {
                 Some(e) => {
                     open.push(&wm, &sinks, e);
@@ -459,7 +578,8 @@ async fn run_sequencer(
             },
         }
         metrics::SEQ_QUEUE.with_label_values(&["node"]).set((rx.max_capacity() - rx.capacity()) as i64);
-        if inflight.is_none() && !open.seg.is_empty() {
+        let want = if inflight.is_empty() { 1 } else { concurrent_fill };
+        if inflight.len() < k && !open.seg.is_empty() && open.seg.len() >= want {
             if let Some(ok) = &lease_ok {
                 if !ok() {
                     tracing::error!(%log_id, "node lease lapsed before segment PUT: fail-stop");
@@ -468,7 +588,11 @@ async fn run_sequencer(
             }
             let o = std::mem::replace(&mut open, Open::new());
             metrics::SEGMENT_EVENTS.observe(o.frames.len() as f64);
-            let header = o.seg.header(&log_id, ordinal);
+            metrics::COMMIT_STAGE.with_label_values(&["seal_wait"]).observe(o.acks.first().map_or(0.0, |a| a.2.elapsed().as_secs_f64()));
+            if inflight.is_empty() {
+                prefix_end = ordinal;
+            }
+            let header = o.seg.sealed_header(&log_id, ordinal, prefix_end);
             let off = header.len();
             let mut data = header;
             data.extend_from_slice(&o.seg.body);
@@ -483,7 +607,7 @@ async fn run_sequencer(
             };
             ordinal += 1;
             let (store, log_id) = (store.clone(), log_id.clone());
-            inflight = Some(tokio::spawn(async move {
+            inflight.push_back(tokio::spawn(async move {
                 let mut sealed = sealed;
                 let t = Instant::now();
                 upload(&store, &log_id, sealed.ordinal, sealed.data.clone(), hedge_after).await;
@@ -491,13 +615,14 @@ async fn run_sequencer(
                 sealed
             }));
         }
-        if closed && inflight.is_none() && open.seg.is_empty() {
+        if closed && inflight.is_empty() && open.seg.is_empty() {
             return;
         }
     }
 }
 
 async fn put_once(store: &Store, path: &Path, data: Bytes) -> object_store::Result<()> {
+    let _inflight = metrics::InflightGuard::new(&metrics::PUTS_INFLIGHT);
     store.inject_latency().await;
     let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
     let r = store.raw.put_opts(path, PutPayload::from_bytes(data), opts).await.map(|_| ());
@@ -519,12 +644,15 @@ async fn upload(store: &Store, log_id: &str, ordinal: u64, data: Bytes, hedge_af
     let path = segment_path(store, log_id, ordinal);
     let t = Instant::now();
     let mut backoff = Duration::from_millis(20);
+    // At most one hedge per ordinal: with K segments in flight, hedging every
+    // retry round of every segment could multiply PUT load K-fold just when
+    // S3 is slow.
+    let mut hedged = false;
     loop {
         let mut attempts = FuturesUnordered::new();
         attempts.push(put_once(store, &path, data.clone()));
         let hedge = tokio::time::sleep(hedge_after);
         tokio::pin!(hedge);
-        let mut hedged = false;
         let result = loop {
             tokio::select! {
                 Some(r) = attempts.next() => match r {
@@ -627,7 +755,14 @@ async fn run_finalizer(
     lease_ok: Option<LeaseCheck>,
     durable_ordinal: Arc<AtomicU64>,
 ) {
+    let mut expect = 0u64;
     while let Some(s) = rx.recv().await {
+        // The sequencer hands segments over in ordinal order: everything this
+        // does (apply, live ring, merger, watermark, acks) covers a gap-free
+        // prefix of the log.
+        assert_eq!(s.ordinal, expect, "log {log_id}: finalizer got ordinal {} out of order", s.ordinal);
+        expect += 1;
+        let t_lock = Instant::now();
         // Take every touched shard's apply lock (id order) and hold it across
         // apply *and* ack, so export readers never see a SlateDB snapshot newer
         // than the repo views published by these acks.
@@ -643,6 +778,7 @@ async fn run_finalizer(
             }
         }
         let t = Instant::now();
+        metrics::COMMIT_STAGE.with_label_values(&["apply_lock"]).observe((t - t_lock).as_secs_f64());
         // Shards are independent DBs: apply them concurrently, so one shard
         // stalled on memtable backpressure doesn't serialize the rest (a
         // segment touches up to every owned shard).
@@ -665,6 +801,8 @@ async fn run_finalizer(
         }
         let _ = STATS.apply_us.lock().record(t.elapsed().as_micros().max(1) as u64);
         metrics::APPLY_DURATION.observe(t.elapsed().as_secs_f64());
+        metrics::COMMIT_STAGE.with_label_values(&["apply"]).observe(t.elapsed().as_secs_f64());
+        let t_ack = Instant::now();
         let events: Vec<(i64, Bytes)> =
             s.frames.iter().filter(|(_, r)| !r.is_empty()).map(|(seq, r)| (*seq, s.data.slice(r.clone()))).collect();
         let batch = LogBatch { log_id: log_id.clone(), ordinal: s.ordinal, events };
@@ -682,6 +820,7 @@ async fn run_finalizer(
         metrics::SEGMENT_BYTES.observe(s.data.len() as f64);
         metrics::SEGMENT_BYTES_TOTAL.inc_by(s.data.len() as u64);
         metrics::PUT_DURATION.with_label_values(&["node"]).observe(s.put_secs);
+        metrics::COMMIT_STAGE.with_label_values(&["put"]).observe(s.put_secs);
         let n = s.acks.len();
         for (ack, pending, enq) in s.acks {
             STATS.record_commit_latency(enq.elapsed());
@@ -694,6 +833,7 @@ async fn run_finalizer(
             }
         }
         drop(guards);
+        metrics::COMMIT_STAGE.with_label_values(&["ack"]).observe(t_ack.elapsed().as_secs_f64());
         STATS.entries_durable.fetch_add(n as u64, Ordering::Relaxed);
     }
 }
@@ -958,6 +1098,224 @@ mod tests {
         assert_eq!(resolve_conflict(&store, &path, &other).await, Conflict::Other);
         store.raw.put(&path, PutPayload::from_bytes(segment::fence_object("B"))).await.unwrap();
         assert_eq!(resolve_conflict(&store, &path, &ours).await, Conflict::Fenced);
+    }
+
+    /// In-memory object store whose segment PUTs can be delayed, or held
+    /// forever (the node crashed before they landed), per ordinal.
+    #[derive(Debug, Default)]
+    struct FaultStore {
+        inner: object_store::memory::InMemory,
+        delays: Mutex<HashMap<u64, Duration>>,
+        holds: Mutex<std::collections::HashSet<u64>>,
+    }
+
+    impl std::fmt::Display for FaultStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FaultStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for FaultStore {
+        async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<object_store::PutResult> {
+            if let Some(ord) = location.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse::<u64>().ok()) {
+                if self.holds.lock().contains(&ord) {
+                    futures::future::pending::<()>().await;
+                }
+                let delay = self.delays.lock().get(&ord).copied();
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(&self, location: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(&self, locations: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(&self, from: &Path, to: &Path, options: object_store::CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn fault_store() -> (Arc<FaultStore>, Store) {
+        let fs = Arc::new(FaultStore::default());
+        (fs.clone(), Store { raw: fs, ..Store::memory(None) })
+    }
+
+    /// A log on `store` with K = `k`, owning `shard` (epoch 1) into a DB
+    /// under its own prefix. Segments hold one entry each (`entry` makes
+    /// entries bigger than max_segment_bytes).
+    async fn test_log(store: &Store, k: usize, shard: u16, max_segment_bytes: usize) -> (Arc<NodeLog>, Arc<Db>, mpsc::UnboundedReceiver<LogBatch>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes, hedge_after: Duration::from_secs(10), lease_ok: None };
+        let log = NodeLog::start_with_inflight(store.clone(), cfg, k, tx);
+        let db = Arc::new(crate::partition::open_db(&Store { prefix: "apply".into(), ..store.clone() }, shard, None).await.unwrap());
+        log.sinks.insert(Arc::new(ShardSink { id: shard, epoch: 1, db: db.clone(), apply_lock: Default::default() }));
+        (log, db, rx)
+    }
+
+    fn entry(shard: u16, key: String, val_len: usize, ack: Option<AckFn>) -> LogEntry {
+        LogEntry {
+            shard,
+            frames: vec![Frame { prefix: key.clone().into_bytes(), suffix: Vec::new() }],
+            muts: vec![Mutation { key: Bytes::from(key), val: Some(Bytes::from(vec![7u8; val_len])) }],
+            ack,
+            pending: None,
+            enqueued: Instant::now(),
+        }
+    }
+
+    /// Sends `n` one-entry segments; returns the order acks arrived in.
+    async fn send_n(log: &NodeLog, shard: u16, n: usize) -> Arc<Mutex<Vec<usize>>> {
+        let acked = Arc::new(Mutex::new(Vec::new()));
+        for i in 0..n {
+            let a = acked.clone();
+            let ack: AckFn = Box::new(move |r| {
+                r.unwrap();
+                a.lock().push(i);
+            });
+            log.tx.send(entry(shard, format!("k{i}"), 2000, Some(ack))).await.ok().unwrap();
+            // let the sequencer seal it alone
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        acked
+    }
+
+    async fn exists(store: &Store, ord: u64) -> bool {
+        read_head(store, "L", ord).await.unwrap().is_segment()
+    }
+
+    /// K = 4 with segment 0 slow: 1..3 land first but are acked, applied,
+    /// pushed to the live ring and the merger only after 0, in order.
+    #[tokio::test]
+    async fn out_of_order_completion_finalizes_in_order() {
+        let (fs, store) = fault_store();
+        fs.delays.lock().insert(0, Duration::from_millis(300));
+        let (log, db, mut merger) = test_log(&store, 4, 3, 1024).await;
+        let mut live = log.live.subscribe();
+        let acked = send_n(&log, 3, 4).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        for o in 1..4 {
+            assert!(exists(&store, o).await, "segment {o} landed");
+        }
+        assert!(!exists(&store, 0).await);
+        assert!(acked.lock().is_empty(), "nothing acked before segment 0");
+        assert_eq!(log.durable_ordinal.load(Ordering::Acquire), u64::MAX);
+        assert!(matches!(live.try_recv(), LiveRecv::Empty));
+        assert!(merger.try_recv().is_err());
+        assert!(db.get(b"k1").await.unwrap().is_none(), "segment 1 not applied before 0");
+        assert!(!log.wm.idle());
+        // segments sealed while 0 was pending record it as the prefix end
+        let Head::Segment(h) = read_head(&store, "L", 3).await.unwrap() else { panic!() };
+        assert_eq!((h.prefix_end, prefix_hole(&store, &h, 0).await.unwrap()), (0, Some(0)));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(*acked.lock(), vec![0, 1, 2, 3]);
+        assert_eq!(log.durable_ordinal.load(Ordering::Acquire), 3);
+        assert!(log.wm.idle());
+        for o in 0..4 {
+            assert!(matches!(live.try_recv(), LiveRecv::Batch(b) if b.ordinal == o));
+            assert_eq!(merger.try_recv().unwrap().ordinal, o);
+        }
+        assert_eq!(prefix_hole(&store, &h, 0).await.unwrap(), None, "segment 3 is in the gap-free prefix now");
+        assert!(db.get(b"k3").await.unwrap().is_some());
+        assert_eq!(first_free(&store, "L").await.unwrap(), (4, false));
+    }
+
+    /// A crash with K = 4 in flight leaves ordinal 1 missing and 2, 3
+    /// present. Only 0 was acked; the fence goes at the hole, a zombie can't
+    /// write it, and no reader gets past it.
+    #[tokio::test]
+    async fn crash_hole_is_fenced_and_never_read_past() {
+        let (fs, store) = fault_store();
+        fs.holds.lock().insert(1); // its PUT never lands: the node "crashed"
+        let (log, _db, mut merger) = test_log(&store, 4, 3, 1024).await;
+        let acked = send_n(&log, 3, 4).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(*acked.lock(), vec![0], "acks stop at the hole");
+        assert_eq!(merger.try_recv().unwrap().ordinal, 0);
+        assert!(merger.try_recv().is_err());
+        assert!(exists(&store, 2).await && exists(&store, 3).await, "garbage past the hole");
+        assert_eq!(log.durable_ordinal.load(Ordering::Acquire), 0);
+
+        // the fencer's rule: the first non-segment ordinal
+        assert_eq!(first_free(&store, "L").await.unwrap(), (1, false));
+        let p = segment_path(&store, "L", 1);
+        let create = PutOptions { mode: PutMode::Create, ..Default::default() };
+        // (straight to the inner store: the faulty one holds every PUT at 1)
+        use object_store::ObjectStore as _;
+        fs.inner.put_opts(&p, PutPayload::from_bytes(segment::fence_object("B")), create.clone()).await.unwrap();
+        // a zombie's PUT at the fence collides; a second fencer finds the same end
+        let zombie = fs.inner.put_opts(&p, PutPayload::from_static(b"zombie"), create).await;
+        assert!(matches!(zombie, Err(object_store::Error::AlreadyExists { .. })));
+        assert_eq!(first_free(&store, "L").await.unwrap(), (1, true));
+
+        // replay: the dead span ends at the fence; an open span stops at the hole
+        let fresh = |name: &'static str| {
+            let s = Store { prefix: name.into(), ..store.clone() };
+            async move { crate::partition::open_db(&s, 3, None).await.unwrap() }
+        };
+        for (name, end) in [("r1", Some(1)), ("r2", None)] {
+            let db = fresh(name).await;
+            let history = vec![span("L", 1, 0, end)];
+            assert_eq!(replay_many(&store, &[(3, &db, &history)]).await.unwrap(), 1, "{name}");
+            assert!(db.get(b"k0").await.unwrap().is_some());
+            for k in ["k1", "k2", "k3"] {
+                assert!(db.get(k.as_bytes()).await.unwrap().is_none(), "{name}: {k} replayed past the hole");
+            }
+        }
+        // backfill and seek stop at the fence
+        let (tx, mut rx) = mpsc::channel(64);
+        crate::backfill::backfill(&store, 0, i64::MAX, &tx).await.unwrap();
+        drop(tx);
+        let mut n = 0;
+        while rx.recv().await.is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 1, "only segment 0's event is served");
+        assert_eq!(crate::backfill::seek(&store, "L", i64::MAX - 1).await.unwrap(), 1);
+    }
+
+    /// Single-log throughput, K = 1 vs K = 4, 25 ms (sigma 0.5) injected PUT
+    /// latency, 256 KB segments of 1 KB entries.
+    /// `cargo test --lib nodelog::tests::bench_inflight -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn bench_inflight() {
+        const N: usize = 30_000;
+        for k in [1, 2, 4] {
+            let store = Store::memory(Some((25.0, 0.5)));
+            let (log, _db, mut merger) = test_log(&store, k, 0, 256 << 10).await;
+            tokio::spawn(async move { while merger.recv().await.is_some() {} });
+            let done = Arc::new(AtomicUsize::new(0));
+            let all = Arc::new(tokio::sync::Notify::new());
+            let t = Instant::now();
+            for i in 0..N {
+                let (d, all) = (done.clone(), all.clone());
+                let ack: AckFn = Box::new(move |r| {
+                    r.unwrap();
+                    if d.fetch_add(1, Ordering::AcqRel) + 1 == N {
+                        all.notify_one();
+                    }
+                });
+                log.tx.send(entry(0, format!("k{i:08}"), 1000, Some(ack))).await.ok().unwrap();
+            }
+            all.notified().await;
+            let secs = t.elapsed().as_secs_f64();
+            let segs = log.durable_ordinal.load(Ordering::Acquire) + 1;
+            println!("K={k}: {N} entries in {secs:.2} s = {:.0}/s, {segs} segments ({:.1} segs/s)", N as f64 / secs, segs as f64 / secs);
+        }
     }
 
     fn batch(ordinal: u64, n: usize) -> Arc<LogBatch> {

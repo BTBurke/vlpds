@@ -429,7 +429,7 @@ async fn oauth_target(
 
 pub async fn route(
     router: Arc<dyn Router>,
-    client: reqwest::Client,
+    client: crate::http::PeerClient,
     mut req: Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -457,7 +457,10 @@ pub async fn route(
     crate::metrics::FORWARDED.inc();
     let token = app.as_ref().map(|a| a.config.internal_token.clone());
     let ttfb = ttfb_for(&req);
-    forward(&client, &owner, req, token.as_deref(), ttfb).await
+    let t = Instant::now();
+    let resp = forward(client.pick(), &owner, req, token.as_deref(), ttfb).await;
+    crate::metrics::observe_forward(resp.status().as_u16(), t);
+    resp
 }
 
 /// Time-to-first-byte deadline for forwarding `req` (see [`TTFB_FAST`]).
@@ -695,7 +698,7 @@ mod tests {
     /// whatever it keeps; returns its base URL.
     async fn spawn_node(name: &'static str, owner: Option<String>) -> String {
         let r: Arc<dyn Router> = Arc::new(Fixed(owner));
-        let client = reqwest::Client::new();
+        let client = crate::http::PeerClient::single(reqwest::Client::new());
         let app = axum::Router::new()
             .route(
                 "/xrpc/{nsid}",

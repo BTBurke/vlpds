@@ -201,6 +201,8 @@ pub enum WorkerMsg {
 pub struct DurableView {
     pub head: Head,
     pub tree: Tree,
+    /// The repo's MST node index (getBlocks), shared with the worker.
+    pub nodes: crate::mst::SharedNodeIndex,
 }
 
 pub type ViewCell = Arc<parking_lot::RwLock<Arc<DurableView>>>;
@@ -223,10 +225,21 @@ pub struct RepoState {
     /// Blob refs per record path (drives the b/{did}\0{blob}\0{path} index).
     pub blob_refs: HashMap<String, Vec<Cid>>,
     pub view: ViewCell,
+    pub nodes: crate::mst::SharedNodeIndex,
 }
 
-fn new_view(head: &Head, tree: &Tree) -> ViewCell {
-    Arc::new(parking_lot::RwLock::new(Arc::new(DurableView { head: head.clone(), tree: tree.clone() })))
+impl RepoState {
+    fn durable_view(&self) -> Arc<DurableView> {
+        Arc::new(DurableView { head: self.head.clone(), tree: self.tree.clone(), nodes: self.nodes.clone() })
+    }
+}
+
+fn new_view(head: &Head, tree: &Tree, nodes: &crate::mst::SharedNodeIndex) -> ViewCell {
+    Arc::new(parking_lot::RwLock::new(Arc::new(DurableView {
+        head: head.clone(),
+        tree: tree.clone(),
+        nodes: nodes.clone(),
+    })))
 }
 
 #[derive(Clone)]
@@ -353,14 +366,17 @@ impl Worker {
                 if let Some(q) = queued {
                     let did = q.did().clone();
                     if let Some(buf) = self.loading.get_mut(&did) {
+                        metrics::REPO_CACHE.with_label_values(&["loading"]).inc();
                         buf.push(q);
                     } else if self.cache.contains(&did) {
+                        metrics::REPO_CACHE.with_label_values(&["hit"]).inc();
                         let g = groups.entry(did.clone()).or_insert_with(|| {
                             order.push(did.clone());
                             Vec::new()
                         });
                         g.push(q);
                     } else {
+                        metrics::REPO_CACHE.with_label_values(&["miss"]).inc();
                         self.start_load(q);
                     }
                 }
@@ -591,6 +607,10 @@ impl Worker {
                 key: state::record_key(&req.did, path).into(),
                 val: Some(state::record_value(cid, rev.0, bytes)),
             });
+            muts.push(Mutation {
+                key: state::record_cid_key(&req.did, cid, path).into(),
+                val: Some(Bytes::new()),
+            });
             if colls.insert(collection_of(path)) {
                 muts.push(Mutation {
                     key: state::collection_key(collection_of(path), &req.did).into(),
@@ -641,7 +661,8 @@ impl Worker {
                 .entry(collection_of(path).to_string())
                 .or_insert(0) += 1;
         }
-        let view = new_view(&head, &tree);
+        let nodes = crate::mst::SharedNodeIndex::default();
+        let view = new_view(&head, &tree, &nodes);
         let st = RepoState {
             did: req.did.clone(),
             partition: partition.clone(),
@@ -653,6 +674,7 @@ impl Worker {
             collections,
             blob_refs: HashMap::new(),
             view,
+            nodes,
         };
         self.cache.put(req.did, st);
         if partition.tx.blocking_send(entry).is_err() {
@@ -761,7 +783,8 @@ fn finish_load(
         "rebuilt MST root {root} != head data {}",
         head.data
     );
-    let view = new_view(&head, &tree);
+    let nodes = crate::mst::SharedNodeIndex::default();
+    let view = new_view(&head, &tree, &nodes);
     Ok(RepoState {
         did,
         partition,
@@ -773,6 +796,7 @@ fn finish_load(
         collections: HashMap::new(),
         blob_refs: HashMap::new(),
         view,
+        nodes,
     })
 }
 
@@ -995,7 +1019,12 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
     let build_start = Instant::now();
     let mut mst_blocks = Vec::with_capacity(16);
     let prev_data = st.head.data;
-    let data = st.tree.write_diff_blocks(&mut mst_blocks)?;
+    // once getBlocks has asked for node blocks, report where written nodes sit
+    let mut node_refs = st.nodes.lock().wanted.then(Vec::new);
+    let data = match &mut node_refs {
+        Some(refs) => st.tree.write_diff_blocks_with_refs(&mut mst_blocks, refs)?,
+        None => st.tree.write_diff_blocks(&mut mst_blocks)?,
+    };
     // A batch that nets to no change (e.g. deleting a missing record) leaves no
     // dirty nodes; the commit's CAR must still carry the root node so it can be
     // loaded and verified.
@@ -1041,6 +1070,12 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
             &mut muts,
         );
         let key = Bytes::from(state::record_key(&st.did, path));
+        if let Some(p) = prev {
+            muts.push(Mutation { key: state::record_cid_key(&st.did, p, path).into(), val: None });
+        }
+        if let Some(c) = new {
+            muts.push(Mutation { key: state::record_cid_key(&st.did, c, path).into(), val: Some(Bytes::new()) });
+        }
         match new {
             Some(c) => {
                 let bytes = &batch.records[c];
@@ -1087,11 +1122,14 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
     metrics::COMMIT_REQUESTS.observe(batch.waiters.len() as f64);
     metrics::COMMIT_BLOCKS_BYTES.observe(car_bytes.len() as f64);
     metrics::COMMIT_BUILD.observe(build_start.elapsed().as_secs_f64());
+    if let Some(refs) = node_refs {
+        st.nodes.lock().commit(st.head.rev.0, head.rev.0, refs);
+    }
     st.head = head;
     st.pending.fetch_add(1, Ordering::AcqRel);
 
     let waiters = batch.waiters;
-    let (view, snap) = (st.view.clone(), Arc::new(DurableView { head: st.head.clone(), tree: st.tree.clone() }));
+    let (view, snap) = (st.view.clone(), st.durable_view());
     let entry = LogEntry {
         shard: st.partition.id,
         frames: vec![frame],
@@ -1205,10 +1243,14 @@ fn head_ack(
 /// Mutations deleting every record (and its index entries) currently in the repo.
 fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>) {
     let did = st.did.clone();
-    st.tree.walk(&mut |k, _| {
+    st.tree.walk(&mut |k, cid| {
         if let Ok(path) = std::str::from_utf8(k) {
             muts.push(Mutation {
                 key: state::record_key(&did, path).into(),
+                val: None,
+            });
+            muts.push(Mutation {
+                key: state::record_cid_key(&did, &cid, path).into(),
                 val: None,
             });
         }
@@ -1338,6 +1380,10 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
                     key: state::record_key(&st.did, path).into(),
                     val: Some(state::record_value(cid, rev.0, bytes)),
                 });
+                muts.push(Mutation {
+                    key: state::record_cid_key(&st.did, cid, path).into(),
+                    val: Some(Bytes::new()),
+                });
                 index_mutations(st, rev.0, path, false, true, Some(blobs), &mut muts);
             }
             let data = tree.root_cid()?;
@@ -1393,7 +1439,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
         muts,
         ack: Some({
             let inner = head_ack(req.reply, st.head.clone());
-            let (view, snap) = (st.view.clone(), Arc::new(DurableView { head: st.head.clone(), tree: st.tree.clone() }));
+            let (view, snap) = (st.view.clone(), st.durable_view());
             Box::new(move |r| {
                 if r.is_ok() {
                     *view.write() = snap;

@@ -8,7 +8,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def rows(name):
-    p = os.path.join(HERE, name)
+    p = name if os.path.exists(name) else os.path.join(HERE, name)
     return [json.loads(l) for l in open(p)] if os.path.exists(p) else []
 
 

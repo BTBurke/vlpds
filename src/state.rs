@@ -3,7 +3,8 @@
 //! h/{did}                 -> head: commit cid | data cid | rev u64 | signed commit block
 //! a/{did}                 -> account JSON
 //! n/{handle}              -> did
-//! R/{did}\0{coll}/{rkey}  -> record cid | record bytes
+//! R/{did}\0{coll}/{rkey}  -> record cid | rev | record bytes
+//! c/{did}\0{cid8}{path}   -> empty (record CID index for getBlocks)
 
 use crate::cid::{Cid, CID_BYTES_LEN};
 use crate::tid::Tid;
@@ -63,6 +64,22 @@ pub fn record_prefix(did: &str) -> Vec<u8> {
 
 pub fn record_key(did: &str, path: &str) -> Vec<u8> {
     [b"R/", did.as_bytes(), b"\0", path.as_bytes()].concat()
+}
+
+/// Bytes of a record CID's digest in its index key: enough to make
+/// collisions rare (a lookup checks the record's CID anyway), short enough
+/// to keep the extra key per record small.
+const RECORD_CID_KEY_BYTES: usize = 8;
+
+/// Record CID index: c/{did}\0{first digest bytes of the cid}{path}. Kept
+/// next to the R/ key in the same batch; the same CID can sit at several
+/// paths (one key each), so lookups scan [`record_cid_prefix`].
+pub fn record_cid_key(did: &str, cid: &Cid, path: &str) -> Vec<u8> {
+    [&record_cid_prefix(did, cid)[..], path.as_bytes()].concat()
+}
+
+pub fn record_cid_prefix(did: &str, cid: &Cid) -> Vec<u8> {
+    [b"c/", did.as_bytes(), b"\0", &cid.digest[..RECORD_CID_KEY_BYTES]].concat()
 }
 
 /// Smallest key greater than every key with this prefix.

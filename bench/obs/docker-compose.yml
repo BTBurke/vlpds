@@ -1,0 +1,73 @@
+# Local observability for vlpds load tests (bench/obs/README.md):
+# Prometheus scraping every second, Grafana with the vlpds dashboard,
+# Pyroscope for continuous CPU profiles. Everything binds to 127.0.0.1.
+#   just obs-up / just obs-down
+name: vlpds-obs
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # bench data: short-lived and capped (the TSDB deletes oldest blocks first)
+      - --storage.tsdb.retention.time=2d
+      - --storage.tsdb.retention.size=2GB
+      # 1 s scrapes: a stopped node's gauges vanish from graphs after 10 s,
+      # not the default 5 min
+      - --query.lookback-delta=10s
+      - --web.enable-lifecycle
+      - --web.enable-admin-api
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    mem_limit: 2g
+    cpus: 1.0
+    restart: unless-stopped
+
+  pyroscope:
+    image: grafana/pyroscope:1.14.0
+    command:
+      - -compactor.blocks-retention-period=48h
+      - -self-profiling.disable-push=true
+    ports:
+      - "127.0.0.1:4040:4040"
+    volumes:
+      - pyroscope-data:/data
+    mem_limit: 1g
+    cpus: 1.0
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 1s
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/vlpds.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_LOG_LEVEL: warn
+    ports:
+      - "127.0.0.1:3300:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on: [prometheus, pyroscope]
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  pyroscope-data:
+  grafana-data:

@@ -1,0 +1,4957 @@
+{
+ "uid": "vlpds",
+ "title": "vlpds",
+ "tags": [
+  "vlpds"
+ ],
+ "timezone": "browser",
+ "editable": true,
+ "graphTooltip": 1,
+ "refresh": "5s",
+ "time": {
+  "from": "now-15m",
+  "to": "now"
+ },
+ "timepicker": {
+  "refresh_intervals": [
+   "1s",
+   "2s",
+   "5s",
+   "10s",
+   "30s",
+   "1m"
+  ]
+ },
+ "schemaVersion": 39,
+ "version": 1,
+ "annotations": {
+  "list": [
+   {
+    "builtIn": 1,
+    "datasource": {
+     "type": "grafana",
+     "uid": "-- Grafana --"
+    },
+    "enable": true,
+    "hide": true,
+    "iconColor": "rgba(0, 211, 255, 1)",
+    "name": "Annotations & Alerts",
+    "type": "dashboard"
+   },
+   {
+    "datasource": {
+     "type": "grafana",
+     "uid": "-- Grafana --"
+    },
+    "enable": true,
+    "iconColor": "#FF9830",
+    "name": "bench steps",
+    "target": {
+     "type": "tags",
+     "tags": [
+      "vlpds-bench"
+     ],
+     "matchAny": true,
+     "limit": 500
+    }
+   }
+  ]
+ },
+ "templating": {
+  "list": [
+   {
+    "name": "instance",
+    "label": "instance",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "prom"
+    },
+    "query": {
+     "query": "label_values(vlpds_build_info, instance)",
+     "refId": "instance"
+    },
+    "definition": "label_values(vlpds_build_info, instance)",
+    "refresh": 2,
+    "multi": true,
+    "includeAll": true,
+    "allValue": ".*",
+    "current": {
+     "selected": true,
+     "text": [
+      "All"
+     ],
+     "value": [
+      "$__all"
+     ]
+    },
+    "sort": 1
+   },
+   {
+    "name": "node",
+    "label": "node (profiles)",
+    "type": "query",
+    "datasource": {
+     "type": "prometheus",
+     "uid": "prom"
+    },
+    "query": {
+     "query": "label_values(vlpds_build_info{instance=~\"$instance\"}, node_id)",
+     "refId": "node"
+    },
+    "definition": "label_values(vlpds_build_info{instance=~\"$instance\"}, node_id)",
+    "refresh": 2,
+    "multi": true,
+    "includeAll": true,
+    "allValue": ".*",
+    "current": {
+     "selected": true,
+     "text": [
+      "All"
+     ],
+     "value": [
+      "$__all"
+     ]
+    },
+    "sort": 1
+   }
+  ]
+ },
+ "panels": [
+  {
+   "type": "row",
+   "id": 1,
+   "title": "Overview",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 0,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "stat",
+   "id": 2,
+   "title": "XRPC req/s",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_http_requests_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "",
+     "range": true,
+     "refId": "A",
+     "instant": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "blue",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "value",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "type": "stat",
+   "id": 3,
+   "title": "Write req/s",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 4,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_http_requests_total{instance=~\"$instance\", method=~\"com\\\\.atproto\\\\.repo\\\\.(createRecord|putRecord|deleteRecord|applyWrites)\"}[$__rate_interval]))",
+     "legendFormat": "",
+     "range": true,
+     "refId": "A",
+     "instant": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "blue",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "value",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "type": "stat",
+   "id": 4,
+   "title": "Commits/s",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_commits_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "",
+     "range": true,
+     "refId": "A",
+     "instant": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "blue",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "value",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "type": "stat",
+   "id": 5,
+   "title": "Commit p99 (durable)",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_commit_durable_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "",
+     "range": true,
+     "refId": "A",
+     "instant": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "blue",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "value",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "type": "stat",
+   "id": 6,
+   "title": "CPU (cores)",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_process_cpu_seconds_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "",
+     "range": true,
+     "refId": "A",
+     "instant": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "blue",
+        "value": null
+       }
+      ]
+     },
+     "decimals": 2
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "value",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "type": "stat",
+   "id": 7,
+   "title": "RSS",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 20,
+    "y": 1,
+    "w": 4,
+    "h": 4
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_process_resident_bytes{instance=~\"$instance\"})",
+     "legendFormat": "",
+     "range": true,
+     "refId": "A",
+     "instant": false
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "color": {
+      "mode": "thresholds"
+     },
+     "thresholds": {
+      "mode": "absolute",
+      "steps": [
+       {
+        "color": "blue",
+        "value": null
+       }
+      ]
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "reduceOptions": {
+     "calcs": [
+      "lastNotNull"
+     ],
+     "fields": "",
+     "values": false
+    },
+    "graphMode": "area",
+    "colorMode": "value",
+    "textMode": "value",
+    "justifyMode": "auto"
+   }
+  },
+  {
+   "type": "table",
+   "id": 8,
+   "title": "Nodes",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 5,
+    "w": 24,
+    "h": 4
+   },
+   "description": "vlpds_build_info: node id, git revision (`-dirty` = uncommitted changes), profiling feature",
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "vlpds_build_info{instance=~\"$instance\"}",
+     "legendFormat": "",
+     "range": false,
+     "refId": "A",
+     "instant": true,
+     "format": "table"
+    }
+   ],
+   "transformations": [
+    {
+     "id": "organize",
+     "options": {
+      "excludeByName": {
+       "Time": true,
+       "Value": true,
+       "__name__": true,
+       "job": true
+      }
+     }
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {},
+    "overrides": []
+   },
+   "options": {
+    "showHeader": true,
+    "cellHeight": "sm"
+   }
+  },
+  {
+   "type": "row",
+   "id": 9,
+   "title": "Writes",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 9,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "id": 10,
+   "title": "Write requests/s by method",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 10,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (method) (rate(vlpds_http_requests_total{instance=~\"$instance\", method=~\"com\\\\.atproto\\\\.repo\\\\..*\"}[$__rate_interval]))",
+     "legendFormat": "{{method}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 11,
+   "title": "Write request latency (createRecord/putRecord/deleteRecord/applyWrites)",
+   "description": "Server-side XRPC latency, from the vlpds_http_request_duration_seconds histogram (0.1 ms .. 52 s, x2 buckets)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 10,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_http_request_duration_seconds_bucket{instance=~\"$instance\", method=~\"com\\\\.atproto\\\\.repo\\\\.(createRecord|putRecord|deleteRecord|applyWrites)\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.9, sum by (le) (rate(vlpds_http_request_duration_seconds_bucket{instance=~\"$instance\", method=~\"com\\\\.atproto\\\\.repo\\\\.(createRecord|putRecord|deleteRecord|applyWrites)\"}[$__rate_interval])))",
+     "legendFormat": "p90",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_http_request_duration_seconds_bucket{instance=~\"$instance\", method=~\"com\\\\.atproto\\\\.repo\\\\.(createRecord|putRecord|deleteRecord|applyWrites)\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.999, sum by (le) (rate(vlpds_http_request_duration_seconds_bucket{instance=~\"$instance\", method=~\"com\\\\.atproto\\\\.repo\\\\.(createRecord|putRecord|deleteRecord|applyWrites)\"}[$__rate_interval])))",
+     "legendFormat": "p99.9",
+     "range": true,
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 12,
+   "title": "Commit latency: enqueue -> durable + applied + acked",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 10,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_commit_durable_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.9, sum by (le) (rate(vlpds_commit_durable_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p90",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_commit_durable_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.999, sum by (le) (rate(vlpds_commit_durable_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99.9",
+     "range": true,
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 13,
+   "title": "Commits/s and record ops/s",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 17,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_commits_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "commits",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (action) (rate(vlpds_ops_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "ops {{action}}",
+     "range": true,
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 14,
+   "title": "Coalescing",
+   "description": "Means over the rate window: write requests per commit, ops per commit, firehose events per segment, worker messages per loop",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 17,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum (rate(vlpds_commit_requests_sum{instance=~\"$instance\"}[$__rate_interval])) / sum (rate(vlpds_commit_requests_count{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "requests / commit",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum (rate(vlpds_commit_ops_sum{instance=~\"$instance\"}[$__rate_interval])) / sum (rate(vlpds_commit_ops_count{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "ops / commit",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum (rate(vlpds_segment_events_sum{instance=~\"$instance\"}[$__rate_interval])) / sum (rate(vlpds_segment_events_count{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "events / segment",
+     "range": true,
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum (rate(vlpds_worker_batch_messages_sum{instance=~\"$instance\"}[$__rate_interval])) / sum (rate(vlpds_worker_batch_messages_count{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "msgs / worker batch",
+     "range": true,
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 15,
+   "title": "Commit build (MST + sign) CPU time",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 17,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_commit_build_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_commit_build_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.999, sum by (le) (rate(vlpds_commit_build_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99.9",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 16,
+   "title": "Rejected writes",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 24,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (kind) (rate(vlpds_write_errors_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "error {{kind}}",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_writes_shed_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "shed (503)",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_rate_limited_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "rate limited (429)",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 17,
+   "title": "Commit size (block CAR bytes)",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 24,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_commit_car_bytes_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_commit_car_bytes_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "id": 18,
+   "title": "Commit pipeline breakdown",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 31,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "id": 19,
+   "title": "Mean time per stage (per segment)",
+   "description": "seal_wait: oldest entry's enqueue -> PUT start; put: PUT until durable (hedges/retries incl.); apply_lock: finalizer waiting for the shards' apply locks; apply: SlateDB batches; ack: acks + repo views. Stacked means approximate the commit latency of a segment's oldest entry.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 32,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (stage) (rate(vlpds_commit_stage_seconds_sum{instance=~\"$instance\"}[$__rate_interval])) / sum by (stage) (rate(vlpds_commit_stage_seconds_count{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "{{stage}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 60,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 20,
+   "title": "Stage p50",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 32,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le, stage) (rate(vlpds_commit_stage_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50 {{stage}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 21,
+   "title": "Stage p99",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 32,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(vlpds_commit_stage_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99 {{stage}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 22,
+   "title": "Sequencer queue / PUTs in flight",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 39,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_sequencer_queue_depth{instance=~\"$instance\"})",
+     "legendFormat": "sequencer queue",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_segment_puts_inflight{instance=~\"$instance\"})",
+     "legendFormat": "PUTs in flight",
+     "range": true,
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 23,
+   "title": "Worker queue depth",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 39,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_worker_queue_depth{instance=~\"$instance\"})",
+     "legendFormat": "sum",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "max(vlpds_worker_queue_depth{instance=~\"$instance\"})",
+     "legendFormat": "max worker",
+     "range": true,
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 24,
+   "title": "Watermark lag",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 39,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "max(vlpds_watermark_lag_microseconds{instance=~\"$instance\"}) / 1e6",
+     "legendFormat": "{{instance}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "id": 25,
+   "title": "Log / segments",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 46,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "id": 26,
+   "title": "Segments/s",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 47,
+    "w": 6,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_segments_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "segments/s",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 27,
+   "title": "Log bytes/s",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 6,
+    "y": 47,
+    "w": 6,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_segment_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "bytes/s",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "Bps",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 28,
+   "title": "Segment size",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 47,
+    "w": 6,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_segment_bytes_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_segment_bytes_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum (rate(vlpds_segment_bytes_sum{instance=~\"$instance\"}[$__rate_interval])) / sum (rate(vlpds_segment_bytes_count{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "mean",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 29,
+   "title": "Events per segment",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 18,
+    "y": 47,
+    "w": 6,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_segment_events_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_segment_events_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 30,
+   "title": "Segment PUT latency (until durable)",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 54,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_segment_put_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.9, sum by (le) (rate(vlpds_segment_put_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p90",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_segment_put_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.999, sum by (le) (rate(vlpds_segment_put_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99.9",
+     "range": true,
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 31,
+   "title": "PUT attempts by result, hedges",
+   "description": "already_exists = a conditional-PUT conflict (our own hedge winning, or a fence)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 54,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (result) (rate(vlpds_segment_put_attempts_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "attempt {{result}}",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_segment_put_hedges_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "hedges",
+     "range": true,
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 32,
+   "title": "SlateDB apply latency per segment",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 54,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_state_apply_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_state_apply_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.999, sum by (le) (rate(vlpds_state_apply_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99.9",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "id": 33,
+   "title": "Firehose",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 61,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "id": 34,
+   "title": "Events emitted / frames sent per s",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 62,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_firehose_events_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "events emitted",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_firehose_frames_sent_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "frames sent",
+     "range": true,
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 35,
+   "title": "Emit delay (seq assigned -> emitted)",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 62,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_firehose_emit_delay_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_firehose_emit_delay_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.999, sum by (le) (rate(vlpds_firehose_emit_delay_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99.9",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 36,
+   "title": "Subscribers",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 62,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_firehose_subscribers{instance=~\"$instance\"})",
+     "legendFormat": "subscribers",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 37,
+   "title": "Merger queue, rings",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 69,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_firehose_merge_queue_bytes{instance=~\"$instance\"})",
+     "legendFormat": "merger queue",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_firehose_ring_bytes{instance=~\"$instance\"})",
+     "legendFormat": "firehose ring",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_log_live_ring_bytes{instance=~\"$instance\"})",
+     "legendFormat": "log live ring",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 38,
+   "title": "Spills, lagged followers, disconnects",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 69,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_firehose_merge_spills_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "merger spills",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_firehose_merge_spill_segments_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "spill segments read",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_log_stream_lagged_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "lagged peer streams",
+     "range": true,
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (reason) (rate(vlpds_firehose_disconnects_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "disconnect {{reason}}",
+     "range": true,
+     "refId": "D"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 39,
+   "title": "Merged batch size",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 69,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_firehose_merge_batch_events_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_firehose_merge_batch_events_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "id": 40,
+   "title": "Repo workers",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 76,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "id": 41,
+   "title": "Repo lookups by result",
+   "description": "hit: cached; miss: starts a cold load; loading: joins a load in flight",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 77,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (result) (rate(vlpds_repo_cache_lookups_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "{{result}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 60,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 42,
+   "title": "Repo cache hit ratio",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 77,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_repo_cache_lookups_total{instance=~\"$instance\", result=\"hit\"}[$__rate_interval])) / sum(rate(vlpds_repo_cache_lookups_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "hit ratio",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 43,
+   "title": "Cold loads by result, evictions",
+   "description": "stale = a load finished after its shard moved (dropped, reloaded)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 77,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (result) (rate(vlpds_repo_loads_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "load {{result}}",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_repo_evictions_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "evictions",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_repos_loading{instance=~\"$instance\"})",
+     "legendFormat": "loading now",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 44,
+   "title": "Cold load latency",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 84,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_repo_load_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_repo_load_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.999, sum by (le) (rate(vlpds_repo_load_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99.9",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 45,
+   "title": "Cached repos",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 8,
+    "y": 84,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_cached_repos{instance=~\"$instance\"})",
+     "legendFormat": "cached",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 46,
+   "title": "Records per cold-loaded repo",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 16,
+    "y": 84,
+    "w": 8,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_repo_load_records_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_repo_load_records_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "id": 47,
+   "title": "HTTP server",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 91,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "id": 48,
+   "title": "Requests/s by method (top 12)",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 92,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "topk(12, sum by (method) (rate(vlpds_http_requests_total{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "{{method}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 49,
+   "title": "Requests/s by status",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 92,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (status) (rate(vlpds_http_requests_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "{{status}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "reqps",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 50,
+   "title": "p99 latency by method (top 12)",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 100,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "topk(12, histogram_quantile(0.99, sum by (le, method) (rate(vlpds_http_request_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval]))))",
+     "legendFormat": "{{method}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 51,
+   "title": "In flight",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 100,
+    "w": 12,
+    "h": 8
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_http_requests_inflight{instance=~\"$instance\"})",
+     "legendFormat": "XRPC in flight",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (version) (vlpds_http_server_active_requests{instance=~\"$instance\"})",
+     "legendFormat": "awaiting head {{version}}",
+     "range": true,
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 52,
+   "title": "Connections",
+   "description": "Outbound connects should stay flat under steady load (pooled h2c to peers)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 108,
+    "w": 12,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_http_server_connections_open{instance=~\"$instance\"})",
+     "legendFormat": "inbound open",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_http_server_connections_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "inbound accepted/s",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (role) (rate(vlpds_http_client_connects_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "outbound connects/s {{role}}",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 53,
+   "title": "Other vlpds_http_* metrics",
+   "description": "Catch-all for HTTP metrics added later (raw values: counters climb)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 108,
+    "w": 12,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (__name__) ({__name__=~\"vlpds_http_.*\", __name__!~\"vlpds_http_(requests_total|request_duration_seconds_.*|requests_inflight|client_connects_total|server_connections_total|server_connections_open|server_active_requests)\", instance=~\"$instance\"})",
+     "legendFormat": "{{__name__}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "id": 54,
+   "title": "Cluster",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 115,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "id": 55,
+   "title": "Owned shards",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 116,
+    "w": 6,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "vlpds_owned_partitions{instance=~\"$instance\"}",
+     "legendFormat": "{{instance}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 56,
+   "title": "Lease events/s",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 6,
+    "y": 116,
+    "w": 6,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (event) (rate(vlpds_lease_events_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "{{event}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 57,
+   "title": "Forwards/s by owner status",
+   "description": "5xx includes owner unreachable / past its TTFB deadline (503 PartitionUnavailable)",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 116,
+    "w": 6,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (result) (rate(vlpds_forwards_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "forward {{result}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 58,
+   "title": "Forward latency (to owner's response head)",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 18,
+    "y": 116,
+    "w": 6,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_forward_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p50",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_forward_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "histogram_quantile(0.999, sum by (le) (rate(vlpds_forward_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+     "legendFormat": "p99.9",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 59,
+   "title": "Control-plane object-store requests/s",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 123,
+    "w": 12,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (op) (rate(vlpds_cluster_store_requests_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "{{op}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 60,
+   "title": "Forwards/s per node",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 123,
+    "w": 12,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (instance) (rate(vlpds_forwards_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "{{instance}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "id": 61,
+   "title": "AppView proxy",
+   "collapsed": true,
+   "gridPos": {
+    "x": 0,
+    "y": 130,
+    "w": 24,
+    "h": 1
+   },
+   "panels": [
+    {
+     "type": "timeseries",
+     "id": 62,
+     "title": "Proxied requests/s by status",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 0,
+      "y": 131,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum by (status) (rate(vlpds_http_requests_total{instance=~\"$instance\", method=~\"(app\\\\.bsky|chat\\\\.bsky|tools\\\\.ozone)\\\\..*\"}[$__rate_interval]))",
+       "legendFormat": "{{status}}",
+       "range": true,
+       "refId": "A"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "reqps",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 63,
+     "title": "Proxied request latency",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 8,
+      "y": 131,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "histogram_quantile(0.5, sum by (le) (rate(vlpds_http_request_duration_seconds_bucket{instance=~\"$instance\", method=~\"(app\\\\.bsky|chat\\\\.bsky|tools\\\\.ozone)\\\\..*\"}[$__rate_interval])))",
+       "legendFormat": "p50",
+       "range": true,
+       "refId": "A"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "histogram_quantile(0.9, sum by (le) (rate(vlpds_http_request_duration_seconds_bucket{instance=~\"$instance\", method=~\"(app\\\\.bsky|chat\\\\.bsky|tools\\\\.ozone)\\\\..*\"}[$__rate_interval])))",
+       "legendFormat": "p90",
+       "range": true,
+       "refId": "B"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_http_request_duration_seconds_bucket{instance=~\"$instance\", method=~\"(app\\\\.bsky|chat\\\\.bsky|tools\\\\.ozone)\\\\..*\"}[$__rate_interval])))",
+       "legendFormat": "p99",
+       "range": true,
+       "refId": "C"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "histogram_quantile(0.999, sum by (le) (rate(vlpds_http_request_duration_seconds_bucket{instance=~\"$instance\", method=~\"(app\\\\.bsky|chat\\\\.bsky|tools\\\\.ozone)\\\\..*\"}[$__rate_interval])))",
+       "legendFormat": "p99.9",
+       "range": true,
+       "refId": "D"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "s",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 64,
+     "title": "Proxy fast-path cache",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 16,
+      "y": 131,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum by (result) (rate(vlpds_proxy_cache_total{instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "{{result}}",
+       "range": true,
+       "refId": "A"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 60,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "normal",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "type": "row",
+   "id": 65,
+   "title": "SlateDB (sum over this node's shard DBs)",
+   "collapsed": true,
+   "gridPos": {
+    "x": 0,
+    "y": 138,
+    "w": 24,
+    "h": 1
+   },
+   "panels": [
+    {
+     "type": "timeseries",
+     "id": 66,
+     "title": "Block cache hit rate by entry kind",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 0,
+      "y": 139,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum by (entry_kind) (rate(slatedb_db_cache_access_count_total{instance=~\"$instance\", result=\"hit\"}[$__rate_interval])) / sum by (entry_kind) (rate(slatedb_db_cache_access_count_total{instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "{{entry_kind}}",
+       "range": true,
+       "refId": "A"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "percentunit",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 67,
+     "title": "DB requests/s",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 8,
+      "y": 139,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum by (op) (rate(slatedb_db_request_count_total{instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "{{op}}",
+       "range": true,
+       "refId": "A"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(rate(slatedb_db_write_batch_count_total{instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "write batches",
+       "range": true,
+       "refId": "B"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(rate(slatedb_db_write_ops_total{instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "write ops",
+       "range": true,
+       "refId": "C"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 68,
+     "title": "Memtables / L0",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 16,
+      "y": 139,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(slatedb_db_total_mem_size_bytes{instance=~\"$instance\"})",
+       "legendFormat": "memtable bytes",
+       "range": true,
+       "refId": "A"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(slatedb_db_l0_sst_count{instance=~\"$instance\"})",
+       "legendFormat": "L0 SSTs",
+       "range": true,
+       "refId": "B"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "bytes",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": [
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "L0 SSTs"
+        },
+        "properties": [
+         {
+          "id": "unit",
+          "value": "short"
+         },
+         {
+          "id": "custom.axisPlacement",
+          "value": "right"
+         }
+        ]
+       }
+      ]
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 69,
+     "title": "Flushes, backpressure, stalls",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 0,
+      "y": 146,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(rate(slatedb_db_immutable_memtable_flushes_total{instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "memtable flushes",
+       "range": true,
+       "refId": "A"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(rate(slatedb_db_backpressure_count_total{instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "backpressure",
+       "range": true,
+       "refId": "B"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum by (type) (rate(slatedb_db_l0_stall_count_total{instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "L0 stall {{type}}",
+       "range": true,
+       "refId": "C"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 70,
+     "title": "Flush / compaction bytes/s",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 8,
+      "y": 146,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(rate(slatedb_db_l0_flush_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "L0 flush",
+       "range": true,
+       "refId": "A"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(rate(slatedb_db_memtable_write_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "memtable writes",
+       "range": true,
+       "refId": "B"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(rate(slatedb_compactor_bytes_compacted_total{instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "compacted",
+       "range": true,
+       "refId": "C"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "Bps",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 71,
+     "title": "Object store requests/s (SlateDB)",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 16,
+      "y": 146,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum by (component, api) (rate(slatedb_object_store_request_count_total{instance=~\"$instance\"}[$__rate_interval])) > 0",
+       "legendFormat": "{{component}} {{api}}",
+       "range": true,
+       "refId": "A"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 72,
+     "title": "Object store p99 (SlateDB)",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 0,
+      "y": 153,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "histogram_quantile(0.99, sum by (le, api) (rate(slatedb_object_store_request_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+       "legendFormat": "{{api}}",
+       "range": true,
+       "refId": "A"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "s",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "type": "row",
+   "id": 73,
+   "title": "MinIO (5 s scrape)",
+   "collapsed": true,
+   "gridPos": {
+    "x": 0,
+    "y": 160,
+    "w": 24,
+    "h": 1
+   },
+   "panels": [
+    {
+     "type": "timeseries",
+     "id": 74,
+     "title": "S3 requests/s by API",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 0,
+      "y": 161,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum by (api) (rate(minio_s3_requests_total[20s])) > 0",
+       "legendFormat": "{{api}}",
+       "range": true,
+       "refId": "A"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "reqps",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 75,
+     "title": "S3 TTFB p99 by API",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 8,
+      "y": 161,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "histogram_quantile(0.99, sum by (le, api) (rate(minio_s3_requests_ttfb_seconds_distribution[20s])))",
+       "legendFormat": "{{api}}",
+       "range": true,
+       "refId": "A"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "s",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 76,
+     "title": "S3 traffic",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 16,
+      "y": 161,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(rate(minio_s3_traffic_received_bytes[20s]))",
+       "legendFormat": "received",
+       "range": true,
+       "refId": "A"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(rate(minio_s3_traffic_sent_bytes[20s]))",
+       "legendFormat": "sent",
+       "range": true,
+       "refId": "B"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "Bps",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 77,
+     "title": "S3 errors / in flight",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 0,
+      "y": 168,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(rate(minio_s3_requests_errors_total[20s]))",
+       "legendFormat": "errors/s",
+       "range": true,
+       "refId": "A"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(minio_s3_requests_inflight_total)",
+       "legendFormat": "in flight",
+       "range": true,
+       "refId": "B"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum(minio_s3_requests_waiting_total)",
+       "legendFormat": "waiting",
+       "range": true,
+       "refId": "C"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 78,
+     "title": "Bucket usage",
+     "description": "",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "gridPos": {
+      "x": 8,
+      "y": 168,
+      "w": 8,
+      "h": 7
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+       },
+       "expr": "sum by (instance) (minio_cluster_usage_total_bytes)",
+       "legendFormat": "{{instance}}",
+       "range": true,
+       "refId": "A"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "bytes",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 10,
+        "showPoints": "never",
+        "spanNulls": false,
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        }
+       },
+       "min": 0
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "type": "row",
+   "id": 79,
+   "title": "Process / runtime",
+   "collapsed": false,
+   "gridPos": {
+    "x": 0,
+    "y": 175,
+    "w": 24,
+    "h": 1
+   },
+   "panels": []
+  },
+  {
+   "type": "timeseries",
+   "id": 80,
+   "title": "CPU (cores) by mode",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 176,
+    "w": 6,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum by (mode) (rate(vlpds_process_cpu_seconds_total{instance=~\"$instance\"}[$__rate_interval]))",
+     "legendFormat": "{{mode}}",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 60,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "normal",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 81,
+   "title": "Memory",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 6,
+    "y": 176,
+    "w": 6,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_process_resident_bytes{instance=~\"$instance\"})",
+     "legendFormat": "RSS",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_jemalloc_bytes{instance=~\"$instance\", stat=\"allocated\"})",
+     "legendFormat": "jemalloc allocated",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_jemalloc_bytes{instance=~\"$instance\", stat=\"resident\"})",
+     "legendFormat": "jemalloc resident",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "bytes",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 82,
+   "title": "Tokio worker utilization",
+   "description": "Busy time / workers: near 100% = the IO runtime is saturated",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 176,
+    "w": 6,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(rate(vlpds_tokio_busy_seconds_total{instance=~\"$instance\"}[$__rate_interval])) / sum(vlpds_tokio_workers{instance=~\"$instance\"})",
+     "legendFormat": "busy",
+     "range": true,
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "percentunit",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 83,
+   "title": "Tokio tasks / injection queue, threads",
+   "description": "",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "prom"
+   },
+   "gridPos": {
+    "x": 18,
+    "y": 176,
+    "w": 6,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_tokio_alive_tasks{instance=~\"$instance\"})",
+     "legendFormat": "alive tasks",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_tokio_global_queue_depth{instance=~\"$instance\"})",
+     "legendFormat": "injection queue",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "prom"
+     },
+     "expr": "sum(vlpds_process_threads{instance=~\"$instance\"})",
+     "legendFormat": "OS threads",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 10,
+      "showPoints": "never",
+      "spanNulls": false,
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      }
+     },
+     "min": 0
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "id": 84,
+   "title": "CPU profile (Pyroscope; nodes run with --pyroscope-url)",
+   "collapsed": true,
+   "gridPos": {
+    "x": 0,
+    "y": 183,
+    "w": 24,
+    "h": 1
+   },
+   "panels": [
+    {
+     "type": "flamegraph",
+     "id": 85,
+     "title": "CPU flamegraph (dashboard time range)",
+     "datasource": {
+      "type": "grafana-pyroscope-datasource",
+      "uid": "pyroscope"
+     },
+     "gridPos": {
+      "x": 0,
+      "y": 184,
+      "w": 24,
+      "h": 16
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "grafana-pyroscope-datasource",
+        "uid": "pyroscope"
+       },
+       "refId": "A",
+       "queryType": "profile",
+       "groupBy": [],
+       "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
+       "labelSelector": "{service_name=\"vlpds\", node_id=~\"$node\"}"
+      }
+     ],
+     "options": {}
+    }
+   ]
+  }
+ ]
+}

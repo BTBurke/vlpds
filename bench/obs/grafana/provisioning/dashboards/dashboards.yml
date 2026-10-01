@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: vlpds
+    type: file
+    # edits to the JSON (grafana/gen_dashboard.py) show up within 5 s
+    updateIntervalSeconds: 5
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

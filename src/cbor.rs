@@ -4,6 +4,7 @@
 
 use crate::cid::{Cid, CID_BYTES_LEN};
 use base64::Engine;
+use std::borrow::Cow;
 
 // ---------- low-level encoding ----------
 
@@ -274,6 +275,310 @@ impl Value {
         let mut d = Decoder { data, pos: 0 };
         let v = d.value(0)?;
         Ok((v, d.pos))
+    }
+}
+
+// ---------- JSON -> DAG-CBOR without a Value tree ----------
+
+/// A JSON value borrowing its strings from the request body: what record
+/// writes parse into (one pass over the bytes), validate against lexicons
+/// ([`crate::lexicon::Node`], with `serde_json::Value`'s semantics) and
+/// encode straight to DAG-CBOR ([`JsonValue::encode_record`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum JsonValue<'a> {
+    Null,
+    Bool(bool),
+    Int(i64),
+    /// A number with a fraction or exponent.
+    Float(f64),
+    /// An integer above `i64::MAX` (never a valid record value).
+    BigUint(u64),
+    Str(Cow<'a, str>),
+    Array(Vec<JsonValue<'a>>),
+    /// Sorted in DAG-CBOR key order; a repeated key keeps its last value,
+    /// as `serde_json::Value` does.
+    Object(Vec<(Cow<'a, str>, JsonValue<'a>)>),
+}
+
+/// Blob references found while encoding a record, in the order a walk of
+/// the record's `Value` visits them (map keys in DAG-CBOR order, a map
+/// before its children).
+#[derive(Debug, Default, PartialEq)]
+pub struct RecordRefs {
+    /// Every `{"$type": "blob"}` ref: (cid, mimeType, size).
+    pub blobs: Vec<(Cid, Option<String>, Option<i64>)>,
+    /// The first legacy blob ref (`{"cid", "mimeType"}` strings, no
+    /// `$type`) whose `cid` parses.
+    pub legacy: Option<String>,
+}
+
+impl RecordRefs {
+    /// Distinct blob CIDs, in order of first reference.
+    pub fn cids(&self) -> Vec<Cid> {
+        let mut out: Vec<Cid> = Vec::with_capacity(self.blobs.len());
+        for (c, ..) in &self.blobs {
+            if !out.contains(c) {
+                out.push(*c);
+            }
+        }
+        out
+    }
+}
+
+/// Largest integer a JSON float may carry into a record (JS's safe range).
+const MAX_SAFE_INT: f64 = 9_007_199_254_740_991.0;
+
+fn obj_get<'v, 'a>(m: &'v [(Cow<'a, str>, JsonValue<'a>)], key: &str) -> Option<&'v JsonValue<'a>> {
+    m.binary_search_by(|(k, _)| key_cmp(k, key))
+        .ok()
+        .map(|i| &m[i].1)
+}
+
+impl<'a> JsonValue<'a> {
+    /// Parses JSON (serde_json's parser, so its syntax errors and nesting
+    /// limit). Unescaped strings borrow from `body`.
+    pub fn parse(body: &'a [u8]) -> serde_json::Result<JsonValue<'a>> {
+        serde_json::from_slice(body)
+    }
+
+    pub fn get(&self, key: &str) -> Option<&JsonValue<'a>> {
+        match self {
+            JsonValue::Object(m) => obj_get(m, key),
+            _ => None,
+        }
+    }
+
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut JsonValue<'a>> {
+        match self {
+            JsonValue::Object(m) => match m.binary_search_by(|(k, _)| key_cmp(k, key)) {
+                Ok(i) => Some(&mut m[i].1),
+                Err(_) => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Sets `key` (keeping the key order).
+    pub fn insert(&mut self, key: &'a str, v: JsonValue<'a>) {
+        if let JsonValue::Object(m) = self {
+            match m.binary_search_by(|(k, _)| key_cmp(k, key)) {
+                Ok(i) => m[i].1 = v,
+                Err(i) => m.insert(i, (Cow::Borrowed(key), v)),
+            }
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            JsonValue::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The equivalent `serde_json::Value`.
+    pub fn to_json(&self) -> serde_json::Value {
+        use serde_json::Value as J;
+        match self {
+            JsonValue::Null => J::Null,
+            JsonValue::Bool(b) => J::Bool(*b),
+            JsonValue::Int(n) => J::from(*n),
+            JsonValue::Float(f) => serde_json::Number::from_f64(*f).map_or(J::Null, J::Number),
+            JsonValue::BigUint(n) => J::from(*n),
+            JsonValue::Str(s) => J::String(s.to_string()),
+            JsonValue::Array(a) => J::Array(a.iter().map(|v| v.to_json()).collect()),
+            JsonValue::Object(m) => J::Object(m.iter().map(|(k, v)| (k.to_string(), v.to_json())).collect()),
+        }
+    }
+
+    /// Appends exactly `Value::from_json(self)?.to_cbor()` (same bytes, same
+    /// accept/reject decision, same error) and collects the record's blob
+    /// refs on the way. Integral floats become `Int` in place, so `self`
+    /// then validates as the encoded record would. On error `out` is left
+    /// as it was.
+    pub fn encode_record(&mut self, out: &mut Vec<u8>, refs: &mut RecordRefs) -> Result<(), CborError> {
+        let start = out.len();
+        if self.encode(out, refs).is_ok() {
+            return Ok(());
+        }
+        out.truncate(start);
+        // Rare: let `from_json` name the error, so it is the one its own
+        // traversal order meets first.
+        match Value::from_json(&self.to_json()) {
+            Err(e) => Err(e),
+            Ok(_) => {
+                debug_assert!(false, "encode_record rejected what from_json accepts");
+                Err(CborError::DataModel("invalid record".into()))
+            }
+        }
+    }
+
+    fn encode(&mut self, out: &mut Vec<u8>, refs: &mut RecordRefs) -> Result<(), ()> {
+        match self {
+            JsonValue::Null => write_null(out),
+            JsonValue::Bool(b) => write_bool(out, *b),
+            JsonValue::Int(n) => write_int(out, *n),
+            JsonValue::Float(f) => {
+                if f.fract() != 0.0 || f.abs() > MAX_SAFE_INT {
+                    return Err(());
+                }
+                let n = *f as i64;
+                write_int(out, n);
+                *self = JsonValue::Int(n);
+            }
+            JsonValue::BigUint(_) => return Err(()),
+            JsonValue::Str(s) => write_text(out, s),
+            JsonValue::Array(a) => {
+                write_array_head(out, a.len());
+                for v in a {
+                    v.encode(out, refs)?;
+                }
+            }
+            JsonValue::Object(m) => {
+                if let Some(l) = obj_get(m, "$link") {
+                    return match (l, m.len()) {
+                        (JsonValue::Str(s), 1) => {
+                            write_cid(out, &Cid::parse(s).map_err(|_| ())?);
+                            Ok(())
+                        }
+                        _ => Err(()),
+                    };
+                }
+                if let Some(b) = obj_get(m, "$bytes") {
+                    return match (b, m.len()) {
+                        (JsonValue::Str(s), 1) => {
+                            let b = base64::engine::general_purpose::STANDARD_NO_PAD
+                                .decode(s.trim_end_matches('='))
+                                .map_err(|_| ())?;
+                            write_bytes(out, &b);
+                            Ok(())
+                        }
+                        _ => Err(()),
+                    };
+                }
+                let text = |k: &str| obj_get(m, k).and_then(|v| v.as_str());
+                match obj_get(m, "$type") {
+                    None => {
+                        if let (Some(c), Some(_), None) = (text("cid"), text("mimeType"), &refs.legacy) {
+                            if Cid::parse(c).is_ok() {
+                                refs.legacy = Some(c.to_string());
+                            }
+                        }
+                    }
+                    Some(JsonValue::Str(t)) if !t.is_empty() => {
+                        if t == "blob" {
+                            let link = match obj_get(m, "ref") {
+                                Some(JsonValue::Object(r)) if r.len() == 1 => obj_get(r, "$link").ok_or(())?,
+                                _ => return Err(()),
+                            };
+                            let (Some(mime), Some(JsonValue::Int(size))) = (text("mimeType"), obj_get(m, "size")) else {
+                                return Err(());
+                            };
+                            let JsonValue::Str(link) = link else { return Err(()) };
+                            let c = Cid::parse(link).map_err(|_| ())?;
+                            refs.blobs.push((c, Some(mime.to_string()), Some(*size)));
+                        }
+                    }
+                    Some(_) => return Err(()),
+                }
+                write_map_head(out, m.len());
+                for (k, v) in m.iter_mut() {
+                    write_text(out, k);
+                    v.encode(out, refs)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for JsonValue<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(JsonVisitor)
+    }
+}
+
+struct JsonVisitor;
+
+impl<'de> serde::de::Visitor<'de> for JsonVisitor {
+    type Value = JsonValue<'de>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any valid JSON value")
+    }
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(JsonValue::Null)
+    }
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(JsonValue::Null)
+    }
+    fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(JsonValue::Bool(v))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(JsonValue::Int(v))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(match i64::try_from(v) {
+            Ok(n) => JsonValue::Int(n),
+            Err(_) => JsonValue::BigUint(v),
+        })
+    }
+    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E> {
+        Ok(JsonValue::Float(v))
+    }
+    fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+        Ok(JsonValue::Str(Cow::Borrowed(v)))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(JsonValue::Str(Cow::Owned(v.to_string())))
+    }
+    fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+        Ok(JsonValue::Str(Cow::Owned(v)))
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+        let mut out = Vec::with_capacity(a.size_hint().unwrap_or(0).min(64));
+        while let Some(v) = a.next_element()? {
+            out.push(v);
+        }
+        Ok(JsonValue::Array(out))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut a: A) -> Result<Self::Value, A::Error> {
+        let mut m: Vec<(Cow<'de, str>, JsonValue<'de>)> = Vec::with_capacity(a.size_hint().unwrap_or(0).min(64));
+        while let Some(JsonKey(k)) = a.next_key()? {
+            m.push((k, a.next_value()?));
+        }
+        if m.len() > 1 {
+            // stable sort of the reversed entries puts a repeated key's last
+            // value first; dedup keeps the first of each run
+            m.reverse();
+            m.sort_by(|x, y| key_cmp(&x.0, &y.0));
+            m.dedup_by(|later, kept| later.0 == kept.0);
+        }
+        Ok(JsonValue::Object(m))
+    }
+}
+
+struct JsonKey<'de>(Cow<'de, str>);
+
+impl<'de> serde::Deserialize<'de> for JsonKey<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = JsonKey<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string key")
+            }
+            fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E> {
+                Ok(JsonKey(Cow::Borrowed(v)))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(JsonKey(Cow::Owned(v.to_string())))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(JsonKey(Cow::Owned(v)))
+            }
+        }
+        d.deserialize_str(V)
     }
 }
 

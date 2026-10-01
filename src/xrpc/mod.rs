@@ -70,8 +70,9 @@ pub struct App {
     pub did_resolver: Arc<crate::did_resolver::DidResolver>,
     /// Cluster membership (None = single node owning every partition).
     pub cluster: Option<Arc<crate::cluster::Cluster>>,
-    /// Internal node-to-node HTTP client.
-    pub http: reqwest::Client,
+    /// Internal node-to-node HTTP client (h2c, a few connections per peer;
+    /// derefs to the next `reqwest::Client` round-robin).
+    pub http: crate::http::PeerClient,
     /// This node's commit log (shared by its shards; peers stream it).
     pub log: Arc<crate::nodelog::NodeLog>,
     /// Shard host (graceful shutdown).
@@ -213,6 +214,7 @@ pub fn router(app: Arc<App>) -> Router {
         .fallback(proxy::fallback)
         .merge(oauth::routes())
         .merge(internal::routes())
+        .merge(crate::profiling::routes())
         .merge(webui::routes())
         // DPoP-Nonce / WWW-Authenticate on DPoP-authenticated requests
         .layer(axum::middleware::from_fn_with_state(app.clone(), oauth::dpop_layer));

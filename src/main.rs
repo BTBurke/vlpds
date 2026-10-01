@@ -80,8 +80,24 @@ struct Args {
     cache_per_worker: usize,
     #[arg(long, default_value_t = 8)]
     max_segment_mb: usize,
+    /// Segment PUTs in flight per node log (finalized in ordinal order).
+    #[arg(long, env = "VLPDS_LOG_INFLIGHT", default_value_t = vlpds::nodelog::DEFAULT_LOG_INFLIGHT)]
+    log_inflight: usize,
     #[arg(long, default_value_t = 512)]
     firehose_ring_mb: usize,
+    /// Threads serving subscribeRepos connections, apart from the request
+    /// runtime (0 = share it).
+    #[arg(long, env = "VLPDS_FIREHOSE_THREADS", default_value_t = 4)]
+    firehose_threads: usize,
+    /// A live subscriber this far behind the stream head gets ConsumerTooSlow (MiB).
+    #[arg(long, env = "VLPDS_FIREHOSE_MAX_LAG_MB", default_value_t = 128)]
+    firehose_max_lag_mb: usize,
+    /// Cursor backfill: segment read-ahead per subscriber (MiB, all logs together).
+    #[arg(long, env = "VLPDS_BACKFILL_READAHEAD_MB", default_value_t = 64)]
+    backfill_readahead_mb: usize,
+    /// Cursor backfill: segment cache shared by subscribers replaying the same range (MiB).
+    #[arg(long, env = "VLPDS_BACKFILL_CACHE_MB", default_value_t = 256)]
+    backfill_cache_mb: usize,
     /// Start a second, identical segment PUT if the first takes longer than this.
     #[arg(long, env = "VLPDS_HEDGE_AFTER_MS", default_value_t = 100)]
     hedge_after_ms: u64,
@@ -150,9 +166,17 @@ struct Args {
     /// trusted for the rate-limit client IP. In cluster mode list the nodes.
     #[arg(long, env = "VLPDS_TRUSTED_PROXIES", value_delimiter = ',')]
     trusted_proxies: Vec<String>,
+    /// HTTP/2 (h2c) connections to each peer node; requests round-robin.
+    #[arg(long, env = "VLPDS_PEER_CONNECTIONS", default_value_t = vlpds::http::DEFAULT_PEER_CONNECTIONS)]
+    peer_connections: usize,
     /// `x-ratelimit-bypass` header value that skips rate limits.
     #[arg(long, env = "VLPDS_RATE_LIMIT_BYPASS_KEY")]
     rate_limit_bypass_key: Option<String>,
+    /// Push continuous CPU profiles (100 Hz) to this Pyroscope server, tagged
+    /// with the node id and git revision (needs `--features profiling`;
+    /// bench/obs runs one on http://127.0.0.1:4040).
+    #[arg(long, env = "VLPDS_PYROSCOPE_URL")]
+    pyroscope_url: Option<String>,
 }
 
 fn url_did(v: &Option<String>) -> anyhow::Result<Option<(String, String)>> {
@@ -174,6 +198,16 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    let node_id = args.node_id.clone().unwrap_or_else(|| "single".into());
+    let rev = vlpds::profiling::git_rev();
+    vlpds::metrics::BUILD_INFO
+        .with_label_values(&[node_id.as_str(), rev.as_str(), if vlpds::profiling::ENABLED { "1" } else { "0" }])
+        .set(1);
+    if let Some(url) = &args.pyroscope_url {
+        // before the runtime: the agent's blocking HTTP client owns one
+        vlpds::profiling::start_pyroscope(url, &node_id, &rev)?;
+        tracing::info!(url, node_id, rev, "pushing CPU profiles to Pyroscope");
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(args.io_threads)
         .enable_all()
@@ -214,6 +248,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         cache_per_worker: args.cache_per_worker,
         max_segment_bytes: args.max_segment_mb << 20,
         firehose_ring_bytes: args.firehose_ring_mb << 20,
+        firehose_threads: args.firehose_threads,
+        firehose_max_lag_bytes: args.firehose_max_lag_mb << 20,
+        backfill_readahead_bytes: args.backfill_readahead_mb << 20,
+        backfill_cache_bytes: args.backfill_cache_mb << 20,
         hedge_after: Duration::from_millis(args.hedge_after_ms),
         max_inflight_writes: args.max_inflight_writes,
         cache_dir: (!args.cache_dir.is_empty()).then(|| std::path::PathBuf::from(&args.cache_dir)),
@@ -230,6 +268,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             .resolve_lexicons
             .then_some(vlpds::lexicon::RESOLVE_TIMEOUT),
         trusted_proxies: args.trusted_proxies.clone(),
+        peer_connections: args.peer_connections,
         rate_limit_bypass_key: args.rate_limit_bypass_key.clone(),
         cluster: Some(vlpds::cluster::ClusterConfig {
             node_id: args.node_id.clone().unwrap_or_else(|| "single".into()),
@@ -250,6 +289,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         );
     }
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    vlpds::nodelog::set_log_inflight(args.log_inflight);
     let app = server::build(cfg).await?;
     server::spawn_reporters(&app);
     tracing::info!(listen = %args.listen, "vlpds serving");

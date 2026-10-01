@@ -33,7 +33,7 @@
 //! resolved lexicon into other unbundled lexicons are not followed.
 //! Messages follow @atproto/lexicon (`Input/repo must be a string`).
 
-use crate::cbor::Value;
+use crate::cbor::{JsonValue, Value};
 use crate::xrpc::syntax;
 use crate::xrpc::App;
 use futures::FutureExt;
@@ -54,10 +54,10 @@ pub type ValidationStatus = Option<&'static str>;
 /// Validates a record (with its `$type` already set to `collection`).
 /// `resolved` is a dynamically resolved lexicon document for `collection`
 /// ([`resolve_record_schema`]); bundled schemas take precedence.
-pub fn validate_record(
+pub fn validate_record<N: Node>(
     collection: &str,
     rkey: &str,
-    record: &Value,
+    record: &N,
     validate: Option<bool>,
     resolved: Option<&J>,
 ) -> Result<ValidationStatus, String> {
@@ -144,7 +144,7 @@ pub fn has_params(nsid: &str) -> bool {
 }
 
 /// Checks a procedure's JSON body (`Input ...` messages).
-pub fn validate_input(nsid: &str, body: &J) -> Result<(), String> {
+pub fn validate_input<N: Node>(nsid: &str, body: &N) -> Result<(), String> {
     validate_payload(nsid, "input", "Input", body)
 }
 
@@ -153,7 +153,7 @@ pub fn validate_output(nsid: &str, body: &J) -> Result<(), String> {
     validate_payload(nsid, "output", "Output", body)
 }
 
-fn validate_payload(nsid: &str, which: &str, root: &str, body: &J) -> Result<(), String> {
+fn validate_payload<N: Node>(nsid: &str, which: &str, root: &str, body: &N) -> Result<(), String> {
     if which == "input" && EXTENDED_INPUTS.contains(&nsid) {
         return Ok(());
     }
@@ -346,8 +346,10 @@ fn record_lexicon(nsid: &str, doc: J) -> Result<J, String> {
 // ---------------------------------------------------------------------------
 
 /// A data-model value the interpreter can check: DAG-CBOR records
-/// ([`Value`]) and JSON bodies (`$link` / `$bytes` objects are CIDs and
-/// bytes, as the reference's `jsonToLex`).
+/// ([`Value`]) and JSON bodies ([`J`], [`JsonValue`]: `$link` / `$bytes`
+/// objects are CIDs and bytes, as the reference's `jsonToLex`). Record
+/// writes validate the parsed [`JsonValue`] once it has been encoded
+/// ([`JsonValue::encode_record`] leaves it equal to the record).
 pub trait Node: Sized {
     fn kind(&self) -> Kind<'_, Self>;
     fn get(&self, key: &str) -> Option<&Self>;
@@ -408,6 +410,30 @@ impl Node for J {
     }
 }
 
+impl Node for JsonValue<'_> {
+    fn kind(&self) -> Kind<'_, Self> {
+        match self {
+            JsonValue::Null => Kind::Null,
+            JsonValue::Bool(b) => Kind::Bool(*b),
+            JsonValue::Int(n) => Kind::Int(*n),
+            JsonValue::Float(_) | JsonValue::BigUint(_) => Kind::Float,
+            JsonValue::Str(s) => Kind::Text(s),
+            JsonValue::Array(a) => Kind::Array(a),
+            JsonValue::Object(o) => match &o[..] {
+                [(k, JsonValue::Str(_))] if k == "$link" => Kind::Link,
+                [(k, JsonValue::Str(b))] if k == "$bytes" => {
+                    Kind::Bytes(b.trim_end_matches('=').len() * 3 / 4)
+                }
+                _ => Kind::Map,
+            },
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&Self> {
+        JsonValue::get(self, key)
+    }
+}
+
 fn text<N: Node>(v: Option<&N>) -> Option<&str> {
     match v?.kind() {
         Kind::Text(s) => Some(s),
@@ -419,8 +445,16 @@ fn text<N: Node>(v: Option<&N>) -> Option<&str> {
 /// resolved (untrusted) lexicon may reference itself in a cycle.
 const MAX_DEPTH: u32 = 128;
 
+/// A step of the path in error messages (`Input/writes/0/collection`),
+/// formatted only when there is an error.
+enum Seg<'a> {
+    Key(&'a str),
+    Index(usize),
+}
+
 struct Validator<'a> {
-    path: Vec<String>,
+    root: String,
+    path: Vec<Seg<'a>>,
     /// A resolved lexicon document, consulted before the bundle.
     doc: Option<&'a J>,
     depth: u32,
@@ -428,7 +462,7 @@ struct Validator<'a> {
 
 impl<'a> Validator<'a> {
     fn new(root: &str, doc: Option<&'a J>) -> Self {
-        Validator { path: vec![root.to_string()], doc, depth: 0 }
+        Validator { root: root.to_string(), path: Vec::new(), doc, depth: 0 }
     }
 
     fn def(&self, nsid: &str, name: &str) -> Option<&'a J> {
@@ -439,10 +473,20 @@ impl<'a> Validator<'a> {
     }
 
     fn err(&self, m: impl std::fmt::Display) -> String {
-        format!("{} {m}", self.path.join("/"))
+        let mut p = self.root.clone();
+        for seg in &self.path {
+            match seg {
+                Seg::Key(k) => {
+                    p.push('/');
+                    p.push_str(k);
+                }
+                Seg::Index(i) => p.push_str(&format!("/{i}")),
+            }
+        }
+        format!("{p} {m}")
     }
 
-    fn nested<T>(&mut self, seg: String, f: impl FnOnce(&mut Self) -> T) -> T {
+    fn nested<T>(&mut self, seg: Seg<'a>, f: impl FnOnce(&mut Self) -> T) -> T {
         self.path.push(seg);
         let r = f(self);
         self.path.pop();
@@ -536,7 +580,7 @@ impl<'a> Validator<'a> {
                 }
                 if let Some(item) = d.get("items") {
                     for (i, x) in items.iter().enumerate() {
-                        self.nested(i.to_string(), |s| s.check(item, x, ctx))?;
+                        self.nested(Seg::Index(i), |s| s.check(item, x, ctx))?;
                     }
                 }
                 Ok(())
@@ -580,7 +624,7 @@ impl<'a> Validator<'a> {
                 if matches!(x.kind(), Kind::Null) && nullable(k) {
                     continue;
                 }
-                self.nested(k.clone(), |s| s.check(pd, x, ctx))?;
+                self.nested(Seg::Key(k), |s| s.check(pd, x, ctx))?;
             }
         }
         Ok(())
@@ -594,10 +638,11 @@ impl<'a> Validator<'a> {
         let Some(t) = t else {
             return Err(self.err("must be an object which includes the \"$type\" property"));
         };
-        let refs: Vec<&'a J> = d["refs"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
         let (tn, tname) = split_ref(t, ctx);
-        let hit = refs
-            .iter()
+        let hit = d["refs"]
+            .as_array()
+            .into_iter()
+            .flatten()
             .filter_map(|r| r.as_str())
             .map(|r| split_ref(r, ctx))
             .find(|(n, name)| *n == tn && *name == tname);

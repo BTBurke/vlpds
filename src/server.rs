@@ -31,6 +31,15 @@ pub struct Config {
     pub cache_per_worker: usize,
     pub max_segment_bytes: usize,
     pub firehose_ring_bytes: usize,
+    /// Threads of the process-wide firehose runtime that serves
+    /// subscribeRepos connections (0 = serve them on the request runtime).
+    pub firehose_threads: usize,
+    /// A live subscriber this many bytes behind the head gets ConsumerTooSlow.
+    pub firehose_max_lag_bytes: usize,
+    /// Cursor backfill: S3 read-ahead per subscriber, and the segment cache
+    /// shared by subscribers replaying the same range.
+    pub backfill_readahead_bytes: usize,
+    pub backfill_cache_bytes: usize,
     pub hedge_after: Duration,
     pub max_inflight_writes: usize,
     pub cache_dir: Option<std::path::PathBuf>,
@@ -58,6 +67,8 @@ pub struct Config {
     /// Proxies (IPs / CIDRs) whose X-Forwarded-For is trusted for the
     /// rate-limit client IP. Empty = always the TCP peer.
     pub trusted_proxies: Vec<String>,
+    /// h2c connections to each peer node (crate::http::PeerClient).
+    pub peer_connections: usize,
     /// `x-ratelimit-bypass` header value that skips rate limits (reference
     /// PDS_RATE_LIMIT_BYPASS_KEY).
     pub rate_limit_bypass_key: Option<String>,
@@ -67,8 +78,9 @@ pub struct Config {
     /// resolution (else `validationStatus: "unknown"`). None = off.
     pub resolve_lexicons: Option<Duration>,
     /// With `s3: None`: share this in-memory object store instead of a fresh
-    /// one, so several in-process nodes form one cluster (tests).
-    pub memory_store: Option<Arc<object_store::memory::InMemory>>,
+    /// one, so several in-process nodes form one cluster (tests; may be
+    /// wrapped, e.g. in a `ThrottledStore` for object-store latency).
+    pub memory_store: Option<Arc<dyn object_store::ObjectStore>>,
 }
 
 /// Well-known secrets: only accepted with `dev_mode` (see [`Config::check_secrets`]).
@@ -125,6 +137,10 @@ impl Default for Config {
             cache_per_worker: 10_000,
             max_segment_bytes: 8 << 20,
             firehose_ring_bytes: 64 << 20,
+            firehose_threads: 2,
+            firehose_max_lag_bytes: crate::firehose::DEFAULT_MAX_LAG_BYTES,
+            backfill_readahead_bytes: crate::backfill::DEFAULT_READAHEAD_BYTES,
+            backfill_cache_bytes: crate::backfill::DEFAULT_CACHE_BYTES,
             hedge_after: Duration::from_millis(100),
             max_inflight_writes: 20_000,
             cache_dir: None,
@@ -139,6 +155,7 @@ impl Default for Config {
             invite_required: false,
             rate_limits_enabled: true,
             trusted_proxies: Vec::new(),
+            peer_connections: crate::http::DEFAULT_PEER_CONNECTIONS,
             rate_limit_bypass_key: None,
             resolve_lexicons: None,
             memory_store: None,
@@ -160,7 +177,13 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         }
         Some(s3) => (Store::s3(s3, &cfg.prefix, cfg.inject_latency)?, Store::s3(s3, &cfg.prefix, None)?),
     };
-    let firehose = Firehose::new(cfg.firehose_ring_bytes);
+    let firehose = Firehose::new(crate::firehose::Options {
+        ring_bytes: cfg.firehose_ring_bytes,
+        max_lag_bytes: cfg.firehose_max_lag_bytes,
+        readahead_bytes: cfg.backfill_readahead_bytes,
+        backfill_cache_bytes: cfg.backfill_cache_bytes,
+        runtime: (cfg.firehose_threads > 0).then(|| crate::firehose::runtime(cfg.firehose_threads)),
+    });
     let (merger_tx, merger_rx) = tokio::sync::mpsc::unbounded_channel();
     let n = cfg.shards;
     let table = crate::partitions::PartitionTable::new(n);
@@ -204,6 +227,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
             }
         });
     }
+    let http = crate::http::PeerClient::new(cfg.peer_connections)?;
     let node = crate::node::Node::new(
         cluster.clone(),
         log.clone(),
@@ -215,6 +239,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         workers.clone(),
         cfg.cache_dir.clone(),
         cfg.internal_token.clone(),
+        http.clone(),
     );
     let host: Arc<dyn ShardHost> = node.clone();
     let node_handle = node.clone();
@@ -243,29 +268,10 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         write_permits: tokio::sync::Semaphore::new(cfg.max_inflight_writes),
         admin_token: cfg.admin_token.clone(),
         did_resolver: Arc::new(crate::did_resolver::DidResolver::new(&cfg.plc_url, cfg.dev_mode)),
+        http,
         config: Arc::new(cfg),
         cluster: Some(cluster),
         log,
-        // node-to-node: fail fast when a peer is unreachable (forwarded
-        // requests return 503 instead of hanging)
-        // Peers speak h2c (the listener is HTTP/1 + HTTP/2 auto). With
-        // HTTP/1.1, forwarding ~10k writes/s at ~100 ms each needed ~1k
-        // concurrent connections per peer: beyond the 256 pooled ones every
-        // request opened and closed a TCP connection, and at 50k/s across 3
-        // nodes the forwards blew the TTFB deadline and the cluster collapsed
-        // to ~2k/s. One multiplexed connection per peer avoids the churn.
-        http: reqwest::Client::builder()
-            .http2_prior_knowledge()
-            .http2_initial_stream_window_size(4 << 20)
-            .http2_initial_connection_window_size(64 << 20)
-            .tcp_nodelay(true)
-            .pool_max_idle_per_host(256)
-            .connect_timeout(Duration::from_millis(1000))
-            .timeout(Duration::from_secs(15))
-            // forwarded responses go back to the client as they are (an
-            // OAuth consent's 303 to the client's redirect_uri included)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?,
         node: node_handle,
     }))
 }
@@ -309,34 +315,114 @@ pub async fn spawn(
 /// HTTP/1.1 + HTTP/2 (h2c) server. axum::serve doesn't expose HTTP/2 settings,
 /// and hyper's default 64KB connection window chops request bodies on busy
 /// connections into tiny DATA frames, which trips h2's small-frame flood guard.
+/// Settings and their reasons: DESIGN.md "HTTP".
 pub async fn serve(listener: tokio::net::TcpListener, router: axum::Router) -> anyhow::Result<()> {
-    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
     use hyper_util::server::conn::auto::Builder;
     use hyper_util::service::TowerToHyperService;
     let mut builder = Builder::new(TokioExecutor::new());
     builder
+        .http1()
+        // the timer enables hyper's header read timeout (slowloris): a
+        // client gets 30 s to send a request head, which also bounds an idle
+        // keep-alive connection waiting for its next request
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(30))
+        .keep_alive(true);
+    builder
         .http2()
+        .timer(TokioTimer::new())
         .initial_stream_window_size(4 << 20)
         .initial_connection_window_size(64 << 20)
         .max_frame_size(256 << 10)
-        .max_concurrent_streams(16_384);
+        // per connection; the load generator spreads its requests over 64
+        // connections, peers over --peer-connections
+        .max_concurrent_streams(1024)
+        // atproto heads (DPoP proof + access token) are a few KiB
+        .max_header_list_size(32 << 10)
+        // PING idle clients; drop the connection after 10 s without a PONG
+        .keep_alive_interval(Duration::from_secs(20))
+        .keep_alive_timeout(Duration::from_secs(10))
+        // rapid-reset (CVE-2023-44487) and local-error-reset floods: hyper/h2's
+        // defaults, stated so a change is a decision
+        .max_pending_accept_reset_streams(20)
+        .max_local_error_reset_streams(1024);
+    let active = ActiveRequests {
+        h1: crate::metrics::HTTP_SERVER_ACTIVE.with_label_values(&["h1"]),
+        h2: crate::metrics::HTTP_SERVER_ACTIVE.with_label_values(&["h2"]),
+    };
     loop {
         let (sock, peer) = listener.accept().await?;
         let _ = sock.set_nodelay(true);
+        crate::metrics::HTTP_SERVER_CONNECTIONS.inc();
         // peer address for rate limiting (axum ConnectInfo)
-        let svc = TowerToHyperService::new(tower::ServiceExt::map_request(
-            router.clone(),
-            move |mut req: axum::http::Request<hyper::body::Incoming>| {
-                req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
-                req
-            },
-        ));
+        let svc = TowerToHyperService::new(Track {
+            inner: tower::ServiceExt::map_request(
+                router.clone(),
+                move |mut req: axum::http::Request<hyper::body::Incoming>| {
+                    req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+                    req
+                },
+            ),
+            active: active.clone(),
+        });
         let builder = builder.clone();
         tokio::spawn(async move {
+            crate::metrics::HTTP_SERVER_OPEN.inc();
             let _ = builder
                 .serve_connection_with_upgrades(TokioIo::new(sock), svc)
                 .await;
+            crate::metrics::HTTP_SERVER_OPEN.dec();
         });
+    }
+}
+
+#[derive(Clone)]
+struct ActiveRequests {
+    h1: prometheus::IntGauge,
+    h2: prometheus::IntGauge,
+}
+
+/// Counts requests (h2: streams) until their response head
+/// (`vlpds_http_server_active_requests`).
+#[derive(Clone)]
+struct Track<S> {
+    inner: S,
+    active: ActiveRequests,
+}
+
+/// Decrements on drop, so a reset stream (future dropped) is counted out.
+struct ActiveGuard(prometheus::IntGauge);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
+impl<S, B> tower::Service<axum::http::Request<B>> for Track<S>
+where
+    S: tower::Service<axum::http::Request<B>>,
+    S::Future: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = futures::future::BoxFuture<'static, Result<S::Response, S::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), S::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: axum::http::Request<B>) -> Self::Future {
+        let g = if req.version() == axum::http::Version::HTTP_2 { &self.active.h2 } else { &self.active.h1 };
+        g.inc();
+        let guard = ActiveGuard(g.clone());
+        let f = self.inner.call(req);
+        Box::pin(async move {
+            let r = f.await;
+            drop(guard);
+            r
+        })
     }
 }
 

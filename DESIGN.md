@@ -72,7 +72,16 @@ The MST is fully determined by the set of `(key, record CID)` pairs. So:
   equals `head.data`**. This verification also gives a free integrity check.
 - MST nodes needed by the firehose (diff + proof) are already in the log segment.
 - `getRepo` / `getRecord` proofs / `getBlocks` are served from the in-memory tree
-  (an Arc snapshot gives consistent exports while writes continue).
+  (an Arc snapshot gives consistent exports while writes continue). Internal
+  nodes (height >= 1) keep their encoded block after each write, so exports
+  and proofs copy them; leaves (~3/4 of the bytes) re-encode on demand.
+- `getBlocks` finds nodes by CID through a per-repo `NodeIndex` (node CID ->
+  first key in its subtree + height; the node is found by descending to that
+  key and checking the CID). It is built lazily, with one walk, the first time a
+  request asks for a node. After that the repo worker advances it with each
+  commit's written nodes. It covers a rev range, so a miss inside that range
+  is final. A broken commit chain (importRepo) or too many stale entries drops
+  it, and the next request rebuilds it. Nothing is persisted.
 - Escape hatch for very large repos (≥1M records): periodically write an MST snapshot
   object so a cold load doesn't need an O(n) rebuild. Not needed for v1.
 
@@ -80,9 +89,10 @@ Persisted state per commit drops from ~15 KV operations to about 2: the record a
 the repo head.
 
 ### 3. Log = WAL = firehose
-> **Superseded by the HA section below:** the log is per *partition*, each with
-> exactly one segment PUT in flight (adaptive batching: whatever queues during
-> a PUT forms the next segment). Throughput comes from P parallel logs.
+> **Superseded by the HA section below:** the log is per *node*, with up to K
+> segment PUTs in flight finalized in ordinal order (adaptive batching:
+> whatever queues during a PUT forms the next segment; see "Pipelined segment
+> PUTs").
 
 - A sequencer task per partition assigns `seq` and splices it into frames that
   workers pre-encoded (header + body DAG-CBOR) in the open segment buffer.
@@ -116,6 +126,10 @@ swappable.
 - Keys:
   - `h/{did}` → head `{commit cid, signed commit bytes, rev, data cid, status}`
   - `R/{did}\0{collection}/{rkey}` → `{cid, record bytes}`
+  - `c/{did}\0{cid8}{path}` → empty: record CID index for `getBlocks` (`cid8` =
+    first 8 bytes of the CID's digest). Written in the same batch as the `R/` key,
+    one per path (a CID can sit at several). A lookup prefix-scans
+    `c/{did}\0{cid8}` on the snapshot and checks each path's record CID.
   - `a/{did}`, `n/{handle}` → account; `k/{did}` → signing key (plaintext in the
     prototype; KMS-wrapped later)
   - `meta/applied_seq`
@@ -130,14 +144,55 @@ swappable.
   passes them. The queues share a byte budget (256 MiB default); a log over
   budget stops being queued and is read back from S3 in chunks until it reaches
   the live ordinal, so a stalled peer can't grow memory without bound.
-- Subscribers that are too slow fall off and resume from a cursor.
-- Backfill: recent segments come from memory; older ones are range-GETs from S3.
+- Serving: `subscribeRepos` does its own websocket upgrade and moves the socket
+  onto a dedicated firehose runtime (`--firehose-threads`, default 4), so fan-out
+  never competes with request handling. The merger frames each batch's websocket
+  messages once; every subscriber writes zero-copy slices of the same bytes and
+  wakes on a watch of emitted bytes (no per-subscriber channel).
+- Slow subscribers: a subscriber may lag the head by at most
+  `--firehose-max-lag-mb` (128 MiB). Past that it gets `ConsumerTooSlow` and is
+  closed; it resumes from its cursor.
+- Backfill: a cursor behind the ring is served from S3 with read-ahead (up to 32
+  GETs per log, `--backfill-readahead-mb` total) through a shared segment cache
+  (`--backfill-cache-mb`), then handed to the live ring once it reaches the ring
+  floor. Readers stop at a log's first non-segment (hole rule).
 - Events: `#commit` (sync 1.1), `#sync` (account creation / repo reset),
   `#identity`, `#account`.
 
 ### 6. Blobs
 `uploadBlob` streams to `blob/{did}/{cid}` (multipart if large). This is off the
 commit hot path.
+
+### 7. HTTP
+Every outbound client is built once in `src/http.rs`, per role, and shared
+(no per-request clients). No client follows redirects. New outbound
+connections count in `vlpds_http_client_connects_total{role}`; under steady
+load it should stay flat (a rising rate means pool churn).
+
+| Role | Used for | Settings |
+|---|---|---|
+| peer | forwarding, internal calls | h2c prior knowledge; 4 MiB stream / 64 MiB conn windows; PING every 10 s (also idle), dead after 5 s; TCP keepalive 30 s; nodelay; connect 1 s; `--peer-connections` (default 4) connections per peer, round-robin |
+| public | AppView / report service proxy, PLC, requestCrawl | h2 by ALPN on https, HTTP/1.1 on http with 1,024 idle per host; idle close 60 s; h2 PING 20 s / 10 s; TCP keepalive; connect 5 s, read 30 s |
+| guarded | user-derived URLs: did:web, handle `.well-known`, OAuth client metadata, lexicons, DID-doc service endpoints | public's settings, 32 idle per host, plus a resolver that drops non-public addresses (outside dev mode); pair with `check_outbound_url` |
+| S3 (object_store) | log and state stores (separate pools) | HTTP/1.1 only, 256 idle per host, idle close 15 s (S3 closes at ~20 s), connect 2 s, 30 s total |
+
+Why: an HTTP/1.1 peer pool smaller than the forwarding concurrency opened a
+connection per request and collapsed a 3-node cluster at 50k/s; one h2
+connection fixes the churn. Keepalive PINGs bound how long a half-open peer
+connection black-holes forwards. Several connections per peer keep a single
+connection (and its driver task, and its 1,024-stream limit at the receiver)
+from being the bottleneck or the single point of failure. The AppView stays
+on pooled HTTP/1.1 over plaintext: one multiplexed h2c connection was slower
+(bench 2026-10-02 §6).
+
+Server (`server::serve`, HTTP/1.1 + h2c auto): h1 header read timeout 30 s
+(slowloris; also the idle keep-alive bound), h2 windows as above, 1,024
+concurrent streams per connection, 32 KiB header list, PING every 20 s with a
+10 s timeout, rapid-reset limits at hyper/h2's defaults (20 pending accept
+resets, 1,024 local error resets; CVE-2023-44487). Metrics:
+`vlpds_http_server_connections_total`, `_connections_open`,
+`vlpds_http_server_active_requests{version}` (h2 = streams awaiting a
+response head).
 
 ## Sync 1.1 checklist
 - Commit object v3, `prev: null`, `rev` = per-repo monotonic TID, signed.
@@ -187,10 +242,12 @@ the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
   ranges. A shard is the unit of ownership and state: one SlateDB at
   `state/{shard}/` and an assignment object `assign/{shard}`.
 - **One log per node incarnation.** A node group-commits every shard's entries,
-  tagged `(shard, epoch)`, into `log/{log_id}/{ordinal}.seg`. Exactly one
-  segment PUT is in flight, written with `If-None-Match: *` at the next
-  ordinal, so the log is a dense chain. A write is acked only after its segment
-  PUT succeeded and only while the node's lease is valid.
+  tagged `(shard, epoch)`, into `log/{log_id}/{ordinal}.seg`. Up to K
+  segment PUTs are in flight (`--log-inflight`, default 4), each written with
+  `If-None-Match: *` at its ordinal; completions are finalized strictly in
+  ordinal order (see "Pipelined segment PUTs"). A write is acked only after
+  its segment and every earlier one are durable, and only while the node's
+  lease is valid.
 - **Node leases.** `nodes/{node_id}` holds `{log_id, addr, writer, renewals}`
   and is renewed by CAS on its ETag every TTL/5 (default TTL 10 s). Renewal
   bumps `renewals`, so every renewal changes the object.
@@ -202,9 +259,25 @@ the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
   segment for all of them (once it is durable, every earlier entry of those
   shards is durable and applied), a checkpoint, then the span end in the
   assignment. A takeover from a dead node first **fences its log**: a
-  conditional create of a fence object at the first free ordinal, which ends
-  its last span for good. The new owner replays its shards' previous spans
+  conditional create of a fence object at the end of its durable prefix (its
+  first ordinal that isn't a segment), which ends its last span for good. The new owner replays its shards' previous spans
   (one pass over each dead log for all shards) before serving.
+- **Handback to a joiner.** A node owning more than its share hands the
+  extras straight to the peers short of theirs (only peers it has seen for a
+  join grace): after the close it CASes each assignment to name the joiner
+  (epoch + 1, its own span closed at the barrier, an open span for the
+  joiner starting at the log ordinal the joiner's lease last published,
+  never inside an earlier span of the same log) and POSTs the handoffs to
+  the joiner's `/internal/v1/cluster/nudge`. The joiner adopts them with no
+  control-plane read (replay the spans before its own, wait out
+  `seq_floor`, serve); a lost nudge is caught by its next step. A shard naming
+  a node at an epoch it already opened is never adopted again (that is a
+  failed release, not a handoff). Every other peer gets an empty nudge so
+  its routing follows at once. Graceful shutdown first marks its lease
+  `draining` (peers stop counting it toward fair shares or handing it
+  shards), then hands its shards out the same way. Release → serving is the joiner's SlateDB open (~22 sequential
+  store calls, ~450 ms at 20 ms per call; it was a step interval plus a
+  step plus the open, ~3 s at TTL 10 s).
 - **Global firehose order with no global sequencer.**
   `seq = unix_micros × 256 + writer`, strictly increasing within a log. Each
   log carries a watermark (every event ≤ W is durable); every node k-way
@@ -216,6 +289,63 @@ the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
   `handle/{handle}`; writer ids (the seq low byte) by CAS on `writers/{w}`.
 
 Single-node mode is the same code with one node owning all shards.
+
+### Pipelined segment PUTs (K in flight per log)
+
+With one PUT in flight a node log commits at most one segment
+(`--max-segment-mb`, 8 MB) per PUT round trip: ~155 MB/s, 44–54k commits/s at
+25 ms PUT latency (bench 2026-10-02 §1). Bigger segments raise the ceiling
+but each PUT gets slower, so the tail grows. Instead the sequencer keeps up
+to K PUTs in flight:
+
+- **Sealing.** Ordinals are assigned at seal time, in order. A segment is
+  sealed when a slot is free and either nothing is in flight (the old
+  behavior: whatever queued during the PUT is the next segment) or it holds
+  at least `max_segment_bytes / K`. Extra PUTs start only under load, so the
+  PUT rate at low load is unchanged; the ceiling becomes K full segments per
+  round trip.
+- **In-order finalization.** Completions are taken in ordinal order
+  (`FuturesOrdered`): a segment that lands early waits for every earlier
+  one. Only then does the finalizer apply it, write its applied marker, push
+  it to the live ring and the merger, advance the watermark and
+  `durable_ordinal`, and ack. So everything downstream of the finalizer
+  (acks, SlateDB, `META_APPLIED`, checkpoints, close barriers, the firehose
+  watermark, peer streams) covers a gap-free prefix of the log, exactly as
+  with K = 1. Hedging is per segment, at most one hedge per ordinal.
+- **`prefix_end`.** Each segment header records the writer's promise at seal
+  time: every ordinal below it was already durable (the oldest PUT still in
+  flight). It is at least `ordinal − K + 1`.
+
+**The hole rule.** A crash can leave holes: ordinal n missing, n+1 present.
+A log's *durable prefix* is its longest gap-free run of segments from the
+start; it ends at the first ordinal that isn't a segment (missing, or a
+fence). Since acks are in order, every acked write is inside the prefix, and
+segments after the first hole were never acked, applied or emitted: they are
+garbage. Everything that reads a log honors this:
+
+- *Fencing* (`Cluster::fence`, `nodelog::first_free`) puts the fence at the
+  end of the durable prefix, not after the highest object. It finds it from
+  one LIST plus a few small GETs: the highest segment's `prefix_end` bounds
+  where the first hole can be (only `[prefix_end, ordinal)` can hold one).
+  Every fencer computes the same ordinal, and once fenced it never changes.
+- *Sequential readers* (replay, follower S3 catch-up, backfill cursors, the
+  merger's spill read-back) already stop at the first missing object or the
+  fence, so they never reach garbage. A closed span ends at a fence or at a
+  release's `durable_ordinal + 1`, so a hole inside it is still an error.
+- *`backfill::seek`* binary-searches on "present", which holes make
+  non-monotone: it could land on garbage past the fence. Its answer is
+  checked: the segment before it must be in the prefix (probe its
+  `[prefix_end, ordinal)` window), else the hole is the answer.
+
+**Why fencing stays safe.** Let F be the fence ordinal: the first
+non-segment when the fencer looked, made permanent by the conditional create
+(a zombie segment landing first makes the create fail, and the fencer
+re-scans). Every ordinal below F is a segment, so a successor replaying
+`[start, F)` sees a gap-free prefix. The zombie can't ack anything at ≥ F:
+acking any of it needs its own segment F durable first (acks are in order),
+and its PUT at F collides with the fence, so it fail-stops instead (exit 3). Its PUTs at F+1 … F+K−1 may still
+land, but nothing reads past F. Garbage is left in place; it's bounded by
+K − 1 segments per crash.
 
 ### Liveness: observed lease changes on the observer's monotonic clock
 
@@ -252,12 +382,13 @@ cost availability, never an acked write. Three mechanisms make that hold
 whatever the clocks do:
 
 1. **Fencing.** A successor fences the dead log before it reassigns any of its
-   shards, and the span it replays ends at the fence. A segment the old owner
-   got in before the fence is below it and is replayed. One after it can't
-   exist: its `If-None-Match` PUT collides with the fence (or with the
-   segment that took that ordinal), so it is never acked and the old owner
-   fail-stops (exit 3). An acked write is therefore always inside the span the
-   successor replays.
+   shards, at the end of its durable prefix, and the span it replays ends at
+   the fence. Every segment below the fence is replayed. The old owner can't
+   ack anything at or past it: its PUT at the fence ordinal collides, so that
+   segment never completes, and acks are in ordinal order. It fail-stops
+   (exit 3). Segments it had in flight past the fence may land, but no reader
+   goes past a fence (see "Pipelined segment PUTs"). An acked write is
+   therefore always inside the span the successor replays.
 2. **CAS assignments.** An assignment moves only by CAS on its ETag, so each
    epoch has one owner, and its history (spans with fence- or barrier-final
    ends) is what the next owner replays. SlateDB's writer epoch fences a
@@ -308,6 +439,8 @@ S3 brownout past the ceiling stops every node. Keep the TTL at 10 s or more.
 changed: one per peer renewal, one per moved shard. Every 150 steps (~5 min) it
 re-reads every assignment as a safety net. Releases CAS against the cached
 assignment and re-read only on a conflict.
+A nudge also wakes the step loop early (shards released without a
+recipient, or a peer that left).
 
 ## What benchmarking changed (Oct 2026)
 

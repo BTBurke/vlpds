@@ -7,10 +7,17 @@ edition = "2021"
 autotests = false
 
 [features]
-default = ["jemalloc"]
+default = ["jemalloc", "slatedb-metrics"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 # A/B alternative: cargo build --release --no-default-features --features mimalloc
 mimalloc = ["dep:mimalloc"]
+# CPU profiling (bench/obs/README.md): --pyroscope-url pushes 100 Hz pprof-rs
+# samples to a Pyroscope server; GET /debug/pprof/profile (admin) serves one
+# on demand. Both use pyroscope's pprof-rs backend (the standalone pprof
+# crate's SIGPROF handler symbol collides with it), one at a time.
+profiling = ["dep:pyroscope", "dep:prost", "dep:inferno"]
+# SlateDB's own stats (block cache hits, memtable, L0, flushes) in /metrics
+slatedb-metrics = ["dep:slatedb-common"]
 
 [dependencies]
 slatedb = { version = "0.17", features = ["aws", "wal_disable"] }
@@ -45,6 +52,10 @@ tokio-tungstenite = "0.26"
 tikv-jemallocator = { version = "0.7", optional = true }
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"], optional = true }
 mimalloc = { version = "0.1", optional = true }
+pyroscope = { version = "2.1", default-features = false, features = ["backend-pprof-rs"], optional = true }
+prost = { version = "0.14", optional = true }
+inferno = { version = "0.11", default-features = false, optional = true }
+slatedb-common = { version = "0.17", optional = true }
 prometheus = { version = "0.14", default-features = false }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }

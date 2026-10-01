@@ -1,0 +1,77 @@
+[
+ {
+  "targets": [
+   "host.docker.internal:2583"
+  ],
+  "labels": {
+   "setup": "single"
+  }
+ },
+ {
+  "targets": [
+   "host.docker.internal:2620"
+  ],
+  "labels": {
+   "setup": "dev"
+  }
+ },
+ {
+  "targets": [
+   "host.docker.internal:2700",
+   "host.docker.internal:2701",
+   "host.docker.internal:2702",
+   "host.docker.internal:2703",
+   "host.docker.internal:2704",
+   "host.docker.internal:2705",
+   "host.docker.internal:2706",
+   "host.docker.internal:2707",
+   "host.docker.internal:2708",
+   "host.docker.internal:2709",
+   "host.docker.internal:2710",
+   "host.docker.internal:2711",
+   "host.docker.internal:2712",
+   "host.docker.internal:2713",
+   "host.docker.internal:2714",
+   "host.docker.internal:2715"
+  ],
+  "labels": {
+   "setup": "adhoc"
+  }
+ },
+ {
+  "targets": [
+   "host.docker.internal:2800",
+   "host.docker.internal:2801",
+   "host.docker.internal:2802"
+  ],
+  "labels": {
+   "setup": "e2e"
+  }
+ },
+ {
+  "targets": [
+   "host.docker.internal:7100",
+   "host.docker.internal:7101",
+   "host.docker.internal:7102",
+   "host.docker.internal:7103",
+   "host.docker.internal:7104",
+   "host.docker.internal:7105"
+  ],
+  "labels": {
+   "setup": "cluster"
+  }
+ },
+ {
+  "targets": [
+   "host.docker.internal:7700",
+   "host.docker.internal:7701",
+   "host.docker.internal:7702",
+   "host.docker.internal:7703",
+   "host.docker.internal:7704",
+   "host.docker.internal:7705"
+  ],
+  "labels": {
+   "setup": "ha-ctr"
+  }
+ }
+]

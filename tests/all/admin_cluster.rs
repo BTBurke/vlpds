@@ -30,14 +30,36 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
     .await
 }
 
-/// Waits until every node owns some shards and together they own each once.
+/// Waits until the shards are spread at fair share (sizes within one of each
+/// other, each shard owned once) and the assignment holds still for 500 ms:
+/// "every node owns something" can still be mid-rebalance (e.g. 6/1/1), and
+/// later moves would carry a node's accounts off it.
 async fn balanced(nodes: &[&TestServer]) {
-    for _ in 0..200 {
-        let owned: Vec<Vec<u16>> =
-            nodes.iter().map(|n| n.app.partitions.owned().iter().map(|p| p.id).collect()).collect();
+    let mut stable_since: Option<(Vec<Vec<u16>>, std::time::Instant)> = None;
+    for _ in 0..400 {
+        let owned: Vec<Vec<u16>> = nodes
+            .iter()
+            .map(|n| {
+                let mut v: Vec<u16> = n.app.partitions.owned().iter().map(|p| p.id).collect();
+                v.sort();
+                v
+            })
+            .collect();
         let all: HashSet<u16> = owned.iter().flatten().copied().collect();
-        if owned.iter().all(|o| !o.is_empty()) && all.len() == SHARDS as usize && owned.iter().map(|o| o.len()).sum::<usize>() == SHARDS as usize {
-            return;
+        let sizes: Vec<usize> = owned.iter().map(|o| o.len()).collect();
+        let fair = sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1;
+        let complete = all.len() == SHARDS as usize && sizes.iter().sum::<usize>() == SHARDS as usize;
+        if fair && complete {
+            match &stable_since {
+                Some((prev, at)) if *prev == owned => {
+                    if at.elapsed() >= Duration::from_millis(500) {
+                        return;
+                    }
+                }
+                _ => stable_since = Some((owned, std::time::Instant::now())),
+            }
+        } else {
+            stable_since = None;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -169,6 +191,8 @@ async fn admin_listings_scatter_gather_across_nodes() {
         writer: 254,
         expires_ms: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() + 60_000) as u64,
         renewals: 1,
+        next_ordinal: 0,
+        draining: false,
     };
     store
         .put(&object_store::path::Path::from("vlpds/nodes/adm-ghost"), serde_json::to_vec(&lease).unwrap().into())

@@ -31,6 +31,8 @@ pub struct Node {
     pub workers: Workers,
     pub cache_dir: Option<std::path::PathBuf>,
     pub internal_token: String,
+    /// Node-to-node client (nudges).
+    pub http: crate::http::PeerClient,
     followers: Mutex<HashMap<String, Follower>>,
 }
 
@@ -47,6 +49,7 @@ impl Node {
         workers: Workers,
         cache_dir: Option<std::path::PathBuf>,
         internal_token: String,
+        http: crate::http::PeerClient,
     ) -> Arc<Node> {
         Arc::new(Node {
             cluster,
@@ -59,6 +62,7 @@ impl Node {
             workers,
             cache_dir,
             internal_token,
+            http,
             followers: Mutex::new(HashMap::new()),
         })
     }
@@ -145,6 +149,7 @@ impl ShardHost for Node {
                 Err(e) => results.push((s, Err(e))),
             }
         }
+        let opened_ms = started.elapsed().as_millis() as u64;
         // 2. one batched replay of previous owners' log tails
         let plan: Vec<(u16, &slatedb::Db, &[Span])> = ready.iter().map(|(s, _, h, db)| (*s, db.as_ref(), h.as_slice())).collect();
         let replayed = match nodelog::replay_many(&self.store, &plan).await {
@@ -157,13 +162,16 @@ impl ShardHost for Node {
                 return results;
             }
         };
-        // 3. make replayed state durable, then serve
+        let replayed_ms = started.elapsed().as_millis() as u64;
+        // 3. make replayed state durable, then serve (nothing to flush after
+        //    a handback: the releaser checkpointed, so nothing was replayed)
         let flushed: Vec<(u16, u64, Arc<slatedb::Db>, anyhow::Result<()>)> = futures::stream::iter(ready)
             .map(|(s, e, _, db)| async move {
-                let r = db
-                    .flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
-                    .await
-                    .map_err(anyhow::Error::from);
+                let r = if replayed == 0 {
+                    Ok(())
+                } else {
+                    db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.map_err(anyhow::Error::from)
+                };
                 (s, e, db, r)
             })
             .buffer_unordered(32)
@@ -192,7 +200,7 @@ impl ShardHost for Node {
             results.push((shard, Ok(())));
         }
         crate::metrics::OWNED_PARTITIONS.set(self.table.owned().len() as i64);
-        tracing::info!(shards = n, segments_replayed = replayed, elapsed_ms = started.elapsed().as_millis() as u64, "shards opened");
+        tracing::info!(shards = n, segments_replayed = replayed, opened_ms, replayed_ms, elapsed_ms = started.elapsed().as_millis() as u64, "shards opened");
         results
     }
 
@@ -281,6 +289,7 @@ impl ShardHost for Node {
                 Err(e) => results.push((k.id, Err(e))),
             }
         }
+        let drained_ms = started.elapsed().as_millis() as u64;
         // 4. checkpoint + close so the successor replays nothing
         let ord = self.log.durable_ordinal.load(Ordering::Acquire);
         let closed: Vec<(u16, anyhow::Result<()>)> = futures::stream::iter(drained)
@@ -292,7 +301,7 @@ impl ShardHost for Node {
                         wb.put(nodelog::META_APPLIED, nodelog::encode_marker(&self.log.log_id, ord));
                         k.db.write(wb).await?;
                     }
-                    k.db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await?;
+                    // closing flushes the memtable (and fails if it can't)
                     self.log.sinks.remove(k.id);
                     k.db.close().await?;
                     crate::metrics::LEASE_EVENTS.with_label_values(&["closed"]).inc();
@@ -306,7 +315,7 @@ impl ShardHost for Node {
             .await;
         results.extend(closed);
         crate::metrics::OWNED_PARTITIONS.set(self.table.owned().len() as i64);
-        tracing::info!(shards = results.len(), elapsed_ms = started.elapsed().as_millis() as u64, "shards closed");
+        tracing::info!(shards = results.len(), drained_ms, elapsed_ms = started.elapsed().as_millis() as u64, "shards closed");
         results
     }
 
@@ -329,5 +338,9 @@ impl ShardHost for Node {
 
     fn on_membership(&self) {
         self.sync_followers();
+    }
+
+    async fn nudge(&self, nudges: Vec<(String, Vec<crate::cluster::Handoff>)>) {
+        crate::xrpc::internal::nudge_peers(&self.http, &self.internal_token, nudges).await;
     }
 }

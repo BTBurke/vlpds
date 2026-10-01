@@ -320,31 +320,31 @@ async fn get_blocks(
         }
     }
     assert_available(&app, &did, creds.as_ref()).await?;
-    let (head, tree, snap) = consistent_tree(&app, &did).await?;
+    let (view, snap) = app.repo_view(&did).await?;
     let mut found: HashMap<Cid, Vec<u8>> = HashMap::new();
-    if want.contains(&head.commit) {
-        found.insert(head.commit, head.commit_block.to_vec());
+    if want.contains(&view.head.commit) {
+        found.insert(view.head.commit, view.head.commit_block.to_vec());
     }
-    let wanted: HashSet<Cid> = want.iter().copied().filter(|c| !found.contains_key(c)).collect();
-    // node blocks + one path per record CID, in one pass that stops early
-    let mut records: HashMap<Cid, Vec<u8>> = HashMap::new();
-    tree.find_cids(&wanted, &mut found, &mut records)
-        .map_err(XrpcError::from_err)?;
-    for (c, key) in records {
-        if found.contains_key(&c) {
-            continue;
-        }
-        let path = String::from_utf8_lossy(&key).into_owned();
-        if let Some(v) =
-            snap.get(state::record_key(&did, &path))
-                .await
-                .map_err(XrpcError::from_err)?
-        {
-            let (cid, bytes) = state::decode_record_value(&v).map_err(XrpcError::from_err)?;
-            if cid == c {
-                found.insert(c, bytes.to_vec());
+    // MST nodes, if the node index already covers this version
+    let rest = |found: &HashMap<Cid, Vec<u8>>| -> Vec<Cid> {
+        want.iter().filter(|c| !found.contains_key(c)).copied().collect()
+    };
+    let todo = rest(&found);
+    if !todo.is_empty() {
+        found.extend(find_nodes(&view, todo, false).await?);
+    }
+    // records, by the record CID index (c/ keys) of the matching snapshot
+    for c in rest(&found) {
+        if c.codec == crate::cid::CODEC_DAG_CBOR {
+            if let Some(b) = find_record(&snap, &did, &c).await? {
+                found.insert(c, b);
             }
         }
+    }
+    // the rest can only be nodes: build the index from this view if needed
+    let todo = rest(&found);
+    if !todo.is_empty() {
+        found.extend(find_nodes(&view, todo, true).await?);
     }
     let missing: Vec<String> = want
         .iter()
@@ -371,6 +371,72 @@ async fn get_blocks(
         car::write_block(&mut out, c, &found[c]);
     }
     Ok(car_response(out))
+}
+
+/// A record block by CID: the c/ index names the paths holding that CID
+/// (or one sharing its key prefix); the record at a path must match.
+async fn find_record(snap: &slatedb::DbSnapshot, did: &str, cid: &Cid) -> XResult<Option<Vec<u8>>> {
+    let prefix = state::record_cid_prefix(did, cid);
+    let mut iter = snap
+        .scan(prefix.clone()..state::prefix_end(&prefix))
+        .await
+        .map_err(XrpcError::from_err)?;
+    while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
+        let Ok(path) = std::str::from_utf8(&kv.key[prefix.len()..]) else {
+            continue;
+        };
+        if let Some(v) = snap.get(state::record_key(did, path)).await.map_err(XrpcError::from_err)? {
+            let (c, bytes) = state::decode_record_value(&v).map_err(XrpcError::from_err)?;
+            if c == *cid {
+                return Ok(Some(bytes.to_vec()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// MST node blocks by CID from the repo's node index (O(depth) each). With
+/// `build`, an index that doesn't cover this view's version is rebuilt from
+/// the view (one walk, on the blocking pool), then kept up to date by the
+/// repo worker; without, nothing is found unless one already covers it.
+async fn find_nodes(
+    view: &Arc<crate::worker::DurableView>,
+    cids: Vec<Cid>,
+    build: bool,
+) -> XResult<Vec<(Cid, Vec<u8>)>> {
+    use crate::mst::{MstError, NodeIndex};
+    fn get(view: &crate::worker::DurableView, ix: &NodeIndex, cids: &[Cid]) -> Result<Vec<(Cid, Vec<u8>)>, MstError> {
+        let mut out = Vec::new();
+        for c in cids {
+            if let Some(b) = view.tree.find_node(c, ix)? {
+                out.push((*c, b));
+            }
+        }
+        Ok(out)
+    }
+    let rev = view.head.rev.0;
+    {
+        let mut cell = view.nodes.lock();
+        if let Some(ix) = cell.index.as_ref().filter(|ix| ix.covers(rev)) {
+            return get(view, ix, &cids).map_err(XrpcError::from_err);
+        }
+        if !build {
+            return Ok(Vec::new());
+        }
+        // from now on the worker reports written nodes, so the index built
+        // below can catch up with commits made meanwhile
+        cell.wanted = true;
+    }
+    let view = view.clone();
+    tokio::task::spawn_blocking(move || {
+        let ix = NodeIndex::build(&view.tree, rev)?;
+        let out = get(&view, &ix, &cids)?;
+        view.nodes.lock().install(ix);
+        Ok::<_, MstError>(out)
+    })
+    .await
+    .map_err(XrpcError::from_err)?
+    .map_err(XrpcError::from_err)
 }
 
 #[derive(Deserialize)]
@@ -656,13 +722,8 @@ struct SubQ {
     cursor: Option<i64>,
 }
 
-async fn subscribe_repos(
-    State(app): AppState,
-    Query(q): Query<SubQ>,
-    ws: WebSocketUpgrade,
-) -> Response {
-    let fh = app.firehose.clone();
-    ws.on_upgrade(move |socket| fh.serve(socket, q.cursor))
+async fn subscribe_repos(State(app): AppState, Query(q): Query<SubQ>, req: axum::extract::Request) -> Response {
+    app.firehose.upgrade(req, q.cursor)
 }
 
 /// Asks each configured relay (`config.crawlers`) to crawl this PDS:
@@ -670,16 +731,7 @@ async fn subscribe_repos(
 /// Failures are logged, not returned.
 pub async fn request_crawl(app: Arc<App>) {
     let hostname = public_hostname(&app.config.public_url);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!("requestCrawl: http client: {e}");
-            return;
-        }
-    };
+    let client = crate::http::public();
     let reqs = app
         .config
         .crawlers
@@ -693,11 +745,12 @@ pub async fn request_crawl(app: Arc<App>) {
                 format!("https://{crawler}")
             };
             let url = format!("{base}/xrpc/com.atproto.sync.requestCrawl");
-            let (client, hostname) = (client.clone(), hostname.clone());
+            let hostname = hostname.clone();
             async move {
                 match client
                     .post(&url)
                     .json(&json!({"hostname": hostname}))
+                    .timeout(std::time::Duration::from_secs(10))
                     .send()
                     .await
                 {

@@ -53,3 +53,18 @@ checker host="http://127.0.0.1:2620" *args:
 # Production image (Dockerfile: UI build, release build, slim non-root runtime)
 docker-build tag="vlpds:local":
     docker build -t {{tag}} .
+
+# Observability stack for load tests (bench/obs/README.md): Prometheus (1 s scrapes) :9090,
+# Grafana (vlpds dashboard, anonymous admin) :3300, Pyroscope :4040, all on 127.0.0.1
+obs-up:
+    python3 bench/obs/minio-token.py
+    docker compose -f bench/obs/docker-compose.yml up -d --wait
+    @echo "grafana http://127.0.0.1:3300/d/vlpds  prometheus http://127.0.0.1:9090  pyroscope http://127.0.0.1:4040"
+
+# Stop the observability stack (keeps its data; `docker compose -f bench/obs/docker-compose.yml down -v` wipes it)
+obs-down:
+    docker compose -f bench/obs/docker-compose.yml down
+
+# CPU profile of a running vlpds (built with --features profiling): top functions by self and cumulative time
+profile host="127.0.0.1:2583" seconds="10" *args:
+    bench/obs/profile.sh {{args}} {{host}} {{seconds}}

@@ -18,21 +18,31 @@ pub struct Mutation {
 // a *fence* object written at its next ordinal (If-None-Match), after which
 // the writer can never append again.
 //
-// "VLSEG02\n"
-// header: log_id_len u16 | log_id | ordinal u64 | first_seq i64 | last_seq i64 | count u32
+// "VLSEG03\n"
+// header: log_id_len u16 | log_id | ordinal u64 | prefix_end u64
+//         | first_seq i64 | last_seq i64 | count u32
 // entry:  seq i64 | shard u16 | epoch u64 | frame_len u32 | frame
 //         | mut_count u32 | (key_len u16 | key | val_len u32 (MAX = delete) | val)*
 //
 // "VLFENCE\n" | fenced_by (utf8)
+//
+// Up to K segment PUTs are in flight per log, so a crash can leave holes
+// (ordinal n missing, n+1 present). `prefix_end` is the writer's promise when
+// it sealed the segment: every ordinal below it was already durable. Holes
+// can therefore only sit in [prefix_end, ordinal), at most K - 1 ordinals,
+// which lets a reader prove a segment is inside the log's gap-free prefix
+// with a bounded number of probes (see `nodelog::in_prefix`).
 // ---------------------------------------------------------------------------
 
-pub const MAGIC: &[u8; 8] = b"VLSEG02\n";
+pub const MAGIC: &[u8; 8] = b"VLSEG03\n";
 pub const FENCE_MAGIC: &[u8; 8] = b"VLFENCE\n";
 
 #[derive(Clone, Debug)]
 pub struct SegHeader {
     pub log_id: String,
     pub ordinal: u64,
+    /// Every ordinal below this was durable when this segment was sealed.
+    pub prefix_end: u64,
     pub first_seq: i64,
     pub last_seq: i64,
     pub count: u32,
@@ -114,14 +124,22 @@ impl SegmentBuilder {
         start..end
     }
 
+    /// Header bytes for a segment written after every earlier ordinal was
+    /// durable (a dense log: `prefix_end` = `ordinal`).
+    pub fn header(&self, log_id: &str, ordinal: u64) -> Vec<u8> {
+        self.sealed_header(log_id, ordinal, ordinal)
+    }
+
     /// Header bytes; entry ranges returned by `push` are relative to the body,
     /// so add the header length to address the full object.
-    pub fn header(&self, log_id: &str, ordinal: u64) -> Vec<u8> {
-        let mut h = Vec::with_capacity(40 + log_id.len());
+    pub fn sealed_header(&self, log_id: &str, ordinal: u64, prefix_end: u64) -> Vec<u8> {
+        debug_assert!(prefix_end <= ordinal);
+        let mut h = Vec::with_capacity(48 + log_id.len());
         h.put_slice(MAGIC);
         h.put_u16(log_id.len() as u16);
         h.put_slice(log_id.as_bytes());
         h.put_u64(ordinal);
+        h.put_u64(prefix_end);
         h.put_i64(self.first_seq);
         h.put_i64(self.last_seq);
         h.put_u32(self.count);
@@ -136,30 +154,41 @@ pub fn fence_object(by: &str) -> Bytes {
     b.into()
 }
 
-/// Parses a v2 log object (segment or fence). With `shard` set, only that
+/// Parses just the header of a log object (a prefix of it is enough): None
+/// for a fence. Returns the header and its length.
+pub fn parse_header(data: &[u8]) -> anyhow::Result<Option<(SegHeader, usize)>> {
+    if data.starts_with(FENCE_MAGIC) {
+        return Ok(None);
+    }
+    anyhow::ensure!(data.len() >= 10 && data.starts_with(MAGIC), "bad segment magic");
+    let idlen = u16::from_be_bytes(data[8..10].try_into()?) as usize;
+    let pos = 10 + idlen;
+    anyhow::ensure!(data.len() >= pos + 36, "truncated segment header");
+    let rd8 = |p: usize| -> [u8; 8] { data[p..p + 8].try_into().unwrap() };
+    let h = SegHeader {
+        log_id: String::from_utf8(data[10..pos].to_vec())?,
+        ordinal: u64::from_be_bytes(rd8(pos)),
+        prefix_end: u64::from_be_bytes(rd8(pos + 8)),
+        first_seq: i64::from_be_bytes(rd8(pos + 16)),
+        last_seq: i64::from_be_bytes(rd8(pos + 24)),
+        count: u32::from_be_bytes(data[pos + 32..pos + 36].try_into()?),
+    };
+    anyhow::ensure!(h.prefix_end <= h.ordinal, "segment {} has prefix_end {} past it", h.ordinal, h.prefix_end);
+    Ok(Some((h, pos + 36)))
+}
+
+/// Parses a log object (segment or fence). With `shard` set, only that
 /// shard's entries are returned (handoff replay).
 pub fn parse(data: Bytes, with_muts: bool, shard: Option<u16>) -> anyhow::Result<LogObject> {
-    if data.len() >= 8 && &data[..8] == FENCE_MAGIC {
+    let Some((h, mut pos)) = parse_header(&data)? else {
         return Ok(LogObject::Fence { by: String::from_utf8_lossy(&data[8..]).into_owned() });
-    }
-    anyhow::ensure!(data.len() >= 10 && &data[..8] == MAGIC, "bad v2 segment magic");
+    };
     let need = |pos: usize, n: usize| -> anyhow::Result<()> {
         anyhow::ensure!(pos + n <= data.len(), "truncated segment");
         Ok(())
     };
-    let mut pos = 8;
-    let idlen = u16::from_be_bytes(data[pos..pos + 2].try_into()?) as usize;
-    pos += 2;
-    need(pos, idlen + 28)?;
-    let log_id = String::from_utf8(data[pos..pos + idlen].to_vec())?;
-    pos += idlen;
     let rd8 = |p: usize| -> [u8; 8] { data[p..p + 8].try_into().unwrap() };
-    let ordinal = u64::from_be_bytes(rd8(pos));
-    let first_seq = i64::from_be_bytes(rd8(pos + 8));
-    let last_seq = i64::from_be_bytes(rd8(pos + 16));
-    let count = u32::from_be_bytes(data[pos + 24..pos + 28].try_into()?);
-    pos += 28;
-    let h = SegHeader { log_id, ordinal, first_seq, last_seq, count };
+    let count = h.count;
     let mut out = Vec::new();
     for _ in 0..count {
         need(pos, 22)?;
@@ -214,10 +243,13 @@ mod tests {
         b.push(10, 3, 7, |o| o.extend_from_slice(b"frame-a"), &[m("k1", Some("v1"))]);
         b.push(11, 5, 1, |o| o.extend_from_slice(b"frame-b"), &[m("k2", None)]);
         b.push(12, 3, 7, |_| {}, &[m("k3", Some("v3"))]);
-        let mut obj = b.header("node-a.1", 42);
+        let mut obj = b.sealed_header("node-a.1", 42, 39);
         obj.extend_from_slice(&b.body);
         let LogObject::Segment(h, all) = parse(Bytes::from(obj.clone()), true, None).unwrap() else { panic!() };
-        assert_eq!((h.log_id.as_str(), h.ordinal, h.first_seq, h.last_seq, h.count), ("node-a.1", 42, 10, 12, 3));
+        assert_eq!((h.log_id.as_str(), h.ordinal, h.prefix_end, h.first_seq, h.last_seq, h.count), ("node-a.1", 42, 39, 10, 12, 3));
+        let (hh, len) = parse_header(&obj[..60]).unwrap().unwrap();
+        assert_eq!((hh.ordinal, hh.prefix_end, len), (42, 39, b.header("node-a.1", 42).len()));
+        assert!(parse_header(&fence_object("node-b")).unwrap().is_none());
         assert_eq!(all.len(), 3);
         assert_eq!(&all[1].frame[..], b"frame-b");
         assert!(all[1].muts[0].val.is_none());

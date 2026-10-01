@@ -56,13 +56,35 @@ pub async fn open_db(
     partition: u16,
     cache_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<Db> {
+    // Per-shard LSM shape. A whole repo lives in one shard, so one shard must
+    // absorb a bulk import (bench 2026-10-02 §4). With 8 MiB L0s and
+    // SlateDB's default cap of 8, L0 filled in ~2 s at 25 MB/s and then
+    // waited a full compaction cycle (coordinator poll 5 s + worker poll
+    // 5 s ± 2.5 + commit 1 s + manifest poll 1 s): 4-11 s write stalls, and
+    // since the finalizer awaits every shard's apply, the whole node stalled.
+    // Now L0 holds 32 x 16 MiB = 512 MiB, more than a slow cycle's worth of
+    // ingest, so compaction catches up without backpressure (one shard,
+    // 2M records, 10 ms store calls: worst write 11.8 s -> 6 ms at 50k
+    // records/s, 34 ms at 80k/s; tests/all/shard_ingest.rs). L0s live in the
+    // object store and are bloom-filtered, so the cost is read
+    // amplification only while compaction lags. The polls stay at their
+    // defaults: at 1 s they also absorb unpaced bursts, but cost ~4x the
+    // idle GETs across 256 shards.
+    //
+    // Memory: the active memtable freezes at 16 MiB (the 10 s node
+    // checkpoint flushes idle shards' sooner), so memtables total at most
+    // min(shards x 16 MiB, ingest rate x 10 s). `max_unflushed_bytes` only
+    // binds on a shard whose flushes are blocked, and while one shard is
+    // blocked the node log's finalizer stops feeding every shard, so the
+    // blocked shard's 128 MiB is the only excess: no node-wide budget needed.
     let mut settings = slatedb::Settings {
         wal_enabled: false,
         flush_interval: Some(Duration::from_millis(100)),
-        // Many shards per node: keep each memtable small (the node checkpoint
-        // also flushes every shard periodically).
-        l0_sst_size_bytes: 8 * 1024 * 1024,
-        max_unflushed_bytes: 64 * 1024 * 1024,
+        l0_sst_size_bytes: 16 << 20,
+        l0_max_ssts: 32,
+        l0_max_ssts_per_key: 32,
+        // room for the active memtable plus l0_flush_parallelism (4) uploads
+        max_unflushed_bytes: 128 << 20,
         ..Default::default()
     };
     if let Some(dir) = cache_dir {
@@ -82,7 +104,7 @@ pub async fn open_db(
         path.hash(&mut h);
         h.finish()
     };
-    Ok(Db::builder(path, store.raw.clone())
+    Ok(crate::metrics::with_slatedb_metrics(Db::builder(path, store.raw.clone()))
         .with_settings(settings)
         .with_db_cache(shared_db_cache(), cache_id)
         .with_sst_block_size(slatedb::SstBlockSize::Block16Kib)

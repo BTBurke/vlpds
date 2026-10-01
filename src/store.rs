@@ -33,8 +33,17 @@ impl Store {
             .with_region(&cfg.region)
             .with_virtual_hosted_style_request(false)
             .with_client_options(
+                // HTTP/1.1 pool (object_store's default, stated: h2 to S3 is
+                // slower and S3 caps streams per connection). S3 closes idle
+                // connections after ~20 s; dropping ours at 15 s avoids
+                // reusing one the server is closing (a reset on the next
+                // request). TCP keepalive isn't exposed by ClientOptions; a
+                // busy pool doesn't need it and an idle one is closed at 15 s.
                 object_store::ClientOptions::new()
+                    .with_http1_only()
                     .with_pool_max_idle_per_host(256)
+                    .with_pool_idle_timeout(Duration::from_secs(15))
+                    .with_connect_timeout(Duration::from_secs(2))
                     .with_timeout(Duration::from_secs(30))
                     // must be set after with_client_options would overwrite it
                     .with_allow_http(cfg.endpoint.starts_with("http://")),

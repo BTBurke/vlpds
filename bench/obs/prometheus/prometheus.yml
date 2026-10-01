@@ -1,0 +1,42 @@
+# Scrapes every second for high-resolution load-test graphs. vlpds nodes run
+# natively on the host (Docker reaches them via host.docker.internal) on the
+# ports the bench scripts use: targets/vlpds.json (re-read every 5 s; down
+# targets just show up=0).
+global:
+  scrape_interval: 1s
+  scrape_timeout: 900ms
+  evaluation_interval: 1s
+
+scrape_configs:
+  - job_name: vlpds
+    file_sd_configs:
+      - files: [/etc/prometheus/targets/vlpds.json]
+        refresh_interval: 5s
+    relabel_configs:
+      # instance = 127.0.0.1:<port>, as the bench scripts and logs name nodes
+      - source_labels: [__address__]
+        regex: "[^:]+:(\\d+)"
+        target_label: instance
+        replacement: "127.0.0.1:$1"
+
+  # Native MinIO (:9200, bench.py) and the docker-compose one (:9000, just bench).
+  # Bearer token: prometheus/minio.token, written by `just obs-up` (minio-token.py).
+  - job_name: minio
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    metrics_path: /minio/v2/metrics/cluster
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/minio.token
+    static_configs:
+      - targets: ["host.docker.internal:9200", "host.docker.internal:9000"]
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "[^:]+:(\\d+)"
+        target_label: instance
+        replacement: "127.0.0.1:$1"
+
+  - job_name: prometheus
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["localhost:9090"]

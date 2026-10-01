@@ -13,7 +13,9 @@
 //! has subscribed us, it catches up from S3 after the last ordinal it
 //! delivered, then dedupes against the stream. When the peer dies, the
 //! follower drains the log from S3 up to its fence object and then retires
-//! (the host removes its firehose source).
+//! (the host removes its firehose source). S3 reads are sequential and stop
+//! at the first missing ordinal or the fence, so they only ever deliver the
+//! log's gap-free durable prefix, never segments a crash left past a hole.
 
 use crate::firehose::Firehose;
 use crate::nodelog::{segment_path, LiveRecv, LogBatch, NodeLog};
@@ -280,5 +282,51 @@ async fn next_msg(ws: &mut Ws, log_id: &str, base: &str) -> anyhow::Result<Optio
         })),
         Ok(None) => Ok(None),
         Err(_) => anyhow::bail!("log {log_id} stream from {base} idle for {STREAM_IDLE_TIMEOUT:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::segment::SegmentBuilder;
+    use object_store::PutPayload;
+
+    async fn put(store: &Store, ord: u64, prefix_end: u64) {
+        let mut b = SegmentBuilder::new();
+        b.push(1000 + ord as i64, 0, 1, |o| o.extend_from_slice(b"f"), &[]);
+        let mut obj = b.sealed_header("A", ord, prefix_end);
+        obj.extend_from_slice(&b.body);
+        store.raw.put(&segment_path(store, "A", ord), PutPayload::from(obj)).await.unwrap();
+    }
+
+    /// Draining a dead log delivers its gap-free prefix up to the fence and
+    /// nothing past it (segments a crash left beyond the hole).
+    #[tokio::test]
+    async fn catch_up_stops_at_the_fence_before_garbage() {
+        let store = Store::memory(None);
+        put(&store, 0, 0).await;
+        put(&store, 1, 0).await;
+        put(&store, 3, 2).await; // landed while 2 was in flight; 2 never did
+        let log_id: Arc<str> = "A".into();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let wm = AtomicI64::new(0);
+        let mut next = None;
+        // not fenced yet: delivers 0, 1 and waits at the hole
+        assert!(!catch_up(&log_id, &store, 0, &tx, &wm, &mut next).await.unwrap());
+        assert_eq!(next, Some(2));
+        store.raw.put(&segment_path(&store, "A", 2), PutPayload::from_bytes(segment::fence_object("B"))).await.unwrap();
+        assert!(catch_up(&log_id, &store, 0, &tx, &wm, &mut next).await.unwrap());
+        drop(tx);
+        let mut ords = Vec::new();
+        while let Some(b) = rx.recv().await {
+            ords.push(b.ordinal);
+        }
+        assert_eq!(ords, vec![0, 1]);
+        assert_eq!(wm.load(Ordering::Acquire), 1001);
+        // a follower starting late seeks into the prefix, never past the fence
+        let mut next = None;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(catch_up(&log_id, &store, 1002, &tx, &wm, &mut next).await.unwrap());
+        assert_eq!(next, Some(2));
     }
 }

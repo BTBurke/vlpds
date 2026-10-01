@@ -239,20 +239,7 @@ async fn check_new_handle(app: &App, handle: &str, did: &str) -> XResult<()> {
     if app.config.dev_mode {
         return Ok(());
     }
-    let url = format!("https://{handle}/.well-known/atproto-did");
-    let resolved = async {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .ok()?;
-        let r = client.get(&url).send().await.ok()?;
-        if !r.status().is_success() {
-            return None;
-        }
-        let body = r.text().await.ok()?;
-        Some(body.lines().next().unwrap_or("").trim().to_string())
-    }
-    .await;
+    let resolved = well_known_did(handle, false).await.ok();
     if resolved.as_deref() != Some(did) {
         return Err(XrpcError::bad(
             "InvalidRequest",
@@ -260,6 +247,35 @@ async fn check_new_handle(app: &App, handle: &str, did: &str) -> XResult<()> {
         ));
     }
     Ok(())
+}
+
+/// The DID served at `https://{handle}/.well-known/atproto-did`, fetched with
+/// the SSRF-guarded client (outside dev mode a handle resolving to a private
+/// or loopback address is refused before connecting), a 5 s deadline and a
+/// small body cap.
+async fn well_known_did(handle: &str, dev_mode: bool) -> Result<String, String> {
+    use futures::StreamExt;
+    const MAX_BYTES: usize = 2048;
+    let url = format!("https://{handle}/.well-known/atproto-did");
+    let fetch = async {
+        let r = crate::http::guarded(dev_mode).get(&url).send().await.map_err(|e| format!("{e:?}"))?;
+        if !r.status().is_success() {
+            return Err(format!("status {}", r.status()));
+        }
+        let mut buf = Vec::new();
+        let mut s = r.bytes_stream();
+        while let Some(c) = s.next().await {
+            buf.extend_from_slice(&c.map_err(|e| e.to_string())?);
+            if buf.len() > MAX_BYTES {
+                return Err("response too large".into());
+            }
+        }
+        let body = String::from_utf8_lossy(&buf);
+        Ok(body.lines().next().unwrap_or("").trim().to_string())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), fetch)
+        .await
+        .map_err(|_| "timed out".to_string())?
 }
 
 async fn update_handle(
@@ -365,5 +381,18 @@ async fn plc_unsupported() -> XrpcError {
         status: StatusCode::NOT_IMPLEMENTED,
         error: "MethodNotImplemented".into(),
         message: "PLC operations are not supported: this PDS mints did:plc identifiers locally without registering them with a PLC directory".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn well_known_check_refuses_private_hosts() {
+        // "localhost" resolves to loopback only: refused at resolution,
+        // before any connection
+        let e = well_known_did("localhost", false).await.unwrap_err();
+        assert!(e.contains("public unicast"), "{e}");
     }
 }

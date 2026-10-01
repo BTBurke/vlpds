@@ -6,8 +6,9 @@
 //!   nodes/{node_id}     NodeLease {log_id, addr, writer, renewals, ..}  renewed by the node
 //!   writers/{w:03}      WriterClaim {node_id, log_id, confirmed}  unique seq low byte among live nodes
 //!   assign/{shard:03}   Assignment {owner, log_id, addr, epoch, seq_floor, history[Span]}
-//!                       changes only when a shard moves
-//!   log/{log}/{ord}.seg a fence object at a dead log's next ordinal closes it
+//!                       changes only when a shard moves: taken by CAS, or
+//!                       handed by its owner straight to a joiner (see `Handoff`)
+//!   log/{log}/{ord}.seg a fence object at a dead log's first hole closes it
 //!
 //! Liveness never compares wall clocks across nodes. A peer is presumed dead
 //! once its lease object has not changed for TTL + skew of *our* monotonic
@@ -47,6 +48,13 @@ pub struct NodeLease {
     /// Bumped on every write, so every renewal changes the object (and its
     /// ETag): peers judge liveness by seeing it change.
     pub renewals: u64,
+    /// Our log's next ordinal as of this renewal. Ordinals only grow, so a
+    /// peer handing us a shard starts our span here: a lower bound on our
+    /// first entry for it.
+    pub next_ordinal: u64,
+    /// Set by a graceful shutdown before it hands its shards out: peers stop
+    /// counting it toward fair shares and never hand it shards.
+    pub draining: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -61,6 +69,21 @@ pub struct Assignment {
     pub seq_floor: i64,
     /// Chronological ownership spans (last may be open).
     pub history: Vec<Span>,
+}
+
+/// A shard handed straight to a joiner: the releaser closed it and CASed its
+/// assignment to name the joiner (epoch + 1, the releaser's span closed at
+/// its barrier, a new open span for the joiner), then POSTs this to the
+/// joiner's /internal/v1/cluster/nudge. The joiner adopts it without a
+/// control-plane read: replays `history` minus its own span and serves once
+/// its seqs pass `seq_floor`. If the nudge is lost, the joiner's next step
+/// finds the same assignment and adopts it then.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Handoff {
+    pub shard: u16,
+    pub assignment: Assignment,
+    /// ETag of the handed assignment (our release CAS later starts from it).
+    pub etag: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +144,10 @@ pub trait ShardHost: Send + Sync + 'static {
     fn lost(&self);
     /// Called after every membership refresh (e.g. to follow peers' logs).
     fn on_membership(&self) {}
+    /// POSTs /internal/v1/cluster/nudge to each `(addr, handoffs)`: the node
+    /// adopts the shards handed to it, and steps at once instead of on its
+    /// next tick. Best effort: a missed nudge costs a step interval.
+    async fn nudge(&self, _nudges: Vec<(String, Vec<Handoff>)>) {}
 }
 
 /// What we last saw of a peer's lease, timed on our monotonic clock.
@@ -128,6 +155,8 @@ struct Seen {
     etag: Option<String>,
     lease: NodeLease,
     changed_at: Instant,
+    /// When we first saw this incarnation (log_id) of the peer.
+    first_seen: Instant,
 }
 
 /// Re-read every assignment (not only those whose ETag changed in the
@@ -173,6 +202,16 @@ pub struct Cluster {
     gone: AtomicBool,
     /// Held across each renewal so shutdown can't delete the lease under one.
     renew_lock: tokio::sync::Mutex<()>,
+    /// Wakes the step loop early (a peer released shards for us).
+    nudged: tokio::sync::Notify,
+    /// Shards peers handed us that we haven't adopted yet.
+    handed: parking_lot::Mutex<Vec<Handoff>>,
+    /// Highest epoch of each shard this incarnation has opened. An
+    /// assignment naming us at a newer epoch was handed to us; at an epoch we
+    /// already opened it is ours from before (e.g. a release CAS that failed)
+    /// and must not be adopted again: its history minus our span would
+    /// replay older owners' writes over ours.
+    opened: RwLock<HashMap<u16, u64>>,
 }
 
 fn now_ms() -> u64 {
@@ -192,7 +231,7 @@ impl Cluster {
             writer: 0,
             store,
             lease_etag: RwLock::new(None),
-            lease: RwLock::new(NodeLease { node_id: cfg.node_id.clone(), log_id, addr: cfg.addr.clone(), writer: 0, expires_ms: 0, renewals: 0 }),
+            lease: RwLock::new(NodeLease { node_id: cfg.node_id.clone(), log_id, addr: cfg.addr.clone(), writer: 0, expires_ms: 0, renewals: 0, next_ordinal: 0, draining: false }),
             expires_local_ms: AtomicU64::new(0),
             valid_until: RwLock::new(Instant::now()),
             table: RwLock::new(vec![None; cfg.shards as usize]),
@@ -208,6 +247,9 @@ impl Cluster {
             step_lock: tokio::sync::Mutex::new(()),
             gone: AtomicBool::new(false),
             renew_lock: tokio::sync::Mutex::new(()),
+            nudged: tokio::sync::Notify::new(),
+            handed: parking_lot::Mutex::new(Vec::new()),
+            opened: RwLock::new(HashMap::new()),
             cfg,
         };
         // create (or take over our own stale) node lease
@@ -384,48 +426,38 @@ impl Cluster {
         self.fenced.read().iter().map(|(k, (o, _))| (k.clone(), *o)).collect()
     }
 
-    /// Closes a dead node's log: writes a fence object at its first free
-    /// ordinal. Returns that ordinal (the log's final end) and the last seq
-    /// in the log before it.
+    /// Closes a dead node's log: writes a fence object at the end of its
+    /// durable prefix, its first ordinal that isn't a segment (with K PUTs in
+    /// flight a crash can leave segments past a hole: those were never acked
+    /// and the fence cuts them off). Returns that ordinal (the log's final
+    /// end) and the last seq in the log before it.
     pub async fn fence(&self, log_id: &str) -> anyhow::Result<(u64, i64)> {
         if let Some(f) = self.fenced.read().get(log_id) {
             return Ok(*f);
         }
         loop {
-            let mut next = 0u64;
-            for (name, _) in self.list(&format!("log/{log_id}")).await? {
-                if let Some(ord) = name.strip_suffix(".seg").and_then(|f| f.parse::<u64>().ok()) {
-                    next = next.max(ord + 1);
-                }
-            }
-            // HA fix: if the last object is already a fence (another survivor
-            // fenced first), that ordinal is the log's end. Without this check
-            // every survivor stacked another fence after it, so spans for the same
-            // dead log ended at different ordinals.
-            if next > 0 {
-                let last = crate::nodelog::segment_path(&self.store, log_id, next - 1);
-                self.count("get");
-                if let Ok(r) = self.store.raw.get(&last).await {
-                    if matches!(crate::segment::parse(r.bytes().await?, false, None), Ok(crate::segment::LogObject::Fence { .. })) {
-                        let seq = self.last_seq_before(log_id, next - 1).await?;
-                        self.fenced.write().insert(log_id.to_string(), (next - 1, seq));
-                        return Ok((next - 1, seq));
+            // HA fix: if a fence is already there (another survivor fenced
+            // first), it is the log's end. Without this check every survivor
+            // stacked another fence after it, so spans for the same dead log
+            // ended at different ordinals. Fencers agree because the end is
+            // the first non-segment ordinal, which never changes once fenced.
+            self.count("list");
+            let (next, fenced) = crate::nodelog::first_free(&self.store, log_id).await?;
+            if !fenced {
+                let path = crate::nodelog::segment_path(&self.store, log_id, next);
+                self.count("put");
+                match self.store.raw.put_opts(&path, PutPayload::from_bytes(crate::segment::fence_object(&self.cfg.node_id)), PutOptions { mode: PutMode::Create, ..Default::default() }).await {
+                    Ok(_) => {}
+                    Err(e) if is_conflict(&e) => {
+                        // a zombie got a segment in, or another node fenced first
+                        self.count("get");
+                        let b = self.store.raw.get(&path).await?.bytes().await?;
+                        if !matches!(crate::segment::parse(b, false, None)?, crate::segment::LogObject::Fence { .. }) {
+                            continue; // re-scan: the log grew
+                        }
                     }
+                    Err(e) => return Err(e.into()),
                 }
-            }
-            let path = crate::nodelog::segment_path(&self.store, log_id, next);
-            self.count("put");
-            match self.store.raw.put_opts(&path, PutPayload::from_bytes(crate::segment::fence_object(&self.cfg.node_id)), PutOptions { mode: PutMode::Create, ..Default::default() }).await {
-                Ok(_) => {}
-                Err(e) if is_conflict(&e) => {
-                    // a zombie got a segment in, or another node fenced first
-                    self.count("get");
-                    let b = self.store.raw.get(&path).await?.bytes().await?;
-                    if !matches!(crate::segment::parse(b, false, None)?, crate::segment::LogObject::Fence { .. }) {
-                        continue; // re-scan: the log grew
-                    }
-                }
-                Err(e) => return Err(e.into()),
             }
             let seq = self.last_seq_before(log_id, next).await?;
             self.fenced.write().insert(log_id.to_string(), (next, seq));
@@ -435,13 +467,13 @@ impl Cluster {
     }
 
     /// The last seq in `log_id` below ordinal `end` (0 for an empty log).
+    /// Everything below a fence is a segment, so this reads one header.
     async fn last_seq_before(&self, log_id: &str, end: u64) -> anyhow::Result<i64> {
         let mut ord = end;
         while ord > 0 {
             ord -= 1;
             self.count("get");
-            let b = self.store.raw.get(&crate::nodelog::segment_path(&self.store, log_id, ord)).await?.bytes().await?;
-            if let crate::segment::LogObject::Segment(h, _) = crate::segment::parse(b, false, None)? {
+            if let crate::nodelog::Head::Segment(h) = crate::nodelog::read_head(&self.store, log_id, ord).await? {
                 return Ok(h.last_seq);
             }
         }
@@ -500,12 +532,116 @@ impl Cluster {
             let mut tick = tokio::time::interval(me.cfg.renew_every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                tick.tick().await;
+                // Step every tick, when a peer nudges us (it released shards
+                // for us: take them now, not up to a tick later), and once
+                // more as our join grace ends (a nudge during it is a no-op).
+                let grace_end = tokio::time::Instant::from_std(me.joined_at + me.join_grace());
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = me.nudged.notified() => {
+                        crate::metrics::CLUSTER_NUDGES.with_label_values(&["received"]).inc();
+                    }
+                    _ = tokio::time::sleep_until(grace_end), if tokio::time::Instant::now() < grace_end => {}
+                }
+                if let Err(e) = me.adopt_handed(&host).await {
+                    tracing::warn!("adopting handed shards failed: {e:#}");
+                }
                 if let Err(e) = me.step_inner(&host, false).await {
                     tracing::warn!("cluster step failed: {e:#}");
                 }
             }
         });
+    }
+
+    /// A peer handed us shards or released some: adopt / step now
+    /// (coalesced; one queued while a step runs starts right after it).
+    pub fn nudge(&self, handoffs: Vec<Handoff>) {
+        self.handed.lock().extend(handoffs);
+        self.nudged.notify_one();
+    }
+
+    /// Whether `a` names this incarnation at an epoch it hasn't opened yet:
+    /// a peer handed the shard to us.
+    fn handed_to_us(&self, shard: u16, a: &Assignment) -> bool {
+        a.owner.as_deref() == Some(&self.cfg.node_id)
+            && a.log_id.as_deref() == Some(&self.log_id)
+            && !self.is_owner(shard)
+            && self.opened.read().get(&shard).is_none_or(|&e| e < a.epoch)
+    }
+
+    /// Adopts the shards peers handed us in nudges: no control-plane read,
+    /// the nudge carries the assignment the releaser wrote.
+    async fn adopt_handed(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
+        if self.handed.lock().is_empty() {
+            return Ok(());
+        }
+        let _step = self.step_lock.lock().await;
+        let handed = std::mem::take(&mut *self.handed.lock());
+        // in our join grace (or without a lease) the step adopts them later
+        if self.stopping.load(Ordering::Acquire) || !self.lease_valid() || self.joined_at.elapsed() < self.join_grace() {
+            return Ok(());
+        }
+        let mut adopt = Vec::new();
+        for h in handed {
+            if h.shard >= self.cfg.shards || !self.handed_to_us(h.shard, &h.assignment) {
+                continue;
+            }
+            self.assigns.write()[h.shard as usize] = Some((h.assignment.clone(), h.etag));
+            adopt.push((h.shard, h.assignment));
+        }
+        self.adopt(host, adopt).await
+    }
+
+    /// Starts serving shards whose assignment already names us (handed by
+    /// their previous owner): replay the history before our own span.
+    async fn adopt(&self, host: &Arc<dyn ShardHost>, shards: Vec<(u16, Assignment)>) -> anyhow::Result<()> {
+        if shards.is_empty() {
+            return Ok(());
+        }
+        let mut floor = 0i64;
+        let mut open = Vec::with_capacity(shards.len());
+        for (s, a) in shards {
+            self.owned.write().insert(s);
+            floor = floor.max(a.seq_floor);
+            let mut history = a.history;
+            history.pop(); // our own, open span
+            open.push((s, a.epoch, history));
+        }
+        tracing::info!(shards = ?open.iter().map(|a| a.0).collect::<Vec<_>>(), owned = self.owned().len(), "adopting shards handed to us");
+        host.wait_seq_floor(floor).await;
+        self.open_acquired(host, open).await
+    }
+
+    /// Opens shards we now own and routes them to us; one that fails to open
+    /// is released (nothing was logged for it).
+    async fn open_acquired(&self, host: &Arc<dyn ShardHost>, shards: Vec<(u16, u64, Vec<Span>)>) -> anyhow::Result<()> {
+        {
+            let mut opened = self.opened.write();
+            for (s, epoch, _) in &shards {
+                opened.insert(*s, *epoch);
+            }
+        }
+        for (s, res) in host.open_many(shards).await {
+            match res {
+                Ok(()) => {
+                    self.table.write()[s as usize] = Some((self.cfg.node_id.clone(), self.cfg.addr.clone()));
+                }
+                Err(e) => {
+                    // nothing was logged for it: release with an empty span
+                    tracing::error!(shard = s, "open failed: {e:#}; releasing");
+                    self.owned.write().remove(&s);
+                    self.release(s, host.next_ordinal(), host.seq_high(), None).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// After joining, give every peer a membership refresh to discover us
+    /// (and start following our log) before we produce events, so no peer's
+    /// merged firehose has already moved past our first seqs.
+    fn join_grace(&self) -> Duration {
+        self.cfg.renew_every * 2
     }
 
     /// Renews our node lease (CAS on its ETag); a conflict means someone
@@ -525,6 +661,7 @@ impl Cluster {
             host.lost();
             return;
         }
+        self.lease.write().next_ordinal = host.next_ordinal();
         let etag = self.lease_etag.read().clone();
         if let Err(e) = self.write_lease(PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
             match e.downcast_ref::<object_store::Error>() {
@@ -574,9 +711,10 @@ impl Cluster {
                     seen.remove(&id);
                 }
                 Some((lease, etag)) => {
-                    let prev = seen.get(&id).filter(|s| s.lease.renewals == lease.renewals && s.lease.log_id == lease.log_id);
-                    let changed_at = prev.map_or(now, |s| s.changed_at);
-                    seen.insert(id, Seen { etag, lease, changed_at });
+                    let same = seen.get(&id).filter(|s| s.lease.log_id == lease.log_id);
+                    let first_seen = same.map_or(now, |s| s.first_seen);
+                    let changed_at = same.filter(|s| s.lease.renewals == lease.renewals).map_or(now, |s| s.changed_at);
+                    seen.insert(id, Seen { etag, lease, changed_at, first_seen });
                 }
             }
         }
@@ -688,6 +826,7 @@ impl Cluster {
     }
 
     async fn step_body(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
+        use futures::StreamExt;
         // 2. membership
         let (live, dead) = self.read_nodes().await?;
         *self.peers.write() = live.iter().filter(|l| l.node_id != self.cfg.node_id).map(|l| (l.node_id.clone(), l.clone())).collect();
@@ -717,13 +856,10 @@ impl Cluster {
             host.lost();
             return Ok(());
         }
-        let fair = (n as usize).div_ceil(live.len().max(1));
-        let owned = self.owned();
-        // Join grace: give every peer a membership refresh to discover us (and
-        // start following our log) before we produce events, so no peer's
-        // merged firehose has already moved past our first seqs.
+        let fair = (n as usize).div_ceil(live.iter().filter(|l| !l.draining).count().max(1));
+        // Join grace (see `join_grace`).
         let has_peers = live.iter().any(|l| l.node_id != self.cfg.node_id);
-        if has_peers && self.joined_at.elapsed() < self.cfg.renew_every * 2 {
+        if has_peers && self.joined_at.elapsed() < self.join_grace() {
             return Ok(());
         }
         // HA fix: never take (or juggle) shards without a valid lease, e.g. a
@@ -731,13 +867,19 @@ impl Cluster {
         if !self.lease_valid() {
             return Ok(());
         }
-        // 4. acquire free / orphaned shards up to our fair share
+        // 4a. shards a peer handed us whose nudge we missed
+        let handed: Vec<(u16, Assignment)> = (0..n)
+            .filter_map(|s| assigns[s as usize].as_ref().filter(|(a, _)| self.handed_to_us(s, a)).map(|(a, _)| (s, a.clone())))
+            .collect();
+        self.adopt(host, handed).await?;
+        let owned = self.owned();
+        // 4b. acquire free / orphaned shards up to our fair share
         if owned.len() < fair {
-            let mut want = fair - owned.len();
-            let mut acquired = Vec::new();
-            let mut floor = 0i64;
+            let want = fair - owned.len();
+            // pick them (fencing an orphan's log first so its span end is final)
+            let mut picked = Vec::new();
             for s in 0..n {
-                if want == 0 {
+                if picked.len() == want {
                     break;
                 }
                 if self.is_owner(s) {
@@ -784,45 +926,58 @@ impl Cluster {
                     None => PutMode::Create,
                     Some(e) => PutMode::Update(UpdateVersion { e_tag: Some(e), version: None }),
                 };
-                match self.put_json(&self.path(&format!("assign/{s:03}")), &newa, mode).await {
-                    Ok(e) => self.assigns.write()[s as usize] = Some((newa, e)),
+                picked.push((s, newa, mode, history));
+            }
+            // CAS them concurrently: a handback of ~85 shards is one round
+            // trip, not one per shard (~2 s at 25 ms PUTs, bench 2026-10-02 §2)
+            let cas: Vec<_> = futures::stream::iter(picked)
+                .map(|(s, newa, mode, history)| async move {
+                    let r = self.put_json(&self.path(&format!("assign/{s:03}")), &newa, mode).await;
+                    (s, newa, history, r)
+                })
+                .buffer_unordered(32)
+                .collect()
+                .await;
+            let (mut acquired, mut floor, mut failed) = (Vec::new(), 0i64, None);
+            for (s, newa, history, r) in cas {
+                match r {
+                    Ok(e) => {
+                        floor = floor.max(newa.seq_floor);
+                        acquired.push((s, newa.epoch, history));
+                        self.assigns.write()[s as usize] = Some((newa, e));
+                        self.owned.write().insert(s);
+                    }
                     Err(e) if is_conflict(&e) => {
                         // someone else moved it: re-read it next step
                         if let Some((_, etag)) = self.assigns.write()[s as usize].as_mut() {
                             *etag = None;
                         }
-                        continue;
                     }
-                    Err(e) => return Err(e.into()),
+                    Err(e) => failed = Some(e),
                 }
-                self.owned.write().insert(s);
-                floor = floor.max(seq_floor);
-                acquired.push((s, epoch, history));
-                want -= 1;
             }
+            acquired.sort_by_key(|a| a.0);
             if !acquired.is_empty() {
                 tracing::info!(shards = ?acquired.iter().map(|a| a.0).collect::<Vec<_>>(), owned = self.owned().len(), fair, live = live.len(), "acquired shards");
                 host.wait_seq_floor(floor).await;
             }
-            for (s, res) in host.open_many(acquired).await {
-                match res {
-                    Ok(()) => {
-                        self.table.write()[s as usize] = Some((self.cfg.node_id.clone(), self.cfg.addr.clone()));
-                    }
-                    Err(e) => {
-                        // nothing was logged for it: release with an empty span
-                        tracing::error!(shard = s, "open failed: {e:#}; releasing");
-                        self.owned.write().remove(&s);
-                        self.release(s, host.next_ordinal(), host.seq_high()).await?;
-                    }
-                }
+            self.open_acquired(host, acquired).await?;
+            if let Some(e) = failed {
+                return Err(e.into());
             }
-        } else if owned.len() > fair {
-            // 5. hand back extras so newcomers get work
-            tracing::info!(owned = owned.len(), fair, live = live.len(), "releasing extra shards");
-            let extras: Vec<u16> = owned.iter().rev().take(owned.len() - fair).copied().collect();
-            if !self.close_and_release(host, extras).await {
-                return Ok(());
+        } else {
+            // 5. hand extras straight to the peers short of their share. A
+            //    peer counts only once it is past its join grace (as we time
+            //    it): it can't adopt anything before that.
+            let settled = self.settled_peers();
+            let keep = (n as usize).div_ceil(settled.len() + 1);
+            if owned.len() > keep {
+                tracing::info!(owned = owned.len(), keep, live = live.len(), "handing back extra shards");
+                let extras: Vec<u16> = owned.iter().rev().take(owned.len() - keep).copied().collect();
+                let to = self.short_of(&settled, fair);
+                if !self.close_and_release(host, extras, to).await {
+                    return Ok(());
+                }
             }
         }
         // 6. dead nodes whose shards have all moved can be forgotten
@@ -834,13 +989,46 @@ impl Cluster {
         Ok(())
     }
 
+    /// Live peers we've seen for at least a join grace (past theirs).
+    fn settled_peers(&self) -> Vec<NodeLease> {
+        let seen = self.seen.read();
+        self.peers
+            .read()
+            .values()
+            .filter(|l| !l.draining && seen.get(&l.node_id).is_some_and(|s| s.first_seen.elapsed() >= self.join_grace()))
+            .cloned()
+            .collect()
+    }
+
+    /// `peers` owning fewer than `share` shards (per our assignment cache),
+    /// each with how many it is short.
+    fn short_of(&self, peers: &[NodeLease], share: usize) -> Vec<(NodeLease, usize)> {
+        let mut count: HashMap<&str, usize> = HashMap::new();
+        let assigns = self.assigns.read();
+        for (a, _) in assigns.iter().flatten() {
+            if let Some(o) = a.owner.as_deref() {
+                *count.entry(o).or_default() += 1;
+            }
+        }
+        peers
+            .iter()
+            .filter_map(|l| {
+                let have = count.get(l.node_id.as_str()).copied().unwrap_or(0);
+                (have < share).then(|| (l.clone(), share - have))
+            })
+            .collect()
+    }
+
     /// Closes `shards` together (one barrier segment for all of them) and
-    /// releases each one whose close succeeded. A failed close means entries
-    /// of that shard may still be in flight past the span end we would
-    /// publish, so it is never released: we fail-stop instead, and a
-    /// successor fences our log and replays it to the fence. False if we
-    /// fail-stopped.
-    async fn close_and_release(&self, host: &Arc<dyn ShardHost>, shards: Vec<u16>) -> bool {
+    /// releases each one whose close succeeded: handed straight to a peer in
+    /// `to` while it is short (up to its count), else unowned. Then nudges
+    /// every peer: those in `to` with their handoffs, so they serve the
+    /// shards at once; the rest so their routing follows.
+    /// A failed close means entries of that shard may still be in flight
+    /// past the span end we would publish, so it is never released: we
+    /// fail-stop instead, and a successor fences our log and replays it to
+    /// the fence. False if we fail-stopped.
+    async fn close_and_release(&self, host: &Arc<dyn ShardHost>, shards: Vec<u16>, mut to: Vec<(NodeLease, usize)>) -> bool {
         use futures::StreamExt;
         if shards.is_empty() {
             return true;
@@ -863,15 +1051,49 @@ impl Cluster {
                 }
             }
         }
-        let released: Vec<anyhow::Result<()>> = futures::stream::iter(done).map(|s| self.release(s, end, floor)).buffer_unordered(32).collect().await;
-        for r in released {
-            if let Err(e) = r {
+        // round-robin over the peers still short, so each gets a fair slice
+        let mut plan = Vec::with_capacity(done.len());
+        let mut i = 0;
+        for s in done {
+            let mut dest = None;
+            for _ in 0..to.len() {
+                let k = i % to.len();
+                i += 1;
+                if to[k].1 > 0 {
+                    to[k].1 -= 1;
+                    dest = Some(to[k].0.clone());
+                    break;
+                }
+            }
+            plan.push((s, dest));
+        }
+        let released: Vec<(Option<NodeLease>, anyhow::Result<Option<Handoff>>)> = futures::stream::iter(plan)
+            .map(|(s, dest)| async move {
+                let r = self.release(s, end, floor, dest.as_ref()).await;
+                (dest, r)
+            })
+            .buffer_unordered(32)
+            .collect()
+            .await;
+        // every peer: recipients adopt, the rest refresh their routing now
+        // (a stale route forwards to us, and we no longer own the shard)
+        let mut nudges: HashMap<String, Vec<Handoff>> = self.peers.read().values().map(|l| (l.addr.clone(), Vec::new())).collect();
+        for (dest, r) in released {
+            match r {
+                Ok(Some(h)) => nudges.entry(dest.map(|l| l.addr).unwrap_or_default()).or_default().push(h),
+                Ok(None) => {}
                 // the assignment still names us with an open span: whoever
                 // takes the shard once our lease lapses fences and replays
-                tracing::warn!("release failed: {e:#}");
+                Err(e) => tracing::warn!("release failed: {e:#}"),
             }
         }
-        tracing::info!(shards = n, elapsed_ms = started.elapsed().as_millis() as u64, "closed and released shards");
+        let handed: usize = nudges.values().map(|v| v.len()).sum();
+        tracing::info!(shards = n, handed, elapsed_ms = started.elapsed().as_millis() as u64, "closed and released shards");
+        // wake them instead of leaving the shards idle (and misrouted) until
+        // their next step
+        let nudges: Vec<(String, Vec<Handoff>)> = nudges.into_iter().filter(|(a, _)| !a.is_empty()).collect();
+        crate::metrics::CLUSTER_NUDGES.with_label_values(&["sent"]).inc_by(nudges.len() as u64);
+        host.nudge(nudges).await;
         if !ok {
             tracing::error!("a shard failed to close cleanly: fail-stop (a successor fences and replays our log)");
             host.lost();
@@ -880,9 +1102,11 @@ impl Cluster {
     }
 
     /// Releases `shard`, closing our span at `end` (exclusive) and raising its
-    /// seq floor to `seq_floor`. CAS against the cached assignment; re-read
-    /// once on a conflict.
-    async fn release(&self, shard: u16, end: u64, seq_floor: i64) -> anyhow::Result<()> {
+    /// seq floor to `seq_floor`: unowned, or handed to `to` (the next epoch,
+    /// with an open span for it starting at the log ordinal its lease last
+    /// published). CAS against the cached assignment; re-read once on a
+    /// conflict. Returns the handoff for `to`.
+    async fn release(&self, shard: u16, end: u64, seq_floor: i64, to: Option<&NodeLease>) -> anyhow::Result<Option<Handoff>> {
         let path = self.path(&format!("assign/{shard:03}"));
         let mut cur = self.assigns.read()[shard as usize].clone().filter(|(_, e)| e.is_some());
         for attempt in 0..2 {
@@ -890,26 +1114,45 @@ impl Cluster {
                 Some(c) => c,
                 None => match self.get_json::<Assignment>(&path).await? {
                     Some(c) => c,
-                    None => return Ok(()),
+                    None => return Ok(None),
                 },
             };
             if a.owner.as_deref() != Some(&self.cfg.node_id) {
-                return Ok(());
+                return Ok(None);
             }
             if let Some(last) = a.history.last_mut() {
                 if last.log_id == self.log_id && last.end.is_none() {
                     last.end = Some(end);
                 }
             }
-            a.owner = None;
-            a.addr = None;
-            a.log_id = None;
             a.seq_floor = a.seq_floor.max(seq_floor);
+            match to {
+                None => {
+                    a.owner = None;
+                    a.addr = None;
+                    a.log_id = None;
+                }
+                Some(l) => {
+                    // Its span starts at the ordinal its lease published (a
+                    // lower bound: ordinals only grow), and never inside an
+                    // earlier span of the same log: replay markers must map
+                    // to one span.
+                    let start = a.history.iter().filter(|sp| sp.log_id == l.log_id).filter_map(|sp| sp.end).fold(l.next_ordinal, u64::max);
+                    a.epoch += 1;
+                    a.owner = Some(l.node_id.clone());
+                    a.addr = Some(l.addr.clone());
+                    a.log_id = Some(l.log_id.clone());
+                    a.history.push(Span { log_id: l.log_id.clone(), epoch: a.epoch, start, end: None });
+                    if a.history.len() > 16 {
+                        a.history.drain(..a.history.len() - 16);
+                    }
+                }
+            }
             match self.put_json(&path, &a, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
                 Ok(e) => {
-                    self.assigns.write()[shard as usize] = Some((a, e));
-                    self.table.write()[shard as usize] = None;
-                    return Ok(());
+                    self.assigns.write()[shard as usize] = Some((a.clone(), e.clone()));
+                    self.table.write()[shard as usize] = to.map(|l| (l.node_id.clone(), l.addr.clone()));
+                    return Ok(to.map(|_| Handoff { shard, assignment: a, etag: e }));
                 }
                 Err(e) if is_conflict(&e) && attempt == 0 => continue, // stale cache: re-read
                 Err(e) => return Err(e.into()),
@@ -924,7 +1167,26 @@ impl Cluster {
         // are releasing), and wait out a step already in flight.
         self.stopping.store(true, Ordering::Release);
         let _step = self.step_lock.lock().await;
-        if !self.close_and_release(host, self.owned()).await {
+        // Announce the drain first: otherwise a peer stepping meanwhile still
+        // counts us toward the fair share and hands shards back to us, which
+        // we'd never adopt (they'd wait out our lease and a fence).
+        self.lease.write().draining = true;
+        self.renew(host).await;
+        // hand our shards straight to the settled peers, evenly
+        let settled = self.settled_peers();
+        let to = self.short_of(&settled, (self.cfg.shards as usize).div_ceil(settled.len().max(1)));
+        // plus any a peer handed us before it saw the drain (never opened:
+        // closing them is a no-op, so they are just handed on)
+        let mut shards = self.owned();
+        let pending = std::mem::take(&mut *self.handed.lock());
+        for h in pending {
+            if h.shard < self.cfg.shards && self.handed_to_us(h.shard, &h.assignment) {
+                self.assigns.write()[h.shard as usize] = Some((h.assignment, h.etag));
+            }
+        }
+        let assigns = self.assigns.read().clone();
+        shards.extend((0..self.cfg.shards).filter(|&s| assigns[s as usize].as_ref().is_some_and(|(a, _)| self.handed_to_us(s, a))));
+        if !self.close_and_release(host, shards, to).await {
             return;
         }
         // Nothing may still be in flight on our log when we fence it: a
@@ -947,6 +1209,11 @@ impl Cluster {
             self.gone.store(true, Ordering::Release);
         }
         self.delete(&format!("nodes/{}", self.cfg.node_id)).await;
+        // Our lease is gone, so peers' next step counts us out and takes
+        // whatever we didn't hand them: run it now, not a step interval later.
+        let nudges: Vec<(String, Vec<Handoff>)> = self.peers().into_iter().map(|l| (l.addr, Vec::new())).collect();
+        crate::metrics::CLUSTER_NUDGES.with_label_values(&["sent"]).inc_by(nudges.len() as u64);
+        host.nudge(nudges).await;
     }
 }
 
@@ -965,6 +1232,7 @@ mod tests {
         floors: Mutex<Vec<i64>>,
         lost: AtomicU64,
         fail_close: Mutex<HashSet<u16>>,
+        nudged: Mutex<Vec<(String, Vec<Handoff>)>>,
     }
 
     #[async_trait::async_trait]
@@ -996,6 +1264,9 @@ mod tests {
         }
         fn lost(&self) {
             self.lost.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn nudge(&self, nudges: Vec<(String, Vec<Handoff>)>) {
+            self.nudged.lock().extend(nudges);
         }
     }
 
@@ -1030,6 +1301,34 @@ mod tests {
         PutPayload::from(data)
     }
 
+    /// With K PUTs in flight a crash leaves holes: 0..=2 durable, 3 never
+    /// landed, 4 and 5 (sealed while 3 was in flight) did. The fence goes at
+    /// the hole, every fencer agrees on it, and the garbage stays cut off.
+    #[tokio::test]
+    async fn fence_lands_at_the_first_hole() {
+        let store = Store::memory(None);
+        let log = "dead.1";
+        for ord in 0..3 {
+            store.raw.put(&crate::nodelog::segment_path(&store, log, ord), segment(log, ord, 100 + ord as i64)).await.unwrap();
+        }
+        for ord in 4..6u64 {
+            let mut b = crate::segment::SegmentBuilder::new();
+            b.push(200 + ord as i64, 0, 1, |_| {}, &[]);
+            let mut data = b.sealed_header(log, ord, 3);
+            data.extend_from_slice(&b.body);
+            store.raw.put(&crate::nodelog::segment_path(&store, log, ord), PutPayload::from(data)).await.unwrap();
+        }
+        let a = Cluster::join(cfg("a"), store.clone()).await.unwrap();
+        assert_eq!(a.fence(log).await.unwrap(), (3, 102), "fence at the hole; last seq from the durable prefix");
+        let b = Cluster::join(cfg("b"), store.clone()).await.unwrap();
+        assert_eq!(b.fence(log).await.unwrap(), (3, 102), "a second fencer finds the same end instead of stacking one");
+        let r = store
+            .raw
+            .put_opts(&crate::nodelog::segment_path(&store, log, 3), segment(log, 3, 103), PutOptions { mode: PutMode::Create, ..Default::default() })
+            .await;
+        assert!(r.is_err(), "the zombie's in-flight segment collides with the fence");
+    }
+
     #[tokio::test]
     async fn assignment_handoff_fencing() {
         let store = Store::memory(None);
@@ -1045,10 +1344,25 @@ mod tests {
         let (hb, hb_dyn) = host();
         b.step(&hb_dyn).await.unwrap();
         assert!(b.owned().is_empty(), "join grace: no shards before peers can discover us");
+        a.step(&ha_dyn).await.unwrap(); // a first sees b
+        assert!(ha.closed.lock().is_empty(), "a keeps its shards while b is in its join grace");
         tokio::time::sleep(Duration::from_millis(250)).await;
         a.step(&ha_dyn).await.unwrap(); // a releases 4
         assert_eq!(ha.closed.lock().len(), 1, "the 4 extras are closed in one batch (one barrier segment)");
-        b.step(&hb_dyn).await.unwrap(); // b takes them, with a's closed span as history
+        let nudged = ha.nudged.lock().clone();
+        assert_eq!(nudged.len(), 1, "one nudge, to the node short of its share");
+        assert_eq!((nudged[0].0.as_str(), nudged[0].1.len()), ("http://b", 4), "carrying the 4 handoffs");
+        for h in &nudged[0].1 {
+            let a = &h.assignment;
+            assert_eq!((a.owner.as_deref(), a.log_id.as_deref(), a.epoch), (Some("b"), Some(b.log_id.as_str()), 2), "handed straight to b");
+            assert_eq!(a.history.len(), 2);
+            assert_eq!(a.history[1], Span { log_id: b.log_id.clone(), epoch: 2, start: 0, end: None }, "b's span opens at b's published ordinal");
+        }
+        // b adopts them from the nudge, with no control-plane read
+        let before = b.store_requests();
+        b.nudge(nudged[0].1.clone());
+        b.adopt_handed(&hb_dyn).await.unwrap();
+        assert_eq!(b.store_requests(), before, "adopting a handoff reads nothing");
         assert_eq!((a.owned().len(), b.owned().len()), (4, 4));
         for (_, epoch, hist) in hb.opened.lock().iter() {
             assert_eq!(*epoch, 2);
@@ -1087,6 +1401,36 @@ mod tests {
         assert!(ha.lost.load(Ordering::SeqCst) > 0, "a zombie whose shards moved fail-stops");
     }
 
+    /// A handoff whose nudge never arrived is adopted by the joiner's next
+    /// step; a shard still naming us at an epoch we already opened (our
+    /// release CAS failed) is never adopted again.
+    #[tokio::test]
+    async fn missed_nudge_is_adopted_by_the_next_step_once() {
+        let store = Store::memory(None);
+        let a = Cluster::join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        ha.ord.store(3, Ordering::SeqCst);
+        let b = Cluster::join(cfg("b"), store.clone()).await.unwrap();
+        let (hb, hb_dyn) = host();
+        hb.ord.store(7, Ordering::SeqCst);
+        b.step(&hb_dyn).await.unwrap(); // renews: publishes ordinal 7
+        a.step(&ha_dyn).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        a.step(&ha_dyn).await.unwrap(); // hands 4 to b; the nudge is dropped
+        assert_eq!(ha.nudged.lock()[0].1.len(), 4);
+        b.step(&hb_dyn).await.unwrap();
+        assert_eq!(b.owned(), vec![4, 5, 6, 7]);
+        for (_, epoch, hist) in hb.opened.lock().iter() {
+            assert_eq!((*epoch, hist.len(), hist[0].end), (2, 1, Some(3)), "replays a's closed span only");
+        }
+        // b's release of 7 "fails" (the assignment still names b): b must not
+        // reopen it with a's span as its history
+        b.owned.write().remove(&7);
+        b.step(&hb_dyn).await.unwrap();
+        assert_eq!(hb.opened.lock().len(), 4, "not adopted twice");
+    }
+
     /// A shard whose close failed (its barrier never became durable) is
     /// never released: entries of it may still be in flight past the span
     /// end we'd publish. The node fail-stops; a successor fences and replays.
@@ -1099,6 +1443,7 @@ mod tests {
         let b = Cluster::join(cfg("b"), store.clone()).await.unwrap();
         let (_hb, hb_dyn) = host();
         b.step(&hb_dyn).await.unwrap();
+        a.step(&ha_dyn).await.unwrap(); // a first sees b
         tokio::time::sleep(Duration::from_millis(250)).await;
         ha.fail_close.lock().insert(7); // a releases 7..4 (highest first)
         a.step(&ha_dyn).await.unwrap();
@@ -1114,7 +1459,7 @@ mod tests {
         let s7 = get(7).await;
         assert_eq!(s7.owner.as_deref(), Some("a"), "not released");
         assert_eq!(s7.history.last().unwrap().end, None, "span left open: a successor ends it at the fence");
-        assert_eq!(get(6).await.owner, None, "the closed ones are released");
+        assert_eq!(get(6).await.owner.as_deref(), Some("b"), "the closed ones are handed to b");
     }
 
     /// Wall clocks minutes apart: liveness doesn't care (O3). With the old
@@ -1173,7 +1518,7 @@ mod tests {
         let a = Cluster::join(c.clone(), store.clone()).await.unwrap();
         let b = Cluster::join(ClusterConfig { node_id: "b".into(), ..c }, store.clone()).await.unwrap();
         let ((_, ha), (_, hb)) = (host(), host());
-        for _ in 0..6 {
+        for _ in 0..10 {
             a.step(&ha).await.unwrap();
             b.step(&hb).await.unwrap();
             tokio::time::sleep(Duration::from_millis(60)).await;

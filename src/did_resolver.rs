@@ -1,7 +1,7 @@
 //! DID document resolution (did:plc via the PLC directory, did:web via
-//! /.well-known/did.json) with an in-memory TTL cache, plus the SSRF-guarded
-//! HTTP client used for all outbound requests to user-controlled endpoints
-//! (did:web hosts, proxied service endpoints).
+//! /.well-known/did.json) with an in-memory TTL cache, plus the SSRF policy
+//! for outbound requests to user-controlled endpoints (the guarded client
+//! itself is [`crate::http::guarded`]).
 //!
 //! DIDs hosted on this PDS are resolved by the caller without the network
 //! (see `xrpc::proxy::resolve_did`).
@@ -9,7 +9,7 @@
 use parking_lot::Mutex;
 use serde_json::Value as J;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,18 +44,13 @@ impl DidResolver {
         DidResolver {
             plc_url: plc_url.trim_end_matches('/').to_string(),
             allow_insecure,
-            http: guarded_client(allow_insecure),
-            plc_http: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(RESOLVE_TIMEOUT)
-                .build()
-                .expect("reqwest client"),
+            http: crate::http::guarded(allow_insecure).clone(),
+            plc_http: crate::http::public().clone(),
             cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The SSRF-guarded client (no redirects, connect/read timeouts; private
-    /// addresses rejected at DNS resolution unless `allow_insecure`).
+    /// The SSRF-guarded client ([`crate::http::guarded`]).
     pub fn http(&self) -> &reqwest::Client {
         &self.http
     }
@@ -250,38 +245,6 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
             // IPv4-compatible
         }
     }
-}
-
-/// DNS resolver that drops non-public addresses, so a hostname can't be used
-/// to reach internal services.
-struct PublicOnlyResolver;
-
-impl reqwest::dns::Resolve for PublicOnlyResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_string();
-        Box::pin(async move {
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
-                .await?
-                .filter(|a| is_public_ip(a.ip()))
-                .collect();
-            if addrs.is_empty() {
-                return Err(format!("{host} did not resolve to a public unicast address").into());
-            }
-            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
-        })
-    }
-}
-
-fn guarded_client(allow_insecure: bool) -> reqwest::Client {
-    let mut b = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(5))
-        .read_timeout(Duration::from_secs(30))
-        .pool_idle_timeout(Duration::from_secs(60));
-    if !allow_insecure {
-        b = b.dns_resolver(Arc::new(PublicOnlyResolver));
-    }
-    b.build().expect("reqwest client")
 }
 
 /// Checks a URL against the SSRF policy before connecting: https only and no
