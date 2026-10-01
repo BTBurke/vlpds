@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Confirm, CopyText, Empty, ErrorNotice, Field, JsonView, Loading, Notice, PageHead, Panel, Spinner, Status } from '../../components/ui'
+import { Confirm, CopyText, Empty, ErrorNotice, Field, JsonView, Loading, Notice, PageHead, Panel, PartialNotice, partialOf, Spinner, Status, type PartialResult } from '../../components/ui'
 import { fmtTime } from '../../lib/format'
 import { useAction, useLoad } from '../../lib/hooks'
 import { Link, navigate } from '../../lib/router'
@@ -25,8 +25,10 @@ export function Accounts() {
   const [rows, setRows] = useState<AccountView[]>([])
   const [cursor, setCursor] = useState<string>()
   const [loaded, setLoaded] = useState(false)
+  const [partial, setPartial] = useState<PartialResult>()
   const page = useAction(async (email: string, cur?: string) => {
     const r = await admin('com.atproto.admin.searchAccounts', { params: { email, cursor: cur, limit: 50 } })
+    setPartial(partialOf(r))
     setRows((x) => (cur ? [...x, ...r.accounts] : r.accounts))
     setCursor(r.accounts.length === 50 ? r.cursor : undefined)
     setLoaded(true)
@@ -72,11 +74,12 @@ export function Accounts() {
         </form>
       </div>
       <ErrorNotice error={page.error || lookup.error} />
+      <PartialNotice partial={partial} />
       <Panel flush>
         {!loaded ? (
           <Loading />
         ) : rows.length === 0 ? (
-          <Empty title={applied ? `No accounts with an email starting “${applied}”` : 'No accounts on the shards this node owns'} />
+          <Empty title={applied ? `No accounts with an email starting “${applied}”` : 'No accounts yet'} />
         ) : (
           <div className="table-wrap">
             <table className="data">

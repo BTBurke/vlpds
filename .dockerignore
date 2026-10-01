@@ -1,0 +1,11 @@
+# build context = packages/vlpds (see Dockerfile)
+target/
+ui/node_modules/
+ui/dist/
+ui/screenshots/
+bench/
+checker/
+testdata/
+tests/
+accounts.json
+*.car

@@ -66,6 +66,9 @@ pub struct Config {
     /// over the network and validated; a write waits at most this long for a
     /// resolution (else `validationStatus: "unknown"`). None = off.
     pub resolve_lexicons: Option<Duration>,
+    /// With `s3: None`: share this in-memory object store instead of a fresh
+    /// one, so several in-process nodes form one cluster (tests).
+    pub memory_store: Option<Arc<object_store::memory::InMemory>>,
 }
 
 /// Well-known secrets: only accepted with `dev_mode` (see [`Config::check_secrets`]).
@@ -138,6 +141,7 @@ impl Default for Config {
             trusted_proxies: Vec::new(),
             rate_limit_bypass_key: None,
             resolve_lexicons: None,
+            memory_store: None,
         }
     }
 }
@@ -148,7 +152,10 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     // Separate clients (connection pools) for the commit log and everything else.
     let (store, state_store) = match &cfg.s3 {
         None => {
-            let m = Store::memory(cfg.inject_latency);
+            let m = match &cfg.memory_store {
+                Some(raw) => Store { raw: raw.clone(), ..Store::memory(cfg.inject_latency) },
+                None => Store::memory(cfg.inject_latency),
+            };
             (m.clone(), Store { latency: None, ..m })
         }
         Some(s3) => (Store::s3(s3, &cfg.prefix, cfg.inject_latency)?, Store::s3(s3, &cfg.prefix, None)?),

@@ -29,3 +29,27 @@ seed accounts="3" records="200":
 
 test *args:
     cargo test {{args}}
+
+# Local MinIO (build/docker-compose.yml) on :9000 (console :9001), with the `vlpds` bucket created
+minio:
+    docker compose -f build/docker-compose.yml up -d --build --wait minio
+    docker compose -f build/docker-compose.yml run --rm minio-init
+
+# Stop the local MinIO (keeps its volume; `docker compose -f build/docker-compose.yml down -v` wipes it)
+minio-down:
+    docker compose -f build/docker-compose.yml down
+
+# bench/step.sh writes ./target/release whatever CARGO_TARGET_DIR says; env ACCOUNTS, RECORDS, DURATION, OUT.
+# One benchmark step on a fresh RAM-backed MinIO: just bench <name> <rate> [hot_rate] [inject_put_ms] [vlpds args...]
+bench name rate *args:
+    docker compose -f build/docker-compose.yml build minio
+    CARGO_TARGET_DIR=target cargo build --release --bins
+    bench/step.sh {{name}} {{rate}} {{args}}
+
+# Build the Go sync 1.1 firehose checker and run it against a vlpds (extra flags e.g. -cursor 0 -strict)
+checker host="http://127.0.0.1:2620" *args:
+    cd checker && go build -o checker . && ./checker -host {{host}} {{args}}
+
+# Production image (Dockerfile: UI build, release build, slim non-root runtime)
+docker-build tag="vlpds:local":
+    docker build -t {{tag}} .

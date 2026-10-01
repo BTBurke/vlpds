@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1.7
+# Production vlpds image: the web UI (ui/) built with node, embedded into a
+# release build of the vlpds (and loadgen) binaries, on a slim non-root runtime.
+#
+#   docker build -t vlpds:local .            (or: just docker-build)
+#   docker run -p 2583:2583 -e VLPDS_S3_ENDPOINT=... -e VLPDS_JWT_SECRET=... \
+#     -e VLPDS_ADMIN_TOKEN=... -e VLPDS_INTERNAL_TOKEN=... vlpds:local
+#
+# Configuration is all VLPDS_* env vars (see `vlpds --help`). Prometheus
+# metrics are served at /metrics on the app port.
+
+# --- web UI -----------------------------------------------------------------
+FROM node:22-bookworm-slim AS ui
+WORKDIR /src/ui
+COPY ui/package.json ui/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
+COPY ui/ ./
+RUN npm run build
+
+# --- rust release build -----------------------------------------------------
+FROM rust:1.98.1-bookworm AS build
+# cmake/clang: aws-lc-sys (rustls) and the vendored libsecp256k1 / jemalloc C builds
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake clang \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY rust-toolchain.toml ./
+# installs the pinned toolchain if the base image's differs
+RUN rustup show active-toolchain
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src ./src
+COPY lexicons ./lexicons
+# the manifest declares the test binary; it is never built here
+RUN mkdir -p tests/all && touch tests/all/main.rs
+COPY --from=ui /src/ui/dist ./ui/dist
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked --bins \
+    && mkdir -p /out \
+    && cp target/release/vlpds target/release/loadgen /out/
+
+# --- runtime ----------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 vlpds \
+    && useradd --system --uid 10001 --gid vlpds --home-dir /var/lib/vlpds --create-home vlpds
+COPY --from=build /out/vlpds /out/loadgen /usr/local/bin/
+USER vlpds:vlpds
+WORKDIR /var/lib/vlpds
+ENV VLPDS_LISTEN=0.0.0.0:2583 \
+    RUST_LOG=info
+# 2583: XRPC, web UI, /internal (cluster) and /metrics (Prometheus)
+EXPOSE 2583
+HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=3 \
+    CMD curl -sf http://127.0.0.1:2583/xrpc/_health || exit 1
+# tini forwards SIGTERM so vlpds drains and releases its shards gracefully
+ENTRYPOINT ["/usr/bin/tini", "--", "vlpds"]

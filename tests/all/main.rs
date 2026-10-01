@@ -8,6 +8,7 @@
 mod common;
 
 mod account_deactivation;
+mod admin_cluster;
 mod account_status;
 mod account;
 mod app_passwords;

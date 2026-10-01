@@ -15,6 +15,8 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/internal/v1/private/put", post(put_private))
         .route("/internal/v1/private/get", get(get_private))
         .route("/internal/v1/cluster", get(cluster_status))
+        .route("/internal/v1/admin/searchAccounts", get(admin_search_accounts))
+        .route("/internal/v1/admin/inviteCodes", get(admin_invite_codes))
 }
 
 /// Cluster view of this node (HA tests / ops): shards it owns, the routing
@@ -151,4 +153,92 @@ pub async fn forward_get_private(app: &App, owner: &str, routing: &str, name: &s
         Some(s) => Ok(Some(B64.decode(s).map_err(upstream)?.into())),
         None => Ok(None),
     }
+}
+
+// ---------------------------------------------------------------------------
+// admin scatter-gather (cluster-wide listings; see admin.rs)
+// ---------------------------------------------------------------------------
+
+/// Per-peer deadline for a scatter-gather leg: a slow or dead peer costs the
+/// admin call at most this, and is reported as unreachable.
+const GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The local half of searchAccounts on this node's shards, for a peer's merge.
+async fn admin_search_accounts(
+    State(app): AppState,
+    headers: HeaderMap,
+    Query(q): Query<super::admin::SearchQ>,
+) -> XResult<Json<J>> {
+    check(&app, &headers)?;
+    let (hits, owned) = super::admin::search_accounts_local(&app, &q).await?;
+    Ok(Json(json!({"owned": owned, "accounts": hits})))
+}
+
+/// The local half of getInviteCodes on this node's shards, for a peer's merge.
+async fn admin_invite_codes(
+    State(app): AppState,
+    headers: HeaderMap,
+    Query(q): Query<super::admin::InviteCodesQ>,
+) -> XResult<Json<J>> {
+    check(&app, &headers)?;
+    let (codes, owned) = super::admin::invite_codes_local(&app, &q).await?;
+    Ok(Json(json!({"owned": owned, "codes": codes})))
+}
+
+pub struct PeerReply {
+    pub node: String,
+    /// Shards the peer scanned (owned at the time).
+    pub owned: Vec<u16>,
+    pub body: J,
+}
+
+#[derive(Default)]
+pub struct Gathered {
+    pub replies: Vec<PeerReply>,
+    /// Node ids of live peers that failed or timed out.
+    pub unreachable: Vec<String>,
+}
+
+/// GETs `path?query` on every live peer (not this node) concurrently, each
+/// bounded by [`GATHER_TIMEOUT`]. No peers (a single node) = nothing to do.
+pub async fn gather(app: &App, path: &str, query: &[(&str, String)]) -> Gathered {
+    let Some(c) = &app.cluster else {
+        return Gathered::default();
+    };
+    let me = c.cfg.node_id.clone();
+    let mut peers: Vec<_> = c.peers().into_iter().filter(|l| l.node_id != me).collect();
+    peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    let legs = peers.into_iter().map(|l| async move {
+        let r = async {
+            let r = app
+                .http
+                .get(format!("{}{path}", l.addr.trim_end_matches('/')))
+                .header(HDR, &app.config.internal_token)
+                .query(query)
+                .timeout(GATHER_TIMEOUT)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !r.status().is_success() {
+                return Err(format!("{}: {}", r.status(), r.text().await.unwrap_or_default()));
+            }
+            r.json::<J>().await.map_err(|e| e.to_string())
+        }
+        .await;
+        (l.node_id, r)
+    });
+    let mut out = Gathered::default();
+    for (node, r) in futures::future::join_all(legs).await {
+        match r {
+            Ok(body) => {
+                let owned = serde_json::from_value(body["owned"].clone()).unwrap_or_default();
+                out.replies.push(PeerReply { node, owned, body });
+            }
+            Err(e) => {
+                tracing::warn!(peer = %node, path, "admin scatter-gather: peer unreachable: {e}");
+                out.unreachable.push(node);
+            }
+        }
+    }
+    out
 }

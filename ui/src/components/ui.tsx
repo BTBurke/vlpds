@@ -19,6 +19,31 @@ export function ErrorNotice({ error }: { error: unknown }) {
   return <Notice kind="err">{errText(error)}</Notice>
 }
 
+/** Cluster-wide admin listings (searchAccounts, getInviteCodes) gather from
+ * every node; a peer that didn't answer, or a shard nobody owned mid-move,
+ * leaves the list incomplete. */
+export type PartialResult = { unreachableNodes?: string[]; missingShards?: number[] }
+
+export function partialOf(r: PartialResult): PartialResult | undefined {
+  return r.unreachableNodes?.length || r.missingShards?.length ? { unreachableNodes: r.unreachableNodes, missingShards: r.missingShards } : undefined
+}
+
+export function PartialNotice({ partial }: { partial?: PartialResult }) {
+  if (!partial) return null
+  const nodes = partial.unreachableNodes ?? []
+  const shards = partial.missingShards ?? []
+  return (
+    <Notice kind="warn">
+      <p>
+        <b>Incomplete results.</b>
+        {nodes.length > 0 && <> No answer from {nodes.length === 1 ? 'node' : 'nodes'} <span className="mono">{nodes.join(', ')}</span>.</>}
+        {shards.length > 0 && <> {shards.length === 1 ? 'Shard' : `${shards.length} shards`} unowned or unreachable{shards.length <= 8 && <> (<span className="mono">{shards.join(', ')}</span>)</>}.</>}
+        {' '}Retry once the cluster settles.
+      </p>
+    </Notice>
+  )
+}
+
 export function Spinner({ label = 'Loading' }: { label?: string }) {
   return <span className="spinner" role="status" aria-label={label} />
 }

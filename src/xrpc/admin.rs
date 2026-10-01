@@ -420,36 +420,53 @@ async fn get_account_infos(
 }
 
 #[derive(Deserialize)]
-struct SearchQ {
+pub(super) struct SearchQ {
     email: Option<String>,
     cursor: Option<String>,
     limit: Option<usize>,
 }
 
-/// Scans `a/` across owned partitions; `email` filters by case-insensitive
-/// prefix. Cursor: `{partition}:{did}`.
-async fn search_accounts(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Query(q): Query<SearchQ>,
-) -> XResult<Json<J>> {
-    require_admin(&creds)?;
-    let limit = q.limit.unwrap_or(50).clamp(1, 100);
-    let email = q
-        .email
-        .as_deref()
-        .map(|e| e.trim().to_ascii_lowercase())
-        .filter(|e| !e.is_empty());
-    let (mut part, mut after) = match q.cursor.as_deref().and_then(|c| c.split_once(':')) {
-        Some((p, d)) => (
-            p.parse::<usize>()
-                .map_err(|_| invalid_request("Malformed cursor"))?,
-            Some(d.to_string()),
-        ),
+/// One searchAccounts hit, keyed by the global sort key (shard, did).
+#[derive(serde::Serialize, Deserialize)]
+pub(super) struct AccountHit {
+    shard: usize,
+    did: String,
+    view: J,
+}
+
+/// (limit, lowercased email prefix, resume after (shard, did))
+type SearchParams = (usize, Option<String>, Option<(usize, String)>);
+
+impl SearchQ {
+    fn parsed(&self) -> XResult<SearchParams> {
+        let limit = self.limit.unwrap_or(50).clamp(1, 100);
+        let email = self
+            .email
+            .as_deref()
+            .map(|e| e.trim().to_ascii_lowercase())
+            .filter(|e| !e.is_empty());
+        let after = match self.cursor.as_deref().filter(|c| !c.is_empty()) {
+            Some(c) => {
+                let (p, d) = c.split_once(':').ok_or_else(|| invalid_request("Malformed cursor"))?;
+                Some((p.parse::<usize>().map_err(|_| invalid_request("Malformed cursor"))?, d.to_string()))
+            }
+            None => None,
+        };
+        Ok((limit, email, after))
+    }
+}
+
+/// Accounts on the shards this node owns, in (shard, did) order after the
+/// cursor, at most `limit`; plus the shards scanned. The local half of
+/// searchAccounts (also served to peers by /internal/v1/admin/searchAccounts).
+pub(super) async fn search_accounts_local(app: &App, q: &SearchQ) -> XResult<(Vec<AccountHit>, Vec<u16>)> {
+    let (limit, email, after) = q.parsed()?;
+    let owned: Vec<u16> = app.partitions.owned().iter().map(|p| p.id).collect();
+    let (mut part, mut after) = match after {
+        Some((p, d)) => (p, Some(d)),
         None => (0, None),
     };
     let mut out = Vec::new();
-    let mut cursor = None;
     while part < app.partitions.len() && out.len() < limit {
         if let Some(p) = app.partitions.get(part) {
             let lo = match &after {
@@ -464,8 +481,6 @@ async fn search_accounts(
                 let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? else {
                     break;
                 };
-                let did = String::from_utf8_lossy(&kv.key[2..]).to_string();
-                cursor = Some(format!("{part}:{did}"));
                 let Ok(a) = serde_json::from_slice::<Account>(&kv.value) else {
                     continue;
                 };
@@ -478,20 +493,75 @@ async fn search_accounts(
                         continue;
                     }
                 }
-                out.push(account_view(&app, &a).await?);
+                let did = String::from_utf8_lossy(&kv.key[2..]).to_string();
+                out.push(AccountHit { shard: part, did, view: account_view(app, &a).await? });
             }
         }
-        if out.len() < limit {
-            part += 1;
-            after = None;
-            cursor = None;
-        }
+        part += 1;
+        after = None;
     }
-    let mut res = json!({"accounts": out});
+    Ok((out, owned))
+}
+
+/// Scans `a/` across every shard in the cluster (this node's, plus each live
+/// peer's via /internal/v1/admin/searchAccounts), merged in (shard, did)
+/// order; `email` filters by case-insensitive prefix. Cursor:
+/// `{shard}:{did}`, the last returned key, so a page resumes on every node.
+/// Unreachable peers / unowned shards are reported (`unreachableNodes`,
+/// `missingShards`) instead of silently dropped.
+async fn search_accounts(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Query(q): Query<SearchQ>,
+) -> XResult<Json<J>> {
+    require_admin(&creds)?;
+    let (limit, _, after) = q.parsed()?;
+    let (mut hits, owned) = search_accounts_local(&app, &q).await?;
+    let mut query = vec![("limit", limit.to_string())];
+    if let Some(e) = &q.email {
+        query.push(("email", e.clone()));
+    }
+    if let Some(c) = &q.cursor {
+        query.push(("cursor", c.clone()));
+    }
+    let g = super::internal::gather(&app, "/internal/v1/admin/searchAccounts", &query).await;
+    let mut covered: std::collections::HashSet<u16> = owned.into_iter().collect();
+    for r in g.replies {
+        covered.extend(r.owned);
+        hits.extend(serde_json::from_value::<Vec<AccountHit>>(r.body["accounts"].clone()).unwrap_or_default());
+    }
+    hits.sort_by(|a, b| (a.shard, &a.did).cmp(&(b.shard, &b.did)));
+    hits.dedup_by(|a, b| a.did == b.did);
+    hits.truncate(limit);
+    let cursor = (hits.len() == limit).then(|| hits.last().map(|h| format!("{}:{}", h.shard, h.did))).flatten();
+    // shards before the cursor's are done; only the rest can be missing
+    let from = after.map(|(p, _)| p).unwrap_or(0);
+    let mut res = json!({"accounts": hits.into_iter().map(|h| h.view).collect::<Vec<_>>()});
     if let Some(c) = cursor {
         res["cursor"] = json!(c);
     }
+    partial_fields(&app, &mut res, g.unreachable, &covered, from);
     Ok(Json(res))
+}
+
+/// Marks a scatter-gather result incomplete: `unreachableNodes` (peers that
+/// timed out or failed) and `missingShards` (shards >= `from` that no
+/// answering node owned, e.g. mid-move). Absent when the result is complete.
+fn partial_fields(
+    app: &App,
+    res: &mut J,
+    unreachable: Vec<String>,
+    covered: &std::collections::HashSet<u16>,
+    from: usize,
+) {
+    let missing: Vec<usize> =
+        (from..app.partitions.len()).filter(|p| !covered.contains(&(*p as u16))).collect();
+    if !unreachable.is_empty() {
+        res["unreachableNodes"] = json!(unreachable);
+    }
+    if !missing.is_empty() {
+        res["missingShards"] = json!(missing);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -938,50 +1008,114 @@ async fn disable_invite_codes(
 }
 
 #[derive(Deserialize)]
-struct InviteCodesQ {
+pub(super) struct InviteCodesQ {
     sort: Option<String>,
     limit: Option<i64>,
     cursor: Option<String>,
 }
 
-/// All invite codes, sorted "recent" (createdAt desc) or "usage" (uses desc).
-/// Cursor: the last returned code.
+/// Global sort key of an invite code (listed descending).
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum InviteKey {
+    Recent(String, String),
+    Usage(usize, String),
+}
+
+impl InviteKey {
+    fn of(usage: bool, c: &InviteCode) -> InviteKey {
+        if usage {
+            InviteKey::Usage(c.uses.len(), c.code.clone())
+        } else {
+            InviteKey::Recent(c.created_at.clone(), c.code.clone())
+        }
+    }
+
+    /// `{createdAt|uses}/{code}` (codes and timestamps never contain '/').
+    fn cursor(&self) -> String {
+        match self {
+            InviteKey::Recent(t, c) => format!("{t}/{c}"),
+            InviteKey::Usage(n, c) => format!("{n}/{c}"),
+        }
+    }
+
+    fn parse(usage: bool, s: &str) -> XResult<InviteKey> {
+        let bad = || invalid_request("Malformed cursor");
+        let (k, c) = s.split_once('/').ok_or_else(bad)?;
+        Ok(if usage {
+            InviteKey::Usage(k.parse().map_err(|_| bad())?, c.to_string())
+        } else {
+            InviteKey::Recent(k.to_string(), c.to_string())
+        })
+    }
+}
+
+impl InviteCodesQ {
+    /// (usage sort, limit, resume-after key)
+    fn parsed(&self) -> XResult<(bool, usize, Option<InviteKey>)> {
+        let sort = self.sort.as_deref().unwrap_or("recent");
+        if sort != "recent" && sort != "usage" {
+            return Err(invalid_request(format!("unknown sort method: {sort}")));
+        }
+        let usage = sort == "usage";
+        let limit = super::extract::limit_param(self.limit, 100, 1, 500)?;
+        let after = self.cursor.as_deref().filter(|c| !c.is_empty()).map(|c| InviteKey::parse(usage, c)).transpose()?;
+        Ok((usage, limit, after))
+    }
+}
+
+/// Invite codes on the shards this node owns that sort after the cursor, in
+/// order, at most `limit + 1` (so the merger knows whether more exist); plus
+/// the shards scanned. Also served to peers by /internal/v1/admin/inviteCodes.
+pub(super) async fn invite_codes_local(app: &App, q: &InviteCodesQ) -> XResult<(Vec<InviteCode>, Vec<u16>)> {
+    let (usage, limit, after) = q.parsed()?;
+    let owned: Vec<u16> = app.partitions.owned().iter().map(|p| p.id).collect();
+    let mut all: Vec<(InviteKey, InviteCode)> = scan_private_routing(app, "_invite:")
+        .await?
+        .into_iter()
+        .filter(|(_, name, _)| name == "c")
+        .filter_map(|(_, _, v)| serde_json::from_slice::<InviteCode>(&v).ok())
+        .map(|c| (InviteKey::of(usage, &c), c))
+        .filter(|(k, _)| after.as_ref().is_none_or(|a| k < a))
+        .collect();
+    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.truncate(limit + 1);
+    Ok((all.into_iter().map(|(_, c)| c).collect(), owned))
+}
+
+/// All invite codes in the cluster (this node's shards plus each live
+/// peer's), sorted "recent" (createdAt desc) or "usage" (uses desc), code
+/// desc as the tiebreak. Cursor: the last returned code's sort key, so the
+/// next page resumes on every node. Partial results are flagged as in
+/// searchAccounts.
 async fn get_invite_codes(
     State(app): AppState,
     Auth(creds): Auth,
     Query(q): Query<InviteCodesQ>,
 ) -> XResult<Json<J>> {
     require_admin(&creds)?;
-    let sort = q.sort.as_deref().unwrap_or("recent");
-    if sort != "recent" && sort != "usage" {
-        return Err(invalid_request(format!("unknown sort method: {sort}")));
+    let (usage, limit, _) = q.parsed()?;
+    let (codes, owned) = invite_codes_local(&app, &q).await?;
+    let mut all: Vec<(InviteKey, InviteCode)> = codes.into_iter().map(|c| (InviteKey::of(usage, &c), c)).collect();
+    let mut query = vec![("limit", limit.to_string()), ("sort", (if usage { "usage" } else { "recent" }).to_string())];
+    if let Some(c) = &q.cursor {
+        query.push(("cursor", c.clone()));
     }
-    let limit = super::extract::limit_param(q.limit, 100, 1, 500)?;
-    let mut all: Vec<InviteCode> = scan_private_routing(&app, "_invite:")
-        .await?
-        .into_iter()
-        .filter(|(_, name, _)| name == "c")
-        .filter_map(|(_, _, v)| serde_json::from_slice(&v).ok())
-        .collect();
-    if sort == "recent" {
-        all.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.code.cmp(&a.code)));
-    } else {
-        all.sort_by(|a, b| b.uses.len().cmp(&a.uses.len()).then(b.code.cmp(&a.code)));
+    let g = super::internal::gather(&app, "/internal/v1/admin/inviteCodes", &query).await;
+    let mut covered: std::collections::HashSet<u16> = owned.into_iter().collect();
+    for r in g.replies {
+        covered.extend(r.owned);
+        let codes = serde_json::from_value::<Vec<InviteCode>>(r.body["codes"].clone()).unwrap_or_default();
+        all.extend(codes.into_iter().map(|c| (InviteKey::of(usage, &c), c)));
     }
-    let start = match &q.cursor {
-        Some(c) => all
-            .iter()
-            .position(|i| &i.code == c)
-            .map(|p| p + 1)
-            .unwrap_or(all.len()),
-        None => 0,
-    };
-    let page: Vec<InviteCode> = all.iter().skip(start).take(limit).cloned().collect();
-    let mut out =
-        json!({"codes": page.iter().map(|c| serde_json::to_value(c).unwrap()).collect::<Vec<_>>()});
-    if page.len() == limit && start + limit < all.len() {
-        out["cursor"] = json!(page.last().map(|c| c.code.clone()));
+    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.dedup_by(|a, b| a.1.code == b.1.code);
+    let more = all.len() > limit;
+    all.truncate(limit);
+    let mut out = json!({"codes": all.iter().map(|(_, c)| serde_json::to_value(c).unwrap()).collect::<Vec<_>>()});
+    if more {
+        out["cursor"] = json!(all.last().map(|(k, _)| k.cursor()));
     }
+    partial_fields(&app, &mut out, g.unreachable, &covered, 0);
     Ok(Json(out))
 }
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { CopyText, Empty, ErrorNotice, Field, Loading, Notice, Panel, Spinner } from '../../components/ui'
+import { CopyText, Empty, ErrorNotice, Field, Loading, Notice, Panel, PartialNotice, partialOf, Spinner, type PartialResult } from '../../components/ui'
 import { fmtTime } from '../../lib/format'
 import { useAction } from '../../lib/hooks'
 import { Link } from '../../lib/router'
@@ -12,8 +12,10 @@ export function Invites() {
   const [cursor, setCursor] = useState<string>()
   const [loaded, setLoaded] = useState(false)
   const [sel, setSel] = useState<Set<string>>(new Set())
+  const [partial, setPartial] = useState<PartialResult>()
   const page = useAction(async (cur?: string) => {
     const r = await admin('com.atproto.admin.getInviteCodes', { params: { sort: 'recent', limit: 100, cursor: cur } })
+    setPartial(partialOf(r))
     setCodes((x) => (cur ? [...x, ...r.codes] : r.codes))
     setCursor(r.cursor)
     setLoaded(true)
@@ -87,6 +89,7 @@ export function Invites() {
         </form>
       </Panel>
       <ErrorNotice error={page.error || disable.error} />
+      <PartialNotice partial={partial} />
       <Panel
         title="All codes"
         desc="Newest first."

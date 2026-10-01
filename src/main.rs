@@ -229,6 +229,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             renew_every: Duration::from_millis(args.lease_ttl_ms / 5),
             skew: Duration::from_millis(args.lease_ttl_ms / 5),
         }),
+        memory_store: None,
     };
     cfg.check_secrets()?;
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
