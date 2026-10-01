@@ -1,0 +1,175 @@
+{
+ "total": 10000000,
+ "active": 50000,
+ "rate": 50000,
+ "inject_put_ms": 25,
+ "runs": [
+  {
+   "cache_per_worker": 50000,
+   "snapshots": [
+    {
+     "label": "started",
+     "rss_gb": 0.07,
+     "jemalloc_gb": {
+      "active": 0.13,
+      "allocated": 0.112,
+      "mapped": 0.181,
+      "metadata": 0.007,
+      "resident": 0.141,
+      "retained": 0.039
+     },
+     "cached_repos": 0,
+     "firehose_ring_gb": 0.0,
+     "live_ring_gb": 0.0
+    },
+    {
+     "label": "after bulk",
+     "rss_gb": 11.9,
+     "jemalloc_gb": {
+      "active": 10.539,
+      "allocated": 9.554,
+      "mapped": 12.01,
+      "metadata": 0.183,
+      "resident": 11.943,
+      "retained": 4.332
+     },
+     "cached_repos": 400000.0,
+     "firehose_ring_gb": 0.536,
+     "live_ring_gb": 0.0
+    },
+    {
+     "label": "idle",
+     "rss_gb": 10.45,
+     "jemalloc_gb": {
+      "active": 9.706,
+      "allocated": 8.399,
+      "mapped": 10.561,
+      "metadata": 0.183,
+      "resident": 10.493,
+      "retained": 5.781
+     },
+     "cached_repos": 400000.0,
+     "firehose_ring_gb": 0.536,
+     "live_ring_gb": 0.0
+    },
+    {
+     "label": "after 70 s load",
+     "rss_gb": 9.75,
+     "jemalloc_gb": {
+      "active": 9.165,
+      "allocated": 7.65,
+      "mapped": 9.858,
+      "metadata": 0.281,
+      "resident": 9.778,
+      "retained": 11.54
+     },
+     "cached_repos": 400000.0,
+     "firehose_ring_gb": 0.532,
+     "live_ring_gb": 0.0
+    }
+   ],
+   "load": {
+    "achieved": 50200,
+    "errors": 0,
+    "all": {
+     "n": 3012000,
+     "p50": 78.8,
+     "p90": 126.6,
+     "p99": 186.0,
+     "p999": 240.5,
+     "max": 282.4
+    },
+    "server": {
+     "cpu_pct_avg": 578.3,
+     "cpu_pct_max": 901.6,
+     "rss_gb_max": 11.74,
+     "rss_gb_last": 9.69
+    },
+    "jemalloc": {
+     "active": 9164947456.0,
+     "allocated": 7652885992.0,
+     "mapped": 9862610944.0,
+     "metadata": 280961712.0,
+     "resident": 9782804480.0,
+     "retained": 11534630912.0
+    }
+   }
+  },
+  {
+   "cache_per_worker": 6250,
+   "snapshots": [
+    {
+     "label": "started",
+     "rss_gb": 0.14,
+     "jemalloc_gb": {
+      "active": 0.222,
+      "allocated": 0.164,
+      "mapped": 0.355,
+      "metadata": 0.015,
+      "resident": 0.244,
+      "retained": 0.074
+     },
+     "cached_repos": 0,
+     "firehose_ring_gb": 0.0,
+     "live_ring_gb": 0.0
+    },
+    {
+     "label": "idle",
+     "rss_gb": 0.15,
+     "jemalloc_gb": {
+      "active": 0.232,
+      "allocated": 0.16,
+      "mapped": 0.36,
+      "metadata": 0.016,
+      "resident": 0.249,
+      "retained": 0.189
+     },
+     "cached_repos": 0,
+     "firehose_ring_gb": 0.0,
+     "live_ring_gb": 0.0
+    },
+    {
+     "label": "after 70 s load",
+     "rss_gb": 7.78,
+     "jemalloc_gb": {
+      "active": 7.423,
+      "allocated": 7.072,
+      "mapped": 7.89,
+      "metadata": 0.164,
+      "resident": 7.851,
+      "retained": 2.619
+     },
+     "cached_repos": 50000.0,
+     "firehose_ring_gb": 0.535,
+     "live_ring_gb": 0.0
+    }
+   ],
+   "load": {
+    "achieved": 50200,
+    "errors": 0,
+    "all": {
+     "n": 3012000,
+     "p50": 84.1,
+     "p90": 126.5,
+     "p99": 171.6,
+     "p999": 192.4,
+     "max": 222.0
+    },
+    "server": {
+     "cpu_pct_avg": 518.6,
+     "cpu_pct_max": 952.0,
+     "rss_gb_max": 7.88,
+     "rss_gb_last": 7.79
+    },
+    "jemalloc": {
+     "active": 7422918656.0,
+     "allocated": 7072226992.0,
+     "mapped": 7894859776.0,
+     "metadata": 164408568.0,
+     "resident": 7855718400.0,
+     "retained": 2613968896.0
+    }
+   }
+  }
+ ]
+}

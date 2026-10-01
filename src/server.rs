@@ -248,7 +248,17 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         log,
         // node-to-node: fail fast when a peer is unreachable (forwarded
         // requests return 503 instead of hanging)
+        // Peers speak h2c (the listener is HTTP/1 + HTTP/2 auto). With
+        // HTTP/1.1, forwarding ~10k writes/s at ~100 ms each needed ~1k
+        // concurrent connections per peer: beyond the 256 pooled ones every
+        // request opened and closed a TCP connection, and at 50k/s across 3
+        // nodes the forwards blew the TTFB deadline and the cluster collapsed
+        // to ~2k/s. One multiplexed connection per peer avoids the churn.
         http: reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .http2_initial_stream_window_size(4 << 20)
+            .http2_initial_connection_window_size(64 << 20)
+            .tcp_nodelay(true)
             .pool_max_idle_per_host(256)
             .connect_timeout(Duration::from_millis(1000))
             .timeout(Duration::from_secs(15))

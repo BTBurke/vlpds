@@ -643,7 +643,10 @@ async fn run_finalizer(
             }
         }
         let t = Instant::now();
-        for (sink, muts) in &targets {
+        // Shards are independent DBs: apply them concurrently, so one shard
+        // stalled on memtable backpressure doesn't serialize the rest (a
+        // segment touches up to every owned shard).
+        let writes = targets.iter().map(|(sink, muts)| {
             let mut wb = WriteBatch::new();
             for m in muts.iter() {
                 match &m.val {
@@ -652,8 +655,11 @@ async fn run_finalizer(
                 }
             }
             wb.put(META_APPLIED, encode_marker(&log_id, s.ordinal));
-            if let Err(e) = sink.db.write(wb).await {
-                tracing::error!(shard = sink.id, "state apply failed: {e}; exiting");
+            async move { (sink.id, sink.db.write(wb).await) }
+        });
+        for (shard, r) in futures::future::join_all(writes).await {
+            if let Err(e) = r {
+                tracing::error!(shard, "state apply failed: {e}; exiting");
                 std::process::exit(4);
             }
         }

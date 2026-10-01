@@ -8,3 +8,5 @@
 /checker/checker
 /bench/ha/faultproxy/faultproxy
 /bench/ha/fhaudit/fhaudit
+# the repo-root Go rule `bin/` would hide the Rust binaries in src/bin
+!/src/bin/

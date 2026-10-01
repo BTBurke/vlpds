@@ -325,24 +325,16 @@ async fn get_blocks(
     if want.contains(&head.commit) {
         found.insert(head.commit, head.commit_block.to_vec());
     }
-    let wanted: HashSet<Cid> = want.iter().copied().collect();
-    tree.walk_blocks(&mut |c, b| {
-        if wanted.contains(&c) {
-            found.insert(c, b.to_vec());
+    let wanted: HashSet<Cid> = want.iter().copied().filter(|c| !found.contains_key(c)).collect();
+    // node blocks + one path per record CID, in one pass that stops early
+    let mut records: HashMap<Cid, Vec<u8>> = HashMap::new();
+    tree.find_cids(&wanted, &mut found, &mut records)
+        .map_err(XrpcError::from_err)?;
+    for (c, key) in records {
+        if found.contains_key(&c) {
+            continue;
         }
-    })
-    .map_err(XrpcError::from_err)?;
-    // record CIDs -> one path holding each
-    let mut record_paths: Vec<(Cid, String)> = Vec::new();
-    tree.walk(&mut |k, c| {
-        if wanted.contains(&c)
-            && !found.contains_key(&c)
-            && !record_paths.iter().any(|(x, _)| *x == c)
-        {
-            record_paths.push((c, String::from_utf8_lossy(k).into_owned()));
-        }
-    });
-    for (c, path) in record_paths {
+        let path = String::from_utf8_lossy(&key).into_owned();
         if let Some(v) =
             snap.get(state::record_key(&did, &path))
                 .await

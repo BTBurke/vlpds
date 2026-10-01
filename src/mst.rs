@@ -1009,6 +1009,56 @@ impl Tree {
         rec(&self.root, &mut buf, f, 0)
     }
 
+    /// One pass over a fully written tree for `wanted` CIDs: encodes only the
+    /// matching node blocks (into `nodes`) and records one key per matching
+    /// record CID (into `records`); stops once everything wanted is found.
+    /// getBlocks used walk_blocks + walk, which re-encoded every node of the
+    /// repo per request (106 req/s at 1M records).
+    pub fn find_cids(
+        &self,
+        wanted: &std::collections::HashSet<Cid>,
+        nodes: &mut std::collections::HashMap<Cid, Vec<u8>>,
+        records: &mut std::collections::HashMap<Cid, Vec<u8>>,
+    ) -> Result<()> {
+        fn rec(
+            n: &Node,
+            wanted: &std::collections::HashSet<Cid>,
+            nodes: &mut std::collections::HashMap<Cid, Vec<u8>>,
+            records: &mut std::collections::HashMap<Cid, Vec<u8>>,
+            depth: usize,
+        ) -> Result<bool> {
+            if depth > MAX_DEPTH {
+                return Err(MstError::Invalid("tree too deep"));
+            }
+            let c = n.cid.ok_or(MstError::Invalid("unwritten node"))?;
+            if wanted.contains(&c) && !nodes.contains_key(&c) {
+                let mut buf = Vec::with_capacity(512);
+                encode_node(n, &mut buf)?;
+                nodes.insert(c, buf);
+            }
+            for e in &n.entries {
+                match e {
+                    Entry::Value { key, val } => {
+                        if wanted.contains(val) && !records.contains_key(val) {
+                            records.insert(*val, key.to_vec());
+                        }
+                    }
+                    Entry::Child { node: Some(c), .. } => {
+                        if rec(c, wanted, nodes, records, depth + 1)? {
+                            return Ok(true);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(nodes.len() + records.len() >= wanted.len())
+        }
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        rec(&self.root, wanted, nodes, records, 0).map(|_| ())
+    }
+
     /// Node blocks on the path from the root to `key` (inclusion or exclusion proof).
     pub fn proof_blocks(&self, key: &[u8]) -> Result<Vec<(Cid, Vec<u8>)>> {
         let height = height_for_key(key);

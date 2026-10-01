@@ -25,6 +25,32 @@ pub struct Partition {
     pub log: Arc<NodeLog>,
 }
 
+/// One SST block/meta cache shared by every shard DB in the process. SlateDB's
+/// default is a private 512 MiB block + 128 MiB meta cache per Db, which at
+/// 256 shards per node lets the caches grow toward ~160 GiB as reads touch
+/// more shards (the RSS creep seen at 1M–10M repos).
+static BLOCK_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(4 << 30);
+
+/// Size of the shared block cache (the meta cache gets a quarter on top).
+/// Takes effect only before the first shard DB opens.
+pub fn set_block_cache_bytes(n: u64) {
+    BLOCK_CACHE_BYTES.store(n.max(64 << 20), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn shared_db_cache() -> Arc<dyn slatedb::db_cache::DbCache> {
+    use slatedb::db_cache::{foyer::{FoyerCache, FoyerCacheOptions}, SplitCache};
+    static CACHE: std::sync::OnceLock<Arc<dyn slatedb::db_cache::DbCache>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mk = |cap| -> Arc<dyn slatedb::db_cache::DbCache> {
+                Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions { max_capacity: cap, ..Default::default() }))
+            };
+            let block = BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+            Arc::new(SplitCache::new().with_block_cache(Some(mk(block))).with_meta_cache(Some(mk(block / 4))))
+        })
+        .clone()
+}
+
 pub async fn open_db(
     store: &Store,
     partition: u16,
@@ -48,8 +74,17 @@ pub async fn open_db(
         oc.cache_on_compaction = true;
     }
     let path = format!("{}/state/{:03}", store.prefix, partition);
+    // cache ids only need to be distinct per DB in this process (tests open
+    // several prefixes with the same shard numbers)
+    let cache_id = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        path.hash(&mut h);
+        h.finish()
+    };
     Ok(Db::builder(path, store.raw.clone())
         .with_settings(settings)
+        .with_db_cache(shared_db_cache(), cache_id)
         .with_sst_block_size(slatedb::SstBlockSize::Block16Kib)
         .build()
         .await?)

@@ -91,6 +91,10 @@ struct Args {
     /// Local disk cache for SlateDB SSTs (empty = disabled).
     #[arg(long, env = "VLPDS_CACHE_DIR", default_value = "")]
     cache_dir: String,
+    /// In-memory SST block cache shared by every shard DB on this node (MiB;
+    /// the meta/index cache gets a quarter of this on top).
+    #[arg(long, env = "VLPDS_BLOCK_CACHE_MB", default_value_t = 4096)]
+    block_cache_mb: u64,
     /// Default AppView for proxied requests: "<url>,<service did>".
     #[arg(long, env = "VLPDS_APPVIEW")]
     appview: Option<String>,
@@ -188,6 +192,7 @@ fn secret(v: &Option<String>, dev_mode: bool, dev_default: &str) -> String {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
+    vlpds::partition::set_block_cache_bytes(args.block_cache_mb << 20);
     let cfg = Config {
         public_url: args.public_url.clone(),
         handle_domain: args.handle_domain.clone(),
