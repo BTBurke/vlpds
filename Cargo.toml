@@ -2,6 +2,9 @@
 name = "vlpds"
 version = "0.1.0"
 edition = "2021"
+# tests/ is one binary (tests/all/main.rs), declared below: one link per run
+# instead of one per file.
+autotests = false
 
 [features]
 default = ["jemalloc"]
@@ -59,6 +62,10 @@ tower = { version = "0.5", features = ["util"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "decompression-gzip", "decompression-deflate"] }
 
+[[test]]
+name = "all"
+path = "tests/all/main.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
@@ -66,9 +73,28 @@ codegen-units = 1
 # keep symbols for profiling (sample/perf/pprof)
 debug = 1
 
-# fast iteration builds: `cargo build --profile dev-release`
+# fast iteration builds: `cargo build --profile dev-release`. No LTO and
+# incremental, so an edit recompiles only the crate; dependencies are built
+# once at full opt-level and cached. Benches/deploys use --release.
 [profile.dev-release]
 inherits = "release"
-lto = "thin"
+opt-level = 2
+lto = false
+debug = "line-tables-only"
+codegen-units = 256
+incremental = true
+
+[profile.dev-release.package."*"]
+opt-level = 3
+
+# `cargo test` (tests/STATUS.md): quick to build and link, still fast enough
+# to run (crypto, CBOR and MST code is slow at opt-level 0).
+[profile.test]
+opt-level = 1
+debug = 0
+lto = false
 codegen-units = 16
 incremental = true
+
+[profile.test.package."*"]
+opt-level = 2

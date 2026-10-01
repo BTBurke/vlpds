@@ -1,51 +1,132 @@
 # vlpds conformance suite: status
 
-Last full run: 2026-09-30, `CARGO_TARGET_DIR=target/agent-fix cargo test --profile dev-release --no-fail-fast --tests`.
-The lead was landing log/cluster/firehose changes in `src/` during the run.
+## Running it
 
-**Totals:** 264 passed, 3 failed, 2 ignored, across 36 integration test files (the 6 new `rate_limits.rs` tests included).
-The 2 ignored tests are the email-2FA cases in `auth.rs`: vlpds replaces email sign-in codes with TOTP, which `totp.rs` covers.
+The integration tests are **one test binary**, `tests/all/main.rs`. Every former `tests/*.rs` file is a
+module of it (`tests/all/<name>.rs`), and the shared harness is `tests/all/common/mod.rs` (`use crate::common::*`).
+`Cargo.toml` sets `autotests = false` and declares the binary as `[[test]] name = "all"`.
+A new test file goes in `tests/all/` plus a `mod <name>;` line in `main.rs`.
 
-| File | Pass | Fail | Ign | Failing tests → endpoint/behavior at fault | Kind |
-|---|---:|---:|---:|---|---|
-| account.rs | 15 | 0 | 0 | | |
-| account_deactivation.rs | 6 | 0 | 0 | | |
-| account_status.rs | 8 | 0 | 0 | | |
-| app_passwords.rs | 3 | 0 | 0 | | |
-| auth.rs | 13 | 0 | 2 | (ignored: email 2FA, replaced by TOTP by design) | |
-| blob_deletes.rs | 6 | 0 | 0 | | |
-| blobs.rs | 1 | 0 | 0 | | |
-| create_post.rs | 2 | 0 | 0 | | |
-| crud.rs | 30 | 0 | 0 | | |
-| email_flows.rs | 6 | 0 | 0 | | |
-| file_uploads.rs | 11 | 0 | 0 | | |
-| firehose_backfill.rs | 2 | 0 | 0 | | |
-| go_checker.rs | 2 | 0 | 0 | | |
-| handle_validation.rs | 5 | 0 | 0 | | |
-| handles.rs | 12 | 0 | 0 | | |
-| harness.rs | 1 | 0 | 0 | | |
-| interop_crypto.rs | 7 | 0 | 0 | | |
-| interop_data_model.rs | 8 | 0 | 0 | | |
-| interop_mst.rs | 8 | 0 | 0 | | |
-| interop_syntax.rs | 15 | 0 | 0 | | |
-| invertible_ops.rs | 1 | 0 | 0 | | |
-| invite_codes.rs | 10 | 0 | 0 | | |
-| moderation.rs | 5 | 0 | 0 | | |
-| oauth.rs | 10 | 0 | 0 | | |
-| preferences.rs | 6 | 0 | 0 | | |
-| proxy.rs | 9 | 0 | 0 | | |
-| races.rs | 4 | 0 | 0 | | |
-| rate_limits.rs *(new)* | 6 | 0 | 0 | | |
-| sequencer.rs | 5 | 1 | 0 | `buffers_events_that_are_not_being_read`: subscribing with `cursor=0` now yields a frame without `seq` (likely the new cursor-backfill path's `#info`/OutdatedCursor frame); fails 3/3 locally. Firehose code is the lead's (`src/firehose.rs`) | new with the firehose backfill work |
-| server_basics.rs | 6 | 0 | 0 | | |
-| service_auth.rs | 7 | 0 | 0 | | |
-| subscribe_repos.rs | 14 | 0 | 0 | | |
-| sync.rs | 8 | 2 | 0 | `get_repo_since_returns_diff`, `list_blobs`: `getRepo?since=` / `listBlobs?since=` ignore `since` (lead's scope) | scope gap |
-| sync11_property.rs | 3 | 0 | 0 | | |
-| sync_list.rs | 3 | 0 | 0 | | |
-| totp.rs | 6 | 0 | 0 | | |
+```bash
+cargo test                          # unit tests (src/) + the whole suite
+cargo test --test all               # just the integration suite
+cargo test --test all crud::        # one former file (module)
+cargo test --test all crud::put_    # name prefix within a module
+VLPDS_TEST_LOG=debug cargo test --test all sync:: -- --nocapture   # server logs
+```
 
-## What this pass fixed (src/)
+`cargo test` uses `[profile.test]`: the crate at opt-level 1, dependencies at opt-level 2 (built once and cached),
+no LTO, no debuginfo, incremental. Don't run the suite with `--profile dev-release` or `--release`; it only makes the build slower.
+`go_checker` needs a Go toolchain (set `VLPDS_SKIP_GO_CHECKER=1` to skip it). It builds the checker once per run into `CARGO_TARGET_TMPDIR`.
+
+Every test boots its own in-process server (`TestServer::spawn`: in-memory store, port 0, `shards: 8`, `workers: 2`,
+rate limits off). Boot takes milliseconds, and the whole suite runs in about 3 s with tests in parallel. Sharing a server per module would
+save almost nothing, and each `#[tokio::test]` has its own runtime, which would cost isolation. So it isn't done.
+Handles come from `unique_name()` (process-wide counter + random suffix), so tests never collide.
+
+## Build and run times
+
+Measured 2026-10-01 on the 14-core laptop with `CARGO_TARGET_DIR=target/agent-tests`. Other agents were compiling at the same
+time (load average 35–75), so treat the numbers as ±30%. The ratios are what matter.
+
+| | Before: 36 binaries, `--profile dev-release` (thin LTO, opt 3) | After: 1 binary, `[profile.test]` |
+|---|---:|---:|
+| Cold build (`--no-run`, empty target dir) | 1416 s (load 60–75) | **108 s** (load 35) |
+| Warm rebuild after `touch src/lib.rs` | 1075 s (36 thin-LTO links) | **2 s** |
+| Warm rebuild after a real one-line `src/` edit | (≥ the touch case) | **35 s** (`cargo test --no-run`: lib, lib unit tests, 2 bins, `all`); ~29 s for `--test all` |
+| Running the suite | 13.4 s summed over 39 binaries (+ cargo/process overhead) | **2.9–3.1 s** (`--test all`); `cargo test` total 23 s including the rebuild |
+
+**`[profile.dev-release]`** (`cargo build --profile dev-release --bins`, which every agent uses to iterate). It used to inherit release with
+thin LTO, opt 3 and debug=1. It is now opt 2, `lto = false`, `debug = "line-tables-only"`, `codegen-units = 256`, incremental,
+with dependencies at opt 3:
+
+| | Before | After |
+|---|---:|---:|
+| Cold `--bins` | 99 s | 107 s (deps now at opt 3 without LTO; about the same) |
+| Warm after `touch src/lib.rs` | 33 s | **2 s** |
+| Warm after a one-line `src/` edit | ≥ 33 s | **12 s** |
+
+Performance sanity check (`vlpds --memory --no-rate-limits`, 500 accounts, `loadgen run --rate 5000 --duration 8 --warmup 3`, then
+`loadgen methods --seconds 4 --concurrency 32`), old and new profile built from the same source, interleaved twice:
+
+| | Old dev-release | New dev-release |
+|---|---|---|
+| 5000/s open loop | achieved 5000/s both runs, 0 errors | achieved 5000/s both runs, 0 errors |
+| Server CPU for the 8 s run | 16.5 s, 17.5 s | 18.8 s, 16.0 s |
+| `createRecord` closed loop (4 s) | 39.1k, 47.4k | 50.9k, 43.1k |
+| `sync.getRepo` closed loop (4 s) | 14.6k, 12.8k | 13.0k, 12.3k |
+| write p50 / p99 | 1.0–1.2 ms / 2.4–57 ms | 1.0–1.2 ms / 8.6–222 ms |
+
+These are equal within the noise of a loaded machine. The tail latencies swing by 10× between runs of the *same* binary.
+`sync.getRepo` (CPU-bound MST/CAR code in the crate) may be ~5% slower. Use `--release` (fat LTO, unchanged) for real benchmarks.
+
+## Results
+
+Last full run: 2026-10-01: `cargo test --test all`, run 13 times (3 via cargo, 10 directly, plus `--test-threads=2` and `=64`); all green. `cargo test` adds 47 unit tests in `src/`, all passing.
+
+**Totals:** 267 passed, 0 failed, 2 ignored, across 36 modules. The 2 ignored tests are the email-2FA cases in `auth`: vlpds replaces email sign-in codes with TOTP, which `totp` covers.
+
+| Module | Pass | Fail | Ign | Notes |
+|---|---:|---:|---:|---|
+| account | 15 | 0 | 0 |  |
+| account_deactivation | 6 | 0 | 0 |  |
+| account_status | 8 | 0 | 0 |  |
+| app_passwords | 3 | 0 | 0 |  |
+| auth | 13 | 0 | 2 | ignored: email 2FA, replaced by TOTP by design |
+| blob_deletes | 6 | 0 | 0 |  |
+| blobs | 1 | 0 | 0 |  |
+| create_post | 2 | 0 | 0 |  |
+| crud | 30 | 0 | 0 |  |
+| email_flows | 6 | 0 | 0 |  |
+| file_uploads | 11 | 0 | 0 |  |
+| firehose_backfill | 2 | 0 | 0 |  |
+| go_checker | 2 | 0 | 0 | checker built once per run (`OnceLock`) |
+| handle_validation | 5 | 0 | 0 |  |
+| handles | 12 | 0 | 0 |  |
+| harness | 1 | 0 | 0 |  |
+| interop_crypto | 7 | 0 | 0 |  |
+| interop_data_model | 8 | 0 | 0 |  |
+| interop_mst | 8 | 0 | 0 |  |
+| interop_syntax | 15 | 0 | 0 |  |
+| invertible_ops | 1 | 0 | 0 |  |
+| invite_codes | 10 | 0 | 0 |  |
+| moderation | 5 | 0 | 0 |  |
+| oauth | 10 | 0 | 0 |  |
+| preferences | 6 | 0 | 0 |  |
+| proxy | 9 | 0 | 0 |  |
+| races | 4 | 0 | 0 |  |
+| rate_limits | 6 | 0 | 0 |  |
+| sequencer | 6 | 0 | 0 |  |
+| server_basics | 6 | 0 | 0 |  |
+| service_auth | 7 | 0 | 0 |  |
+| subscribe_repos | 14 | 0 | 0 | fixed sleeps replaced by `sync_subs` polling |
+| sync | 10 | 0 | 0 | `get_repo_since_returns_diff` was flaky (2 of 3 runs failed), fixed test-side; see below |
+| sync_list | 3 | 0 | 0 |  |
+| sync11_property | 3 | 0 | 0 |  |
+| totp | 6 | 0 | 0 |  |
+
+The earlier failures are fixed in `src/`: `sequencer::buffers_events_that_are_not_being_read` and `sync`'s `getRepo`/`listBlobs` `since`.
+
+## Speed pass (2026-10-01): test-side changes
+
+- **One binary.** `tests/*.rs` became `tests/all/*.rs`, `mod common;` became `use crate::common::*`, and there were no name collisions.
+- **Flake: `sync::get_repo_since_returns_diff`.** It asserted `diff.blocks.len() < 10`. vlpds answers `getRepo?since=` with the commit, *all* MST
+  nodes and the records newer than `since`. That is a deliberate superset of the reference's rev-filtered block set (TODO.md), so the
+  block count depends on the shape of an MST over 20 random TIDs, and the test failed in 2 of 3 runs. The test now checks the same
+  thing deterministically: no record block from before `since` is in the diff, and every block other than the commit and the new record is an
+  MST node. It still checks that the diff is smaller than the full repo and that diff + old blocks = the new tree.
+  If the server is ever narrowed to the reference's block set, a `< N` bound on the MST nodes can come back.
+- **Fixed sleeps → polling.** `subscribe_repos::{live_tail_without_cursor_has_no_backfill, many_open_connections_see_identical_streams}`
+  slept 100 ms "so the subscription registers". They now call `TestServer::sync_subs`, which writes probe posts until every
+  subscription has received one, then consumes each stream up to the last probe (with a deadline).
+  Two sleeps remain on purpose: `sequencer::buffers_events_that_are_not_being_read` (200 ms of *not reading* is the point of
+  the test) and the 20 ms writer delay in `subscribe_repos::cutover_from_backfill_to_live` (it interleaves writes with the backfill).
+  The `drain(idle)` calls assert that *nothing more* arrives, so they need an idle window by definition.
+- **`go_checker`.** Its two tests ran `go build -o <same path>` concurrently. Now one `OnceLock` builds it once.
+- Known harness leak (src-side, harmless in tests): each server's repo-worker threads hold a sender to their own channel, so they
+  never exit. That is 2 idle threads per test server, about 540 per full run.
+
+## Earlier pass (2026-09-30): what it fixed (src/)
 
 - **Invite race:** each use of a code is a conditional-create claim object `invite-use/{hex code}/{slot}` (`If-None-Match: *`), released if the signup fails (`admin::claim_invite_use` / `release_invite_use`).
 - **Writes:** `applyWrites#update` of a missing record fails (400 InvalidRequest; the reference's MST update throws, which surfaces there as a 500). An identical `putRecord` makes no commit and returns no `commit`. `$type` defaults to the collection, and any other value (including null, non-string or empty) is rejected. `listRecords` limit must be 1..=100. `applyWrites` over 200 writes is rejected.
@@ -66,7 +147,7 @@ The 2 ignored tests are the email-2FA cases in `auth.rs`: vlpds replaces email s
 - **putPreferences** is serialized per account.
 - **Rate limits** (`src/ratelimit.rs`): the reference buckets and values, a 429 RateLimitExceeded envelope, `RateLimit-*` headers and `Retry-After`. Admin, internal and bypass-key requests are exempt. `X-Forwarded-For` is trusted only from `trusted_proxies`. `--no-rate-limits` turns them off. They are off in the test harness by default, as in the reference dev env.
 
-## Test fixes made in this pass (tests were wrong about the reference)
+## Earlier pass (2026-09-30): test fixes (tests were wrong about the reference)
 
 - **`proxy::target_selection_and_rejections`:** a locally implemented protected method (`listAppPasswords`) with an `atproto-proxy` header is served locally, not refused. In the reference, xrpc-server mounts `this.routes` before the proxy catchall (packages/xrpc-server/src/server.ts: `this.router.use(this.routes); this.router.use(this.catchall)`), and pipethrough.ts's `PROTECTED_METHODS` "Bad token method" check runs only in that catchall. The test now asserts 200 and that the upstream saw nothing.
 - **`crud::profile_gets_self_rkey`:** in the reference test the *client* fills in rkey `self`. The server validates the key against the schema (repo/prepare.ts `validateRecord` → `schema.keySchema.safeValidate`), so `createRecord` of a profile without an rkey is a 400. The test now checks both behaviours.
