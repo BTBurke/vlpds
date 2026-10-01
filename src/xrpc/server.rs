@@ -1348,18 +1348,41 @@ struct CreateSessionIn {
 }
 
 /// Resolves a login identifier (handle, DID or email) to a local account.
-pub(super) async fn login_account(app: &App, identifier: &str) -> Option<Account> {
+/// The account a login identifier names; Ok(None) if there is none.
+/// Unavailability (the account's shard moving between nodes) is an error,
+/// not "no such account", so a client retries instead of being told its
+/// credentials are wrong.
+pub(super) async fn login_account(app: &App, identifier: &str) -> XResult<Option<Account>> {
     let ident = identifier.trim().to_ascii_lowercase();
     let did = if ident.contains('@') {
-        did_by_email(app, &ident).await.ok()??
+        match did_by_email(app, &ident).await? {
+            Some(d) => d,
+            None => return Ok(None),
+        }
     } else {
-        app.resolve_repo(&ident).await.ok()?.to_string()
+        match app.resolve_repo(&ident).await {
+            Ok(d) => d.to_string(),
+            Err(e) if e.status.is_client_error() => return Ok(None),
+            Err(e) => return Err(e),
+        }
     };
-    let a = app.account(&did).await.ok()?;
+    let Some(a) = account_if_exists(app, &did).await? else {
+        return Ok(None);
+    };
     if ident.contains('@') && a.email.as_deref() != Some(ident.as_str()) {
-        return None;
+        return Ok(None);
     }
-    Some(a)
+    Ok(Some(a))
+}
+
+/// `app.account`, with "no such account" as Ok(None) and every other error
+/// (e.g. 503 while the shard moves) passed on.
+pub(super) async fn account_if_exists(app: &App, did: &str) -> XResult<Option<Account>> {
+    match app.account(did).await {
+        Ok(a) => Ok(Some(a)),
+        Err(e) if e.error == "AccountNotFound" => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// App passwords are server-generated with ~80 bits of randomness, so a fast
@@ -1393,14 +1416,18 @@ async fn create_session(
             "Password too long. Consider resetting your password.",
         ));
     }
-    // reference: 300/day and 30/5min per `${identifier}-${ip}`
+    // reference: 300/day and 30/5min per `${identifier}-${ip}`, normalized
+    // like the OAuth sign-in's key (whose buckets these are too), so case
+    // variants of one handle or email share a bucket instead of each
+    // getting a fresh one
     {
         use crate::ratelimit::*;
-        check_with_ip(&[&CREATE_SESSION_DAY, &CREATE_SESSION_5MIN], &inp.identifier, 1)?;
+        let key = inp.identifier.trim().trim_start_matches('@').to_lowercase();
+        check_with_ip(&[&CREATE_SESSION_DAY, &CREATE_SESSION_5MIN], &key, 1)?;
     }
     let invalid = || auth_required("Invalid identifier or password");
     let acct = login_account(&app, &inp.identifier)
-        .await
+        .await?
         .ok_or_else(invalid)?;
     let soft_deleted = is_takendown_account(&acct);
     let mut app_pass = None;
@@ -2163,10 +2190,8 @@ async fn request_password_reset(
 ) -> XResult<StatusCode> {
     let email = inp.email.trim().to_ascii_lowercase();
     let acct = match did_by_email(&app, &email).await? {
-        Some(did) => app
-            .account(&did)
-            .await
-            .ok()
+        Some(did) => account_if_exists(&app, &did)
+            .await?
             .filter(|a| a.email.as_deref() == Some(email.as_str())),
         None => None,
     };
@@ -2189,6 +2214,16 @@ async fn request_password_reset(
 struct ResetPasswordIn {
     token: String,
     password: String,
+}
+
+/// The account a password-reset token was issued for (a global lookup; HA
+/// routing sends resetPassword to that account's owner).
+pub async fn reset_token_did(app: &App, token: &str) -> XResult<Option<String>> {
+    let routing = format!("_reset:{}", token.trim().to_ascii_uppercase());
+    Ok(app
+        .get_private(&routing, "t")
+        .await?
+        .map(|v| String::from_utf8_lossy(&v).to_string()))
 }
 
 /// Sets a new password and revokes every session, OAuth grants included.
@@ -2215,10 +2250,8 @@ async fn reset_password(
     }
     let token = inp.token.trim().to_ascii_uppercase();
     let routing = format!("_reset:{token}");
-    let did = app
-        .get_private(&routing, "t")
+    let did = reset_token_did(&app, &token)
         .await?
-        .map(|v| String::from_utf8_lossy(&v).to_string())
         .ok_or_else(|| invalid_token("Token is invalid"))?;
     assert_email_token(&app, &did, "reset_password", &token).await?;
     change_password(&app, &did, &inp.password).await?;

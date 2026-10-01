@@ -15,7 +15,7 @@ mod sync;
 pub mod syntax;
 mod webui;
 pub use blobs::spawn_blob_gc;
-pub use server::{spawn_reserved_key_gc, sweep_reserved_keys};
+pub use server::{reset_token_did, spawn_reserved_key_gc, sweep_reserved_keys};
 pub use sync::request_crawl;
 
 /// Imports shared by every XRPC module (they `use super::*`).

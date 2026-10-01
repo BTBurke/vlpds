@@ -129,6 +129,9 @@ func (s *stats) summary(lastSeq int64, firstSeq int64, reason string) {
 	fmt.Fprintf(s.out, "  unknown:       %d\n", s.unknown.Load())
 	fmt.Fprintf(s.out, "lag (all):       p50=%s p99=%s max=%s\n",
 		fmtDur(s.allLags.quantile(0.5), s.allLags.n), fmtDur(s.allLags.quantile(0.99), s.allLags.n), fmtDur(s.allLags.max, s.allLags.n))
+	if n := keysGone.Load(); n > 0 {
+		fmt.Fprintf(s.out, "sigs skipped:    %d (account deleted: key no longer served)\n", n)
+	}
 	fmt.Fprintf(s.out, "failures:        %d [%s]\n", s.totalFails, s.failBreakdownLocked())
 	if s.totalFails == 0 {
 		fmt.Fprintf(s.out, "RESULT: PASS\n")

@@ -252,6 +252,9 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
             .pool_max_idle_per_host(256)
             .connect_timeout(Duration::from_millis(1000))
             .timeout(Duration::from_secs(15))
+            // forwarded responses go back to the client as they are (an
+            // OAuth consent's 303 to the client's redirect_uri included)
+            .redirect(reqwest::redirect::Policy::none())
             .build()?,
         node: node_handle,
     }))

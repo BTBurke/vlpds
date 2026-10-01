@@ -20,6 +20,8 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/internal/v1/cluster", get(cluster_status))
         .route("/internal/v1/admin/searchAccounts", get(admin_search_accounts))
         .route("/internal/v1/admin/inviteCodes", get(admin_invite_codes))
+        .route("/internal/v1/sync/listRepos", get(sync_list_repos))
+        .route("/internal/v1/sync/listReposByCollection", get(sync_list_repos_by_collection))
 }
 
 /// Cluster view of this node (HA tests / ops): shards it owns, the routing
@@ -343,6 +345,28 @@ async fn admin_invite_codes(
     check(&app, &headers)?;
     let (codes, owned) = super::admin::invite_codes_local(&app, &q).await?;
     Ok(Json(json!({"owned": owned, "codes": codes})))
+}
+
+/// The local half of sync.listRepos on this node's shards, for a peer's merge.
+async fn sync_list_repos(
+    State(app): AppState,
+    headers: HeaderMap,
+    Query(q): Query<super::sync::ListReposQ>,
+) -> XResult<Json<J>> {
+    check(&app, &headers)?;
+    let (repos, owned) = super::sync::list_repos_local(&app, &q).await?;
+    Ok(Json(json!({"owned": owned, "repos": repos})))
+}
+
+/// The local half of sync.listReposByCollection, for a peer's merge.
+async fn sync_list_repos_by_collection(
+    State(app): AppState,
+    headers: HeaderMap,
+    Query(q): Query<super::sync::ByCollectionQ>,
+) -> XResult<Json<J>> {
+    check(&app, &headers)?;
+    let (repos, owned) = super::sync::list_repos_by_collection_local(&app, &q).await?;
+    Ok(Json(json!({"owned": owned, "repos": repos})))
 }
 
 pub struct PeerReply {

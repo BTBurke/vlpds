@@ -19,6 +19,7 @@ mod blobs;
 mod cbor_transcode;
 mod create_post;
 mod crud;
+mod e2e_regressions;
 mod email_flows;
 mod file_uploads;
 mod firehose_backfill;

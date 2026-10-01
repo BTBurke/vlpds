@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	comatproto "github.com/bluesky-social/indigo/api/atproto"
@@ -100,6 +101,14 @@ func (s *pdsKeySource) Invalidate(did string) {
 	s.mu.Unlock()
 }
 
+// errKeyGone: the PDS no longer has the account (deleted), so its key, and
+// any signature made with it, can't be checked any more. A replay that
+// starts after a deletion meets this for every event of that account.
+var errKeyGone = errors.New("account deleted: signing key unavailable")
+
+// keysGone counts signature checks skipped with errKeyGone (summary line).
+var keysGone atomic.Int64
+
 func (s *pdsKeySource) Get(ctx context.Context, did string) (atcrypto.PublicKey, error) {
 	s.mu.Lock()
 	k, ok := s.cache[did]
@@ -107,22 +116,79 @@ func (s *pdsKeySource) Get(ctx context.Context, did string) (atcrypto.PublicKey,
 	if ok {
 		return k, nil
 	}
-	u := s.host + "/xrpc/com.atproto.repo.describeRepo?repo=" + url.QueryEscape(did)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	// describeRepo refuses deactivated / taken-down repos; resolveDid still
+	// serves their DID document (as PLC would), so a late replay can check them.
+	mb, err := s.fetchKeyRetry(ctx, "/xrpc/com.atproto.repo.describeRepo?repo="+url.QueryEscape(did), "describeRepo")
 	if err != nil {
-		return nil, err
+		var err2 error
+		mb, err2 = s.fetchKeyRetry(ctx, "/xrpc/com.atproto.identity.resolveDid?did="+url.QueryEscape(did), "resolveDid")
+		if errors.Is(err2, errKeyGone) {
+			return nil, errKeyGone
+		}
+		if err2 != nil {
+			return nil, fmt.Errorf("%v; %v", err, err2)
+		}
+	}
+	k, err = atcrypto.ParsePublicMultibase(mb)
+	if err != nil {
+		return nil, fmt.Errorf("publicKeyMultibase %q: %w", mb, err)
+	}
+	s.mu.Lock()
+	s.cache[did] = k
+	s.mu.Unlock()
+	return k, nil
+}
+
+// errUnavailable: a 503 (the repo's shard is moving between nodes).
+var errUnavailable = errors.New("HTTP 503")
+
+// fetchKeyRetry is fetchKey, retrying 503s and connection errors for up to
+// 30 s (shard handoffs and node restarts answer 503 briefly).
+func (s *pdsKeySource) fetchKeyRetry(ctx context.Context, path, name string) (string, error) {
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		mb, err := s.fetchKey(ctx, path, name)
+		var netErr interface{ Timeout() bool }
+		retry := errors.Is(err, errUnavailable) || errors.As(err, &netErr)
+		if err == nil || !retry || time.Now().After(deadline) {
+			return mb, err
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+// fetchKey GETs a {didDoc} response and returns its #atproto key multibase.
+// A 400 DidNotFound / RepoNotFound is errKeyGone.
+func (s *pdsKeySource) fetchKey(ctx context.Context, path, name string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.host+path, nil)
+	if err != nil {
+		return "", err
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("describeRepo: HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
+		var e struct {
+			Error string `json:"error"`
+		}
+		if resp.StatusCode == http.StatusBadRequest && json.Unmarshal(body, &e) == nil &&
+			(e.Error == "DidNotFound" || e.Error == "RepoNotFound") {
+			return "", errKeyGone
+		}
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			return "", fmt.Errorf("%s: %w: %s", name, errUnavailable, truncate(string(body), 200))
+		}
+		return "", fmt.Errorf("%s: HTTP %d: %s", name, resp.StatusCode, truncate(string(body), 200))
 	}
 	var out struct {
 		DidDoc struct {
@@ -133,11 +199,11 @@ func (s *pdsKeySource) Get(ctx context.Context, did string) (atcrypto.PublicKey,
 		} `json:"didDoc"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, fmt.Errorf("describeRepo: bad JSON: %w", err)
+		return "", fmt.Errorf("%s: bad JSON: %w", name, err)
 	}
 	vms := out.DidDoc.VerificationMethod
 	if len(vms) == 0 {
-		return nil, fmt.Errorf("describeRepo: didDoc has no verificationMethod")
+		return "", fmt.Errorf("%s: didDoc has no verificationMethod", name)
 	}
 	mb := vms[0].PublicKeyMultibase
 	for _, vm := range vms {
@@ -146,14 +212,7 @@ func (s *pdsKeySource) Get(ctx context.Context, did string) (atcrypto.PublicKey,
 			break
 		}
 	}
-	k, err = atcrypto.ParsePublicMultibase(mb)
-	if err != nil {
-		return nil, fmt.Errorf("describeRepo: publicKeyMultibase %q: %w", mb, err)
-	}
-	s.mu.Lock()
-	s.cache[did] = k
-	s.mu.Unlock()
-	return k, nil
+	return mb, nil
 }
 
 type chainState struct {
@@ -296,6 +355,10 @@ func (v *verifier) checkSignature(ctx context.Context, did string, c *repo.Commi
 		return nil
 	}
 	key, err := v.keys.Get(ctx, did)
+	if errors.Is(err, errKeyGone) {
+		keysGone.Add(1)
+		return nil
+	}
 	if err != nil {
 		return &failure{Kind: failKeyFetch, Reason: err.Error()}
 	}

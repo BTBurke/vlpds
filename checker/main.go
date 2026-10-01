@@ -20,7 +20,8 @@
 //
 // Flags: -host, -cursor (replay from seq; omit to start live), -max-events (0 =
 // unlimited), -workers (default NumCPU), -strict (exit 1 on any failure),
-// -quiet (no 5 s progress lines). Exit codes: 0 ok, 1 failures under -strict,
+// -quiet (no 5 s progress lines), -reconnect (resume after the PDS restarts,
+// from the last seq seen; seq order and chains carry across). Exit codes: 0 ok, 1 failures under -strict,
 // 2 could not connect / bad flags.
 package main
 
@@ -58,6 +59,7 @@ type config struct {
 	strict    bool
 	quiet     bool
 	dense     bool
+	reconnect bool
 }
 
 func parseFlags() (config, error) {
@@ -70,6 +72,7 @@ func parseFlags() (config, error) {
 	flag.BoolVar(&c.strict, "strict", false, "exit non-zero if any failure was seen")
 	flag.BoolVar(&c.quiet, "quiet", false, "suppress the periodic progress line")
 	flag.BoolVar(&c.dense, "dense", false, "require dense seqs (each seq == previous+1)")
+	flag.BoolVar(&c.reconnect, "reconnect", false, "on a dropped connection, redial and resume from the last seq seen")
 	flag.Parse()
 	if cursor != "" {
 		n, err := strconv.ParseInt(cursor, 10, 64)
@@ -136,19 +139,28 @@ func run() int {
 
 	fmt.Printf("connecting to %s (workers=%d)\n", wsURL, cfg.workers)
 	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
-	conn, resp, err := dialer.DialContext(ctx, wsURL, nil)
-	if err != nil {
-		if resp != nil {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-			fmt.Fprintf(os.Stderr, "dial %s: %v (HTTP %d: %s)\n", wsURL, err, resp.StatusCode, body)
-		} else {
-			fmt.Fprintf(os.Stderr, "dial %s: %v\n", wsURL, err)
+	dial := func(u string) (*websocket.Conn, error) {
+		conn, resp, err := dialer.DialContext(ctx, u, nil)
+		if err != nil {
+			if resp != nil {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+				return nil, fmt.Errorf("dial %s: %v (HTTP %d: %s)", u, err, resp.StatusCode, body)
+			}
+			return nil, fmt.Errorf("dial %s: %v", u, err)
 		}
+		conn.SetReadLimit(64 << 20)
+		return conn, nil
+	}
+	conn, err := dial(wsURL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
-	conn.SetReadLimit(64 << 20)
+	var connMu sync.Mutex
 	go func() {
 		<-ctx.Done()
+		connMu.Lock()
+		defer connMu.Unlock()
 		_ = conn.WriteControl(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
 		conn.Close()
@@ -181,6 +193,32 @@ func run() int {
 	sc := newSeqChecker()
 	sc.allowGaps = !cfg.dense
 	reason := readLoop(ctx, conn, cfg, st, sc, pool)
+	for cfg.reconnect && ctx.Err() == nil && strings.HasPrefix(reason, "connection ") {
+		cur, has := cfg.cursor, cfg.hasCursor
+		if sc.last >= 0 {
+			cur, has = sc.last, true
+		}
+		u, _ := subscribeURL(cfg.host, cur, has)
+		fmt.Printf("RECONNECT after %s; resuming at cursor %d\n", reason, cur)
+		var next *websocket.Conn
+		for ctx.Err() == nil {
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+			}
+			if next, err = dial(u); err == nil {
+				break
+			}
+		}
+		if next == nil {
+			break
+		}
+		connMu.Lock()
+		conn.Close()
+		conn = next
+		connMu.Unlock()
+		reason = readLoop(ctx, next, cfg, st, sc, pool)
+	}
 
 	pool.close()
 	close(reportDone)

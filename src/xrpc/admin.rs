@@ -6,7 +6,7 @@
 use super::authn::Credentials;
 use super::server::{
     ctl, delete_account_fully, ext, get_json, invalid_request, normalize_handle, pmut, put_sec,
-    recompute_status, scan_private, scan_private_routing, set_deactivated,
+    recompute_status, scan_private_routing, set_deactivated,
     set_email, set_extra, to_json_bytes, update_account, NEW_PASSWORD_MAX_LENGTH, TAKEDOWN,
 };
 use super::*;
@@ -203,7 +203,8 @@ pub(super) async fn create_invites(
 /// Invite codes created for `account` (a DID or "admin").
 pub(super) async fn account_invites(app: &App, account: &str) -> XResult<Vec<InviteCode>> {
     let mut out = Vec::new();
-    for (name, _) in scan_private(app, account, "invite/").await? {
+    // `account` may be owned elsewhere (getAccountInfos, disableInviteCodes)
+    for (name, _) in super::internal::scan_private_anywhere(app, account, "invite/").await? {
         if let Some(inv) = get_invite(app, &name["invite/".len()..]).await? {
             out.push(inv);
         }
@@ -415,7 +416,8 @@ async fn get_account_infos(
     let mut seen = std::collections::HashSet::new();
     for (k, did) in query_pairs(raw.as_deref().unwrap_or("")) {
         if (k == "dids" || k == "dids[]") && seen.insert(did.clone()) {
-            if let Ok(a) = app.account(&did).await {
+            // the DIDs live on any node's shards (the request routes by none)
+            if let Ok(a) = super::internal::account_anywhere(&app, &did).await {
                 infos.push(account_view(&app, &a).await?);
             }
         }

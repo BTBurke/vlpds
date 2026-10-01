@@ -1,13 +1,16 @@
 //! HA request routing: any node accepts any request; requests for a DID whose
 //! partition is owned by another node are proxied to that owner.
 //!
-//! XRPC: the routing DID comes from (in order) the `repo` / `did` query
-//! parameter (handles resolved), the bearer token's `sub` (when that is
-//! ours the body is never parsed), then the `repo` / `did` / `identifier`
-//! field of a JSON body (handles and emails resolved) and, for
-//! `com.atproto.admin.*`, the moderation `subject` (`did`, or the DID of its
-//! `uri`; also the `uri` query parameter), then the token `sub`. Requests
-//! without one (describeServer, subscribeRepos, ...) are served locally.
+//! XRPC: the routing DID comes from (in order) the `repo` / `did` /
+//! `handle` / `identifier` query parameter (handles resolved), the bearer
+//! token's `sub` (when that is ours the body is never parsed), then the
+//! `repo` / `did` / `identifier` field of a JSON body (handles and emails
+//! resolved) and, for `com.atproto.admin.*`, the moderation `subject` (`did`,
+//! or the DID of its `uri`; also the `uri` query parameter) or the `account`
+//! / `recipientDid`, then the token `sub` (requestPasswordReset: its
+//! `email`'s account; resetPassword: the account its token was issued for).
+//! Requests without one (describeServer, subscribeRepos, ...) are served
+//! locally.
 //! Bodies are only buffered for JSON requests (bounded), so blob uploads
 //! stream straight through; routing reads them with a borrowed struct that
 //! skips every other field.
@@ -68,7 +71,7 @@ pub trait Router: Send + Sync + 'static {
 }
 
 /// Routing key from the query string: a DID in `repo`/`did`, else a handle in
-/// `repo`/`did`/`handle` (resolved to its DID by the caller). `admin` also
+/// `repo`/`did`/`handle`/`identifier` (resolved to its DID by the caller). `admin` also
 /// takes the DID of an at:// `uri` (getSubjectStatus).
 fn query_target(query: Option<&str>, admin: bool) -> (Option<String>, Option<String>) {
     let mut handle = None;
@@ -80,7 +83,7 @@ fn query_target(query: Option<&str>, admin: bool) -> (Option<String>, Option<Str
             }
             continue;
         }
-        if !matches!(k, "repo" | "did" | "handle") {
+        if !matches!(k, "repo" | "did" | "handle" | "identifier") {
             continue;
         }
         let v = percent_decode(v);
@@ -259,6 +262,12 @@ struct BodyKeys<'a> {
     identifier: Str<'a>,
     #[serde(borrow, default)]
     subject: Subject<'a>,
+    /// admin updateAccountEmail / {enable,disable}AccountInvites (DID or handle)
+    #[serde(borrow, default)]
+    account: Str<'a>,
+    /// admin sendEmail
+    #[serde(borrow, default, rename = "recipientDid")]
+    recipient_did: Str<'a>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -280,8 +289,13 @@ fn body_target(body: &[u8], admin: bool) -> Option<BodyTarget> {
     if admin {
         if let Some(d) = is_did(&k.subject.did)
             .or_else(|| k.subject.uri.0.as_deref().and_then(uri_did).map(String::from))
+            .or_else(|| is_did(&k.account))
+            .or_else(|| is_did(&k.recipient_did))
         {
             return Some(BodyTarget::Did(d));
+        }
+        if let Some(h) = k.account.0.as_deref().filter(|s| s.contains('.') && !s.contains('@')) {
+            return Some(BodyTarget::Ident(h.to_string()));
         }
     }
     if let Some(i) = k.identifier.0.as_deref().filter(|s| s.contains('.') || s.contains('@')) {
@@ -326,6 +340,30 @@ async fn resolve_ident(router: &dyn Router, app: Option<&crate::xrpc::App>, iden
     }
 }
 
+/// Unauthenticated calls that name their account another way:
+/// requestPasswordReset by `email`, resetPassword by its token (the account
+/// it was issued for). Both run through that account's owner.
+async fn named_account(router: &dyn Router, app: Option<&crate::xrpc::App>, path: &str, body: &[u8]) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Named<'a> {
+        #[serde(borrow, default)]
+        email: Str<'a>,
+        #[serde(borrow, default)]
+        token: Str<'a>,
+    }
+    let n: Named = match path {
+        "/xrpc/com.atproto.server.requestPasswordReset" | "/xrpc/com.atproto.server.resetPassword" => {
+            serde_json::from_slice(body).ok()?
+        }
+        _ => return None,
+    };
+    if path.ends_with("requestPasswordReset") {
+        let email = n.email.0.filter(|e| e.contains('@'))?;
+        return resolve_ident(router, app, &email).await;
+    }
+    crate::xrpc::reset_token_did(app?, n.token.0.as_deref()?).await.ok()?
+}
+
 /// XRPC routing DID (None = serve here).
 #[allow(clippy::result_large_err)]
 async fn xrpc_target(
@@ -359,7 +397,7 @@ async fn xrpc_target(
     let did = match body_target(&b, admin) {
         Some(BodyTarget::Did(d)) => Some(d),
         Some(BodyTarget::Ident(i)) => resolve_ident(router, app, &i).await,
-        None => None,
+        None => named_account(router, app, req.uri().path(), &b).await,
     };
     Ok((req, did.or(sub)))
 }
@@ -623,6 +661,11 @@ mod tests {
         let rec = r#"{"subject":{"$type":"com.atproto.repo.strongRef","uri":"at://did:plc:r/app.bsky.feed.post/1","cid":"bafy"}}"#;
         assert_eq!(t(rec, true), did("did:plc:r"));
         assert_eq!(t(r#"{"subject":"x"}"#, true), None);
+        // admin account updates name the account as `account` / `recipientDid`
+        assert_eq!(t(r#"{"account":"did:plc:e","email":"a@b.c"}"#, true), did("did:plc:e"));
+        assert_eq!(t(r#"{"account":"alice.test","email":"a@b.c"}"#, true), Some(BodyTarget::Ident("alice.test".into())));
+        assert_eq!(t(r#"{"account":"did:plc:e"}"#, false), None);
+        assert_eq!(t(r#"{"recipientDid":"did:plc:m","content":"hi"}"#, true), did("did:plc:m"));
     }
 
     #[test]

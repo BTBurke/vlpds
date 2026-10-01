@@ -69,6 +69,26 @@ async fn disabled_means_no_limits_or_headers() {
     }
 }
 
+/// Case variants of one identifier share its createSession bucket (the key
+/// is normalized as the OAuth sign-in's is); before, each variant of a
+/// handle got a fresh 30 guesses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_session_identifier_variants_share_a_bucket() {
+    let s = limited().await;
+    let a = s.create_account("rlv").await;
+    let variants = [a.handle.clone(), a.handle.to_uppercase(), format!(" {} ", a.handle), format!("@{}", a.handle)];
+    for i in 0..30 {
+        let r = s.create_session(&variants[i % variants.len()], "wrong").await;
+        assert_eq!(r.status, 401, "attempt {i}: {}", r.text());
+    }
+    for v in &variants {
+        s.create_session(v, "wrong").await.err(429, "RateLimitExceeded");
+    }
+    // another account's identifier is unaffected
+    let b = s.create_account("rlv").await;
+    s.create_session(&b.handle, PASSWORD).await.ok();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_session_per_identifier_and_ip() {
     let s = limited().await;

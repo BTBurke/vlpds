@@ -457,8 +457,10 @@ async fn oauth_flow_across_nodes_single_use_cluster_wide() {
         let n = |k: usize| all[(i + k) % 3];
         let client = Client::new();
         let mut browser = Browser::default();
-        // every step of the flow on another node than the one before
-        let (code, verifier) = client.authorize(&mut browser, [n(0), n(1), n(2), n(0)], &acct.handle, &acct.did).await;
+        // every step of the flow on another node than the one before; the
+        // consent POST off the pushed request's node, so its 303 to the
+        // client is forwarded back as is (not followed by the forwarder)
+        let (code, verifier) = client.authorize(&mut browser, [n(0), n(1), n(2), n(1)], &acct.handle, &acct.did).await;
         let (st, t) = client.exchange(n(1), &code, &verifier).await;
         assert_eq!(st, 200, "token: {t}");
         assert_eq!(t["sub"], acct.did.as_str());

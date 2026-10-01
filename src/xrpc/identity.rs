@@ -35,6 +35,37 @@ pub fn routes() -> Router<Arc<App>> {
             "/xrpc/com.atproto.identity.submitPlcOperation",
             post(plc_unsupported),
         )
+        .route("/.well-known/atproto-did", get(well_known_atproto_did))
+}
+
+/// HTTPS handle verification for handles under our domain (the reference's
+/// well-known.ts): the request's Host is the handle; its DID as text/plain,
+/// or 404 unless it is an active account here.
+async fn well_known_atproto_did(State(app): AppState, headers: HeaderMap) -> Response {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let handle = match host.rsplit_once(':') {
+        Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => host,
+    }
+    .to_ascii_lowercase();
+    let not_found = || (StatusCode::NOT_FOUND, "User not found").into_response();
+    if !handle.ends_with(&format!(".{}", app.handle_domain)) {
+        return not_found();
+    }
+    let Ok(Some(did)) = app.resolve_handle(&handle).await else {
+        return not_found();
+    };
+    match super::internal::account_anywhere(&app, &did).await {
+        Ok(a) if a.status.is_none() && a.handle == handle => {
+            ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], did).into_response()
+        }
+        // owner unreachable / shard moving: retry, not "no such user"
+        Err(e) if e.status.is_server_error() => e.into_response(),
+        _ => not_found(),
+    }
 }
 
 /// The DID document of a local account (also used by describeRepo).
@@ -71,8 +102,11 @@ async fn resolve_handle(State(app): AppState, Query(q): Query<HandleQ>) -> XResu
     // Like the reference's getAccount(handle): deactivated and taken-down
     // accounts don't resolve.
     let did = app.resolve_handle(&handle).await?;
+    // a shard mid-move is a 503 (retry), not "no such handle"
     let active = match &did {
-        Some(d) => app.account(d).await.is_ok_and(|a| a.status.is_none()),
+        Some(d) => super::server::account_if_exists(&app, d)
+            .await?
+            .is_some_and(|a| a.status.is_none()),
         None => false,
     };
     match did {
