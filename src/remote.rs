@@ -24,6 +24,8 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 
 const HEARTBEAT: Duration = Duration::from_millis(5);
+/// A live log stream (or its connect) silent this long is presumed dead.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn encode_batch(b: &LogBatch) -> Bytes {
     let size: usize = b.events.iter().map(|(_, f)| f.len() + 12).sum();
@@ -204,13 +206,26 @@ async fn stream_live(
     let url = format!("{}/internal/v1/log/stream", base.replacen("http", "ws", 1));
     let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str())?;
     req.headers_mut().insert("x-vlpds-internal", token.parse()?);
-    let (mut ws, _) = tokio_tungstenite::connect_async(req).await?;
+    let (mut ws, _) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, tokio_tungstenite::connect_async(req))
+        .await
+        .map_err(|_| anyhow::anyhow!("log stream connect to {base} timed out"))??;
     // Connected (live batches now buffer in the socket): catch up from S3
     // after what we already delivered, then dedupe against the stream.
     if last.is_some() {
         drain_s3(log_id, store, merger_tx, wm, last).await?;
     }
-    while let Some(msg) = ws.next().await {
+    // HA fix: an idle timeout. The owner heartbeats every 5 ms, so silence
+    // means a dead or partitioned peer. Without it, a half-open connection
+    // (peer cut off by the network, then dead: no FIN/RST ever arrives) kept
+    // us in ws.next() forever. We never noticed the peer's lease was gone, so
+    // we never drained its log to the fence, and every survivor's merged
+    // firehose stalled for good (bench/ha ctr-partition).
+    loop {
+        let msg = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, ws.next()).await {
+            Ok(Some(m)) => m,
+            Ok(None) => break,
+            Err(_) => anyhow::bail!("log {log_id} stream from {base} idle for {STREAM_IDLE_TIMEOUT:?}"),
+        };
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }

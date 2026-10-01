@@ -1,14 +1,22 @@
-# vlpds HA end-to-end results: baseline on the per-partition-lease model
+# vlpds HA end-to-end results: per-node-log design
 
-These results come from the **per-partition lease model**: 16 partitions, each with its own S3 lease object and segment log. That model is being replaced (256 shards, one log per node, node leases, and a CAS shard-assignment map). Treat these numbers as the baseline to compare the new design against.
+These results are for the **per-node-log design**:
+- 65,536 hash slots grouped into `--shards N` (64 here, plus 256 for the 5-node runs);
+- one log per node incarnation;
+- node leases;
+- CAS shard assignments;
+- fencing of dead logs.
 
-- Run ID: `base1`, plus the smoke runs `smoke1`–`smoke3`. Outputs are in `bench/ha/out/<run>/<scenario>/`.
-- Setup: native processes on one Mac (14 cores), with native MinIO on 127.0.0.1:9200.
-- Lease TTL: 3 s, so renew and skew margin are both 600 ms.
-- Load: 150 creates/s through **every** node, using one `loadgen` per node over all accounts, so most writes are forwarded.
-- Probes: one 10 Hz probe writer per hash bucket, sent through n1.
+The previous baseline, on the per-partition-lease design, is summarised under "Comparison with the old baseline" below, with its bug list B1–B9 and each bug's status today.
 
-The run was stopped partway at the lead's request, so not every scenario ran (see "Not run").
+- **Run IDs:** `final` is the whole native matrix. `final2` and `final3` re-run the scenarios affected by the last fix (the log-stream idle timeout). `final-rep` holds repeats. `final-256` and `final3-256` are the 256-shard runs. `final2-ctr` (and `final-ctr`) are the containers. Outputs are in `bench/ha/out/<run>/<scenario>/`.
+- **Setup:** native processes on one Mac (14 cores), with native MinIO on 127.0.0.1:9200.
+- **Lease TTL:** 3 s, so renew and skew margin are both 600 ms.
+- **Load:** 150 creates/s through **every** node, using one `loadgen` per node over all accounts, so most writes are forwarded.
+- **Probes:** 32 probe writers at 10 Hz, one per sampled shard, sent through n1.
+- **Node flags:** `--shards N --no-rate-limits --dev-mode --workers 2 --io-threads 3`.
+- **Host load:** the host was shared with other agents' builds and benchmarks. The load average was 25–67 during `final` and 8–25 later. Absolute latencies are therefore pessimistic, but failover and outage times are dominated by TTL and skew.
+- **Binaries:** every run used binaries built from the tree with all of the HA fixes below. The exception is the final idle-timeout fix in `remote.rs`. The `final` native matrix predates it, so every scenario that could involve a peer stream stall was re-run after it (`final2`, `final3`, `final2-ctr`).
 
 ## How to run
 
@@ -17,190 +25,333 @@ bench/ha/run_all.sh                    # whole matrix (native + containers); bui
 bench/ha/run_all.sh native             # native-process scenarios only
 bench/ha/run_all.sh ctr                # container scenarios (docker network disconnect, docker pause, libfaketime)
 bench/ha/run_all.sh kill9-1of3 zombie  # named scenarios
-SKIP_BUILD=1 HA_RUN_ID=x bench/ha/run_all.sh ...
+SKIP_BUILD=1 HA_RUN_ID=x VLPDS_HA_PARTITIONS=256 bench/ha/run_all.sh baseline-5 kill9-2of5
 python3 bench/ha/hactl.py list         # scenario catalogue
 ```
 
-**Knobs** (environment variables). They let the harness run unchanged against the new design.
+**Knobs** (environment variables):
 
 | Variable | Default | What it sets |
 |---|---|---|
 | `VLPDS_HA_NODE_ARGS` | see below | Node flag template. Placeholders: `{listen} {url} {advertise} {s3} {prefix} {id} {ttl_ms} {partitions}`. |
-| `VLPDS_HA_PARTITIONS` | 16 | Expected total owned units, and the probe bucket count. |
+| `VLPDS_HA_PARTITIONS` | 64 | Shard count: passed as `--shards`, and used for the probe shard mapping. |
 | `VLPDS_HA_TTL_MS` | 3000 | Lease TTL. |
 | `VLPDS_HA_RATE` | 150 | Writes/s per loadgen. |
-| `VLPDS_HA_BASE_PORT` | 7100 | Node ports are base+i. Peer proxies are base+200+i. S3 proxies are base+2300+i. Containers are base+600+i. |
-| `VLPDS_HA_OWNED_METRICS` | `vlpds_owned_shards,vlpds_owned_partitions` | Ownership gauges to observe. |
-| `VLPDS_BIN_DIR` | | Directory containing `vlpds` and `loadgen`. |
-| `VLPDS_HA_S3` | | S3 endpoint. |
-| `VLPDS_HA_IMAGE` | | Container image. |
-| `VLPDS_HA_DOCKER_S3` | | S3 endpoint as seen from containers. |
+| `VLPDS_HA_PROBES` | 32 | Probe writers, each on a shard sampled at random with a fixed seed. |
+| `VLPDS_HA_CLEANUP` | 1 | Delete the scenario's bucket prefix once its results are recorded. Deletion runs through `mc` in `vlpds-minio:local`. |
+| `VLPDS_HA_INTERNAL_TOKEN` | `dev-internal-token` | The `x-vlpds-internal` token. It falls back to the admin token on 401, for older dev-mode builds. |
+| `VLPDS_HA_BASE_PORT`, `VLPDS_BIN_DIR`, `VLPDS_HA_S3`, `VLPDS_HA_IMAGE`, `VLPDS_HA_DOCKER_S3` | | As before. |
 
 The default node template is:
 
 ```
 --listen {listen} --public-url {url} --advertise-url {advertise} --s3-endpoint {s3} --prefix {prefix}
---cluster --node-id {id} --lease-ttl-ms {ttl_ms} --partitions {partitions} --dev-mode --workers 2 --io-threads 3 --firehose-ring-mb 256
+--node-id {id} --lease-ttl-ms {ttl_ms} --shards {partitions} --no-rate-limits --dev-mode --workers 2 --io-threads 3 --firehose-ring-mb 256
 ```
 
-**Ownership is an optional observation.** The harness tries these sources in order:
-1. The `/internal/v1/cluster` status endpoint, if the build has it.
-2. Otherwise, the first owned-units gauge from `VLPDS_HA_OWNED_METRICS`.
-3. Otherwise, it treats "every live node is healthy" as converged.
-
-Verdicts never depend on lease or assignment object layout.
-
-### Files
-
-| Path | Purpose |
-|---|---|
-| `hactl.py` | Orchestrator (stdlib Python): nodes, proxies, load, probes, checker, audits, verdicts. |
-| `run_all.sh` | Builds the tools and runs the matrix. |
-| `faultproxy/` | Go fault proxy, one HTTP instance and one TCP instance per node (details below). |
-| `fhaudit/` | Go firehose audit (details below). |
-| `Dockerfile` (+ `Dockerfile.dockerignore`) | Debian node image with `faketime`, for the `ctr-*` scenarios. It is built and libfaketime was verified to shift a container's wall clock (+2.5 s), but **no container scenario has been run yet**. |
-| `out/<run>/summary.md` | One line per scenario. |
-| `out/<run>/<scenario>/result.json` | Full metrics for one scenario. |
-
-**faultproxy** runs in two modes:
-- **HTTP mode**, in front of MinIO for each node. It injects latency, jitter, and S3-style 503/500 errors, or blackholes requests (they hang until healed).
-- **TCP mode**, in front of the address each node *advertises* to peers. It can blackhole (stall) traffic, add latency, or reset connections. Clients still reach the node directly.
-
-A control API is on its own port: `/set`, `/clear`, `/reset`, `/stats`.
-
-**fhaudit** subscribes to `subscribeRepos`, optionally from a cursor. It records every created record path, and every commit's (seq, did, rev). On SIGINT it writes everything as JSON.
+**Harness changes for the new design:**
+- **Shard mapping:** the probe mapping now follows `src/slots.rs`: `(top 16 bits of sha256(did)) * N / 65536`.
+- **`--shards` and `--no-rate-limits`** replace the old flags.
+- **Probe sampling:** probe shards are sampled across all nodes. Before, they were the first N in account order, which meant only n1 and n2's shards.
+- **Outage metric:** the per-shard outage is now the longest *contiguous* window. It no longer spans from a kill to the rebalance blip at a later restart.
+- **Late joiners:** a node that joined mid-run is not judged on cursor-replay completeness.
+- **Replay window:** the replay window is 30 s when a rejoined node backfills from S3, versus 8 s otherwise.
+- **New checks:**
+  - **History diff:** a cross-node comparison of merged history, over (seq, did, rev) sequences. It covers both the cursor replays and the live audits over their common range.
+  - **Exit codes:** expected exit codes, e.g. a zombie must exit 3 or 5.
+  - **Unexpected exits:** a scenario fails on any unexpected exit (used by `grow-1-to-3`).
+- **Diagnostics added to the code:**
+  - a `checkpoint start` log line, which `kill9-mid-checkpoint` keys off;
+  - `acquired shards` and `releasing extra shards` log lines;
+  - a firehose-merger warning for late events (an event at or below the emitted watermark). It never fired in any run.
 
 ### What each scenario checks
 
-1. **Acked writes:** every create acknowledged by any loadgen or probe is readable via `listRecords` (`loadgen verify`).
-2. **Checker:** the sync-1.1 checker on n1 (which is never faulted) reports PASS. That means inversion proofs, signatures, and per-repo `since`/`prevData` chains are all intact, with no forks.
-3. **Live firehose audit:** a live `fhaudit` runs on every node from the start. For each node that stayed up, every acked create must appear on its firehose, with no reorders. **The checker cannot catch a stall: a merged stream that stops just looks like a quiet repo. This audit is what catches it.**
-4. **Replay audit:** after the load, a cursor replay runs on each surviving node from just before the run. Nodes that stayed up must be complete and must agree with each other, with the same commit count and last seq. Nodes that rejoined are reported but not judged.
-5. **Probe outages:** the 10 Hz probes are reported as outage windows. A probe is "bad" if it failed or took more than 2 s. Each window is `[start s, end s, failed probes]` relative to the load start.
-6. **Loadgen metrics:** errors per node and the maximum p99 from the 5 s lines.
-7. **End state:** final ownership and node exit codes.
+These are as before:
+1. **Acked writes:** every create acknowledged by any loadgen or probe is readable (`loadgen verify`).
+2. **Checker:** the sync-1.1 checker reports `-strict` PASS on n1. Some scenarios also run a second, cursor-based checker.
+3. **Live firehose audit:** for every node that stayed up, every acked create is on its live firehose.
+4. **Replay audit:** a cursor replay from before the run on each survivor is complete.
+5. **Merged-history agreement (new):** every node that stayed up emits the identical commit sequence, both in the replay and in the live audit.
+6. **Availability:** probe outage windows. A probe is bad if it failed or took more than 2 s.
+7. **Exit codes:** these are recorded, and expected codes are checked where a scenario sets them.
 
-## Results (`base1`)
+## Results
 
-How to read the table:
-- **"FH missing (live)"** counts acked creates that never appeared on a surviving node's live firehose, per node that stayed up.
-- **"Outage windows"** comes from the probes.
-- **"Max part. outage"** is the longest outage of any single partition, including the rebalance blip after a restart.
+How to read the tables:
+- "Outage windows" are relative to load start: `start–end s (failed probes)`. Long windows with few failed probes are hung requests (see O2).
+- "Max shard outage" is the longest contiguous outage of a single shard.
+- Exit code −9 is the harness's kill, 0 a graceful exit, 5 a lease fail-stop, 3 a fenced-log fail-stop, and 137 a docker kill.
 
-| Scenario | Verdict | Acked / lost | Checker | FH missing (live) | Outage windows (s) | Max part. outage | Loadgen errors (per node) | Exit codes |
+### Native, 64 shards (`final`, every native scenario)
+
+| Scenario | Verdict | Acked / lost | Checker | FH missing (live, stayed-up nodes) | History agree (replay / live) | Outage windows [start–end s, failed probes] | Max shard outage | Exits |
 |---|---|---|---|---|---|---|---|---|
-| baseline-2 | FAIL¹ | 14261 / **0** | PASS | n1 0, n2 0 | none | 0 | 0 / 0 | – |
-| baseline-3 | FAIL¹ | 18444 / **0** | PASS | 0, 0, 0 | none | 0 | 0 / 0 / 0 | – |
-| baseline-5 | FAIL¹ | 27764 / **0** | PASS | 0 ×5 | none | 0 | 0 ×5 | – |
-| kill9-1of3 | FAIL² | 31571 / **0** | PASS | n1 11753, n3 11912 | [15.0–25.6, 466 failed], [40.1–41.2, 30] | 26.2 | 473 / *3770 (killed node)* / 491 | n2 −9 |
-| kill9-2of5 | FAIL² | 45512 / **0** | PASS | n1 17595, n2 17591, n5 17334 | [15.0–24.9, 506], [40.4–41.1, 25] | 26.0 | 441 / 442 / *3781* / *3769* / 435 | n3, n4 −9 |
-| sigterm | FAIL² | 26530 / **0** | PASS | n1 8901, n3 8901 | [15.0–24.9, 373], [35.2–35.8, 24] | 20.7 | 504 / *3016* / 504 | n2 −15 (no handler) |
-| rolling-restart | PASS³ | 28196 / **0** | PASS (+ cursor checker on n2 PASS) | n/a (every node restarted) | [10.0–14.2, 230], [22.0–26.5, 247], [34.0–38.9, 257] | 28.8 | 681 / 685 / 666 | all −15 |
-| zombie (SIGSTOP 12 s) | FAIL² | 30920 / **0** | PASS | n1 8696, n3 8714 | [15.0–27.0, 6 failed + hung probes], [45.5–46.1, 24] | 31.0 | 406 / *4509* / 398 | n2 **5** (fenced) |
-| zombie-short (3.3 s) | FAIL² | 28565 / **0** | PASS | n1 8695, n3 8898 | [15.0–24.9, 259], [40.1–41.2, 42] | 26.1 | 494 / *3766* / 501 | n2 **5** |
-| s3-partition (12 s) | FAIL² | 29829 / **0** | PASS | n1 8636, n3 8679 | [15.0–27.0, 5 + hung], [40.5–41.1, 22] | 26.0 | 408 / *2574* / 410 | n2 **5** |
-| peer-partition (12 s) | FAIL¹ | 30202 / **0** | PASS | 0, 0, 0 | [15.0–27.1, 0 failed, all hung] | 12.1 | 0 / 0 / 0 (p99 11.9 s) | – |
-| full-partition (12 s) | FAIL² | 29689 / **0** | PASS | n1 8739, n3 8635 | [15.0–27.1, 5 + hung], [40.5–41.7, 32] | 26.2 | 517 / *2547* / 486 | n2 **5** |
-| s3-slow, s3-slow-all, s3-5xx | ERROR⁴ | – | – | – | – | – | – | – |
-| add-remove, cas-contention, handoff-firehose, all `ctr-*` | not run⁵ | | | | | | | |
+| baseline-2 | PASS | 19365 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – |
+| baseline-3 | PASS | 24092 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – |
+| baseline-5 | PASS | 33084 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – |
+| kill9-1of3 | PASS | 41804 / **0** | PASS | all 0 | yes / yes | 15–19.7 (745), 40.2–42 (110) | 4.73 s | n2 -9 |
+| kill9-2of5 | PASS | 55522 / **0** | PASS | all 0 | yes / yes | 15–19.8 (410), 40.4–41.6 (115) | 4.73 s | n3 -9, n4 -9 |
+| sigterm | PASS | 35884 / **0** | PASS | all 0 | yes / yes | 15–16.1 (134), 35.3–36.5 (172) | 1.13 s | n2 0 |
+| rolling-restart | PASS | 37411 / **0** | PASS | – | yes / yes | 10.3–12.5 (296), 22.1–22.7 (13), 34–36.7 (587) | 2.76 s | n1 0, n2 0, n3 0 |
+| zombie | PASS | 40547 / **0** | PASS | all 0 | yes / yes | 15–27 (13), 45.7–46.8 (93) | 12.01 s | n2 5 |
+| zombie-short | PASS | 38212 / **0** | PASS | all 0 | yes / yes | 15–18.6 (75), 40.3–41.5 (162) | 3.61 s | n2 5 |
+| zombie-check | PASS | 28665 / **0** | PASS | all 0 | yes / yes | 15–27 (15) | 12.01 s | n2 5 |
+| s3-partition | PASS | 38241 / **0** | PASS | all 0 | yes / yes | 15–19.8 (161), 40.2–41.4 (82) | 4.67 s | n2 5 |
+| peer-partition | PASS | 37178 / **0** | PASS | all 0 | yes / yes | 15–27.1 (0) | 12.09 s | – |
+| full-partition | PASS | 36829 / **0** | PASS | all 0 | yes / yes | 15–27 (16), 40.4–41.7 (114) | 12.02 s | n2 5 |
+| s3-slow | PASS | 40248 / **0** | PASS | all 0 | yes / yes | 42–43.8 (242) | 1.78 s | n2 -9 |
+| s3-slow-one-long | PASS | 35416 / **0** | PASS | all 0 | yes / yes | 15–19.3 (180), 35.1–36.4 (101) | 4.27 s | n2 5 |
+| s3-slow-all | PASS | 22038 / **0** | PASS | – | yes / yes | 15–40 (5405) | 24.98 s | n1 5, n2 5, n3 5 |
+| s3-5xx | PASS | 43020 / **0** | PASS | all 0 | yes / yes | 30.1–34 (261), 45.5–46.6 (85) | 3.94 s | n2 5 |
+| s3-5xx-all | PASS | 38240 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – |
+| add-remove | PASS | 36237 / **0** | PASS | all 0 | yes / yes | 10.3–11.4 (91), 20.3–21.6 (89), 32–33.7 (108), 44–48.5 (330) | 4.46 s | n3 -9, n4 0 |
+| grow-1-to-3 | PASS | 15881 / **0** | PASS | all 0 | yes / yes | 8.4–9.5 (129), 16.2–17.4 (92) | 1.14 s | – |
+| cas-contention | PASS | 9600 / **0** | PASS | – | – / – | converged in 1.65 s |  | – |
+| handoff-firehose | PASS | 40189 / **0** | PASS | all 0 | yes / yes | 10–12 (297), 18.2–19.8 (105), 34.3–35.4 (168), 42–43.8 (89) | 1.96 s | n2 0, n3 -9, n4 0 |
+| kill9-rebalance-drainer | PASS | 39110 / **0** | PASS | all 0 | yes / yes | 12.6–18.7 (632), 32.5–33.6 (57) | 5.0 s | n2 -9 |
+| kill9-rebalance-joiner | PASS | 41925 / **0** | PASS | all 0 | yes / yes | 12.1–13.3 (86), 13.7–17.5 (267), 32.5–33.7 (144) | 5.43 s | n4 -9 |
+| kill9-mid-checkpoint | PASS | 43526 / **0** | PASS | all 0 | yes / yes | 8.1–11.9 (538), 25.2–26.4 (110), 35.1–38.9 (337), 50.3–51.5 (196) | 3.83 s | n2 -9/-9 |
 
-**Footnotes:**
+### Re-run after the log-stream idle-timeout fix (`final2`, `final3`, 64 shards)
 
-¹ **Replay disagreement** (bug B5): replays from the same cursor give different commit counts on different nodes. Every acked create is still present everywhere.
-- baseline-2: n1 14276 vs n2 14280.
-- baseline-3: 18521, 18506, 18512.
-- baseline-5: 27613 vs 27604.
-- peer-partition: 29140, 29156, 29153.
+| Scenario | Verdict | Acked / lost | Checker | FH missing (live, stayed-up nodes) | History agree (replay / live) | Outage windows [start–end s, failed probes] | Max shard outage | Exits |
+|---|---|---|---|---|---|---|---|---|
+| peer-partition | PASS | 37908 / **0** | PASS | all 0 | yes / yes | 15–27.1 (0) | 12.08 s | – |
+| full-partition | PASS | 37657 / **0** | PASS | all 0 | yes / yes | 15–27 (11), 40.2–41.4 (130) | 12.0 s | n2 5 |
+| zombie | PASS | 40314 / **0** | PASS | all 0 | yes / yes | 15–27 (12), 45.1–46.8 (96) | 11.98 s | n2 5 |
+| zombie-short | PASS | 38245 / **0** | PASS | all 0 | yes / yes | 15–19 (88), 40.2–41.3 (116) | 4.0 s | n2 5 |
+| zombie-check | PASS | 28910 / **0** | PASS | all 0 | yes / yes | 15–27 (12) | 12.01 s | n2 5 |
+| kill9-1of3 | PASS | 41791 / **0** | PASS | all 0 | yes / yes | 15–19.5 (463), 40.2–41.4 (99) | 4.44 s | n2 -9 |
+| s3-partition | PASS | 38264 / **0** | PASS | all 0 | yes / yes | 15–19.4 (135), 40.4–41.5 (121) | 4.4 s | n2 5 |
+| handoff-firehose | PASS | 39673 / **0** | PASS | all 0 | yes / yes | 10–12 (232), 18.3–19.8 (77), 26–30.6 (441), 34.2–35.4 (91), 42–43.9 (161) | 4.57 s | n2 0, n3 -9, n4 0 |
+| sigterm | PASS | 35742 / **0** | PASS | all 0 | yes / yes | 15–16.1 (115), 35.4–36.5 (111) | 1.14 s | n2 0 |
+| kill9-2of5 | PASS | 55418 / **0** | PASS | all 0 | yes / yes | 15–19.5 (523), 40.4–41.7 (168) | 4.48 s | n3 -9, n4 -9 |
 
-² **Survivors' firehoses stall permanently** after the next ownership move (bug B1). This happened in every scenario with a restart or rejoin, and accounts for 28–40 % of acked creates missing from the firehose.
+### 256 shards (`final-256`, `final3-256`)
 
-³ **Rolling restart:** every node restarted, so there is no node to run a "stayed-up" audit on. The checker on n1 and the cursor checker on n2 both passed. The replay audits on the rejoined nodes are each incomplete in a different way (B7), as expected.
+| Scenario | Verdict | Acked / lost | Checker | FH missing (live, stayed-up nodes) | History agree (replay / live) | Outage windows [start–end s, failed probes] | Max shard outage | Exits |
+|---|---|---|---|---|---|---|---|---|
+| baseline-5 | PASS | 33128 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – |
+| sigterm | PASS | 35989 / **0** | PASS | all 0 | yes / yes | 15–16.4 (73), 35.6–36.8 (153) | 1.34 s | n2 0 |
+| rolling-restart | PASS | 37307 / **0** | PASS | – | yes / yes | 10.2–12.4 (175), 23.5–24.7 (61), 34–36.8 (720) | 2.79 s | n1 0, n2 0, n3 0 |
+| grow-1-to-3 | PASS | 17230 / **0** | PASS | all 0 | yes / yes | 8.5–9.9 (140), 16.3–17.8 (83) | 1.44 s | – |
+| kill9-2of5 | PASS | 55307 / **0** | PASS | all 0 | yes / yes | 15–19.9 (616), 40.2–42.1 (200) | 4.87 s | n3 -9, n4 -9 |
 
-⁴ **ERROR = MinIO returned `507 Insufficient Storage`.** The host disk was at 100 % (8 GiB free), so `createAccount` and the node heartbeats failed. This is an environment problem, not vlpds: these scenarios need re-running once there is disk space.
+`baseline-5` at 256 shards converged in 2.47 s (52/52/52/52/48 shards). In `grow-1-to-3`, n1 took all 256 shards alone on first start (the lead's lease-lapse repro, now passing) and then rebalanced to 86/86/84 under load.
 
-⁵ Stopped at the lead's request before these ran.
+### Repeats of the race-prone scenarios (`final-rep`)
 
-### What held up
+| Scenario | Verdict | Acked / lost | Checker | FH missing (live, stayed-up nodes) | History agree (replay / live) | Outage windows [start–end s, failed probes] | Max shard outage | Exits |
+|---|---|---|---|---|---|---|---|---|
+| kill9-rebalance-drainer | PASS | 39263 / **0** | PASS | all 0 | yes / yes | 12.6–17.9 (478), 32.4–33.5 (85) | 4.3 s | n2 -9 |
+| kill9-rebalance-joiner | PASS | 41910 / **0** | PASS | all 0 | yes / yes | 12.1–13.5 (92), 13.7–17.6 (315), 32.1–33.8 (138) | 5.24 s | n4 -9 |
+| zombie-short | PASS | 37949 / **0** | PASS | all 0 | yes / yes | 15–19.8 (196), 40.3–41.4 (60) | 4.75 s | n2 5 |
 
-- **No acknowledged write was lost in any scenario.** That covers kill -9 of one and two nodes, SIGTERM, a rolling restart, SIGSTOP zombies (short and long), and S3, peer and full partitions.
-- **The checker never saw a fork, a chain break, or a bad proof or signature.**
-- **Zombies and partitioned nodes fail-stop as designed.** Their logs show one of:
-  - `lease lapsed before segment PUT: fail-stop`
-  - `lease lost unexpectedly: fail-stop` (after SIGCONT or heal, the renew's compare-and-swap fails)
+`zombie-short` ran twice in `final-rep`. Both runs passed (`out/final-rep/summary.md`); the table shows the second, whose `result.json` overwrote the first.
 
-  Either way the node exits with code 5, and it never acked anything stale.
-- **Steady state works:** ownership is exactly once (status endpoint), and initial convergence takes 1.1–2.7 s. Forwarding works: in baseline-3, n1 forwarded 6895 requests and n2/n3 about 3000 each. There are no errors, and p99 stays under 110 ms at 150/s per node.
+### Containers (`final2-ctr`): docker network disconnect, docker pause, libfaketime clock skew
 
-## Bugs found, on the per-partition model (none fixed: the lead froze those files)
+| Scenario | Verdict | Acked / lost | Checker | FH missing (live, stayed-up nodes) | History agree (replay / live) | Outage windows [start–end s, failed probes] | Max shard outage | Exits |
+|---|---|---|---|---|---|---|---|---|
+| ctr-baseline-3 | PASS | 19363 / **0** | PASS | all 0 | yes / yes | none | 0.0 s | – |
+| ctr-partition | PASS | 33027 / **0** | PASS | all 0 | yes / yes | 15.1–30.1 (423), 41–42.2 (79) | 15.01 s | n2 5 |
+| ctr-pause | PASS | 31154 / **0** | PASS | all 0 | yes / yes | 15–27.1 (14), 41.4–42.9 (44) | 12.09 s | n2 5 |
+| ctr-skew-small | PASS | 30424 / **0** | PASS | all 0 | yes / yes | 15.2–20.3 (374), 36.8–38.1 (57) | 4.93 s | n2 137 |
 
-**B1 – Followers never switch to a partition's new owner, so followers' firehoses stall permanently.** Severity: high. Files: `remote.rs`, `node.rs`.
+| Scenario | Verdict | Notes |
+|---|---|---|
+| ctr-skew-large (n2 +2.5 s, n3 −2.5 s) | ERROR (expected: out of spec) | Clock skew of 2.5 s exceeds the skew margin (600 ms). See O3. |
+| ctr-skew-steady (same skew, no faults) | ERROR (same cause) | Same as above (`final-ctr`). |
 
-- **Cause, part 1:** `remote::spawn_subscriber`'s loop only calls `owner()` again when the websocket ends. The *old* owner's `serve_stream` keeps running after `Node::close()`, because it holds an `Arc<Partition>`, so `live` never closes.
-- **Cause, part 2:** while it keeps running, it heartbeats `wm.get()`, which keeps advancing with the clock (idle partition) until it reaches the old lease-expiry cap. Then it plateaus. Every third node's merged firehose then stops at `min_p W_p`, for every partition, forever.
-- **Why the 2-node test missed it:** with two nodes, the only follower is the acquirer itself, and `open()` drops its subscription.
-- **Evidence:** `smoke3/kill9-1of3`. After n2 restarts (at 04:42:41), n1 and n3 release partitions to it. n1's and n3's firehoses stop at 04:42:43.7 and 04:42:44.0 (about one lease TTL later), while load runs until about 04:43:02. 11,893 and 11,703 acked creates never appear. The same signature shows up in every `base1` scenario with a restart. The checker still PASSes, because nothing it receives is inconsistent.
-- **Fix direction:**
-  - The old owner ends its streams (and freezes its watermark at durable) on close.
-  - Subscribers re-check `owner()` periodically and on a read timeout, then reconnect and catch up from S3.
+In both skew-large runs, n3 (clock −2.5 s) wrote leases that looked expired to its peers 1.1 s after each renewal. Its peers declared it dead and took the shards it had opened a second earlier (its SlateDBs logged `Fenced`), fenced its log, and n3 exited 3 (`our log was fenced by a successor`). Setup failed because n3 died mid-`createAccount`. Safety held, availability did not.
 
-**B2 – Watermark cap does not hold on graceful handoff.** Severity: high (correctness of the merged order). Files: `cluster.rs`, `node.rs`.
+### Specific checks
 
-- **Cause:** `release()` writes `expires_ms = 0`, and the successor opens immediately (wait 0). The old owner's announced watermark may already have run ahead to "now" (bounded only by its old expiry, up to TTL in the future). The successor assigns seqs from its own clock, which can be below a watermark the followers have already used to emit.
-- **Effect:** the merger then emits those events late and out of order. Live subscribers drop them (`send_batches` skips `seq <= last`), and ring replays drop them too. This is masked today by B1.
-- **Fix direction:** on close, cap the watermark at durable. Record the cap in the released lease, and have the successor floor its seqs above it. That also covers skew.
+- **No acknowledged write was lost in any run.** That covers 35 native runs at 64 shards (`final`, `final2`, `final3`), 6 at 256 shards, 4 repeats and 4 container runs, plus every earlier smoke run. Checker `-strict` passed in every run on the final binaries.
+- **Merged history agrees across nodes everywhere** (the old B5). Replays from one cursor give identical (seq, did, rev) sequences on every node that stayed up. The live audits agree over their common range in every scenario. The merger's late-event warning never fired.
+- **Zombie (SIGSTOP 4×TTL, then SIGCONT):**
+  - n2 exits 5 within about 0.5 s of waking (`node lease lapsed past takeover` or `lapsed before renewal`), and acks nothing stale: verify finds 0 lost and the checker passes.
+  - With a short pause (1.1×TTL, waking around takeover) n2 also exits 5 and nothing is lost. Before the fixes below, this exact scenario produced a firehose chain break and two permanently unloadable repos (N6, N7).
+- **kill -9 mid-checkpoint (twice):** the kill lands about 10–30 ms after `checkpoint start`. The successors replay the whole log tail (1,284 and 1,388 segments) in 0.4–0.6 s, and every survivor ends its span at the same fence ordinal. Nothing is lost.
+- **kill -9 mid-rebalance:**
+  - Killing the draining node 0.4 s into the join, or the joining node while it opens its shards, loses nothing.
+  - Windows are about 5–6 s: TTL + skew plus the rebalance.
+- **CAS contention:** 8 nodes started at the same instant converge in 1.65–2.1 s, with exactly 8 shard opens per node: no CAS churn and no double ownership.
+- **Failover time:**
+  - Takeover after kill -9 is 4.4–4.9 s (TTL 3 s + skew 0.6 s + replay), versus 9.9–10.6 s before.
+  - Shards opened with 1,100–1,900 segments replayed take 150–1,000 ms (`segments_replayed` in the logs).
+  - A graceful SIGTERM moves its shards in 1.1–1.4 s, and exit is 0 after 0.5–0.9 s.
+- **S3 brownouts:**
+  - **400 ± 400 ms latency on one node:** no outage, no fail-stop (this used to fail-stop, see N2).
+  - **1500 ms latency, on one node or on all nodes:** the affected nodes fail-stop with exit 5. This is a protocol limit at TTL 3 s, not a bug: renewals are sequential CAS PUTs and validity is send time + TTL − skew, so a renewal RTT above (TTL − skew)/2 = 1.2 s opens a validity gap. With the production default TTL of 10 s the tolerance is 4 s. With all three nodes down, the cluster is unavailable until the harness restarts them (25 s).
+  - **30 % 503s on one node or on all nodes:** no outage at all; the retries absorb them.
+  - **30 % 503s, then 100 % 500s on one node:** that node's lease lapses, it is fenced, and it exits 3 or 5. The outage is about 4 s.
 
-**B3 – Failover takes about 10 s with TTL 3 s, because of the heartbeat liveness window.** Severity: medium (availability). File: `cluster.rs`.
+## Comparison with the old baseline (`base1`, per-partition leases, 16 partitions)
 
-- **Cause:** survivors only acquire up to `ceil(P / live)`, and a dead node counts as live until its heartbeat is older than `3 × TTL` (9 s). So orphaned partitions wait out the heartbeat, not the lease (TTL + skew = 3.6 s).
-- **Evidence:** the outage windows are 10.2–10.6 s for kill -9 (1 of 3 and 2 of 5) and for SIGTERM.
-- **Fix direction:** always take orphaned (expired) units regardless of fair share, and rebalance later. Or use TTL-scale liveness.
+| Scenario | Old verdict | Old outage / FH missing | New verdict | New outage / FH missing |
+|---|---|---|---|---|
+| baseline-2/3/5 | FAIL (B5 history disagreement) | – | PASS | identical history on all nodes |
+| kill9-1of3 | FAIL (B1 firehose stall) | 10.6 s / 11.7k missing | PASS | 4.4–4.7 s / 0 |
+| kill9-2of5 | FAIL (B1) | 9.9 s / 17.6k missing | PASS | 4.5 s (64 shards), 4.9 s (256) / 0 |
+| sigterm | FAIL (B1, no SIGTERM handler) | 9.9 s / 8.9k missing | PASS | 1.1 s / 0, exit 0 |
+| rolling-restart | PASS | 4.2–4.9 s per node | PASS | 0.6–2.7 s per node |
+| zombie / zombie-short | FAIL (B1) | 12 s / 25.9 s, about 8.7k missing | PASS | 12 s (hung forwards, O2) / 4 s; 0 missing |
+| s3-partition | FAIL (B1) | 12 s / 8.6k missing | PASS | 4.4 s / 0 |
+| peer-partition | FAIL (B5) | 12.1 s (hung) | PASS | 12.1 s (hung, O2) |
+| full-partition | FAIL (B1) | 12 s / 8.7k missing | PASS | 12 s (hung forwards, O2) / 0 |
+| s3-slow, s3-slow-all, s3-5xx | ERROR (disk full) | – | PASS | see S3 brownouts above |
+| add-remove, cas-contention, handoff-firehose, all `ctr-*` | not run | – | PASS (except ctr-skew-large and ctr-skew-steady, out of spec) | – |
 
-**B4 – No graceful shutdown.** Severity: medium. Files: `main.rs`, `server.rs`, `cluster.rs`.
+### Status of the old bugs
 
-- **Cause:** SIGTERM uses the default action and the process dies (exit −15), so a "graceful" restart is a crash. `Cluster::shutdown` exists but nothing calls it, and the `PartitionHost` isn't reachable from `main`. A rolling restart costs 4–5 s of outage per node.
-- **Why not fixed:** wiring it means keeping the host in `Cluster`, and adding a stop flag plus a step lock so the lease loop can't re-acquire during shutdown. That is in the frozen files, so it was not done.
+- **B1 – followers never switch owners / firehose stalls: gone, with two regressions found and fixed.**
+  - The design itself removes the old mechanism: followers follow node logs, and a dead log is drained to its fence.
+  - It came back twice by other routes: graceful shutdown never fenced its log (N1), and half-open peer connections never timed out (N8). Both are fixed.
+- **B2 – watermark cap on graceful handoff: not observed.**
+  - The merger's late-event diagnostic never fired in any run, including joins, rebalances, handoffs and container skew within the margin.
+  - Shards no longer move between per-shard streams; per-log watermarks plus the join grace cover it.
+- **B3 – slow failover from the heartbeat liveness window: fixed by design.** Takeover is TTL + skew + replay, 4.4–4.9 s.
+- **B4 – no graceful shutdown: fixed by design**, with a race fixed here (N1): the step loop could re-acquire shards during shutdown. Exit 0 in 0.5–0.9 s.
+- **B5 – merged history differs between nodes: gone.** Every node that stayed up agrees on identical (seq, did, rev) sequences in every scenario.
+- **B6 – 500 instead of 503 for an unowned shard: fixed by design.** Moving or unowned shards return 503 `PartitionUnavailable`.
+- **B7 – firehose history starts at join: mostly fixed by another agent's S3 cursor backfill**, which landed during this work.
+  - Rejoined nodes' cursor replays are now usually complete.
+  - There is one seam at a node's start (O1).
+- **B8 – forwards to an unreachable owner hang: partly fixed.**
+  - The 1 s connect timeout fails fast when the peer is gone.
+  - A peer whose TCP endpoint accepts but stalls (frozen process, blackholed path, disconnected container) still holds forwarded requests up to the 15 s total timeout (O2).
+- **B9 – a lease renew error doesn't stop the node acking: fixed** (N4, N5). The node now fail-stops once its lease is past takeover. It no longer waits for the next PUT, which may be hung.
 
-**B5 – Merged history differs between nodes.** Severity: medium; cause not yet found.
+## Bugs found and fixed in this round (all in the HA files, each commented `HA fix` in the code)
 
-- **Evidence:** replaying from the same cursor on each node gives the same first and last seq, but different commit counts. Examples: baseline-2 has 14276 vs 14280; baseline-3 has 18521 / 18506 / 18512. This happens even with no faults. All acked creates are present on all nodes, so the differing commits are ones the load generators didn't track.
-- **Hypotheses:**
-  - Late or out-of-order events being dropped by `send_batches`' `seq <= last` filter. Each node would lose a different set, depending on merge timing.
-  - Or something in the startup handoff.
-- **Next step:** `fhaudit` now records every commit's (seq, did, rev), so a single rerun of `baseline-2` will show exactly which commits differ.
+**N1 – Graceful shutdown never fenced its log, so every peer's firehose stalled permanently.** Severity: high. File: `cluster.rs` (`shutdown`).
 
-**B6 – Requests for a unit with no owner yet get HTTP 500 instead of a retryable 503.** Severity: low.
+- **Cause:** shutdown released the shards and deleted the node lease, but never closed the log. Peers drain a dead log from S3 *up to its fence* before removing its watermark source. With no fence, they waited forever, and their merged firehose stopped at the dead node's last watermark. Since the lease was deleted, a restart with the same node id did not fence the old log either.
+- **Evidence:** `new-smoke1/sigterm`. All three firehoses stopped at 05:39:53.64, the instant of the SIGTERM. 25.6k acked creates were missing on n1 and n3, and their logs never showed "dead peer log drained".
+- **Fix:**
+  - Shutdown fences its own idle log after releasing its shards.
+  - It also sets a stop flag and takes a step lock, so a concurrent step cannot re-acquire the shards being released (B4's race).
+- **After the fix:** sigterm passes (0 missing, exit 0), and so does rolling-restart.
 
-- **Cause:** when the lease has expired (so it's filtered out of the routing table) but no one has acquired it yet, `App::remote_owner` returns None. The request is handled locally and fails with `500 InternalServerError "repo load failed: partition not owned by this node"`.
-- **Evidence:** 265 of these during kill9-1of3 (probe.csv).
-- **Fix direction:** a 503 `PartitionUnavailable` with Retry-After, in `xrpc/mod.rs` and the worker.
+**N2 – Lease renewal was serialised behind an O(shards) sequential scan, so a mild S3 brownout fail-stopped the node.** Severity: high. File: `cluster.rs`.
 
-**B7 – Firehose history starts when a node joins.** Severity: low (known TODO).
+- **Cause:** the lease was renewed only at the top of `step()`. The step then made about 70 sequential S3 round trips: LIST, the node leases, and one GET per assignment.
+- **Evidence:** `new-smoke2/s3-slow`. With 400 ± 400 ms latency, a step took about 25 s against a 2.4 s validity window, and n2 exited 5, 2.1 s into the brownout (`lease lapsed before segment PUT`).
+- **Fix:**
+  - Renewal runs on its own loop, every renew interval, independent of the step.
+  - Assignment GETs are concurrent (32 in flight).
+  - A node without a valid lease never acquires or releases shards.
+- **After the fix:** s3-slow shows no outage and no fail-stop.
 
-- **Cause:** a (re)started node only has events from its join onwards in memory. A cursor from before that replays from the oldest event it has. It does send one `OutdatedCursor` `#info` frame first, which is the correct behaviour: the replay audit on the rejoined n2 in kill9-1of3 received exactly one `#info` frame.
-- **Evidence:** in kill9-1of3, n2's replay after it rejoined misses 18.5k creates.
-- **Fix direction:** S3 cursor backfill, as already planned.
+**N3 – Fresh lone node fail-stopped on first start: the inline first step outlived the lease.** Severity: high. File: `cluster.rs`. This is the lead and UI-agent report.
 
-**B8 – Requests forwarded to a node cut off from its peers hang instead of failing fast.** Severity: low/medium.
+- **Cause:** `server::build` runs the first step inline, before the renew loop exists. A node starting alone acquires its whole share there: one CAS PUT per shard, then it opens all of them. For the UI agent that was 181 shards in 19 s against a 10 s TTL.
+- **Repro:** a fresh prefix and 256 shards, with n1 starting 3 s before n2 and n3, at TTL 1 s. n1's inline step took 1.77 s, and n1 exited 5 right after "node ready" (`repro-alone-before`). A simultaneous start does not reproduce it: peers are visible, so the join grace defers acquisition to spawned steps.
+- **Fix:**
+  - The whole inline step runs under a keepalive that renews every interval. Renewals are never cancelled mid-flight, because a dropped CAS PUT could land with an ETag we never learn.
+  - The renew loop and watchdog keep running through a graceful shutdown's drain, and stop only when the lease is deleted.
+- **After the fix:**
+  - At TTL 1 s and 3 s, all three nodes stay up and rebalance.
+  - SIGTERM of a node holding 256 shards at TTL 1 s drains in 3.4 s with exit 0.
+  - The `grow-1-to-3` regression scenario passes at 64 and at 256 shards.
 
-- **Cause:** while peers can't reach the owner but the owner still holds its leases (peer-partition), forwarded requests hang until the network heals. The forward client has a 30 s timeout. The followers' firehose also pauses for the whole partition (no watermark heartbeats), though nothing is lost after the heal.
-- **Evidence:** peer-partition. The p99 was 11.9 s and all of n2's units were unavailable for 12.1 s through peers, with zero failures.
-- **Fix direction:** a shorter connect/first-byte timeout on forwarding. Possibly also peer-reachability input to lease decisions.
+**N4 – No lease watchdog: a node with hung S3 calls stayed up as a zombie.** Severity: medium. File: `cluster.rs`.
 
-**B9 – A lease renew error doesn't stop the node acking writes.** Severity: low (observation).
+- **Cause:** validity was checked only before a segment PUT or an ack. A node whose PUT hung in an S3 blackhole kept client and forwarded requests open until the network healed, long after its peers had fenced its log.
+- **Evidence:** in s3-partition, the longest shard outage was 12.0 s.
+- **Fix:** a watchdog fail-stops (exit 5) once the lease has been invalid for longer than 2 × skew.
+- **After the fix:** s3-partition's longest shard outage is 4.4 s.
 
-- **Cause:** on a renew error that isn't a CAS conflict, the node keeps serving reads. It only fail-stops at the next PUT or ack.
-- **Evidence:** with S3 cut (s3-partition, full-partition), n2 fail-stopped about 3.5–7 s into the cut. That is correct, but a single 600 ms renew hiccup kills the process once the cut lasts past `valid_until`. Expect exit-5 restarts under sustained S3 brownouts.
-- **Note:** the s3-slow, s3-slow-all and s3-5xx scenarios exist to measure exactly this, but they hit the full disk (footnote 4).
+**N5 – A zombie resurrected its own lapsed lease.** Severity: high (availability; it amplified N6). File: `cluster.rs`.
 
-## Code changes made
+- **Cause:** after a SIGSTOP, the renew loop's CAS on our own lease object succeeds, because nobody else writes it, even though peers have already fenced our log. Peers then count the dead node as live for another TTL. They shrink their fair share and release the shards they had just taken over: n3 released 10 shards 20 ms after opening them, and they sat unowned for about 3 s.
+- **Evidence:** `final` (pre-fix binary)/zombie-short. n3 logged `releasing extra shards owned=32 fair=22 live=3` right after taking n2's shards with live=2.
+- **Fix:** never renew a lease that has already lapsed; fail-stop instead.
 
-These are diagnostics only. No HA logic was changed.
+**N6 – Stale worker repo cache across a shard bounce: firehose chain break and permanently unloadable repos.** Severity: **critical** (data corruption). Files: `node.rs`, `nodelog.rs`. The root cause is in `worker.rs`, which is not in my ownership.
 
-- **`src/xrpc/internal.rs`:** added `GET /internal/v1/cluster`, using the same internal-token auth as the other internal endpoints. It returns `{node, owned, table, lease_valid, firehose_last_emitted, firehose_min_watermark}`. The harness uses it as an optional ownership observation. The new design can drop it or reshape it: the harness falls back to the metric gauges.
-- **`src/firehose.rs`:** `Firehose::min_watermark` is now `pub`, for the endpoint above. This was made before the files were frozen. It is a visibility change only.
+- **Cause:**
+  - A repo load in flight when `close()` purged the workers completes afterwards and re-caches the repo, still bound to the closed shard.
+  - Writes then build commits on that cached state. The cached head advances, but the entries cannot be durably applied.
+  - When the node later takes the shard back, the next durable commit chains on those never-logged commits.
+- **Evidence:** `final` (pre-fix binary)/zombie-short, combined with N5's bounce.
+  - n3 logged 25 rejected log entries for shard 51 (my N7 guard), then re-acquired shard 51.
+  - The checker reported `chain_since` and `chain_prevdata` failures for two repos: the `since` named a rev that was never on the firehose.
+  - On the next owner both repos failed every load with `rebuilt MST root … != head data …`. That is a 20 s outage window that never recovers for those repos: their stored records no longer match their head.
+- **Fix:**
+  - `open_many` purges every worker's cache for a shard before serving it.
+  - `close()` purges again after the drain.
+- **After the fix:** zombie-short passes 4 out of 4 (`final`, `final-rep` ×2, `final2`), and so do all the rebalance scenarios.
+- **Still wanted:** a fix in `worker.rs`, so that a `Loaded` result whose shard has since changed (`Arc::ptr_eq` against the current partition) is dropped. The lead has queued it.
 
-## Not run, or environment issues
+**N7 – Writes for a shard the node no longer holds were acked but never replayable (lost acked writes).** Severity: high. File: `nodelog.rs` (`Open::push`).
 
-- **Disk:** the host disk is full (MinIO 507 below its free-space threshold). The scenarios that hit it are s3-slow, s3-slow-all and s3-5xx. Free space before re-running.
-- **Stopped by the lead:** add-remove, cas-contention, handoff-firehose and the `ctr-*` scenarios (network partition, docker pause, and clock skew ±250 ms / ±2.5 s) were never run. They are implemented and ready. The container image is built and libfaketime is verified working.
-- **Clock skew:** this is the `ctr-skew-*` scenarios. They use libfaketime with `DONT_FAKE_MONOTONIC=1`, so only wall time is skewed and the `Instant`-based lease validity is not. The expectation is that skew inside the TTL/5 margin is safe. Beyond the margin, a successor can take over while the old owner's `valid_until` is still in the future; log fencing (If-None-Match) prevents forks, but the merged order can break (as in B2) and fh-missing shows up.
+- **Cause:** such an entry got epoch 0 and was acked. Replay applies only entries whose epoch matches a span, so the successor never saw it.
+- **Fix:** reject the entry (the ack fails, so the client gets an error) instead of logging it under epoch 0.
+- **Evidence:** this is the path the N6 race took (25 rejections). Without the guard, those 25 writes would have been acknowledged and lost.
+
+**N8 – A half-open peer log stream hung the follower forever: a permanent firehose stall after a network partition.** Severity: high. File: `remote.rs`.
+
+- **Cause:**
+  - `stream_live` awaited `ws.next()` with no timeout. The follower only re-checks whether its peer is alive after the socket ends.
+  - With `docker network disconnect`, the dead peer never sends a FIN or RST, so the survivors never drained its log to the fence.
+  - The native faultproxy tests miss this because healing the proxy releases the held connection.
+- **Evidence:** `final-ctr/ctr-partition`. n1 and n3 were each missing 24,499 acked creates, and neither logged "dead peer log drained", although n3 had fenced n2's log at ordinal 3045.
+- **Fix:** a 2 s idle timeout on the stream (heartbeats come every 5 ms), and a 2 s connect timeout.
+- **After the fix:** `final2-ctr/ctr-partition` passes with 0 missing, and so do peer-partition, full-partition, the zombies and handoff-firehose (`final2`).
+
+**N9 – Survivors stacked extra fences on an already-fenced log.** Severity: low. File: `cluster.rs` (`fence`).
+
+- **Cause:** a second survivor's LIST counted the first survivor's fence object as a segment and wrote another fence after it.
+- **Evidence:** `new-smoke2/kill9-1of3` (n1 fenced at 2742, then n3 at 2743).
+- **Fix:** if the last object is already a fence, its ordinal is the log's end.
+- **After the fix:** every survivor used the same end ordinal (`kill9-mid-checkpoint`: 1284 on both).
+
+## Open issues
+
+**O1 – Firehose seam on a node that just (re)started.** Severity: medium. Files: `remote.rs`, `firehose.rs`. Reported to the lead; queued for a fix agent.
+
+- **Cause:**
+  - A first-time follower skips every peer batch broadcast before its subscription, but the ring floor is set from the first merged batch.
+  - Another peer's skipped events can have seqs above that floor, so they are in neither the ring nor the S3 backfill.
+  - Live subscribers of the new node miss them too.
+- **Evidence:**
+  - `final/kill9-2of5` (pre-fix run): n3's replay is missing 15 commits, all in 07:19:10.843–.878, at n3's join.
+  - `final/rolling-restart` (pre-fix run): the cursor checker on n2 reports `chain_since` FAILs for 4 repos, at 07:22:34.55–.73, just after n2 restarted.
+  - `final2-ctr/ctr-skew-small`: 74 missing on the rejoined n2.
+  - Nodes that stayed up are unaffected, and so is every acked write.
+- **Suggested fix:** use max over the initial followers of their first heartbeat watermark as the start floor. Drop events at or below it, and let the S3 backfill serve them.
+
+**O2 – Forwarded requests hang for up to 15 s on an owner that accepts TCP but doesn't respond** (the rest of B8). Severity: medium (availability). Files: `forward.rs` and the client in `server.rs`.
+
+- **Affected scenarios:** peer-partition, full-partition, zombie, ctr-pause and ctr-partition all show a 12–15 s window with very few failed probes.
+- **Cause:** those are requests hung on the frozen or unreachable owner. Takeover itself happens at about 3.6 s, and new requests route to the new owner.
+- **Possible fix:** a time-to-first-byte deadline for buffered JSON requests (for example 3–5 s, returning 503). Streaming blob uploads need the long timeout.
+- **Why it wasn't changed here:** it changes client-visible semantics (at-least-once on retry).
+
+**O3 – Lease liveness compares wall clocks across nodes.** Severity: medium (availability only). File: `cluster.rs`.
+
+- **Cause:** a node whose clock is behind by more than the skew margin (TTL/5) looks dead to its peers between renewals, and gets fenced repeatedly. Safety holds: SlateDB fencing plus log fencing, and the node exits 3.
+- **Evidence:** `ctr-skew-large`; see above.
+- **Possible fix:** peers could judge liveness by observing the lease object *change* (ETag or version), timed on their own monotonic clock. With that, no cross-node wall-clock comparison is needed.
+
+**O4 – Renewal-RTT ceiling.** Severity: low. Validity has gaps once the renewal RTT exceeds (TTL − skew)/2 (1.2 s at TTL 3 s, 4 s at TTL 10 s). A cluster-wide S3 brownout above that fail-stops every node at once (s3-slow-all). That is inherent to sequential CAS renewals; keep the TTL at 10 s or more in production.
+
+**O5 – Control-plane GET volume (observation).** Severity: low. Every node reads every assignment object on every step (renew/5 of TTL). At 256 shards and the production TTL of 10 s, that is about 128 GET/s per node: roughly $130/month per node on S3 Standard. That is fine at 5 nodes, but at planet scale a LIST plus an ETag cache, or a single assignment-map object, would be better.
+
+**O6 – Graceful drain cost (observation).** Severity: low. Closing a shard writes a barrier segment and a checkpoint flush. Draining 256 shards on SIGTERM takes about 3.4 s (one segment PUT per shard). Batching the barriers would make that one PUT.
+
+## Code changes (HA files only)
+
+| File | Change |
+|---|---|
+| `src/cluster.rs` | N1, N2, N3, N4, N5 and N9, plus `acquired shards` / `releasing extra shards` logs. The unit test now keeps b renewing while a's lease runs out, since a node that stops renewing now fail-stops. |
+| `src/node.rs` | N6: `purge_worker_caches` on open, and again at the end of close. |
+| `src/nodelog.rs` | N7: reject entries for shards we don't hold. Also the `checkpoint start` log line. |
+| `src/remote.rs` | N8: stream idle and connect timeouts (2 s). |
+| `src/firehose.rs` | A diagnostic warning when the merger emits an event at or below the already-emitted watermark. It never fired. Another agent's S3 backfill also landed in this file during this work. |
+| `bench/ha/*` | The harness changes above; the new scenarios `kill9-rebalance-drainer`, `kill9-rebalance-joiner`, `zombie-check`, `s3-5xx-all`, `s3-slow-one-long`, `kill9-mid-checkpoint` and `grow-1-to-3`; the Dockerfile now copies `lexicons/` and `ui/dist` (new compile-time inputs). |
+
+`cargo test --lib`: 59 passed.

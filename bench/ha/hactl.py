@@ -43,6 +43,9 @@ FAULTPROXY = os.path.join(HERE, "faultproxy", "faultproxy")
 FHAUDIT = os.path.join(HERE, "fhaudit", "fhaudit")
 S3 = os.environ.get("VLPDS_HA_S3", "127.0.0.1:9200")
 ADMIN = "dev-admin-token"
+# x-vlpds-internal (node-to-node / status) token: VLPDS_INTERNAL_TOKEN on the
+# nodes; dev default. Older builds took the admin token there (dev mode only).
+INTERNAL = os.environ.get("VLPDS_HA_INTERNAL_TOKEN", "dev-internal-token")
 PARTITIONS = int(os.environ.get("VLPDS_HA_PARTITIONS", "64"))  # shards
 TTL_MS = int(os.environ.get("VLPDS_HA_TTL_MS", "3000"))
 RATE = float(os.environ.get("VLPDS_HA_RATE", "150"))  # writes/s per loadgen (one per node)
@@ -201,7 +204,12 @@ class Node:
         self.alive()
 
     def status(self, timeout=2.0):
-        _, raw = http("GET", self.url + "/internal/v1/cluster", headers={"x-vlpds-internal": ADMIN}, timeout=timeout)
+        try:
+            _, raw = http("GET", self.url + "/internal/v1/cluster", headers={"x-vlpds-internal": INTERNAL}, timeout=timeout)
+        except urllib.error.HTTPError as e:
+            if e.code not in (401, 403):
+                raise
+            _, raw = http("GET", self.url + "/internal/v1/cluster", headers={"x-vlpds-internal": ADMIN}, timeout=timeout)
         return json.loads(raw)
 
     def metrics(self):
@@ -503,7 +511,11 @@ class Prober:
         by_p = {}
         for a in accts:
             by_p.setdefault(partition_of(a["did"]), a)
-        self.accts = list(by_p.values())[:PROBES]
+        # sample shards across all nodes: accounts come grouped by the node that
+        # minted them (on its own shards), so "the first N" probed only n1/n2
+        picks = list(by_p.values())
+        random.Random(1).shuffle(picks)
+        self.accts = picks[:PROBES]
         self.tokens = {}
         self.lock = threading.Lock()
         self.threads = [threading.Thread(target=self.loop, args=(a,), daemon=True) for a in self.accts]
