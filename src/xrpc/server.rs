@@ -11,8 +11,10 @@
 //!   p/{did}\0totp                  TOTP state (src/totp.rs)
 //!   p/_reset:{TOKEN}\0t            password-reset token -> did
 //!   p/_invite:{code}\0c            invite code (+ p/{account}\0invite/{code} index)
-//!   p/_revoked\0f/{family}         revoked session family (access tokens), TTL'd
-//!   p/_revoked\0d/{did}            all sessions of a DID revoked before a time
+//!   p/{did}\0sec/rvk/f/{family}    revoked session family (access tokens), TTL'd
+//!   p/{did}\0sec/rvk/d             all sessions of the DID revoked before a time
+//!   p/{did}\0sec/td/rec/{coll}/{rkey}, p/{did}\0sec/td/blob/{cid}
+//!                                  record / blob takedowns (admin.rs)
 //!   {prefix}/email/{sha256(email)} global email claim -> did (object store,
 //!                                  conditional create, like handle claims)
 //! Account fields owned here live in `Account.extra`: deactivatedAt,
@@ -20,9 +22,13 @@
 //! totpEnabled.
 //!
 //! Access tokens carry `jti` = session family id (`{issue micros:016x}{rand}`),
-//! refresh tokens `jti` = refresh id. `verify_bearer` checks revocations
-//! against in-memory maps (loaded from `p/_revoked` and refreshed every few
-//! seconds), so the hot path does no storage reads.
+//! refresh tokens `jti` = refresh id. Revocations and takedowns live in the
+//! account's own partition (`sec/`), so the node that owns the DID (where
+//! forwarding sends its requests) enforces them, and a successor owner reads
+//! them back after a failover. `verify_bearer` and the takedown checks use a
+//! per-DID in-memory view ([`ctl`]): loaded once from the owned partition and
+//! kept until a change or an ownership move (re-read from the owner every
+//! few seconds on other nodes), so the hot path does no storage reads.
 
 use super::authn::Credentials;
 use super::*;
@@ -31,7 +37,7 @@ use crate::worker::AccountOp;
 use parking_lot::{Mutex as PMutex, RwLock};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::AtomicU64;
 
 pub fn routes() -> Router<Arc<App>> {
     let r = Router::new()
@@ -151,14 +157,25 @@ const REFRESH_TTL: u64 = 90 * 86400;
 const REFRESH_GRACE: u64 = 2 * 3600;
 /// How long a revocation must be remembered for access tokens: their lifetime + slack.
 const REVOKE_TTL: u64 = ACCESS_TTL + 600;
-/// Revocation/takedown sets are re-read from storage this often (other nodes' changes).
+/// A DID's revocations/takedowns read from another node (its owner) are
+/// re-read this often.
 const RELOAD_SECS: u64 = 10;
+/// ... and when read from a partition this node owns (changes made here or
+/// forwarded here invalidate it at once; this only bounds a missed one).
+const LOCAL_RELOAD_SECS: u64 = 60;
+/// Cached per-DID views beyond this are evicted (stale ones first); ~250 B
+/// each, so ~125 MB at the cap.
+const CTL_CACHE_MAX: usize = 500_000;
 const EMAIL_TOKEN_TTL_MS: u64 = 15 * 60 * 1000;
 pub(super) const NEW_PASSWORD_MAX_LENGTH: usize = 256;
 pub(super) const OLD_PASSWORD_MAX_LENGTH: usize = 512;
 
-pub(super) const REVOKED: &str = "_revoked";
-pub(super) const TAKEDOWNS: &str = "_takedowns";
+/// Private-name prefix of an account's revocations and takedowns.
+pub(super) const SEC: &str = "sec/";
+const REVOKED_ALL: &str = "sec/rvk/d";
+const REVOKED_FAMILY: &str = "sec/rvk/f/";
+/// Takedown entries: `sec/td/rec/{collection}/{rkey}`, `sec/td/blob/{cid}`.
+pub(super) const TAKEDOWN: &str = "sec/td/";
 
 pub(super) const SCOPE_ACCESS: &str = "com.atproto.access";
 pub(super) const SCOPE_APP_PASS: &str = "com.atproto.appPass";
@@ -409,16 +426,9 @@ fn standard_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> X
 // ---------------------------------------------------------------------------
 
 pub(super) struct Ext {
-    /// revoked session family -> expiry (unix secs)
-    families: RwLock<HashMap<String, u64>>,
-    /// did -> (sessions issued at or before this many micros are revoked, expiry secs)
-    dids: RwLock<HashMap<String, (u64, u64)>>,
-    /// taken-down subjects: at:// URIs, bare blob CIDs and "blob/{did}/{cid}"
-    takedowns: RwLock<HashSet<String>>,
-    loaded: AtomicBool,
-    loading: tokio::sync::Mutex<()>,
-    last_load: AtomicU64,
-    /// bumped by every local change, so a concurrent reload merges instead of replacing
+    /// did -> its revocations and takedowns ([`ctl`])
+    ctl: RwLock<HashMap<String, Arc<Ctl>>>,
+    /// bumped by every change, so a load racing one is not cached
     gen: AtomicU64,
     pub(super) dev_mail: PMutex<HashMap<String, Vec<Mail>>>,
     locks: Vec<tokio::sync::Mutex<()>>,
@@ -436,12 +446,7 @@ pub(super) fn ext(app: &App) -> Arc<Ext> {
         return e.clone();
     }
     let e = Arc::new(Ext {
-        families: RwLock::new(HashMap::new()),
-        dids: RwLock::new(HashMap::new()),
-        takedowns: RwLock::new(HashSet::new()),
-        loaded: AtomicBool::new(false),
-        loading: tokio::sync::Mutex::new(()),
-        last_load: AtomicU64::new(0),
+        ctl: RwLock::new(HashMap::new()),
         gen: AtomicU64::new(0),
         dev_mail: PMutex::new(HashMap::new()),
         locks: (0..64).map(|_| tokio::sync::Mutex::new(())).collect(),
@@ -457,45 +462,40 @@ impl Ext {
             .lock()
             .await
     }
+}
 
-    fn is_revoked(&self, did: &str, jti: Option<&str>, iat: u64) -> bool {
+/// One account's session revocations and record/blob takedowns, as read from
+/// its partition (`p/{did}\0sec/...`).
+#[derive(Default)]
+pub(super) struct Ctl {
+    /// when it was read (unix secs)
+    at: u64,
+    /// (partition, epoch) when read from a partition this node owns; None =
+    /// read from the owning node
+    local: Option<(u16, u64)>,
+    /// sessions issued at or before these micros are revoked (until exp secs)
+    before: Option<(u64, u64)>,
+    /// revoked session family -> expiry (unix secs)
+    families: HashMap<String, u64>,
+    /// takedown names below [`TAKEDOWN`]: `rec/{collection}/{rkey}`, `blob/{cid}`
+    takedowns: HashSet<String>,
+}
+
+impl Ctl {
+    fn is_revoked(&self, jti: Option<&str>, iat: u64) -> bool {
+        let now = now_secs();
         let issued_us = jti
             .and_then(family_micros)
             .unwrap_or(iat.saturating_mul(1_000_000));
-        {
-            let d = self.dids.read();
-            if !d.is_empty() {
-                if let Some((before, _)) = d.get(did) {
-                    if issued_us <= *before {
-                        return true;
-                    }
-                }
-            }
+        if self.before.is_some_and(|(before, exp)| exp >= now && issued_us <= before) {
+            return true;
         }
-        if let Some(j) = jti {
-            let f = self.families.read();
-            if !f.is_empty() && f.contains_key(j) {
-                return true;
-            }
-        }
-        false
+        jti.is_some_and(|j| self.families.get(j).is_some_and(|exp| *exp >= now))
     }
 
-    pub(super) fn has_takedown(&self, subject: &str) -> bool {
-        let t = self.takedowns.read();
-        !t.is_empty() && t.contains(subject)
-    }
-
-    pub(super) fn set_takedown(&self, subjects: &[String], applied: bool) {
-        self.gen.fetch_add(1, Ordering::SeqCst);
-        let mut t = self.takedowns.write();
-        for s in subjects {
-            if applied {
-                t.insert(s.clone());
-            } else {
-                t.remove(s);
-            }
-        }
+    /// `name` relative to [`TAKEDOWN`] (`rec/{collection}/{rkey}` or `blob/{cid}`).
+    pub(super) fn has_takedown(&self, name: &str) -> bool {
+        !self.takedowns.is_empty() && self.takedowns.contains(name)
     }
 }
 
@@ -511,102 +511,93 @@ fn new_family_id() -> String {
     format!("{:016x}{}", crate::tid::now_micros(), random_hex(8))
 }
 
-/// In-memory takedown keys for a stored takedown entry name.
-pub(super) fn takedown_keys(name: &str) -> Vec<String> {
-    if let Some(uri) = name.strip_prefix("rec/") {
-        vec![uri.to_string()]
-    } else if let Some(rest) = name.strip_prefix("blob/") {
-        let cid = rest.rsplit_once('/').map(|(_, c)| c).unwrap_or(rest);
-        vec![name.to_string(), cid.to_string()]
+async fn load_sets(app: &App, did: &str, local: Option<(u16, u64)>) -> XResult<Ctl> {
+    let rows = if local.is_some() {
+        scan_private(app, did, SEC).await?
     } else {
-        vec![]
-    }
-}
-
-type Sets = (
-    HashMap<String, u64>,
-    HashMap<String, (u64, u64)>,
-    HashSet<String>,
-);
-
-async fn load_sets(app: &App) -> XResult<Sets> {
-    let now = now_secs();
-    let mut fams = HashMap::new();
-    let mut dids = HashMap::new();
-    let mut tds = HashSet::new();
-    if app.partition(REVOKED).is_ok() {
-        for (name, v) in scan_private(app, REVOKED, "").await? {
-            let Ok(j) = serde_json::from_slice::<J>(&v) else {
-                continue;
-            };
-            let exp = j["exp"].as_u64().unwrap_or(0);
-            if exp < now {
-                continue;
-            }
-            if let Some(f) = name.strip_prefix("f/") {
-                fams.insert(f.to_string(), exp);
-            } else if let Some(d) = name.strip_prefix("d/") {
-                dids.insert(d.to_string(), (j["before"].as_u64().unwrap_or(0), exp));
-            }
-        }
-    }
-    if app.partition(TAKEDOWNS).is_ok() {
-        for (name, _) in scan_private(app, TAKEDOWNS, "").await? {
-            tds.extend(takedown_keys(&name));
-        }
-    }
-    Ok((fams, dids, tds))
-}
-
-/// Makes sure the revocation/takedown sets are loaded (first call awaits the
-/// scan) and refreshes them every RELOAD_SECS (one request pays for it).
-pub(super) async fn ensure_loaded(app: &App, e: &Ext) {
-    let now = now_secs();
-    if e.loaded.load(Ordering::Acquire)
-        && now.saturating_sub(e.last_load.load(Ordering::Relaxed)) < RELOAD_SECS
-    {
-        return;
-    }
-    let _g = match e.loading.try_lock() {
-        Ok(g) => g,
-        Err(_) => {
-            if e.loaded.load(Ordering::Acquire) {
-                return; // someone else is refreshing; serve the current view
-            }
-            e.loading.lock().await
-        }
+        super::internal::scan_private_anywhere(app, did, SEC).await?
     };
-    if e.loaded.load(Ordering::Acquire)
-        && now.saturating_sub(e.last_load.load(Ordering::Relaxed)) < RELOAD_SECS
-    {
-        return;
+    let now = now_secs();
+    let mut c = Ctl { at: now, local, ..Default::default() };
+    for (name, v) in rows {
+        if let Some(td) = name.strip_prefix(TAKEDOWN) {
+            c.takedowns.insert(td.to_string());
+            continue;
+        }
+        let Ok(j) = serde_json::from_slice::<J>(&v) else {
+            continue;
+        };
+        let exp = j["exp"].as_u64().unwrap_or(0);
+        if exp < now {
+            continue;
+        }
+        if name == REVOKED_ALL {
+            c.before = Some((j["before"].as_u64().unwrap_or(0), exp));
+        } else if let Some(f) = name.strip_prefix(REVOKED_FAMILY) {
+            c.families.insert(f.to_string(), exp);
+        }
+    }
+    Ok(c)
+}
+
+/// `did`'s revocations and takedowns. Read from its partition and cached:
+/// on the owning node until a change ([`ctl_changed`], also called for
+/// changes forwarded here) or an ownership move; elsewhere re-read from the
+/// owner every [`RELOAD_SECS`]. If the owner can't be reached the last view
+/// (or none) is used, as before for the cluster-wide sets.
+pub(super) async fn ctl(app: &App, did: &str) -> Arc<Ctl> {
+    let e = ext(app);
+    let now = now_secs();
+    let p = state::partition_of(did, app.partitions.len() as u16);
+    let local = app.partitions.get(p as usize).map(|p| (p.id, p.epoch));
+    let cached = e.ctl.read().get(did).cloned();
+    if let Some(c) = &cached {
+        let fresh = match (c.local, local) {
+            (Some(a), Some(b)) => a == b && now.saturating_sub(c.at) < LOCAL_RELOAD_SECS,
+            (None, None) => now.saturating_sub(c.at) < RELOAD_SECS,
+            _ => false,
+        };
+        if fresh {
+            return c.clone();
+        }
     }
     let gen0 = e.gen.load(Ordering::SeqCst);
-    match load_sets(app).await {
-        Ok((fams, dids, tds)) => {
-            let replace = e.gen.load(Ordering::SeqCst) == gen0;
-            let mut f = e.families.write();
-            let mut d = e.dids.write();
-            let mut t = e.takedowns.write();
-            if replace {
-                *f = fams;
-                *d = dids;
-                *t = tds;
-            } else {
-                f.extend(fams);
-                d.extend(dids);
-                t.extend(tds);
+    match load_sets(app, did, local).await {
+        Ok(c) => {
+            let c = Arc::new(c);
+            let mut m = e.ctl.write();
+            // a change since the read began: use it for this check only
+            if e.gen.load(Ordering::SeqCst) == gen0 {
+                if m.len() >= CTL_CACHE_MAX {
+                    m.retain(|_, v| now.saturating_sub(v.at) < RELOAD_SECS);
+                    if m.len() >= CTL_CACHE_MAX {
+                        m.clear();
+                    }
+                }
+                m.insert(did.to_string(), c.clone());
             }
-            f.retain(|_, exp| *exp >= now);
-            d.retain(|_, (_, exp)| *exp >= now);
+            c
         }
-        Err(err) => tracing::warn!(
-            "loading session revocations/takedowns failed: {}",
-            err.message
-        ),
+        Err(err) => {
+            tracing::warn!(%did, "loading session revocations/takedowns failed: {}", err.message);
+            cached.unwrap_or_default()
+        }
     }
-    e.last_load.store(now, Ordering::Relaxed);
-    e.loaded.store(true, Ordering::Release);
+}
+
+/// Drops the cached view of `did` after a change to its `sec/` entries.
+pub(super) fn ctl_changed(app: &App, did: &str) {
+    let e = ext(app);
+    e.gen.fetch_add(1, Ordering::SeqCst);
+    e.ctl.write().remove(did);
+}
+
+/// Writes `did`'s `sec/` entries (in its partition, forwarded to the owner if
+/// need be) and drops the cached view.
+pub(super) async fn put_sec(app: &App, did: &str, muts: Vec<Mutation>) -> XResult<()> {
+    let r = app.put_private(did, muts).await;
+    ctl_changed(app, did);
+    r
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,61 +1002,41 @@ async fn create_session_tokens_scoped(
     Ok((access, refresh))
 }
 
-async fn revoke_families(app: &App, families: &[String]) {
+/// Revokes session families of `did` (their access tokens), durably in its
+/// partition.
+async fn revoke_families(app: &App, did: &str, families: &[String]) -> XResult<()> {
     if families.is_empty() {
-        return;
+        return Ok(());
     }
-    let e = ext(app);
     let exp = now_secs() + REVOKE_TTL;
-    e.gen.fetch_add(1, Ordering::SeqCst);
-    {
-        let mut f = e.families.write();
-        for fam in families {
-            f.insert(fam.clone(), exp);
-        }
-    }
     let muts = families
         .iter()
         .map(|fam| {
             pmut(
-                REVOKED,
-                &format!("f/{fam}"),
+                did,
+                &format!("{REVOKED_FAMILY}{fam}"),
                 Some(to_json_bytes(&json!({"exp": exp}))),
             )
         })
         .collect();
-    if let Err(err) = app.put_private(REVOKED, muts).await {
-        tracing::warn!(
-            "persisting session revocation failed (in-memory only): {}",
-            err.message
-        );
-    }
+    put_sec(app, did, muts).await
 }
 
 /// Revokes every session of `did` (refresh tokens deleted, outstanding access
 /// tokens rejected). Used on password change, takedown and deletion.
 pub(super) async fn revoke_all_sessions(app: &App, did: &str) -> XResult<()> {
-    let e = ext(app);
     let before = crate::tid::now_micros();
     let exp = now_secs() + REVOKE_TTL;
-    e.gen.fetch_add(1, Ordering::SeqCst);
-    e.dids.write().insert(did.to_string(), (before, exp));
-    if let Err(err) = app
-        .put_private(
-            REVOKED,
-            vec![pmut(
-                REVOKED,
-                &format!("d/{did}"),
-                Some(to_json_bytes(&json!({"before": before, "exp": exp}))),
-            )],
-        )
-        .await
-    {
-        tracing::warn!(
-            "persisting session revocation failed (in-memory only): {}",
-            err.message
-        );
-    }
+    put_sec(
+        app,
+        did,
+        vec![pmut(
+            did,
+            REVOKED_ALL,
+            Some(to_json_bytes(&json!({"before": before, "exp": exp}))),
+        )],
+    )
+    .await?;
     revoke_refresh_tokens(app, did).await
 }
 
@@ -1104,8 +1075,7 @@ async fn revoke_app_password_sessions(app: &App, did: &str, name: &str) -> XResu
     if !dels.is_empty() {
         app.put_private(did, dels).await?;
     }
-    revoke_families(app, &fams).await;
-    Ok(())
+    revoke_families(app, did, &fams).await
 }
 
 /// Verifies a legacy Bearer token (session or app-password access JWT).
@@ -1134,9 +1104,7 @@ pub async fn verify_bearer(app: &App, token: &str) -> XResult<Credentials> {
         SCOPE_TAKENDOWN => Credentials::Takendown { did: c.sub.clone() },
         _ => return Err(bad_scope()),
     };
-    let e = ext(app);
-    ensure_loaded(app, &e).await;
-    if e.is_revoked(&c.sub, c.jti.as_deref(), c.iat) {
+    if ctl(app, &c.sub).await.is_revoked(c.jti.as_deref(), c.iat) {
         return Err(expired_token("Token has been revoked"));
     }
     Ok(creds)
@@ -1491,8 +1459,7 @@ async fn refresh_session(State(app): AppState, headers: HeaderMap) -> XResult<Js
     // revoked (deleteSession, password change, ...) or past its grace period
     let now = now_secs();
     let st = st.filter(|s| s.exp >= now).ok_or_else(|| expired_token("Token has been revoked"))?;
-    ensure_loaded(&app, &e).await;
-    if e.is_revoked(&did, Some(&st.family), 0) {
+    if ctl(&app, &did).await.is_revoked(Some(&st.family), 0) {
         return Err(expired_token("Token has been revoked"));
     }
     // Rotation as in the reference: the old token stays usable for a grace
@@ -1531,7 +1498,7 @@ async fn delete_session(State(app): AppState, headers: HeaderMap) -> XResult<Sta
             }
         }
         app.put_private(&did, dels).await?;
-        revoke_families(&app, &[st.family]).await;
+        revoke_families(&app, &did, &[st.family]).await?;
     }
     Ok(StatusCode::OK)
 }
@@ -1635,7 +1602,8 @@ async fn revoke_app_password(
 // account lifecycle
 // ---------------------------------------------------------------------------
 
-/// Locked read-modify-write of an account through the repo's worker.
+/// Read-modify-write of an account, applied by the repo's worker to its
+/// current state (App::mutate_account). Returns the account as written.
 pub(super) async fn update_account<F>(
     app: &App,
     did: &str,
@@ -1644,22 +1612,11 @@ pub(super) async fn update_account<F>(
     f: F,
 ) -> XResult<Account>
 where
-    F: FnOnce(&mut Account) -> XResult<()>,
+    F: FnOnce(&mut Account) -> XResult<()> + Send + 'static,
 {
-    let e = ext(app);
-    let _g = e.lock(did).await;
-    let mut a = app.account(did).await?;
-    f(&mut a)?;
-    app.account_op(
-        did,
-        AccountOp::Update {
-            account: a.clone(),
-            old_handle: None,
-            identity_event,
-            account_event,
-        },
-    )
-    .await?;
+    let (_, a) = app
+        .mutate_account(did, identity_event, account_event, false, |a| f(a).map(|_| true))
+        .await?;
     Ok(a)
 }
 
@@ -1675,7 +1632,7 @@ pub(super) async fn set_deactivated(
     deactivated: bool,
     delete_after: Option<String>,
 ) -> XResult<Account> {
-    update_account(app, did, !deactivated, true, |a| {
+    update_account(app, did, !deactivated, true, move |a| {
         if deactivated {
             if a.extra.get("deactivatedAt").is_none_or(|v| v.is_null()) {
                 set_extra(a, "deactivatedAt", json!(crate::events::now_rfc3339()));
@@ -1728,21 +1685,21 @@ async fn activate_account(State(app): AppState, Auth(creds): Auth) -> XResult<St
         }
         _ => full_access(&creds)?,
     };
-    let e = ext(&app);
-    let _g = e.lock(&did).await;
-    let mut a = app
-        .account(&did)
+    app.account(&did)
         .await
         .map_err(|_| XrpcError::bad("AccountNotFound", "user not found"))?;
-    // a taken-down account can't be activated
-    if a.extra.get("takedownRef").is_some_and(|v| !v.is_null()) {
-        return Err(XrpcError::bad("AccountNotFound", "user not found"));
-    }
-    set_extra(&mut a, "deactivatedAt", J::Null);
-    set_extra(&mut a, "deleteAfter", J::Null);
-    recompute_status(&mut a);
     // #account, #identity and #sync (reference sequenceAccountActivation)
-    app.account_op(&did, AccountOp::Activate { account: a }).await?;
+    app.mutate_account(&did, true, true, true, |a| {
+        // a taken-down account can't be activated
+        if a.extra.get("takedownRef").is_some_and(|v| !v.is_null()) {
+            return Err(XrpcError::bad("AccountNotFound", "user not found"));
+        }
+        set_extra(a, "deactivatedAt", J::Null);
+        set_extra(a, "deleteAfter", J::Null);
+        recompute_status(a);
+        Ok(true)
+    })
+    .await?;
     Ok(StatusCode::OK)
 }
 
@@ -1833,7 +1790,10 @@ pub(super) async fn delete_account_fully(app: &App, did: &str) -> XResult<()> {
             release_email(app, e, did).await;
         }
     }
-    let private = scan_private(app, did, "").await?;
+    // revocations stay (TTL'd), so a DID that comes back (migration) doesn't
+    // revive access tokens issued before
+    let mut private = scan_private(app, did, "").await?;
+    private.retain(|(name, _)| !name.starts_with(REVOKED_ALL) && !name.starts_with(REVOKED_FAMILY));
     for chunk in private.chunks(500) {
         app.put_private(
             did,
@@ -1844,6 +1804,7 @@ pub(super) async fn delete_account_fully(app: &App, did: &str) -> XResult<()> {
         )
         .await?;
     }
+    ctl_changed(app, did);
     Ok(())
 }
 
@@ -2059,7 +2020,7 @@ async fn confirm_email(
     }
     assert_email_token(&app, &did, "confirm_email", &inp.token).await?;
     delete_email_tokens(&app, &did, &["confirm_email"]).await?;
-    update_account(&app, &did, false, false, |a| {
+    update_account(&app, &did, false, false, move |a| {
         a.email_confirmed = true;
         set_extra(a, "emailConfirmedAt", json!(crate::events::now_rfc3339()));
         Ok(())
@@ -2118,19 +2079,27 @@ pub(super) async fn set_email(app: &App, did: &str, email: &str) -> XResult<()> 
             "This email address is already in use, please use a different email.",
         ));
     }
-    let old = acct.email.clone();
-    let res = update_account(app, did, false, false, |a| {
-        a.email = Some(email.clone());
-        a.email_confirmed = false;
-        set_extra(a, "emailConfirmedAt", J::Null);
-        Ok(())
-    })
-    .await;
-    if let Err(e) = res {
-        release_email(app, &email, did).await;
-        return Err(e);
-    }
-    if let Some(o) = old {
+    let new = email.clone();
+    let res = app
+        .mutate_account(did, false, false, false, move |a| {
+            if a.email.as_deref() == Some(new.as_str()) {
+                return Ok(false);
+            }
+            a.email = Some(new);
+            a.email_confirmed = false;
+            set_extra(a, "emailConfirmedAt", J::Null);
+            Ok(true)
+        })
+        .await;
+    let before = match res {
+        Ok((before, _)) => before,
+        Err(e) => {
+            release_email(app, &email, did).await;
+            return Err(e);
+        }
+    };
+    // the email replaced is the one the worker saw, not the one read above
+    if let Some(o) = before.email.filter(|o| *o != email) {
         release_email(app, &o, did).await;
     }
     delete_email_tokens(app, did, EMAIL_PURPOSES).await
@@ -2225,7 +2194,7 @@ struct ResetPasswordIn {
 /// Sets a new password and revokes every session, OAuth grants included.
 pub(super) async fn change_password(app: &App, did: &str, password: &str) -> XResult<()> {
     let hash = state::hash_password(password).await;
-    update_account(app, did, false, false, |a| {
+    update_account(app, did, false, false, move |a| {
         a.password_hash = hash.clone();
         Ok(())
     })
@@ -2557,7 +2526,7 @@ fn session_only(creds: &Credentials) -> XResult<String> {
 }
 
 async fn set_totp_flag(app: &App, did: &str, enabled: bool) -> XResult<()> {
-    update_account(app, did, false, false, |a| {
+    update_account(app, did, false, false, move |a| {
         set_extra(a, "totpEnabled", json!(enabled));
         Ok(())
     })

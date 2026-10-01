@@ -3,13 +3,12 @@
 //! nonces.
 
 use super::util::{
-    b64u, b64u_decode, derive_secret, hmac_sha256, now_secs, sha256_b64u, ReplayCache,
+    b64u, b64u_decode, derive_secret, hmac_sha256, now_secs, sha256_b64u, Replay,
 };
 use p256::ecdsa::signature::{Signer, Verifier};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::EncodedPoint;
 use serde_json::{json, Value as J};
-use std::sync::LazyLock;
 
 /// Signing algorithms accepted for DPoP proofs and client assertions.
 pub const VERIFY_ALGS: [&str; 1] = ["ES256"];
@@ -231,14 +230,17 @@ pub struct DpopProof {
     pub jti: String,
     pub htm: String,
     pub htu: String,
+    /// Until when the proof could be replayed (its `jti` must stay claimed).
+    pub until: i64,
 }
 
-/// DPoP proof `jti` replay cache. Process-local (see HA note in mod.rs).
-static DPOP_JTIS: LazyLock<ReplayCache> = LazyLock::new(|| ReplayCache::new(1_000_000));
-
-/// Drops expired DPoP `jti`s (OAuth GC task). Returns how many were removed.
-pub fn sweep_dpop_jtis() -> usize {
-    DPOP_JTIS.sweep()
+impl DpopProof {
+    /// The proof's single-use key, claimed at the owner of `routing`: the
+    /// access token's DID for resource requests (`ath` binds the proof to
+    /// that token), the key's [`super::util::jkt_routing`] at the AS.
+    pub fn replay(&self, routing: String) -> Replay {
+        Replay { routing, key: format!("dpop:{}:{}", self.jkt, self.jti), until: self.until }
+    }
 }
 
 /// Normalizes an absolute http(s) URL for `htu` comparison: scheme + host +
@@ -351,18 +353,14 @@ pub fn check_proof(
     }
     let jkt = jwk_thumbprint(jwk)
         .map_err(|e| DpopError::Invalid(format!("Failed to calculate jkt: {e}")))?;
-    // Replay protection: a proof may be used once within its validity window.
-    if !DPOP_JTIS.insert_unique(
-        &format!("{jkt}:{jti}"),
-        now + DPOP_MAX_AGE + 2 * DPOP_CLOCK_TOLERANCE,
-    ) {
-        return Err(inv("DPoP proof replayed"));
-    }
+    // Replay protection (a proof may be used once within its validity
+    // window) is the caller's: claim `DpopProof::replay` at its owner.
     Ok(DpopProof {
         jkt,
         jti,
         htm: htm.to_string(),
         htu: htu_norm,
+        until: now + DPOP_MAX_AGE + 2 * DPOP_CLOCK_TOLERANCE,
     })
 }
 
@@ -418,13 +416,11 @@ mod tests {
             ok.jkt,
             jwk_thumbprint(&key_to_jwk(sk.verifying_key())).unwrap()
         );
-        assert!(
-            matches!(
-                check_proof(&p, "POST", htu, Some("tok"), &nonces),
-                Err(DpopError::Invalid(_))
-            ),
-            "replay"
-        );
+        // single use is claimed by the caller, at the routing key's owner
+        let r = ok.replay("did:plc:x".into());
+        let c = super::super::util::ReplayCache::new(10);
+        assert!(c.insert_unique(&r.key, r.until));
+        assert!(!c.insert_unique(&r.key, r.until), "replay");
         let p = proof(&sk, "GET", htu, Some(&n), Some("tok"));
         assert!(check_proof(&p, "POST", htu, Some("tok"), &nonces).is_err());
         let p = proof(&sk, "POST", htu, Some(&n), Some("other"));

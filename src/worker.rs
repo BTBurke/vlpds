@@ -123,14 +123,20 @@ pub struct AccountReq {
     pub reply: oneshot::Sender<Result<Head, WriteError>>,
 }
 
+/// A read-modify-write of the account, run by the repo's worker on its
+/// current copy, so concurrent changes compose instead of one overwriting the
+/// other with a stale snapshot. Preconditions belong inside it: it sees the
+/// state it changes. `Ok(false)` = nothing to do (no write, no events); an
+/// error rejects the op unchanged.
+pub type AccountMutation = Box<dyn FnOnce(&mut state::Account) -> Result<bool, WriteError> + Send>;
+
 pub enum AccountOp {
-    /// Persist a new account record. `old_handle` set = handle changed (index
-    /// moved, #identity emitted). `account_event` emits #account with the
-    /// account's status (status None = active). Writes are rejected while
-    /// status is Some.
+    /// Persist the mutated account record. A changed handle moves the handle
+    /// index. `identity_event` emits #identity; `account_event` emits #account
+    /// with the account's status (status None = active). Writes are rejected
+    /// while status is Some.
     Update {
-        account: state::Account,
-        old_handle: Option<String>,
+        mutate: AccountMutation,
         identity_event: bool,
         account_event: bool,
     },
@@ -143,7 +149,7 @@ pub enum AccountOp {
     Delete,
     /// Persist a reactivated account: #account, #identity and #sync of the
     /// current commit, as the reference's sequenceAccountActivation.
-    Activate { account: state::Account },
+    Activate { mutate: AccountMutation },
 }
 
 pub enum Queued {
@@ -373,6 +379,23 @@ impl Worker {
                     WorkerMsg::Loaded { did, res } => {
                         let buffered = self.loading.remove(&did).unwrap_or_default();
                         match res {
+                            // The shard closed (and maybe reopened) while the load
+                            // was in flight: the state belongs to an ownership that
+                            // ended and must never be cached, or commits built on it
+                            // chain past whatever the shard saw since (bench/ha N6).
+                            // close() purges the cache after unrouting the shard, so
+                            // checking here closes the window. Reload against the
+                            // current partition, if any.
+                            Ok(Some(st)) if !(self.partitions)(&did).is_some_and(|p| Arc::ptr_eq(&p, &st.partition)) => {
+                                metrics::REPO_LOADS.with_label_values(&["stale"]).inc();
+                                let mut buffered = buffered.into_iter();
+                                if let Some(first) = buffered.next() {
+                                    self.start_load(first);
+                                    if let Some(buf) = self.loading.get_mut(&did) {
+                                        buf.extend(buffered);
+                                    }
+                                }
+                            }
                             Ok(Some(st)) => {
                                 STATS.repo_loads.fetch_add(1, Ordering::Relaxed);
                                 metrics::REPO_LOADS.with_label_values(&["ok"]).inc();
@@ -1141,28 +1164,43 @@ fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>) {
     st.blob_refs.clear();
 }
 
+/// Runs `mutate` on a copy of the current account: Some(next) = persist it,
+/// None = a no-op (the mutation said nothing changed).
+fn mutate_account(st: &RepoState, mutate: AccountMutation) -> Result<Option<state::Account>, WriteError> {
+    if st.account.status.as_deref() == Some("deleted") {
+        return Err(WriteError::RepoNotFound);
+    }
+    let mut next = st.account.clone();
+    Ok(mutate(&mut next)?.then_some(next))
+}
+
 fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::Result<()> {
     let time = events::now_rfc3339();
     let mut frames = Vec::new();
     let mut muts = Vec::new();
     match req.op {
         AccountOp::Update {
-            account,
-            old_handle,
+            mutate,
             identity_event,
             account_event,
         } => {
-            if let Some(old) = &old_handle {
-                if *old != account.handle {
-                    muts.push(Mutation {
-                        key: state::handle_key(old).into(),
-                        val: None,
-                    });
-                    muts.push(Mutation {
-                        key: state::handle_key(&account.handle).into(),
-                        val: Some(Bytes::from(st.did.to_string())),
-                    });
+            let account = match mutate_account(st, mutate) {
+                Ok(Some(a)) => a,
+                // rejected, or nothing to write: ack now (a no-op logs nothing)
+                r => {
+                    let _ = req.reply.send(r.map(|_| st.head.clone()));
+                    return Ok(());
                 }
+            };
+            if account.handle != st.account.handle {
+                muts.push(Mutation {
+                    key: state::handle_key(&st.account.handle).into(),
+                    val: None,
+                });
+                muts.push(Mutation {
+                    key: state::handle_key(&account.handle).into(),
+                    val: Some(Bytes::from(st.did.to_string())),
+                });
             }
             muts.push(Mutation {
                 key: state::account_key(&st.did).into(),
@@ -1185,7 +1223,15 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
             }
             st.account = account;
         }
-        AccountOp::Activate { account } => {
+        AccountOp::Activate { mutate } => {
+            let account = match mutate_account(st, mutate) {
+                Ok(Some(a)) => a,
+                // rejected, or nothing to write: ack now (a no-op logs nothing)
+                r => {
+                    let _ = req.reply.send(r.map(|_| st.head.clone()));
+                    return Ok(());
+                }
+            };
             muts.push(Mutation {
                 key: state::account_key(&st.did).into(),
                 val: Some(Bytes::from(serde_json::to_vec(&account)?)),

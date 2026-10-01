@@ -509,6 +509,53 @@ impl App {
             .await
             .map_err(|_| XrpcError::internal("worker dropped request"))??)
     }
+
+    /// Read-modify-write of an account, run by the repo's worker on its
+    /// current state (never on a snapshot read here, which a concurrent change
+    /// could have outdated). `f` checks its preconditions on that state and
+    /// returns whether anything changed (false = no write, no events).
+    /// `activate` sends it as AccountOp::Activate. Returns (before, after).
+    pub async fn mutate_account<F>(
+        &self,
+        did: &str,
+        identity_event: bool,
+        account_event: bool,
+        activate: bool,
+        f: F,
+    ) -> Result<(Account, Account), XrpcError>
+    where
+        F: FnOnce(&mut Account) -> Result<bool, XrpcError> + Send + 'static,
+    {
+        // f's own error and the accounts come back through `out`; the worker
+        // only learns that the op was rejected
+        let (out_tx, mut out_rx) = oneshot::channel();
+        let mutate: crate::worker::AccountMutation = Box::new(move |a: &mut Account| {
+            let before = a.clone();
+            match f(a) {
+                Ok(changed) => {
+                    let _ = out_tx.send(Ok((before, a.clone())));
+                    Ok(changed)
+                }
+                Err(e) => {
+                    let msg = e.message.clone();
+                    let _ = out_tx.send(Err(e));
+                    Err(WriteError::Invalid(msg))
+                }
+            }
+        });
+        let op = if activate {
+            crate::worker::AccountOp::Activate { mutate }
+        } else {
+            crate::worker::AccountOp::Update { mutate, identity_event, account_event }
+        };
+        let res = self.account_op(did, op).await;
+        match (out_rx.try_recv(), res) {
+            (Ok(Err(e)), _) => Err(e),
+            (_, Err(e)) => Err(e),
+            (Ok(Ok(accts)), Ok(_)) => Ok(accts),
+            (Err(_), Ok(_)) => Err(XrpcError::internal("account mutation did not run")),
+        }
+    }
 }
 
 /// Blob CIDs referenced by a record ({"$type": "blob", "ref": {"$link": ...}}).

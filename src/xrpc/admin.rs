@@ -1,15 +1,15 @@
 //! com.atproto.admin.* (Basic `admin:<token>` auth), invite-code storage,
-//! subject takedowns (`is_takendown` for other modules), the dev-mode
+//! subject takedowns (`is_record_takendown` / `is_blob_takendown`, kept in
+//! the account's partition under `sec/td/`), the dev-mode
 //! mailbox (vlpds.admin.getDevMail) and the vlpds.admin.bulkCreate simulator.
 
 use super::authn::Credentials;
 use super::server::{
-    delete_account_fully, ensure_loaded, ext, get_json, invalid_request, normalize_handle, pmut,
+    ctl, delete_account_fully, ext, get_json, invalid_request, normalize_handle, pmut, put_sec,
     recompute_status, scan_private, scan_private_routing, set_deactivated,
-    set_email, set_extra, to_json_bytes, update_account, NEW_PASSWORD_MAX_LENGTH, TAKEDOWNS,
+    set_email, set_extra, to_json_bytes, update_account, NEW_PASSWORD_MAX_LENGTH, TAKEDOWN,
 };
 use super::*;
-use crate::worker::AccountOp;
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
@@ -319,32 +319,36 @@ async fn set_invites_disabled(app: &App, codes: &[String], disabled: bool) -> XR
 // takedowns
 // ---------------------------------------------------------------------------
 
-/// Is `subject` (an at:// record URI or a blob CID) taken down? In-memory
-/// check (sets loaded from p/_takedowns and refreshed periodically).
-#[allow(dead_code)]
-pub async fn is_takendown(app: &App, subject: &str) -> bool {
-    let e = ext(app);
-    ensure_loaded(app, &e).await;
-    e.has_takedown(subject)
+/// Is record `{collection}/{rkey}` of `did` taken down? Takedowns live in
+/// the account's own partition (`sec/td/`), so the owner checks them from
+/// its cached per-DID view (`server::ctl`).
+pub async fn is_record_takendown(app: &App, did: &str, path: &str) -> bool {
+    ctl(app, did).await.has_takedown(&format!("rec/{path}"))
 }
 
 /// Is blob `cid` of repo `did` taken down?
-#[allow(dead_code)]
 pub async fn is_blob_takendown(app: &App, did: &str, cid: &str) -> bool {
-    let e = ext(app);
-    ensure_loaded(app, &e).await;
-    e.has_takedown(&format!("blob/{did}/{cid}"))
+    ctl(app, did).await.has_takedown(&format!("blob/{cid}"))
 }
 
-async fn set_subject_takedown(app: &App, name: &str, val: Option<J>) -> XResult<()> {
-    let applied = val.is_some();
-    app.put_private(
-        TAKEDOWNS,
-        vec![pmut(TAKEDOWNS, name, val.map(|v| to_json_bytes(&v)))],
+/// Applies (`val` = Some) or lifts a record/blob takedown of `did`; `name` is
+/// relative to `sec/td/` (`rec/{collection}/{rkey}` or `blob/{cid}`).
+async fn set_subject_takedown(app: &App, did: &str, name: &str, val: Option<J>) -> XResult<()> {
+    put_sec(
+        app,
+        did,
+        vec![pmut(did, &format!("{TAKEDOWN}{name}"), val.map(|v| to_json_bytes(&v)))],
     )
-    .await?;
-    ext(app).set_takedown(&super::server::takedown_keys(name), applied);
-    Ok(())
+    .await
+}
+
+/// `{collection}/{rkey}` of an at:// URI naming a record of `did`.
+fn record_path<'a>(uri: &'a str, did: &str) -> XResult<&'a str> {
+    uri.strip_prefix("at://")
+        .and_then(|r| r.strip_prefix(did))
+        .and_then(|r| r.strip_prefix('/'))
+        .filter(|p| p.split('/').count() == 2 && !p.split('/').any(str::is_empty))
+        .ok_or_else(|| invalid_request("invalid at-uri"))
 }
 
 // ---------------------------------------------------------------------------
@@ -582,33 +586,10 @@ async fn update_account_handle(
     require_admin(&creds)?;
     let handle = normalize_handle(&inp.handle)?;
     let did = inp.did.clone();
-    let e = ext(&app);
-    let _g = e.lock(&did).await;
-    let acct = app
-        .account(&did)
+    app.account(&did)
         .await
         .map_err(|_| invalid_request(format!("Account not found: {did}")))?;
-    let old = acct.handle.clone();
-    if handle != old && !super::server::claim_handle(&app, &handle, &did).await? {
-        return Err(XrpcError::bad("HandleNotAvailable", format!("Handle already taken: {handle}")));
-    }
-    let mut next = acct.clone();
-    next.handle = handle.clone();
-    let op = AccountOp::Update {
-        account: next,
-        old_handle: Some(old.clone()),
-        identity_event: true,
-        account_event: false,
-    };
-    if let Err(err) = app.account_op(&did, op).await {
-        if handle != old {
-            super::server::release_handle(&app, &handle, &did).await;
-        }
-        return Err(err);
-    }
-    if handle != old {
-        super::server::release_handle(&app, &old, &did).await;
-    }
+    super::identity::set_handle(&app, &did, &handle, false).await?;
     Ok(StatusCode::OK)
 }
 
@@ -804,7 +785,7 @@ async fn update_subject_status(
                     .clone()
                     .unwrap_or_else(crate::events::now_rfc3339);
                 let applied = td.applied;
-                update_account(&app, did, false, true, |a| {
+                update_account(&app, did, false, true, move |a| {
                     set_extra(a, "takedownRef", if applied { json!(r) } else { J::Null });
                     recompute_status(a);
                     Ok(())
@@ -823,13 +804,13 @@ async fn update_subject_status(
                 let v = td
                     .applied
                     .then(|| json!({"uri": uri, "did": did, "cid": cid, "ref": td.r#ref}));
-                set_subject_takedown(&app, &format!("rec/{uri}"), v).await?;
+                set_subject_takedown(&app, did, &format!("rec/{}", record_path(uri, did)?), v).await?;
             }
             Subject::Blob { did, cid } => {
                 let v = td
                     .applied
                     .then(|| json!({"did": did, "cid": cid, "ref": td.r#ref}));
-                set_subject_takedown(&app, &format!("blob/{did}/{cid}"), v).await?;
+                set_subject_takedown(&app, did, &format!("blob/{cid}"), v).await?;
             }
         }
     }
@@ -870,14 +851,18 @@ async fn get_subject_status(
             .did
             .as_deref()
             .ok_or_else(|| invalid_request("Must provide a did to request blob state"))?;
-        get_json::<J>(&app, TAKEDOWNS, &format!("blob/{did}/{blob}")).await?.map(|t| {
+        get_json::<J>(&app, did, &format!("{TAKEDOWN}blob/{blob}")).await?.map(|t| {
             json!({
                 "subject": {"$type": "com.atproto.admin.defs#repoBlobRef", "did": did, "cid": blob},
                 "takedown": status_attr(true, t["ref"].as_str()),
             })
         })
     } else if let Some(uri) = &q.uri {
-        let td = get_json::<J>(&app, TAKEDOWNS, &format!("rec/{uri}")).await?;
+        let did = uri
+            .strip_prefix("at://")
+            .and_then(|r| r.split('/').next())
+            .ok_or_else(|| invalid_request("invalid at-uri"))?;
+        let td = get_json::<J>(&app, did, &format!("{TAKEDOWN}rec/{}", record_path(uri, did)?)).await?;
         let cid = current_record_cid(&app, uri).await;
         match (td, cid) {
             (Some(t), Some(cid)) => Some(json!({
@@ -949,7 +934,7 @@ struct AccountIn {
 
 async fn set_account_invites_disabled(app: &App, account: &str, disabled: bool) -> XResult<()> {
     let did = app.resolve_repo(account).await?;
-    update_account(app, &did, false, false, |a| {
+    update_account(app, &did, false, false, move |a| {
         set_extra(a, "invitesDisabled", json!(disabled));
         Ok(())
     })

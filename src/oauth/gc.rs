@@ -22,7 +22,7 @@
 //! device session.
 
 use super::client::{
-    self, ClientAuth, REFRESH_LIFETIME, REFRESH_LIFETIME_EXTENDED, SESSION_LIFETIME,
+    ClientAuth, REFRESH_LIFETIME, REFRESH_LIFETIME_EXTENDED, SESSION_LIFETIME,
     SESSION_LIFETIME_EXTENDED,
 };
 use super::store::{self, Device, RequestData, Session};
@@ -117,7 +117,7 @@ async fn delete_if_expired(
     name: &str,
     now: i64,
 ) -> Result<bool, OAuthError> {
-    let _g = store::lock(&lock_key(kind, routing, name)).await;
+    let _g = store::lock(app, &lock_key(kind, routing, name)).await;
     let Some(val) = app.get_private(routing, name).await? else {
         return Ok(false);
     };
@@ -159,7 +159,7 @@ impl Sweeper {
         delete_budget: usize,
     ) -> Result<SweepStats, OAuthError> {
         let mut st = SweepStats {
-            replay_entries: client::sweep_replay_caches() + super::jose::sweep_dpop_jtis(),
+            replay_entries: super::util::sweep_replays(app),
             ..Default::default()
         };
         let lo = b"p/".to_vec();

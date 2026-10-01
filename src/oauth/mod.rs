@@ -16,7 +16,8 @@
 //! applied:
 //! - `oauth:req:{id}` / `oauth/req`: pending authorization (PAR) requests,
 //!   later the issued code; a consumed request is kept as a tombstone so code
-//!   reuse can revoke the session it created.
+//!   reuse can revoke the session it created. The id is minted so that this
+//!   row lands on a partition of the node that ran PAR.
 //! - `oauth:cc:{hash}` / `oauth/cc`: PKCE `code_challenge` reuse index (24 h).
 //! - `oauth:dev:{id}` / `oauth/dev`: browser device sessions (account chooser).
 //! - `{did}` / `oauth/ses/{session id}`: OAuth sessions (one per grant),
@@ -30,16 +31,48 @@
 //! Lookups by token value need no index: refresh tokens and codes embed the
 //! routing information (DID + session id, request id) next to their secret.
 //!
-//! ## HA caveats
-//! - DPoP proof, client-assertion and request-object (JAR) `jti`s are
-//!   tracked in an in-memory TTL cache per process. Behind a load balancer
-//!   a proof could be replayed once against a different node within its
-//!   ~3-minute window (~1 minute for request objects); nonces bound that
-//!   window. A shared cache would close it.
-//! - Single-use operations (code exchange, refresh-token rotation) take a
-//!   process-local lock before their read-modify-write. Requests for the same
-//!   code/session that hit two different nodes concurrently are not
-//!   serialized against each other.
+//! ## HA: which node does what
+//! Every row has a routing key (above) and so one owning node at a time.
+//! Reads and writes from other nodes go through `put_private` /
+//! `get_private` (forwarded to the owner), so any node *can* serve any
+//! step; what needs one node is single use. `crate::forward` routes
+//! `/oauth/*` by `xrpc::oauth::route_key` (stateless: the key comes from the
+//! request itself):
+//! - `/oauth/par`: the `login_hint` account's owner if there is one, else
+//!   the receiving node; either way the request id is minted local to the
+//!   node that runs it, so the flow tends to stay on one node.
+//! - `/oauth/authorize` (GET), `.../select`, `.../consent`: the request
+//!   row's owner (`request_uri` -> `oauth:req:{id}`).
+//! - `.../sign-in` and `/oauth/account/sign-in`: the account's owner, from
+//!   the identifier (handle / DID / email, resolved through the global
+//!   handle and email claims); the authenticator-code step names no account
+//!   and goes to the owner of the device's pending one. Per-account rate
+//!   limits, the TOTP lockout and the account record are then local.
+//! - `/oauth/token`: a code -> its request row's owner (codes embed the
+//!   request id); a refresh token -> its session's account owner (refresh
+//!   tokens embed the DID). `/oauth/revoke` likewise (access tokens by `sub`).
+//! - `/oauth/account` pages and the rest: any node (account records and
+//!   session lists are read from their owners).
+//!
+//! Single use, cluster-wide:
+//! - Code exchange and refresh rotation run only on the owner of the code's
+//!   request row / the session's account (`require_owner`; 503
+//!   `temporarily_unavailable` mid-handoff, so clients retry), under a lock
+//!   on that node (`store::lock`), so concurrent uses that hit different
+//!   nodes are serialized there: exactly one wins.
+//! - DPoP proof, client-assertion and request-object (JAR) `jti`s are claimed
+//!   at the owner of a routing key (`xrpc::internal::claim_replay_anywhere`,
+//!   an in-memory TTL set per node): a resource request's proof under the
+//!   access token's DID (`ath` binds it to that token, and the request was
+//!   routed there, so this is normally local), an authorization-server proof
+//!   under its key (`oauth:jkt:{jkt}`), assertions and request objects under
+//!   the client (`oauth:client:{hash}`). PKCE `code_challenge` reuse: the
+//!   durable 24 h marker plus a short claim at its owner for concurrent PARs.
+//! - Residual: the replay sets are memory only. When a partition moves, its
+//!   new owner starts with an empty set, so a proof captured in the last few
+//!   minutes (its validity window; nonces bound it further) could be
+//!   replayed once against the new owner. Codes and refresh tokens are not
+//!   affected (their state is durable rows).
 
 pub mod client;
 pub mod gc;

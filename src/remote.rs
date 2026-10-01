@@ -6,11 +6,16 @@
 //!   0x01 | watermark i64                                            heartbeat
 //! A watermark promises every event with seq <= it has been sent.
 //!
-//! Every node follows every peer's log. On (re)connect it first catches up
-//! from S3 segments after the last ordinal it delivered. When the peer dies,
-//! the follower drains the log from S3 up to its fence object and then
-//! retires (the host removes its firehose source).
+//! Every node follows every peer's log. A follower owes the merger every
+//! event of the log above its floor (the merger's position when it started,
+//! see firehose.rs), in ordinal order with no gaps. Its first ordinal is the
+//! first segment in S3 past the floor. On every (re)connect, once the owner
+//! has subscribed us, it catches up from S3 after the last ordinal it
+//! delivered, then dedupes against the stream. When the peer dies, the
+//! follower drains the log from S3 up to its fence object and then retires
+//! (the host removes its firehose source).
 
+use crate::firehose::Firehose;
 use crate::nodelog::{segment_path, LogBatch, NodeLog};
 use crate::segment::{self, LogObject};
 use crate::store::Store;
@@ -118,38 +123,36 @@ pub struct Follower {
     pub done: Arc<AtomicBool>,
 }
 
-/// `addr` returns the peer's base URL while it is alive, None once it's dead.
+/// Registers the log as a firehose source of `fh` and follows it. `addr`
+/// returns the peer's base URL while it is alive, None once it's dead.
 pub fn follow_log(
     log_id: &str,
+    fh: &Firehose,
     store: Store,
     addr: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     token: String,
     merger_tx: mpsc::UnboundedSender<LogBatch>,
 ) -> Follower {
     let log_id: Arc<str> = log_id.into();
+    let (floor, watermark) = fh.add_remote(&log_id);
     let f = Follower {
         log_id: log_id.clone(),
-        watermark: Arc::new(AtomicI64::new(0)),
+        watermark,
         stop: Arc::new(AtomicBool::new(false)),
         done: Arc::new(AtomicBool::new(false)),
     };
     let (wm, stop, done) = (f.watermark.clone(), f.stop.clone(), f.done.clone());
     tokio::spawn(async move {
-        // last ordinal delivered to the merger
-        let mut last: Option<u64> = None;
+        // next ordinal to deliver to the merger (None until found in S3)
+        let mut next: Option<u64> = None;
         while !stop.load(Ordering::Acquire) {
             match addr() {
                 Some(base) => {
-                    if let Err(e) = stream_live(&log_id, &store, &base, &token, &merger_tx, &wm, &mut last, &stop).await {
+                    if let Err(e) = stream_live(&log_id, &store, floor, &base, &token, &merger_tx, &wm, &mut next, &stop).await {
                         tracing::debug!(%log_id, "log stream from {base} ended: {e:#}");
                     }
                 }
-                // never streamed it while alive: its events predate our firehose
-                None if last.is_none() => {
-                    done.store(true, Ordering::Release);
-                    return;
-                }
-                None => match drain_s3(&log_id, &store, &merger_tx, &wm, &mut last).await {
+                None => match catch_up(&log_id, &store, floor, &merger_tx, &wm, &mut next).await {
                     Ok(true) => {
                         done.store(true, Ordering::Release);
                         return;
@@ -164,17 +167,22 @@ pub fn follow_log(
     f
 }
 
-/// Delivers segments after `last` from S3. Ok(true) = reached the fence.
-async fn drain_s3(
+/// Delivers segments from `next` (first resolved as the first segment past
+/// `floor`) from S3 until the first missing one. Ok(true) = reached the fence.
+async fn catch_up(
     log_id: &Arc<str>,
     store: &Store,
+    floor: i64,
     merger_tx: &mpsc::UnboundedSender<LogBatch>,
     wm: &AtomicI64,
-    last: &mut Option<u64>,
+    next: &mut Option<u64>,
 ) -> anyhow::Result<bool> {
-    let mut next = last.map(|o| o + 1).unwrap_or(0);
+    let next = match next {
+        Some(n) => n,
+        None => next.insert(crate::backfill::seek(store, log_id, floor).await?),
+    };
     loop {
-        let data = match store.raw.get(&segment_path(store, log_id, next)).await {
+        let data = match store.raw.get(&segment_path(store, log_id, *next)).await {
             Ok(r) => r.bytes().await?,
             Err(object_store::Error::NotFound { .. }) => return Ok(false),
             Err(e) => return Err(e.into()),
@@ -183,10 +191,9 @@ async fn drain_s3(
             LogObject::Fence { .. } => return Ok(true),
             LogObject::Segment(h, entries) => {
                 let events: Vec<_> = entries.into_iter().filter(|e| !e.frame.is_empty()).map(|e| (e.seq, e.frame)).collect();
-                let _ = merger_tx.send(LogBatch { log_id: log_id.clone(), ordinal: next, events });
+                let _ = merger_tx.send(LogBatch { log_id: log_id.clone(), ordinal: *next, events });
                 wm.fetch_max(h.last_seq, Ordering::AcqRel);
-                *last = Some(next);
-                next += 1;
+                *next += 1;
             }
         }
     }
@@ -196,11 +203,12 @@ async fn drain_s3(
 async fn stream_live(
     log_id: &Arc<str>,
     store: &Store,
+    floor: i64,
     base: &str,
     token: &str,
     merger_tx: &mpsc::UnboundedSender<LogBatch>,
     wm: &AtomicI64,
-    last: &mut Option<u64>,
+    next: &mut Option<u64>,
     stop: &AtomicBool,
 ) -> anyhow::Result<()> {
     let url = format!("{}/internal/v1/log/stream", base.replacen("http", "ws", 1));
@@ -209,11 +217,14 @@ async fn stream_live(
     let (mut ws, _) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, tokio_tungstenite::connect_async(req))
         .await
         .map_err(|_| anyhow::anyhow!("log stream connect to {base} timed out"))??;
-    // Connected (live batches now buffer in the socket): catch up from S3
-    // after what we already delivered, then dedupe against the stream.
-    if last.is_some() {
-        drain_s3(log_id, store, merger_tx, wm, last).await?;
-    }
+    // The owner subscribes to its log only after the upgrade, so wait for its
+    // first message before the S3 catch-up: every batch it won't send us was
+    // broadcast, so PUT, before that. Catching up any earlier could miss a
+    // batch landing in between, which the first heartbeat already covers.
+    let Some(first) = next_msg(&mut ws, log_id, base).await? else { return Ok(()) };
+    let mut first = Some(first);
+    catch_up(log_id, store, floor, merger_tx, wm, next).await?;
+    let n = next.as_mut().expect("resolved by catch_up");
     // HA fix: an idle timeout. The owner heartbeats every 5 ms, so silence
     // means a dead or partitioned peer. Without it, a half-open connection
     // (peer cut off by the network, then dead: no FIN/RST ever arrives) kept
@@ -221,24 +232,24 @@ async fn stream_live(
     // we never drained its log to the fence, and every survivor's merged
     // firehose stalled for good (bench/ha ctr-partition).
     loop {
-        let msg = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, ws.next()).await {
-            Ok(Some(m)) => m,
-            Ok(None) => break,
-            Err(_) => anyhow::bail!("log {log_id} stream from {base} idle for {STREAM_IDLE_TIMEOUT:?}"),
+        let msg = match first.take() {
+            Some(m) => m,
+            None => match next_msg(&mut ws, log_id, base).await? {
+                Some(m) => m,
+                None => break,
+            },
         };
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
-        let tokio_tungstenite::tungstenite::Message::Binary(data) = msg? else { continue };
+        let Some(data) = msg else { continue };
         match decode(log_id, data)? {
             StreamMsg::Batch(b) => {
-                if let Some(ord) = *last {
-                    if b.ordinal <= ord {
-                        continue; // already delivered via S3 catch-up
-                    }
-                    anyhow::ensure!(b.ordinal == ord + 1, "log {log_id} stream gap: {} after {ord}", b.ordinal);
+                if b.ordinal < *n {
+                    continue; // already delivered via S3 catch-up
                 }
-                *last = Some(b.ordinal);
+                anyhow::ensure!(b.ordinal == *n, "log {log_id} stream gap: {} while expecting {n}", b.ordinal);
+                *n += 1;
                 let _ = merger_tx.send(b);
             }
             StreamMsg::Watermark(w) => {
@@ -248,4 +259,19 @@ async fn stream_live(
     }
     let _ = ws.close(None).await;
     Ok(())
+}
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The next message of a log stream: None at its end, Some(None) for a
+/// non-binary message.
+async fn next_msg(ws: &mut Ws, log_id: &str, base: &str) -> anyhow::Result<Option<Option<Bytes>>> {
+    match tokio::time::timeout(STREAM_IDLE_TIMEOUT, ws.next()).await {
+        Ok(Some(m)) => Ok(Some(match m? {
+            tokio_tungstenite::tungstenite::Message::Binary(data) => Some(data),
+            _ => None,
+        })),
+        Ok(None) => Ok(None),
+        Err(_) => anyhow::bail!("log {log_id} stream from {base} idle for {STREAM_IDLE_TIMEOUT:?}"),
+    }
 }

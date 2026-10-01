@@ -8,6 +8,7 @@
 mod common;
 
 mod account_deactivation;
+mod account_races;
 mod admin_cluster;
 mod account_status;
 mod account;
@@ -21,7 +22,9 @@ mod crud;
 mod email_flows;
 mod file_uploads;
 mod firehose_backfill;
+mod firehose_startup;
 mod go_checker;
+mod ha_auth;
 mod handle_validation;
 mod handles;
 mod harness;

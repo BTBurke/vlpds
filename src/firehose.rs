@@ -5,6 +5,12 @@
 //! event with seq <= W_l has been delivered). The merger emits events with
 //! seq <= min_l W_l in seq order, so the merged order is total, stable and the
 //! same on every node.
+//!
+//! The merged stream starts at a floor F (the clock at startup): every log
+//! delivers its events with seq > F (followers catch up from S3, see
+//! remote.rs), the merger drops anything <= F, and cursors at or below F are
+//! backfilled from S3 (backfill.rs). A log followed later starts at the
+//! merger's position at that moment, so nothing above it is skipped either.
 
 use crate::events;
 use crate::metrics;
@@ -51,9 +57,15 @@ pub struct Firehose {
     pub last_emitted: AtomicI64,
     /// Watermark source per log id.
     pub sources: RwLock<HashMap<Arc<str>, Source>>,
-    /// The ring holds every event with seq > ring_floor (i64::MAX until the
-    /// first batch). Older cursors are backfilled from S3.
+    /// The ring holds every event with seq > ring_floor (the start floor
+    /// until the ring evicts). Older cursors are backfilled from S3.
     ring_floor: AtomicI64,
+    /// The merged stream's start floor F: events <= F are only served by the
+    /// S3 backfill.
+    start_floor: i64,
+    /// Highest min watermark the merger has acted on: every event <= it (and
+    /// > start_floor) of every followed log has been emitted.
+    settled: AtomicI64,
     /// Object store for S3 backfill (set once the node log is known).
     pub store: RwLock<Option<crate::store::Store>>,
 }
@@ -61,6 +73,7 @@ pub struct Firehose {
 impl Firehose {
     pub fn new(max_ring_bytes: usize) -> Arc<Firehose> {
         let (tx, _) = broadcast::channel(4096);
+        let floor = crate::nodelog::seq_floor(crate::tid::now_micros());
         Arc::new(Firehose {
             tx,
             ring: RwLock::new(VecDeque::new()),
@@ -68,13 +81,33 @@ impl Firehose {
             max_ring_bytes: max_ring_bytes as i64,
             last_emitted: AtomicI64::new(0),
             sources: RwLock::new(HashMap::new()),
-            ring_floor: AtomicI64::new(i64::MAX),
+            ring_floor: AtomicI64::new(floor),
+            start_floor: floor,
+            settled: AtomicI64::new(i64::MIN),
             store: RwLock::new(None),
         })
     }
 
     pub fn min_watermark(&self) -> Option<i64> {
         self.sources.read().values().map(|s| s.get()).min()
+    }
+
+    /// Everything at or below this has been emitted (or is below the start
+    /// floor): a log followed from now on only owes us its events above it.
+    pub fn position(&self) -> i64 {
+        self.start_floor.max(self.settled.load(Ordering::Acquire))
+    }
+
+    /// Registers a newly followed peer log: returns the floor its follower
+    /// must deliver every event above, and its watermark (starting there).
+    /// Taken under the sources lock, so no merger tick that ignored this log
+    /// can settle past the floor afterwards.
+    pub fn add_remote(&self, log_id: &str) -> (i64, Arc<AtomicI64>) {
+        let mut s = self.sources.write();
+        let floor = self.position();
+        let wm = Arc::new(AtomicI64::new(floor));
+        s.insert(log_id.into(), Source::Remote(wm.clone()));
+        (floor, wm)
     }
 
     /// Adds (Some) or removes (None) a log's watermark source. Remove a log
@@ -103,25 +136,48 @@ impl Firehose {
             loop {
                 tick.tick().await;
                 // Read the watermark *before* draining: anything at or below it
-                // was sent to us before the watermark was published.
-                let Some(w) = fh.min_watermark() else {
-                    continue;
+                // was sent to us before the watermark was published. Settle it
+                // under the sources lock (see add_remote).
+                let (w, prev) = {
+                    let s = fh.sources.read();
+                    let Some(w) = s.values().map(|s| s.get()).min() else {
+                        continue;
+                    };
+                    let prev = fh.position();
+                    fh.settled.fetch_max(w, Ordering::AcqRel);
+                    (w, prev)
                 };
+                let mut late = 0usize;
                 loop {
                     match rx.try_recv() {
                         Ok(b) => {
                             let h = high.entry(b.log_id.clone()).or_insert(i64::MIN);
                             let q = queues.entry(b.log_id.clone()).or_default();
                             for (seq, frame) in b.events {
-                                if seq > *h {
-                                    *h = seq;
-                                    q.push_back((seq, frame));
+                                if seq <= *h {
+                                    continue;
                                 }
+                                *h = seq;
+                                // At or below what we already emitted: the start
+                                // of a follower's S3 catch-up (<= the start floor,
+                                // backfill serves it), or a late event (a log we
+                                // weren't following yet, or a watermark that
+                                // overpromised), which live order can't take.
+                                if seq <= prev {
+                                    if seq > fh.start_floor {
+                                        late += 1;
+                                    }
+                                    continue;
+                                }
+                                q.push_back((seq, frame));
                             }
                         }
                         Err(mpsc::error::TryRecvError::Empty) => break,
                         Err(mpsc::error::TryRecvError::Disconnected) => return,
                     }
+                }
+                if late > 0 {
+                    tracing::warn!(late, settled = prev, "firehose merger: dropped late events below the emitted watermark");
                 }
                 let mut out = Vec::new();
                 for q in queues.values_mut() {
@@ -136,16 +192,6 @@ impl Firehose {
                     continue;
                 }
                 out.sort_unstable_by_key(|(s, _)| *s);
-                // Diagnostic: an event at or below what we already emitted
-                // arrived after the min watermark passed it (a log we weren't
-                // following yet, or a watermark that overpromised). Live
-                // subscribers skip it (seq <= their last), so it is lost to them
-                // and the merged order differs from other nodes'.
-                let prev = fh.last_emitted.load(Ordering::Acquire);
-                let late = out.iter().take_while(|(s, _)| *s <= prev).count();
-                if late > 0 {
-                    tracing::warn!(late, first_late = out[0].0, last_emitted = prev, "firehose merger: late events below the emitted watermark");
-                }
                 let bytes = out.iter().map(|(_, b)| b.len()).sum();
                 let batch = Arc::new(MergedBatch {
                     first: out[0].0,
@@ -168,9 +214,6 @@ impl Firehose {
             let mut ring = self.ring.write();
             self.ring_bytes
                 .fetch_add(batch.bytes as i64, Ordering::Relaxed);
-            if ring.is_empty() && self.ring_floor.load(Ordering::Acquire) == i64::MAX {
-                self.ring_floor.store(batch.first - 1, Ordering::Release);
-            }
             ring.push_back(batch.clone());
             while self.ring_bytes.load(Ordering::Relaxed) > self.max_ring_bytes && ring.len() > 1 {
                 let old = ring.pop_front().unwrap();
@@ -189,10 +232,7 @@ impl Firehose {
     fn from_ring(&self, after: i64) -> (Vec<Arc<MergedBatch>>, bool) {
         let ring = self.ring.read();
         // seqs are gappy: completeness is about what was evicted, not adjacency.
-        // An empty ring that never held anything is complete (backfill covers
-        // anything older from S3).
-        let floor = self.ring_floor.load(Ordering::Acquire);
-        let complete = floor == i64::MAX || after >= floor;
+        let complete = after >= self.ring_floor.load(Ordering::Acquire);
         let out = ring.iter().filter(|b| b.last > after).cloned().collect();
         (out, complete)
     }
@@ -227,14 +267,17 @@ impl Firehose {
             let store = self.store.read().clone();
             if let Some(store) = store {
                 loop {
-                    // backfill up to the ring floor, or (empty ring) up to what
-                    // the live stream has already emitted
-                    let floor = match self.ring_floor.load(Ordering::Acquire) {
-                        i64::MAX => self.last_emitted.load(Ordering::Acquire),
-                        f => f,
-                    };
+                    // backfill up to the ring floor, once every log is durable
+                    // up to it (right after startup the start floor can be
+                    // ahead of a peer's watermark: its events <= F may not be
+                    // in S3 yet)
+                    let floor = self.ring_floor.load(Ordering::Acquire);
                     if last >= floor {
                         break;
+                    }
+                    if self.settled.load(Ordering::Acquire) < floor {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        continue;
                     }
                     let (tx, mut brx) = mpsc::channel(4096);
                     let (st, from) = (store.clone(), last);

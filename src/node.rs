@@ -3,7 +3,7 @@
 //! remote.rs).
 
 use crate::cluster::{Cluster, ShardHost};
-use crate::firehose::{Firehose, Source};
+use crate::firehose::Firehose;
 use crate::nodelog::{self, LogBatch, LogEntry, NodeLog, ShardSink, Span};
 use crate::partition::{self, Partition};
 use crate::partitions::PartitionTable;
@@ -72,8 +72,7 @@ impl Node {
             let cluster = self.cluster.clone();
             let log_id = p.log_id.clone();
             let addr = Arc::new(move || cluster.peers().into_iter().find(|l| l.log_id == log_id).map(|l| l.addr));
-            let fl = remote::follow_log(&p.log_id, self.store.clone(), addr, self.internal_token.clone(), self.merger_tx.clone());
-            self.firehose.set_source(&p.log_id, Some(Source::Remote(fl.watermark.clone())));
+            let fl = remote::follow_log(&p.log_id, &self.firehose, self.store.clone(), addr, self.internal_token.clone(), self.merger_tx.clone());
             tracing::info!(log_id = %p.log_id, node = %p.node_id, "following peer log");
             f.insert(p.log_id.clone(), fl);
         }
@@ -162,17 +161,6 @@ impl ShardHost for Node {
             .buffer_unordered(32)
             .collect()
             .await;
-        // HA fix: never serve a shard on top of repo state cached during an
-        // earlier ownership. A repo load that was in flight when close() purged
-        // the workers lands in the cache afterwards, still bound to the closed
-        // shard. Writes built on it are rejected (nodelog), but its in-memory
-        // head keeps advancing. When this node took the shard back, the next
-        // durable commit chained on those never-logged commits: a firehose
-        // chain break, and a head whose MST no longer matched its stored
-        // records ("rebuilt MST root != head data"), so the repo could not be
-        // loaded at all (bench/ha zombie-short).
-        let ok_shards: Vec<u16> = flushed.iter().filter(|f| f.3.is_ok()).map(|f| f.0).collect();
-        self.purge_worker_caches(&ok_shards).await;
         for (shard, epoch, db, r) in flushed {
             if let Err(e) = r {
                 results.push((shard, Err(e)));
@@ -205,7 +193,9 @@ impl ShardHost for Node {
         let started = Instant::now();
         // 1. stop routing new work here
         self.table.set(shard, None);
-        // 2. no worker may keep (or start) building commits for it
+        // 2. no worker may keep (or start) building commits for it. Loads still
+        //    in flight are dropped when they land: the worker caches a load only
+        //    while its Partition is still the routed one (bench/ha N6)
         self.purge_worker_caches(&[shard]).await;
         // 3. barrier: once an empty entry for this shard is durable, every
         //    earlier entry for it is durable and applied (the log is FIFO)
@@ -235,9 +225,6 @@ impl ShardHost for Node {
         }
         part.db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await?;
         self.log.sinks.remove(shard);
-        // HA fix: purge again; loads that completed during the drain re-cached
-        // repos of this shard (see open_many)
-        self.purge_worker_caches(&[shard]).await;
         part.db.close().await?;
         crate::metrics::OWNED_PARTITIONS.set(self.table.owned().len() as i64);
         crate::metrics::LEASE_EVENTS.with_label_values(&["closed"]).inc();

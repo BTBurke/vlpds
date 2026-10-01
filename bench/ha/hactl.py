@@ -829,6 +829,7 @@ def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_fina
     lgs = [Loadgen(nd, accounts_file, ctx.outdir, duration, rate=rate) for nd in live]
     fault_at = None
     extra = []
+    start_audits = []  # live audits attached the moment a node (re)started
     for at, fn in sorted(actions, key=lambda a: a[0]):
         dt = ctx.t0 + at - time.time()
         if dt > 0:
@@ -840,6 +841,8 @@ def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_fina
             lgs.append(r)
         if isinstance(r, Checker):
             extra.append(r)
+        if isinstance(r, FhAudit):
+            start_audits.append(r)
     for lg in lgs:
         lg.wait(duration + 120)
     load_end = time.time()
@@ -880,15 +883,27 @@ def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_fina
         replay_raw = {}
         for a in reps:
             data = a.stop()
-            if not a.node.exit_codes() and a.node.started_at < ctx.t0:
-                replay_raw[a.node.id] = data
+            # every survivor is judged, including nodes (re)started or joined
+            # mid-run: older cursors backfill from S3, and the merged stream
+            # has no seam at a node's start (O1)
+            replay_raw[a.node.id] = data
             rep = audit_report(data, acked, a.node.id)
-            # a node (re)started mid-run only has events from its join onwards
-            # in memory (no S3 backfill for cursors yet): informational only
-            # (also: a node that joined mid-run has no history from before its join)
             rep["node_stayed_up"] = not a.node.exit_codes() and a.node.started_at < ctx.t0
             res["fh_replay"].append(rep)
         res["fh_replay_diff"] = history_diff(replay_raw)
+        # a live subscriber attached at a node's (re)start must see exactly the
+        # merged history from its first event on (compare with a survivor's replay)
+        res["fh_start"] = []
+        ref = next((k for k, v in replay_raw.items() if v), None)
+        for a in start_audits:
+            data = a.stop()
+            r = audit_report(data, {}, a.node.id)
+            if ref and data:
+                d = history_diff({ref: replay_raw[ref], f"{a.node.id}-start": data}, common_range=True)
+                r["agree"], r["diff"] = d["agree"], d.get("pairs")
+            else:
+                r["agree"] = False
+            res["fh_start"].append(r)
     res["fh_live_diff"] = history_diff(live_raw, common_range=True)
     res["probe"] = prober.analyze(fault_at or ctx.t0 + 1e9, t0=ctx.t0)
     res["loadgens"] = []
@@ -922,10 +937,11 @@ def judge(res, allow_lost=0):
         if a.get("node_stayed_up"):
             ok = ok and a.get("fh_missing") == 0 and not a.get("reorders")
     for a in res.get("fh_replay", []):
-        if a.get("node_stayed_up"):
-            ok = ok and a.get("fh_missing") == 0 and not a.get("reorders")
-    if len({(a.get("commits"), a.get("last_seq")) for a in res.get("fh_replay", []) if a.get("node_stayed_up")}) > 1:
+        ok = ok and a.get("fh_missing") == 0 and not a.get("reorders") and not a.get("dups") and not a.get("infos")
+    if len({(a.get("commits"), a.get("last_seq")) for a in res.get("fh_replay", [])}) > 1:
         ok = False  # nodes disagree on the merged history
+    for a in res.get("fh_start", []):
+        ok = ok and a.get("agree") and not a.get("reorders") and not a.get("dups")
     for k in ("fh_replay_diff", "fh_live_diff"):
         if res.get(k) and not res[k].get("agree", True):
             ok = False
@@ -1016,6 +1032,17 @@ def checker_with_cursor(on_idx, back_s=15):
     return f
 
 
+def audit_from_start(idx):
+    """Attaches a cursorless live audit to a node the moment it answers
+    (run right after its start/restart action)."""
+    def f(ctx):
+        n = ctx.nodes[idx]
+        wait_ready([n])
+        ctx.mark(f"live audit attached to {n.id} at start")
+        return FhAudit(n, ctx.outdir, tag="-start")
+    return f
+
+
 def snapshot_ownership(label):
     def f(ctx):
         ctx.mark(f"{label}: {json.dumps(ownership(ctx.nodes))}")
@@ -1054,7 +1081,9 @@ def s_kill1(ctx):
 
 @scenario("kill9-2of5", "kill -9 two of 5 nodes at once under load, restart both 25 s later")
 def s_kill2(ctx):
-    return run_load_scenario(ctx, 5, 60, [(15, kill(2)), (15.01, kill(3)), (40, restart(2)), (40.01, restart(3))], per_node=20)
+    return run_load_scenario(ctx, 5, 60, [(15, kill(2)), (15.01, kill(3)), (40, restart(2)), (40.01, restart(3)),
+                                          (40.02, audit_from_start(2)), (40.03, audit_from_start(3)),
+                                          (46, checker_with_cursor(2, back_s=10))], per_node=20)
 
 
 @scenario("sigterm", "SIGTERM one of 3 nodes under load (graceful handoff), restart it later")
@@ -1065,8 +1094,8 @@ def s_term(ctx):
 @scenario("rolling-restart", "graceful rolling restart of all 3 nodes, one every 12 s")
 def s_roll(ctx):
     # checker lives on n1, restarted last; a second checker resumes on n2 by cursor
-    acts = [(10, graceful_restart(1)), (22, graceful_restart(2)), (34, graceful_restart(0)),
-            (33, checker_with_cursor(1, back_s=25))]
+    acts = [(10, graceful_restart(1)), (10.01, audit_from_start(1)), (22, graceful_restart(2)), (22.01, audit_from_start(2)),
+            (34, graceful_restart(0)), (34.01, audit_from_start(0)), (33, checker_with_cursor(1, back_s=25))]
     return run_load_scenario(ctx, 3, 50, acts)
 
 
@@ -1239,7 +1268,9 @@ def s_zombie_check(ctx):
 
 @scenario("grow-1-to-3", "fresh prefix: n1 starts alone (its inline first step takes every shard), n2/n3 join under load; nobody may exit")
 def s_grow(ctx):
-    res = run_load_scenario(ctx, 3, 40, [(8, start_node(1)), (16, start_node(2))], start_nodes=1, expect_final=3)
+    res = run_load_scenario(ctx, 3, 40, [(8, start_node(1)), (8.01, audit_from_start(1)), (16, start_node(2)),
+                                         (16.01, audit_from_start(2)), (22, checker_with_cursor(2, back_s=10))],
+                            start_nodes=1, expect_final=3)
     res["expect_exit"] = {}
     if any(res["exit_codes"].values()):
         res["unexpected_exits"] = res["exit_codes"]
@@ -1383,9 +1414,11 @@ def summarize(r):
     dist_s = " ".join(f"{k}:{v if isinstance(v, (int, bool)) else len(v)}" for k, v in sorted(dist.items()))
     fl = [f"{a['node']}:{a.get('fh_missing')}" for a in r.get("fh_live", []) if a.get("node_stayed_up")]
     fr = [f"{a['node']}:{a.get('fh_missing')}{'' if a.get('node_stayed_up') else '(rejoined)'}" for a in r.get("fh_replay", [])]
+    fs = [f"{a['node']}:{'ok' if a.get('agree') else 'GAP'}" for a in r.get("fh_start", [])]
+    xc = [f"{c.get('node')}:{c.get('result')}" for c in r.get("extra_checkers", [])]
     errs_by = {lg["node"]: lg.get("errors", 0) for lg in r.get("loadgens", [])}
     return (f"| {r['scenario']} | {r['verdict']} | acked {v.get('acked')} lost {v.get('missing')} | checker {ck.get('result')} "
-            f"| fh-missing live {' '.join(fl)} replay {' '.join(fr)} | windows {pr.get('windows')} | errs {errs_by} "
+            f"| fh-missing live {' '.join(fl)} replay {' '.join(fr)} start-audits {' '.join(fs) or '-'} cursor-checkers {' '.join(xc) or '-'} | windows {pr.get('windows')} | errs {errs_by} "
             f"({ck.get('commits')} commits, fails {ck.get('failures')}) | unavail {pr.get('unavail_s')}s recov {pr.get('recovery_s')}s "
             f"(max partition {pr.get('max_partition_outage_s')}s) | loadgen errs {errs} | final {dist_s} | exits {r.get('exit_codes')} "
             f"| history agree replay={(r.get('fh_replay_diff') or {}).get('agree')} live={(r.get('fh_live_diff') or {}).get('agree')} |")

@@ -199,8 +199,74 @@ pub fn html_escape(s: &str) -> String {
     out
 }
 
+/// A single-use value (DPoP proof / client assertion / request object
+/// `jti`) to claim until `until` (unix secs). The claim is made at the owner
+/// of `routing`'s partition (`xrpc::internal::claim_replay_anywhere`), so
+/// every node checks a given key against the same set (HA notes in mod.rs).
+#[derive(Clone, Debug)]
+pub struct Replay {
+    pub routing: String,
+    pub key: String,
+    pub until: i64,
+}
+
+/// Routing key of a client's single-use values (assertion / JAR `jti`s).
+pub fn client_routing(client_id: &str) -> String {
+    format!("oauth:client:{}", sha256_b64u(client_id))
+}
+
+/// Routing key of a DPoP key's proofs at the authorization server.
+pub fn jkt_routing(jkt: &str) -> String {
+    format!("oauth:jkt:{jkt}")
+}
+
+/// Per-node OAuth state: the replay set of the routing keys this node owns
+/// and the locks for single-use read-modify-writes. Per `App` (not per
+/// process), so in-process test clusters behave like separate machines.
+pub(crate) struct NodeState {
+    replays: ReplayCache,
+    pub(crate) locks: Vec<std::sync::Arc<tokio::sync::Mutex<()>>>,
+}
+
+static NODES: parking_lot::RwLock<Vec<(usize, std::sync::Arc<NodeState>)>> =
+    parking_lot::RwLock::new(Vec::new());
+
+pub(crate) fn node_state(app: &crate::xrpc::App) -> std::sync::Arc<NodeState> {
+    let id = app as *const crate::xrpc::App as usize;
+    if let Some((_, n)) = NODES.read().iter().find(|(k, _)| *k == id) {
+        return n.clone();
+    }
+    let mut w = NODES.write();
+    if let Some((_, n)) = w.iter().find(|(k, _)| *k == id) {
+        return n.clone();
+    }
+    let n = std::sync::Arc::new(NodeState {
+        replays: ReplayCache::new(2_000_000),
+        locks: (0..256).map(|_| std::sync::Arc::new(tokio::sync::Mutex::new(()))).collect(),
+    });
+    w.push((id, n.clone()));
+    n
+}
+
+/// Claims `key` in this node's replay set (we own its routing key's
+/// partition). False = already claimed (a replay).
+pub fn claim_replay_local(app: &crate::xrpc::App, key: &str, until: i64) -> bool {
+    node_state(app).replays.insert_unique(key, until)
+}
+
+/// Releases a claim made with [`claim_replay_local`] (a guard whose durable
+/// record is now written).
+pub fn release_replay_local(app: &crate::xrpc::App, key: &str) {
+    node_state(app).replays.inner.lock().0.remove(key);
+}
+
+/// Drops expired replay keys (OAuth GC task). Returns how many were removed.
+pub fn sweep_replays(app: &crate::xrpc::App) -> usize {
+    node_state(app).replays.sweep()
+}
+
 /// Simple TTL set used for replay detection (DPoP proof `jti`s, client
-/// assertion `jti`s). Process-local: see the HA note in `oauth/mod.rs`.
+/// assertion `jti`s): [`claim_replay_local`].
 pub struct ReplayCache {
     inner: parking_lot::Mutex<(std::collections::HashMap<String, i64>, i64)>,
     max: usize,

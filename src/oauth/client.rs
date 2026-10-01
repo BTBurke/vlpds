@@ -4,7 +4,7 @@
 //! confidential-client authentication (`private_key_jwt`, RFC 7523).
 
 use super::jose::{jwk_thumbprint, jwk_to_key, DecodedJwt};
-use super::util::{now_secs, parse_form, ReplayCache};
+use super::util::{client_routing, now_secs, parse_form, Replay};
 use super::OAuthError;
 use serde_json::{json, Value as J};
 use std::collections::HashMap;
@@ -106,12 +106,13 @@ impl Client {
 
     /// Validates a client assertion (RFC 7523 §3) and returns the binding
     /// to store with the session. `issuer` is our issuer identifier (the
-    /// required `aud`).
+    /// required `aud`). An assertion's `jti` comes back as a [`Replay`] the
+    /// caller must claim (single use for the assertion's validity period).
     pub fn authenticate(
         &self,
         creds: &ClientCredentials,
         issuer: &str,
-    ) -> Result<ClientAuth, OAuthError> {
+    ) -> Result<(ClientAuth, Option<Replay>), OAuthError> {
         if creds.client_id != self.id {
             return Err(OAuthError::invalid_client("client_id mismatch"));
         }
@@ -122,7 +123,7 @@ impl Client {
                         "client authentication not expected for public clients",
                     ));
                 }
-                Ok(ClientAuth::None)
+                Ok((ClientAuth::None, None))
             }
             "private_key_jwt" => {
                 let Some(assertion) = &creds.client_assertion else {
@@ -221,15 +222,20 @@ impl Client {
                     .unwrap_or(iat + CLIENT_ASSERTION_MAX_AGE)
                     .max(iat + CLIENT_ASSERTION_MAX_AGE)
                     + 10;
-                if !ASSERTION_JTIS.insert_unique(&format!("{}\0{jti}", self.id), until) {
-                    return Err(OAuthError::invalid_client("client assertion replayed"));
-                }
+                let replay = Replay {
+                    routing: client_routing(&self.id),
+                    key: format!("assert:{}\0{jti}", self.id),
+                    until,
+                };
                 let jkt = jwk_thumbprint(jwk).map_err(|e| fail(&e))?;
-                Ok(ClientAuth::PrivateKeyJwt {
-                    alg,
-                    kid: kid.to_string(),
-                    jkt,
-                })
+                Ok((
+                    ClientAuth::PrivateKeyJwt {
+                        alg,
+                        kid: kid.to_string(),
+                        jkt,
+                    },
+                    Some(replay),
+                ))
             }
             m => Err(OAuthError::invalid_client(&format!(
                 "Unsupported token_endpoint_auth_method \"{m}\""
@@ -251,16 +257,6 @@ impl Client {
     }
 }
 
-static ASSERTION_JTIS: LazyLock<ReplayCache> = LazyLock::new(|| ReplayCache::new(1_000_000));
-/// Request object `jti`s (per client). Process-local, like the assertion
-/// cache (see the HA note in mod.rs).
-static JAR_JTIS: LazyLock<ReplayCache> = LazyLock::new(|| ReplayCache::new(1_000_000));
-
-/// Drops expired client-assertion and request-object `jti`s (OAuth GC task).
-pub fn sweep_replay_caches() -> usize {
-    ASSERTION_JTIS.sweep() + JAR_JTIS.sweep()
-}
-
 impl Client {
     /// Verifies a JWT-secured authorization request (RFC 9101 request
     /// object, `Client.decodeRequestObject` + `decodeJAR` in the reference)
@@ -271,8 +267,8 @@ impl Client {
     /// only when the client registered `request_object_signing_alg: "none"`,
     /// in which case `iss` / `aud` are optional but checked when present.
     /// `iat` is required and must be under [`JAR_MAX_AGE`]; `jti` is required
-    /// and single-use.
-    pub fn decode_request_object(&self, jar: &str, issuer: &str) -> Result<J, OAuthError> {
+    /// and single-use: it comes back as a [`Replay`] for the caller to claim.
+    pub fn decode_request_object(&self, jar: &str, issuer: &str) -> Result<(J, Replay), OAuthError> {
         let fail =
             |m: &str| OAuthError::invalid_request(&format!("Invalid \"request\" object: {m}"));
         let jwt = DecodedJwt::decode(jar).map_err(|e| fail(&e))?;
@@ -362,10 +358,12 @@ impl Client {
                 OAuthError::invalid_request("Request object payload must contain a \"jti\" claim")
             })?;
         let until = iat.max(now) + JAR_MAX_AGE + CLOCK_TOLERANCE;
-        if !JAR_JTIS.insert_unique(&format!("{}\0{jti}", self.id), until) {
-            return Err(OAuthError::invalid_request("Request object was replayed"));
-        }
-        Ok(jwt.payload)
+        let replay = Replay {
+            routing: client_routing(&self.id),
+            key: format!("jar:{}\0{jti}", self.id),
+            until,
+        };
+        Ok((jwt.payload, replay))
     }
 }
 

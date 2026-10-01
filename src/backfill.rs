@@ -47,10 +47,18 @@ pub async fn list_logs(store: &Store) -> anyhow::Result<Vec<String>> {
 /// First ordinal of `log_id` whose segment has events with seq > `after`
 /// (None if the log has nothing past it).
 async fn first_ordinal_after(store: &Store, log_id: &str, after: i64) -> anyhow::Result<Option<u64>> {
+    let o = seek(store, log_id, after).await?;
+    Ok(seg_header(store, log_id, o).await?.map(|_| o))
+}
+
+/// First ordinal of `log_id` that is missing (not written yet, or the fence)
+/// or whose segment has events with seq > `after`. Segments appear in ordinal
+/// order and their seqs increase, so everything before it is <= `after`.
+pub async fn seek(store: &Store, log_id: &str, after: i64) -> anyhow::Result<u64> {
     // exponential probe for an upper bound (first missing ordinal or a segment past `after`)
-    let Some((_, last0)) = seg_header(store, log_id, 0).await? else { return Ok(None) };
-    if last0 > after {
-        return Ok(Some(0));
+    match seg_header(store, log_id, 0).await? {
+        Some((_, last0)) if last0 <= after => {}
+        _ => return Ok(0),
     }
     let (mut lo, mut hi) = (0u64, 1u64); // invariant: seg(lo).last <= after
     loop {
@@ -70,10 +78,7 @@ async fn first_ordinal_after(store: &Store, log_id: &str, after: i64) -> anyhow:
             _ => hi = mid,
         }
     }
-    Ok(match seg_header(store, log_id, hi).await? {
-        Some(_) => Some(hi),
-        None => None,
-    })
+    Ok(hi)
 }
 
 struct LogCursor {

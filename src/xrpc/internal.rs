@@ -14,6 +14,9 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/internal/v1/log/stream", get(stream))
         .route("/internal/v1/private/put", post(put_private))
         .route("/internal/v1/private/get", get(get_private))
+        .route("/internal/v1/private/scan", get(scan_private))
+        .route("/internal/v1/account", get(get_account))
+        .route("/internal/v1/oauth/replay", post(claim_replay))
         .route("/internal/v1/cluster", get(cluster_status))
         .route("/internal/v1/admin/searchAccounts", get(admin_search_accounts))
         .route("/internal/v1/admin/inviteCodes", get(admin_invite_codes))
@@ -96,7 +99,13 @@ async fn put_private(State(app): AppState, headers: HeaderMap, axum::Json(inp): 
         .collect::<XResult<Vec<_>>>()?;
     // must be local now (no forwarding loops)
     app.partition(&inp.routing)?;
+    let sec = state::private_key(&inp.routing, super::server::SEC);
+    let touches_sec = muts.iter().any(|m| m.key.starts_with(&sec));
     app.put_private(&inp.routing, muts).await?;
+    if touches_sec {
+        // a revocation/takedown written from another node: drop our view
+        super::server::ctl_changed(&app, &inp.routing);
+    }
     Ok(Json(json!({})))
 }
 
@@ -112,6 +121,157 @@ async fn get_private(State(app): AppState, headers: HeaderMap, Query(q): Query<G
     let v = app.get_private(&q.routing, &q.name).await?;
     Ok(Json(json!({"value": v.map(|b| B64.encode(b))})))
 }
+
+#[derive(Deserialize)]
+struct ScanQ {
+    routing: String,
+    prefix: String,
+}
+
+/// Private entries of a local routing key by name prefix (bounded: callers
+/// scan small per-account sets such as `sec/` or `oauth/ses/`).
+async fn scan_private(State(app): AppState, headers: HeaderMap, Query(q): Query<ScanQ>) -> XResult<Json<J>> {
+    check(&app, &headers)?;
+    app.partition(&q.routing)?;
+    let rows = super::server::scan_private(&app, &q.routing, &q.prefix).await?;
+    let rows: Vec<(String, String)> = rows.into_iter().map(|(n, v)| (n, B64.encode(v))).collect();
+    Ok(Json(json!({"rows": rows})))
+}
+
+#[derive(Deserialize)]
+struct AccountQ {
+    did: String,
+}
+
+async fn get_account(State(app): AppState, headers: HeaderMap, Query(q): Query<AccountQ>) -> XResult<Json<J>> {
+    check(&app, &headers)?;
+    app.partition(&q.did)?;
+    let a = app.account(&q.did).await?;
+    Ok(Json(serde_json::to_value(a).map_err(XrpcError::from_err)?))
+}
+
+#[derive(serde::Serialize, Deserialize)]
+struct ReplayIn {
+    routing: String,
+    key: String,
+    until: i64,
+    /// release an earlier claim instead
+    #[serde(default)]
+    release: bool,
+}
+
+/// Single-use check-and-set of an OAuth replay key (DPoP proof / client
+/// assertion / request object jti) at the owner of its routing key.
+async fn claim_replay(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<ReplayIn>) -> XResult<Json<J>> {
+    check(&app, &headers)?;
+    app.partition(&inp.routing)?;
+    if inp.release {
+        crate::oauth::util::release_replay_local(&app, &inp.key);
+        return Ok(Json(json!({})));
+    }
+    let fresh = crate::oauth::util::claim_replay_local(&app, &inp.key, inp.until);
+    Ok(Json(json!({"fresh": fresh})))
+}
+
+/// [`super::server::scan_private`] of `routing` wherever its partition is
+/// owned (here, or one internal call to the owner).
+pub async fn scan_private_anywhere(app: &App, routing: &str, prefix: &str) -> XResult<Vec<(String, Bytes)>> {
+    let Some(owner) = app.remote_owner(routing) else {
+        return super::server::scan_private(app, routing, prefix).await;
+    };
+    let r = app
+        .http
+        .get(format!("{owner}/internal/v1/private/scan"))
+        .header(HDR, &app.config.internal_token)
+        .timeout(OWNER_CALL_TIMEOUT)
+        .query(&[("routing", routing), ("prefix", prefix)])
+        .send()
+        .await
+        .map_err(upstream)?;
+    if !r.status().is_success() {
+        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
+    }
+    #[derive(Deserialize)]
+    struct Rows {
+        rows: Vec<(String, String)>,
+    }
+    let rows: Rows = r.json().await.map_err(upstream)?;
+    rows.rows
+        .into_iter()
+        .map(|(n, v)| Ok((n, Bytes::from(B64.decode(v).map_err(upstream)?))))
+        .collect()
+}
+
+/// The account record of `did` wherever its partition is owned.
+pub async fn account_anywhere(app: &App, did: &str) -> XResult<Account> {
+    let Some(owner) = app.remote_owner(did) else {
+        return app.account(did).await;
+    };
+    let r = app
+        .http
+        .get(format!("{owner}/internal/v1/account"))
+        .header(HDR, &app.config.internal_token)
+        .timeout(OWNER_CALL_TIMEOUT)
+        .query(&[("did", did)])
+        .send()
+        .await
+        .map_err(upstream)?;
+    if r.status().is_client_error() {
+        // the owner's own error (AccountNotFound, ...)
+        let status = r.status();
+        let v: J = r.json().await.unwrap_or_default();
+        return Err(XrpcError {
+            status,
+            error: v["error"].as_str().unwrap_or("InvalidRequest").into(),
+            message: v["message"].as_str().unwrap_or_default().into(),
+        });
+    }
+    if !r.status().is_success() {
+        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
+    }
+    r.json().await.map_err(upstream)
+}
+
+/// Single-use claim of an OAuth replay `key` until `until` (unix secs), made
+/// at the owner of `routing` so every node agrees. Ok(false) = replayed.
+pub async fn claim_replay_anywhere(app: &App, routing: &str, key: &str, until: i64) -> XResult<bool> {
+    replay_call(app, routing, key, until, false).await
+}
+
+/// Releases a claim made with [`claim_replay_anywhere`].
+pub async fn release_replay_anywhere(app: &App, routing: &str, key: &str) -> XResult<()> {
+    replay_call(app, routing, key, 0, true).await.map(|_| ())
+}
+
+async fn replay_call(app: &App, routing: &str, key: &str, until: i64, release: bool) -> XResult<bool> {
+    let Some(owner) = app.remote_owner(routing) else {
+        app.partition(routing)?;
+        if release {
+            crate::oauth::util::release_replay_local(app, key);
+            return Ok(true);
+        }
+        return Ok(crate::oauth::util::claim_replay_local(app, key, until));
+    };
+    let body = ReplayIn { routing: routing.into(), key: key.into(), until, release };
+    let r = app
+        .http
+        .post(format!("{owner}/internal/v1/oauth/replay"))
+        .header(HDR, &app.config.internal_token)
+        .timeout(OWNER_CALL_TIMEOUT)
+        .json(&body)
+        .send()
+        .await
+        .map_err(upstream)?;
+    if !r.status().is_success() {
+        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
+    }
+    let v: J = r.json().await.map_err(upstream)?;
+    Ok(v["fresh"].as_bool().unwrap_or(false))
+}
+
+/// Deadline for the small owner lookups below (auth checks wait on them):
+/// a frozen owner fails the request fast instead of holding it.
+const OWNER_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn upstream(e: impl std::fmt::Display) -> XrpcError {
     XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: "PartitionUnavailable".into(), message: format!("partition owner: {e}") }

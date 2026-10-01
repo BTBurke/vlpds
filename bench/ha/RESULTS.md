@@ -54,7 +54,7 @@ The default node template is:
 - **`--shards` and `--no-rate-limits`** replace the old flags.
 - **Probe sampling:** probe shards are sampled across all nodes. Before, they were the first N in account order, which meant only n1 and n2's shards.
 - **Outage metric:** the per-shard outage is now the longest *contiguous* window. It no longer spans from a kill to the rebalance blip at a later restart.
-- **Late joiners:** a node that joined mid-run is not judged on cursor-replay completeness.
+- **Late joiners:** a node that joined mid-run was not judged on cursor-replay completeness. Since the O1 fix every survivor is judged.
 - **Replay window:** the replay window is 30 s when a rejoined node backfills from S3, versus 8 s otherwise.
 - **New checks:**
   - **History diff:** a cross-node comparison of merged history, over (seq, did, rev) sequences. It covers both the cursor replays and the live audits over their common range.
@@ -217,8 +217,8 @@ In both skew-large runs, n3 (clock −2.5 s) wrote leases that looked expired to
 - **B5 – merged history differs between nodes: gone.** Every node that stayed up agrees on identical (seq, did, rev) sequences in every scenario.
 - **B6 – 500 instead of 503 for an unowned shard: fixed by design.** Moving or unowned shards return 503 `PartitionUnavailable`.
 - **B7 – firehose history starts at join: mostly fixed by another agent's S3 cursor backfill**, which landed during this work.
-  - Rejoined nodes' cursor replays are now usually complete.
-  - There is one seam at a node's start (O1).
+  - Rejoined nodes' cursor replays are now complete.
+  - The seam at a node's start (O1) is fixed (`o1fix`, below).
 - **B8 – forwards to an unreachable owner hang: partly fixed.**
   - The 1 s connect timeout fails fast when the peer is gone.
   - A peer whose TCP endpoint accepts but stalls (frozen process, blackholed path, disconnected container) still holds forwarded requests up to the 15 s total timeout (O2).
@@ -311,7 +311,7 @@ In both skew-large runs, n3 (clock −2.5 s) wrote leases that looked expired to
 
 ## Open issues
 
-**O1 – Firehose seam on a node that just (re)started.** Severity: medium. Files: `remote.rs`, `firehose.rs`. Reported to the lead; queued for a fix agent.
+**O1 – Firehose seam on a node that just (re)started.** Severity: medium. Files: `remote.rs`, `firehose.rs`. **Fixed** (see "O1 fix and re-run" below).
 
 - **Cause:**
   - A first-time follower skips every peer batch broadcast before its subscription, but the ring floor is set from the first merged batch.
@@ -323,6 +323,26 @@ In both skew-large runs, n3 (clock −2.5 s) wrote leases that looked expired to
   - `final2-ctr/ctr-skew-small`: 74 missing on the rejoined n2.
   - Nodes that stayed up are unaffected, and so is every acked write.
 - **Suggested fix:** use max over the initial followers of their first heartbeat watermark as the start floor. Drop events at or below it, and let the S3 backfill serve them.
+
+### O1 fix and re-run (`o1fix`)
+
+- **Root cause, confirmed.** Two holes, both in `remote.rs`:
+  - A first-time follower (no known ordinal) skipped everything its peer broadcast before the subscription, while the ring floor came from the first merged batch. A peer subscribed later lost its events in between: in neither the ring nor the backfill (<= floor). The new in-process test reproduces it every run on the old code (thousands of events missing on a joining node).
+  - The S3 catch-up on reconnect started right after the websocket handshake, but the owner subscribes only after the upgrade. A batch PUT in between was in neither, and the first heartbeat already covered it. That is also why the suggested max(w0) floor alone would not do: the finalizer broadcasts a batch before it advances the watermark, so w0 can trail a batch the subscription missed.
+- **Fix:**
+  - The merged stream starts at a floor F, the clock at startup. The ring floor starts at F, and cursors <= F backfill from S3 once the merger's min watermark has passed F (so every log's events <= F are in S3).
+  - Every follower owes every event of its log above its floor: F for the followers registered by the first step (the merger starts only after it), or the merger's position when a later log is followed (`Firehose::add_remote`, taken under the sources lock). Its first ordinal is the first segment in S3 past that floor (`backfill::seek`).
+  - On every (re)connect, the follower waits for the owner's first message, so it knows it is subscribed, then catches up from S3 and dedupes by ordinal. A dead log is drained to its fence even if it was never streamed.
+  - The merger drops events at or below its position. Events <= F are expected; any above it are logged as late.
+- **Harness:** every survivor's cursor replay is now judged, including rejoined and late-joined nodes, and all must agree. New `audit_from_start` attaches a live audit the moment a node (re)starts. It must match a stayed-up node's replay over its range, with no gaps. kill9-2of5 and grow-1-to-3 also run a cursor checker on the (re)started node.
+
+| Scenario | Verdict | Acked / lost | Checker / cursor checker | Replay missing (all survivors) | Live audit from (re)start | History agree |
+|---|---|---|---|---|---|---|
+| kill9-2of5 | PASS | 55453 / **0** | PASS / n3 PASS | all 0 (55270 commits on every node, n3 and n4 rejoined) | n3, n4: identical to n1 (23.9k commits each) | yes / yes |
+| rolling-restart | PASS | 37767 / **0** | PASS / n2 PASS | all 0 (37738 on every node, all rejoined) | n2, n3, n1: identical to n1 (31.0k / 22.2k / 13.7k) | yes / yes |
+| grow-1-to-3 | PASS | 15037 / **0** | PASS / n3 PASS | all 0 (15035 on every node, n2 and n3 joined mid-run) | n2, n3: identical to n1 (12.4k / 9.7k) | yes / yes |
+
+No merger late-event warnings and no follower stream gaps in any node log. Tests: `tests/all/firehose_startup.rs` (4 nodes join one by one under load; each node's cursor-0 subscriber attached at its start, live subscriber attached at its start, and post-hoc cursor-0 replay must equal the union of all logs in S3).
 
 **O2 – Forwarded requests hang for up to 15 s on an owner that accepts TCP but doesn't respond** (the rest of B8). Severity: medium (availability). Files: `forward.rs` and the client in `server.rs`.
 

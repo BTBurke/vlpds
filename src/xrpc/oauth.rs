@@ -103,6 +103,104 @@ pub fn routes() -> Router<Arc<App>> {
 
 // ---------- CORS / common headers ----------
 
+// ---------- HA routing ----------
+
+/// Login identifier (handle, DID or email; `@` prefix and case ignored) ->
+/// DID. Global lookups (handle / email claims), so any node can resolve.
+pub async fn resolve_identifier(app: &App, ident: &str) -> Option<String> {
+    let ident = ident.trim().trim_start_matches('@').to_ascii_lowercase();
+    if ident.starts_with("did:") {
+        return Some(ident);
+    }
+    if ident.contains('@') {
+        return super::server::did_by_email(app, &ident).await.ok().flatten();
+    }
+    if !ident.contains('.') {
+        return None;
+    }
+    app.resolve_handle(&ident).await.ok().flatten()
+}
+
+/// The routing key an `/oauth/*` request is served by, for the forwarding
+/// layer (`crate::forward`); None = any node. See the HA notes in
+/// `crate::oauth`. `body` is the (form or JSON) request body.
+pub async fn route_key(
+    app: &App,
+    path: &str,
+    query: Option<&str>,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Option<String> {
+    let params = || parse_params(headers, body).ok().unwrap_or_default();
+    let request = |uri: Option<&String>| {
+        store::request_id_from_uri(uri?).map(store::req_routing)
+    };
+    match path {
+        // the account owner (so the whole flow tends to stay there: the
+        // request id is minted local to whichever node runs PAR)
+        "/oauth/par" => {
+            let hint = params().remove("login_hint")?;
+            resolve_identifier(app, &hint).await
+        }
+        "/oauth/authorize" => {
+            let q: HashMap<String, String> =
+                ou::parse_form(query.unwrap_or("")).into_iter().collect();
+            request(q.get("request_uri"))
+        }
+        "/oauth/authorize/select" | "/oauth/authorize/consent" => {
+            request(params().get("request_uri"))
+        }
+        // sign-in: the account's owner (its rate limits, 2FA lockout and
+        // account record are there); the code step names no account, so the
+        // device's pending one
+        "/oauth/authorize/sign-in" | "/oauth/account/sign-in" => {
+            let p = params();
+            let did = if p.get("step").map(String::as_str) == Some("totp") {
+                let id = cookie(headers, DEVICE_COOKIE).filter(|i| store::valid_device_id(i))?;
+                store::get_device(app, &id).await.ok()??.pending_2fa.map(|(did, _)| did)
+            } else {
+                match p.get("identifier") {
+                    Some(i) => resolve_identifier(app, i).await,
+                    None => None,
+                }
+            };
+            did.or_else(|| request(p.get("request_uri")))
+        }
+        "/oauth/account/revoke" => params().remove("did").filter(|d| d.starts_with("did:")),
+        // code -> its request row; refresh token -> its session's account
+        "/oauth/token" => {
+            let p = params();
+            match p.get("grant_type").map(String::as_str) {
+                Some("authorization_code") => {
+                    store::code_request_id(p.get("code")?).map(|id| store::req_routing(&id))
+                }
+                Some("refresh_token") => {
+                    store::parse_refresh_token(p.get("refresh_token")?).map(|r| r.did)
+                }
+                _ => None,
+            }
+        }
+        "/oauth/revoke" => {
+            let p = params();
+            let tok = p.get("token")?;
+            if let Some(r) = store::parse_refresh_token(tok) {
+                Some(r.did)
+            } else if let Some(id) = store::code_request_id(tok) {
+                Some(store::req_routing(&id))
+            } else {
+                // access token: its (unverified) sub; the owner verifies
+                let payload = ou::b64u_decode(tok.split('.').nth(1)?)?;
+                #[derive(Deserialize)]
+                struct Sub {
+                    sub: String,
+                }
+                serde_json::from_slice::<Sub>(&payload).ok().map(|s| s.sub)
+            }
+        }
+        _ => None,
+    }
+}
+
 fn cors(h: &mut HeaderMap) {
     h.insert(
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -276,17 +374,62 @@ fn dpop_header(headers: &HeaderMap) -> Result<Option<String>, String> {
     }
 }
 
-/// DPoP proof at the authorization server (PAR / token): required.
-fn check_as_dpop(app: &App, headers: &HeaderMap, path: &str) -> Result<DpopProof, OAuthError> {
+/// DPoP proof at the authorization server (PAR / token): required, and
+/// single use cluster-wide (claimed at the owner of the key's routing).
+async fn check_as_dpop(app: &App, headers: &HeaderMap, path: &str) -> Result<DpopProof, OAuthError> {
     let proof = dpop_header(headers)
         .map_err(|e| OAuthError::invalid_dpop_proof(&e))?
         .ok_or_else(|| OAuthError::invalid_dpop_proof("DPoP proof required"))?;
     let htu = jose::normalize_htu(&format!("{}{path}", issuer(app)))
         .ok_or_else(|| OAuthError::server_error("bad public_url"))?;
-    jose::check_proof(&proof, "POST", &htu, None, &keys(app).nonces).map_err(|e| match e {
+    let proof = jose::check_proof(&proof, "POST", &htu, None, &keys(app).nonces).map_err(|e| match e {
         DpopError::UseNonce(m) => OAuthError::use_dpop_nonce(&m),
         DpopError::Invalid(m) => OAuthError::invalid_dpop_proof(&m),
-    })
+    })?;
+    let replay = proof.replay(ou::jkt_routing(&proof.jkt));
+    claim(app, &replay, OAuthError::invalid_dpop_proof("DPoP proof replayed")).await?;
+    Ok(proof)
+}
+
+/// Claims a single-use value at the owner of its routing key (see the HA
+/// notes in `crate::oauth`). `replayed` is the error for a second use.
+async fn claim(app: &App, r: &ou::Replay, replayed: OAuthError) -> Result<(), OAuthError> {
+    match super::internal::claim_replay_anywhere(app, &r.routing, &r.key, r.until).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(replayed),
+        Err(e) => Err(unavailable(&e.message)),
+    }
+}
+
+fn unavailable(msg: &str) -> OAuthError {
+    OAuthError::new(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable", msg)
+}
+
+/// Single-use state (a request row's code, a session's refresh rotation) is
+/// read-modify-written only by the node owning its routing key, under a
+/// process-local lock there. Forwarding sends the request to that node; this
+/// refuses (retryably) if it isn't us, e.g. mid-handoff.
+fn require_owner(app: &App, routing: &str) -> Result<(), OAuthError> {
+    if app.remote_owner(routing).is_some() || app.partition(routing).is_err() {
+        return Err(unavailable("this grant's partition is moving; retry"));
+    }
+    Ok(())
+}
+
+/// Account record of `did`, from its owner if that is another node.
+async fn account_any(app: &App, did: &str) -> XResult<Account> {
+    super::internal::account_anywhere(app, did).await
+}
+
+/// [`App::ensure_active`] wherever the account lives.
+async fn ensure_active_any(app: &App, did: &str) -> XResult<Account> {
+    let a = account_any(app, did)
+        .await
+        .map_err(|_| XrpcError::bad("RepoNotFound", format!("could not find repo: {did}")))?;
+    match &a.status {
+        Some(st) => Err(super::inactive_account_error(st)),
+        None => Ok(a),
+    }
 }
 
 // ---------- PAR ----------
@@ -300,10 +443,13 @@ async fn par(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Respons
 
 async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAuthError> {
     let p = parse_params(headers, body)?;
-    let proof = check_as_dpop(app, headers, "/oauth/par")?;
+    let proof = check_as_dpop(app, headers, "/oauth/par").await?;
     let creds = ClientCredentials::from_params(&p)?;
     let client = client::get_client(&creds.client_id, app.config.dev_mode).await?;
-    let client_auth = client.authenticate(&creds, &issuer(app))?;
+    let (client_auth, assertion) = client.authenticate(&creds, &issuer(app))?;
+    if let Some(r) = &assertion {
+        claim(app, r, OAuthError::invalid_client("client assertion replayed")).await?;
+    }
     if p.contains_key("request_uri") {
         return Err(OAuthError::invalid_request(
             "\"request_uri\" is not supported in pushed authorization requests",
@@ -311,7 +457,11 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
     }
     // JAR (RFC 9101): only the request object's parameters are used.
     let p = match p.get("request") {
-        Some(jar) => request_object_params(&client.decode_request_object(jar, &issuer(app))?)?,
+        Some(jar) => {
+            let (payload, r) = client.decode_request_object(jar, &issuer(app))?;
+            claim(app, &r, OAuthError::invalid_request("Request object was replayed")).await?;
+            request_object_params(&payload)?
+        }
         None => p,
     };
     let params = validate_authorization_request(app, &client, &p, &proof).await?;
@@ -320,7 +470,7 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
             "code_challenge was already used",
         ));
     }
-    let id = store::new_request_id();
+    let id = store::new_local_request_id(app);
     let now = now_secs();
     let req = RequestData {
         client_id: client.id.clone(),
@@ -931,7 +1081,7 @@ async fn device_accounts(app: &App, d: &Device) -> Vec<(String, String)> {
         if now - a.authenticated_at > AUTHENTICATION_MAX_AGE {
             continue;
         }
-        if let Ok(acct) = app.account(&a.did).await {
+        if let Ok(acct) = account_any(app, &a.did).await {
             if acct.status.is_none() {
                 out.push((acct.did.clone(), acct.handle.clone()));
             }
@@ -987,7 +1137,7 @@ fn login_page(
 /// After an account is chosen: show consent, or approve directly when the
 /// user already granted these scopes to this (confidential) client.
 async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
-    let acct = match app.account(did).await {
+    let acct = match account_any(app, did).await {
         Ok(a) => a,
         Err(_) => {
             return login_page(
@@ -1032,7 +1182,7 @@ async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
 /// Binds the request to the account and redirects with the code
 /// (`RequestManager.setAuthorized`).
 async fn issue_code(app: &App, mut flow: Flow, did: &str) -> Response {
-    if let Err(e) = app.ensure_active(did).await {
+    if let Err(e) = ensure_active_any(app, did).await {
         let _ = store::put_request(app, &flow.id, None).await;
         return redirect_error(
             app,
@@ -1301,7 +1451,7 @@ async fn sign_in(
         {
             return limited(String::new());
         }
-        (app.account(&did).await?, String::new())
+        (account_any(app, &did).await?, String::new())
     } else {
         let invalid = || Ok(SignIn::Failed(ident.clone(), LoginError::Invalid));
         let password = f.get("password").cloned().unwrap_or_default();
@@ -1318,15 +1468,18 @@ async fn sign_in(
         {
             return limited(ident);
         }
-        let Ok(did) = app.resolve_repo(&ident).await else {
+        let Some(did) = resolve_identifier(app, &ident).await else {
             return invalid();
         };
         if rl::check(&[&rl::SIGN_IN_ACCOUNT], &did, 1).is_err() {
             return limited(ident);
         }
-        let Ok(acct) = app.account(&did).await else {
+        let Ok(acct) = account_any(app, &did).await else {
             return invalid();
         };
+        if ident.contains('@') && acct.email.as_deref() != Some(ident.as_str()) {
+            return invalid();
+        }
         if !state::verify_password_hash(&acct.password_hash, &password).await {
             return invalid();
         }
@@ -1537,10 +1690,13 @@ fn same_client_auth(a: &ClientAuth, b: &ClientAuth) -> bool {
 
 async fn token_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAuthError> {
     let p = parse_params(headers, body)?;
-    let proof = check_as_dpop(app, headers, "/oauth/token")?;
+    let proof = check_as_dpop(app, headers, "/oauth/token").await?;
     let creds = ClientCredentials::from_params(&p)?;
     let client = client::get_client(&creds.client_id, app.config.dev_mode).await?;
-    let client_auth = client.authenticate(&creds, &issuer(app))?;
+    let (client_auth, assertion) = client.authenticate(&creds, &issuer(app))?;
+    if let Some(r) = &assertion {
+        claim(app, r, OAuthError::invalid_client("client assertion replayed")).await?;
+    }
     let grant_type = p.get("grant_type").map(String::as_str).unwrap_or("");
     if !client.grant_types.iter().any(|g| g == grant_type)
         && matches!(grant_type, "authorization_code" | "refresh_token")
@@ -1581,7 +1737,8 @@ async fn code_grant(
         .ok_or_else(|| OAuthError::invalid_request("Missing \"code\""))?;
     let rid =
         store::code_request_id(code).ok_or_else(|| OAuthError::invalid_grant("Invalid code"))?;
-    let _g = store::lock(&format!("req:{rid}")).await;
+    require_owner(app, &store::req_routing(&rid))?;
+    let _g = store::lock(app, &format!("req:{rid}")).await;
     let mut req = store::get_request(app, &rid)
         .await?
         .ok_or_else(|| OAuthError::invalid_grant("Invalid code"))?;
@@ -1627,7 +1784,7 @@ async fn code_grant(
             "DPoP proof does not match the expected JKT",
         ));
     }
-    app.ensure_active(&did)
+    ensure_active_any(app, &did)
         .await
         .map_err(|e| OAuthError::invalid_grant(&e.message))?;
     let token_scope = lexicon::build_token_scope(app, &params.scope)
@@ -1706,7 +1863,8 @@ async fn refresh_grant(
         .ok_or_else(|| OAuthError::invalid_request("Missing \"refresh_token\""))?;
     let invalid = || OAuthError::invalid_grant("Invalid refresh token");
     let parsed = store::parse_refresh_token(tok).ok_or_else(invalid)?;
-    let _g = store::lock(&format!("ses:{}", parsed.session_id)).await;
+    require_owner(app, &parsed.did)?;
+    let _g = store::lock(app, &format!("ses:{}", parsed.session_id)).await;
     let mut s = store::get_session(app, &parsed.did, &parsed.session_id)
         .await?
         .ok_or_else(invalid)?;
@@ -1749,7 +1907,7 @@ async fn refresh_grant(
         store::delete_session(app, &s.did, &s.id).await?;
         return Err(OAuthError::invalid_grant("Refresh token expired"));
     }
-    app.ensure_active(&s.did)
+    ensure_active_any(app, &s.did)
         .await
         .map_err(|e| OAuthError::invalid_grant(&e.message))?;
     s.token_scope = lexicon::build_token_scope(app, &s.scope)
@@ -1776,7 +1934,9 @@ async fn revoke_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(),
         .ok_or_else(|| OAuthError::invalid_request("Missing \"token\""))?;
     let creds = ClientCredentials::from_params(&p)?;
     let client = client::get_client(&creds.client_id, app.config.dev_mode).await?;
-    client.authenticate(&creds, &issuer(app))?;
+    if let (_, Some(r)) = client.authenticate(&creds, &issuer(app))? {
+        claim(app, &r, OAuthError::invalid_client("client assertion replayed")).await?;
+    }
     let k = keys(app);
     // Invalid or unknown tokens are not an error (RFC 7009 §2.2).
     if let Some(r) = store::parse_refresh_token(tok) {
@@ -1794,7 +1954,8 @@ async fn revoke_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(),
             }
         }
     } else if let Some(rid) = store::code_request_id(tok) {
-        let _g = store::lock(&format!("req:{rid}")).await;
+        require_owner(app, &store::req_routing(&rid))?;
+        let _g = store::lock(app, &format!("req:{rid}")).await;
         if let Some(req) = store::get_request(app, &rid).await? {
             let ok = req
                 .code_hash
@@ -1919,6 +2080,14 @@ pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Crede
             "invalid_token",
             "Access token is bound to another DPoP key",
         ));
+    }
+    // single use, claimed at the token DID's owner (normally this node: the
+    // request was routed by that DID); `ath` binds the proof to this token
+    let replay = checked.replay(did.to_string());
+    match super::internal::claim_replay_anywhere(app, &replay.routing, &replay.key, replay.until).await {
+        Ok(true) => {}
+        Ok(false) => return Err(dpop_fail("invalid_dpop_proof", "DPoP proof replayed")),
+        Err(e) => return Err(e),
     }
     // Stateful check: the session must still exist and this must be its
     // current token (rotation and revocation take effect immediately).

@@ -8,7 +8,6 @@ use crate::xrpc::App;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
 
 pub const REQUEST_URI_PREFIX: &str = "urn:ietf:params:oauth:request_uri:";
 
@@ -42,13 +41,13 @@ pub(super) async fn get<T: DeserializeOwned>(
 }
 
 /// Striped process-local locks for read-modify-write sequences on one
-/// object (code exchange, refresh rotation). See the HA note in mod.rs.
-static LOCKS: LazyLock<Vec<tokio::sync::Mutex<()>>> =
-    LazyLock::new(|| (0..256).map(|_| tokio::sync::Mutex::new(())).collect());
-
-pub async fn lock(key: &str) -> tokio::sync::MutexGuard<'static, ()> {
+/// object (code exchange, refresh rotation). Held on the node owning the
+/// object's routing key, which is where those requests are routed (HA notes
+/// in mod.rs), so they serialize cluster-wide.
+pub async fn lock(app: &App, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
     let h = super::util::sha256(key.as_bytes());
-    LOCKS[h[0] as usize].lock().await
+    let n = super::util::node_state(app);
+    n.locks[h[0] as usize].clone().lock_owned().await
 }
 
 // ---------- authorization requests ----------
@@ -98,12 +97,26 @@ pub struct RequestData {
     pub consumed: Option<(String, String)>,
 }
 
-fn req_routing(id: &str) -> String {
+pub fn req_routing(id: &str) -> String {
     format!("oauth:req:{id}")
 }
 
 pub fn new_request_id() -> String {
     random_id("req-", 16)
+}
+
+/// A request id whose row lands in a partition this node owns (like
+/// `App::mint_local_did`), so the PAR write is local and the rest of the
+/// flow, routed by the id, comes back here.
+pub fn new_local_request_id(app: &App) -> String {
+    for _ in 0..1_000 {
+        let id = new_request_id();
+        let r = req_routing(&id);
+        if app.remote_owner(&r).is_none() && app.partition(&r).is_ok() {
+            return id;
+        }
+    }
+    new_request_id()
 }
 
 pub fn request_uri(id: &str) -> String {
@@ -145,17 +158,24 @@ pub fn hash_secret(s: &str) -> String {
 }
 
 /// Records a PKCE code_challenge; false if it was used in the last 24 h.
+/// PAR runs on any node: the durable marker covers earlier uses, and a
+/// single-use claim at the marker's owner settles concurrent ones.
 pub async fn claim_code_challenge(app: &App, challenge: &str) -> Result<bool, OAuthError> {
     let routing = format!("oauth:cc:{}", hash_secret(challenge));
-    let _g = lock(&routing).await;
     let now = now_secs();
     if let Some(at) = get::<i64>(app, &routing, "oauth/cc").await? {
         if now - at < super::CODE_CHALLENGE_REPLAY_TIMEFRAME {
             return Ok(false);
         }
     }
-    put(app, &routing, "oauth/cc", Some(&now)).await?;
-    Ok(true)
+    // guards the window between the read above and the put (released after)
+    let key = format!("cc:{routing}");
+    if !crate::xrpc::internal::claim_replay_anywhere(app, &routing, &key, now + 60).await? {
+        return Ok(false);
+    }
+    let r = put(app, &routing, "oauth/cc", Some(&now)).await;
+    let _ = crate::xrpc::internal::release_replay_anywhere(app, &routing, &key).await;
+    r.map(|_| true)
 }
 
 // ---------- sessions ----------
@@ -203,26 +223,14 @@ pub async fn delete_session(app: &App, did: &str, id: &str) -> Result<(), OAuthE
     put::<Session>(app, did, &session_key(id), None).await
 }
 
-/// All OAuth sessions of an account (prefix scan of its private keys).
+/// All OAuth sessions of an account (prefix scan of its private keys, on
+/// its owner if that is another node).
 pub async fn list_sessions(app: &App, did: &str) -> Result<Vec<Session>, OAuthError> {
-    let p = app.partition(did)?;
-    let prefix = crate::state::private_key(did, "oauth/ses/");
-    let end = crate::state::prefix_end(&prefix);
-    let mut it =
-        p.db.scan(prefix..end)
-            .await
-            .map_err(|e| OAuthError::server_error(&e.to_string()))?;
-    let mut out = Vec::new();
-    while let Some(kv) = it
-        .next()
-        .await
-        .map_err(|e| OAuthError::server_error(&e.to_string()))?
-    {
-        if let Ok(s) = serde_json::from_slice::<Session>(&kv.value) {
-            out.push(s);
-        }
-    }
-    Ok(out)
+    let rows = crate::xrpc::internal::scan_private_anywhere(app, did, "oauth/ses/").await?;
+    Ok(rows
+        .iter()
+        .filter_map(|(_, v)| serde_json::from_slice::<Session>(v).ok())
+        .collect())
 }
 
 /// Deletes every OAuth session of `did` in one log write, so its DPoP access

@@ -169,15 +169,13 @@ async fn refresh_identity(
         Some(c) => c.did() == Some(acct.did.as_str()) && c.allows_identity("*"),
         None => false,
     };
-    if may_emit && acct.status.as_deref() != Some("takendown") {
-        let did = acct.did.clone();
-        let op = crate::worker::AccountOp::Update {
-            account: acct,
-            old_handle: None,
-            identity_event: true,
-            account_event: false,
-        };
-        app.account_op(&did, op).await?;
+    if may_emit {
+        // writes nothing: the worker re-announces its current account (a
+        // snapshot sent from here could undo a concurrent takedown)
+        app.mutate_account(&acct.did, true, false, false, |a| {
+            Ok(a.status.as_deref() != Some("takendown"))
+        })
+        .await?;
     }
     Ok(Json(info))
 }
@@ -185,10 +183,6 @@ async fn refresh_identity(
 #[derive(Deserialize)]
 struct UpdateHandleIn {
     handle: String,
-}
-
-fn handle_object(app: &App, handle: &str) -> object_store::path::Path {
-    object_store::path::Path::from(format!("{}/handle/{}", app.store.prefix, handle))
 }
 
 /// Checks a requested handle: a single label under our handle domain
@@ -248,71 +242,63 @@ async fn update_handle(
         use crate::ratelimit::*;
         check(&[&UPDATE_HANDLE_5MIN, &UPDATE_HANDLE_DAY], &did, 1)?;
     }
+    // early refusal; set_handle re-checks against the worker's state
     let acct = app.account(&did).await?;
-    if matches!(
-        acct.status.as_deref(),
-        Some("takendown") | Some("suspended")
-    ) {
-        return Err(XrpcError {
-            status: StatusCode::UNAUTHORIZED,
-            error: "AccountTakedown".into(),
-            message: "Account has been taken down".into(),
-        });
+    if super::server::is_takendown_account(&acct) {
+        return Err(super::server::takedown_error());
     }
     let handle = inp.handle.trim().to_ascii_lowercase();
-    let old = acct.handle.clone();
-    if handle != old {
+    if handle != acct.handle {
+        // the slow part (external .well-known proof) runs before the op
         check_new_handle(&app, &handle, &did).await?;
-        // Global uniqueness: conditional create of handle/{handle}. An object
-        // already holding our DID is a retry of an interrupted update.
-        let path = handle_object(&app, &handle);
-        let opts = PutOptions {
-            mode: PutMode::Create,
-            ..Default::default()
-        };
-        match app
-            .store
-            .raw
-            .put_opts(&path, PutPayload::from(did.clone().into_bytes()), opts)
-            .await
-        {
-            Ok(_) => {}
-            Err(object_store::Error::AlreadyExists { .. }) => {
-                if app.resolve_handle(&handle).await?.as_deref() != Some(did.as_str()) {
-                    return Err(XrpcError::bad("HandleNotAvailable", "Handle already taken"));
-                }
-            }
-            Err(e) => return Err(XrpcError::from_err(e)),
-        }
-        let mut next = acct.clone();
-        next.handle = handle.clone();
-        let op = crate::worker::AccountOp::Update {
-            account: next,
-            old_handle: Some(old.clone()),
-            identity_event: true,
-            account_event: false,
-        };
-        if let Err(e) = app.account_op(&did, op).await {
-            let _ = app.store.raw.delete(&path).await;
-            return Err(e);
-        }
-        // Release the old claim (only if it's still ours).
-        if app.resolve_handle(&old).await.ok().flatten().as_deref() == Some(did.as_str()) {
-            if let Err(e) = app.store.raw.delete(&handle_object(&app, &old)).await {
-                tracing::warn!(%did, %old, "updateHandle: failed to release old handle: {e}");
-            }
-        }
-    } else {
-        // Same handle: the reference still re-announces it.
-        let op = crate::worker::AccountOp::Update {
-            account: acct,
-            old_handle: None,
-            identity_event: true,
-            account_event: false,
-        };
-        app.account_op(&did, op).await?;
     }
+    // same handle: the reference still re-announces it
+    set_handle(&app, &did, &handle, true).await?;
     Ok(StatusCode::OK)
+}
+
+/// Moves the account to `handle` (already validated) and emits #identity.
+/// Global uniqueness is a conditional create of handle/{handle} (an object
+/// already holding our DID is a retry of an interrupted update). The worker
+/// then swaps the handle on its current state, and the handle that state held
+/// is released. `user`: the account's own request, refused while taken down
+/// or suspended (admins may rename those).
+pub(super) async fn set_handle(app: &App, did: &str, handle: &str, user: bool) -> XResult<()> {
+    // only decides whether to claim; the op re-checks against current state
+    let read = app.account(did).await?.handle;
+    let claimed = handle != read;
+    if claimed && !super::server::claim_handle(app, handle, did).await? {
+        return Err(XrpcError::bad("HandleNotAvailable", format!("Handle already taken: {handle}")));
+    }
+    let h = handle.to_string();
+    let res = app
+        .mutate_account(did, true, false, false, move |a| {
+            if user && super::server::is_takendown_account(a) {
+                return Err(super::server::takedown_error());
+            }
+            if a.handle != h && !claimed {
+                // renamed since the read above: we hold no claim on `h`
+                return Err(XrpcError::bad("InvalidRequest", "Handle changed concurrently, retry"));
+            }
+            a.handle = h;
+            Ok(true)
+        })
+        .await;
+    match res {
+        Ok((before, _)) => {
+            if before.handle != handle {
+                super::server::release_handle(app, &before.handle, did).await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // keep the claim if a concurrent update moved us onto it anyway
+            if claimed && app.account(did).await.map_or(true, |a| a.handle != handle) {
+                super::server::release_handle(app, handle, did).await;
+            }
+            Err(e)
+        }
+    }
 }
 
 async fn get_recommended_did_credentials(

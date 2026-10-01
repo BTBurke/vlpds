@@ -186,7 +186,6 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     );
     firehose.set_source(&log.log_id, Some(crate::firehose::Source::Local(log.wm.clone())));
     *firehose.store.write() = Some(store.clone());
-    firehose.spawn_merger(merger_rx);
     {
         // never announce a watermark beyond our node lease
         let (c, wm) = (cluster.clone(), log.wm.clone());
@@ -221,6 +220,11 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let node_handle = node.clone();
     // first membership step inline, so a lone node serves with all its shards
     cluster.step(&host).await?;
+    // Only now merge: the step registered a follower for every live peer, so
+    // the merger never settles past the start floor on our own log's
+    // watermark alone (a peer followed after that would owe only its events
+    // above the new position; the ones below it would be lost).
+    firehose.spawn_merger(merger_rx);
     cluster.spawn(host);
     tracing::info!(
         node = %cluster.cfg.node_id, log = %cluster.log_id, writer = cluster.writer, shards = n,
@@ -334,6 +338,9 @@ impl crate::forward::Router for ClusterRouter {
     }
     async fn resolve_handle(&self, handle: &str) -> Option<String> {
         self.app.resolve_handle(handle).await.ok().flatten()
+    }
+    fn app(&self) -> Option<Arc<xrpc::App>> {
+        Some(self.app.clone())
     }
 }
 

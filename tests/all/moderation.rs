@@ -218,10 +218,13 @@ async fn suspended_account_cannot_write_or_proxy() {
     })
     .await;
     let a = s.create_account("susp").await;
-    let mut acct = s.app.account(&a.did).await.unwrap_or_else(|e| panic!("{}", e.message));
-    acct.status = Some("suspended".into());
-    let op = vlpds::worker::AccountOp::Update { account: acct, old_handle: None, identity_event: false, account_event: false };
-    s.app.account_op(&a.did, op).await.unwrap_or_else(|e| panic!("{}", e.message));
+    s.app
+        .mutate_account(&a.did, false, false, false, |acct| {
+            acct.status = Some("suspended".into());
+            Ok(true)
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.message));
 
     s.xrpc
         .post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x")}), &a.auth())
@@ -236,10 +239,13 @@ async fn suspended_account_cannot_write_or_proxy() {
 async fn takendown_repo_write_is_account_takedown() {
     let s = TestServer::spawn().await;
     let a = s.create_account("tkw").await;
-    let mut acct = s.app.account(&a.did).await.unwrap_or_else(|e| panic!("{}", e.message));
-    acct.status = Some("takendown".into());
-    let op = vlpds::worker::AccountOp::Update { account: acct, old_handle: None, identity_event: false, account_event: false };
-    s.app.account_op(&a.did, op).await.unwrap_or_else(|e| panic!("{}", e.message));
+    s.app
+        .mutate_account(&a.did, false, false, false, |acct| {
+            acct.status = Some("takendown".into());
+            Ok(true)
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.message));
     for (nsid, body) in [
         ("com.atproto.repo.createRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x")})),
         ("com.atproto.repo.deleteRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": "3jzfcijpj2z2a"})),
