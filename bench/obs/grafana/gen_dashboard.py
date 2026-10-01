@@ -9,8 +9,10 @@ histogram_quantile, so a 1 s refresh stays cheap.
 import json
 import os
 
-PROM = {"type": "prometheus", "uid": "prom"}
-PYRO = {"type": "grafana-pyroscope-datasource", "uid": "pyroscope"}
+# Overrides render the same dashboard for another Grafana, e.g. the lab
+# one that benchbox's Alloy remote-writes to (deploy/ansible, see bench/obs/README.md).
+PROM = {"type": "prometheus", "uid": os.environ.get("VLPDS_PROM_UID", "prom")}
+PYRO = {"type": "grafana-pyroscope-datasource", "uid": os.environ.get("VLPDS_PYRO_UID", "pyroscope")}
 I = 'instance=~"$instance"'
 RI = "[$__rate_interval]"
 # MinIO is scraped every 5 s: rate windows need >= 2 samples
@@ -294,8 +296,8 @@ add({
 })
 
 dashboard = {
-    "uid": "vlpds",
-    "title": "vlpds",
+    "uid": os.environ.get("VLPDS_DASH_UID", "vlpds"),
+    "title": os.environ.get("VLPDS_DASH_TITLE", "vlpds"),
     "tags": ["vlpds"],
     "timezone": "browser",
     "editable": True,
@@ -324,7 +326,7 @@ dashboard = {
     "panels": panels,
 }
 
-out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboards", "vlpds.json")
+out = os.environ.get("VLPDS_DASH_OUT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboards", "vlpds.json")
 with open(out, "w") as f:
     json.dump(dashboard, f, indent=1)
     f.write("\n")
