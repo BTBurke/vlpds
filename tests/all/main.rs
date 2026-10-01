@@ -31,6 +31,7 @@ mod interop_mst;
 mod interop_syntax;
 mod invertible_ops;
 mod invite_codes;
+mod lexicons;
 mod moderation;
 mod oauth;
 mod preferences;

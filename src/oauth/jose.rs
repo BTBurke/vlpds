@@ -110,6 +110,11 @@ impl DecodedJwt {
         }
     }
 
+    /// An unsecured JWT (`alg: none`, empty signature part).
+    pub fn is_unsecured(&self) -> bool {
+        self.alg() == "none" && self.sig.is_empty()
+    }
+
     pub fn claim_str(&self, k: &str) -> Option<&str> {
         self.payload.get(k).and_then(|v| v.as_str())
     }
@@ -230,6 +235,11 @@ pub struct DpopProof {
 
 /// DPoP proof `jti` replay cache. Process-local (see HA note in mod.rs).
 static DPOP_JTIS: LazyLock<ReplayCache> = LazyLock::new(|| ReplayCache::new(1_000_000));
+
+/// Drops expired DPoP `jti`s (OAuth GC task). Returns how many were removed.
+pub fn sweep_dpop_jtis() -> usize {
+    DPOP_JTIS.sweep()
+}
 
 /// Normalizes an absolute http(s) URL for `htu` comparison: scheme + host +
 /// port (default ports elided) + normalized path; no query or fragment.

@@ -24,20 +24,25 @@
 //! - `{did}` / `oauth/authz/{hash(client_id)}`: remembered consent.
 //! - `oauth:lex:{nsid}` / `oauth/lex`: last good permission-set lexicons.
 //!
+//! Expired requests, code-challenge markers, idle devices and sessions past
+//! their lifetime are deleted by a periodic, bounded sweep (`gc.rs`).
+//!
 //! Lookups by token value need no index: refresh tokens and codes embed the
 //! routing information (DID + session id, request id) next to their secret.
 //!
 //! ## HA caveats
-//! - DPoP proof `jti`s and client-assertion `jti`s are tracked in an
-//!   in-memory TTL cache per process. Behind a load balancer a proof could be
-//!   replayed once against a different node within its ~3-minute window;
-//!   nonces bound that window. A shared cache would close it.
+//! - DPoP proof, client-assertion and request-object (JAR) `jti`s are
+//!   tracked in an in-memory TTL cache per process. Behind a load balancer
+//!   a proof could be replayed once against a different node within its
+//!   ~3-minute window (~1 minute for request objects); nonces bound that
+//!   window. A shared cache would close it.
 //! - Single-use operations (code exchange, refresh-token rotation) take a
 //!   process-local lock before their read-modify-write. Requests for the same
 //!   code/session that hit two different nodes concurrently are not
 //!   serialized against each other.
 
 pub mod client;
+pub mod gc;
 pub mod jose;
 pub mod lexicon;
 pub mod scopes;

@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
 pub fn routes() -> Router<Arc<App>> {
-    Router::new()
+    let r = Router::new()
         .route(
             "/xrpc/com.atproto.server.describeServer",
             get(describe_server),
@@ -137,7 +137,8 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/vlpds.server.setupTotp", post(setup_totp))
         .route("/xrpc/vlpds.server.confirmTotp", post(confirm_totp))
         .route("/xrpc/vlpds.server.disableTotp", post(disable_totp))
-        .route("/xrpc/vlpds.server.getTotpStatus", get(get_totp_status))
+        .route("/xrpc/vlpds.server.getTotpStatus", get(get_totp_status));
+    r
 }
 
 // ---------------------------------------------------------------------------

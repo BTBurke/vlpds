@@ -2,7 +2,7 @@ use super::extract::RecordJson;
 use super::*;
 
 pub fn routes() -> Router<Arc<App>> {
-    Router::new()
+    let r = Router::new()
         .route("/xrpc/com.atproto.repo.createRecord", post(create_record))
         .route("/xrpc/com.atproto.repo.putRecord", post(put_record))
         .route("/xrpc/com.atproto.repo.deleteRecord", post(delete_record))
@@ -13,7 +13,8 @@ pub fn routes() -> Router<Arc<App>> {
         .route(
             "/xrpc/com.atproto.repo.importRepo",
             post(import_repo).layer(axum::extract::DefaultBodyLimit::max(MAX_IMPORT_BYTES)),
-        )
+        );
+    r
 }
 
 /// Largest CAR importRepo accepts (it is parsed in memory).
@@ -79,8 +80,15 @@ fn blob_decls(v: &Value, out: &mut Vec<BlobDecl>) {
 
 /// JSON record -> DAG-CBOR, as the reference's prepareWrite: a missing
 /// `$type` defaults to the collection and any other value must equal it,
-/// then known lexicons are validated (record key included).
-fn encode_record(v: &J, collection: &str, rkey: &str, validate: Option<bool>) -> XResult<Encoded> {
+/// then known lexicons are validated (record key included); `resolved` is
+/// the dynamically resolved lexicon of `collection`, if any.
+fn encode_record(
+    v: &J,
+    collection: &str,
+    rkey: &str,
+    validate: Option<bool>,
+    resolved: Option<&J>,
+) -> XResult<Encoded> {
     let J::Object(o) = v else {
         return Err(XrpcError::bad("InvalidRequest", "record must be an object"));
     };
@@ -101,7 +109,7 @@ fn encode_record(v: &J, collection: &str, rkey: &str, validate: Option<bool>) ->
         }
     };
     let val = Value::from_json(v).map_err(|e| XrpcError::bad("InvalidRequest", e.to_string()))?;
-    let status = crate::lexicon::validate_record(collection, rkey, &val, validate)
+    let status = crate::lexicon::validate_record(collection, rkey, &val, validate, resolved)
         .map_err(|e| XrpcError::bad("InvalidRequest", e))?;
     if let Some(c) = legacy_blob(&val) {
         return Err(XrpcError::bad(
@@ -263,8 +271,9 @@ async fn create_record(
     check_path(&inp.collection, inp.rkey.as_deref())?;
     // as the reference: no rkey = a fresh TID (validated against the schema's key)
     let rkey = inp.rkey.unwrap_or_else(|| app.tids.next().to_string());
+    let schema = crate::lexicon::resolve_record_schema(&app, &inp.collection, inp.validate).await;
     let (cid, bytes, blobs, status, decls) =
-        encode_record(&inp.record, &inp.collection, &rkey, inp.validate)?;
+        encode_record(&inp.record, &inp.collection, &rkey, inp.validate, schema.as_deref())?;
     check_blobs(&app, &did, &decls).await?;
     let swap = parse_cid_opt(&inp.swap_commit)?;
     let path = format!("{}/{}", inp.collection, rkey);
@@ -333,8 +342,9 @@ async fn put_record(
             && creds.allows_repo(&inp.collection, "update"),
     )?;
     check_path(&inp.collection, Some(&inp.rkey))?;
+    let schema = crate::lexicon::resolve_record_schema(&app, &inp.collection, inp.validate).await;
     let (cid, bytes, blobs, status, decls) =
-        encode_record(&inp.record, &inp.collection, &inp.rkey, inp.validate)?;
+        encode_record(&inp.record, &inp.collection, &inp.rkey, inp.validate, schema.as_deref())?;
     let swap = parse_cid_opt(&inp.swap_commit)?;
     let swap_record = parse_swap_record(&inp.swap_record)?;
     let path = format!("{}/{}", inp.collection, inp.rkey);
@@ -460,6 +470,8 @@ async fn apply_writes(
     let mut writes = Vec::with_capacity(inp.writes.len());
     let mut statuses = Vec::with_capacity(inp.writes.len());
     let mut decls = Vec::new();
+    // dynamically resolved lexicons, once per collection
+    let mut schemas: std::collections::HashMap<String, Option<Arc<J>>> = Default::default();
     for w in &inp.writes {
         let t = w.get("$type").and_then(|v| v.as_str()).unwrap_or("");
         let collection = w
@@ -475,11 +487,16 @@ async fn apply_writes(
         };
         creds.require(creds.allows_repo(&collection, action))?;
         check_path(&collection, rkey.as_deref())?;
+        if action != "delete" && !schemas.contains_key(&collection) {
+            let s = crate::lexicon::resolve_record_schema(&app, &collection, inp.validate).await;
+            schemas.insert(collection.clone(), s);
+        }
+        let schema = schemas.get(&collection).cloned().flatten();
         match t {
             "com.atproto.repo.applyWrites#create" => {
                 let rkey = rkey.unwrap_or_else(|| app.tids.next().to_string());
                 let (cid, bytes, blobs, status, d) =
-                    encode_record(w.get("value").unwrap_or(&J::Null), &collection, &rkey, inp.validate)?;
+                    encode_record(w.get("value").unwrap_or(&J::Null), &collection, &rkey, inp.validate, schema.as_deref())?;
                 statuses.push(status);
                 decls.extend(d);
                 writes.push(Write::Create {
@@ -494,7 +511,7 @@ async fn apply_writes(
                 let rkey =
                     rkey.ok_or_else(|| XrpcError::bad("InvalidRequest", "update requires rkey"))?;
                 let (cid, bytes, blobs, status, d) =
-                    encode_record(w.get("value").unwrap_or(&J::Null), &collection, &rkey, inp.validate)?;
+                    encode_record(w.get("value").unwrap_or(&J::Null), &collection, &rkey, inp.validate, schema.as_deref())?;
                 statuses.push(status);
                 decls.extend(d);
                 writes.push(Write::Update {

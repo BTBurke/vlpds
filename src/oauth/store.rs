@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 
 pub const REQUEST_URI_PREFIX: &str = "urn:ietf:params:oauth:request_uri:";
 
-async fn put<T: Serialize>(
+pub(super) async fn put<T: Serialize>(
     app: &App,
     routing: &str,
     name: &str,
@@ -28,7 +28,7 @@ async fn put<T: Serialize>(
         .map_err(OAuthError::from)
 }
 
-async fn get<T: DeserializeOwned>(
+pub(super) async fn get<T: DeserializeOwned>(
     app: &App,
     routing: &str,
     name: &str,

@@ -1,6 +1,7 @@
 //! Server-rendered pages for the authorization flow and session management.
-//! No external assets and no scripts: one inline stylesheet allowed by hash
-//! in the Content-Security-Policy.
+//! No external assets: one inline stylesheet allowed by hash in the
+//! Content-Security-Policy. The only script is the fixed auto-submit of the
+//! `response_mode=form_post` page, also allowed by hash and only there.
 
 use super::scopes::{IncludeScope, Permission};
 use super::util::{html_escape as e, sha256};
@@ -51,6 +52,7 @@ table{width:100%;border-collapse:collapse;font-size:13.5px}
 td{border-top:1px solid var(--rule);padding:10px 4px;vertical-align:top;overflow-wrap:anywhere}
 td:last-child{text-align:right;width:1%;white-space:nowrap;overflow-wrap:normal;padding-left:10px}
 footer{margin-top:14px;text-align:center}
+label.check{display:flex;align-items:center;gap:8px;font-weight:500;margin:12px 0 4px}
 "#;
 
 static STYLE_HASH: LazyLock<String> =
@@ -69,6 +71,47 @@ pub fn csp(form_action: &[String]) -> String {
     format!(
         "default-src 'none'; style-src 'sha256-{}'; font-src 'self'; img-src 'self' data:; form-action {fa}; frame-ancestors 'none'; base-uri 'none'",
         *STYLE_HASH
+    )
+}
+
+/// Auto-submit for the form_post response page. Submits once; the guard
+/// keeps a page restored from history from posting the code again.
+const AUTO_SUBMIT: &str = "var f=document.forms[0],done=false;\
+f.addEventListener('submit',function(e){if(done){e.preventDefault()}done=true});\
+setTimeout(function(){if(!done){done=true;f.submit()}},1);";
+
+static AUTO_SUBMIT_HASH: LazyLock<String> =
+    LazyLock::new(|| base64::engine::general_purpose::STANDARD.encode(sha256(AUTO_SUBMIT)));
+
+/// CSP for the form_post response page: [`csp`] plus the auto-submit
+/// script by hash (nothing else may run).
+pub fn csp_form_post(form_action: &[String]) -> String {
+    format!(
+        "{}; script-src 'sha256-{}'",
+        csp(form_action),
+        *AUTO_SUBMIT_HASH
+    )
+}
+
+/// `response_mode=form_post` (OAuth 2.0 Form Post Response Mode): the
+/// authorization response as hidden fields posted to the redirect URI. The
+/// button is the no-script fallback.
+pub fn form_post(redirect_uri: &str, params: &[(String, String)]) -> String {
+    let mut fields = String::new();
+    for (k, v) in params {
+        fields.push_str(&format!(
+            "<input type=\"hidden\" name=\"{}\" value=\"{}\">",
+            e(k),
+            e(v)
+        ));
+    }
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<meta name=\"referrer\" content=\"no-referrer\"><title>Returning to the app</title><style>{STYLE}</style></head><body><main>\
+<div class=\"brand\">{MARK}vlpds<span>account security</span></div><div class=\"card\"><div class=\"strata\"></div>\
+<h1>Returning to the app</h1><form method=\"post\" action=\"{}\">{fields}<div class=\"row\">\
+<button type=\"submit\" class=\"primary\">Continue</button></div></form></div></main><script>{AUTO_SUBMIT}</script></body></html>",
+        e(redirect_uri)
     )
 }
 
@@ -310,7 +353,10 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-pub fn consent(ctx: &Ctx, did: &str, handle: &str, perms: &[String]) -> String {
+/// `email_choice`: offer to withhold the email address (the requested scope
+/// has an `account:email` read scope and no `transition:` scope, as in the
+/// reference consent form).
+pub fn consent(ctx: &Ctx, did: &str, handle: &str, perms: &[String], email_choice: bool) -> String {
     let mut b = format!(
         "<h1>Authorize access</h1><p class=\"muted\">Signed in as <b>@{}</b></p><p>This app wants access to your account:</p>{}<p>It will be able to:</p><ul class=\"perms\">",
         e(handle),
@@ -329,6 +375,15 @@ pub fn consent(ctx: &Ctx, did: &str, handle: &str, perms: &[String]) -> String {
         hidden(ctx),
         e(did)
     ));
+    if email_choice {
+        // the checkbox goes inside the form, before the buttons
+        let at = b.rfind("<div class=\"row\">").expect("consent buttons");
+        b.insert_str(
+            at,
+            "<input type=\"hidden\" name=\"email_choice\" value=\"1\">\
+<label class=\"check\"><input type=\"checkbox\" name=\"allow_email\" value=\"1\" checked>Share my email address with this app</label>",
+        );
+    }
     page("Authorize access", &b)
 }
 

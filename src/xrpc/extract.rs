@@ -12,7 +12,12 @@
 //! - params whose lexicon format is fixed everywhere they appear (`did`,
 //!   `repo` (at-identifier), `cid`, `handle`) are syntax-checked, so a bad
 //!   value is a 400 `InvalidRequest` rather than a lookup miss, as the
-//!   reference's lexicon param validation does.
+//!   reference's lexicon param validation does;
+//! - params and JSON bodies of the bundled com.atproto.* methods are then
+//!   validated against their lexicons (src/lexicon.rs), with the
+//!   reference's `Params ...` / `Input ...` messages. A checked body is
+//!   parsed once into a JSON value, validated, then converted to `T`.
+//!   [`debug_output_layer`] checks responses in debug builds.
 
 use super::syntax;
 use super::XrpcError;
@@ -49,7 +54,11 @@ pub struct Json<T>(pub T);
 
 impl<T: serde::Serialize> IntoResponse for Json<T> {
     fn into_response(self) -> Response {
-        axum::Json(self.0).into_response()
+        #[allow(unused_mut)]
+        let mut r = axum::Json(self.0).into_response();
+        #[cfg(debug_assertions)]
+        r.extensions_mut().insert(HandlerJson);
+        r
     }
 }
 
@@ -104,13 +113,33 @@ fn parse<T: DeserializeOwned>(body: &[u8]) -> Result<T, XrpcError> {
     })
 }
 
+/// The method NSID of a request whose JSON input has a bundled schema.
+fn input_nsid(req: &Request) -> Option<String> {
+    req.uri()
+        .path()
+        .strip_prefix("/xrpc/")
+        .filter(|n| crate::lexicon::has_input_schema(n))
+        .map(String::from)
+}
+
+/// [`parse`], validating against the method's input schema if it has one.
+fn parse_input<T: DeserializeOwned>(nsid: Option<&str>, body: &[u8]) -> Result<T, XrpcError> {
+    let Some(nsid) = nsid else {
+        return parse(body);
+    };
+    let v: serde_json::Value = parse(body)?;
+    crate::lexicon::validate_input(nsid, &v).map_err(invalid)?;
+    serde_json::from_value(v).map_err(|e| invalid(format!("Invalid JSON body: {e}")))
+}
+
 impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for Json<T> {
     type Rejection = XrpcError;
 
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
         check_content_type(&req)?;
+        let nsid = input_nsid(&req);
         let body = read_body(req, JSON_LIMIT).await?;
-        parse(&body).map(Json)
+        parse_input(nsid.as_deref(), &body).map(Json)
     }
 }
 
@@ -122,8 +151,9 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for RecordJson<T> {
 
     async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
         check_content_type(&req)?;
+        let nsid = input_nsid(&req);
         let body = read_body(req, RECORD_JSON_LIMIT).await?;
-        parse(&body).map(RecordJson)
+        parse_input(nsid.as_deref(), &body).map(RecordJson)
     }
 }
 
@@ -133,11 +163,12 @@ impl<T: DeserializeOwned, S: Send + Sync> OptionalFromRequest<S> for Json<T> {
 
     async fn from_request(req: Request, _state: &S) -> Result<Option<Self>, Self::Rejection> {
         check_content_type(&req)?;
+        let nsid = input_nsid(&req);
         let body = read_body(req, JSON_LIMIT).await?;
         if body.iter().all(|b| b.is_ascii_whitespace()) {
             return Ok(None);
         }
-        parse(&body).map(|v| Some(Json(v)))
+        parse_input(nsid.as_deref(), &body).map(|v| Some(Json(v)))
     }
 }
 
@@ -178,15 +209,21 @@ pub fn valid_at_identifier(s: &str) -> bool {
 }
 
 /// Syntax checks for params whose lexicon format is the same in every
-/// com.atproto method that takes them.
+/// com.atproto method that takes them, then the method's lexicon params.
 fn validate_params(parts: &Parts) -> Result<(), XrpcError> {
-    if parts.uri.query().is_none() || !parts.uri.path().starts_with("/xrpc/com.atproto.") {
+    let Some(nsid) = parts.uri.path().strip_prefix("/xrpc/") else {
+        return Ok(());
+    };
+    let schema = crate::lexicon::has_params(nsid);
+    if !nsid.starts_with("com.atproto.") || (parts.uri.query().is_none() && !schema) {
         return Ok(());
     }
-    let pairs: Vec<(String, String)> =
-        axum::extract::Query::<Vec<(String, String)>>::try_from_uri(&parts.uri)
+    let pairs: Vec<(String, String)> = match parts.uri.query() {
+        None => Vec::new(),
+        Some(_) => axum::extract::Query::<Vec<(String, String)>>::try_from_uri(&parts.uri)
             .map(|q| q.0)
-            .map_err(|e| invalid(e.body_text()))?;
+            .map_err(|e| invalid(e.body_text()))?,
+    };
     for (k, v) in &pairs {
         let ok = match k.as_str() {
             "did" => syntax::valid_did(v),
@@ -205,6 +242,9 @@ fn validate_params(parts: &Parts) -> Result<(), XrpcError> {
             return Err(invalid(format!("Invalid {what} in param {k}: {v}")));
         }
     }
+    if schema {
+        crate::lexicon::validate_params(nsid, &pairs).map_err(invalid)?;
+    }
     Ok(())
 }
 
@@ -217,4 +257,49 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequestParts<S> for Query<T> {
             .map(|q| Query(q.0))
             .map_err(|e| invalid(e.body_text()))
     }
+}
+
+// ---------------------------------------------------------------------------
+// output validation (debug builds)
+// ---------------------------------------------------------------------------
+
+/// Marks a response body built by a handler's [`Json`] (not piped through
+/// from another service), so [`debug_output_layer`] checks it.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+struct HandlerJson;
+
+/// Debug builds: validates 200 [`Json`] responses of bundled methods against
+/// their output schema and turns a mismatch into a 500 (like the
+/// reference's output verifier), so handler bugs fail the test suite.
+/// Release builds: no layer at all.
+pub fn debug_output_layer<S: Clone + Send + Sync + 'static>(
+    r: axum::Router<S>,
+) -> axum::Router<S> {
+    #[cfg(debug_assertions)]
+    let r = r.layer(axum::middleware::from_fn(check_output));
+    r
+}
+
+#[cfg(debug_assertions)]
+async fn check_output(req: Request, next: axum::middleware::Next) -> Response {
+    let nsid = req.uri().path().strip_prefix("/xrpc/").map(String::from);
+    let resp = next.run(req).await;
+    let ours = resp.extensions().get::<HandlerJson>().is_some();
+    let Some(nsid) = nsid.filter(|_| resp.status() == StatusCode::OK && ours) else {
+        return resp;
+    };
+    let (parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => return XrpcError::internal(format!("reading response: {e}")).into_response(),
+    };
+    let checked = serde_json::from_slice::<serde_json::Value>(&bytes)
+        .map_err(|e| e.to_string())
+        .and_then(|v| crate::lexicon::validate_output(&nsid, &v));
+    if let Err(e) = checked {
+        tracing::error!(nsid, "invalid handler output: {e}");
+        return XrpcError::internal(format!("Invalid {nsid} output: {e}")).into_response();
+    }
+    Response::from_parts(parts, axum::body::Body::from(bytes))
 }

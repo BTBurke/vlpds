@@ -321,8 +321,11 @@ impl Browser {
     async fn absorb(&mut self, r: reqwest::Response) -> (u16, reqwest::header::HeaderMap, String) {
         let status = r.status().as_u16();
         let headers = r.headers().clone();
-        if let Some(sc) = headers.get("set-cookie").and_then(|v| v.to_str().ok()) {
-            self.cookie = Some(sc.split(';').next().unwrap().to_string());
+        for sc in headers.get_all("set-cookie") {
+            let c = sc.to_str().unwrap().split(';').next().unwrap();
+            if c.starts_with("vlpds-device=") {
+                self.cookie = Some(c.to_string());
+            }
         }
         (status, headers, r.text().await.unwrap())
     }
@@ -403,6 +406,27 @@ async fn authorize_interactive(
     let par = f.par(s, p, &state).await;
     assert_eq!(par.status, 201, "PAR: {}", par.body);
     let request_uri = par.body["request_uri"].as_str().unwrap().to_string();
+    let (st, h, body) = browser_consent(s, b, f, acct, &request_uri, &[]).await;
+    assert_eq!(st, 303, "{body}");
+    let (base, q) = location_params(&h);
+    assert_eq!(base, f.redirect_uri.split('?').next().unwrap());
+    assert_eq!(q.get("state"), Some(&state));
+    assert_eq!(q.get("iss"), Some(&s.base));
+    q.get("code").expect("code").clone()
+}
+
+/// Browser side of a pushed request: open the authorization page, pick or
+/// sign in to `acct`, and post "allow" on the consent page (with `extra`
+/// form fields). Returns the consent POST's response.
+async fn browser_consent(
+    s: &Srv,
+    b: &mut Browser,
+    f: &Flow<'_>,
+    acct: &Account,
+    request_uri: &str,
+    extra: &[(&str, &str)],
+) -> (u16, reqwest::header::HeaderMap, String) {
+    let request_uri = request_uri.to_string();
     let (st, h, html) = b.get(s, &f.authorize_url(s, &request_uri)).await;
     assert_eq!(st, 200, "{html}");
     let csp = h.get("content-security-policy").unwrap().to_str().unwrap();
@@ -455,24 +479,14 @@ async fn authorize_interactive(
         "expected consent page: {html}"
     );
     let csrf = csrf_of(&html);
-    let (st, h, body) = b
-        .post(
-            s,
-            "/oauth/authorize/consent",
-            &[
-                ("request_uri", &request_uri),
-                ("csrf", &csrf),
-                ("did", &acct.did),
-                ("action", "allow"),
-            ],
-        )
-        .await;
-    assert_eq!(st, 303, "{body}");
-    let (base, q) = location_params(&h);
-    assert_eq!(base, f.redirect_uri.split('?').next().unwrap());
-    assert_eq!(q.get("state"), Some(&state));
-    assert_eq!(q.get("iss"), Some(&s.base));
-    q.get("code").expect("code").clone()
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("request_uri", &request_uri),
+        ("csrf", &csrf),
+        ("did", &acct.did),
+        ("action", "allow"),
+    ];
+    pairs.extend_from_slice(extra);
+    b.post(s, "/oauth/authorize/consent", &pairs).await
 }
 
 async fn exchange(s: &Srv, f: &Flow<'_>, code: &str, p: &Pkce, extra: &[(&str, &str)]) -> Resp {
@@ -1749,7 +1763,10 @@ async fn totp_brute_force_lockout() {
     let cid = loopback_client_id("atproto", redirect);
     let f = Flow::new(&cid, redirect, "atproto", &key);
     let mut b = Browser::default();
-    let ru = f.par(&s, &pkce(), "t").await.body["request_uri"].as_str().unwrap().to_string();
+    let ru = f.par(&s, &pkce(), "t").await.body["request_uri"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let (_, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
     let csrf = csrf_of(&html);
     let password = [
@@ -1774,17 +1791,26 @@ async fn totp_brute_force_lockout() {
         (st, html)
     }
 
-    let (st, html) = b.post(&s, "/oauth/authorize/sign-in", &password).await.into_pair();
+    let (st, html) = b
+        .post(&s, "/oauth/authorize/sign-in", &password)
+        .await
+        .into_pair();
     assert_eq!(st, 200, "{html}");
     for _ in 0..2 {
         let (st, html) = post_owned(&mut b, &s, &totp("000000")).await;
         assert_eq!(st, 401);
-        assert!(html.contains("Invalid authenticator code") && html.contains("name=\"code\""), "{html}");
+        assert!(
+            html.contains("Invalid authenticator code") && html.contains("name=\"code\""),
+            "{html}"
+        );
     }
     // third wrong code on this pending sign-in: back to the password step
     let (st, html) = post_owned(&mut b, &s, &totp("000000")).await;
     assert_eq!(st, 429, "{html}");
-    assert!(html.contains("Too many invalid authenticator codes"), "{html}");
+    assert!(
+        html.contains("Too many invalid authenticator codes"),
+        "{html}"
+    );
     assert!(!html.contains("name=\"code\""), "{html}");
     // the pending step is gone: a right code alone no longer signs in
     let good = vlpds::totp::code_for_step(&secret, step + 1);
@@ -1793,19 +1819,30 @@ async fn totp_brute_force_lockout() {
     assert!(html.contains("timed out"), "{html}");
 
     // password again; the account counter is at 3, two more lock it
-    let (st, _) = b.post(&s, "/oauth/authorize/sign-in", &password).await.into_pair();
+    let (st, _) = b
+        .post(&s, "/oauth/authorize/sign-in", &password)
+        .await
+        .into_pair();
     assert_eq!(st, 200);
     let (st, _) = post_owned(&mut b, &s, &totp("111111")).await;
     assert_eq!(st, 401);
     let (st, html) = post_owned(&mut b, &s, &totp("222222")).await;
     assert_eq!(st, 429, "{html}");
-    let Ok(st) = vlpds::totp::load(&s.app, &acct.did).await else { panic!("load totp state") };
+    let Ok(st) = vlpds::totp::load(&s.app, &acct.did).await else {
+        panic!("load totp state")
+    };
     assert_eq!(st.failures, vlpds::totp::MAX_FAILURES);
-    assert!(st.locked_until > vlpds::totp::now_secs(), "lockout persisted");
+    assert!(
+        st.locked_until > vlpds::totp::now_secs(),
+        "lockout persisted"
+    );
 
     // locked: the password step itself is refused, and so is createSession
     // with a right code (shared counter)
-    let (st, html) = b.post(&s, "/oauth/authorize/sign-in", &password).await.into_pair();
+    let (st, html) = b
+        .post(&s, "/oauth/authorize/sign-in", &password)
+        .await
+        .into_pair();
     assert_eq!(st, 429, "{html}");
     let r = s
         .http
@@ -1837,9 +1874,19 @@ async fn account_page_error_codes() {
     let acct = create_account(&s, "ivan").await;
     let mut b = Browser::default();
     let evil = enc("<b>Your account is compromised, call 555-0100</b>");
-    let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1&error={evil}", s.base)).await;
-    assert!(!html.contains("compromised") && !html.contains("555-0100"), "{html}");
-    let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1&error=bad_code", s.base)).await;
+    let (_, _, html) = b
+        .get(&s, &format!("{}/oauth/account?add=1&error={evil}", s.base))
+        .await;
+    assert!(
+        !html.contains("compromised") && !html.contains("555-0100"),
+        "{html}"
+    );
+    let (_, _, html) = b
+        .get(
+            &s,
+            &format!("{}/oauth/account?add=1&error=bad_code", s.base),
+        )
+        .await;
     assert!(html.contains("Invalid authenticator code"), "{html}");
 
     let csrf = csrf_of(&html);
@@ -1847,12 +1894,21 @@ async fn account_page_error_codes() {
         .post(
             &s,
             "/oauth/account/sign-in",
-            &[("csrf", &csrf), ("identifier", &acct.handle), ("password", "wrong")],
+            &[
+                ("csrf", &csrf),
+                ("identifier", &acct.handle),
+                ("password", "wrong"),
+            ],
         )
         .await;
     assert_eq!(st, 303);
-    assert_eq!(h.get("location").unwrap(), "/oauth/account?add=1&error=invalid");
-    let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1&error=invalid", s.base)).await;
+    assert_eq!(
+        h.get("location").unwrap(),
+        "/oauth/account?add=1&error=invalid"
+    );
+    let (_, _, html) = b
+        .get(&s, &format!("{}/oauth/account?add=1&error=invalid", s.base))
+        .await;
     assert!(html.contains("Invalid handle or password"), "{html}");
 }
 
@@ -1864,13 +1920,636 @@ async fn sign_in_rate_limited() {
     let mut b = Browser::default();
     let (_, _, html) = b.get(&s, &format!("{}/oauth/account", s.base)).await;
     let csrf = csrf_of(&html);
-    let form = [("csrf", csrf.as_str()), ("identifier", "ghost.vlpds.test"), ("password", "x")];
+    let form = [
+        ("csrf", csrf.as_str()),
+        ("identifier", "ghost.vlpds.test"),
+        ("password", "x"),
+    ];
     for _ in 0..30 {
         let (_, h, _) = b.post(&s, "/oauth/account/sign-in", &form).await;
-        assert_eq!(h.get("location").unwrap(), "/oauth/account?add=1&error=invalid");
+        assert_eq!(
+            h.get("location").unwrap(),
+            "/oauth/account?add=1&error=invalid"
+        );
     }
     let (_, h, _) = b.post(&s, "/oauth/account/sign-in", &form).await;
-    assert_eq!(h.get("location").unwrap(), "/oauth/account?add=1&error=rate_limited");
-    let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1&error=rate_limited", s.base)).await;
+    assert_eq!(
+        h.get("location").unwrap(),
+        "/oauth/account?add=1&error=rate_limited"
+    );
+    let (_, _, html) = b
+        .get(
+            &s,
+            &format!("{}/oauth/account?add=1&error=rate_limited", s.base),
+        )
+        .await;
     assert!(html.contains("Too many sign-in attempts"), "{html}");
+}
+
+// ---------- JAR, response modes, prompt=create, scope narrowing, GC ----------
+
+/// Serves a client metadata document built from its own client_id.
+async fn serve_metadata(build: impl FnOnce(&str) -> J) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_id = format!(
+        "http://{}/client-metadata.json",
+        listener.local_addr().unwrap()
+    );
+    let md = build(&client_id);
+    let router = axum::Router::new().route(
+        "/client-metadata.json",
+        axum::routing::get(move || {
+            let md = md.clone();
+            async move { axum::Json(md) }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    client_id
+}
+
+fn unsecured_jwt(payload: &J) -> String {
+    format!(
+        "{}.{}.",
+        b64(serde_json::to_vec(&json!({"alg": "none"})).unwrap()),
+        b64(serde_json::to_vec(payload).unwrap())
+    )
+}
+
+fn hidden_field(html: &str, name: &str) -> Option<String> {
+    let pat = format!("name=\"{name}\" value=\"");
+    let i = html.find(&pat)? + pat.len();
+    Some(html[i..i + html[i..].find('"').unwrap()].replace("&amp;", "&"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jar_request_objects() {
+    let s = spawn().await;
+    let acct = create_account(&s, "jar").await;
+    let client_key = SigningKey::random(&mut rand::rngs::OsRng);
+    let pt = client_key.verifying_key().to_encoded_point(false);
+    let jwk = json!({"kty": "EC", "crv": "P-256", "x": b64(pt.x().unwrap()), "y": b64(pt.y().unwrap()), "kid": "k1", "alg": "ES256", "use": "sig"});
+    let redirect = "https://app.example.com/callback";
+    let client_id = serve_metadata(|id| {
+        json!({
+            "client_id": id,
+            "redirect_uris": [redirect],
+            "scope": "atproto transition:generic",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "private_key_jwt",
+            "token_endpoint_auth_signing_alg": "ES256",
+            "application_type": "web",
+            "dpop_bound_access_tokens": true,
+            "jwks": {"keys": [jwk]},
+        })
+    })
+    .await;
+    let assertion = || {
+        let header = json!({"alg": "ES256", "kid": "k1", "typ": "JWT"});
+        let payload = json!({"iss": client_id, "sub": client_id, "aud": s.base, "jti": rand_str(12), "iat": now(), "exp": now() + 60});
+        sign_jwt(&client_key, &header, &payload)
+    };
+    let key = DpopKey::new();
+    let p = pkce();
+    let claims = || {
+        json!({
+            "iss": client_id, "aud": s.base, "iat": now(), "jti": rand_str(12),
+            "client_id": client_id, "response_type": "code", "redirect_uri": redirect,
+            "scope": "atproto transition:generic", "state": "inner",
+            "code_challenge": p.challenge, "code_challenge_method": "S256",
+        })
+    };
+    let jar_header = json!({"alg": "ES256", "kid": "k1", "typ": "oauth-authz-req+jwt"});
+    let jar = |payload: &J| sign_jwt(&client_key, &jar_header, payload);
+    let par = |request: String| {
+        let a = assertion();
+        let (s, key, client_id) = (&s, &key, client_id.clone());
+        async move {
+            as_post(
+                s,
+                key,
+                "/oauth/par",
+                &[
+                    ("client_id", &client_id),
+                    (
+                        "client_assertion_type",
+                        "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                    ),
+                    ("client_assertion", &a),
+                    ("request", &request),
+                    // ignored: only the request object's parameters count
+                    ("state", "outer"),
+                ],
+            )
+            .await
+        }
+    };
+    let expect_invalid = |r: Resp, needle: &str| {
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert_eq!(r.body["error"], "invalid_request", "{}", r.body);
+        let d = r.body["error_description"].as_str().unwrap();
+        assert!(d.contains(needle), "{needle:?} not in {d:?}");
+    };
+
+    let mut c = claims();
+    c["aud"] = json!("https://elsewhere.example");
+    expect_invalid(par(jar(&c)).await, "\"aud\"");
+    let mut c = claims();
+    c["iat"] = json!(now() - 120);
+    expect_invalid(par(jar(&c)).await, "\"iat\"");
+    let mut c = claims();
+    c.as_object_mut().unwrap().remove("jti");
+    expect_invalid(par(jar(&c)).await, "\"jti\"");
+    let mut c = claims();
+    c["iss"] = json!("https://someone.else/client.json");
+    expect_invalid(par(jar(&c)).await, "\"iss\"");
+    let other = SigningKey::random(&mut rand::rngs::OsRng);
+    expect_invalid(
+        par(sign_jwt(&other, &jar_header, &claims())).await,
+        "signature verification failed",
+    );
+    expect_invalid(par(unsecured_jwt(&claims())).await, "unsecured");
+    let mut c = claims();
+    c["client_id"] = json!("http://localhost");
+    expect_invalid(par(jar(&c)).await, "does not match");
+    let mut c = claims();
+    c.as_object_mut().unwrap().remove("client_id");
+    expect_invalid(par(jar(&c)).await, "client_id");
+    expect_invalid(par("not-a-jwt".into()).await, "Invalid \"request\" object");
+
+    // a valid request object; its parameters (state=inner) win
+    let good = jar(&claims());
+    let r = par(good.clone()).await;
+    assert_eq!(r.status, 201, "{}", r.body);
+    let ru = r.body["request_uri"].as_str().unwrap().to_string();
+    // the same request object again: jti replay
+    expect_invalid(par(good).await, "replayed");
+
+    let f = Flow::new(&client_id, redirect, "atproto transition:generic", &key);
+    let mut b = Browser::default();
+    let (st, h, body) = browser_consent(&s, &mut b, &f, &acct, &ru, &[]).await;
+    assert_eq!(st, 303, "{body}");
+    let (_, q) = location_params(&h);
+    assert_eq!(q["state"], "inner");
+    let a = assertion();
+    let t = tokens(
+        &exchange(
+            &s,
+            &f,
+            &q["code"],
+            &p,
+            &[
+                (
+                    "client_assertion_type",
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                ),
+                ("client_assertion", &a),
+            ],
+        )
+        .await,
+    );
+    assert_eq!(t.scope, "atproto transition:generic");
+}
+
+/// A public client that registered `request_object_signing_alg: none` sends
+/// unsecured request objects (iss/aud optional); signed ones are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn jar_unsecured_request_objects() {
+    let s = spawn().await;
+    let redirect = "https://app.example.com/callback";
+    let client_id = serve_metadata(|id| {
+        json!({
+            "client_id": id,
+            "redirect_uris": [redirect],
+            "scope": "atproto",
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+            "request_object_signing_alg": "none",
+            "application_type": "web",
+            "dpop_bound_access_tokens": true,
+        })
+    })
+    .await;
+    let key = DpopKey::new();
+    let payload = |p: &Pkce| {
+        json!({
+            "iat": now(), "jti": rand_str(12), "client_id": client_id,
+            "response_type": "code", "redirect_uri": redirect, "scope": "atproto",
+            "code_challenge": p.challenge, "code_challenge_method": "S256",
+        })
+    };
+    let r = as_post(
+        &s,
+        &key,
+        "/oauth/par",
+        &[
+            ("client_id", &client_id),
+            ("request", &unsecured_jwt(&payload(&pkce()))),
+        ],
+    )
+    .await;
+    assert_eq!(r.status, 201, "{}", r.body);
+    let other = SigningKey::random(&mut rand::rngs::OsRng);
+    let signed = sign_jwt(&other, &json!({"alg": "ES256"}), &payload(&pkce()));
+    let r = as_post(
+        &s,
+        &key,
+        "/oauth/par",
+        &[("client_id", &client_id), ("request", &signed)],
+    )
+    .await;
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(r.body["error_description"]
+        .as_str()
+        .unwrap()
+        .contains("unsecured"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn response_modes_form_post_and_fragment() {
+    use base64::engine::general_purpose::STANDARD;
+    let s = spawn().await;
+    let acct = create_account(&s, "formpost").await;
+    let m: J = s
+        .http
+        .get(format!("{}/.well-known/oauth-authorization-server", s.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        m["response_modes_supported"],
+        json!(["query", "fragment", "form_post"])
+    );
+    assert_eq!(m["request_parameter_supported"], true);
+    assert!(m["request_object_signing_alg_values_supported"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("none")));
+
+    let key = DpopKey::new();
+    let redirect = "http://127.0.0.1/callback";
+    let cid = loopback_client_id("atproto transition:generic", redirect);
+    let mut f = Flow::new(&cid, redirect, "atproto transition:generic", &key);
+    f.extra = vec![("response_mode".into(), "form_post".into())];
+    let p = pkce();
+    let par = f.par(&s, &p, "fp-state").await;
+    assert_eq!(par.status, 201, "{}", par.body);
+    let ru = par.body["request_uri"].as_str().unwrap().to_string();
+    let mut b = Browser::default();
+    let (st, h, body) = browser_consent(&s, &mut b, &f, &acct, &ru, &[]).await;
+    assert_eq!(st, 200, "{body}");
+    assert!(h.get("location").is_none());
+    assert_eq!(h.get("cache-control").unwrap(), "no-store");
+    assert!(
+        body.contains("<form method=\"post\" action=\"http://127.0.0.1/callback\">"),
+        "{body}"
+    );
+    assert_eq!(hidden_field(&body, "state").as_deref(), Some("fp-state"));
+    assert_eq!(hidden_field(&body, "iss"), Some(s.base.clone()));
+    let code = hidden_field(&body, "code").expect("code field");
+    // CSP: only the inline auto-submit script (by hash), and the form may
+    // post to the client's redirect origin
+    let csp = h.get("content-security-policy").unwrap().to_str().unwrap();
+    let i = body.find("<script>").unwrap() + "<script>".len();
+    let script = &body[i..i + body[i..].find("</script>").unwrap()];
+    let hash = STANDARD.encode(Sha256::digest(script));
+    assert!(
+        csp.contains(&format!("script-src 'sha256-{hash}'")),
+        "{csp}"
+    );
+    assert!(csp.contains("form-action 'self' http://127.0.0.1"), "{csp}");
+    assert!(csp.contains("default-src 'none'"), "{csp}");
+    tokens(&exchange(&s, &f, &code, &p, &[]).await);
+
+    // errors use the same response mode
+    let par = f.par(&s, &pkce(), "fp-deny").await;
+    let ru = par.body["request_uri"].as_str().unwrap().to_string();
+    let (_, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
+    let csrf = csrf_of(&html);
+    let (st, _, body) = b
+        .post(
+            &s,
+            "/oauth/authorize/consent",
+            &[("request_uri", &ru), ("csrf", &csrf), ("action", "deny")],
+        )
+        .await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(
+        hidden_field(&body, "error").as_deref(),
+        Some("access_denied")
+    );
+    assert_eq!(hidden_field(&body, "state").as_deref(), Some("fp-deny"));
+
+    // fragment: the response is in the redirect's fragment
+    f.extra = vec![("response_mode".into(), "fragment".into())];
+    let p = pkce();
+    let par = f.par(&s, &p, "frag").await;
+    let ru = par.body["request_uri"].as_str().unwrap().to_string();
+    let (st, h, body) = browser_consent(&s, &mut b, &f, &acct, &ru, &[]).await;
+    assert_eq!(st, 303, "{body}");
+    let loc = h.get("location").unwrap().to_str().unwrap();
+    assert!(loc.starts_with("http://127.0.0.1/callback#"), "{loc}");
+    let (_, q) = location_params(&h);
+    assert_eq!(q["state"], "frag");
+    tokens(&exchange(&s, &f, &q["code"], &p, &[]).await);
+
+    // unknown response modes are refused at PAR
+    f.extra = vec![("response_mode".into(), "web_message".into())];
+    let r = f.par(&s, &pkce(), "x").await;
+    assert_eq!(r.status, 400, "{}", r.body);
+}
+
+/// prompt=create: no sign-up exists in the authorization UI, so it falls
+/// back to sign-in / account choice (the reference without user domains),
+/// still with consent for public clients.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prompt_create_falls_back_to_sign_in() {
+    let s = spawn().await;
+    let acct = create_account(&s, "creator").await;
+    let m: J = s
+        .http
+        .get(format!("{}/.well-known/oauth-authorization-server", s.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(m["prompt_values_supported"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("create")));
+    let key = DpopKey::new();
+    let redirect = "http://127.0.0.1/callback";
+    let cid = loopback_client_id("atproto", redirect);
+    let mut f = Flow::new(&cid, redirect, "atproto", &key);
+    f.extra = vec![("prompt".into(), "create".into())];
+    let mut b = Browser::default();
+    let par = f.par(&s, &pkce(), "c1").await;
+    assert_eq!(par.status, 201, "{}", par.body);
+    let ru = par.body["request_uri"].as_str().unwrap().to_string();
+    let (st, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
+    assert_eq!(st, 200);
+    assert!(
+        html.contains("name=\"password\""),
+        "sign-in expected: {html}"
+    );
+    // sign in, then the public client still gets the consent page
+    let (st, h, body) = browser_consent(&s, &mut b, &f, &acct, &ru, &[]).await;
+    assert_eq!(st, 303, "{body}");
+    assert!(location_params(&h).1.contains_key("code"));
+
+    // signed in on this device: the chooser, not straight to consent
+    let par = f.par(&s, &pkce(), "c2").await;
+    let ru = par.body["request_uri"].as_str().unwrap().to_string();
+    let (_, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
+    assert!(html.contains("Choose an account"), "{html}");
+    // with a matching login_hint: sign-in pre-filled (no hint shortcut)...
+    f.extra.push(("login_hint".into(), acct.handle.clone()));
+    let par = f.par(&s, &pkce(), "c3").await;
+    let ru = par.body["request_uri"].as_str().unwrap().to_string();
+    let (_, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
+    assert!(html.contains("name=\"password\""), "{html}");
+    assert!(html.contains(&acct.handle), "{html}");
+    // ...whereas without prompt=create the hint goes to consent
+    f.extra.remove(0);
+    let par = f.par(&s, &pkce(), "c4").await;
+    let ru = par.body["request_uri"].as_str().unwrap().to_string();
+    let (_, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
+    assert!(html.contains("Authorize access"), "{html}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consent_scope_narrowing() {
+    let s = spawn().await;
+    let acct = create_account(&s, "narrow").await;
+    let key = DpopKey::new();
+    let redirect = "http://127.0.0.1/callback";
+    let scope = "atproto account:email repo:app.bsky.feed.post";
+    let cid = loopback_client_id(scope, redirect);
+    let mut f = Flow::new(&cid, redirect, scope, &key);
+    let mut b = Browser::default();
+    // run one flow; returns the consent POST's response and the granted
+    // token scope (if a code was issued)
+    async fn grant(
+        s: &Srv,
+        b: &mut Browser,
+        f: &Flow<'_>,
+        acct: &Account,
+        extra: &[(&str, &str)],
+    ) -> (HashMap<String, String>, Option<String>) {
+        let p = pkce();
+        let par = f.par(s, &p, "n").await;
+        assert_eq!(par.status, 201, "{}", par.body);
+        let ru = par.body["request_uri"].as_str().unwrap().to_string();
+        let (st, h, body) = browser_consent(s, b, f, acct, &ru, extra).await;
+        assert_eq!(st, 303, "{body}");
+        let (_, q) = location_params(&h);
+        let scope = match q.get("code") {
+            Some(code) => Some(tokens(&exchange(s, f, code, &p, &[]).await).scope),
+            None => None,
+        };
+        (q, scope)
+    }
+
+    // allowed as requested
+    let (_, sc) = grant(&s, &mut b, &f, &acct, &[]).await;
+    assert_eq!(sc.as_deref(), Some(scope));
+    // the consent page offers to withhold the email address
+    f.extra = vec![("login_hint".into(), acct.handle.clone())];
+    let par = f.par(&s, &pkce(), "page").await;
+    let ru = par.body["request_uri"].as_str().unwrap().to_string();
+    let (_, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
+    assert!(html.contains("name=\"allow_email\""), "{html}");
+    assert!(html.contains("name=\"email_choice\""), "{html}");
+    // checkbox cleared: the token has no account:email
+    let (_, sc) = grant(&s, &mut b, &f, &acct, &[("email_choice", "1")]).await;
+    assert_eq!(sc.as_deref(), Some("atproto repo:app.bsky.feed.post"));
+    // checkbox kept
+    let (_, sc) = grant(
+        &s,
+        &mut b,
+        &f,
+        &acct,
+        &[("email_choice", "1"), ("allow_email", "1")],
+    )
+    .await;
+    assert_eq!(sc.as_deref(), Some(scope));
+    // explicit scope override: intersection only (nothing can be added)
+    let (_, sc) = grant(
+        &s,
+        &mut b,
+        &f,
+        &acct,
+        &[(
+            "scope",
+            "atproto transition:generic repo:app.bsky.feed.post",
+        )],
+    )
+    .await;
+    assert_eq!(sc.as_deref(), Some("atproto repo:app.bsky.feed.post"));
+    // removing atproto is a denial
+    let (q, sc) = grant(
+        &s,
+        &mut b,
+        &f,
+        &acct,
+        &[("scope", "repo:app.bsky.feed.post")],
+    )
+    .await;
+    assert_eq!(sc, None);
+    assert_eq!(q["error"], "access_denied");
+    // the narrowed grant is what the session holds
+    let sessions = vlpds::oauth::store::list_sessions(&s.app, &acct.did)
+        .await
+        .unwrap();
+    assert!(sessions
+        .iter()
+        .any(|x| x.scope == "atproto repo:app.bsky.feed.post"));
+
+    // transition scopes cannot be narrowed: no checkbox
+    let scope2 = "atproto transition:generic account:email";
+    let cid2 = loopback_client_id(scope2, redirect);
+    let mut f2 = Flow::new(&cid2, redirect, scope2, &key);
+    f2.extra = vec![("login_hint".into(), acct.handle.clone())];
+    let par = f2.par(&s, &pkce(), "page2").await;
+    assert_eq!(par.status, 201, "{}", par.body);
+    let ru = par.body["request_uri"].as_str().unwrap().to_string();
+    let (_, _, html) = b.get(&s, &f2.authorize_url(&s, &ru)).await;
+    assert!(html.contains("Authorize access"), "{html}");
+    assert!(!html.contains("allow_email"), "{html}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_sweeps_expired_rows() {
+    use vlpds::oauth::gc::Sweeper;
+    use vlpds::oauth::store;
+    let s = spawn().await;
+    let acct = create_account(&s, "gc").await;
+    let key = DpopKey::new();
+    let redirect = "http://127.0.0.1/callback";
+    let cid = loopback_client_id("atproto transition:generic", redirect);
+    let f = Flow::new(&cid, redirect, "atproto transition:generic", &key);
+    let mut b = Browser::default();
+    // a full grant: consumed request, code challenge, device, session
+    let p = pkce();
+    let code = authorize_interactive(&s, &mut b, &f, &acct, &p).await;
+    let t = tokens(&exchange(&s, &f, &code, &p, &[]).await);
+    let consumed_rid = store::code_request_id(&code).unwrap();
+    let device_id = b
+        .cookie
+        .clone()
+        .unwrap()
+        .split_once('=')
+        .unwrap()
+        .1
+        .to_string();
+    // a pending (unauthorized) request
+    let p2 = pkce();
+    let par = f.par(&s, &p2, "pending").await;
+    let pending_uri = par.body["request_uri"].as_str().unwrap().to_string();
+    let pending_rid = store::request_id_from_uri(&pending_uri)
+        .unwrap()
+        .to_string();
+
+    let mut sw = Sweeper::new();
+    let now = now();
+    // nothing is expired yet
+    let st = sw.tick(&s.app, now, 10_000, 10_000).await.unwrap();
+    assert_eq!(st.removed, 0, "{st:?}");
+    assert!(st.scanned > 0);
+    // past the PAR lifetime: only the pending request goes; the consumed
+    // request stays as a code-reuse tombstone
+    let st = sw.tick(&s.app, now + 6 * 60, 10_000, 10_000).await.unwrap();
+    assert_eq!(st.removed, 1, "{st:?}");
+    assert!(store::get_request(&s.app, &pending_rid)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store::get_request(&s.app, &consumed_rid)
+        .await
+        .unwrap()
+        .is_some());
+    let (st_code, _, html) = b.get(&s, &f.authorize_url(&s, &pending_uri)).await;
+    assert_eq!(st_code, 400);
+    assert!(html.contains("Unknown request_uri"), "{html}");
+    // code challenges are claimed for 24 h
+    let r = f.par(&s, &p2, "again").await;
+    assert_eq!(r.status, 400, "{}", r.body);
+    let st = sw
+        .tick(&s.app, now + 86_400 + 60, 10_000, 10_000)
+        .await
+        .unwrap();
+    assert_eq!(st.removed, 2, "two code challenges: {st:?}");
+    let r = f.par(&s, &p2, "again").await;
+    assert_eq!(r.status, 201, "{}", r.body);
+    // 15 days on: the public client's session, the idle device and the
+    // tombstone are gone (the new PAR request too)
+    assert_eq!(
+        store::list_sessions(&s.app, &acct.did).await.unwrap().len(),
+        1
+    );
+    let st = sw
+        .tick(&s.app, now + 15 * 86_400, 10_000, 10_000)
+        .await
+        .unwrap();
+    assert!(st.removed >= 4, "{st:?}");
+    assert!(store::list_sessions(&s.app, &acct.did)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store::get_device(&s.app, &device_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store::get_request(&s.app, &consumed_rid)
+        .await
+        .unwrap()
+        .is_none());
+    let r = refresh(&s, &f, t.refresh.as_ref().unwrap(), &[]).await;
+    assert_eq!(r.body["error"], "invalid_grant", "{}", r.body);
+}
+
+/// Each tick does bounded work and resumes where it stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_work_is_bounded_per_tick() {
+    use vlpds::oauth::gc::Sweeper;
+    let s = spawn().await;
+    let key = DpopKey::new();
+    let redirect = "http://127.0.0.1/callback";
+    let cid = loopback_client_id("atproto", redirect);
+    let f = Flow::new(&cid, redirect, "atproto", &key);
+    for i in 0..3 {
+        let r = f.par(&s, &pkce(), &format!("s{i}")).await;
+        assert_eq!(r.status, 201);
+    }
+    let later = now() + 6 * 60;
+    // delete budget 1: one request per tick
+    let mut sw = Sweeper::new();
+    for _ in 0..3 {
+        let st = sw.tick(&s.app, later, 10_000, 1).await.unwrap();
+        assert_eq!(st.removed, 1, "{st:?}");
+    }
+    assert_eq!(sw.tick(&s.app, later, 10_000, 1).await.unwrap().removed, 0);
+    // scan budget 1: one key examined per partition per tick, the cursor
+    // carries on, and everything is found within a bounded number of ticks
+    for i in 0..3 {
+        f.par(&s, &pkce(), &format!("t{i}")).await;
+    }
+    let mut sw = Sweeper::new();
+    let parts = s.app.partitions.owned().len();
+    let mut removed = 0;
+    for _ in 0..200 {
+        let st = sw.tick(&s.app, later, 1, 10_000).await.unwrap();
+        assert!(st.scanned <= parts, "{st:?}");
+        removed += st.removed;
+        if removed == 3 {
+            break;
+        }
+    }
+    assert_eq!(removed, 3);
 }

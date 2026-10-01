@@ -214,6 +214,19 @@ impl ReplayCache {
         }
     }
 
+    /// Drops expired entries (also done lazily by `insert_unique`; the OAuth
+    /// GC task calls this so an idle cache does not hold its peak size).
+    /// Returns how many were removed.
+    pub fn sweep(&self) -> usize {
+        let now = now_secs();
+        let mut g = self.inner.lock();
+        let (map, last_sweep) = &mut *g;
+        let before = map.len();
+        map.retain(|_, exp| *exp > now);
+        *last_sweep = now;
+        before - map.len()
+    }
+
     /// Records `key` until `expires_at` (unix secs). Returns false if it was
     /// already present (a replay).
     pub fn insert_unique(&self, key: &str, expires_at: i64) -> bool {

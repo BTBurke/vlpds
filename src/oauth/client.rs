@@ -26,6 +26,11 @@ pub const SESSION_LIFETIME_EXTENDED: i64 = 730 * DAY;
 pub const REFRESH_LIFETIME_EXTENDED: i64 = 91 * DAY;
 /// Client assertions must be younger than this (seconds).
 const CLIENT_ASSERTION_MAX_AGE: i64 = 60;
+/// Request objects (JAR) must be younger than this (RFC 9101 §10.2: "less
+/// than a minute"; the reference's `JAR_MAX_AGE`).
+pub const JAR_MAX_AGE: i64 = 59;
+/// Accepted clock skew for `iat` / `nbf` in the future (seconds).
+const CLOCK_TOLERANCE: i64 = 10;
 
 const METADATA_MAX_BYTES: usize = 64 << 10;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -247,6 +252,122 @@ impl Client {
 }
 
 static ASSERTION_JTIS: LazyLock<ReplayCache> = LazyLock::new(|| ReplayCache::new(1_000_000));
+/// Request object `jti`s (per client). Process-local, like the assertion
+/// cache (see the HA note in mod.rs).
+static JAR_JTIS: LazyLock<ReplayCache> = LazyLock::new(|| ReplayCache::new(1_000_000));
+
+/// Drops expired client-assertion and request-object `jti`s (OAuth GC task).
+pub fn sweep_replay_caches() -> usize {
+    ASSERTION_JTIS.sweep() + JAR_JTIS.sweep()
+}
+
+impl Client {
+    /// Verifies a JWT-secured authorization request (RFC 9101 request
+    /// object, `Client.decodeRequestObject` + `decodeJAR` in the reference)
+    /// and returns its payload.
+    ///
+    /// Signed with one of the client's keys (`jwks` / `jwks_uri`), with
+    /// `iss` = client_id and `aud` = our issuer; or unsecured (`alg: none`)
+    /// only when the client registered `request_object_signing_alg: "none"`,
+    /// in which case `iss` / `aud` are optional but checked when present.
+    /// `iat` is required and must be under [`JAR_MAX_AGE`]; `jti` is required
+    /// and single-use.
+    pub fn decode_request_object(&self, jar: &str, issuer: &str) -> Result<J, OAuthError> {
+        let fail =
+            |m: &str| OAuthError::invalid_request(&format!("Invalid \"request\" object: {m}"));
+        let jwt = DecodedJwt::decode(jar).map_err(|e| fail(&e))?;
+        let registered = self
+            .metadata
+            .get("request_object_signing_alg")
+            .and_then(|v| v.as_str());
+        let alg = jwt.alg();
+        let unsecured = registered == Some("none");
+        if unsecured {
+            if !jwt.is_unsecured() {
+                return Err(fail(
+                    "expected an unsecured (\"alg\": \"none\") request object",
+                ));
+            }
+        } else {
+            if alg == "none" {
+                return Err(fail(
+                    "unsecured request objects are not allowed for this client",
+                ));
+            }
+            if !super::jose::VERIFY_ALGS.contains(&alg) || registered.is_some_and(|r| r != alg) {
+                return Err(fail("unsupported \"alg\""));
+            }
+            let kid = jwt.header.get("kid").and_then(|v| v.as_str());
+            let candidates: Vec<&J> = self
+                .jwks
+                .iter()
+                .filter(|k| kid.is_none() || k.get("kid").and_then(|v| v.as_str()) == kid)
+                .filter(|k| {
+                    k.get("use")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|u| u == "sig")
+                })
+                .filter(|k| {
+                    k.get("alg")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|a| a == alg)
+                })
+                .collect();
+            if candidates.is_empty() {
+                return Err(fail("no applicable key found in the client JWKS"));
+            }
+            let verified = candidates
+                .iter()
+                .any(|k| jwk_to_key(k).is_ok_and(|key| jwt.verify_es256(&key)));
+            if !verified {
+                return Err(fail("signature verification failed"));
+            }
+        }
+        // iss / aud: required when signed (jose `jwtVerify` with issuer +
+        // audience), checked only when present for unsecured objects.
+        match jwt.payload.get("iss") {
+            None if unsecured => {}
+            Some(J::String(i)) if *i == self.id => {}
+            _ => return Err(fail("unexpected \"iss\" claim value")),
+        }
+        let aud_ok = match jwt.payload.get("aud") {
+            None => unsecured,
+            Some(J::String(a)) => a == issuer,
+            Some(J::Array(a)) => a.iter().any(|x| x.as_str() == Some(issuer)),
+            _ => false,
+        };
+        if !aud_ok {
+            return Err(fail("unexpected \"aud\" claim value"));
+        }
+        let now = now_secs();
+        let iat = jwt
+            .claim_i64("iat")
+            .ok_or_else(|| fail("missing \"iat\" claim"))?;
+        if iat > now + CLOCK_TOLERANCE || now - iat > JAR_MAX_AGE {
+            return Err(fail("\"iat\" claim timestamp check failed"));
+        }
+        if jwt.claim_i64("exp").is_some_and(|exp| exp <= now) {
+            return Err(fail("\"exp\" claim timestamp check failed"));
+        }
+        if jwt
+            .claim_i64("nbf")
+            .is_some_and(|nbf| nbf > now + CLOCK_TOLERANCE)
+        {
+            return Err(fail("\"nbf\" claim timestamp check failed"));
+        }
+        let jti = jwt
+            .claim_str("jti")
+            .filter(|j| !j.is_empty())
+            .ok_or_else(|| {
+                OAuthError::invalid_request("Request object payload must contain a \"jti\" claim")
+            })?;
+        let until = iat.max(now) + JAR_MAX_AGE + CLOCK_TOLERANCE;
+        if !JAR_JTIS.insert_unique(&format!("{}\0{jti}", self.id), until) {
+            return Err(OAuthError::invalid_request("Request object was replayed"));
+        }
+        Ok(jwt.payload)
+    }
+}
 
 /// Client credentials from a PAR / token / revocation request body.
 #[derive(Clone, Debug, Default)]
@@ -798,6 +919,10 @@ pub fn validate_metadata(
         "none" => {
             if gs("token_endpoint_auth_signing_alg").is_some() {
                 return Err(bad("token_endpoint_auth_method \"none\" must not have token_endpoint_auth_signing_alg"));
+            }
+            // Public clients may still sign request objects (JAR).
+            if let Some(j) = md.get("jwks") {
+                jwks = parse_jwks(j)?;
             }
         }
         "private_key_jwt" => {

@@ -61,6 +61,11 @@ pub struct Config {
     /// `x-ratelimit-bypass` header value that skips rate limits (reference
     /// PDS_RATE_LIMIT_BYPASS_KEY).
     pub rate_limit_bypass_key: Option<String>,
+    /// Opt-in dynamic lexicon resolution for record validation
+    /// (src/lexicon.rs): record types without a bundled schema are resolved
+    /// over the network and validated; a write waits at most this long for a
+    /// resolution (else `validationStatus: "unknown"`). None = off.
+    pub resolve_lexicons: Option<Duration>,
 }
 
 /// Well-known secrets: only accepted with `dev_mode` (see [`Config::check_secrets`]).
@@ -132,6 +137,7 @@ impl Default for Config {
             rate_limits_enabled: true,
             trusted_proxies: Vec::new(),
             rate_limit_bypass_key: None,
+            resolve_lexicons: None,
         }
     }
 }

@@ -125,7 +125,9 @@ fn main_def(nsid: &str, doc: &J) -> Result<J, String> {
     Ok(main.clone())
 }
 
-async fn resolve(app: &App, nsid: &str) -> Result<(String, J), String> {
+/// Resolves and fetches the lexicon document for `nsid` (at-uri, doc),
+/// uncached. Also used for record validation (crate::lexicon).
+pub(crate) async fn resolve(app: &App, nsid: &str) -> Result<(String, J), String> {
     let did = resolve_authority(nsid).await?;
     let uri = format!("at://{did}/{LEXICON_COLLECTION}/{nsid}");
     let doc = fetch_record(app, &did, nsid)

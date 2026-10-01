@@ -199,12 +199,16 @@ pub fn router(app: Arc<App>) -> Router {
             get(|| async { Json(json!({"version": "vlpds"})) }),
         )
         .route("/metrics", get(|| async { metrics::render() }))
-        .merge(server::routes())
-        .merge(identity::routes())
-        .merge(repo::routes())
-        .merge(sync::routes())
-        .merge(blobs::routes())
-        .merge(admin::routes())
+        // locally served XRPC methods; debug builds check their output schemas
+        .merge(extract::debug_output_layer(
+            Router::new()
+                .merge(server::routes())
+                .merge(identity::routes())
+                .merge(repo::routes())
+                .merge(sync::routes())
+                .merge(blobs::routes())
+                .merge(admin::routes()),
+        ))
         .merge(proxy::routes())
         .fallback(proxy::fallback)
         .merge(oauth::routes())

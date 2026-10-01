@@ -116,6 +116,11 @@ struct Args {
     /// Require an invite code for createAccount.
     #[arg(long, env = "VLPDS_INVITE_REQUIRED")]
     invite_required: bool,
+    /// Resolve the lexicons of record types without a bundled schema (DNS
+    /// `_lexicon` TXT -> DID -> com.atproto.lexicon.schema record) and
+    /// validate those records too, instead of reporting them "unknown".
+    #[arg(long, env = "VLPDS_RESOLVE_LEXICONS")]
+    resolve_lexicons: bool,
     /// Accepted for script compatibility; every node runs the cluster protocol
     /// (a lone node is a one-node cluster).
     #[arg(long, env = "VLPDS_CLUSTER")]
@@ -211,6 +216,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         plc_url: args.plc_url.clone(),
         invite_required: args.invite_required,
         rate_limits_enabled: !args.no_rate_limits,
+        resolve_lexicons: args
+            .resolve_lexicons
+            .then_some(vlpds::lexicon::RESOLVE_TIMEOUT),
         trusted_proxies: args.trusted_proxies.clone(),
         rate_limit_bypass_key: args.rate_limit_bypass_key.clone(),
         cluster: Some(vlpds::cluster::ClusterConfig {
@@ -230,6 +238,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // background services
     vlpds::xrpc::spawn_blob_gc(app.clone());
     vlpds::xrpc::spawn_reserved_key_gc(app.clone());
+    vlpds::oauth::gc::spawn_gc(app.clone());
     tokio::spawn(vlpds::xrpc::request_crawl(app.clone()));
     let router = server::with_forwarding(&app, vlpds::xrpc::router(app.clone()));
     tokio::select! {

@@ -179,14 +179,17 @@ async fn authorization_server_metadata(State(app): AppState) -> Response {
         "scopes_supported": ["atproto", "transition:email", "transition:generic", "transition:chat.bsky"],
         "subject_types_supported": ["public"],
         "response_types_supported": ["code"],
-        "response_modes_supported": ["query", "fragment"],
+        "response_modes_supported": ["query", "fragment", "form_post"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "ui_locales_supported": ["en-US"],
         "display_values_supported": ["page", "popup", "touch"],
-        "prompt_values_supported": ["none", "login", "consent", "select_account"],
+        "prompt_values_supported": ["none", "login", "consent", "select_account", "create"],
         "authorization_response_iss_parameter_supported": true,
-        "request_parameter_supported": false,
+        "request_object_signing_alg_values_supported": [jose::VERIFY_ALGS[0], "none"],
+        "request_object_encryption_alg_values_supported": [],
+        "request_object_encryption_enc_values_supported": [],
+        "request_parameter_supported": true,
         "request_uri_parameter_supported": true,
         "require_request_uri_registration": true,
         "jwks_uri": format!("{iss}/oauth/jwks"),
@@ -301,6 +304,16 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
     let creds = ClientCredentials::from_params(&p)?;
     let client = client::get_client(&creds.client_id, app.config.dev_mode).await?;
     let client_auth = client.authenticate(&creds, &issuer(app))?;
+    if p.contains_key("request_uri") {
+        return Err(OAuthError::invalid_request(
+            "\"request_uri\" is not supported in pushed authorization requests",
+        ));
+    }
+    // JAR (RFC 9101): only the request object's parameters are used.
+    let p = match p.get("request") {
+        Some(jar) => request_object_params(&client.decode_request_object(jar, &issuer(app))?)?,
+        None => p,
+    };
     let params = validate_authorization_request(app, &client, &p, &proof).await?;
     if !store::claim_code_challenge(app, &params.code_challenge).await? {
         return Err(OAuthError::invalid_request(
@@ -322,6 +335,41 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
     };
     store::put_request(app, &id, Some(&req)).await?;
     Ok(json!({"request_uri": store::request_uri(&id), "expires_in": PAR_EXPIRES_IN - 1}))
+}
+
+/// Authorization request parameters from a verified request object payload
+/// (`oauthAuthorizationRequestParametersSchema` in the reference): string
+/// values as-is, scalars stringified, registered JWT claims dropped.
+fn request_object_params(payload: &J) -> Result<HashMap<String, String>, OAuthError> {
+    let bad = |k: &str| {
+        OAuthError::invalid_request(&format!("Invalid parameters in JAR: invalid \"{k}\""))
+    };
+    let obj = payload
+        .as_object()
+        .ok_or_else(|| OAuthError::invalid_request("Invalid parameters in JAR"))?;
+    let mut out = HashMap::new();
+    for (k, v) in obj {
+        if matches!(
+            k.as_str(),
+            "iss" | "aud" | "sub" | "iat" | "exp" | "nbf" | "jti"
+        ) {
+            continue;
+        }
+        let s = match v {
+            J::Null => continue,
+            J::String(s) => s.clone(),
+            J::Number(n) => n.to_string(),
+            J::Bool(b) => b.to_string(),
+            // rejected with its own error by validate_authorization_request
+            J::Array(_) if k == "authorization_details" => v.to_string(),
+            _ => return Err(bad(k)),
+        };
+        out.insert(k.clone(), s);
+    }
+    if !out.contains_key("client_id") {
+        return Err(bad("client_id"));
+    }
+    Ok(out)
 }
 
 fn is_valid_handle(h: &str) -> bool {
@@ -350,6 +398,11 @@ async fn validate_authorization_request(
     proof: &DpopProof,
 ) -> Result<AuthParams, OAuthError> {
     let g = |k: &str| p.get(k).filter(|v| !v.is_empty()).cloned();
+    if g("client_id").is_some_and(|c| c != client.id) {
+        return Err(OAuthError::invalid_request(
+            "The \"client_id\" parameter field does not match the value used to authenticate the client",
+        ));
+    }
     for k in ["request", "request_uri"] {
         if p.contains_key(k) {
             return Err(OAuthError::invalid_request(&format!(
@@ -450,7 +503,7 @@ async fn validate_authorization_request(
     }
     let response_mode = g("response_mode");
     match response_mode.as_deref() {
-        None | Some("query") | Some("fragment") => {}
+        None | Some("query") | Some("fragment") | Some("form_post") => {}
         Some(m) => {
             return Err(OAuthError::invalid_request(&format!(
                 "Unsupported response_mode \"{m}\""
@@ -459,7 +512,12 @@ async fn validate_authorization_request(
     }
     let mut prompt = g("prompt");
     match prompt.as_deref() {
-        None | Some("none") | Some("login") | Some("consent") | Some("select_account") => {}
+        None
+        | Some("none")
+        | Some("login")
+        | Some("consent")
+        | Some("select_account")
+        | Some("create") => {}
         Some(v) => {
             return Err(OAuthError::invalid_request(&format!(
                 "Unsupported prompt \"{v}\""
@@ -467,7 +525,8 @@ async fn validate_authorization_request(
         }
     }
     // atproto: public (unauthenticated) clients may not sign in silently and
-    // always get the consent screen.
+    // always get the consent screen (unless they ask for account creation,
+    // which keeps its prompt; consent_required still holds for them).
     if !client.is_confidential() {
         if prompt.as_deref() == Some("none") {
             return Err(OAuthError::new(
@@ -476,7 +535,9 @@ async fn validate_authorization_request(
                 "Public clients are not allowed to use silent-sign-on",
             ));
         }
-        prompt = Some("consent".into());
+        if prompt.as_deref() != Some("create") {
+            prompt = Some("consent".into());
+        }
     }
     let login_hint = match g("login_hint") {
         Some(h) => {
@@ -662,12 +723,36 @@ fn error_page(app: &App, status: StatusCode, title: &str, msg: &str) -> Response
     html(app, status, ui::error(title, msg), &[], None)
 }
 
-/// Builds the redirect back to the client (RFC 6749 §4.1.2 + RFC 9207 `iss`).
+/// Builds the redirect back to the client (RFC 6749 §4.1.2 + RFC 9207 `iss`)
+/// in the request's response mode: query (default), fragment, or form_post
+/// (an auto-submitting form page).
 fn client_redirect(app: &App, params: &AuthParams, mut pairs: Vec<(String, String)>) -> Response {
     if let Some(s) = &params.state {
         pairs.push(("state".into(), s.clone()));
     }
     pairs.push(("iss".into(), issuer(app)));
+    if params.response_mode.as_deref() == Some("form_post") {
+        let form_action: Vec<String> = redirect_source(&params.redirect_uri).into_iter().collect();
+        let mut r = html(
+            app,
+            StatusCode::OK,
+            ui::form_post(&params.redirect_uri, &pairs),
+            &form_action,
+            None,
+        );
+        let h = r.headers_mut();
+        h.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_str(&ui::csp_form_post(&form_action)).unwrap(),
+        );
+        // Keep the page out of the back/forward cache, so going "back" never
+        // re-posts the response (as the reference does).
+        h.append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("bfCacheBypass=1; Path=/; Max-Age=1; SameSite=Lax"),
+        );
+        return r;
+    }
     let enc = ou::form_encode(&pairs);
     let url = if params.response_mode.as_deref() == Some("fragment") {
         format!(
@@ -860,7 +945,7 @@ fn hint_matches(hint: &str, did: &str, handle: &str) -> bool {
 }
 
 async fn consent_required(app: &App, flow: &Flow, did: &str) -> Result<bool, OAuthError> {
-    if flow.req.params.prompt.as_deref() == Some("consent") {
+    if flow.req.params.prompt.as_deref() == Some("consent") || !flow.client.is_confidential() {
         return Ok(true);
     }
     let Some(a) = store::get_authorization(app, did, &flow.client.id).await? else {
@@ -933,7 +1018,14 @@ async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
     let perms = ui::describe_scopes(&flow.req.params.scope, &sets);
     let csrf = flow.csrf(app);
     let name = server_name(app);
-    let body = ui::consent(&flow.ctx(&csrf, &name), did, &acct.handle, &perms);
+    let email_choice = can_withhold_email(&flow.req.params.scope);
+    let body = ui::consent(
+        &flow.ctx(&csrf, &name),
+        did,
+        &acct.handle,
+        &perms,
+        email_choice,
+    );
     flow.page(app, body)
 }
 
@@ -983,7 +1075,7 @@ async fn issue_code(app: &App, mut flow: Flow, did: &str) -> Response {
     let mut r = client_redirect(app, &flow.req.params, vec![("code".into(), code)]);
     if flow.new_cookie {
         r.headers_mut()
-            .insert(header::SET_COOKIE, device_cookie(app, &flow.device));
+            .append(header::SET_COOKIE, device_cookie(app, &flow.device));
     }
     r
 }
@@ -1048,6 +1140,14 @@ async fn authorize(
             }
         }
         Some("login") => login_page(&app, &flow, &hint, None, false, StatusCode::OK),
+        // prompt=create: there is no sign-up in the authorization UI (account
+        // creation is createAccount only), so this behaves like the
+        // reference without available user domains: the sign-in / account
+        // chooser, without the login_hint shortcut to consent.
+        Some("create") if hint.is_empty() && !accounts.is_empty() => {
+            chooser_page(&app, &flow, &accounts)
+        }
+        Some("create") => login_page(&app, &flow, &hint, None, false, StatusCode::OK),
         Some("select_account") if !accounts.is_empty() => chooser_page(&app, &flow, &accounts),
         _ => {
             if let Some((did, _)) = hinted {
@@ -1191,7 +1291,12 @@ async fn sign_in(
         else {
             return Ok(SignIn::Failed(String::new(), LoginError::Timeout));
         };
-        if rl::check_with_ip(&[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN], &did, 1).is_err()
+        if rl::check_with_ip(
+            &[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN],
+            &did,
+            1,
+        )
+        .is_err()
             || rl::check(&[&rl::SIGN_IN_ACCOUNT], &did, 1).is_err()
         {
             return limited(String::new());
@@ -1204,7 +1309,13 @@ async fn sign_in(
             return invalid();
         }
         // createSession's buckets (shared with it), before any Argon2 work
-        if rl::check_with_ip(&[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN], &ident, 1).is_err() {
+        if rl::check_with_ip(
+            &[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN],
+            &ident,
+            1,
+        )
+        .is_err()
+        {
             return limited(ident);
         }
         let Ok(did) = app.resolve_repo(&ident).await else {
@@ -1240,7 +1351,9 @@ async fn sign_in(
                 device.pending_2fa_failures = 0;
             }
             device.pending_2fa_failures += 1;
-            if crate::totp::is_lockout(&e) || device.pending_2fa_failures >= PENDING_2FA_MAX_FAILURES {
+            if crate::totp::is_lockout(&e)
+                || device.pending_2fa_failures >= PENDING_2FA_MAX_FAILURES
+            {
                 device.pending_2fa = None;
                 device.pending_2fa_failures = 0;
                 store::put_device(app, device).await?;
@@ -1347,7 +1460,51 @@ async fn authorize_consent(State(app): AppState, headers: HeaderMap, body: AxByt
             StatusCode::UNAUTHORIZED,
         );
     }
+    let mut flow = flow;
+    match granted_scope(&flow.req.params.scope, &f) {
+        Some(scope) => flow.req.params.scope = scope,
+        None => {
+            let _ = store::put_request(&app, &flow.id, None).await;
+            return redirect_error(
+                &app,
+                &flow.req.params,
+                "access_denied",
+                "The \"atproto\" scope is required",
+            );
+        }
+    }
     issue_code(&app, flow, &did).await
+}
+
+fn is_email_read_scope(s: &str) -> bool {
+    crate::oauth::scopes::Permission::parse(s).is_some_and(|p| p.matches_account("email", "read"))
+}
+
+/// The consent form may withhold the email address when it is requested
+/// through a granular `account:email` scope (transition scopes cannot be
+/// narrowed).
+fn can_withhold_email(scope: &str) -> bool {
+    !scope.split(' ').any(|s| s.starts_with("transition:"))
+        && scope.split(' ').any(is_email_read_scope)
+}
+
+/// Scope the user granted on the consent form (`setAuthorized` with a scope
+/// override in the reference): the requested scope, narrowed to the form's
+/// `scope` field when present (scopes can be removed, never added) and
+/// without the `account:email` scopes when the email checkbox was cleared.
+/// None if the result lacks `atproto`.
+fn granted_scope(requested: &str, f: &HashMap<String, String>) -> Option<String> {
+    let allowed: Option<Vec<&str>> = f.get("scope").map(|s| s.split(' ').collect());
+    let withhold_email = f.contains_key("email_choice")
+        && !f.contains_key("allow_email")
+        && can_withhold_email(requested);
+    let granted: Vec<&str> = requested
+        .split(' ')
+        .filter(|s| !s.is_empty())
+        .filter(|s| allowed.as_ref().is_none_or(|a| a.contains(s)))
+        .filter(|s| !(withhold_email && is_email_read_scope(s)))
+        .collect();
+    granted.contains(&"atproto").then(|| granted.join(" "))
 }
 
 // ---------- token endpoint ----------

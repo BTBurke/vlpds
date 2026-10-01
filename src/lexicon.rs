@@ -1,28 +1,50 @@
-//! Record validation against known lexicons, like the reference's
-//! `validateRecord` (packages/pds/src/repo/prepare.ts): a record whose
-//! `$type` has a bundled schema is checked (record key + record body) and
-//! reported `valid`; unknown types are `unknown` unless `validate: true`
-//! was requested; `validate: false` skips validation.
+//! Lexicon validation with one generic schema interpreter:
 //!
-//! `lexicons/records.json` bundles every record lexicon of the atproto
-//! repo plus the lexicons they reference, as `{nsid: lexicon document}`
-//! (regenerate with `lexicons/bundle.py`).
+//! - Records, like the reference's `validateRecord`
+//!   (packages/pds/src/repo/prepare.ts): a record whose `$type` has a
+//!   schema is checked (record key + record body) and reported `valid`;
+//!   unknown types are `unknown` unless `validate: true` was requested;
+//!   `validate: false` skips validation.
+//! - XRPC, like @atproto/lexicon's `assertValidXrpcParams` /
+//!   `assertValidXrpcInput`: query params and JSON inputs of the bundled
+//!   com.atproto.* methods are checked by the extractors
+//!   (src/xrpc/extract.rs) before the handler runs (400 `InvalidRequest`).
+//!   Outputs are checked in debug builds only ([`validate_output`], wired as
+//!   a route layer), to catch handler bugs in the test suite at no prod cost.
+//! - Opt-in dynamic resolution (`Config::resolve_lexicons`): record types
+//!   without a bundled schema are resolved like permission sets
+//!   (src/oauth/lexicon.rs: DNS `_lexicon` TXT -> DID ->
+//!   `com.atproto.lexicon.schema` record with proof) and validated too. The
+//!   reference has no such resolution yet (`@TODO` in prepare.ts); a write
+//!   waits at most the configured timeout and otherwise treats the type as
+//!   unknown, while the resolution finishes in the background and fills the
+//!   cache (TTL, negative TTL, size bound) for later writes.
+//!
+//! `lexicons/bundle.json` bundles every record lexicon of the atproto repo
+//! and every com.atproto.* query/procedure, plus the lexicons they
+//! reference, as `{nsid: lexicon document}` (regenerate with
+//! `lexicons/bundle.py`).
 //!
 //! Checked: object required/nullable fields, string formats, byte and
 //! grapheme lengths, enum/const, integer ranges, arrays, refs, open and
 //! closed unions, blobs (accepted MIME types, max size), bytes and
 //! cid-links. Like the reference, extra object properties are allowed and
-//! open-union members of unknown types are not validated.
+//! open-union members of unknown types are not validated; refs from a
+//! resolved lexicon into other unbundled lexicons are not followed.
+//! Messages follow @atproto/lexicon (`Input/repo must be a string`).
 
 use crate::cbor::Value;
 use crate::xrpc::syntax;
+use crate::xrpc::App;
+use futures::FutureExt;
 use serde_json::Value as J;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
 static LEXICONS: LazyLock<HashMap<String, J>> = LazyLock::new(|| {
-    serde_json::from_str(include_str!("../lexicons/records.json")).expect("bundled lexicons")
+    serde_json::from_str(include_str!("../lexicons/bundle.json")).expect("bundled lexicons")
 });
 
 /// Result of validating a write: `Some("valid" | "unknown")`, or `None`
@@ -30,16 +52,25 @@ static LEXICONS: LazyLock<HashMap<String, J>> = LazyLock::new(|| {
 pub type ValidationStatus = Option<&'static str>;
 
 /// Validates a record (with its `$type` already set to `collection`).
+/// `resolved` is a dynamically resolved lexicon document for `collection`
+/// ([`resolve_record_schema`]); bundled schemas take precedence.
 pub fn validate_record(
     collection: &str,
     rkey: &str,
     record: &Value,
     validate: Option<bool>,
+    resolved: Option<&J>,
 ) -> Result<ValidationStatus, String> {
     if validate == Some(false) {
         return Ok(None);
     }
-    let Some(main) = def(collection, "main").filter(|d| d["type"] == "record") else {
+    let resolved = resolved.filter(|d| d["id"] == collection);
+    let main = def(collection, "main").filter(|d| is_record(d)).or_else(|| {
+        resolved
+            .and_then(|d| d.get("defs")?.get("main"))
+            .filter(|d| is_record(d))
+    });
+    let Some(main) = main else {
         if validate == Some(true) {
             return Err(format!("Unknown lexicon type: {collection}"));
         }
@@ -60,13 +91,17 @@ pub fn validate_record(
             "Invalid record key for {collection}: must be {key}, got {rkey:?}"
         ));
     }
-    let mut v = Validator { path: vec!["record".into()] };
+    let mut v = Validator::new("record", resolved);
     v.check(&main["record"], record, collection)
         .map_err(|e| format!("Invalid {collection} record: {e}"))?;
     Ok(Some("valid"))
 }
 
-fn def<'a>(nsid: &str, name: &str) -> Option<&'a J> {
+fn is_record(d: &J) -> bool {
+    d["type"] == "record"
+}
+
+fn def(nsid: &str, name: &str) -> Option<&'static J> {
     LEXICONS.get(nsid)?.get("defs")?.get(name)
 }
 
@@ -79,11 +114,330 @@ fn split_ref<'a>(r: &'a str, ctx: &'a str) -> (&'a str, &'a str) {
     }
 }
 
-struct Validator {
-    path: Vec<String>,
+// ---------------------------------------------------------------------------
+// XRPC params / input / output
+// ---------------------------------------------------------------------------
+
+/// The bundled `query` / `procedure` definition of `nsid`.
+fn method(nsid: &str) -> Option<&'static J> {
+    def(nsid, "main").filter(|d| matches!(d["type"].as_str(), Some("query" | "procedure")))
 }
 
-impl Validator {
+/// The JSON schema of a method's `input` / `output` payload.
+fn payload_schema<'a>(m: &'a J, which: &str) -> Option<&'a J> {
+    let p = m.get(which)?;
+    (p["encoding"] == "application/json").then(|| p.get("schema")).flatten()
+}
+
+/// Methods whose vlpds input deliberately extends the lexicon:
+/// updateAccountSigningKey generates a key when `signingKey` is omitted.
+const EXTENDED_INPUTS: &[&str] = &["com.atproto.admin.updateAccountSigningKey"];
+
+/// Whether `nsid` is a bundled method with a JSON input schema.
+pub fn has_input_schema(nsid: &str) -> bool {
+    !EXTENDED_INPUTS.contains(&nsid) && method(nsid).and_then(|m| payload_schema(m, "input")).is_some()
+}
+
+/// Whether `nsid` is a bundled method with parameters.
+pub fn has_params(nsid: &str) -> bool {
+    method(nsid).is_some_and(|m| m.get("parameters").is_some())
+}
+
+/// Checks a procedure's JSON body (`Input ...` messages).
+pub fn validate_input(nsid: &str, body: &J) -> Result<(), String> {
+    validate_payload(nsid, "input", "Input", body)
+}
+
+/// Checks a method's JSON response body (`Output ...` messages).
+pub fn validate_output(nsid: &str, body: &J) -> Result<(), String> {
+    validate_payload(nsid, "output", "Output", body)
+}
+
+fn validate_payload(nsid: &str, which: &str, root: &str, body: &J) -> Result<(), String> {
+    if which == "input" && EXTENDED_INPUTS.contains(&nsid) {
+        return Ok(());
+    }
+    let Some(schema) = method(nsid).and_then(|m| payload_schema(m, which)) else {
+        return Ok(());
+    };
+    if !matches!(body.kind(), Kind::Map) {
+        return Err(format!("{root} must be an object"));
+    }
+    Validator::new(root, None).check(schema, body, nsid)
+}
+
+/// Checks a method's query params (the raw `key=value` pairs, decoded per
+/// the param types like the reference's `decodeQueryParams`). Empty values
+/// count as absent; unknown params are ignored.
+pub fn validate_params(nsid: &str, pairs: &[(String, String)]) -> Result<(), String> {
+    let Some(params) = method(nsid).and_then(|m| m.get("parameters")) else {
+        return Ok(());
+    };
+    let Some(props) = params.get("properties").and_then(|p| p.as_object()) else {
+        return Ok(());
+    };
+    let required = |k: &str| {
+        params
+            .get("required")
+            .and_then(|r| r.as_array())
+            .is_some_and(|r| r.iter().any(|x| x == k))
+    };
+    for (k, pd) in props {
+        let is_array = pd["type"] == "array";
+        let item_type = if is_array { pd["items"]["type"].as_str() } else { pd["type"].as_str() };
+        let decode = |s: &str| match item_type {
+            Some("integer") => s.parse::<i64>().map(J::from).unwrap_or_else(|_| J::String(s.into())),
+            Some("boolean") => match s {
+                "true" => J::Bool(true),
+                "false" => J::Bool(false),
+                _ => J::String(s.into()),
+            },
+            _ => J::String(s.into()),
+        };
+        let mut vals = pairs
+            .iter()
+            .filter(|(pk, v)| pk == k && !v.is_empty())
+            .map(|(_, v)| decode(v));
+        let value = if is_array {
+            let a: Vec<J> = vals.collect();
+            (!a.is_empty()).then_some(J::Array(a))
+        } else {
+            vals.next()
+        };
+        match value {
+            None if required(k) => return Err(format!("Params must have the property \"{k}\"")),
+            None => {}
+            Some(v) => Validator::new(k, None).check(pd, &v, nsid)?,
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// dynamic resolution
+// ---------------------------------------------------------------------------
+
+/// Default time a write waits for a lexicon resolution (`--resolve-lexicons`).
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a resolved lexicon is used before it is resolved again.
+const RESOLVED_TTL: Duration = Duration::from_secs(600);
+/// How long a failed resolution is remembered (negative cache).
+const NEGATIVE_TTL: Duration = Duration::from_secs(60);
+/// Most cached resolutions (resolved or failed).
+const MAX_RESOLVED: usize = 4096;
+
+type Resolution = futures::future::Shared<futures::future::BoxFuture<'static, Option<Arc<J>>>>;
+
+enum Slot {
+    Done { at: Instant, doc: Option<Arc<J>> },
+    /// In flight; `prev` is the last good document, served meanwhile.
+    Pending { fut: Resolution, prev: Option<Arc<J>> },
+}
+
+impl Slot {
+    fn fresh(&self) -> bool {
+        match self {
+            Slot::Done { at, doc } => at.elapsed() < if doc.is_some() { RESOLVED_TTL } else { NEGATIVE_TTL },
+            Slot::Pending { .. } => true,
+        }
+    }
+}
+
+static RESOLVED: LazyLock<parking_lot::Mutex<HashMap<String, Slot>>> =
+    LazyLock::new(Default::default);
+
+/// The dynamically resolved lexicon document for a record type, when
+/// resolution is enabled, validation isn't skipped and no schema is bundled.
+/// Waits at most `Config::resolve_lexicons` for a resolution; None (the
+/// record is then `unknown`) on failure or timeout. Concurrent writes of
+/// the same type share one resolution.
+pub async fn resolve_record_schema(
+    app: &Arc<App>,
+    collection: &str,
+    validate: Option<bool>,
+) -> Option<Arc<J>> {
+    let timeout = app.config.resolve_lexicons?;
+    if validate == Some(false)
+        || def(collection, "main").is_some_and(is_record)
+        || !syntax::valid_nsid(collection)
+    {
+        return None;
+    }
+    let (fut, prev) = {
+        let mut m = RESOLVED.lock();
+        match m.get(collection) {
+            Some(Slot::Pending { fut, prev }) => (fut.clone(), prev.clone()),
+            Some(s @ Slot::Done { doc, .. }) if s.fresh() => return doc.clone(),
+            other => {
+                let prev = match other {
+                    Some(Slot::Done { doc, .. }) => doc.clone(),
+                    _ => None,
+                };
+                if m.len() >= MAX_RESOLVED {
+                    evict(&mut m);
+                }
+                let fut = spawn_resolution(app.clone(), collection.to_string(), prev.clone());
+                m.insert(
+                    collection.to_string(),
+                    Slot::Pending { fut: fut.clone(), prev: prev.clone() },
+                );
+                (fut, prev)
+            }
+        }
+    };
+    tokio::time::timeout(timeout, fut).await.unwrap_or(prev)
+}
+
+/// Drops expired entries, then the oldest finished one if still full.
+fn evict(m: &mut HashMap<String, Slot>) {
+    m.retain(|_, s| s.fresh());
+    if m.len() >= MAX_RESOLVED {
+        let oldest = m
+            .iter()
+            .filter_map(|(k, s)| match s {
+                Slot::Done { at, .. } => Some((*at, k.clone())),
+                Slot::Pending { .. } => None,
+            })
+            .min();
+        if let Some((_, k)) = oldest {
+            m.remove(&k);
+        }
+    }
+}
+
+/// Resolves in a task of its own, so a write that stops waiting doesn't
+/// cancel it; the result lands in the cache either way. A failed refresh
+/// keeps serving the last good document.
+fn spawn_resolution(app: Arc<App>, nsid: String, prev: Option<Arc<J>>) -> Resolution {
+    let task = tokio::spawn(async move {
+        let doc = crate::oauth::lexicon::resolve(&app, &nsid)
+            .await
+            .and_then(|(_, doc)| record_lexicon(&nsid, doc));
+        let doc = match doc {
+            Ok(d) => Some(Arc::new(d)),
+            Err(e) => {
+                tracing::debug!(nsid, "lexicon resolution failed: {e}");
+                prev
+            }
+        };
+        RESOLVED
+            .lock()
+            .insert(nsid, Slot::Done { at: Instant::now(), doc: doc.clone() });
+        doc
+    });
+    async move { task.await.ok().flatten() }.boxed().shared()
+}
+
+/// A resolved lexicon document usable for record validation.
+fn record_lexicon(nsid: &str, doc: J) -> Result<J, String> {
+    if doc["lexicon"].as_i64() != Some(1) || doc["id"] != nsid {
+        return Err(format!("Invalid Lexicon document for {nsid}"));
+    }
+    if !doc["defs"]["main"].get("record").is_some_and(|r| r.is_object())
+        || !is_record(&doc["defs"]["main"])
+    {
+        return Err(format!("Lexicon {nsid} is not a record type"));
+    }
+    Ok(doc)
+}
+
+// ---------------------------------------------------------------------------
+// interpreter
+// ---------------------------------------------------------------------------
+
+/// A data-model value the interpreter can check: DAG-CBOR records
+/// ([`Value`]) and JSON bodies (`$link` / `$bytes` objects are CIDs and
+/// bytes, as the reference's `jsonToLex`).
+pub trait Node: Sized {
+    fn kind(&self) -> Kind<'_, Self>;
+    fn get(&self, key: &str) -> Option<&Self>;
+}
+
+pub enum Kind<'a, N> {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float,
+    Text(&'a str),
+    /// Byte length.
+    Bytes(usize),
+    Link,
+    Array(&'a [N]),
+    Map,
+}
+
+impl Node for Value {
+    fn kind(&self) -> Kind<'_, Value> {
+        match self {
+            Value::Null => Kind::Null,
+            Value::Bool(b) => Kind::Bool(*b),
+            Value::Int(n) => Kind::Int(*n),
+            Value::Bytes(b) => Kind::Bytes(b.len()),
+            Value::Text(s) => Kind::Text(s),
+            Value::Array(a) => Kind::Array(a),
+            Value::Map(_) => Kind::Map,
+            Value::Link(_) => Kind::Link,
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&Value> {
+        Value::get(self, key)
+    }
+}
+
+impl Node for J {
+    fn kind(&self) -> Kind<'_, J> {
+        match self {
+            J::Null => Kind::Null,
+            J::Bool(b) => Kind::Bool(*b),
+            J::Number(n) => n.as_i64().map_or(Kind::Float, Kind::Int),
+            J::String(s) => Kind::Text(s),
+            J::Array(a) => Kind::Array(a),
+            J::Object(o) => match (o.len(), o.get("$link"), o.get("$bytes")) {
+                (1, Some(J::String(_)), _) => Kind::Link,
+                (1, _, Some(J::String(b))) => {
+                    Kind::Bytes(b.trim_end_matches('=').len() * 3 / 4)
+                }
+                _ => Kind::Map,
+            },
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&J> {
+        self.as_object()?.get(key)
+    }
+}
+
+fn text<N: Node>(v: Option<&N>) -> Option<&str> {
+    match v?.kind() {
+        Kind::Text(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// Most schema indirections (refs, union members) followed at once: a
+/// resolved (untrusted) lexicon may reference itself in a cycle.
+const MAX_DEPTH: u32 = 128;
+
+struct Validator<'a> {
+    path: Vec<String>,
+    /// A resolved lexicon document, consulted before the bundle.
+    doc: Option<&'a J>,
+    depth: u32,
+}
+
+impl<'a> Validator<'a> {
+    fn new(root: &str, doc: Option<&'a J>) -> Self {
+        Validator { path: vec![root.to_string()], doc, depth: 0 }
+    }
+
+    fn def(&self, nsid: &str, name: &str) -> Option<&'a J> {
+        match self.doc {
+            Some(d) if d["id"] == nsid => d.get("defs")?.get(name),
+            _ => def(nsid, name),
+        }
+    }
+
     fn err(&self, m: impl std::fmt::Display) -> String {
         format!("{} {m}", self.path.join("/"))
     }
@@ -95,7 +449,18 @@ impl Validator {
         r
     }
 
-    fn check(&mut self, d: &J, v: &Value, ctx: &str) -> Result<(), String> {
+    /// Checks `v` against the definition `target`, one indirection deeper.
+    fn follow<N: Node>(&mut self, target: &'a J, v: &N, ctx: &str) -> Result<(), String> {
+        if self.depth >= MAX_DEPTH {
+            return Err(self.err("exceeds the maximum schema depth"));
+        }
+        self.depth += 1;
+        let r = self.check(target, v, ctx);
+        self.depth -= 1;
+        r
+    }
+
+    fn check<N: Node>(&mut self, d: &'a J, v: &N, ctx: &str) -> Result<(), String> {
         let t = d["type"].as_str().unwrap_or("");
         match t {
             "object" | "record" => {
@@ -104,59 +469,71 @@ impl Validator {
             }
             "ref" => {
                 let (nsid, name) = split_ref(d["ref"].as_str().unwrap_or(""), ctx);
-                match def(nsid, name) {
-                    Some(target) => self.check(target, v, nsid),
-                    // a schema we don't bundle: can't validate further
+                match self.def(nsid, name) {
+                    Some(target) => self.follow(target, v, nsid),
+                    // a schema we don't have: can't validate further
                     None => Ok(()),
                 }
             }
             "union" => self.union(d, v, ctx),
             "string" => self.string(d, v),
             "integer" => {
-                let Value::Int(n) = v else {
+                let Kind::Int(n) = v.kind() else {
                     return Err(self.err("must be an integer"));
                 };
                 if let Some(c) = d.get("const") {
-                    if c.as_i64() != Some(*n) {
+                    if c.as_i64() != Some(n) {
                         return Err(self.err(format!("must be {c}")));
                     }
                 }
                 if let Some(e) = d.get("enum").and_then(|e| e.as_array()) {
-                    if !e.iter().any(|x| x.as_i64() == Some(*n)) {
-                        return Err(self.err("must be one of the enumerated values"));
+                    if !e.iter().any(|x| x.as_i64() == Some(n)) {
+                        return Err(self.err(format!("must be one of ({})", join(e, "|"))));
                     }
                 }
-                if d.get("minimum").and_then(|m| m.as_i64()).is_some_and(|m| *n < m) {
+                if d.get("minimum").and_then(|m| m.as_i64()).is_some_and(|m| n < m) {
                     return Err(self.err(format!("can not be less than {}", d["minimum"])));
                 }
-                if d.get("maximum").and_then(|m| m.as_i64()).is_some_and(|m| *n > m) {
+                if d.get("maximum").and_then(|m| m.as_i64()).is_some_and(|m| n > m) {
                     return Err(self.err(format!("can not be greater than {}", d["maximum"])));
                 }
                 Ok(())
             }
-            "boolean" => match v {
-                Value::Bool(b) => match d.get("const").and_then(|c| c.as_bool()) {
-                    Some(c) if c != *b => Err(self.err(format!("must be {c}"))),
+            "boolean" => match v.kind() {
+                Kind::Bool(b) => match d.get("const").and_then(|c| c.as_bool()) {
+                    Some(c) if c != b => Err(self.err(format!("must be {c}"))),
                     _ => Ok(()),
                 },
                 _ => Err(self.err("must be a boolean")),
             },
             "bytes" => {
-                let Value::Bytes(b) = v else {
+                let Kind::Bytes(n) = v.kind() else {
                     return Err(self.err("must be a byte array"));
                 };
-                self.len_bounds(d, b.len(), "bytes")
+                if d.get("maxLength").and_then(|m| m.as_u64()).is_some_and(|m| n as u64 > m) {
+                    return Err(self.err(format!("must not be larger than {} bytes", d["maxLength"])));
+                }
+                if d.get("minLength").and_then(|m| m.as_u64()).is_some_and(|m| (n as u64) < m) {
+                    return Err(self.err(format!("must not be smaller than {} bytes", d["minLength"])));
+                }
+                Ok(())
             }
-            "cid-link" => match v {
-                Value::Link(_) => Ok(()),
+            "cid-link" => match v.kind() {
+                Kind::Link => Ok(()),
                 _ => Err(self.err("must be a CID")),
             },
             "blob" => self.blob(d, v),
             "array" => {
-                let Value::Array(items) = v else {
+                let Kind::Array(items) = v.kind() else {
                     return Err(self.err("must be an array"));
                 };
-                self.len_bounds(d, items.len(), "elements")?;
+                let n = items.len() as u64;
+                if d.get("maxLength").and_then(|m| m.as_u64()).is_some_and(|m| n > m) {
+                    return Err(self.err(format!("must not have more than {} elements", d["maxLength"])));
+                }
+                if d.get("minLength").and_then(|m| m.as_u64()).is_some_and(|m| n < m) {
+                    return Err(self.err(format!("must not have fewer than {} elements", d["minLength"])));
+                }
                 if let Some(item) = d.get("items") {
                     for (i, x) in items.iter().enumerate() {
                         self.nested(i.to_string(), |s| s.check(item, x, ctx))?;
@@ -164,12 +541,12 @@ impl Validator {
                 }
                 Ok(())
             }
-            "unknown" => match v {
-                Value::Map(_) => Ok(()),
+            "unknown" => match v.kind() {
+                Kind::Map => Ok(()),
                 _ => Err(self.err("must be an object")),
             },
-            "null" => match v {
-                Value::Null => Ok(()),
+            "null" => match v.kind() {
+                Kind::Null => Ok(()),
                 _ => Err(self.err("must be null")),
             },
             // token / params / anything else: nothing to check here
@@ -177,18 +554,8 @@ impl Validator {
         }
     }
 
-    fn len_bounds(&self, d: &J, n: usize, what: &str) -> Result<(), String> {
-        if d.get("minLength").and_then(|m| m.as_u64()).is_some_and(|m| (n as u64) < m) {
-            return Err(self.err(format!("must not be smaller than {} {what}", d["minLength"])));
-        }
-        if d.get("maxLength").and_then(|m| m.as_u64()).is_some_and(|m| (n as u64) > m) {
-            return Err(self.err(format!("must not be larger than {} {what}", d["maxLength"])));
-        }
-        Ok(())
-    }
-
-    fn object(&mut self, d: &J, v: &Value, ctx: &str) -> Result<(), String> {
-        if !matches!(v, Value::Map(_)) {
+    fn object<N: Node>(&mut self, d: &'a J, v: &N, ctx: &str) -> Result<(), String> {
+        if !matches!(v.kind(), Kind::Map) {
             return Err(self.err("must be an object"));
         }
         let nullable = |k: &str| {
@@ -198,19 +565,19 @@ impl Validator {
         };
         if let Some(req) = d.get("required").and_then(|r| r.as_array()) {
             for k in req.iter().filter_map(|k| k.as_str()) {
-                match v.get(k) {
-                    None => return Err(self.err(format!("must have the property \"{k}\""))),
-                    Some(Value::Null) if !nullable(k) => {
-                        return Err(self.err(format!("must have the property \"{k}\"")))
-                    }
-                    _ => {}
+                let missing = match v.get(k) {
+                    None => true,
+                    Some(x) => matches!(x.kind(), Kind::Null) && !nullable(k),
+                };
+                if missing {
+                    return Err(self.err(format!("must have the property \"{k}\"")));
                 }
             }
         }
         if let Some(props) = d.get("properties").and_then(|p| p.as_object()) {
             for (k, pd) in props {
                 let Some(x) = v.get(k) else { continue };
-                if matches!(x, Value::Null) && nullable(k) {
+                if matches!(x.kind(), Kind::Null) && nullable(k) {
                     continue;
                 }
                 self.nested(k.clone(), |s| s.check(pd, x, ctx))?;
@@ -219,30 +586,39 @@ impl Validator {
         Ok(())
     }
 
-    fn union(&mut self, d: &J, v: &Value, ctx: &str) -> Result<(), String> {
-        let Some(t) = v.get("$type").and_then(|t| t.as_str()) else {
+    fn union<N: Node>(&mut self, d: &'a J, v: &N, ctx: &str) -> Result<(), String> {
+        let t = match v.kind() {
+            Kind::Map => text(v.get("$type")),
+            _ => None,
+        };
+        let Some(t) = t else {
             return Err(self.err("must be an object which includes the \"$type\" property"));
         };
-        let refs: Vec<(&str, &str)> = d["refs"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|r| r.as_str()).map(|r| split_ref(r, ctx)).collect())
-            .unwrap_or_default();
+        let refs: Vec<&'a J> = d["refs"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
         let (tn, tname) = split_ref(t, ctx);
-        match refs.iter().find(|(n, name)| *n == tn && *name == tname) {
-            Some((nsid, name)) => match def(nsid, name) {
-                Some(target) => self.check(target, v, nsid),
+        let hit = refs
+            .iter()
+            .filter_map(|r| r.as_str())
+            .map(|r| split_ref(r, ctx))
+            .find(|(n, name)| *n == tn && *name == tname);
+        match hit {
+            Some((nsid, name)) => match self.def(nsid, name) {
+                Some(target) => {
+                    let nsid = nsid.to_string();
+                    self.follow(target, v, &nsid)
+                }
                 None => Ok(()),
             },
             None if d["closed"].as_bool() == Some(true) => Err(self.err(format!(
                 "$type must be one of {}",
-                d["refs"]
+                join(&d["refs"].as_array().cloned().unwrap_or_default(), ", ")
             ))),
             None => Ok(()),
         }
     }
 
-    fn string(&mut self, d: &J, v: &Value) -> Result<(), String> {
-        let Value::Text(s) = v else {
+    fn string<N: Node>(&mut self, d: &J, v: &N) -> Result<(), String> {
+        let Kind::Text(s) = v.kind() else {
             return Err(self.err("must be a string"));
         };
         if let Some(c) = d.get("const").and_then(|c| c.as_str()) {
@@ -252,10 +628,17 @@ impl Validator {
         }
         if let Some(e) = d.get("enum").and_then(|e| e.as_array()) {
             if !e.iter().any(|x| x.as_str() == Some(s)) {
-                return Err(self.err("must be one of the enumerated values"));
+                return Err(self.err(format!("must be one of ({})", join(e, "|"))));
             }
         }
-        self.len_bounds(d, s.len(), "bytes")?;
+        // lengths are UTF-8 bytes, worded as characters like the reference
+        let n = s.len() as u64;
+        if d.get("maxLength").and_then(|m| m.as_u64()).is_some_and(|m| n > m) {
+            return Err(self.err(format!("must not be longer than {} characters", d["maxLength"])));
+        }
+        if d.get("minLength").and_then(|m| m.as_u64()).is_some_and(|m| n < m) {
+            return Err(self.err(format!("must not be shorter than {} characters", d["minLength"])));
+        }
         let (min_g, max_g) = (
             d.get("minGraphemes").and_then(|m| m.as_u64()),
             d.get("maxGraphemes").and_then(|m| m.as_u64()),
@@ -275,40 +658,44 @@ impl Validator {
             }
         }
         if let Some(f) = d.get("format").and_then(|f| f.as_str()) {
-            let ok = match f {
-                "datetime" => valid_datetime(s),
-                "uri" => valid_uri(s),
-                "at-uri" => valid_at_uri(s),
-                "did" => syntax::valid_did(s),
-                "handle" => syntax::valid_handle(s),
-                "at-identifier" => crate::xrpc::extract::valid_at_identifier(s),
-                "nsid" => syntax::valid_nsid(s),
-                "cid" => crate::cid::Cid::parse(s).is_ok() || crate::xrpc::extract::valid_cid_syntax(s),
-                "language" => valid_language(s),
-                "tid" => syntax::valid_tid(s),
-                "record-key" => syntax::valid_rkey(s),
-                _ => true,
+            // (valid, @atproto/lexicon message)
+            let (ok, msg) = match f {
+                "datetime" => (valid_datetime(s), "must be an valid atproto datetime (both RFC-3339 and ISO-8601)"),
+                "uri" => (valid_uri(s), "must be a uri"),
+                "at-uri" => (valid_at_uri(s), "must be a valid at-uri"),
+                "did" => (syntax::valid_did(s), "must be a valid did"),
+                "handle" => (syntax::valid_handle(s), "must be a valid handle"),
+                "at-identifier" => (
+                    crate::xrpc::extract::valid_at_identifier(s),
+                    "must be a valid did or a handle",
+                ),
+                "nsid" => (syntax::valid_nsid(s), "must be a valid nsid"),
+                "cid" => (
+                    crate::cid::Cid::parse(s).is_ok() || crate::xrpc::extract::valid_cid_syntax(s),
+                    "must be a cid string",
+                ),
+                "language" => (valid_language(s), "must be a well-formed BCP 47 language tag"),
+                "tid" => (syntax::valid_tid(s), "must be a valid TID"),
+                "record-key" => (syntax::valid_rkey(s), "must be a valid Record Key"),
+                _ => (true, ""),
             };
             if !ok {
-                return Err(self.err(format!("must be a valid {f}")));
+                return Err(self.err(msg));
             }
         }
         Ok(())
     }
 
-    fn blob(&mut self, d: &J, v: &Value) -> Result<(), String> {
-        let (mime, size) = match (v.get("$type").and_then(|t| t.as_str()), v) {
-            (Some("blob"), _) => (
-                v.get("mimeType").and_then(|m| m.as_str()),
-                match v.get("size") {
-                    Some(Value::Int(n)) => Some(*n),
-                    _ => None,
-                },
-            ),
-            _ => return Err(self.err("should be a blob ref")),
-        };
-        let Some(mime) = mime else {
+    fn blob<N: Node>(&mut self, d: &J, v: &N) -> Result<(), String> {
+        if !matches!(v.kind(), Kind::Map) || text(v.get("$type")) != Some("blob") {
             return Err(self.err("should be a blob ref"));
+        }
+        let Some(mime) = text(v.get("mimeType")) else {
+            return Err(self.err("should be a blob ref"));
+        };
+        let size = match v.get("size").map(|s| s.kind()) {
+            Some(Kind::Int(n)) => Some(n),
+            _ => None,
         };
         if let Some(accept) = d.get("accept").and_then(|a| a.as_array()) {
             let ok = accept.iter().filter_map(|a| a.as_str()).any(|a| {
@@ -330,6 +717,15 @@ impl Validator {
         }
         Ok(())
     }
+}
+
+/// Enum values / refs joined like JS `Array.join` (strings unquoted).
+fn join(items: &[J], sep: &str) -> String {
+    items
+        .iter()
+        .map(|x| x.as_str().map_or_else(|| x.to_string(), String::from))
+        .collect::<Vec<_>>()
+        .join(sep)
 }
 
 // ---------------------------------------------------------------------------
@@ -488,9 +884,78 @@ mod tests {
             "$type": "app.bsky.feed.post", "text": "hi", "createdAt": "2024-01-01T00:00:00Z"
         }))
         .unwrap();
-        assert_eq!(validate_record("app.bsky.feed.post", "3jui7kd54zh2y", &rec, None), Ok(Some("valid")));
+        assert_eq!(validate_record("app.bsky.feed.post", "3jui7kd54zh2y", &rec, None, None), Ok(Some("valid")));
         let bad = Value::from_json(&serde_json::json!({"$type": "app.bsky.feed.post", "createdAt": "x"})).unwrap();
-        assert!(validate_record("app.bsky.feed.post", "3jui7kd54zh2y", &bad, None).is_err());
-        assert!(validate_record("app.bsky.actor.profile", "3jui7kd54zh2y", &rec, None).is_err());
+        assert!(validate_record("app.bsky.feed.post", "3jui7kd54zh2y", &bad, None, None).is_err());
+        assert!(validate_record("app.bsky.actor.profile", "3jui7kd54zh2y", &rec, None, None).is_err());
+    }
+
+    #[test]
+    fn resolved_record_lexicon() {
+        let doc = serde_json::json!({
+            "lexicon": 1, "id": "com.example.thing",
+            "defs": {
+                "main": {"type": "record", "key": "tid", "record": {"type": "object",
+                    "required": ["n"],
+                    "properties": {"n": {"type": "integer", "maximum": 5}, "loop": {"type": "ref", "ref": "#loop"}}}},
+                "loop": {"type": "ref", "ref": "#loop"}
+            }
+        });
+        let rec = |j| Value::from_json(&j).unwrap();
+        let ok = rec(serde_json::json!({"$type": "com.example.thing", "n": 3}));
+        assert_eq!(validate_record("com.example.thing", "3jui7kd54zh2y", &ok, None, Some(&doc)), Ok(Some("valid")));
+        assert_eq!(validate_record("com.example.thing", "3jui7kd54zh2y", &ok, None, None), Ok(Some("unknown")));
+        let big = rec(serde_json::json!({"$type": "com.example.thing", "n": 9}));
+        assert_eq!(
+            validate_record("com.example.thing", "3jui7kd54zh2y", &big, None, Some(&doc)),
+            Err("Invalid com.example.thing record: record/n can not be greater than 5".into())
+        );
+        // a self-referencing def is cut off instead of overflowing the stack
+        let cyc = rec(serde_json::json!({"$type": "com.example.thing", "n": 1, "loop": {}}));
+        assert!(validate_record("com.example.thing", "3jui7kd54zh2y", &cyc, None, Some(&doc))
+            .unwrap_err()
+            .contains("maximum schema depth"));
+        // a document for another NSID is ignored
+        assert_eq!(validate_record("com.example.other", "x", &ok, None, Some(&doc)), Ok(Some("unknown")));
+    }
+
+    #[test]
+    fn xrpc_input_and_params() {
+        let n = "com.atproto.repo.createRecord";
+        assert!(has_input_schema(n) && !has_input_schema("com.atproto.repo.getRecord"));
+        let body = serde_json::json!({"repo": "did:plc:abc", "collection": "app.bsky.feed.post", "record": {}});
+        assert_eq!(validate_input(n, &body), Ok(()));
+        assert_eq!(
+            validate_input(n, &serde_json::json!({"repo": "did:plc:abc", "record": {}})),
+            Err("Input must have the property \"collection\"".into())
+        );
+        assert_eq!(
+            validate_input(n, &serde_json::json!({"repo": 1, "collection": "a.b.c", "record": {}})),
+            Err("Input/repo must be a string".into())
+        );
+        assert_eq!(validate_input(n, &serde_json::json!([])), Err("Input must be an object".into()));
+        let aw = serde_json::json!({"repo": "did:plc:abc", "writes": [{"$type": "com.atproto.repo.applyWrites#nope"}]});
+        assert!(validate_input("com.atproto.repo.applyWrites", &aw)
+            .unwrap_err()
+            .starts_with("Input/writes/0 $type must be one of #create, #update, #delete"));
+        let p = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+        let q = "com.atproto.repo.listRecords";
+        assert_eq!(validate_params(q, &p(&[("repo", "did:plc:abc"), ("collection", "a.b.c")])), Ok(()));
+        assert_eq!(validate_params(q, &p(&[("repo", "did:plc:abc")])), Err("Params must have the property \"collection\"".into()));
+        assert_eq!(
+            validate_params(q, &p(&[("repo", "did:plc:abc"), ("collection", "a.b.c"), ("limit", "500")])),
+            Err("limit can not be greater than 100".into())
+        );
+        assert_eq!(
+            validate_params(q, &p(&[("repo", "did:plc:abc"), ("collection", "a.b.c"), ("reverse", "maybe")])),
+            Err("reverse must be a boolean".into())
+        );
+        // $link / $bytes objects are CIDs and bytes in JSON
+        let out = serde_json::json!({"uri": "at://did:plc:abc/a.b.c/x", "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm", "value": {}});
+        assert_eq!(validate_output("com.atproto.repo.getRecord", &out), Ok(()));
+        assert_eq!(
+            validate_output("com.atproto.repo.getRecord", &serde_json::json!({"value": {}})),
+            Err("Output must have the property \"uri\"".into())
+        );
     }
 }
