@@ -30,6 +30,8 @@ type event struct {
 	Info     *comatproto.SyncSubscribeRepos_Info
 	ErrName  string
 	ErrMsg   string
+	// NonCanonical is set when the header or body is not canonical DAG-CBOR.
+	NonCanonical string
 }
 
 // seq returns the event's sequence number, or (0, false) if it has none.
@@ -78,12 +80,19 @@ func (e *event) time() string {
 // decodeFrame parses one websocket binary message: a DAG-CBOR header object
 // followed immediately by a DAG-CBOR body object.
 func decodeFrame(msg []byte) (*event, error) {
-	cr := cbg.NewCborReader(bytes.NewReader(msg))
+	br := bytes.NewReader(msg)
+	cr := cbg.NewCborReader(br) // reads br byte by byte (no buffering)
 	hdr, err := readHeader(cr)
 	if err != nil {
 		return nil, fmt.Errorf("frame header: %w", err)
 	}
 	ev := &event{Header: hdr}
+	hlen := len(msg) - br.Len()
+	if err := checkCanonical(msg[:hlen]); err != nil {
+		ev.NonCanonical = "frame header: " + err.Error()
+	} else if err := checkCanonical(msg[hlen:]); err != nil {
+		ev.NonCanonical = "frame body: " + err.Error()
+	}
 	switch hdr.Op {
 	case frameOpError:
 		m, err := readStringMap(cr)

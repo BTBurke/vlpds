@@ -16,6 +16,16 @@
 //! | identity.updateHandle | 5 min / 1 day | 10 / 50 | DID |
 //! | server.requestAccountDelete, requestEmailConfirmation, requestEmailUpdate (each) | 1 day / 1 h | 15 / 5 | DID |
 //! | repo-write-hour / repo-write-day (shared by every repo write) | 1 h / 1 day | 5000 / 35000 | DID; create=3, update=2, delete=1 points |
+//! | OAuth sign-in posts (`/oauth/authorize/sign-in`, `/oauth/account/sign-in`) | | | |
+//! | ↳ global-ip + oauth-sign-in-ip | 5 min | 3000 / 100 | client IP |
+//! | ↳ the createSession buckets (shared with it) | 1 day / 5 min | 300 / 30 | identifier (or pending DID) + IP |
+//! | ↳ sign-in-account (vlpds; any IP) | 1 h | 100 | DID |
+//!
+//! The reference's oauth-provider has no sign-in limits of its own; the PDS
+//! applies createSession's to its account-manager login. vlpds adds a per-IP
+//! cap and a per-account cap across IPs (password guessing is Argon2 CPU);
+//! TOTP guessing is bounded separately by the persisted per-account lockout
+//! in `crate::totp`.
 //!
 //! Responses carry `RateLimit-Limit` / `-Remaining` / `-Reset` / `-Policy`
 //! for the tightest bucket the request consumed (plus `Retry-After` on a
@@ -99,6 +109,12 @@ limit!(REQUEST_EMAIL_UPDATE_DAY, "com.atproto.server.requestEmailUpdate-0", DAY,
 limit!(REQUEST_EMAIL_UPDATE_HOUR, "com.atproto.server.requestEmailUpdate-1", HOUR, 5);
 limit!(REPO_WRITE_HOUR, "repo-write-hour", HOUR, 5000);
 limit!(REPO_WRITE_DAY, "repo-write-day", DAY, 35000);
+limit!(OAUTH_SIGN_IN_IP, "oauth-sign-in-ip", 5 * MINUTE, 100);
+limit!(SIGN_IN_ACCOUNT, "sign-in-account", HOUR, 100);
+
+/// Browser form posts that run the rate-limit context (checked by the
+/// handler, which renders its own page on a 429).
+const OAUTH_SIGN_IN_PATHS: [&str; 2] = ["/oauth/authorize/sign-in", "/oauth/account/sign-in"];
 
 /// Repo write points (reference: create=3, update=2, delete=1).
 pub const CREATE_POINTS: u32 = 3;
@@ -288,7 +304,8 @@ pub struct Limiter {
     pub counters: Counters,
     pub trusted: Vec<Cidr>,
     pub bypass_key: Option<String>,
-    pub admin_token: String,
+    /// Admin / internal tokens for the bypass check.
+    cfg: crate::server::Config,
 }
 
 impl Limiter {
@@ -307,26 +324,24 @@ impl Limiter {
                 })
                 .collect(),
             bypass_key: cfg.rate_limit_bypass_key.clone().filter(|k| !k.is_empty()),
-            admin_token: cfg.admin_token.clone(),
+            cfg: cfg.clone(),
         }
     }
 
     fn bypassed(&self, headers: &HeaderMap) -> bool {
         let hdr = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
-        if hdr("x-vlpds-internal") == Some(self.admin_token.as_str()) {
-            return true;
+        if let Some(t) = hdr("x-vlpds-internal") {
+            if crate::xrpc::internal::internal_token_ok(&self.cfg, t) {
+                return true;
+            }
         }
         if let (Some(k), Some(v)) = (&self.bypass_key, hdr("x-ratelimit-bypass")) {
-            if k == v {
+            if crate::auth::token_eq(k, v) {
                 return true;
             }
         }
         if let Some(b) = hdr("authorization").and_then(|v| v.strip_prefix("Basic ")) {
-            use base64::Engine;
-            let dec = base64::engine::general_purpose::STANDARD
-                .decode(b.trim())
-                .unwrap_or_default();
-            if dec == format!("admin:{}", self.admin_token).as_bytes() {
+            if crate::auth::basic_admin_ok(b, &self.cfg.admin_token) {
                 return true;
             }
         }
@@ -402,6 +417,16 @@ pub fn check_with_ip(limits: &[&'static Limit], prefix: &str, points: u32) -> Re
     .unwrap_or(Ok(()))
 }
 
+/// Like [`check`], keyed by the client IP alone.
+pub fn check_ip(limits: &[&'static Limit], points: u32) -> Result<(), XrpcError> {
+    CTX.try_with(|c| {
+        let mut c = c.borrow_mut();
+        let key = c.ip.clone();
+        c.consume(limits, &key, points)
+    })
+    .unwrap_or(Ok(()))
+}
+
 /// The repo-write buckets for `did` (hour and day).
 pub fn check_repo_write(did: Option<&str>, points: u32) -> Result<(), XrpcError> {
     match did {
@@ -432,9 +457,12 @@ pub async fn layer(
     next: axum::middleware::Next,
 ) -> Response {
     let path = req.uri().path();
-    if !path.starts_with("/xrpc/")
-        || path == "/xrpc/_health"
-        || path == "/xrpc/com.atproto.sync.subscribeRepos"
+    // OAuth sign-in forms: context only; the handler consumes its buckets
+    let sign_in_form = req.method() == axum::http::Method::POST && OAUTH_SIGN_IN_PATHS.contains(&path);
+    if !sign_in_form
+        && (!path.starts_with("/xrpc/")
+            || path == "/xrpc/_health"
+            || path == "/xrpc/com.atproto.sync.subscribeRepos")
     {
         return next.run(req).await;
     }
@@ -447,7 +475,7 @@ pub async fn layer(
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "unknown".into());
     let route = ip_route_limits(path);
-    let global = path != "/xrpc/com.atproto.sync.getRepo";
+    let global = !sign_in_form && path != "/xrpc/com.atproto.sync.getRepo";
     let ctx = Ctx {
         limiter,
         ip,

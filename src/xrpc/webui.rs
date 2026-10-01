@@ -167,7 +167,7 @@ async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json
             let r = app
                 .http
                 .get(format!("{}/internal/v1/cluster", l.addr.trim_end_matches('/')))
-                .header("x-vlpds-internal", &app.admin_token)
+                .header("x-vlpds-internal", &app.config.internal_token)
                 .timeout(std::time::Duration::from_millis(1500))
                 .send()
                 .await;

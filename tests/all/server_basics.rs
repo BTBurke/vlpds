@@ -92,3 +92,16 @@ async fn malformed_json_and_missing_params_are_400() {
     assert_eq!(r.status, 400, "missing required params: {}", r.text());
     assert!(r.error_name().is_some(), "XRPC error envelope expected: {}", r.text());
 }
+
+/// Wrong HTTP method on a local XRPC route: 400 InvalidRequest with an XRPC
+/// body (reference "Incorrect HTTP method (X) expected Y"), not a bare 405.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incorrect_http_method_is_400() {
+    let s = TestServer::spawn().await;
+    let r = s.xrpc.post("com.atproto.repo.getRecord", &json!({}), &Auth::None).await;
+    r.err(400, "InvalidRequest");
+    assert!(r.text().contains("Incorrect HTTP method (POST) expected GET"), "{}", r.text());
+    let r = s.xrpc.get("com.atproto.repo.createRecord", &[], &Auth::None).await;
+    r.err(400, "InvalidRequest");
+    assert!(r.text().contains("Incorrect HTTP method (GET) expected POST"), "{}", r.text());
+}

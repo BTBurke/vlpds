@@ -15,6 +15,7 @@ mod sync;
 pub mod syntax;
 mod webui;
 pub use blobs::spawn_blob_gc;
+pub use server::{spawn_reserved_key_gc, sweep_reserved_keys};
 pub use sync::request_crawl;
 
 /// Imports shared by every XRPC module (they `use super::*`).
@@ -170,9 +171,7 @@ impl From<WriteError> for XrpcError {
     fn from(e: WriteError) -> XrpcError {
         match e {
             WriteError::RepoNotFound => XrpcError::bad("RepoNotFound", "repo not found"),
-            WriteError::RepoInactive(status) => {
-                XrpcError::bad(&inactive_error(&status), format!("repo is {status}"))
-            }
+            WriteError::RepoInactive(status) => inactive_account_error(&status),
             WriteError::InvalidSwap(m) => XrpcError::bad("InvalidSwap", m),
             WriteError::Invalid(m) => XrpcError::bad("InvalidRequest", m),
             WriteError::Internal(m) => XrpcError::internal(m),
@@ -219,7 +218,8 @@ pub fn router(app: Arc<App>) -> Router {
     } else {
         r
     };
-    r.layer(axum::middleware::from_fn(track_http))
+    r.layer(axum::middleware::from_fn(incorrect_method))
+        .layer(axum::middleware::from_fn(track_http))
         // request bodies: Content-Encoding gzip/deflate decoded (415 otherwise)
         .layer(tower_http::decompression::RequestDecompressionLayer::new())
         // responses: gzip for JSON and CAR bodies over 1 KiB (reference
@@ -308,6 +308,27 @@ async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> Resp
     resp
 }
 
+/// A local XRPC route called with the wrong HTTP method: 400 InvalidRequest
+/// as the reference's xrpc-server ("Incorrect HTTP method (POST) expected
+/// GET") instead of axum's bare 405. Local routes are GET or POST only, so
+/// the expected method is the other one (axum adds its Allow header outside
+/// route layers, too late to read here). Preflights are left to [`cors`].
+async fn incorrect_method(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    use axum::http::Method;
+    let method = req.method().clone();
+    let xrpc = req.uri().path().starts_with("/xrpc/");
+    let resp = next.run(req).await;
+    if !xrpc || method == Method::OPTIONS || resp.status() != StatusCode::METHOD_NOT_ALLOWED {
+        return resp;
+    }
+    let message = match method {
+        Method::POST => "Incorrect HTTP method (POST) expected GET".to_string(),
+        Method::GET | Method::HEAD => format!("Incorrect HTTP method ({method}) expected POST"),
+        _ => "XRPC requests only supports GET and POST".to_string(),
+    };
+    XrpcError::bad("InvalidRequest", message).into_response()
+}
+
 async fn track_http(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     // Label by matched route only: proxied/fallback paths are attacker-chosen,
     // so they share one label to keep metric cardinality bounded.
@@ -330,6 +351,26 @@ async fn track_http(req: axum::extract::Request, next: axum::middleware::Next) -
 
 #[allow(unused_imports)]
 pub(crate) use authn::{authed_repo, Auth, Credentials, MaybeAuth};
+
+/// Error for a write to an inactive account, as the reference's findAccount
+/// with checkTakedown/checkDeactivated: 401 AccountTakedown (taken down or
+/// suspended) or 401 AccountDeactivated; other statuses keep the
+/// Repo{Status} name.
+pub fn inactive_account_error(status: &str) -> XrpcError {
+    match status {
+        "takendown" | "suspended" => XrpcError {
+            status: StatusCode::UNAUTHORIZED,
+            error: "AccountTakedown".into(),
+            message: "Account has been taken down".into(),
+        },
+        "deactivated" => XrpcError {
+            status: StatusCode::UNAUTHORIZED,
+            error: "AccountDeactivated".into(),
+            message: "Account is deactivated".into(),
+        },
+        st => XrpcError::bad(&inactive_error(st), format!("repo is {st}")),
+    }
+}
 
 /// XRPC error name for an inactive account status (RepoDeactivated, RepoTakendown, ...).
 pub fn inactive_error(status: &str) -> String {
@@ -391,15 +432,15 @@ impl App {
         Ok((view, snap))
     }
 
-    /// Loads the account and fails with the lexicon error for its status
-    /// (RepoDeactivated, RepoTakendown, ...) unless it is active.
+    /// Loads the account and fails unless it is active, with the
+    /// reference findAccount errors ([`inactive_account_error`]).
     pub async fn ensure_active(&self, did: &str) -> Result<Account, XrpcError> {
         let a = self
             .account(did)
             .await
             .map_err(|_| XrpcError::bad("RepoNotFound", format!("could not find repo: {did}")))?;
         match &a.status {
-            Some(st) => Err(XrpcError::bad(&inactive_error(st), format!("repo is {st}"))),
+            Some(st) => Err(inactive_account_error(st)),
             None => Ok(a),
         }
     }

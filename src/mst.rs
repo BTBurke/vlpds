@@ -29,6 +29,13 @@ type Result<T> = std::result::Result<T, MstError>;
 
 pub const MAX_KEY_BYTES: usize = 1024;
 
+/// Deepest tree accepted from a block set (nodes on a root-to-leaf path). A
+/// key's height counts its hash's leading zero 2-bit pairs, so 2^32 keys
+/// give a tree ~16 levels deep, and a key of height 64 would take a 128-bit
+/// zero hash prefix. The bound keeps every recursive walk off the end of the
+/// stack: a chain of `{e: [], l: child}` nodes is otherwise unbounded.
+pub const MAX_DEPTH: usize = 64;
+
 #[derive(Clone, Debug)]
 pub struct Node {
     pub height: i32,
@@ -661,7 +668,14 @@ pub fn encode_node(n: &Node, out: &mut Vec<u8>) -> Result<()> {
 }
 
 /// Recomputes CIDs of dirty nodes, emitting their blocks into `out`.
-fn write_blocks(n: &mut Arc<Node>, out: &mut Option<&mut Vec<(Cid, Vec<u8>)>>) -> Result<Cid> {
+fn write_blocks(
+    n: &mut Arc<Node>,
+    out: &mut Option<&mut Vec<(Cid, Vec<u8>)>>,
+    depth: usize,
+) -> Result<Cid> {
+    if depth > MAX_DEPTH {
+        return Err(MstError::Invalid("tree too deep"));
+    }
     if n.stub {
         return Err(MstError::Invalid("nil tree node"));
     }
@@ -674,7 +688,7 @@ fn write_blocks(n: &mut Arc<Node>, out: &mut Option<&mut Vec<(Cid, Vec<u8>)>>) -
     for e in nm.entries.iter_mut() {
         if let Entry::Child { node: Some(c), cid } = e {
             if c.dirty || c.cid.is_none() {
-                *cid = Some(write_blocks(c, out)?);
+                *cid = Some(write_blocks(c, out, depth + 1)?);
             } else {
                 *cid = c.cid;
             }
@@ -693,24 +707,43 @@ fn write_blocks(n: &mut Arc<Node>, out: &mut Option<&mut Vec<(Cid, Vec<u8>)>>) -
 
 // ---------- decoding (partial trees from a block set) ----------
 
+/// Decodes one node block, checking that it is the canonical encoding of a
+/// valid node: exactly the `e` and `l` fields (both required, `l` and each
+/// `t` a link or null, as the reference's NodeData schema), entries with
+/// exactly `k`/`p`/`t`/`v`, keys strictly ascending and all of one height,
+/// maximal prefix lengths (the first entry's is 0), and no child pointers
+/// in a height-0 node. Heights across nodes are checked by `load_from_blocks`.
 pub fn decode_node(data: &[u8], c: Cid) -> std::result::Result<Node, MstError> {
     use cbor::Value;
     let v = Value::decode(data).map_err(|_| MstError::Invalid("bad node cbor"))?;
+    let link = |v: Option<&Value>| match v {
+        Some(Value::Link(l)) => Ok(Some(*l)),
+        Some(Value::Null) => Ok(None),
+        _ => Err(MstError::Invalid("bad link")),
+    };
+    let fields = |v: &Value| match v {
+        Value::Map(m) => m.len(),
+        _ => 0,
+    };
+    if fields(&v) != 2 {
+        return Err(MstError::Invalid("node must have exactly e and l"));
+    }
     let mut entries = Vec::new();
-    match v.get("l") {
-        Some(Value::Link(l)) => entries.push(Entry::Child {
+    if let Some(l) = link(v.get("l"))? {
+        entries.push(Entry::Child {
             node: None,
-            cid: Some(*l),
-        }),
-        Some(Value::Null) | None => {}
-        _ => return Err(MstError::Invalid("bad l")),
+            cid: Some(l),
+        });
     }
     let Some(Value::Array(es)) = v.get("e") else {
         return Err(MstError::Invalid("bad e"));
     };
     let mut prev: Vec<u8> = Vec::new();
     let mut height = -1;
-    for e in es {
+    for (i, e) in es.iter().enumerate() {
+        if fields(e) != 4 {
+            return Err(MstError::Invalid("entry must have exactly k, p, t and v"));
+        }
         let p = match e.get("p") {
             Some(Value::Int(p)) if *p >= 0 && (*p as usize) <= prev.len() => *p as usize,
             _ => return Err(MstError::Invalid("bad prefix len")),
@@ -721,22 +754,39 @@ pub fn decode_node(data: &[u8], c: Cid) -> std::result::Result<Node, MstError> {
         let Some(Value::Link(val)) = e.get("v") else {
             return Err(MstError::Invalid("bad v"));
         };
+        let t = link(e.get("t"))?;
         let mut key = prev[..p].to_vec();
         key.extend_from_slice(k);
+        if !valid_key(&key) {
+            return Err(MstError::InvalidKey);
+        }
+        if i > 0 && key <= prev {
+            return Err(MstError::Invalid("keys not in ascending order"));
+        }
+        // canonical prefix compression; for the first entry prev is empty, so p == 0
+        if count_prefix_len(&prev, &key) != p {
+            return Err(MstError::Invalid("non-canonical prefix len"));
+        }
+        let h = height_for_key(&key);
         if height < 0 {
-            height = height_for_key(&key);
+            height = h;
+        } else if h != height {
+            return Err(MstError::Invalid("keys of different heights in one node"));
         }
         entries.push(Entry::Value {
             key: key.clone().into(),
             val: *val,
         });
         prev = key;
-        if let Some(Value::Link(t)) = e.get("t") {
+        if let Some(t) = t {
             entries.push(Entry::Child {
                 node: None,
-                cid: Some(*t),
+                cid: Some(t),
             });
         }
+    }
+    if height == 0 && entries.iter().any(Entry::is_child) {
+        return Err(MstError::Invalid("child of a height-0 node"));
     }
     Ok(Node {
         height,
@@ -747,20 +797,38 @@ pub fn decode_node(data: &[u8], c: Cid) -> std::result::Result<Node, MstError> {
     })
 }
 
-fn load_from_blocks(blocks: &HashMap<Cid, Vec<u8>>, c: Cid) -> Result<Option<Arc<Node>>> {
+/// Loads the subtree at `c` (`depth` nodes below the root). Children missing
+/// from `blocks` stay unloaded (partial tree). A node without keys takes its
+/// height from its child; every loaded child must be exactly one level below
+/// its parent.
+fn load_from_blocks(
+    blocks: &HashMap<Cid, Vec<u8>>,
+    c: Cid,
+    depth: usize,
+) -> Result<Option<Arc<Node>>> {
+    if depth >= MAX_DEPTH {
+        return Err(MstError::Invalid("tree too deep"));
+    }
     let Some(data) = blocks.get(&c) else {
         return Ok(None);
     };
     let mut n = decode_node(data, c)?;
+    if depth > 0 && n.entries.is_empty() {
+        return Err(MstError::Invalid("empty child node"));
+    }
     for e in n.entries.iter_mut() {
         if let Entry::Child {
             node,
             cid: Some(cc),
         } = e
         {
-            if let Some(child) = load_from_blocks(blocks, *cc)? {
-                if n.height == -1 && child.height >= 0 {
-                    n.height = child.height + 1;
+            if let Some(child) = load_from_blocks(blocks, *cc, depth + 1)? {
+                if child.height >= 0 {
+                    if n.height < 0 {
+                        n.height = child.height + 1;
+                    } else if child.height != n.height - 1 {
+                        return Err(MstError::Invalid("child height is not parent height - 1"));
+                    }
                 }
                 *node = Some(child);
             }
@@ -769,9 +837,19 @@ fn load_from_blocks(blocks: &HashMap<Cid, Vec<u8>>, c: Cid) -> Result<Option<Arc
     Ok(Some(Arc::new(n)))
 }
 
-fn ensure_heights(n: &mut Arc<Node>) {
-    if n.height <= 0 {
-        return;
+/// Pushes known heights down into loaded nodes without keys (whose subtrees
+/// had no keys either). Depth is bounded by `load_from_blocks`.
+fn ensure_heights(n: &mut Arc<Node>, depth: usize) -> Result<()> {
+    debug_assert!(depth <= MAX_DEPTH);
+    if n.height < 0 {
+        return Ok(());
+    }
+    if n.height == 0 {
+        // a key-less node pushed down to height 0 cannot have children either
+        return match n.entries.iter().any(Entry::is_child) {
+            true => Err(MstError::Invalid("child of a height-0 node")),
+            false => Ok(()),
+        };
     }
     let h = n.height;
     let nm = Arc::make_mut(n);
@@ -780,9 +858,10 @@ fn ensure_heights(n: &mut Arc<Node>) {
             if c.height < 0 {
                 Arc::make_mut(c).height = h - 1;
             }
-            ensure_heights(c);
+            ensure_heights(c, depth + 1)?;
         }
     }
+    Ok(())
 }
 
 // ---------- tree ----------
@@ -872,52 +951,62 @@ impl Tree {
                 return Ok(c);
             }
         }
-        write_blocks(&mut self.root, &mut None)
+        write_blocks(&mut self.root, &mut None, 0)
     }
 
     /// Computes the root CID and returns every dirty block (new nodes + proof nodes).
     pub fn write_diff_blocks(&mut self, out: &mut Vec<(Cid, Vec<u8>)>) -> Result<Cid> {
-        write_blocks(&mut self.root, &mut Some(out))
+        write_blocks(&mut self.root, &mut Some(out), 0)
     }
 
     /// Loads a (possibly partial) tree from a block set.
     pub fn load_from_blocks(blocks: &HashMap<Cid, Vec<u8>>, root: Cid) -> Result<Tree> {
-        let mut r = load_from_blocks(blocks, root)?.ok_or(MstError::Partial)?;
-        ensure_heights(&mut r);
+        let mut r = load_from_blocks(blocks, root, 0)?.ok_or(MstError::Partial)?;
+        ensure_heights(&mut r, 0)?;
         Ok(Tree { root: r })
     }
 
     /// Visits every (key, value) in key order.
     pub fn walk(&self, f: &mut dyn FnMut(&[u8], Cid)) {
-        fn rec(n: &Node, f: &mut dyn FnMut(&[u8], Cid)) {
+        fn rec(n: &Node, f: &mut dyn FnMut(&[u8], Cid), depth: usize) {
+            // loaded trees are bounded by load_from_blocks, built ones by key heights
+            debug_assert!(depth <= MAX_DEPTH);
             for e in &n.entries {
                 match e {
                     Entry::Value { key, val } => f(key, *val),
-                    Entry::Child { node: Some(c), .. } => rec(c, f),
+                    Entry::Child { node: Some(c), .. } => rec(c, f, depth + 1),
                     _ => {}
                 }
             }
         }
-        rec(&self.root, f)
+        rec(&self.root, f, 0)
     }
 
     /// Visits every node block (cid, encoded bytes). The tree must be fully
     /// written (no dirty nodes), e.g. right after `root_cid`.
     pub fn walk_blocks(&self, f: &mut dyn FnMut(Cid, &[u8])) -> Result<()> {
-        fn rec(n: &Node, buf: &mut Vec<u8>, f: &mut dyn FnMut(Cid, &[u8])) -> Result<()> {
+        fn rec(
+            n: &Node,
+            buf: &mut Vec<u8>,
+            f: &mut dyn FnMut(Cid, &[u8]),
+            depth: usize,
+        ) -> Result<()> {
+            if depth > MAX_DEPTH {
+                return Err(MstError::Invalid("tree too deep"));
+            }
             buf.clear();
             encode_node(n, buf)?;
             let c = n.cid.ok_or(MstError::Invalid("unwritten node"))?;
             f(c, buf);
             for e in &n.entries {
                 if let Entry::Child { node: Some(c), .. } = e {
-                    rec(c, buf, f)?;
+                    rec(c, buf, f, depth + 1)?;
                 }
             }
             Ok(())
         }
         let mut buf = Vec::with_capacity(1024);
-        rec(&self.root, &mut buf, f)
+        rec(&self.root, &mut buf, f, 0)
     }
 
     /// Node blocks on the path from the root to `key` (inclusion or exclusion proof).
@@ -1168,5 +1257,207 @@ mod tests {
         let mut fresh = Tree::new();
         fresh.insert(b"app.bsky.feed.post/aaaa", leaf()).unwrap();
         assert_eq!(t.root_cid().unwrap(), fresh.root_cid().unwrap());
+    }
+
+    /// Raw node bytes: `l`, then entries of (key suffix, prefix len, t).
+    fn raw_node(l: Option<Cid>, es: &[(&[u8], u64, Option<Cid>)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        cbor::write_map_head(&mut b, 2);
+        cbor::write_text(&mut b, "e");
+        cbor::write_array_head(&mut b, es.len());
+        for (k, p, t) in es {
+            cbor::write_map_head(&mut b, 4);
+            cbor::write_text(&mut b, "k");
+            cbor::write_bytes(&mut b, k);
+            cbor::write_text(&mut b, "p");
+            cbor::write_uint(&mut b, *p);
+            cbor::write_text(&mut b, "t");
+            cbor::write_opt_cid(&mut b, t.as_ref());
+            cbor::write_text(&mut b, "v");
+            cbor::write_cid(&mut b, &leaf());
+        }
+        cbor::write_text(&mut b, "l");
+        cbor::write_opt_cid(&mut b, l.as_ref());
+        b
+    }
+
+    fn add(blocks: &mut HashMap<Cid, Vec<u8>>, b: Vec<u8>) -> Cid {
+        let c = Cid::dag_cbor(&b);
+        blocks.insert(c, b);
+        c
+    }
+
+    fn load(blocks: &HashMap<Cid, Vec<u8>>, root: Cid) -> Result<Tree> {
+        Tree::load_from_blocks(blocks, root)
+    }
+
+    /// A chain of `{e: [], l: child}` nodes used to overflow the stack (and
+    /// abort the process) in load_from_blocks; it is an error now, on the
+    /// 2 MiB stack of a tokio blocking thread.
+    #[test]
+    fn deep_chain_rejected_not_overflowed() {
+        let mut blocks = HashMap::new();
+        let mut c = add(&mut blocks, raw_node(None, &[(b"asdf", 0, None)]));
+        let mut depth_ok = None;
+        for d in 1..200_000 {
+            c = add(&mut blocks, raw_node(Some(c), &[]));
+            if d == MAX_DEPTH - 1 {
+                depth_ok = Some(c);
+            }
+        }
+        let r = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let ok = load(&blocks, depth_ok.unwrap()).map(|t| t.root.height);
+                (ok, load(&blocks, c).err())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        // MAX_DEPTH levels load (heights inferred upward from the leaf)
+        assert_eq!(r.0, Ok(MAX_DEPTH as i32 - 1));
+        assert_eq!(r.1, Some(MstError::Invalid("tree too deep")));
+    }
+
+    #[test]
+    fn heights_must_step_down_by_one() {
+        // "blue" has height 1, "88bfafc7" height 2, "asdf"/"2653ae71" height 0
+        let mut blocks = HashMap::new();
+        let h0 = add(&mut blocks, raw_node(None, &[(b"asdf", 0, None)]));
+        let h1 = add(&mut blocks, raw_node(None, &[(b"blue", 0, None)]));
+        let good = add(&mut blocks, raw_node(Some(h0), &[(b"blue", 0, None)]));
+        assert_eq!(
+            load(&blocks, good).unwrap().get(b"asdf").unwrap(),
+            Some(leaf())
+        );
+        // height 2 over height 0, height 1 over height 1
+        let skip = add(&mut blocks, raw_node(Some(h0), &[(b"88bfafc7", 0, None)]));
+        let same = add(&mut blocks, raw_node(None, &[(b"blue", 0, Some(h1))]));
+        // a key-less node over height 0 is height 1; over that, height 2 is fine
+        let mid = add(&mut blocks, raw_node(Some(h0), &[]));
+        let ok2 = add(&mut blocks, raw_node(Some(mid), &[(b"88bfafc7", 0, None)]));
+        let bad2 = add(&mut blocks, raw_node(Some(mid), &[(b"blue", 0, None)]));
+        for c in [skip, same, bad2] {
+            assert!(load(&blocks, c).is_err());
+        }
+        assert!(load(&blocks, ok2).is_ok());
+        // key-less nodes pushed down to height 0 cannot have children: the
+        // stub below `mid0` is missing, so its height comes from above
+        let stub = add(&mut blocks, raw_node(Some(leaf()), &[]));
+        let mid0 = add(&mut blocks, raw_node(Some(stub), &[]));
+        let top = add(&mut blocks, raw_node(Some(mid0), &[(b"blue", 0, None)]));
+        assert_eq!(
+            load(&blocks, top).err(),
+            Some(MstError::Invalid("child of a height-0 node"))
+        );
+        // empty non-root nodes don't exist in a canonical tree
+        let empty = add(&mut blocks, raw_node(None, &[]));
+        let over_empty = add(&mut blocks, raw_node(Some(empty), &[(b"blue", 0, None)]));
+        assert!(load(&blocks, over_empty).is_err());
+        assert!(load(&blocks, empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn decode_node_structural_checks() {
+        let c = leaf();
+        let ok = |b: Vec<u8>| decode_node(&b, Cid::dag_cbor(&b));
+        // "asdf" < "asdg", both height 0, sharing a 3-byte prefix
+        assert!(ok(raw_node(None, &[(b"asdf", 0, None), (b"g", 3, None)])).is_ok());
+        let bad: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "unsorted",
+                raw_node(None, &[(b"asdf", 0, None), (b"2653ae71", 0, None)]),
+            ),
+            (
+                "duplicate",
+                raw_node(None, &[(b"asdf", 0, None), (b"", 4, None)]),
+            ),
+            (
+                "mixed heights",
+                raw_node(None, &[(b"asdf", 0, None), (b"blue", 0, None)]),
+            ),
+            ("first p != 0", raw_node(None, &[(b"asdf", 1, None)])),
+            (
+                "prefix not maximal",
+                raw_node(None, &[(b"asdf", 0, None), (b"asdg", 0, None)]),
+            ),
+            ("empty key", raw_node(None, &[(b"", 0, None)])),
+            ("height-0 child", raw_node(Some(c), &[(b"asdf", 0, None)])),
+            (
+                "height-0 right child",
+                raw_node(None, &[(b"asdf", 0, Some(c))]),
+            ),
+        ];
+        for (what, b) in bad {
+            assert!(ok(b).is_err(), "{what} accepted");
+        }
+        use cbor::Value as V;
+        let entry = |extra: Option<(&str, V)>, t: Option<V>| {
+            let mut m = vec![
+                ("k".to_string(), V::Bytes(b"blue".to_vec())),
+                ("p".to_string(), V::Int(0)),
+                ("v".to_string(), V::Link(c)),
+            ];
+            if let Some(t) = t {
+                m.push(("t".to_string(), t));
+            }
+            if let Some((k, v)) = extra {
+                m.push((k.to_string(), v));
+            }
+            m.sort_by(|a, b| cbor::key_cmp(&a.0, &b.0));
+            V::Map(m)
+        };
+        let node = |e: V, l: Option<V>, extra: Option<(&str, V)>| {
+            let mut m = vec![("e".to_string(), V::Array(vec![e]))];
+            if let Some(l) = l {
+                m.push(("l".to_string(), l));
+            }
+            if let Some((k, v)) = extra {
+                m.push((k.to_string(), v));
+            }
+            m.sort_by(|a, b| cbor::key_cmp(&a.0, &b.0));
+            V::Map(m).to_cbor()
+        };
+        assert!(ok(node(entry(None, Some(V::Null)), Some(V::Null), None)).is_ok());
+        assert!(ok(node(entry(None, Some(V::Link(c))), Some(V::Link(c)), None)).is_ok());
+        let bad = [
+            ("missing l", node(entry(None, Some(V::Null)), None, None)),
+            ("missing t", node(entry(None, None), Some(V::Null), None)),
+            (
+                "unknown node field",
+                node(
+                    entry(None, Some(V::Null)),
+                    Some(V::Null),
+                    Some(("x", V::Null)),
+                ),
+            ),
+            (
+                "unknown entry field",
+                node(
+                    entry(Some(("x", V::Null)), Some(V::Null)),
+                    Some(V::Null),
+                    None,
+                ),
+            ),
+            (
+                "t not a link",
+                node(
+                    entry(None, Some(V::Bytes(c.to_bytes().to_vec()))),
+                    Some(V::Null),
+                    None,
+                ),
+            ),
+            (
+                "t int",
+                node(entry(None, Some(V::Int(0))), Some(V::Null), None),
+            ),
+            (
+                "l not a link",
+                node(entry(None, Some(V::Null)), Some(V::Text("x".into())), None),
+            ),
+        ];
+        for (what, b) in bad {
+            assert!(ok(b).is_err(), "{what} accepted");
+        }
     }
 }

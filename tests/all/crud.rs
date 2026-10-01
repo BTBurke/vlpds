@@ -1156,3 +1156,43 @@ async fn apply_writes_limits() {
     assert_eq!(r["results"].as_array().unwrap().len(), 200);
     assert_eq!(s.get_repo(&a.did).await.entries().len(), 200);
 }
+
+/// Record writes take JSON bodies up to 1,000,000 bytes (reference
+/// createRecord/putRecord/applyWrites `jsonLimit`), past the 150 KiB default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_writes_accept_large_json_bodies() {
+    let (s, a) = setup().await;
+    let big = "x".repeat(600_000);
+    let rec = json!({"$type": "com.example.big", "data": big});
+    create(&s, &a, json!({"collection": "com.example.big", "rkey": "a", "record": rec})).await.ok();
+    put(&s, &a, json!({"collection": "com.example.big", "rkey": "b", "record": rec})).await.ok();
+    apply(
+        &s,
+        &a,
+        json!({"writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": "com.example.big", "rkey": "c", "value": rec}]}),
+    )
+    .await
+    .ok();
+    let got = s.get_record(&a.did, "com.example.big", "b").await.ok();
+    assert_eq!(got["value"]["data"].as_str().map(str::len), Some(600_000));
+    // past 1,000,000 bytes: 413
+    let huge = format!(
+        "{{\"repo\":\"{}\",\"collection\":\"com.example.big\",\"record\":{{\"data\":\"{}\"}}}}",
+        a.did,
+        "x".repeat(1_000_000)
+    );
+    s.xrpc
+        .post_bytes("com.atproto.repo.createRecord", huge.into_bytes(), "application/json", &a.auth())
+        .await
+        .err(413, "PayloadTooLarge");
+}
+
+/// Without an AppView, getRecord for a repo not hosted here is the
+/// reference's 400 InvalidRequest "Could not locate record".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_record_unhosted_without_appview() {
+    let (s, _) = setup().await;
+    let r = s.get_record("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "app.bsky.feed.post", "3jzfcijpj2z2a").await;
+    r.err(400, "InvalidRequest");
+    assert!(r.text().contains("Could not locate record"), "{}", r.text());
+}

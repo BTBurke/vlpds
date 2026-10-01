@@ -225,6 +225,26 @@ pub async fn list_sessions(app: &App, did: &str) -> Result<Vec<Session>, OAuthEr
     Ok(out)
 }
 
+/// Deletes every OAuth session of `did` in one log write, so its DPoP access
+/// tokens stop verifying (verify_dpop requires the live session) and its
+/// refresh tokens are dead. Used by takedowns and password change/reset.
+/// Returns how many sessions were revoked.
+pub async fn revoke_all_sessions(app: &App, did: &str) -> Result<usize, OAuthError> {
+    let muts: Vec<_> = list_sessions(app, did)
+        .await?
+        .iter()
+        .map(|s| crate::segment::Mutation {
+            key: Bytes::from(crate::state::private_key(did, &session_key(&s.id))),
+            val: None,
+        })
+        .collect();
+    let n = muts.len();
+    if n > 0 {
+        app.put_private(did, muts).await.map_err(OAuthError::from)?;
+    }
+    Ok(n)
+}
+
 /// Refresh tokens: `ref-{b64u(did)}.{session id}.{generation}.{mac}` where
 /// mac = HMAC(server refresh key, did | session | generation | session salt).
 /// Embedding the routing info avoids a token index; the per-session salt
@@ -308,6 +328,10 @@ pub struct Device {
     /// Password verified, second factor pending: (did, at).
     #[serde(default)]
     pub pending_2fa: Option<(String, i64)>,
+    /// Wrong codes against `pending_2fa`; past a few the password step must
+    /// be redone.
+    #[serde(default)]
+    pub pending_2fa_failures: u32,
 }
 
 pub fn new_device_id() -> String {

@@ -707,15 +707,8 @@ fn parse_subject(s: &J) -> XResult<Subject> {
 /// Deletes every OAuth session of `did`, so its DPoP access tokens stop
 /// verifying (verify_dpop requires the live session) and can't be refreshed.
 async fn revoke_oauth_sessions(app: &App, did: &str) {
-    match crate::oauth::store::list_sessions(app, did).await {
-        Ok(sessions) => {
-            for s in sessions {
-                if let Err(e) = crate::oauth::store::delete_session(app, did, &s.id).await {
-                    tracing::warn!(%did, "takedown: deleting OAuth session failed: {}", e.description);
-                }
-            }
-        }
-        Err(e) => tracing::warn!(%did, "takedown: listing OAuth sessions failed: {}", e.description),
+    if let Err(e) = crate::oauth::store::revoke_all_sessions(app, did).await {
+        tracing::warn!(%did, "takedown: revoking OAuth sessions failed: {}", e.description);
     }
 }
 
@@ -947,7 +940,7 @@ async fn disable_invite_codes(
 #[derive(Deserialize)]
 struct InviteCodesQ {
     sort: Option<String>,
-    limit: Option<usize>,
+    limit: Option<i64>,
     cursor: Option<String>,
 }
 
@@ -963,7 +956,7 @@ async fn get_invite_codes(
     if sort != "recent" && sort != "usage" {
         return Err(invalid_request(format!("unknown sort method: {sort}")));
     }
-    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    let limit = super::extract::limit_param(q.limit, 100, 1, 500)?;
     let mut all: Vec<InviteCode> = scan_private_routing(&app, "_invite:")
         .await?
         .into_iter()
@@ -1078,7 +1071,7 @@ async fn bulk_create(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    if tok != Some(app.admin_token.as_str()) {
+    if !tok.is_some_and(|t| crate::auth::token_eq(&app.admin_token, t)) {
         return Err(XrpcError::auth("admin token required"));
     }
     let mut waits = Vec::with_capacity(inp.count as usize);

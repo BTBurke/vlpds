@@ -25,10 +25,18 @@ struct Args {
     handle_domain: String,
     #[arg(long, env = "VLPDS_SERVICE_DID", default_value = "did:web:localhost")]
     service_did: String,
-    #[arg(long, env = "VLPDS_JWT_SECRET", default_value = "dev-secret-change-me")]
-    jwt_secret: String,
-    #[arg(long, env = "VLPDS_ADMIN_TOKEN", default_value = "dev-admin-token")]
-    admin_token: String,
+    /// Session JWT / OAuth key-derivation secret (>= 32 bytes; dev default
+    /// only with --dev-mode).
+    #[arg(long, env = "VLPDS_JWT_SECRET", hide_env_values = true)]
+    jwt_secret: Option<String>,
+    /// Admin Basic-auth token (>= 32 bytes; dev default only with --dev-mode).
+    #[arg(long, env = "VLPDS_ADMIN_TOKEN", hide_env_values = true)]
+    admin_token: Option<String>,
+    /// Node-to-node token (`x-vlpds-internal`), the same on every node of a
+    /// cluster (>= 32 bytes, distinct from the admin token; dev default only
+    /// with --dev-mode).
+    #[arg(long, env = "VLPDS_INTERNAL_TOKEN", hide_env_values = true)]
+    internal_token: Option<String>,
 
     #[arg(
         long,
@@ -92,7 +100,8 @@ struct Args {
     /// Relays to send requestCrawl to at startup (comma-separated hostnames/urls).
     #[arg(long, env = "VLPDS_CRAWLERS", value_delimiter = ',')]
     crawlers: Vec<String>,
-    /// Dev mode: email/password tokens are logged instead of mailed.
+    /// Dev mode: email/password tokens are logged instead of mailed, and the
+    /// well-known dev secrets are accepted.
     #[arg(long, env = "VLPDS_DEV_MODE")]
     dev_mode: bool,
     /// Max uploadBlob size (MB).
@@ -158,13 +167,24 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(run(args))
 }
 
+/// A secret flag's value; the well-known dev default only in dev mode (an
+/// unset secret outside dev mode is refused by `Config::check_secrets`).
+fn secret(v: &Option<String>, dev_mode: bool, dev_default: &str) -> String {
+    match v {
+        Some(v) => v.clone(),
+        None if dev_mode => dev_default.to_string(),
+        None => String::new(),
+    }
+}
+
 async fn run(args: Args) -> anyhow::Result<()> {
     let cfg = Config {
         public_url: args.public_url.clone(),
         handle_domain: args.handle_domain.clone(),
         service_did: args.service_did.clone(),
-        jwt_secret: args.jwt_secret.clone(),
-        admin_token: args.admin_token.clone(),
+        jwt_secret: secret(&args.jwt_secret, args.dev_mode, server::DEV_JWT_SECRET),
+        admin_token: secret(&args.admin_token, args.dev_mode, server::DEV_ADMIN_TOKEN),
+        internal_token: secret(&args.internal_token, args.dev_mode, server::DEV_INTERNAL_TOKEN),
         s3: (!args.memory).then(|| S3Config {
             endpoint: args.s3_endpoint.clone(),
             bucket: args.s3_bucket.clone(),
@@ -202,12 +222,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
             skew: Duration::from_millis(args.lease_ttl_ms / 5),
         }),
     };
+    cfg.check_secrets()?;
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     let app = server::build(cfg).await?;
     server::spawn_reporters(&app);
     tracing::info!(listen = %args.listen, "vlpds serving");
     // background services
     vlpds::xrpc::spawn_blob_gc(app.clone());
+    vlpds::xrpc::spawn_reserved_key_gc(app.clone());
     tokio::spawn(vlpds::xrpc::request_crawl(app.clone()));
     let router = server::with_forwarding(&app, vlpds::xrpc::router(app.clone()));
     tokio::select! {

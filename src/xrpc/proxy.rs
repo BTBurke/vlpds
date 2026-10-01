@@ -294,7 +294,7 @@ fn upstream_failure(message: &str) -> XrpcError {
 }
 
 /// Request headers passed to the upstream service (TS allow-list).
-fn forward_headers(src: &HeaderMap, with_body: bool, authorization: String) -> HeaderMap {
+fn forward_headers(src: &HeaderMap, with_body: bool, authorization: Option<String>) -> HeaderMap {
     let mut out = HeaderMap::new();
     let copy = |out: &mut HeaderMap, name: &str| {
         for v in src.get_all(name) {
@@ -328,7 +328,7 @@ fn forward_headers(src: &HeaderMap, with_body: bool, authorization: String) -> H
         copy(&mut out, "content-encoding");
         copy(&mut out, "content-length");
     }
-    if let Ok(v) = header::HeaderValue::from_str(&authorization) {
+    if let Some(Ok(v)) = authorization.map(|a| header::HeaderValue::from_str(&a)) {
         out.insert(header::AUTHORIZATION, v);
     }
     out
@@ -452,7 +452,8 @@ struct Forward<'a> {
     path_and_query: &'a str,
     headers: &'a HeaderMap,
     body: Option<reqwest::Body>,
-    iss: &'a str,
+    /// Service-auth issuer; None forwards without credentials.
+    iss: Option<&'a str>,
     lxm: &'a str,
 }
 
@@ -538,12 +539,17 @@ fn service_jwt(acct: &CachedAcct, iss: &str, aud: &str, lxm: &str) -> Arc<str> {
     j
 }
 
-/// Sends the request to `target` with a (cached) service-auth token and
-/// streams the response back.
+/// Sends the request to `target` with a (cached) service-auth token (when
+/// there is an issuer) and streams the response back.
 async fn forward(app: &App, target: &Target, f: Forward<'_>) -> XResult<Response> {
-    let acct = cached_account(app, f.iss).await?;
-    // Phase 1 of service-auth updates: the outbound JWT aud is the bare DID.
-    let jwt = service_jwt(&acct, f.iss, &target.did, f.lxm);
+    let authorization = match f.iss {
+        Some(iss) => {
+            let acct = cached_account(app, iss).await?;
+            // Phase 1 of service-auth updates: the outbound JWT aud is the bare DID.
+            Some(format!("Bearer {}", service_jwt(&acct, iss, &target.did, f.lxm)))
+        }
+        None => None,
+    };
 
     let base = reqwest::Url::parse(&target.url)
         .map_err(|_| XrpcError::bad("InvalidRequest", "invalid service endpoint"))?;
@@ -561,11 +567,7 @@ async fn forward(app: &App, target: &Target, f: Forward<'_>) -> XResult<Response
     let with_body = f.body.is_some();
     let mut rb = proxy_http(app, target.trusted)
         .request(f.method, &url)
-        .headers(forward_headers(
-            f.headers,
-            with_body,
-            format!("Bearer {jwt}"),
-        ));
+        .headers(forward_headers(f.headers, with_body, authorization));
     if let Some(b) = f.body {
         rb = rb.body(b);
     }
@@ -613,6 +615,37 @@ async fn forward(app: &App, target: &Target, f: Forward<'_>) -> XResult<Response
         .map_err(XrpcError::from_err)
 }
 
+/// Unauthenticated pipethrough of a GET to the `atproto-proxy` target or the
+/// method's default service (reference `pipethrough(ctx, req)` without an
+/// issuer), e.g. repo.getRecord for repos not hosted here.
+pub(super) async fn pipethrough_unauthed(
+    app: &App,
+    headers: &HeaderMap,
+    uri: &Uri,
+    lxm: &str,
+) -> XResult<Response> {
+    let target = match proxy_header(headers)? {
+        Some(h) => parse_proxy_header(app, h).await?,
+        None => default_target(app, lxm)?
+            .or_else(|| configured(&app.config.appview, "bsky_appview"))
+            .ok_or_else(|| XrpcError::bad("InvalidRequest", format!("No service configured for {lxm}")))?,
+    };
+    let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path());
+    forward(
+        app,
+        &target,
+        Forward {
+            method: Method::GET,
+            path_and_query: pq,
+            headers,
+            body: None,
+            iss: None,
+            lxm,
+        },
+    )
+    .await
+}
+
 /// Account checks shared by every proxied call: loads the account and
 /// rejects taken-down accounts unless the method allows them.
 async fn check_takedown(app: &App, did: &str, allow_takendown: bool) -> XResult<()> {
@@ -623,7 +656,7 @@ async fn check_takedown(app: &App, did: &str, allow_takendown: bool) -> XResult<
             "Account not found",
         )
     })?;
-    if !allow_takendown && acct.status.as_deref() == Some("takendown") {
+    if !allow_takendown && matches!(acct.status.as_deref(), Some("takendown") | Some("suspended")) {
         return Err(xerr(
             StatusCode::UNAUTHORIZED,
             "AccountTakedown",
@@ -719,7 +752,7 @@ async fn proxy_request(app: &App, req: Request) -> XResult<Response> {
             path_and_query: pq,
             headers: &parts.headers,
             body,
-            iss: &did,
+            iss: Some(&did),
             lxm: &lxm,
         },
     )
@@ -817,7 +850,7 @@ async fn get_preferences(
                 path_and_query: pq,
                 headers: &headers,
                 body: None,
-                iss: &did,
+                iss: Some(&did),
                 lxm: GET_PREFERENCES,
             },
         )
@@ -858,7 +891,7 @@ async fn put_preferences(
             path_and_query: pq,
             headers: &headers,
             body: Some(body.into()),
-            iss: &did,
+            iss: Some(&did),
             lxm: PUT_PREFERENCES,
         };
         return forward(&app, &target, fwd).await;
@@ -1005,7 +1038,7 @@ async fn create_report(
             path_and_query: &path,
             headers: &fwd_headers,
             body: Some(body.into()),
-            iss: &did,
+            iss: Some(&did),
             lxm: CREATE_REPORT,
         },
     )

@@ -135,3 +135,50 @@ async fn upload_get_list_and_gc() {
         .unwrap();
     assert_eq!(deleted, 0);
 }
+
+/// Declared blob refs must match the stored blob (reference verifyBlob), so
+/// lexicon accept/maxSize can't be bypassed by lying about size or type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blob_refs_must_match_stored_blob() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("blobref").await;
+    let png = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", PNG_1X1.to_vec(), "image/png", &a.auth()).await.ok()["blob"].clone();
+    let text = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", b"just some text".to_vec(), "text/plain", &a.auth()).await.ok()["blob"].clone();
+    let profile = |avatar: &serde_json::Value| json!({"repo": a.did, "collection": "app.bsky.actor.profile", "rkey": "self", "record": {"$type": "app.bsky.actor.profile", "avatar": avatar}});
+    let put = |body: serde_json::Value| {
+        let (x, auth) = (s.xrpc.clone(), a.auth());
+        async move { x.post("com.atproto.repo.putRecord", &body, &auth).await }
+    };
+
+    let mut lie = png.clone();
+    lie["size"] = json!(png["size"].as_i64().unwrap() + 1);
+    put(profile(&lie)).await.err(400, "InvalidSize");
+    let mut lie = png.clone();
+    lie["mimeType"] = json!("image/jpeg");
+    put(profile(&lie)).await.err(400, "InvalidMimeType");
+    // a non-image declared as an image to pass the avatar's accept list
+    let mut lie = text.clone();
+    lie["mimeType"] = json!("image/png");
+    put(profile(&lie)).await.err(400, "InvalidMimeType");
+    // same check through applyWrites and createRecord
+    let mut lie = png.clone();
+    lie["size"] = json!(1);
+    s.xrpc
+        .post(
+            "com.atproto.repo.applyWrites",
+            &json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": "com.example.thing", "value": {"file": lie}}]}),
+            &a.auth(),
+        )
+        .await
+        .err(400, "InvalidSize");
+    s.xrpc
+        .post(
+            "com.atproto.repo.createRecord",
+            &json!({"repo": a.did, "collection": "com.example.thing", "record": {"file": lie}}),
+            &a.auth(),
+        )
+        .await
+        .err(400, "InvalidSize");
+
+    put(profile(&png)).await.ok();
+}

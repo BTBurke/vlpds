@@ -1,5 +1,6 @@
-//! Node-to-node endpoints (cluster mode). Authenticated with the shared admin
-//! token in `x-vlpds-internal`; never exposed publicly in production.
+//! Node-to-node endpoints (cluster mode). Authenticated with the shared
+//! internal token (`Config::internal_token`, not the admin token) in
+//! `x-vlpds-internal`; never exposed publicly in production.
 
 use super::*;
 use crate::segment::Mutation;
@@ -44,10 +45,19 @@ async fn cluster_status(State(app): AppState, headers: HeaderMap) -> XResult<Jso
 }
 
 fn check(app: &App, headers: &HeaderMap) -> XResult<()> {
-    match headers.get(HDR).and_then(|v| v.to_str().ok()) {
-        Some(t) if t == app.admin_token => Ok(()),
-        _ => Err(XrpcError::auth("internal endpoint")),
+    let t = headers.get(HDR).and_then(|v| v.to_str().ok()).unwrap_or("");
+    if internal_token_ok(&app.config, t) {
+        Ok(())
+    } else {
+        Err(XrpcError::auth("internal endpoint"))
     }
+}
+
+/// Whether `t` is the node-to-node token. Dev mode also accepts the admin
+/// token, for senders not yet switched to the internal token.
+pub fn internal_token_ok(cfg: &crate::server::Config, t: &str) -> bool {
+    crate::auth::token_eq(&cfg.internal_token, t)
+        || (cfg.dev_mode && crate::auth::token_eq(&cfg.admin_token, t))
 }
 
 /// Streams this node's log (durable batches + watermark heartbeats) to a peer.
@@ -70,8 +80,14 @@ async fn put_private(State(app): AppState, headers: HeaderMap, axum::Json(inp): 
         .muts
         .into_iter()
         .map(|(k, v)| {
+            let key = B64.decode(k).map_err(XrpcError::from_err)?;
+            // only the routing key's own private state (p/{routing}\0...),
+            // never repo data, heads or another account's state
+            if !key.starts_with(&state::private_prefix(&inp.routing)) {
+                return Err(XrpcError::bad("InvalidRequest", "key outside the routing key's private state"));
+            }
             Ok(Mutation {
-                key: B64.decode(k).map_err(XrpcError::from_err)?.into(),
+                key: key.into(),
                 val: v.map(|v| B64.decode(v).map(Bytes::from)).transpose().map_err(XrpcError::from_err)?,
             })
         })
@@ -107,7 +123,7 @@ pub async fn forward_put_private(app: &App, owner: &str, routing: &str, muts: Ve
     let r = app
         .http
         .post(format!("{owner}/internal/v1/private/put"))
-        .header(HDR, &app.admin_token)
+        .header(HDR, &app.config.internal_token)
         .json(&body)
         .send()
         .await
@@ -122,7 +138,7 @@ pub async fn forward_get_private(app: &App, owner: &str, routing: &str, name: &s
     let r = app
         .http
         .get(format!("{owner}/internal/v1/private/get"))
-        .header(HDR, &app.admin_token)
+        .header(HDR, &app.config.internal_token)
         .query(&[("routing", routing), ("name", name)])
         .send()
         .await

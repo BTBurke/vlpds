@@ -49,6 +49,7 @@ pub const TAKENDOWN_METHODS: &[&str] = &[
     "com.atproto.sync.getBlob",
     "com.atproto.sync.getRepo",
     "com.atproto.sync.listBlobs",
+    "tools.ozone.inbox.appealActionedSubject",
 ];
 
 impl Credentials {
@@ -143,11 +144,7 @@ pub async fn authenticate(app: &App, parts: &Parts) -> XResult<Credentials> {
         return super::oauth::verify_dpop(app, tok, parts).await;
     }
     if let Some(b) = h.strip_prefix("Basic ") {
-        use base64::Engine;
-        let dec = base64::engine::general_purpose::STANDARD
-            .decode(b)
-            .unwrap_or_default();
-        if dec == format!("admin:{}", app.admin_token).as_bytes() {
+        if crate::auth::basic_admin_ok(b, &app.admin_token) {
             return Ok(Credentials::Admin);
         }
         return Err(XrpcError::auth("invalid admin credentials"));

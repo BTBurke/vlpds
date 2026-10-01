@@ -7,6 +7,10 @@
 // signature against the key from the PDS's describeRepo, and per-DID chain
 // continuity (since == previous rev, prevData == previous data CID, rev
 // strictly increasing). #sync events are signature-checked and reset the chain.
+// Every frame header/body and every DAG-CBOR block must be canonical DAG-CBOR;
+// op paths are unique within a commit; blocks fit the lexicon's maxLength;
+// #identity/#account fields are well-formed; and per-DID event times never go
+// backwards.
 //
 // Usage:
 //
@@ -214,6 +218,13 @@ func readLoop(ctx context.Context, conn *websocket.Conn, cfg config, st *stats, 
 			continue
 		}
 		st.events.Add(1)
+		if ev.NonCanonical != "" {
+			seq, ok := ev.seq()
+			if !ok {
+				seq = sc.last
+			}
+			st.fail(failure{Kind: failNonCanonical, Seq: seq, DID: ev.did(), Reason: ev.NonCanonical})
+		}
 
 		if ev.Header.Op == frameOpError {
 			st.fail(failure{Kind: failUpstreamError, Seq: sc.last, Reason: ev.ErrName + ": " + ev.ErrMsg})
@@ -239,6 +250,7 @@ func readLoop(ctx context.Context, conn *websocket.Conn, cfg config, st *stats, 
 			pool.dispatch(ev)
 		case ev.Account != nil:
 			st.account.Add(1)
+			pool.dispatch(ev)
 		case ev.Info == nil:
 			st.unknown.Add(1)
 		}
@@ -336,9 +348,17 @@ func handleEvent(ctx context.Context, v *verifier, keys KeySource, st *stats, ev
 		}
 	case ev.Identity != nil:
 		st.identity.Add(1)
+		for _, f := range v.verifyIdentity(ev.Identity) {
+			st.fail(f)
+		}
 		// Handled in the DID's worker so the key refresh is ordered with its commits.
 		if keys != nil {
 			keys.Invalidate(ev.Identity.Did)
+		}
+	case ev.Account != nil:
+		// counted in readLoop
+		for _, f := range v.verifyAccount(ev.Account) {
+			st.fail(f)
 		}
 	}
 }

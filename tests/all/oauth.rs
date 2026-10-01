@@ -1708,3 +1708,169 @@ async fn include_permission_set() {
         "invalid_scope"
     );
 }
+
+/// Enables TOTP for `acct`; returns the secret and the step the confirm code
+/// spent.
+async fn enable_totp(s: &Srv, acct: &Account) -> (Vec<u8>, u64) {
+    let setup: J = s
+        .http
+        .post(format!("{}/xrpc/vlpds.server.setupTotp", s.base))
+        .bearer_auth(&acct.jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let secret = vlpds::totp::base32_decode(setup["secret"].as_str().unwrap()).unwrap();
+    let step = vlpds::totp::step_at(vlpds::totp::now_secs());
+    let r = s
+        .http
+        .post(format!("{}/xrpc/vlpds.server.confirmTotp", s.base))
+        .bearer_auth(&acct.jwt)
+        .json(&json!({"code": vlpds::totp::code_for_step(&secret, step)}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    (secret, step)
+}
+
+/// Wrong authenticator codes: a few are fine, three drop the pending sign-in
+/// (password again), and five in a row lock the account's factor for both
+/// OAuth and createSession, persisted in its TOTP state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn totp_brute_force_lockout() {
+    let s = spawn().await;
+    let acct = create_account(&s, "mallory").await;
+    let (secret, step) = enable_totp(&s, &acct).await;
+    let key = DpopKey::new();
+    let redirect = "http://127.0.0.1/cb";
+    let cid = loopback_client_id("atproto", redirect);
+    let f = Flow::new(&cid, redirect, "atproto", &key);
+    let mut b = Browser::default();
+    let ru = f.par(&s, &pkce(), "t").await.body["request_uri"].as_str().unwrap().to_string();
+    let (_, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
+    let csrf = csrf_of(&html);
+    let password = [
+        ("request_uri", ru.as_str()),
+        ("csrf", csrf.as_str()),
+        ("identifier", acct.handle.as_str()),
+        ("password", PASSWORD),
+        ("action", "sign-in"),
+    ];
+    let totp = |code: &str| {
+        [
+            ("request_uri", ru.clone()),
+            ("csrf", csrf.clone()),
+            ("step", "totp".to_string()),
+            ("code", code.to_string()),
+            ("action", "sign-in".to_string()),
+        ]
+    };
+    async fn post_owned(b: &mut Browser, s: &Srv, p: &[(&str, String)]) -> (u16, String) {
+        let p: Vec<(&str, &str)> = p.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let (st, _, html) = b.post(s, "/oauth/authorize/sign-in", &p).await;
+        (st, html)
+    }
+
+    let (st, html) = b.post(&s, "/oauth/authorize/sign-in", &password).await.into_pair();
+    assert_eq!(st, 200, "{html}");
+    for _ in 0..2 {
+        let (st, html) = post_owned(&mut b, &s, &totp("000000")).await;
+        assert_eq!(st, 401);
+        assert!(html.contains("Invalid authenticator code") && html.contains("name=\"code\""), "{html}");
+    }
+    // third wrong code on this pending sign-in: back to the password step
+    let (st, html) = post_owned(&mut b, &s, &totp("000000")).await;
+    assert_eq!(st, 429, "{html}");
+    assert!(html.contains("Too many invalid authenticator codes"), "{html}");
+    assert!(!html.contains("name=\"code\""), "{html}");
+    // the pending step is gone: a right code alone no longer signs in
+    let good = vlpds::totp::code_for_step(&secret, step + 1);
+    let (st, html) = post_owned(&mut b, &s, &totp(&good)).await;
+    assert_eq!(st, 401);
+    assert!(html.contains("timed out"), "{html}");
+
+    // password again; the account counter is at 3, two more lock it
+    let (st, _) = b.post(&s, "/oauth/authorize/sign-in", &password).await.into_pair();
+    assert_eq!(st, 200);
+    let (st, _) = post_owned(&mut b, &s, &totp("111111")).await;
+    assert_eq!(st, 401);
+    let (st, html) = post_owned(&mut b, &s, &totp("222222")).await;
+    assert_eq!(st, 429, "{html}");
+    let Ok(st) = vlpds::totp::load(&s.app, &acct.did).await else { panic!("load totp state") };
+    assert_eq!(st.failures, vlpds::totp::MAX_FAILURES);
+    assert!(st.locked_until > vlpds::totp::now_secs(), "lockout persisted");
+
+    // locked: the password step itself is refused, and so is createSession
+    // with a right code (shared counter)
+    let (st, html) = b.post(&s, "/oauth/authorize/sign-in", &password).await.into_pair();
+    assert_eq!(st, 429, "{html}");
+    let r = s
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.createSession", s.base))
+        .json(&json!({"identifier": acct.handle, "password": PASSWORD, "authFactorToken": good}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 429);
+    let j: J = r.json().await.unwrap();
+    assert_eq!(j["error"], "RateLimitExceeded");
+}
+
+trait IntoPair {
+    fn into_pair(self) -> (u16, String);
+}
+
+impl IntoPair for (u16, reqwest::header::HeaderMap, String) {
+    fn into_pair(self) -> (u16, String) {
+        (self.0, self.2)
+    }
+}
+
+/// `/oauth/account?error=` only maps fixed codes to fixed messages; sign-in
+/// failures redirect with a code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_page_error_codes() {
+    let s = spawn().await;
+    let acct = create_account(&s, "ivan").await;
+    let mut b = Browser::default();
+    let evil = enc("<b>Your account is compromised, call 555-0100</b>");
+    let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1&error={evil}", s.base)).await;
+    assert!(!html.contains("compromised") && !html.contains("555-0100"), "{html}");
+    let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1&error=bad_code", s.base)).await;
+    assert!(html.contains("Invalid authenticator code"), "{html}");
+
+    let csrf = csrf_of(&html);
+    let (st, h, _) = b
+        .post(
+            &s,
+            "/oauth/account/sign-in",
+            &[("csrf", &csrf), ("identifier", &acct.handle), ("password", "wrong")],
+        )
+        .await;
+    assert_eq!(st, 303);
+    assert_eq!(h.get("location").unwrap(), "/oauth/account?add=1&error=invalid");
+    let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1&error=invalid", s.base)).await;
+    assert!(html.contains("Invalid handle or password"), "{html}");
+}
+
+/// OAuth sign-in posts share createSession's identifier + IP buckets (30 per
+/// 5 min), checked before any password hashing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_in_rate_limited() {
+    let s = spawn().await;
+    let mut b = Browser::default();
+    let (_, _, html) = b.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let csrf = csrf_of(&html);
+    let form = [("csrf", csrf.as_str()), ("identifier", "ghost.vlpds.test"), ("password", "x")];
+    for _ in 0..30 {
+        let (_, h, _) = b.post(&s, "/oauth/account/sign-in", &form).await;
+        assert_eq!(h.get("location").unwrap(), "/oauth/account?add=1&error=invalid");
+    }
+    let (_, h, _) = b.post(&s, "/oauth/account/sign-in", &form).await;
+    assert_eq!(h.get("location").unwrap(), "/oauth/account?add=1&error=rate_limited");
+    let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1&error=rate_limited", s.base)).await;
+    assert!(html.contains("Too many sign-in attempts"), "{html}");
+}

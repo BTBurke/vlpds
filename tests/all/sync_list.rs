@@ -86,3 +86,25 @@ async fn includes_inactive_repos_with_status() {
     assert_eq!(ea["status"], json!("deactivated"));
     assert_eq!(find(&b.did)["active"], json!(true));
 }
+
+/// limit outside the lexicon range is a 400 (reference param validation),
+/// not silently clamped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limit_range_is_validated() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("lim").await;
+    for (nsid, extra, max) in [
+        ("com.atproto.sync.listRepos", vec![], "1000"),
+        ("com.atproto.sync.listBlobs", vec![("did", a.did.as_str())], "1000"),
+        ("com.atproto.sync.listReposByCollection", vec![("collection", "app.bsky.feed.post")], "2000"),
+    ] {
+        for bad in ["0", "-1", if max == "1000" { "1001" } else { "2001" }] {
+            let mut q = extra.clone();
+            q.push(("limit", bad));
+            s.xrpc.get(nsid, &q, &Auth::None).await.err(400, "InvalidRequest");
+        }
+        let mut q = extra.clone();
+        q.push(("limit", max));
+        s.xrpc.get(nsid, &q, &Auth::None).await.ok();
+    }
+}

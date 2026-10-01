@@ -34,6 +34,9 @@ pub use crate::oauth::ScopeSet;
 
 const DEVICE_COOKIE: &str = "vlpds-device";
 const PENDING_2FA_TTL: i64 = 5 * 60;
+/// Wrong authenticator codes per pending sign-in before the password step
+/// must be redone (the per-account lockout in `crate::totp` still applies).
+const PENDING_2FA_MAX_FAILURES: u32 = 3;
 
 // ---------- per-secret keys ----------
 
@@ -556,6 +559,7 @@ async fn device_for(app: &App, headers: &HeaderMap) -> Result<(Device, bool), OA
         user_agent: ua,
         accounts: vec![],
         pending_2fa: None,
+        pending_2fa_failures: 0,
     };
     store::put_device(app, &d).await?;
     Ok((d, true))
@@ -1091,85 +1095,164 @@ enum SignIn {
     Ok(String),
     /// Password accepted; authenticator code needed (handle).
     NeedTotp(String),
-    /// Wrong authenticator code (handle, message).
-    NeedTotpErr(String, String),
-    /// (identifier to pre-fill, message)
-    Failed(String, String),
+    /// Wrong authenticator code; still pending (handle).
+    NeedTotpErr(String),
+    /// (identifier to pre-fill, why)
+    Failed(String, LoginError),
 }
 
-/// Password (+ TOTP) sign-in; records the login on the device.
+/// Sign-in failures. Pages show only these fixed messages, and
+/// `/oauth/account?error=` carries the code, never request-supplied text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoginError {
+    Invalid,
+    Timeout,
+    BadCode,
+    /// Too many wrong codes: password step again (or the account's factor
+    /// is locked out).
+    TooManyCodes,
+    RateLimited,
+    Inactive,
+}
+
+impl LoginError {
+    const ALL: [LoginError; 6] = [
+        LoginError::Invalid,
+        LoginError::Timeout,
+        LoginError::BadCode,
+        LoginError::TooManyCodes,
+        LoginError::RateLimited,
+        LoginError::Inactive,
+    ];
+
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            LoginError::Invalid => "invalid",
+            LoginError::Timeout => "timeout",
+            LoginError::BadCode => "bad_code",
+            LoginError::TooManyCodes => "too_many_codes",
+            LoginError::RateLimited => "rate_limited",
+            LoginError::Inactive => "inactive",
+        }
+    }
+
+    pub(crate) fn from_code(c: &str) -> Option<LoginError> {
+        Self::ALL.into_iter().find(|e| e.code() == c)
+    }
+
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            LoginError::Invalid => "Invalid handle or password",
+            LoginError::Timeout => "Your sign-in timed out. Please enter your password again.",
+            LoginError::BadCode => "Invalid authenticator code",
+            LoginError::TooManyCodes => {
+                "Too many invalid authenticator codes. Please sign in again later."
+            }
+            LoginError::RateLimited => "Too many sign-in attempts. Please try again later.",
+            LoginError::Inactive => "This account is deactivated or suspended",
+        }
+    }
+
+    fn status(self) -> StatusCode {
+        match self {
+            LoginError::TooManyCodes | LoginError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            _ => StatusCode::UNAUTHORIZED,
+        }
+    }
+}
+
+/// Password (+ TOTP) sign-in; records the login on the device. Rate limited
+/// per IP, per identifier + IP and per account (src/ratelimit.rs); wrong
+/// codes count against the account's TOTP lockout and, past
+/// [`PENDING_2FA_MAX_FAILURES`], drop the pending sign-in.
 async fn sign_in(
     app: &App,
     device: &mut Device,
     f: &HashMap<String, String>,
 ) -> Result<SignIn, OAuthError> {
+    use crate::ratelimit as rl;
     let now = now_secs();
     let code = f.get("code").map(|c| c.trim()).filter(|c| !c.is_empty());
-    let did = if f.get("step").map(String::as_str) == Some("totp") {
+    let ident = f
+        .get("identifier")
+        .map(|s| s.trim().trim_start_matches('@').to_lowercase())
+        .unwrap_or_default();
+    let limited = |ident: String| Ok(SignIn::Failed(ident, LoginError::RateLimited));
+    if rl::check_ip(&[&rl::GLOBAL_IP, &rl::OAUTH_SIGN_IN_IP], 1).is_err() {
+        return limited(ident);
+    }
+    let password_step = f.get("step").map(String::as_str) != Some("totp");
+    let (acct, ident) = if !password_step {
         // Second step: password already verified for the pending account.
         let Some((did, _)) = device
             .pending_2fa
             .clone()
             .filter(|(_, at)| now - at < PENDING_2FA_TTL)
         else {
-            return Ok(SignIn::Failed(
-                String::new(),
-                "Your sign-in timed out. Please enter your password again.".into(),
-            ));
+            return Ok(SignIn::Failed(String::new(), LoginError::Timeout));
         };
-        let acct = app.account(&did).await?;
-        match crate::totp::check_second_factor(app, &acct, code).await {
-            Ok(()) => did,
-            Err(e) if e.error == "AuthFactorTokenRequired" => {
-                return Ok(SignIn::NeedTotp(acct.handle))
-            }
-            Err(_) => {
-                return Ok(SignIn::NeedTotpErr(
-                    acct.handle,
-                    "Invalid authenticator code".into(),
-                ))
-            }
+        if rl::check_with_ip(&[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN], &did, 1).is_err()
+            || rl::check(&[&rl::SIGN_IN_ACCOUNT], &did, 1).is_err()
+        {
+            return limited(String::new());
         }
+        (app.account(&did).await?, String::new())
     } else {
-        let ident = f
-            .get("identifier")
-            .map(|s| s.trim().trim_start_matches('@').to_lowercase())
-            .unwrap_or_default();
+        let invalid = || Ok(SignIn::Failed(ident.clone(), LoginError::Invalid));
         let password = f.get("password").cloned().unwrap_or_default();
-        let invalid = || SignIn::Failed(ident.clone(), "Invalid handle or password".into());
         if ident.is_empty() || password.is_empty() {
-            return Ok(invalid());
+            return invalid();
+        }
+        // createSession's buckets (shared with it), before any Argon2 work
+        if rl::check_with_ip(&[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN], &ident, 1).is_err() {
+            return limited(ident);
         }
         let Ok(did) = app.resolve_repo(&ident).await else {
-            return Ok(invalid());
+            return invalid();
         };
+        if rl::check(&[&rl::SIGN_IN_ACCOUNT], &did, 1).is_err() {
+            return limited(ident);
+        }
         let Ok(acct) = app.account(&did).await else {
-            return Ok(invalid());
+            return invalid();
         };
         if !state::verify_password_hash(&acct.password_hash, &password).await {
-            return Ok(invalid());
+            return invalid();
         }
-        if let Some(st) = &acct.status {
-            return Ok(SignIn::Failed(ident, format!("This account is {st}")));
+        if acct.status.is_some() {
+            return Ok(SignIn::Failed(ident, LoginError::Inactive));
         }
-        match crate::totp::check_second_factor(app, &acct, code).await {
-            Ok(()) => acct.did.clone(),
-            Err(e) if e.error == "AuthFactorTokenRequired" => {
-                device.pending_2fa = Some((acct.did.clone(), now));
-                store::put_device(app, device).await?;
-                return Ok(SignIn::NeedTotp(acct.handle));
-            }
-            Err(_) => {
-                device.pending_2fa = Some((acct.did.clone(), now));
-                store::put_device(app, device).await?;
-                return Ok(SignIn::NeedTotpErr(
-                    acct.handle,
-                    "Invalid authenticator code".into(),
-                ));
-            }
-        }
+        (acct, ident)
     };
+    match crate::totp::check_second_factor(app, &acct, code).await {
+        Ok(()) => {}
+        Err(e) if e.error == "AuthFactorTokenRequired" => {
+            device.pending_2fa = Some((acct.did.clone(), now));
+            device.pending_2fa_failures = 0;
+            store::put_device(app, device).await?;
+            return Ok(SignIn::NeedTotp(acct.handle));
+        }
+        Err(e) if e.status.is_server_error() => return Err(e.into()),
+        Err(e) => {
+            // a password step starts a new pending sign-in
+            if password_step {
+                device.pending_2fa = Some((acct.did.clone(), now));
+                device.pending_2fa_failures = 0;
+            }
+            device.pending_2fa_failures += 1;
+            if crate::totp::is_lockout(&e) || device.pending_2fa_failures >= PENDING_2FA_MAX_FAILURES {
+                device.pending_2fa = None;
+                device.pending_2fa_failures = 0;
+                store::put_device(app, device).await?;
+                return Ok(SignIn::Failed(ident, LoginError::TooManyCodes));
+            }
+            store::put_device(app, device).await?;
+            return Ok(SignIn::NeedTotpErr(acct.handle));
+        }
+    }
+    let did = acct.did;
     device.pending_2fa = None;
+    device.pending_2fa_failures = 0;
     device.accounts.retain(|a| a.did != did);
     device.accounts.push(DeviceAccount {
         did: did.clone(),
@@ -1194,22 +1277,17 @@ async fn authorize_sign_in(State(app): AppState, headers: HeaderMap, body: AxByt
         Ok(SignIn::NeedTotp(handle)) => {
             login_page(&app, &flow, &handle, None, true, StatusCode::OK)
         }
-        Ok(SignIn::NeedTotpErr(handle, msg)) => login_page(
+        Ok(SignIn::NeedTotpErr(handle)) => login_page(
             &app,
             &flow,
             &handle,
-            Some(&msg),
+            Some(LoginError::BadCode.message()),
             true,
             StatusCode::UNAUTHORIZED,
         ),
-        Ok(SignIn::Failed(ident, msg)) => login_page(
-            &app,
-            &flow,
-            &ident,
-            Some(&msg),
-            false,
-            StatusCode::UNAUTHORIZED,
-        ),
+        Ok(SignIn::Failed(ident, e)) => {
+            login_page(&app, &flow, &ident, Some(e.message()), false, e.status())
+        }
         Err(e) => error_page(
             &app,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1760,7 +1838,11 @@ async fn account_page(
             &ui::LoginForm {
                 action: "/oauth/account/sign-in",
                 identifier: "",
-                error: q.get("error").map(String::as_str),
+                // fixed messages by code only (never echo the query text)
+                error: q
+                    .get("error")
+                    .and_then(|c| LoginError::from_code(c))
+                    .map(LoginError::message),
                 totp: pending,
             },
             &csrf,
@@ -1828,14 +1910,13 @@ async fn account_sign_in(State(app): AppState, headers: HeaderMap, body: AxBytes
     match sign_in(&app, &mut device, &f).await {
         Ok(SignIn::Ok(_)) => redirect_to("/oauth/account"),
         Ok(SignIn::NeedTotp(_)) => redirect_to("/oauth/account?add=1&totp=1"),
-        Ok(SignIn::NeedTotpErr(_, m)) => redirect_to(&format!(
+        Ok(SignIn::NeedTotpErr(_)) => redirect_to(&format!(
             "/oauth/account?add=1&totp=1&error={}",
-            ou::encode_uri_component(&m)
+            LoginError::BadCode.code()
         )),
-        Ok(SignIn::Failed(_, m)) => redirect_to(&format!(
-            "/oauth/account?add=1&error={}",
-            ou::encode_uri_component(&m)
-        )),
+        Ok(SignIn::Failed(_, e)) => {
+            redirect_to(&format!("/oauth/account?add=1&error={}", e.code()))
+        }
         Err(e) => error_page(
             &app,
             StatusCode::INTERNAL_SERVER_ERROR,

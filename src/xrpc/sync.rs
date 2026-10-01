@@ -424,13 +424,13 @@ async fn sync_get_record(
 
 #[derive(Deserialize)]
 struct ListReposQ {
-    limit: Option<usize>,
+    limit: Option<i64>,
     cursor: Option<String>,
 }
 
 /// Cursor is "{partition}:{did}". Repos are ordered by partition, then DID.
 async fn list_repos(State(app): AppState, Query(q): Query<ListReposQ>) -> XResult<Json<J>> {
-    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let limit = super::extract::limit_param(q.limit, 500, 1, 1000)?;
     let (mut part, mut after) = match &q.cursor {
         Some(c) => {
             let (p, d) = c
@@ -521,7 +521,7 @@ async fn list_repos(State(app): AppState, Query(q): Query<ListReposQ>) -> XResul
 #[derive(Deserialize)]
 struct ByCollectionQ {
     collection: String,
-    limit: Option<usize>,
+    limit: Option<i64>,
     cursor: Option<String>,
 }
 
@@ -537,7 +537,7 @@ async fn list_repos_by_collection(
             "collection must be a valid nsid",
         ));
     }
-    let limit = q.limit.unwrap_or(500).clamp(1, 2000);
+    let limit = super::extract::limit_param(q.limit, 500, 1, 2000)?;
     let prefix = state::collection_prefix(&q.collection);
     let lo = match &q.cursor {
         Some(c) => [state::collection_key(&q.collection, c), vec![0]].concat(),

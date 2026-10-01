@@ -208,3 +208,43 @@ async fn takendown_actor_cannot_report_or_write() {
         .await;
     r.client_err();
 }
+
+/// A suspended account is treated like a taken-down one: writes get the
+/// reference's 401 AccountTakedown, and so do proxied calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn suspended_account_cannot_write_or_proxy() {
+    let s = TestServer::spawn_with(|c| {
+        c.appview = Some(("http://127.0.0.1:1".into(), "did:web:appview.test".into()))
+    })
+    .await;
+    let a = s.create_account("susp").await;
+    let mut acct = s.app.account(&a.did).await.unwrap_or_else(|e| panic!("{}", e.message));
+    acct.status = Some("suspended".into());
+    let op = vlpds::worker::AccountOp::Update { account: acct, old_handle: None, identity_event: false, account_event: false };
+    s.app.account_op(&a.did, op).await.unwrap_or_else(|e| panic!("{}", e.message));
+
+    s.xrpc
+        .post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x")}), &a.auth())
+        .await
+        .err(401, "AccountTakedown");
+    s.xrpc.get("app.bsky.feed.getTimeline", &[], &a.auth()).await.err(401, "AccountTakedown");
+}
+
+/// Writes to a taken-down repo: 401 AccountTakedown (reference findAccount
+/// with checkTakedown), checked with a token minted before the takedown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn takendown_repo_write_is_account_takedown() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("tkw").await;
+    let mut acct = s.app.account(&a.did).await.unwrap_or_else(|e| panic!("{}", e.message));
+    acct.status = Some("takendown".into());
+    let op = vlpds::worker::AccountOp::Update { account: acct, old_handle: None, identity_event: false, account_event: false };
+    s.app.account_op(&a.did, op).await.unwrap_or_else(|e| panic!("{}", e.message));
+    for (nsid, body) in [
+        ("com.atproto.repo.createRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x")})),
+        ("com.atproto.repo.deleteRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": "3jzfcijpj2z2a"})),
+        ("com.atproto.repo.applyWrites", json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": post_record("x")}]})),
+    ] {
+        s.xrpc.post(nsid, &body, &a.auth()).await.err(401, "AccountTakedown");
+    }
+}

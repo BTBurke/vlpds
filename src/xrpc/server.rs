@@ -1264,6 +1264,8 @@ async fn create_account(
         .map(str::trim)
         .filter(|e| !e.is_empty())
     {
+        // required, as in the reference (no self-delete / password reset without one)
+        None => return Err(invalid_request("Email is required")),
         Some(e) => {
             let e = e.to_ascii_lowercase();
             if !valid_email(&e) {
@@ -1271,9 +1273,8 @@ async fn create_account(
                     "This email address is not supported, please use a different email.",
                 ));
             }
-            Some(e)
+            e
         }
-        None => None,
     };
     let handle = normalize_handle(&inp.handle)?;
     ensure_service_handle(&app, &handle, false)?;
@@ -1303,14 +1304,12 @@ async fn create_account(
         release(claim).await;
         return Err(XrpcError::bad("HandleNotAvailable", format!("Handle already taken: {handle}")));
     }
-    if let Some(e) = &email {
-        let r = claim_email(&app, e, &did).await;
-        if !matches!(r, Ok(true)) {
-            release_handle(&app, &handle, &did).await;
-            release(claim).await;
-            r?;
-            return Err(invalid_request(format!("Email already taken: {e}")));
-        }
+    let r = claim_email(&app, &email, &did).await;
+    if !matches!(r, Ok(true)) {
+        release_handle(&app, &handle, &did).await;
+        release(claim).await;
+        r?;
+        return Err(invalid_request(format!("Email already taken: {email}")));
     }
     let key = Arc::new(Keypair::generate());
     let mut acct = Account {
@@ -1318,7 +1317,7 @@ async fn create_account(
         handle: handle.clone(),
         signing_key: hex::encode(key.to_bytes()),
         created_at: crate::events::now_rfc3339(),
-        email: email.clone(),
+        email: Some(email.clone()),
         ..Default::default()
     };
     acct.password_hash = state::hash_password(&password).await;
@@ -1348,9 +1347,7 @@ async fn create_account(
     };
     if let Err(e) = created {
         release_handle(&app, &handle, &did).await;
-        if let Some(em) = &email {
-            release_email(&app, em, &did).await;
-        }
+        release_email(&app, &email, &did).await;
         release(claim).await;
         return Err(e);
     }
@@ -1882,38 +1879,123 @@ struct ReserveSigningKeyIn {
     did: Option<String>,
 }
 
-/// Reserves a fresh signing key; `admin.updateAccountSigningKey` can later
-/// install it (the PDS must hold the private key to sign commits).
+/// Unclaimed reserved signing keys expire after this long (swept by
+/// [`spawn_reserved_key_gc`]; an expired reservation can't be taken).
+pub const RESERVED_KEY_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Private-state routing key of a reservation: by did:key for the key
+/// itself, by DID for the per-DID index (`{"signingKey", "createdAt"}`).
+fn reserved_routing(id: &str) -> String {
+    format!("_reserved:{id}")
+}
+
+fn reservation_expired(rec: &J, ttl: std::time::Duration) -> bool {
+    let created = rec["createdAt"]
+        .as_str()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+    match created {
+        Some(t) => chrono::Utc::now().signed_duration_since(t).to_std().unwrap_or_default() >= ttl,
+        None => true,
+    }
+}
+
+/// Reserves a signing key; `admin.updateAccountSigningKey` can later
+/// install it (the PDS must hold the private key to sign commits). With
+/// `did`, the same key comes back while its reservation is live (reference
+/// actorStore.reserveKeypair keys the reservation by DID).
 async fn reserve_signing_key(
     State(app): AppState,
     body: Option<Json<ReserveSigningKeyIn>>,
 ) -> XResult<Json<J>> {
     let inp = body.map(|Json(b)| b).unwrap_or_default();
+    let did = inp.did.filter(|d| !d.is_empty());
+    if let Some(did) = &did {
+        if !did.starts_with("did:") {
+            return Err(invalid_request("did must be a DID"));
+        }
+        let idx = reserved_routing(did);
+        if let Some(rec) = get_json::<J>(&app, &idx, "k").await? {
+            let dk = rec["signingKey"].as_str().unwrap_or("").to_string();
+            let live = !reservation_expired(&rec, RESERVED_KEY_TTL)
+                && get_json::<J>(&app, &reserved_routing(&dk), "k").await?.is_some();
+            if live {
+                return Ok(Json(json!({"signingKey": dk})));
+            }
+        }
+    }
     let key = Keypair::generate();
     let did_key = key.did_key();
-    let routing = format!("_reserved:{did_key}");
-    let rec = json!({"key": hex::encode(key.to_bytes()), "did": inp.did, "createdAt": crate::events::now_rfc3339()});
+    let routing = reserved_routing(&did_key);
+    let now = crate::events::now_rfc3339();
+    let rec = json!({"key": hex::encode(key.to_bytes()), "did": did, "createdAt": now});
     app.put_private(
         &routing,
         vec![pmut(&routing, "k", Some(to_json_bytes(&rec)))],
     )
     .await?;
+    if let Some(did) = &did {
+        let idx = reserved_routing(did);
+        let rec = json!({"signingKey": did_key, "createdAt": now});
+        app.put_private(&idx, vec![pmut(&idx, "k", Some(to_json_bytes(&rec)))])
+            .await?;
+    }
     Ok(Json(json!({"signingKey": did_key})))
 }
 
-/// Takes a key reserved with reserveSigningKey (by its did:key).
+/// Takes a key reserved with reserveSigningKey (by its did:key), clearing
+/// the reservation and its per-DID index. Expired reservations are gone.
 pub(super) async fn take_reserved_key(app: &App, did_key: &str) -> XResult<Option<Keypair>> {
-    let routing = format!("_reserved:{did_key}");
+    let routing = reserved_routing(did_key);
     let Some(rec) = get_json::<J>(app, &routing, "k").await? else {
         return Ok(None);
     };
+    app.put_private(&routing, vec![pmut(&routing, "k", None)])
+        .await?;
+    if let Some(did) = rec["did"].as_str() {
+        let idx = reserved_routing(did);
+        app.put_private(&idx, vec![pmut(&idx, "k", None)]).await?;
+    }
+    if reservation_expired(&rec, RESERVED_KEY_TTL) {
+        return Ok(None);
+    }
     let key = Keypair::from_bytes(
         &hex::decode(rec["key"].as_str().unwrap_or("")).map_err(XrpcError::from_err)?,
     )
     .map_err(XrpcError::from_err)?;
-    app.put_private(&routing, vec![pmut(&routing, "k", None)])
-        .await?;
     Ok(Some(key))
+}
+
+/// Deletes reservations (keys and per-DID indexes) older than `ttl` in the
+/// partitions this node owns. Returns how many were removed.
+pub async fn sweep_reserved_keys(app: &App, ttl: std::time::Duration) -> Result<usize, XrpcError> {
+    let mut n = 0;
+    for (routing, name, val) in scan_private_routing(app, "_reserved:").await? {
+        let expired = serde_json::from_slice::<J>(&val)
+            .map(|rec| reservation_expired(&rec, ttl))
+            .unwrap_or(true);
+        if expired {
+            app.put_private(&routing, vec![pmut(&routing, &name, None)])
+                .await?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// Background sweep of expired signing-key reservations (hourly).
+pub fn spawn_reserved_key_gc(app: Arc<App>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            match sweep_reserved_keys(&app, RESERVED_KEY_TTL).await {
+                Ok(n) if n > 0 => tracing::info!(removed = n, "reserved signing key gc"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("reserved signing key gc: {}", e.message),
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2139,7 +2221,7 @@ struct ResetPasswordIn {
     password: String,
 }
 
-/// Sets a new password and revokes every session.
+/// Sets a new password and revokes every session, OAuth grants included.
 pub(super) async fn change_password(app: &App, did: &str, password: &str) -> XResult<()> {
     let hash = state::hash_password(password).await;
     update_account(app, did, false, false, |a| {
@@ -2148,6 +2230,9 @@ pub(super) async fn change_password(app: &App, did: &str, password: &str) -> XRe
     })
     .await?;
     delete_email_tokens(app, did, &["reset_password"]).await?;
+    crate::oauth::store::revoke_all_sessions(app, did)
+        .await
+        .map_err(|e| XrpcError::from_err(e.description))?;
     revoke_all_sessions(app, did).await
 }
 
@@ -2575,7 +2660,11 @@ async fn disable_totp(
             .or(inp.recovery_code.as_deref())
             .filter(|c| !c.trim().is_empty())
             .ok_or_else(|| invalid_request("code or recoveryCode is required"))?;
-        crate::totp::consume(&mut st, code)?;
+        // counts toward the lockout like a sign-in attempt
+        if let Err(e) = crate::totp::attempt(&mut st, code, crate::totp::now_secs()) {
+            crate::totp::save(&app, &did, &st).await?;
+            return Err(e);
+        }
         crate::totp::save(&app, &did, &crate::totp::TotpState::default()).await?;
     }
     set_totp_flag(&app, &did, false).await?;

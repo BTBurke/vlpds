@@ -17,6 +17,9 @@ pub struct Config {
     pub service_did: String,
     pub jwt_secret: String,
     pub admin_token: String,
+    /// Shared node-to-node secret (`x-vlpds-internal`); distinct from the
+    /// admin token so a leaked node credential isn't an admin credential.
+    pub internal_token: String,
     /// None = in-memory object store (tests/dev).
     pub s3: Option<S3Config>,
     pub prefix: String,
@@ -60,14 +63,52 @@ pub struct Config {
     pub rate_limit_bypass_key: Option<String>,
 }
 
+/// Well-known secrets: only accepted with `dev_mode` (see [`Config::check_secrets`]).
+pub const DEV_JWT_SECRET: &str = "dev-secret-change-me";
+pub const DEV_ADMIN_TOKEN: &str = "dev-admin-token";
+pub const DEV_INTERNAL_TOKEN: &str = "dev-internal-token";
+/// Minimum length of each secret outside dev mode.
+pub const MIN_SECRET_LEN: usize = 32;
+
+impl Config {
+    /// Startup check (the binary calls it; in-process tests may skip it):
+    /// secrets are never empty, and outside dev mode they must be set,
+    /// not the dev defaults, at least [`MIN_SECRET_LEN`] bytes, and
+    /// pairwise distinct.
+    pub fn check_secrets(&self) -> anyhow::Result<()> {
+        let secrets = [
+            ("VLPDS_JWT_SECRET", &self.jwt_secret, DEV_JWT_SECRET),
+            ("VLPDS_ADMIN_TOKEN", &self.admin_token, DEV_ADMIN_TOKEN),
+            ("VLPDS_INTERNAL_TOKEN", &self.internal_token, DEV_INTERNAL_TOKEN),
+        ];
+        for (name, v, dev) in secrets {
+            anyhow::ensure!(!v.is_empty(), "{name} must be set (non-empty)");
+            if self.dev_mode {
+                continue;
+            }
+            anyhow::ensure!(v != dev, "{name} is the dev default; set a real secret (or run with --dev-mode)");
+            anyhow::ensure!(v.len() >= MIN_SECRET_LEN, "{name} must be at least {MIN_SECRET_LEN} bytes");
+        }
+        if !self.dev_mode {
+            for (i, (a, va, _)) in secrets.iter().enumerate() {
+                for (b, vb, _) in &secrets[i + 1..] {
+                    anyhow::ensure!(va != vb, "{a} and {b} must differ");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             public_url: "http://localhost:2583".into(),
             handle_domain: "vlpds.test".into(),
             service_did: "did:web:localhost".into(),
-            jwt_secret: "dev-secret-change-me".into(),
-            admin_token: "dev-admin-token".into(),
+            jwt_secret: DEV_JWT_SECRET.into(),
+            admin_token: DEV_ADMIN_TOKEN.into(),
+            internal_token: DEV_INTERNAL_TOKEN.into(),
             s3: None,
             prefix: "vlpds".into(),
             inject_latency: None,
@@ -161,7 +202,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         merger_tx,
         workers.clone(),
         cfg.cache_dir.clone(),
-        cfg.admin_token.clone(),
+        cfg.internal_token.clone(),
     );
     let host: Arc<dyn ShardHost> = node.clone();
     let node_handle = node.clone();
@@ -304,5 +345,39 @@ pub async fn shutdown(app: &Arc<xrpc::App>) {
         let host: Arc<dyn ShardHost> = app.node.clone();
         tracing::info!(shards = c.owned().len(), "graceful shutdown: releasing shards");
         c.shutdown(&host).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secrets_fail_closed_outside_dev_mode() {
+        let dev = Config::default();
+        assert!(dev.dev_mode);
+        dev.check_secrets().expect("dev defaults are fine in dev mode");
+        let empty_admin = Config { admin_token: String::new(), ..Config::default() };
+        assert!(empty_admin.check_secrets().is_err(), "empty admin token refused even in dev mode");
+
+        let prod = |jwt: &str, admin: &str, internal: &str| Config {
+            dev_mode: false,
+            jwt_secret: jwt.into(),
+            admin_token: admin.into(),
+            internal_token: internal.into(),
+            ..Config::default()
+        };
+        let (a, b, c) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
+        prod(&a, &b, &c).check_secrets().expect("strong distinct secrets");
+        // dev defaults
+        let e = Config { dev_mode: false, ..Config::default() }.check_secrets().unwrap_err();
+        assert!(e.to_string().contains("VLPDS_JWT_SECRET"), "{e}");
+        assert!(prod(&a, DEV_ADMIN_TOKEN, &c).check_secrets().is_err());
+        assert!(prod(&a, &b, DEV_INTERNAL_TOKEN).check_secrets().is_err());
+        // unset / short / shared
+        assert!(prod("", &b, &c).check_secrets().is_err());
+        assert!(prod(&a, &"b".repeat(31), &c).check_secrets().is_err());
+        let e = prod(&a, &b, &b).check_secrets().unwrap_err();
+        assert!(e.to_string().contains("must differ"), "{e}");
     }
 }

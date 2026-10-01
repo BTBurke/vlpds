@@ -133,3 +133,45 @@ pub fn service_auth_jwt(
     let sig = key.sign(signing_input.as_bytes());
     format!("{signing_input}.{}", B64.encode(sig))
 }
+
+/// Constant-time secret comparison for admin / internal / bypass tokens.
+/// Compares SHA-256 digests, so neither content nor length leaks through
+/// timing. An empty `expected` (unset secret) never matches.
+pub fn token_eq(expected: &str, given: &str) -> bool {
+    use sha2::Digest;
+    if expected.is_empty() {
+        return false;
+    }
+    let (a, b) = (Sha256::digest(expected), Sha256::digest(given));
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// `Authorization: Basic <b64>` value (after the scheme) carrying
+/// `admin:<admin_token>`.
+pub fn basic_admin_ok(b64: &str, admin_token: &str) -> bool {
+    let dec = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .unwrap_or_default();
+    match std::str::from_utf8(&dec).ok().and_then(|s| s.strip_prefix("admin:")) {
+        Some(tok) => token_eq(admin_token, tok),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_compare() {
+        assert!(token_eq("abc", "abc"));
+        assert!(!token_eq("abc", "abd"));
+        assert!(!token_eq("abc", "abcd"));
+        assert!(!token_eq("", ""), "an unset token never matches");
+        let b = base64::engine::general_purpose::STANDARD.encode("admin:tok");
+        assert!(basic_admin_ok(&b, "tok"));
+        assert!(!basic_admin_ok(&b, "other"));
+        let empty = base64::engine::general_purpose::STANDARD.encode("admin:");
+        assert!(!basic_admin_ok(&empty, ""));
+    }
+}

@@ -201,7 +201,7 @@ async fn handles_invalid_rejected_by_create_account() {
             .xrpc
             .post(
                 "com.atproto.server.createAccount",
-                &json!({"handle": h, "password": PASSWORD}),
+                &json!({"handle": h, "password": PASSWORD, "email": format!("{}@example.com", unique_name("syn"))}),
                 &Auth::None,
             )
             .await;
@@ -218,7 +218,7 @@ async fn handles_invalid_rejected_by_create_account() {
             .xrpc
             .post(
                 "com.atproto.server.createAccount",
-                &json!({"handle": under, "password": PASSWORD}),
+                &json!({"handle": under, "password": PASSWORD, "email": format!("{}@example.com", unique_name("syn"))}),
                 &Auth::None,
             )
             .await;
@@ -299,7 +299,7 @@ async fn handles_valid_labels_under_service_domain_accepted() {
             .xrpc
             .post(
                 "com.atproto.server.createAccount",
-                &json!({"handle": handle, "password": PASSWORD}),
+                &json!({"handle": handle, "password": PASSWORD, "email": format!("{}@example.com", unique_name("syn"))}),
                 &Auth::None,
             )
             .await;

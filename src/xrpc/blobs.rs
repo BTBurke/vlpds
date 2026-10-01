@@ -284,6 +284,14 @@ pub fn sniff_mime(b: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// A stored blob's MIME type (its Content-Type attribute, set at upload).
+pub(super) fn stored_mime(attrs: &Attributes) -> String {
+    attrs
+        .get(&Attribute::ContentType)
+        .map(|v| v.as_ref().to_string())
+        .unwrap_or_else(|| "application/octet-stream".into())
+}
+
 #[derive(Deserialize)]
 struct BlobQ {
     did: String,
@@ -308,11 +316,7 @@ async fn get_blob(
         }
         Err(e) => return Err(XrpcError::from_err(e)),
     };
-    let mime = r
-        .attributes
-        .get(&Attribute::ContentType)
-        .map(|v| v.as_ref().to_string())
-        .unwrap_or_else(|| "application/octet-stream".into());
+    let mime = stored_mime(&r.attributes);
     let size = r.meta.size;
     let mut resp = Body::from_stream(r.into_stream()).into_response();
     let h = resp.headers_mut();
@@ -386,7 +390,7 @@ async fn referenced_blobs(
 struct ListBlobsQ {
     did: String,
     since: Option<String>,
-    limit: Option<usize>,
+    limit: Option<i64>,
     cursor: Option<String>,
 }
 
@@ -401,7 +405,7 @@ async fn list_blobs(
         Some(s) => Some(crate::tid::Tid::parse(s).ok_or_else(|| XrpcError::bad("InvalidRequest", "since must be a TID"))?.0),
         None => None,
     };
-    let limit = q.limit.unwrap_or(500).clamp(1, 1000);
+    let limit = super::extract::limit_param(q.limit, 500, 1, 1000)?;
     assert_available(&app, &q.did, creds.as_ref()).await?;
     let blobs = referenced_blobs(&app, &q.did, q.cursor.as_deref(), limit, since).await?;
     let cids: Vec<&str> = blobs.iter().map(|(c, _)| c.as_str()).collect();

@@ -99,6 +99,7 @@ async fn still_allows_login_and_returns_status() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn does_not_allow_writes() {
+    // reference findAccount(checkDeactivated): 401 AccountDeactivated
     let f = setup().await;
     deactivate(&f).await;
     let s = &f.s;
@@ -111,7 +112,7 @@ async fn does_not_allow_writes() {
             &auth,
         )
         .await;
-    r.client_err();
+    r.err(401, "AccountDeactivated");
     let r = s
         .xrpc
         .post(
@@ -120,12 +121,12 @@ async fn does_not_allow_writes() {
             &auth,
         )
         .await;
-    r.client_err();
+    r.err(401, "AccountDeactivated");
     let r = s
         .xrpc
         .post("com.atproto.repo.deleteRecord", &json!({"repo": f.a.did, "collection": f.post.collection(), "rkey": f.post.rkey()}), &auth)
         .await;
-    r.client_err();
+    r.err(401, "AccountDeactivated");
     let r = s
         .xrpc
         .post(
@@ -134,7 +135,7 @@ async fn does_not_allow_writes() {
             &auth,
         )
         .await;
-    r.client_err();
+    r.err(401, "AccountDeactivated");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -76,6 +76,14 @@ impl Cid {
     }
 }
 
+impl Cid {
+    /// Appends the string form (as `Display`) without an intermediate String.
+    pub fn write_string(&self, out: &mut Vec<u8>) {
+        out.push(b'b');
+        base32_encode_into(&self.to_bytes(), out);
+    }
+}
+
 impl fmt::Display for Cid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("b")?;
@@ -98,7 +106,13 @@ pub enum CidError {
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
 pub fn base32_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() * 8).div_ceil(5));
+    let mut out = Vec::with_capacity((data.len() * 8).div_ceil(5));
+    base32_encode_into(data, &mut out);
+    // the alphabet is ASCII
+    String::from_utf8(out).unwrap()
+}
+
+pub fn base32_encode_into(data: &[u8], out: &mut Vec<u8>) {
     let mut buf: u32 = 0;
     let mut bits = 0;
     for &b in data {
@@ -106,13 +120,12 @@ pub fn base32_encode(data: &[u8]) -> String {
         bits += 8;
         while bits >= 5 {
             bits -= 5;
-            out.push(B32[((buf >> bits) & 31) as usize] as char);
+            out.push(B32[((buf >> bits) & 31) as usize]);
         }
     }
     if bits > 0 {
-        out.push(B32[((buf << (5 - bits)) & 31) as usize] as char);
+        out.push(B32[((buf << (5 - bits)) & 31) as usize]);
     }
-    out
 }
 
 pub fn base32_decode(s: &str) -> Option<Vec<u8>> {
@@ -132,6 +145,12 @@ pub fn base32_decode(s: &str) -> Option<Vec<u8>> {
             out.push((buf >> bits) as u8);
         }
     }
+    // canonical only: the leftover bits are padding (fewer than one
+    // character's worth) and must be zero, so each byte string has exactly
+    // one encoding
+    if bits >= 5 || buf & ((1 << bits) - 1) != 0 {
+        return None;
+    }
     Some(out)
 }
 
@@ -147,5 +166,28 @@ mod tests {
             c.to_string(),
             "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"
         );
+    }
+
+    #[test]
+    fn non_canonical_base32_rejected() {
+        let s = "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm";
+        // 36 bytes = 288 bits in 58 characters: the last character carries 3
+        // data bits and 2 padding bits, which must be zero
+        let last = s.as_bytes()[s.len() - 1];
+        let v = B32.iter().position(|&c| c == last).unwrap();
+        assert_eq!(v & 3, 0);
+        for pad in 1..4 {
+            let mut t = s[..s.len() - 1].to_string();
+            t.push(B32[v | pad] as char);
+            assert!(Cid::parse(&t).is_err(), "{t}");
+        }
+        // an extra character is padding too
+        assert!(Cid::parse(&format!("{s}a")).is_err());
+        assert!(base32_decode("a").is_none());
+        // every byte string round-trips through its one encoding
+        for n in 0..12u8 {
+            let data: Vec<u8> = (0..n).map(|i| i.wrapping_mul(37) ^ 0xa5).collect();
+            assert_eq!(base32_decode(&base32_encode(&data)).unwrap(), data);
+        }
     }
 }

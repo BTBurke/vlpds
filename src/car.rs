@@ -43,9 +43,14 @@ pub fn write_block(out: &mut Vec<u8>, c: &Cid, data: &[u8]) {
 
 /// Parses a CAR into (roots, blocks).
 pub fn read_car(b: &[u8]) -> anyhow::Result<(Vec<Cid>, Vec<(Cid, &[u8])>)> {
+    // lengths are untrusted varints (up to u64::MAX): check them against
+    // the bytes that remain instead of adding them to a position
     let (hlen, n) = read_varint(b).ok_or_else(|| anyhow::anyhow!("bad car header"))?;
+    if hlen > (b.len() - n) as u64 {
+        anyhow::bail!("short car");
+    }
     let mut pos = n + hlen as usize;
-    let header = cbor::Value::decode(b.get(n..pos).ok_or_else(|| anyhow::anyhow!("short car"))?)?;
+    let header = cbor::Value::decode(&b[n..pos])?;
     let roots = match header.get("roots") {
         Some(cbor::Value::Array(a)) => a
             .iter()
@@ -63,13 +68,39 @@ pub fn read_car(b: &[u8]) -> anyhow::Result<(Vec<Cid>, Vec<(Cid, &[u8])>)> {
     while pos < b.len() {
         let (len, n) = read_varint(&b[pos..]).ok_or_else(|| anyhow::anyhow!("bad block len"))?;
         pos += n;
+        if len > (b.len() - pos) as u64 {
+            anyhow::bail!("short block");
+        }
         let end = pos + len as usize;
-        let blk = b
-            .get(pos..end)
-            .ok_or_else(|| anyhow::anyhow!("short block"))?;
+        let blk = &b[pos..end];
         let (c, cl) = Cid::read_prefix(blk)?;
         blocks.push((c, &blk[cl..]));
         pos = end;
     }
     Ok((roots, blocks))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn huge_lengths_are_errors() {
+        let max = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01];
+        // header length u64::MAX
+        assert!(read_car(&max).is_err());
+        // a valid header, then a block length of u64::MAX
+        let mut car = Vec::new();
+        write_header(&mut car, &Cid::dag_cbor(b"x"));
+        car.extend_from_slice(&max);
+        car.extend_from_slice(&[0; 40]);
+        assert!(read_car(&car).is_err());
+        // and lengths just past the end
+        let mut car = Vec::new();
+        write_header(&mut car, &Cid::dag_cbor(b"x"));
+        write_varint(&mut car, 41);
+        car.extend_from_slice(&[0; 40]);
+        assert!(read_car(&car).is_err());
+        assert!(read_car(&[0x05, 0xa0]).is_err());
+    }
 }

@@ -746,3 +746,71 @@ async fn create_report_goes_to_report_service() {
     .await;
     assert_eq!(s, 400);
 }
+
+/// A takendown-scope session (createSession allowTakendown) may appeal via
+/// tools.ozone.inbox.appealActionedSubject, which is proxied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn takendown_session_can_appeal() {
+    let env = spawn_env(true).await;
+    let u = env.create_account("appealer").await;
+    let r = env
+        .http
+        .post(format!("{}/xrpc/com.atproto.admin.updateSubjectStatus", env.url))
+        .basic_auth("admin", Some(server::DEV_ADMIN_TOKEN))
+        .json(&json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": u.did}, "takedown": {"applied": true}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = env
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.createSession", env.url))
+        .json(&json!({"identifier": "appealer.vlpds.test", "password": "hunter22", "allowTakendown": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: J = r.json().await.unwrap();
+    let tk = User { did: u.did.clone(), jwt: v["accessJwt"].as_str().unwrap().into() };
+
+    let r = env
+        .post(&tk, "tools.ozone.inbox.appealActionedSubject")
+        .json(&json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": u.did}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "{}", r.text().await.unwrap());
+    assert_eq!(env.appview.last().uri, "/xrpc/tools.ozone.inbox.appealActionedSubject");
+    // other proxied methods stay closed to the takendown scope
+    let (s, e) = err_of(env.get(Some(&tk), "app.bsky.feed.getTimeline").send().await.unwrap()).await;
+    assert_eq!((s, e["error"].as_str()), (400, Some("InvalidToken")));
+}
+
+/// repo.getRecord for a repo not hosted here pipes through to the AppView
+/// without credentials (reference getRecord -> pipethrough).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_record_for_unhosted_repo_goes_to_appview() {
+    let env = spawn_env(true).await;
+    let u = env.create_account("hoster").await;
+    for repo in ["did:plc:z72i7hdynmk6r22z27h6tvur", "someone.elsewhere.test"] {
+        let q = format!("com.atproto.repo.getRecord?repo={repo}&collection=app.bsky.actor.profile&rkey=self");
+        let r = env.get(Some(&u), &q).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let body: J = r.json().await.unwrap();
+        assert_eq!(body["path"], "/xrpc/com.atproto.repo.getRecord");
+        let seen = env.appview.last();
+        assert_eq!(seen.uri, format!("/xrpc/{q}"));
+        assert!(seen.headers.get("authorization").is_none(), "pipethrough is unauthenticated");
+    }
+    // a local repo is served locally, misses included
+    let n = env.appview.count();
+    let (s, e) = err_of(
+        env.get(None, &format!("com.atproto.repo.getRecord?repo={}&collection=app.bsky.actor.profile&rkey=self", u.did))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!((s, e["error"].as_str()), (400, Some("RecordNotFound")));
+    assert_eq!(env.appview.count(), n);
+}

@@ -6,7 +6,9 @@
 //! - malformed / mistyped JSON or query params: 400 `InvalidRequest`
 //!   (axum would answer 400/415/422 in plain text);
 //! - JSON bodies over 150 KiB: 413 `PayloadTooLarge` (reference
-//!   `jsonLimit: 150 * 1024`, packages/pds/src/index.ts);
+//!   `jsonLimit: 150 * 1024`, packages/pds/src/index.ts); record writes
+//!   (`RecordJson`) allow 1,000,000 bytes like the reference's
+//!   createRecord/putRecord/applyWrites;
 //! - params whose lexicon format is fixed everywhere they appear (`did`,
 //!   `repo` (at-identifier), `cid`, `handle`) are syntax-checked, so a bad
 //!   value is a 400 `InvalidRequest` rather than a lookup miss, as the
@@ -23,6 +25,9 @@ use serde::de::DeserializeOwned;
 
 /// Largest JSON request body (reference: 150kb).
 pub const JSON_LIMIT: usize = 150 * 1024;
+/// Largest record-write JSON body (reference createRecord/putRecord/
+/// applyWrites `jsonLimit: 1_000_000`).
+pub const RECORD_JSON_LIMIT: usize = 1_000_000;
 
 fn invalid(message: impl Into<String>) -> XrpcError {
     XrpcError::bad("InvalidRequest", message)
@@ -109,6 +114,19 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for Json<T> {
     }
 }
 
+/// `Json` with the record-write body limit ([`RECORD_JSON_LIMIT`]).
+pub struct RecordJson<T>(pub T);
+
+impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for RecordJson<T> {
+    type Rejection = XrpcError;
+
+    async fn from_request(req: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        check_content_type(&req)?;
+        let body = read_body(req, RECORD_JSON_LIMIT).await?;
+        parse(&body).map(RecordJson)
+    }
+}
+
 /// `Option<Json<T>>`: an empty body is `None`; anything else must parse.
 impl<T: DeserializeOwned, S: Send + Sync> OptionalFromRequest<S> for Json<T> {
     type Rejection = XrpcError;
@@ -128,6 +146,17 @@ impl<T: DeserializeOwned, S: Send + Sync> OptionalFromRequest<S> for Json<T> {
 // ---------------------------------------------------------------------------
 
 pub struct Query<T>(pub T);
+
+/// A `limit` param checked against its lexicon range like the reference's
+/// param validation (400 InvalidRequest when out of range), else `default`.
+pub fn limit_param(v: Option<i64>, default: usize, min: i64, max: i64) -> Result<usize, XrpcError> {
+    match v {
+        None => Ok(default),
+        Some(n) if n < min => Err(invalid(format!("Params/limit can not be less than {min}"))),
+        Some(n) if n > max => Err(invalid(format!("Params/limit can not be greater than {max}"))),
+        Some(n) => Ok(n as usize),
+    }
+}
 
 /// CID string syntax (lexicon format `cid`): a multibase CIDv1 string. CIDv0
 /// (`Qm...`) is not supported by atproto.

@@ -199,3 +199,12 @@ async fn invite_admin_endpoints_require_admin() {
     s.xrpc.get("com.atproto.admin.getInviteCodes", &[], &acct.auth()).await.client_err();
     s.xrpc.post("com.atproto.admin.disableInviteCodes", &json!({"codes": ["x"]}), &acct.auth()).await.client_err();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_invite_codes_validates_limit() {
+    let s = server().await;
+    for bad in ["0", "501"] {
+        s.xrpc.get("com.atproto.admin.getInviteCodes", &[("limit", bad)], &Auth::Admin).await.err(400, "InvalidRequest");
+    }
+    s.xrpc.get("com.atproto.admin.getInviteCodes", &[("limit", "500")], &Auth::Admin).await.ok();
+}

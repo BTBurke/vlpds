@@ -550,3 +550,55 @@ async fn create_account_emits_identity_and_account_events() {
     assert_eq!(acct.bool("active"), Some(true));
     assert!(acct.str("status").is_none());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requires_an_email() {
+    let s = TestServer::spawn().await;
+    let handle = format!("{}.{HANDLE_DOMAIN}", unique_name("noemail"));
+    for body in [
+        json!({"handle": handle, "password": PASSWORD}),
+        json!({"handle": handle, "password": PASSWORD, "email": ""}),
+    ] {
+        let r = s.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await;
+        r.err(400, "InvalidRequest");
+        assert!(r.text().contains("Email is required"), "{}", r.text());
+    }
+}
+
+/// reserveSigningKey with a DID returns the same key while the reservation
+/// is live (reference reserveKeypair); unclaimed reservations expire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reserve_signing_key_reuse_and_expiry() {
+    let s = TestServer::spawn().await;
+    let reserve = |body: J| {
+        let x = s.xrpc.clone();
+        async move {
+            x.post("com.atproto.server.reserveSigningKey", &body, &Auth::None).await.ok()["signingKey"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let did = "did:plc:migratingaaaaaaaaaaaaaaa";
+    let k1 = reserve(json!({"did": did})).await;
+    assert_eq!(reserve(json!({"did": did})).await, k1, "same DID, same reserved key");
+    assert_ne!(reserve(json!({})).await, reserve(json!({})).await);
+
+    // once taken, the DID gets a fresh key
+    let a = s.create_account("rsk").await;
+    let k2 = reserve(json!({"did": a.did})).await;
+    let r = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did, "signingKey": k2}), &Auth::Admin).await.ok();
+    assert_eq!(r["signingKey"], json!(k2));
+    assert_ne!(reserve(json!({"did": a.did})).await, k2);
+
+    // expired reservations are swept and can't be installed
+    let swept = vlpds::xrpc::sweep_reserved_keys(&s.app, std::time::Duration::ZERO)
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.message));
+    assert!(swept >= 5, "swept {swept}");
+    assert_ne!(reserve(json!({"did": did})).await, k1, "expired reservation was reused");
+    s.xrpc
+        .post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did, "signingKey": k1}), &Auth::Admin)
+        .await
+        .err(400, "InvalidRequest");
+}

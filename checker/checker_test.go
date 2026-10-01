@@ -481,11 +481,12 @@ func TestSeqChecker(t *testing.T) {
 
 func encodeFrame(t *testing.T, typ string, body interface{ MarshalCBOR(io.Writer) error }) []byte {
 	var b bytes.Buffer
+	// canonical key order: "t" before "op"
 	b.Write([]byte{0xa2})
-	b.Write(cborText("op"))
-	b.WriteByte(0x01)
 	b.Write(cborText("t"))
 	b.Write(cborText(typ))
+	b.Write(cborText("op"))
+	b.WriteByte(0x01)
 	if err := body.MarshalCBOR(&b); err != nil {
 		t.Fatal(err)
 	}
@@ -579,4 +580,150 @@ func TestStreamEndToEnd(t *testing.T) {
 	if !strings.Contains(out.String(), "seq jumped 110 -> 114 (3 missing)") {
 		t.Fatalf("gap detail missing:\n%s", out.String())
 	}
+}
+
+func TestCheckCanonical(t *testing.T) {
+	link := append([]byte{0xd8, 0x2a, 0x58, 0x25, 0x00}, dagCID([]byte{0xf6}).Bytes()...)
+	ok := [][]byte{
+		{0xf6},
+		{0xa2, 0x61, 'a', 0x01, 0x62, 'a', 'a', 0x02}, // {"a":1,"aa":2}: shorter key first
+		{0x18, 0x18}, // 24
+		append([]byte{0xa1, 0x61, 'l'}, link...),
+	}
+	for _, b := range ok {
+		if err := checkCanonical(b); err != nil {
+			t.Errorf("%x: %v", b, err)
+		}
+	}
+	bad := map[string][]byte{
+		"unsorted keys":      {0xa2, 0x62, 'a', 'a', 0x01, 0x61, 'b', 0x02},
+		"duplicate keys":     {0xa2, 0x61, 'a', 0x01, 0x61, 'a', 0x02},
+		"non-minimal int":    {0x18, 0x01},
+		"non-minimal length": {0x78, 0x01, 'a'},
+		"indefinite array":   {0x9f, 0x01, 0xff},
+		"float":              {0xfb, 0x40, 0x09, 0x21, 0xfb, 0x54, 0x44, 0x2d, 0x18},
+		"half float":         {0xf9, 0x3c, 0x00},
+		"undefined":          {0xf7},
+		"tag 1":              {0xc1, 0x01},
+		"trailing bytes":     {0x01, 0x02},
+		"int map key":        {0xa1, 0x01, 0x02},
+	}
+	for name, b := range bad {
+		if err := checkCanonical(b); err == nil {
+			t.Errorf("%s (%x) accepted", name, b)
+		}
+	}
+}
+
+func TestEventChecks(t *testing.T) {
+	ctx := context.Background()
+	p := paths(10)
+	setup := func(t *testing.T) (*verifier, *fakeRepo) {
+		r := newFakeRepo(t, "did:plc:ffffffffffffffffffffffff")
+		srv := describeRepoServer(t, r)
+		t.Cleanup(srv.Close)
+		v := newVerifier(newPDSKeySource(srv.URL))
+		wantKinds(t, v.verifyCommit(ctx, r.commit(opSpec{"create", p[0]})))
+		return v, r
+	}
+
+	t.Run("non-canonical record block", func(t *testing.T) {
+		v, r := setup(t)
+		// {"b":1,"a":2}: unsorted keys, otherwise a fine record
+		rec := []byte{0xa2, 0x61, 'b', 0x01, 0x61, 'a', 0x02}
+		c := dagCID(rec)
+		r.records[p[1]] = c
+		l := lexutil.LexLink(c)
+		ops := []*comatproto.SyncSubscribeRepos_RepoOp{{Action: "create", Path: p[1], Cid: &l}}
+		wantKinds(t, v.verifyCommit(ctx, r.finish(ops, map[cid.Cid][]byte{c: rec})), failNonCanonical)
+	})
+	t.Run("float in record block", func(t *testing.T) {
+		v, r := setup(t)
+		rec := []byte{0xa1, 0x61, 'a', 0xfb, 0x40, 0x09, 0x21, 0xfb, 0x54, 0x44, 0x2d, 0x18}
+		c := dagCID(rec)
+		r.records[p[1]] = c
+		l := lexutil.LexLink(c)
+		ops := []*comatproto.SyncSubscribeRepos_RepoOp{{Action: "create", Path: p[1], Cid: &l}}
+		wantKinds(t, v.verifyCommit(ctx, r.finish(ops, map[cid.Cid][]byte{c: rec})), failNonCanonical)
+	})
+	t.Run("duplicate op path", func(t *testing.T) {
+		v, r := setup(t)
+		msg := r.commit(opSpec{"create", p[1]})
+		dup := *msg.Ops[0]
+		msg.Ops = append(msg.Ops, &dup)
+		// indigo rejects the op list too
+		wantKinds(t, v.verifyCommit(ctx, msg), failDupOpPath, failCommitVerify)
+	})
+	t.Run("blocks too big", func(t *testing.T) {
+		v, r := setup(t)
+		msg := r.commit(opSpec{"create", p[1]})
+		// trailing garbage past the CAR is unreadable too
+		msg.Blocks = append(msg.Blocks, make([]byte, maxCommitBlocks)...)
+		fails := v.verifyCommit(ctx, msg)
+		if k := kinds(fails); len(k) == 0 || !strings.Contains(strings.Join(k, ","), failBlocksSize) {
+			t.Fatalf("got %v", fails)
+		}
+	})
+	t.Run("time goes backwards", func(t *testing.T) {
+		v, r := setup(t)
+		msg := r.commit(opSpec{"create", p[1]})
+		msg.Time = syntax.DatetimeNow().Time().Add(-time.Hour).Format(syntax.AtprotoDatetimeLayout)
+		wantKinds(t, v.verifyCommit(ctx, msg), failTimeOrder)
+		// the next event in order is fine; one with a bad time is not
+		wantKinds(t, v.verifyCommit(ctx, r.commit(opSpec{"create", p[2]})))
+		msg = r.commit(opSpec{"create", p[3]})
+		msg.Time = "yesterday"
+		wantKinds(t, v.verifyCommit(ctx, msg), failBadField, failCommitVerify)
+		id := &comatproto.SyncSubscribeRepos_Identity{Did: r.did, Time: "2001-01-01T00:00:00Z"}
+		wantKinds(t, v.verifyIdentity(id), failTimeOrder)
+	})
+	t.Run("identity fields", func(t *testing.T) {
+		v := newVerifier(nil)
+		now := syntax.DatetimeNow().String()
+		good, bad := "alice.example.com", "not a handle"
+		wantKinds(t, v.verifyIdentity(&comatproto.SyncSubscribeRepos_Identity{Did: "did:plc:aaaa", Handle: &good, Time: now}))
+		wantKinds(t, v.verifyIdentity(&comatproto.SyncSubscribeRepos_Identity{Did: "did:plc:aaaa", Time: now}))
+		wantKinds(t, v.verifyIdentity(&comatproto.SyncSubscribeRepos_Identity{Did: "did:plc:aaaa", Handle: &bad, Time: now}), failBadField)
+		wantKinds(t, v.verifyIdentity(&comatproto.SyncSubscribeRepos_Identity{Did: "alice", Time: now}), failBadField)
+	})
+	t.Run("account fields", func(t *testing.T) {
+		v := newVerifier(nil)
+		now := syntax.DatetimeNow().String()
+		st := func(s string) *string { return &s }
+		wantKinds(t, v.verifyAccount(&comatproto.SyncSubscribeRepos_Account{Did: "did:plc:aaaa", Active: true, Time: now}))
+		wantKinds(t, v.verifyAccount(&comatproto.SyncSubscribeRepos_Account{Did: "did:plc:aaaa", Status: st("takendown"), Time: now}))
+		wantKinds(t, v.verifyAccount(&comatproto.SyncSubscribeRepos_Account{Did: "did:plc:aaaa", Active: true, Status: st("deactivated"), Time: now}), failBadField)
+		wantKinds(t, v.verifyAccount(&comatproto.SyncSubscribeRepos_Account{Did: "did:plc:aaaa", Status: st("sleepy"), Time: now}), failBadField)
+		wantKinds(t, v.verifyAccount(&comatproto.SyncSubscribeRepos_Account{Did: "did:plc:aaaa", Active: true, Time: "x"}), failBadField)
+	})
+	t.Run("non-canonical frame body", func(t *testing.T) {
+		id := &comatproto.SyncSubscribeRepos_Identity{Did: "did:plc:aaaa", Seq: 1, Time: syntax.DatetimeNow().String()}
+		f := encodeFrame(t, "#identity", id)
+		ev, err := decodeFrame(f)
+		if err != nil || ev.NonCanonical != "" {
+			t.Fatalf("canonical frame: %v %q", err, ev.NonCanonical)
+		}
+		// the same fields with "seq" before "did": decodes the same, isn't canonical
+		var b bytes.Buffer
+		b.Write(f[:len(f)-len(frameBody(t, id))])
+		b.WriteByte(0xa3)
+		b.Write(cborText("seq"))
+		b.WriteByte(0x01)
+		b.Write(cborText("did"))
+		b.Write(cborText(id.Did))
+		b.Write(cborText("time"))
+		b.Write(cborText(id.Time))
+		ev, err = decodeFrame(b.Bytes())
+		if err != nil || ev.Identity.Seq != 1 || !strings.Contains(ev.NonCanonical, "frame body") {
+			t.Fatalf("non-canonical body: %v %q", err, ev.NonCanonical)
+		}
+	})
+}
+
+func frameBody(t *testing.T, body interface{ MarshalCBOR(io.Writer) error }) []byte {
+	var b bytes.Buffer
+	if err := body.MarshalCBOR(&b); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
 }

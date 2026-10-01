@@ -44,7 +44,24 @@ const (
 	failChainPrevData   = "chain_prevdata"    // prevData != previous data CID
 	failChainRev        = "chain_rev"         // rev not strictly greater than previous rev
 	failUpstreamError   = "upstream_error"    // server sent an error frame
+	failNonCanonical    = "non_canonical"     // frame header/body or a DAG-CBOR block is not canonical DAG-CBOR
+	failDupOpPath       = "dup_op_path"       // two ops on one path in a commit
+	failBlocksSize      = "blocks_size"       // blocks over the lexicon maxLength
+	failBadField        = "bad_field"         // malformed did/handle/time/status in an event
+	failTimeOrder       = "time_order"        // event time earlier than the DID's previous event
 )
+
+// Lexicon maxLength of the blocks field (com.atproto.sync.subscribeRepos).
+const (
+	maxCommitBlocks = 2_000_000
+	maxSyncBlocks   = 10_000
+)
+
+// Account statuses known to com.atproto.sync.subscribeRepos#account.
+var accountStatuses = map[string]bool{
+	"takendown": true, "suspended": true, "deleted": true,
+	"deactivated": true, "desynchronized": true, "throttled": true,
+}
 
 type failure struct {
 	Kind   string
@@ -147,17 +164,88 @@ type chainState struct {
 // verifier holds per-DID chain state. Each worker owns one, and events are
 // partitioned by DID, so a verifier is only ever used from one goroutine.
 type verifier struct {
-	keys  KeySource // nil disables signature checks
-	state map[string]chainState
+	keys     KeySource // nil disables signature checks
+	state    map[string]chainState
+	lastTime map[string]time.Time
 }
 
 func newVerifier(keys KeySource) *verifier {
-	return &verifier{keys: keys, state: map[string]chainState{}}
+	return &verifier{keys: keys, state: map[string]chainState{}, lastTime: map[string]time.Time{}}
+}
+
+// checkTime requires a valid datetime that is not earlier than the DID's
+// previous event (any type).
+func (v *verifier) checkTime(did, ts string, add func(kind, format string, args ...any)) {
+	dt, err := syntax.ParseDatetime(ts)
+	if err != nil {
+		add(failBadField, "time %q: %v", ts, err)
+		return
+	}
+	t := dt.Time()
+	if prev, ok := v.lastTime[did]; ok && t.Before(prev) {
+		add(failTimeOrder, "time %s is before the previous event's %s", ts, prev.Format(time.RFC3339Nano))
+		return
+	}
+	v.lastTime[did] = t
+}
+
+// verifyIdentity checks an #identity event's fields.
+func (v *verifier) verifyIdentity(msg *comatproto.SyncSubscribeRepos_Identity) []failure {
+	var fails []failure
+	add := func(kind, format string, args ...any) {
+		fails = append(fails, failure{Kind: kind, Seq: msg.Seq, DID: msg.Did, Reason: "#identity " + fmt.Sprintf(format, args...)})
+	}
+	if _, err := syntax.ParseDID(msg.Did); err != nil {
+		add(failBadField, "did: %v", err)
+	}
+	if msg.Handle != nil {
+		if _, err := syntax.ParseHandle(*msg.Handle); err != nil {
+			add(failBadField, "handle: %v", err)
+		}
+	}
+	v.checkTime(msg.Did, msg.Time, add)
+	return fails
+}
+
+// verifyAccount checks an #account event's fields: a known status, and
+// only on an inactive account.
+func (v *verifier) verifyAccount(msg *comatproto.SyncSubscribeRepos_Account) []failure {
+	var fails []failure
+	add := func(kind, format string, args ...any) {
+		fails = append(fails, failure{Kind: kind, Seq: msg.Seq, DID: msg.Did, Reason: "#account " + fmt.Sprintf(format, args...)})
+	}
+	if _, err := syntax.ParseDID(msg.Did); err != nil {
+		add(failBadField, "did: %v", err)
+	}
+	if msg.Status != nil {
+		if msg.Active {
+			add(failBadField, "status %q on an active account", *msg.Status)
+		}
+		if !accountStatuses[*msg.Status] {
+			add(failBadField, "unknown status %q", *msg.Status)
+		}
+	}
+	v.checkTime(msg.Did, msg.Time, add)
+	return fails
 }
 
 // inspectCAR reads a firehose blocks CAR, checks that every block's CID
-// matches its bytes, and decodes the root block as a commit object.
-func inspectCAR(b []byte) (cid.Cid, *repo.Commit, error) {
+// matches its bytes, and decodes the root block as a commit object. Blocks
+// (records, MST nodes, the commit) that are not canonical DAG-CBOR are
+// returned in nonCanon; they don't fail the CAR.
+func inspectCAR(b []byte) (root cid.Cid, commit *repo.Commit, nonCanon []string, err error) {
+	root, commit, err = inspectCARBlocks(b, func(c cid.Cid, data []byte) {
+		if c.Prefix().Codec != cid.DagCBOR {
+			return
+		}
+		if err := checkCanonical(data); err != nil {
+			nonCanon = append(nonCanon, fmt.Sprintf("block %s: %v", c, err))
+		}
+	})
+	return root, commit, nonCanon, err
+}
+
+func inspectCARBlocks(b []byte, each func(cid.Cid, []byte)) (cid.Cid, *repo.Commit, error) {
 	cr, err := car.NewCarReader(bytes.NewReader(b))
 	if err != nil {
 		return cid.Undef, nil, fmt.Errorf("reading CAR header: %w", err)
@@ -185,6 +273,7 @@ func inspectCAR(b []byte) (cid.Cid, *repo.Commit, error) {
 		if !computed.Equals(blk.Cid()) {
 			return root, nil, fmt.Errorf("block %s hashes to %s", blk.Cid(), computed)
 		}
+		each(blk.Cid(), blk.RawData())
 		if blk.Cid().Equals(root) {
 			commitRaw = blk.RawData()
 		}
@@ -240,8 +329,22 @@ func (v *verifier) verifyCommit(ctx context.Context, msg *comatproto.SyncSubscri
 	if msg.Rebase {
 		add(failRebase, "rebase flag set")
 	}
+	if len(msg.Blocks) > maxCommitBlocks {
+		add(failBlocksSize, "blocks is %d bytes (max %d)", len(msg.Blocks), maxCommitBlocks)
+	}
+	seen := map[string]bool{}
+	for _, op := range msg.Ops {
+		if seen[op.Path] {
+			add(failDupOpPath, "two ops on %s", op.Path)
+		}
+		seen[op.Path] = true
+	}
+	v.checkTime(did, msg.Time, add)
 
-	root, commit, err := inspectCAR(msg.Blocks)
+	root, commit, nonCanon, err := inspectCAR(msg.Blocks)
+	for _, nc := range nonCanon {
+		add(failNonCanonical, "%s", nc)
+	}
 	if err != nil {
 		add(failCAR, "%v", err)
 		// Without the commit object we can't know the new data CID; forget the
@@ -310,8 +413,18 @@ func (v *verifier) verifySync(ctx context.Context, msg *comatproto.SyncSubscribe
 	did := msg.Did
 	if _, err := syntax.ParseDatetime(msg.Time); err != nil {
 		add(failCAR, "#sync time: %v", err)
+	} else {
+		v.checkTime(did, msg.Time, func(kind, format string, args ...any) {
+			add(kind, "#sync "+format, args...)
+		})
 	}
-	_, commit, err := inspectCAR(msg.Blocks)
+	if len(msg.Blocks) > maxSyncBlocks {
+		add(failBlocksSize, "#sync blocks is %d bytes (max %d)", len(msg.Blocks), maxSyncBlocks)
+	}
+	_, commit, nonCanon, err := inspectCAR(msg.Blocks)
+	for _, nc := range nonCanon {
+		add(failNonCanonical, "#sync %s", nc)
+	}
 	if err != nil {
 		add(failCAR, "#sync: %v", err)
 		delete(v.state, did)

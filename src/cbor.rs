@@ -220,7 +220,9 @@ impl Value {
                                 && o.get("mimeType").is_some_and(|m| m.is_string())
                                 && o.get("size").is_some_and(|n| n.is_i64() || n.is_u64());
                             if !ok {
-                                return Err(dm("blob needs ref ($link), mimeType (string) and size (integer)"));
+                                return Err(dm(
+                                    "blob needs ref ($link), mimeType (string) and size (integer)",
+                                ));
                             }
                         }
                     }
@@ -275,6 +277,36 @@ impl Value {
     }
 }
 
+// ---------- DAG-CBOR -> JSON ----------
+
+/// Transcodes one DAG-CBOR value straight to atproto JSON (`{"$link": cid}`
+/// for links, `{"$bytes": base64}` for byte strings) without building a
+/// `Value` tree. It accepts exactly what `Value::decode` accepts, and the
+/// output parses to the same JSON as `Value::decode(bytes)?.to_json()`.
+/// On error `out` is left as it was.
+pub fn write_json(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), CborError> {
+    let start = out.len();
+    let mut d = Decoder {
+        data: bytes,
+        pos: 0,
+    };
+    let r = d.json(0, out).and_then(|()| {
+        if d.pos != bytes.len() {
+            return Err(CborError::Invalid("trailing bytes"));
+        }
+        Ok(())
+    });
+    if r.is_err() {
+        out.truncate(start);
+    }
+    r
+}
+
+fn json_str(out: &mut Vec<u8>, s: &str) {
+    // writing into a Vec cannot fail
+    let _ = serde_json::to_writer(&mut *out, s);
+}
+
 struct Decoder<'a> {
     data: &'a [u8],
     pos: usize,
@@ -287,12 +319,15 @@ impl<'a> Decoder<'a> {
         Ok(b)
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], CborError> {
-        if self.pos + n > self.data.len() {
+    /// Takes `n` bytes; `n` is an untrusted length (up to u64::MAX), so it is
+    /// compared against what remains rather than added to `pos`.
+    fn take(&mut self, n: u64) -> Result<&'a [u8], CborError> {
+        let rest = self.data.len() - self.pos;
+        if n > rest as u64 {
             return Err(CborError::Eof);
         }
-        let s = &self.data[self.pos..self.pos + n];
-        self.pos += n;
+        let s = &self.data[self.pos..self.pos + n as usize];
+        self.pos += n as usize;
         Ok(s)
     }
 
@@ -302,16 +337,32 @@ impl<'a> Decoder<'a> {
         let b = self.byte()?;
         let major = b >> 5;
         let info = b & 31;
+        // major 7: only the one-byte false/true/null; floats (25-27), two-byte
+        // simple values (24) and the other simple values are not data model
+        if major == 7 {
+            return match info {
+                20..=22 => Ok((7, info as u64)),
+                _ => Err(CborError::Invalid("floats/simple values not allowed")),
+            };
+        }
         let (n, min) = match info {
             0..=23 => (info as u64, 0),
             24 => (self.byte()? as u64, 24),
-            25 => (u16::from_be_bytes(self.take(2)?.try_into().unwrap()) as u64, 1 << 8),
-            26 => (u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as u64, 1 << 16),
-            27 => (u64::from_be_bytes(self.take(8)?.try_into().unwrap()), 1 << 32),
+            25 => (
+                u16::from_be_bytes(self.take(2)?.try_into().unwrap()) as u64,
+                1 << 8,
+            ),
+            26 => (
+                u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as u64,
+                1 << 16,
+            ),
+            27 => (
+                u64::from_be_bytes(self.take(8)?.try_into().unwrap()),
+                1 << 32,
+            ),
             _ => return Err(CborError::Invalid("indefinite length or reserved")),
         };
-        // major 7 arguments are simple values / floats, not lengths
-        if major != 7 && n < min {
+        if n < min {
             return Err(CborError::Invalid("non-minimal integer encoding"));
         }
         Ok((major, n))
@@ -325,9 +376,9 @@ impl<'a> Decoder<'a> {
         Ok(match major {
             0 => Value::Int(i64::try_from(n).map_err(|_| CborError::Invalid("int range"))?),
             1 => Value::Int(-1 - i64::try_from(n).map_err(|_| CborError::Invalid("int range"))?),
-            2 => Value::Bytes(self.take(n as usize)?.to_vec()),
+            2 => Value::Bytes(self.take(n)?.to_vec()),
             3 => Value::Text(
-                std::str::from_utf8(self.take(n as usize)?)
+                std::str::from_utf8(self.take(n)?)
                     .map_err(|_| CborError::Invalid("utf8"))?
                     .to_string(),
             ),
@@ -376,11 +427,122 @@ impl<'a> Decoder<'a> {
             7 => match n {
                 20 => Value::Bool(false),
                 21 => Value::Bool(true),
-                22 => Value::Null,
-                _ => return Err(CborError::Invalid("floats/simple values not allowed")),
+                _ => Value::Null,
             },
             _ => unreachable!(),
         })
+    }
+}
+
+// The transcoder mirrors `value` check for check (depth limit, minimal
+// heads, string keys in canonical order, tag 42 links, major 7) so both
+// accept the same inputs.
+impl<'a> Decoder<'a> {
+    fn json(&mut self, depth: usize, out: &mut Vec<u8>) -> Result<(), CborError> {
+        if depth > 128 {
+            return Err(CborError::Invalid("nesting too deep"));
+        }
+        let (major, n) = self.head()?;
+        match major {
+            0 => {
+                let n = i64::try_from(n).map_err(|_| CborError::Invalid("int range"))?;
+                let _ = serde_json::to_writer(&mut *out, &n);
+            }
+            1 => {
+                let n = -1 - i64::try_from(n).map_err(|_| CborError::Invalid("int range"))?;
+                let _ = serde_json::to_writer(&mut *out, &n);
+            }
+            2 => {
+                let b = self.take(n)?;
+                out.extend_from_slice(b"{\"$bytes\":\"");
+                let at = out.len();
+                out.resize(at + b.len().div_ceil(3) * 4, 0);
+                let w = base64::engine::general_purpose::STANDARD_NO_PAD
+                    .encode_slice(b, &mut out[at..])
+                    .map_err(|_| CborError::Invalid("base64"))?;
+                out.truncate(at + w);
+                out.extend_from_slice(b"\"}");
+            }
+            3 => json_str(
+                out,
+                std::str::from_utf8(self.take(n)?).map_err(|_| CborError::Invalid("utf8"))?,
+            ),
+            4 => {
+                out.push(b'[');
+                for i in 0..n {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    self.json(depth + 1, out)?;
+                }
+                out.push(b']');
+            }
+            5 => {
+                out.push(b'{');
+                let mut prev: Option<&str> = None;
+                for i in 0..n {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    let k = self.json_key(depth + 1)?;
+                    if let Some(prev) = prev {
+                        match key_cmp(prev, k) {
+                            std::cmp::Ordering::Less => {}
+                            std::cmp::Ordering::Equal => {
+                                return Err(CborError::Invalid("duplicate map key"))
+                            }
+                            std::cmp::Ordering::Greater => {
+                                return Err(CborError::Invalid("map keys not in canonical order"))
+                            }
+                        }
+                    }
+                    json_str(out, k);
+                    out.push(b':');
+                    self.json(depth + 1, out)?;
+                    prev = Some(k);
+                }
+                out.push(b'}');
+            }
+            6 => {
+                if n != 42 {
+                    return Err(CborError::Invalid("unsupported tag"));
+                }
+                let c = self.json_link(depth + 1)?;
+                out.extend_from_slice(b"{\"$link\":\"");
+                c.write_string(out);
+                out.extend_from_slice(b"\"}");
+            }
+            7 => out.extend_from_slice(match n {
+                20 => b"false",
+                21 => b"true",
+                _ => b"null",
+            }),
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn json_key(&mut self, depth: usize) -> Result<&'a str, CborError> {
+        if depth > 128 {
+            return Err(CborError::Invalid("nesting too deep"));
+        }
+        match self.head()? {
+            (3, n) => std::str::from_utf8(self.take(n)?).map_err(|_| CborError::Invalid("utf8")),
+            _ => Err(CborError::Invalid("non-string map key")),
+        }
+    }
+
+    fn json_link(&mut self, depth: usize) -> Result<Cid, CborError> {
+        if depth > 128 {
+            return Err(CborError::Invalid("nesting too deep"));
+        }
+        match self.head()? {
+            (2, n) => match self.take(n)? {
+                [0, c @ ..] => Cid::from_bytes(c).map_err(|_| CborError::Invalid("bad cid")),
+                _ => Err(CborError::Invalid("bad cid link")),
+            },
+            _ => Err(CborError::Invalid("bad cid link")),
+        }
     }
 }
 
@@ -401,5 +563,68 @@ mod tests {
             let keys: Vec<_> = m.iter().map(|(k, _)| k.as_str()).collect();
             assert_eq!(keys, vec!["n", "text", "$type", "createdAt"]);
         }
+    }
+
+    #[test]
+    fn huge_lengths_are_errors_not_panics() {
+        // byte/text strings and arrays of length u64::MAX
+        for major in [0x5b, 0x7b, 0x9b, 0xbb] {
+            let mut b = vec![major, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+            b.extend_from_slice(&[0; 10]);
+            assert!(Value::decode(&b).is_err(), "{major:#x}");
+            assert!(write_json(&b, &mut Vec::new()).is_err(), "{major:#x}");
+        }
+        // one past the end
+        assert!(Value::decode(&[0x43, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn major_7_only_false_true_null() {
+        assert_eq!(Value::decode(&[0xf4]).unwrap(), Value::Bool(false));
+        assert_eq!(Value::decode(&[0xf5]).unwrap(), Value::Bool(true));
+        assert_eq!(Value::decode(&[0xf6]).unwrap(), Value::Null);
+        for b in [
+            &[0xf7][..],                                             // undefined
+            &[0xf0],                                                 // simple(16)
+            &[0xf8, 0x14],                                           // two-byte simple(20)
+            &[0xf8, 0x16],                                           // two-byte simple(22)
+            &[0xf8, 0xff],                                           // simple(255)
+            &[0xf9, 0x00, 0x14],                                     // f16 with bits 20
+            &[0xf9, 0x3c, 0x00],                                     // f16 1.0
+            &[0xfa, 0x00, 0x00, 0x00, 0x15],                         // f32 with bits 21
+            &[0xfb, 0, 0, 0, 0, 0, 0, 0, 0x16],                      // f64 with bits 22
+            &[0xfb, 0x40, 0x09, 0x21, 0xfb, 0x54, 0x44, 0x2d, 0x18], // f64 pi
+            &[0xff],                                                 // break
+        ] {
+            assert!(Value::decode(b).is_err(), "{b:02x?} accepted");
+            assert!(
+                write_json(b, &mut Vec::new()).is_err(),
+                "{b:02x?} transcoded"
+            );
+        }
+    }
+
+    #[test]
+    fn write_json_matches_to_json() {
+        let j = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "quote \" backslash \\ nl \n tab \t ctl \u{1} emoji \u{1F600}",
+            "n": [0, -1, 23, 24, -25, 255, 256, 65536, i64::MAX, i64::MIN + 1, i64::MIN],
+            "b": {"$bytes": "AQIDBA"},
+            "e": {"$bytes": ""},
+            "l": {"$link": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"},
+            "o": {"a": null, "b": true, "c": false, "d": [], "e": {}},
+        });
+        let b = Value::from_json(&j).unwrap().to_cbor();
+        let mut out = b"prefix".to_vec();
+        write_json(&b, &mut out).unwrap();
+        let got: serde_json::Value = serde_json::from_slice(&out[6..]).unwrap();
+        assert_eq!(got, j);
+        // errors leave the output untouched
+        let before = out.clone();
+        let mut bad = b.clone();
+        bad.push(0);
+        assert!(write_json(&bad, &mut out).is_err());
+        assert_eq!(out, before);
     }
 }

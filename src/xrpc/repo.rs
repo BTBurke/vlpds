@@ -1,3 +1,4 @@
+use super::extract::RecordJson;
 use super::*;
 
 pub fn routes() -> Router<Arc<App>> {
@@ -45,8 +46,36 @@ fn parse_cid_opt(v: &Option<String>) -> XResult<Option<Cid>> {
         .transpose()
 }
 
-/// An encoded record: (cid, DAG-CBOR bytes, blob refs, validation status).
-type Encoded = (Cid, Bytes, Vec<Cid>, crate::lexicon::ValidationStatus);
+/// An encoded record: (cid, DAG-CBOR bytes, blob refs, validation status,
+/// declared blob refs).
+type Encoded = (Cid, Bytes, Vec<Cid>, crate::lexicon::ValidationStatus, Vec<BlobDecl>);
+
+/// A blob ref as the record declares it: (cid, mimeType, size).
+type BlobDecl = (Cid, Option<String>, Option<i64>);
+
+/// Every `{"$type": "blob"}` ref in the record with its declared metadata
+/// (repeats kept: each declaration is checked).
+fn blob_decls(v: &Value, out: &mut Vec<BlobDecl>) {
+    match v {
+        Value::Map(m) => {
+            if v.get("$type").and_then(|t| t.as_str()) == Some("blob") {
+                if let Some(Value::Link(c)) = v.get("ref") {
+                    let mime = v.get("mimeType").and_then(|m| m.as_str()).map(String::from);
+                    let size = match v.get("size") {
+                        Some(Value::Int(n)) => Some(*n),
+                        _ => None,
+                    };
+                    out.push((*c, mime, size));
+                }
+            }
+            for (_, child) in m {
+                blob_decls(child, out);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|c| blob_decls(c, out)),
+        _ => {}
+    }
+}
 
 /// JSON record -> DAG-CBOR, as the reference's prepareWrite: a missing
 /// `$type` defaults to the collection and any other value must equal it,
@@ -86,7 +115,9 @@ fn encode_record(v: &J, collection: &str, rkey: &str, validate: Option<bool>) ->
     }
     let mut blobs = Vec::new();
     blob_refs(&val, &mut blobs);
-    Ok((Cid::dag_cbor(&bytes), Bytes::from(bytes), blobs, status))
+    let mut decls = Vec::new();
+    blob_decls(&val, &mut decls);
+    Ok((Cid::dag_cbor(&bytes), Bytes::from(bytes), blobs, status, decls))
 }
 
 /// Adds `validationStatus` unless validation was skipped.
@@ -117,17 +148,40 @@ fn legacy_blob(v: &Value) -> Option<String> {
 }
 
 /// Every blob a write references must have been uploaded by the repo and not
-/// be taken down (reference: processWriteBlobs -> "Could not find blob").
-async fn check_blobs<'a>(app: &App, did: &str, blobs: impl IntoIterator<Item = &'a Cid>) -> XResult<()> {
-    for cid in blobs {
+/// be taken down (reference: processWriteBlobs -> "Could not find blob"),
+/// and its declared mimeType and size must match the stored blob (reference
+/// verifyBlob), so lexicon `accept`/`maxSize` checks hold for the real bytes.
+async fn check_blobs(app: &App, did: &str, decls: &[BlobDecl]) -> XResult<()> {
+    for (cid, mime, size) in decls {
         let missing = || XrpcError::bad("BlobNotFound", format!("Could not find blob: {cid}"));
         if super::admin::is_blob_takendown(app, did, &cid.to_string()).await {
             return Err(missing());
         }
-        match app.store.raw.head(&super::blobs::blob_path(app, did, cid)).await {
-            Ok(_) => {}
+        let opts = object_store::GetOptions { head: true, ..Default::default() };
+        let found = match app.store.raw.get_opts(&super::blobs::blob_path(app, did, cid), opts).await {
+            Ok(r) => r,
             Err(object_store::Error::NotFound { .. }) => return Err(missing()),
             Err(e) => return Err(XrpcError::from_err(e)),
+        };
+        let stored_mime = super::blobs::stored_mime(&found.attributes);
+        if mime.as_deref() != Some(stored_mime.as_str()) {
+            return Err(XrpcError::bad(
+                "InvalidMimeType",
+                format!(
+                    "Referenced Mimetype does not match stored blob. Expected: {stored_mime}, Got: {}",
+                    mime.as_deref().unwrap_or("undefined")
+                ),
+            ));
+        }
+        let stored_size = found.meta.size;
+        if *size != i64::try_from(stored_size).ok() {
+            return Err(XrpcError::bad(
+                "InvalidSize",
+                format!(
+                    "Referenced Size does not match stored blob. Expected: {stored_size}, Got: {}",
+                    size.map_or("undefined".to_string(), |n| n.to_string())
+                ),
+            ));
         }
     }
     Ok(())
@@ -201,7 +255,7 @@ struct CreateRecordIn {
 async fn create_record(
     State(app): AppState,
     Auth(creds): Auth,
-    Json(inp): Json<CreateRecordIn>,
+    RecordJson(inp): RecordJson<CreateRecordIn>,
 ) -> XResult<Json<J>> {
     crate::ratelimit::check_repo_write(creds.did(), crate::ratelimit::CREATE_POINTS)?;
     let did = authed_repo(&app, &creds, &inp.repo).await?;
@@ -209,9 +263,9 @@ async fn create_record(
     check_path(&inp.collection, inp.rkey.as_deref())?;
     // as the reference: no rkey = a fresh TID (validated against the schema's key)
     let rkey = inp.rkey.unwrap_or_else(|| app.tids.next().to_string());
-    let (cid, bytes, blobs, status) =
+    let (cid, bytes, blobs, status, decls) =
         encode_record(&inp.record, &inp.collection, &rkey, inp.validate)?;
-    check_blobs(&app, &did, &blobs).await?;
+    check_blobs(&app, &did, &decls).await?;
     let swap = parse_cid_opt(&inp.swap_commit)?;
     let path = format!("{}/{}", inp.collection, rkey);
     let ack = submit(
@@ -270,7 +324,7 @@ fn parse_swap_record(v: &Option<Option<String>>) -> XResult<Option<Option<Cid>>>
 async fn put_record(
     State(app): AppState,
     Auth(creds): Auth,
-    Json(inp): Json<PutRecordIn>,
+    RecordJson(inp): RecordJson<PutRecordIn>,
 ) -> XResult<Json<J>> {
     crate::ratelimit::check_repo_write(creds.did(), crate::ratelimit::UPDATE_POINTS)?;
     let did = authed_repo(&app, &creds, &inp.repo).await?;
@@ -279,7 +333,7 @@ async fn put_record(
             && creds.allows_repo(&inp.collection, "update"),
     )?;
     check_path(&inp.collection, Some(&inp.rkey))?;
-    let (cid, bytes, blobs, status) =
+    let (cid, bytes, blobs, status, decls) =
         encode_record(&inp.record, &inp.collection, &inp.rkey, inp.validate)?;
     let swap = parse_cid_opt(&inp.swap_commit)?;
     let swap_record = parse_swap_record(&inp.swap_record)?;
@@ -303,7 +357,7 @@ async fn put_record(
             )));
         }
     }
-    check_blobs(&app, &did, &blobs).await?;
+    check_blobs(&app, &did, &decls).await?;
     let w = Write::Update {
         collection: inp.collection,
         rkey: inp.rkey,
@@ -380,7 +434,7 @@ struct ApplyWritesIn {
 async fn apply_writes(
     State(app): AppState,
     Auth(creds): Auth,
-    Json(inp): Json<ApplyWritesIn>,
+    RecordJson(inp): RecordJson<ApplyWritesIn>,
 ) -> XResult<Json<J>> {
     {
         use crate::ratelimit::*;
@@ -405,6 +459,7 @@ async fn apply_writes(
     }
     let mut writes = Vec::with_capacity(inp.writes.len());
     let mut statuses = Vec::with_capacity(inp.writes.len());
+    let mut decls = Vec::new();
     for w in &inp.writes {
         let t = w.get("$type").and_then(|v| v.as_str()).unwrap_or("");
         let collection = w
@@ -423,9 +478,10 @@ async fn apply_writes(
         match t {
             "com.atproto.repo.applyWrites#create" => {
                 let rkey = rkey.unwrap_or_else(|| app.tids.next().to_string());
-                let (cid, bytes, blobs, status) =
+                let (cid, bytes, blobs, status, d) =
                     encode_record(w.get("value").unwrap_or(&J::Null), &collection, &rkey, inp.validate)?;
                 statuses.push(status);
+                decls.extend(d);
                 writes.push(Write::Create {
                     collection,
                     rkey,
@@ -437,9 +493,10 @@ async fn apply_writes(
             "com.atproto.repo.applyWrites#update" => {
                 let rkey =
                     rkey.ok_or_else(|| XrpcError::bad("InvalidRequest", "update requires rkey"))?;
-                let (cid, bytes, blobs, status) =
+                let (cid, bytes, blobs, status, d) =
                     encode_record(w.get("value").unwrap_or(&J::Null), &collection, &rkey, inp.validate)?;
                 statuses.push(status);
+                decls.extend(d);
                 writes.push(Write::Update {
                     collection,
                     rkey,
@@ -468,11 +525,7 @@ async fn apply_writes(
             }
         }
     }
-    for w in &writes {
-        if let Write::Create { blobs, .. } | Write::Update { blobs, .. } = w {
-            check_blobs(&app, &did, blobs).await?;
-        }
-    }
+    check_blobs(&app, &did, &decls).await?;
     let ack = submit(&app, did.clone(), writes, swap).await?;
     let results: Vec<J> = ack
         .results
@@ -497,13 +550,33 @@ struct GetRecordQ {
     cid: Option<String>,
 }
 
+/// Records of repos not hosted here (unknown handle, or no local account
+/// for the DID) are piped through to the AppView, as in the reference. In
+/// cluster mode a DID owned by another node was already forwarded there.
 async fn get_record(
     State(app): AppState,
     MaybeAuth(creds): MaybeAuth,
+    headers: HeaderMap,
+    req_uri: axum::http::Uri,
     Query(q): Query<GetRecordQ>,
-) -> XResult<Json<J>> {
+) -> XResult<Response> {
     check_path(&q.collection, Some(&q.rkey))?;
-    let did = app.resolve_repo(&q.repo).await?;
+    let not_hosted = |e: &XrpcError| e.error == "RepoNotFound" || e.error == "AccountNotFound";
+    let local = match app.resolve_repo(&q.repo).await {
+        Ok(did) => match app.account(&did).await {
+            Ok(_) => Some(did),
+            Err(e) if not_hosted(&e) => None,
+            Err(e) => return Err(e),
+        },
+        Err(e) if not_hosted(&e) => None,
+        Err(e) => return Err(e),
+    };
+    let Some(did) = local else {
+        if app.config.appview.is_none() {
+            return Err(XrpcError::bad("InvalidRequest", "Could not locate record"));
+        }
+        return super::proxy::pipethrough_unauthed(&app, &headers, &req_uri, "com.atproto.repo.getRecord").await;
+    };
     super::sync::assert_available(&app, &did, creds.as_ref()).await?;
     let p = app.partition(&did)?;
     let path = format!("{}/{}", q.collection, q.rkey);
@@ -532,10 +605,26 @@ async fn get_record(
             ));
         }
     }
-    let value = Value::decode(&bytes).map_err(XrpcError::from_err)?;
-    Ok(Json(
-        json!({"uri": uri(&did, &path), "cid": cid.to_string(), "value": value.to_json()}),
-    ))
+    let mut out = Vec::with_capacity(bytes.len() * 2 + 128);
+    write_record_json(&mut out, &uri(&did, &path), &cid, &bytes)?;
+    Ok(json_bytes(out))
+}
+
+/// Appends `{"uri","cid","value"}` for one stored record, transcoding the
+/// DAG-CBOR value straight to JSON (no intermediate value tree).
+fn write_record_json(out: &mut Vec<u8>, uri: &str, cid: &Cid, bytes: &[u8]) -> XResult<()> {
+    out.extend_from_slice(b"{\"uri\":");
+    serde_json::to_writer(&mut *out, uri).map_err(XrpcError::from_err)?;
+    out.extend_from_slice(b",\"cid\":\"");
+    cid.write_string(out);
+    out.extend_from_slice(b"\",\"value\":");
+    crate::cbor::write_json(bytes, out).map_err(XrpcError::from_err)?;
+    out.push(b'}');
+    Ok(())
+}
+
+fn json_bytes(body: Vec<u8>) -> Response {
+    ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
 #[derive(Deserialize)]
@@ -551,7 +640,7 @@ async fn list_records(
     State(app): AppState,
     MaybeAuth(creds): MaybeAuth,
     Query(q): Query<ListRecordsQ>,
-) -> XResult<Json<J>> {
+) -> XResult<Response> {
     check_path(&q.collection, None)?;
     let did = app.resolve_repo(&q.repo).await?;
     super::sync::assert_available(&app, &did, creds.as_ref()).await?;
@@ -595,9 +684,11 @@ async fn list_records(
         p.db.scan_with_options(lo..hi, &opts)
             .await
             .map_err(XrpcError::from_err)?;
-    let mut records = Vec::new();
+    let mut out = Vec::with_capacity(limit * 512);
+    out.extend_from_slice(b"{\"records\":[");
+    let mut n = 0;
     let mut last_rkey = None;
-    while records.len() < limit {
+    while n < limit {
         let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? else {
             break;
         };
@@ -608,22 +699,20 @@ async fn list_records(
             continue;
         }
         let (cid, bytes) = state::decode_record_value(&kv.value).map_err(XrpcError::from_err)?;
-        let value = Value::decode(&bytes).map_err(XrpcError::from_err)?;
-        records.push(json!({"uri": rec_uri, "cid": cid.to_string(), "value": value.to_json()}));
+        if n > 0 {
+            out.push(b',');
+        }
+        write_record_json(&mut out, &rec_uri, &cid, &bytes)?;
+        n += 1;
         last_rkey = Some(rkey);
     }
-    let mut out = json!({"records": records});
-    if records_full(&out, limit) {
-        out["cursor"] = json!(last_rkey);
+    out.push(b']');
+    if let (true, Some(c)) = (n == limit, &last_rkey) {
+        out.extend_from_slice(b",\"cursor\":");
+        serde_json::to_writer(&mut out, c).map_err(XrpcError::from_err)?;
     }
-    Ok(Json(out))
-}
-
-fn records_full(out: &J, limit: usize) -> bool {
-    out["records"]
-        .as_array()
-        .map(|a| a.len() == limit)
-        .unwrap_or(false)
+    out.push(b'}');
+    Ok(json_bytes(out))
 }
 
 #[derive(Deserialize)]

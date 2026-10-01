@@ -15,7 +15,7 @@ docker exec vlpds-bench-minio sh -c 'mc alias set l http://localhost:9000 minioa
 pkill -f "target/release/vlpds " || true; sleep 0.5
 rm -rf "$OUT/cache-$NAME"
 LAT=(); [ -n "$INJECT" ] && LAT=(--inject-put-ms "$INJECT")
-./target/release/vlpds --listen 127.0.0.1:2583 --s3-endpoint http://localhost:9100 --prefix b --no-rate-limits \
+./target/release/vlpds --listen 127.0.0.1:2583 --s3-endpoint http://localhost:9100 --prefix b --no-rate-limits --dev-mode \
   --cache-dir "$OUT/cache-$NAME" "${LAT[@]}" "$@" > "$OUT/$NAME.server.log" 2>&1 &
 PID=$!
 until grep -q "vlpds serving" "$OUT/$NAME.server.log"; do sleep 0.3; done
