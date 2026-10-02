@@ -7,38 +7,40 @@ verification.
     python3 bench/ha/hactl.py run baseline-3 kill9-1of3 ...
     python3 bench/ha/hactl.py run all
 
-Every node gets two faultproxy instances (bench/ha/faultproxy):
-  * an HTTP proxy in front of MinIO (its S3 endpoint), so S3 faults hit one node
-  * a TCP proxy in front of its mTLS peer listener (--peer-listen) that it
-    *advertises* to peers, so peer traffic (request forwarding, log streams)
-    can be cut or slowed while clients (loadgen, checker) still reach its
-    public port directly.
+Every node gets two faultproxy instances (bench/ha/faultproxy): an HTTP
+proxy as its S3 endpoint, so S3 faults hit one node, and a TCP proxy in
+front of its mTLS peer listener that it advertises to peers, so peer traffic
+can be cut while clients still reach its public port directly. Nodes share
+one dev-mode --peer-tls-dir (the first creates the CA); the harness reads a
+node's /internal/v1/cluster with that node's own certificate.
 
-Peers talk mTLS only: nodes run --dev-mode with one shared --peer-tls-dir
-(PEER_TLS_DIR), where the first node creates the cluster CA and each node
-its certificate. The harness reads a node's status (/internal/v1/cluster)
-on its peer listener with that node's own certificate.
-
-Outputs land in bench/ha/out/<run-id>/<scenario>/ (node logs, loadgen logs,
-checker output, probe CSV, result.json); a summary table is appended to
-bench/ha/out/<run-id>/summary.md.
+Outputs: bench/ha/out/<run-id>/<scenario>/ (logs, probe CSV, result.json)
+and a summary table in bench/ha/out/<run-id>/summary.md.
 """
 
 import atexit
+import base64
 import csv
+import datetime
+import glob
 import hashlib
+import hmac
 import json
 import os
 import random
+import re
 import signal
 import ssl
+import struct
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -50,17 +52,14 @@ FAULTPROXY = os.path.join(HERE, "faultproxy", "faultproxy")
 FHAUDIT = os.path.join(HERE, "fhaudit", "fhaudit")
 S3 = os.environ.get("VLPDS_HA_S3", "127.0.0.1:9200")
 ADMIN = "dev-admin-token"
-# x-vlpds-internal (node-to-node / status) token: VLPDS_INTERNAL_TOKEN on the
-# nodes; dev default.
+ADMIN_AUTH = "Basic " + base64.b64encode(f"admin:{ADMIN}".encode()).decode()
 INTERNAL = os.environ.get("VLPDS_HA_INTERNAL_TOKEN", "dev-internal-token")
-# Shared dev-mode peer TLS directory (CA + node certs, created by the nodes).
 PEER_TLS_DIR = os.environ.get("VLPDS_HA_PEER_TLS_DIR", os.path.join(HERE, "out", "peer-tls"))
 PARTITIONS = int(os.environ.get("VLPDS_HA_PARTITIONS", "64"))  # shards
 TTL_MS = int(os.environ.get("VLPDS_HA_TTL_MS", "3000"))
 RATE = float(os.environ.get("VLPDS_HA_RATE", "150"))  # writes/s per loadgen (one per node)
-# Node command line (after the binary). Placeholders: {listen} {url}
-# {peer_listen} {advertise} {tls_dir} {s3} {prefix} {id} {ttl_ms}
-# {partitions}. Override for other designs/flags.
+# Placeholders: {listen} {url} {peer_listen} {advertise} {tls_dir} {s3}
+# {prefix} {id} {ttl_ms} {partitions}
 NODE_ARGS = os.environ.get(
     "VLPDS_HA_NODE_ARGS",
     "--listen {listen} --public-url {url} --peer-listen {peer_listen} --advertise-url {advertise} "
@@ -72,10 +71,8 @@ NODE_ARGS = os.environ.get(
 # faultproxy on +200+i (advertised) / +400+i (ctl); S3 proxy +2300+i / +2500+i;
 # containers publish +600+i (public) and +1400+i (peer).
 BASE_PORT = int(os.environ.get("VLPDS_HA_BASE_PORT", "7100"))
-# Injected median latency (ms) on every node's segment PUTs (--inject-put-ms,
-# lognormal sigma 0.5), so segment PUTs overlap and K > 1 is exercised; 0 = off.
+# Injected segment PUT latency so PUTs overlap and K > 1 is exercised; 0 = off.
 INJECT_PUT_MS = float(os.environ.get("VLPDS_HA_INJECT_PUT_MS", "25"))
-# Segment PUTs in flight per node log (--log-inflight).
 LOG_INFLIGHT = int(os.environ.get("VLPDS_HA_LOG_INFLIGHT", "4"))
 
 
@@ -84,6 +81,7 @@ def base_env():
     if INJECT_PUT_MS > 0:
         e["VLPDS_INJECT_PUT_MS"] = str(INJECT_PUT_MS)
     return e
+
 
 PROCS = []
 
@@ -123,14 +121,11 @@ def http(method, url, body=None, headers=None, timeout=10.0, context=None):
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     with urllib.request.urlopen(req, timeout=timeout, context=context) as r:
-        raw = r.read()
-        return r.status, raw
+        return r.status, r.read()
 
 
 def peer_tls_context(node_id):
-    """mTLS client context for peer listeners: the shared dev CA, and node
-    `node_id`'s certificate (any node's is accepted; each node's exists once
-    it has started)."""
+    """Any node's certificate is accepted; each exists once that node has started."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     ctx.load_verify_locations(os.path.join(PEER_TLS_DIR, "ca.crt"))
@@ -140,21 +135,18 @@ def peer_tls_context(node_id):
 
 
 def partition_of(did, n=PARTITIONS):
-    """Shard of a DID: fixed 65,536 hash slots (top 16 bits of sha256(did)),
-    uniform contiguous ranges per shard (src/slots.rs)."""
+    """src/slots.rs: top 16 bits of sha256(did), uniform contiguous ranges."""
     slot = int.from_bytes(hashlib.sha256(did.encode()).digest()[:2], "big")
     return slot * n // 65536
 
 
-# probe writers: one account per shard, capped (each probes at 10 Hz)
+# probe writers: one account per shard, capped
 PROBES = int(os.environ.get("VLPDS_HA_PROBES", "32"))
-# delete each scenario's bucket prefix once its results are recorded
 CLEANUP = os.environ.get("VLPDS_HA_CLEANUP", "1") == "1"
 MINIO_IMAGE = os.environ.get("VLPDS_HA_MINIO_IMAGE", "vlpds-minio:local")
 
 
 def delete_prefix(prefix):
-    """Removes every object under `prefix` (disk hygiene between scenarios)."""
     host = S3 if not S3.startswith("127.0.0.1") else S3.replace("127.0.0.1", "host.docker.internal")
     r = subprocess.run(["docker", "run", "--rm", "--entrypoint", "sh", MINIO_IMAGE, "-c",
                         f"mc alias set n http://{host} minioadmin minioadmin >/dev/null && mc rm -r --force n/vlpds/{prefix} >/dev/null"],
@@ -177,9 +169,6 @@ class Proxy:
     def clear(self):
         http("GET", f"http://{self.ctl}/clear")
 
-    def reset(self):
-        http("GET", f"http://{self.ctl}/reset")
-
     def stop(self):
         if self.proc.poll() is None:
             self.proc.kill()
@@ -197,8 +186,8 @@ class Node:
         self.extra = extra or []
         self.env = env or {}
         self.proc = None
-        self.exits = []  # (time, returncode)
-        self.bin = None  # this node's vlpds binary (two-build scenarios); None = VLPDS
+        self.exits = []  # (time, returncode, proc)
+        self.bin = None  # two-build scenarios; None = VLPDS
         self.s3 = Proxy("http", f"127.0.0.1:{BASE_PORT + 2300 + idx}", S3, f"127.0.0.1:{BASE_PORT + 2500 + idx}", os.path.join(outdir, f"{self.id}.s3proxy.log"))
         self.peer = Proxy("tcp", f"127.0.0.1:{BASE_PORT + 200 + idx}", f"127.0.0.1:{self.peer_port}", f"127.0.0.1:{BASE_PORT + 400 + idx}", os.path.join(outdir, f"{self.id}.peerproxy.log"))
         self.advertise = f"https://127.0.0.1:{BASE_PORT + 200 + idx}"
@@ -210,9 +199,7 @@ class Node:
             advertise=self.advertise, tls_dir=PEER_TLS_DIR,
             s3=f"http://127.0.0.1:{BASE_PORT + 2300 + self.idx}", prefix=self.prefix, id=self.id,
             ttl_ms=TTL_MS, partitions=PARTITIONS).split() + self.extra
-        env = {"RUST_LOG": "info,slatedb=warn", "VLPDS_NO_RATE_LIMITS": "true"}  # load tests
-        env.update(base_env())
-        env.update(self.env)
+        env = {"RUST_LOG": "info,slatedb=warn", "VLPDS_NO_RATE_LIMITS": "true", **base_env(), **self.env}
         self.proc = spawn(args, os.path.join(self.outdir, f"{self.id}.log"), env)
         self.started_at = time.time()
         return self
@@ -242,8 +229,7 @@ class Node:
         self.alive()
 
     def status(self, timeout=2.0):
-        """/internal/v1/cluster on the node's peer listener (mTLS, this
-        node's own dev certificate; not through its fault proxy)."""
+        """Direct to the peer listener, not through the fault proxy."""
         _, raw = http("GET", f"https://127.0.0.1:{self.peer_port}/internal/v1/cluster",
                       headers={"x-vlpds-internal": INTERNAL}, timeout=timeout, context=peer_tls_context(self.id))
         return json.loads(raw)
@@ -280,8 +266,8 @@ class Node:
             self.alive()
 
 
-# ---- containers: real network partitions (docker network disconnect), docker
-# pause, and per-node clock skew via libfaketime (LD_PRELOAD, realtime only).
+# ---- containers: real network partitions, docker pause, and per-node clock
+# skew via libfaketime (realtime only).
 
 DOCKER_NET = os.environ.get("VLPDS_HA_DOCKER_NET", "vlpds-ha")
 DOCKER_IMAGE = os.environ.get("VLPDS_HA_IMAGE", "vlpds-ha:local")
@@ -301,12 +287,12 @@ class _NoProxy:
     def set(self, **kw):
         raise RuntimeError("no proxy in container mode")
 
-    clear = reset = stop = lambda self: None
+    clear = stop = lambda self: None
 
 
 class CNode(Node):
-    """A node in a container on DOCKER_NET. `skew` (e.g. "+2.5s") offsets its
-    wall clock with libfaketime; monotonic time (lease validity) is untouched."""
+    """`skew` (e.g. "+2.5s") offsets the wall clock only; monotonic time
+    (lease validity) is untouched."""
 
     skews = {}
 
@@ -339,8 +325,7 @@ class CNode(Node):
             env += ["-e", f"{k}={v}"]
         if self.skew:
             env += ["-e", f"LD_PRELOAD={FAKETIME_LIB}", "-e", f"FAKETIME={self.skew}", "-e", "DONT_FAKE_MONOTONIC=1"]
-        # the shared peer TLS dir at the same path, files owned by us (the
-        # harness reads each node's key for its status calls)
+        # same path and our uid: the harness reads each node's key for status calls
         docker("run", "-d", "--name", self.name, "--network", DOCKER_NET, "-p", f"127.0.0.1:{self.port}:2583",
                "-p", f"127.0.0.1:{self.peer_port}:2584", "-v", f"{PEER_TLS_DIR}:{PEER_TLS_DIR}",
                "--user", f"{os.getuid()}:{os.getgid()}", "--cpus", "2", *env, DOCKER_IMAGE, *args)
@@ -403,7 +388,6 @@ def wait_ready(nodes, timeout=30):
 
 
 def ownership(nodes):
-    """{node id: owned shard ids} for live nodes that answer their status."""
     out = {}
     for n in nodes:
         if not n.alive():
@@ -416,10 +400,8 @@ def ownership(nodes):
 
 
 def layout_shards(nodes):
-    """Shard ids of the cluster's current layout (splits and merges change
-    them; /internal/v1/cluster "layout") that every live node agrees on, []
-    while a split/merge is in flight or they disagree, None if no node
-    answered."""
+    """The layout's shard ids every live node agrees on; [] while a
+    split/merge is in flight or they disagree, None if no node answered."""
     seen = set()
     for n in nodes:
         if not n.alive():
@@ -429,7 +411,7 @@ def layout_shards(nodes):
         except Exception:
             continue
         if l.get("op"):
-            return []  # a split/merge in flight: not converged yet
+            return []
         seen.add(tuple(sorted(l["shards"])))
     if len(seen) != 1:
         return [] if seen else None
@@ -452,7 +434,7 @@ def converged(nodes, expect_nodes=None):
             if p in seen:
                 return False, own
             seen[p] = nid
-    if len(seen) != want or (shards and set(seen) != set(shards)):
+    if len(seen) != want or set(seen) != set(shards):
         return False, own
     if expect_nodes:
         fair = -(-want // expect_nodes)
@@ -476,8 +458,7 @@ def wait_converged(nodes, expect_nodes=None, timeout=60):
 
 
 def setup_accounts(nodes, outdir, per_node=40, records=3, tag="a"):
-    files = []
-    procs = []
+    files, procs = [], []
     for n in nodes:
         f = os.path.join(outdir, f"accounts-{n.id}.json")
         files.append(f)
@@ -552,7 +533,7 @@ class Prober:
     recording each outcome: a precise per-partition availability timeline."""
 
     def __init__(self, nodes, accts, outdir, interval=0.1, probes=None):
-        self.nodes = nodes  # candidates (first alive one is used)
+        self.nodes = nodes  # the first alive one is used
         self.interval = interval
         self.outdir = outdir
         self.rows = []
@@ -561,8 +542,8 @@ class Prober:
         by_p = {}
         for a in accts:
             by_p.setdefault(partition_of(a["did"]), a)
-        # sample shards across all nodes: accounts come grouped by the node that
-        # minted them (on its own shards), so "the first N" probed only n1/n2
+        # accounts come grouped by the minting node's shards: shuffle so the
+        # probes cover every node
         picks = list(by_p.values())
         random.Random(1).shuffle(picks)
         self.accts = picks[:PROBES if probes is None else probes]
@@ -627,9 +608,9 @@ class Prober:
         return path
 
     def analyze(self, fault_at, slow_s=2.0, t0=None):
-        self.t0 = t0 or fault_at
         """Unavailability = time covered by failed or slow (> slow_s) probes
         after `fault_at`; recovery = last bad probe end - fault_at."""
+        self.t0 = t0 or fault_at
         bad = [(t0, t1) for (t0, t1, p, _, ok, _, _) in self.rows if t0 >= fault_at - 0.5 and (not ok or t1 - t0 > slow_s)]
         errors = sum(1 for r in self.rows if not r[4])
         total = len(self.rows)
@@ -667,7 +648,7 @@ class Prober:
             "recovery_s": round(max(e for _, e in bad) - fault_at, 2),
             "partitions_hit": len(per_p),
             "max_partition_outage_s": round(max(e - s for s, e in per_p.values()), 2),
-            # every outage window, relative to the scenario start: [start, end, failed probes]
+            # [start, end, failed probes], relative to the scenario start
             "windows": [[round(s - self.t0, 1), round(e - self.t0, 1),
                          sum(1 for r in self.rows if s <= r[0] <= e and not r[4])] for s, e in merged],
         }
@@ -714,8 +695,7 @@ class Checker:
 
 
 class FhAudit:
-    """Firehose completeness: records every create seen on a node's
-    subscribeRepos, so we can require every acked create to appear."""
+    """Records every create seen on a node's subscribeRepos."""
 
     def __init__(self, node, outdir, tag="", cursor=None):
         self.node = node
@@ -739,7 +719,6 @@ class FhAudit:
 
 
 def audit_report(data, acked, node):
-    """Compare an audit's creates against the acked set."""
     if data is None:
         return {"node": node, "error": "no output"}
     seen = {d: set(v) for d, v in data["seen"].items()}
@@ -757,8 +736,7 @@ def audit_report(data, acked, node):
 
 
 def history_diff(datas, common_range=False):
-    """Cross-node agreement of the merged firehose (old bug B5): every node
-    must emit the same commits, (seq, did, rev), in the same order. With
+    """Every node must emit the same commits, (seq, did, rev), in the same order. With
     `common_range` only the seq range every node covered is compared (live
     audits start at slightly different points)."""
     logs = {n: [tuple(c) if isinstance(c, list) else (c["s"], c["d"], c["r"]) for c in (d or {}).get("commits") or []]
@@ -787,19 +765,6 @@ def history_diff(datas, common_range=False):
 def load_acked(files):
     merged = {}
     for f in files:
-        if os.path.exists(f):
-            try:
-                for did, rkeys in json.load(open(f)).items():
-                    merged.setdefault(did, []).extend(rkeys)
-            except Exception:
-                pass
-    return merged
-
-
-def verify(acked_files, node, outdir):
-    """Merge acked files and verify every acked create is readable via `node`."""
-    merged = {}
-    for f in acked_files:
         if not os.path.exists(f):
             continue
         try:
@@ -807,6 +772,12 @@ def verify(acked_files, node, outdir):
                 merged.setdefault(did, []).extend(rkeys)
         except Exception as e:
             log(f"bad acked file {f}: {e}")
+    return merged
+
+
+def verify(acked_files, node, outdir):
+    """Every acked create must be readable via `node`."""
+    merged = load_acked(acked_files)
     path = os.path.join(outdir, "acked-all.json")
     json.dump(merged, open(path, "w"))
     total = sum(len(v) for v in merged.values())
@@ -830,7 +801,7 @@ class Ctx:
     nodes: list = field(default_factory=list)
     events: list = field(default_factory=list)  # (t, what)
     t0: float = 0.0
-    factory: object = None  # Node class (native processes) or CNode (containers)
+    factory: object = None  # Node or CNode
 
     def __post_init__(self):
         self.factory = self.factory or Node
@@ -859,12 +830,12 @@ def teardown(ctx):
 
 
 def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_final=None, per_node=30, rate=RATE,
-                      extra_checkers=None, start_nodes=None, node_extra=None, node_env=None, probes=None, replay=True,
+                      start_nodes=None, node_extra=None, node_env=None, probes=None, replay=True,
                       node_bins=None):
-    """Generic shape: cluster up -> accounts -> checker + probes + load on all
-    nodes -> `actions` [(at_s, fn(ctx))] -> drain -> verify -> results.
-    `replay=False` skips the post-hoc replay from before the run (with a short
-    --log-retention it is OutdatedCursor by design; such scenarios check it)."""
+    """cluster up -> accounts -> checker + probes + load on all nodes ->
+    `actions` [(at_s, fn(ctx))] -> drain -> verify -> results. `replay=False`
+    skips the replay from before the run (with a short --log-retention it is
+    OutdatedCursor by design; such scenarios check it)."""
     nodes = make_cluster(ctx, n_nodes, start=False, extra=node_extra, env=node_env)
     for nd, b in zip(nodes, node_bins or []):
         nd.bin = b
@@ -902,8 +873,7 @@ def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_fina
     for lg in lgs:
         lg.wait(duration + 120)
     load_end = time.time()
-    # control-plane object-store requests/s per node over the load phase
-    # (nodes restarted mid-run reset their counter: not reported)
+    # nodes restarted mid-run reset their counter: not reported
     res["cp_req_per_s"] = {}
     for nd in nodes:
         if nd.id in cp0 and nd.alive() and not nd.exit_codes() and nd.started_at < ctx.t0:
@@ -939,8 +909,6 @@ def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_fina
         if rep.get("first_seq", -1) > 0:
             first_seqs.append(rep["first_seq"])
         res["fh_live"].append(rep)
-    # post-hoc replay from a cursor before the run on every survivor: the merged
-    # stream must be complete and identical on every node
     res["fh_replay"] = []
     if first_seqs and replay:
         cur = min(first_seqs) - 1
@@ -950,9 +918,7 @@ def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_fina
         replay_raw = {}
         for a in reps:
             data = a.stop()
-            # every survivor is judged, including nodes (re)started or joined
-            # mid-run: older cursors backfill from S3, and the merged stream
-            # has no seam at a node's start (O1)
+            # rejoined nodes are judged too: the merged stream has no seam at a node's start
             replay_raw[a.node.id] = data
             rep = audit_report(data, acked, a.node.id)
             rep["node_stayed_up"] = not a.node.exit_codes() and a.node.started_at < ctx.t0
@@ -994,7 +960,6 @@ def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_fina
 
 
 def clock_spread_s(ctx):
-    """Max minus min wall-clock offset across the cluster (libfaketime skews)."""
     if getattr(ctx, "factory", None) is not CNode or not CNode.skews:
         return 0.0
     vals = [float(v.rstrip("s")) for v in CNode.skews.values()] + [0.0]
@@ -1002,14 +967,13 @@ def clock_spread_s(ctx):
 
 
 def cp_requests(node):
-    """Total control-plane object-store requests (vlpds_cluster_store_requests_total)."""
     try:
         return sum(v for k, v in node.metrics().items() if k.startswith("vlpds_cluster_store_requests_total"))
     except Exception:
         return None
 
 
-def judge(res, allow_lost=0):
+def judge(res):
     v = res.get("verify", {})
     ck = res.get("checker", {})
     ok = (v.get("missing") == 0 and v.get("ok")) and ck.get("result") == "PASS"
@@ -1030,7 +994,7 @@ def judge(res, allow_lost=0):
             ok = False
     if res.get("unexpected_exits"):
         ok = False
-    if res.get("k_fail"):  # K-in-flight scenario invariants (see k_* scenarios)
+    if res.get("k_fail"):
         ok = False
     # e.g. a zombie must fail-stop (3 = fenced log, 5 = lease lapsed) before any restart
     for nid, allowed in (res.get("expect_exit") or {}).items():
@@ -1079,10 +1043,7 @@ def fault(idx, which, label, **kw):
     def f(ctx):
         n = ctx.nodes[idx]
         ctx.mark(f"{label} -> {n.id}")
-        px = n.s3 if which == "s3" else n.peer
-        px.set(**kw)
-        if which == "peer" and kw.get("blackhole") == 1:
-            pass
+        (n.s3 if which == "s3" else n.peer).set(**kw)
         return "fault"
     return f
 
@@ -1096,7 +1057,7 @@ def heal(idx, which=("s3", "peer")):
     return f
 
 
-def start_node(idx, accounts=None):
+def start_node(idx):
     def f(ctx):
         n = ctx.nodes[idx]
         if n.alive():
@@ -1125,12 +1086,6 @@ def audit_from_start(idx):
         wait_ready([n])
         ctx.mark(f"live audit attached to {n.id} at start")
         return FhAudit(n, ctx.outdir, tag="-start")
-    return f
-
-
-def snapshot_ownership(label):
-    def f(ctx):
-        ctx.mark(f"{label}: {json.dumps(ownership(ctx.nodes))}")
     return f
 
 
@@ -1267,7 +1222,6 @@ def s_addremove(ctx):
 @scenario("cas-contention", "8 nodes start at the same instant on a fresh prefix")
 def s_cas(ctx):
     nodes = make_cluster(ctx, 8, start=False)
-    t = time.time()
     for n in nodes:
         n.start()
     wait_ready(nodes)
@@ -1302,9 +1256,6 @@ def s_handoff(ctx):
     return run_load_scenario(ctx, 4, 55, acts, start_nodes=3, expect_final=4)
 
 
-# ---- scenarios added for the per-node-log design
-
-
 def watch_log_then(idx, needle, then, label, delay=0.0, timeout=40):
     """Tails node idx's log from now on; when `needle` shows up, waits `delay`
     and runs `then(ctx)` (e.g. kill -9 mid-checkpoint)."""
@@ -1332,8 +1283,7 @@ def watch_log_then(idx, needle, then, label, delay=0.0, timeout=40):
 def s_k9_reb_drainer(ctx):
     grace = 2 * TTL_MS / 5000  # join grace = two renew intervals
     acts = [(12, start_node(3)), (12 + grace + 0.4, kill(1, label="kill -9 n2 (mid-rebalance, draining)")), (32, restart(1))]
-    res = run_load_scenario(ctx, 4, 55, acts, start_nodes=3, expect_final=4)
-    return res
+    return run_load_scenario(ctx, 4, 55, acts, start_nodes=3, expect_final=4)
 
 
 @scenario("kill9-rebalance-joiner", "3 nodes; n4 joins under load; kill -9 n4 while it opens/replays the shards it took; restart it later")
@@ -1408,9 +1358,7 @@ def s_k9_ckpt(ctx):
 
 
 def admin_post(node, nsid, body, timeout=60.0):
-    import base64
-    auth = "Basic " + base64.b64encode(f"admin:{ADMIN}".encode()).decode()
-    _, raw = http("POST", node.url + "/xrpc/" + nsid, body, headers={"authorization": auth}, timeout=timeout)
+    _, raw = http("POST", node.url + "/xrpc/" + nsid, body, headers={"authorization": ADMIN_AUTH}, timeout=timeout)
     return json.loads(raw)
 
 
@@ -1422,7 +1370,7 @@ def owned_by(ctx, idx):
 
 
 def reshard(idx_via, label, plan):
-    """Plans a split/merge through node idx_via. `plan(ctx)` -> (nsid, body)."""
+    """`plan(ctx)` -> (nsid, body)."""
     def f(ctx):
         nsid, body = plan(ctx)
         ctx.mark(f"{label}: {nsid} {body}")
@@ -1468,15 +1416,13 @@ def s_reshard_kill9(ctx):
     return res
 
 
-# ---- K segment PUTs in flight (pipelined log): holes, fences, garbage
+# ---- K segment PUTs in flight: holes, fences, garbage
 
 S3_KEY, S3_SECRET, S3_BUCKET, S3_REGION = "minioadmin", "minioadmin", "vlpds", "us-east-1"
 
 
 def s3_req(method, key="", query=None, headers=None, timeout=10.0):
-    """Minimal SigV4 S3 request against MinIO (path style). Returns (status, body)."""
-    import hmac
-    from urllib.parse import quote
+    """SigV4, path style."""
     now = time.gmtime()
     amz = time.strftime("%Y%m%dT%H%M%SZ", now)
     day = amz[:8]
@@ -1508,7 +1454,6 @@ def s3_req(method, key="", query=None, headers=None, timeout=10.0):
 
 
 def s3_list(prefix, start_after=None):
-    import re
     keys, token = [], None
     while True:
         q = {"list-type": "2", "prefix": prefix, "max-keys": "1000"}
@@ -1543,7 +1488,6 @@ def _zstd_decompress(data, size):
 def parse_log_object(b):
     """VLSEG06 segment (src/segment.rs) -> {'kind': 'segment', ordinal, prefix_end, first_seq, last_seq, seqs};
     VLFENCE -> {'kind': 'fence', by}. Entries: seq i64 | shard u32 | epoch u64 | frame_len u32 | frame | muts."""
-    import struct
     if b[:8] == b"VLFENCE\n":
         return {"kind": "fence", "by": b[8:].decode(errors="replace")}
     if b[:8] not in (b"VLSEG06\n", b"VLSEGT1\n"):
@@ -1599,13 +1543,10 @@ def first_hole(ords):
     return n, [o for o in ords if o > n]
 
 
-ANSI = None
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def strip_ansi(line):
-    import re
-    global ANSI
-    ANSI = ANSI or re.compile(r"\x1b\[[0-9;]*m")
     return ANSI.sub("", line)
 
 
@@ -1617,7 +1558,6 @@ def audit_dead_log(prefix, log_id, survivors_logs, fh_files, dead_node=None):
     - no seq of a segment past the fence (garbage) is on any firehose audit
       (live, cursor replay, start audits), while the prefix's last seqs are
       (so the comparison isn't vacuous)."""
-    import re
     ords = log_ordinals(prefix, log_id)
     objs = {o: parse_log_object(s3_get(f"{prefix}/log/{log_id}/{o:012}.seg") or b"") for o in ords}
     fences = [o for o, v in objs.items() if v["kind"] == "fence"]
@@ -1630,7 +1570,6 @@ def audit_dead_log(prefix, log_id, survivors_logs, fh_files, dead_node=None):
     garbage_seqs = {s for o in garbage for s in objs[o]["seqs"]}
     prefix_seqs = [s for o in segs if o < hole for s in objs[o]["seqs"]]
     tail = set(prefix_seqs[-20:])
-    # spans in every assignment
     span_ends = {}
     for k in s3_list(f"{prefix}/assign/"):
         b = s3_get(k)
@@ -1641,7 +1580,6 @@ def audit_dead_log(prefix, log_id, survivors_logs, fh_files, dead_node=None):
         for sp in a.get("history", []):
             if sp.get("log_id") == log_id:
                 span_ends.setdefault(str(sp.get("end")), []).append(k.rsplit("/", 1)[1])
-    # fencers' log lines
     fencers = {}
     for nid, path in survivors_logs.items():
         try:
@@ -1692,8 +1630,7 @@ def audit_dead_log(prefix, log_id, survivors_logs, fh_files, dead_node=None):
 
 
 def prom(query):
-    """Instant PromQL query against the local obs stack; None if unavailable."""
-    from urllib.parse import quote
+    """Against the local obs stack; None if unavailable."""
     try:
         _, raw = http("GET", f"http://127.0.0.1:9090/api/v1/query?query={quote(query)}", timeout=5)
         return [(r["metric"], float(r["value"][1])) for r in json.loads(raw)["data"]["result"]]
@@ -1755,8 +1692,6 @@ def kill_on_hole(idx, label, timeout=15.0, sig=signal.SIGKILL):
 
 
 def k_audits(ctx, res):
-    """Runs audit_dead_log for every log killed in this scenario."""
-    import glob
     logs = {n.id: os.path.join(ctx.outdir, f"{n.id}.log") for n in ctx.nodes}
     fh = glob.glob(os.path.join(ctx.outdir, "fhaudit-*.json"))
     res["dead_logs"] = []
@@ -1851,7 +1786,6 @@ def s_k_zombie(ctx):
 
 def log_events(path, needles):
     """[(epoch s, needle, line)] for lines containing any needle (tracing's RFC 3339 timestamps)."""
-    import datetime
     out = []
     try:
         for line in open(path, errors="replace"):
@@ -1872,7 +1806,6 @@ def log_events(path, needles):
 def handoff_timing(ctx):
     """release -> serving per handoff: a releaser's 'closed and released shards'
     to the first 'shards opened' after it on a node that adopted handed shards."""
-    import re
     rel, adopt = [], []
     for n in ctx.nodes:
         for t, nd, line in log_events(os.path.join(ctx.outdir, f"{n.id}.log"),
@@ -2003,9 +1936,6 @@ def s_k_spill(ctx):
     return res
 
 
-# ---- container scenarios
-
-
 # ---- log retention under failover (src/retention.rs)
 
 # --log-retention for retention-* scenarios (s): short, so a few passes (one
@@ -2082,7 +2012,6 @@ def s_retention_kill9(ctx):
                               "floor_at_subscribe": ctx.ret.get("floor_at_subscribe"),
                               "floor_after_subscribe": ctx.ret.get("floor_after_subscribe"), "retention_mid": ctx.ret.get("retention_mid")}
 
-    # dead-log pruning down to the fence: retired by the leader within a few passes
     logs = {n.id: os.path.join(ctx.outdir, f"{n.id}.log") for n in ctx.nodes}
     dead = ctx.dead_logs[0][1] if ctx.dead_logs else None
 
@@ -2109,7 +2038,6 @@ def s_retention_kill9(ctx):
         if out["dead_log_report_left"]:
             fails.append("dead log's retain/ report left behind")
         k_audits(ctx, res)  # fence at the first hole, span ends at the fence
-    # live logs pruned too, every pass clean
     out["retention_end"] = {n.id: retention_metrics(n) for n in ctx.nodes if n.alive()}
     if not any((m or {}).get("deleted_own") for m in out["retention_end"].values()):
         fails.append("no live log pruned")
@@ -2188,6 +2116,9 @@ def s_retention_kill9(ctx):
     return res
 
 
+# ---- container scenarios
+
+
 def net(idx, up):
     def f(ctx):
         n = ctx.nodes[idx]
@@ -2252,11 +2183,9 @@ def s_ctr_skew_steady(ctx):
 
 
 # ---- two builds: rolling upgrade / rollback / refusal (DESIGN.md "Rolling
-# upgrades and format versioning", ops/RUNBOOK.md "Rolling upgrade, finalize,
-# rollback"). bench/ha/upgrade.sh builds the binaries: the previous release
-# (VLPDS_PREV_REV, see there) and the current tree, plain and with the
-# test-only feature level (cargo feature test-level: MAX_LEVEL = 2, new
-# segment magic VLSEGT1 + a retain/ report field), so finalize changes formats.
+# upgrades and format versioning"). bench/ha/upgrade.sh builds the previous
+# release and this tree, plain and with the test-level feature (level 2,
+# segment magic VLSEGT1), so finalize changes formats.
 
 UPGRADE_DIR = os.environ.get("VLPDS_UPGRADE_DIR", os.path.join(PKG, "target", "upgrade"))
 OLD_BIN = os.environ.get("VLPDS_HA_OLD_BIN", os.path.join(UPGRADE_DIR, "prev", "vlpds"))
@@ -2266,7 +2195,7 @@ SEG_MAGICS = {b"VLSEG06\n": "VLSEG06", b"VLSEGT1\n": "VLSEGT1", b"VLFENCE\n": "f
 
 
 def segment_magics(prefix):
-    """{magic name: count} over every log object of `prefix` (8-byte range GETs)."""
+    """{magic name: count} over every log object of `prefix`."""
     out = {}
     for k in s3_list(f"{prefix}/log/"):
         st, b = s3_req("GET", k, headers={"range": "bytes=0-7"})
@@ -2294,16 +2223,11 @@ def cluster_version(ctx, via=None):
     for n in ([via] if via else ctx.nodes):
         if n.alive():
             try:
-                _, raw = http("GET", n.url + "/xrpc/vlpds.admin.getClusterStatus", headers={"authorization": admin_basic()}, timeout=5)
+                _, raw = http("GET", n.url + "/xrpc/vlpds.admin.getClusterStatus", headers={"authorization": ADMIN_AUTH}, timeout=5)
                 return json.loads(raw).get("version")
             except Exception:
                 continue
     return None
-
-
-def admin_basic():
-    import base64
-    return "Basic " + base64.b64encode(f"admin:{ADMIN}".encode()).decode()
 
 
 def swap_build(idx, bin_path, label, refuse=False):
@@ -2346,12 +2270,6 @@ def finalize(idx, expect, level=None):
         ctx.ret.setdefault("finalize", []).append({"level": lv, "status": code, "expect": expect, "body": body})
         return None
     return f
-
-
-def start_extra(idx, bin_path, label):
-    """Starts node idx (not part of the initial cluster) on `bin_path`; it must
-    exit 7 by itself (an old build after finalize) within 20 s."""
-    return swap_build(idx, bin_path, label, refuse=True)
 
 
 def upgrade_checks(ctx, res, finalized, new_formats):
@@ -2457,7 +2375,7 @@ def s_upgrade_old_refused(ctx):
     acts = [(5, swap_build(1, NEW_TL_BIN, "new")), (11, swap_build(2, NEW_TL_BIN, "new")),
             (17, swap_build(0, NEW_TL_BIN, "new")), (17.01, audit_from_start(0)),
             (23, finalize(1, 200)),
-            (27, start_extra(3, OLD_BIN, "old")),
+            (27, swap_build(3, OLD_BIN, "old", refuse=True)),
             (31, swap_build(1, OLD_BIN, "old (rollback after finalize)", refuse=True)),
             (36, swap_build(1, NEW_TL_BIN, "new")), (36.01, audit_from_start(1)),
             (38, checker_with_cursor(1, back_s=20))]
@@ -2523,7 +2441,6 @@ def raise_race(old_idx, via_idx, delay_s):
 def s_upgrade_raise_race(ctx):
     upgrade_ctx(ctx)
     delay = float(os.environ.get("VLPDS_HA_RACE_DELAY_MS", str(random.Random().choice([-50, -5, 20, 150])))) / 1000
-    # an old cluster (level 1) upgraded node by node, then the race
     acts = [(5, swap_build(1, NEW_TL_BIN, "new")), (10, swap_build(2, NEW_TL_BIN, "new")),
             (15, swap_build(0, NEW_TL_BIN, "new")), (15.01, audit_from_start(0)),
             (22, raise_race(3, 1, delay))]
@@ -2547,7 +2464,6 @@ def run_one(name, run_id):
         res["verdict"] = judge(res) if "convergence_s" not in res else (
             "PASS" if res.get("convergence_s") is not None and res["checker"].get("result") == "PASS" and res["verify"].get("missing") == 0 else "FAIL")
     except Exception as e:
-        import traceback
         traceback.print_exc()
         res = {"verdict": "ERROR", "error": repr(e), "events": ctx.events}
     finally:

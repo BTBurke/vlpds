@@ -1,11 +1,7 @@
-// fhaudit: firehose completeness audit for HA tests.
-//
-// Subscribes to a node's subscribeRepos (optionally from -cursor) and records
-// every record path created by a #commit, per repo. On SIGINT/SIGTERM it
-// writes {"seen": {did: [rkey...]}, "events": n, "first_seq": s, "last_seq": s,
-// "reorders": n, "dups": n, "infos": n, "info_names": [...], "end": reason} to -out. The harness then checks
-// that every acknowledged create appears on the firehose (a stalled or gappy
-// merge shows up as missing creates even when per-repo chains look clean).
+// fhaudit: firehose completeness audit for HA tests. Records every create
+// seen on a node's subscribeRepos and writes it to -out on SIGINT/SIGTERM; the
+// harness requires every acked create to appear (a stalled or gappy merge
+// shows up as missing creates even when per-repo chains look clean).
 package main
 
 import (
@@ -55,7 +51,7 @@ func main() {
 	}
 	var log []rec
 	var events, reorders, dups, infos int64
-	var infoNames []string // #info names in order (e.g. OutdatedCursor)
+	var infoNames []string
 	var first, last int64 = -1, -1
 	var lastTime string
 	reason := "interrupted"

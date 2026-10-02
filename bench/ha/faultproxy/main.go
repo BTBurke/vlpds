@@ -4,14 +4,12 @@
 //
 //	-mode http  reverse proxy (S3 / MinIO). Faults are per request:
 //	            latency, S3-style 5xx/throttling errors, blackhole (requests hang).
-//	-mode tcp   byte pipe (node internal/public port: websockets, h2c).
-//	            Faults: latency per chunk, blackhole (new and existing
-//	            connections stall), reset (close every live connection).
+//	-mode tcp   byte pipe (a node's peer listener). Faults: latency per
+//	            chunk, blackhole (new and existing connections stall).
 //
 // Control API on -ctl (plain HTTP, idempotent):
 //
 //	GET /set?blackhole=1&latency_ms=200&jitter_ms=50&err_pct=20&err_code=503
-//	GET /reset            close all live TCP connections (tcp mode)
 //	GET /clear            remove all faults
 //	GET /stats            JSON counters
 //
@@ -62,26 +60,7 @@ func (f *faults) delay() time.Duration {
 	return lat
 }
 
-var (
-	reqs, errs, holds, conns, resets atomic.Int64
-)
-
-type connSet struct {
-	mu sync.Mutex
-	m  map[net.Conn]struct{}
-}
-
-func (c *connSet) add(n net.Conn)    { c.mu.Lock(); c.m[n] = struct{}{}; c.mu.Unlock() }
-func (c *connSet) remove(n net.Conn) { c.mu.Lock(); delete(c.m, n); c.mu.Unlock() }
-func (c *connSet) closeAll() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	n := len(c.m)
-	for k := range c.m {
-		_ = k.Close()
-	}
-	return n
-}
+var reqs, errs, holds, conns atomic.Int64
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:9300", "proxy listen address")
@@ -91,7 +70,6 @@ func main() {
 	flag.Parse()
 
 	f := &faults{release: make(chan struct{}), errCode: 503}
-	live := &connSet{m: map[net.Conn]struct{}{}}
 
 	ctlMux := http.NewServeMux()
 	ctlMux.HandleFunc("/set", func(w http.ResponseWriter, r *http.Request) {
@@ -129,16 +107,11 @@ func main() {
 		f.mu.Unlock()
 		fmt.Fprintln(w, "ok")
 	})
-	ctlMux.HandleFunc("/reset", func(w http.ResponseWriter, r *http.Request) {
-		n := live.closeAll()
-		resets.Add(int64(n))
-		fmt.Fprintf(w, "closed %d\n", n)
-	})
 	ctlMux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		bh, lat, jit, ep, ec, _ := f.snapshot()
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"requests": reqs.Load(), "injected_errors": errs.Load(), "held": holds.Load(),
-			"conns": conns.Load(), "resets": resets.Load(),
+			"conns":     conns.Load(),
 			"blackhole": bh, "latency_ms": lat.Milliseconds(), "jitter_ms": jit.Milliseconds(),
 			"err_pct": ep, "err_code": ec,
 		})
@@ -149,7 +122,7 @@ func main() {
 	case "http":
 		serveHTTP(*listen, *target, f)
 	case "tcp":
-		serveTCP(*listen, *target, f, live)
+		serveTCP(*listen, *target, f)
 	default:
 		log.Fatalf("unknown mode %q", *mode)
 	}
@@ -218,7 +191,7 @@ func serveHTTP(listen, target string, f *faults) {
 	log.Fatal(http.ListenAndServe(listen, h))
 }
 
-func serveTCP(listen, target string, f *faults, live *connSet) {
+func serveTCP(listen, target string, f *faults) {
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		log.Fatal(err)
@@ -240,10 +213,6 @@ func serveTCP(listen, target string, f *faults, live *connSet) {
 				return
 			}
 			defer u.Close()
-			live.add(c)
-			live.add(u)
-			defer live.remove(c)
-			defer live.remove(u)
 			done := make(chan struct{}, 2)
 			pipe := func(dst, src net.Conn) {
 				buf := make([]byte, 64<<10)
