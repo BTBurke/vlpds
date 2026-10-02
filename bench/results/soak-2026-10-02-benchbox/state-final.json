@@ -1,0 +1,35 @@
+{
+ "setup_key": {
+  "prefix": "soak1",
+  "population": 200000,
+  "pop_records": 10,
+  "mid_repos": 32,
+  "mid_records": 5000,
+  "nodes": 4
+ },
+ "soak_s": 25200.05380487442,
+ "h": {
+  "incarnations": 168,
+  "restarts": 160,
+  "sigterm": 122,
+  "kill9": 38,
+  "reshards": 100,
+  "splits": 50,
+  "merges": 50,
+  "reshard_fail": 0,
+  "resumes": 2,
+  "commits": 37771679,
+  "creates": 36240372,
+  "deletes": 1418623,
+  "updates": 112684
+ },
+ "next_victim": 160,
+ "next_restart_at": 23430.02005147934,
+ "next_reshard_at": 18014.54640030861,
+ "next_backfill_at": 25311.84961295128,
+ "fh_cursor": 458479405432587626,
+ "setup_population": true,
+ "setup_mid repos": true,
+ "setup_done": true,
+ "setup_s": 2.0
+}

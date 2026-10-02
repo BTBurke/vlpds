@@ -1724,10 +1724,26 @@ def run(cfg):
     finally:
         if stop_ev is not None:
             stop_ev.set()
+        # Drain stats_q while the load processes wind down: a child's final
+        # flush blocks its queue feeder (and so its exit) on a full pipe if
+        # nobody reads. Their last windows' ops still count toward history.
+        # Children ignore SIGTERM (terminate() is a no-op): kill stragglers.
+        t_end = time.time() + 90
+        while procs and any(p.is_alive() for p in procs) and time.time() < t_end:
+            try:
+                m = stats_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            except Exception:
+                break
+            ops = m.get("ops") or {}
+            for k_ in ("create", "delete", "update"):
+                st["h"][k_ + "s"] += ops.get(k_, 0)
+            st["h"]["commits"] += sum(ops.values())
         for p in procs:
-            p.join(timeout=60)
             if p.is_alive():
-                p.terminate()
+                p.kill()
+            p.join(timeout=5)
         if stop["why"] is None:
             stop["why"] = "error"
         if ops_holder:
