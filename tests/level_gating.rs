@@ -36,7 +36,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
         c.memory_store = Some(store);
         c.shards = SHARDS;
         // reports every 100 ms; nothing is old enough to prune
-        c.log_retention = Some(vlpds::retention::Config { window: Duration::from_secs(3600), interval: Duration::from_millis(100), max_deletes: 100 });
+        c.log_retention = Some(vlpds::retention::Config { window: Duration::from_secs(3600), interval: Duration::from_millis(100), max_deletes: 100, fence_retention: None });
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
             addr: c.public_url.clone(),

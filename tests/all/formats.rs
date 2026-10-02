@@ -568,13 +568,14 @@ async fn check(level: u32, name: &str, b: &[u8]) {
         }
         "segment/like.seg" => {
             let LogObject::Segment(h, entries) = segment::parse(Bytes::copy_from_slice(b), true, None).unwrap() else { panic!("{name}") };
+            assert_eq!(h.level, level, "{name}: segment level");
             let e = &entries[0];
             // c/ put, R/ put, the backlink put, h/
             assert_eq!(e.derived, 4, "{name}: #commit muts derived");
             let bl = &e.muts[2];
             assert_eq!(vlpds::state::key_body(&bl.key)[..3], *b"bl/", "{name}: the like's backlink put");
             assert_eq!(bl.val.as_deref(), Some(&b"3l3qo2vutsw2b"[..]));
-            let mut sb = SegmentBuilder::for_log(&h.log_id);
+            let mut sb = SegmentBuilder::for_log_at(&h.log_id, level);
             let frame = e.frame.clone();
             sb.push_derived(e.seq, e.shard, e.epoch, |o| o.extend_from_slice(&frame), &e.muts, e.derived);
             assert!(sb.seal(&h.log_id, h.ordinal, h.prefix_end) == b, "{name}: re-encode differs");
