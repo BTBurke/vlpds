@@ -69,6 +69,19 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
     `validate: false`) deletes the account's earlier record of the collection with the same subject (`subject.uri` for likes and
     reposts, the `subject` DID for follows and blocks) in the new record's commit, as the reference's `getBacklinkConflicts`
     (DESIGN.md "Backlinks").
+15. **User service auth on uploadBlob** (`src/xrpc/authn.rs` `USER_SERVICE_AUTH_METHODS`, `Credentials::UserServiceAuth`). The
+    reference authorizes `com.atproto.repo.uploadBlob` with `authorizationOrUserServiceAuth`: a Bearer token carrying an `lxm`
+    claim is verified as a service JWT issued by the user (iss = a DID hosted here, aud = the PDS's service DID exactly,
+    lxm = uploadBlob, signed with the current `#atproto` key) and the blob is that user's. The Bluesky app's video upload depends
+    on it: the app gets such a token from getServiceAuth and gives it to video.bsky.app, which uploads the processed video to the
+    PDS. vlpds refused it (InvalidToken), so video posts failed. **This audit missed it because no reference test exercises
+    uploadBlob with service auth** (file-uploads.test.ts and the rest only upload with sessions); it was found by reading
+    `auth-verifier.ts`. Tests: `user_service_auth::*` (getServiceAuth → uploadBlob → post with `app.bsky.embed.video`, listBlobs,
+    getBlob; a stub video service end to end; wrong lxm / aud / expired / another user's key / a rotated-out key / a foreign or
+    `did#service` issuer refused with the reference's errors; refused on every other method) and
+    `ha_auth::user_service_auth_uploads_route_to_the_owner` (cluster routing by `iss`). Account status: taken-down accounts are
+    refused also with service auth (divergence below). createAccount's `userServiceAuthOptional` (migration in) was already
+    verified the same way (`authn::optional_service_auth`).
 
 ## Notable divergences
 
@@ -92,6 +105,9 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
   which marks interval-generated codes disabled when they are created (vlpds does that too).
 - **OAuth UI** has no forgot-password step and no deactivate button. Those are the XRPC flows, and the pages are English only.
 - **Legacy blob refs** are refused everywhere. The reference upgrades them on profile updates as a temporary hack.
+- **uploadBlob with user service auth on a taken-down account** is 401 AccountTakedown, as with a session. The reference's
+  `userServiceAuth` skips the account status check (its `checkTakedown` applies to the session path only), so a token issued
+  before a takedown would still upload for up to an hour. Deactivated accounts upload either way.
 
 ## Gaps left
 
@@ -342,6 +358,9 @@ Puppeteer tests of the reference's browser account-manager UI (`@atproto/oauth-p
 | does not allow requests from another did | ported | `ref_moderator_auth::ref_refuses_another_did` (401 UntrustedIss "Untrusted issuer") |
 | does not allow requests with a bad signature | ported | `ref_moderator_auth::ref_refuses_a_bad_signature` ("jwt signature does not match jwt issuer") |
 | does not allow requests with a bad aud | ported | `ref_moderator_auth::ref_refuses_a_bad_aud` ("jwt audience does not match service did") |
+
+User service auth on uploadBlob (`authorizationOrUserServiceAuth`) has no reference test; see "Product fixes" 15 and
+`user_service_auth::*`.
 
 ### rate-limits.test.ts
 

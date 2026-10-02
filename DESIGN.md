@@ -2526,6 +2526,47 @@ messages (tests: `ref_moderator_auth`, `invite_codes::ref_*`,
   injects a stub for tests. The reference's backup nameservers are not
   ported. Dev mode still skips the proof.
 
+## User service auth on uploadBlob (video uploads)
+
+The reference authorizes `com.atproto.repo.uploadBlob` with
+`authorizationOrUserServiceAuth`, and the Bluesky app's video upload relies
+on it. The app asks its PDS for a service token (getServiceAuth, aud =
+`did:web:<PDS host>`, lxm = uploadBlob, 30 minutes) and sends the video, with
+that token, straight to video.bsky.app (`app.bsky.video.uploadVideo`, not via
+the PDS). The video service transcodes it and calls the user's PDS's
+uploadBlob with the token. The app then writes the `app.bsky.embed.video`
+post with its own session. The other `app.bsky.video.*` calls
+(getUploadLimits with a token for the video service's DID, getJobStatus,
+and the multipart start/upload/finish methods) also go to the video service
+directly; the reference PDS has no video-specific code, and nothing here
+proxies them specially (sent through the PDS, they take the generic proxy
+like any `app.bsky.*` method).
+
+`src/xrpc/authn.rs`: on the methods in `USER_SERVICE_AUTH_METHODS`
+(uploadBlob only), a Bearer token whose unverified payload has an `lxm`
+claim is a service JWT (the reference's `isDefinitelyServiceAuth`; session
+tokens never carry one). It is checked by the inbound verifier
+(`verify_service_jwt`: `typ`, exp, aud = our service DID exactly (no
+`#atproto_pds` form, and no entryway DID since vlpds has none), lxm = the
+method, the issuer's current `#atproto` key with one fresh-document retry).
+The issuer must be an account hosted here: a foreign DID or a
+`did#service` issuer is the reference's actor-store miss, 400 NotFound
+"Repo not found". The result is `Credentials::UserServiceAuth`, which allows
+blob uploads (no OAuth-style scope narrowing) and nothing else. Every other
+method treats such a token as a session token, which fails as one. As in the
+reference there is no `jti` replay check (the video service may retry; tokens
+live at most an hour) and no `iat` bound. Unlike the reference, uploadBlob
+refuses a taken-down account (401 AccountTakedown) with service auth too:
+the reference checks takedown only on the session path, so a token issued
+before the takedown would still work. Deactivated accounts may upload.
+
+In a cluster, such a token has no `sub`, so `forward.rs` routes uploadBlob by
+the token's `iss` (its DID part) to the account's owner.
+
+createAccount's optional service auth (`userServiceAuthOptional`, migration
+in) was already the same check (`authn::optional_service_auth`): any Bearer
+token there must be a service JWT for createAccount.
+
 ## Push registration (`src/xrpc/proxy/push.rs`)
 
 `app.bsky.notification.{registerPush,unregisterPush}` name their service in
@@ -3154,5 +3195,7 @@ notable ones:
 - **Proxy defaults.** `chat.bsky.*` needs an explicit `atproto-proxy`, and non-`app.bsky`/`tools.ozone` methods are 501. There is
   no separate mod-service default for `tools.ozone.*`.
 - **Stricter sessions.** `revokeAppPassword` and `identity.updateHandle` require a full (non-app-password) session.
+- **Taken-down accounts can't upload with user service auth** (the reference skips the status check there); see "User service
+  auth on uploadBlob".
 
 No known (non-deliberate) gaps are left in that file.

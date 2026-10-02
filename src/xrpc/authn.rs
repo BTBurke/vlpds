@@ -5,6 +5,9 @@
 //!   Basic admin:<token> -> admin
 //!   Bearer <service jwt> on a moderator method -> the moderation service
 //!     (`--mod-service-did`; [`MODERATOR_METHODS`])
+//!   Bearer <service jwt with `lxm`> on uploadBlob -> a user's own service
+//!     JWT ([`USER_SERVICE_AUTH_METHODS`]; e.g. the video service uploading
+//!     a processed video for the user)
 //! and yields `Credentials`, whose `allows_*` methods are the single place
 //! permission checks happen (OAuth scopes, app-password restrictions).
 
@@ -44,7 +47,24 @@ pub enum Credentials {
     ModService {
         iss: String,
     },
+    /// A service JWT issued by a user hosted here, with its own `#atproto`
+    /// key, addressed to this PDS for the method being called (the
+    /// reference's `userServiceAuth`; from getServiceAuth). Accepted only on
+    /// [`USER_SERVICE_AUTH_METHODS`]; grants blob uploads and nothing else.
+    UserServiceAuth {
+        did: String,
+    },
 }
+
+/// Methods that also take a user's service JWT (the reference's
+/// `authorizationOrUserServiceAuth`): a Bearer token carrying an `lxm`
+/// claim is verified as one ([`verify_user_service_auth`]), anything else
+/// as a session. The Bluesky app's video upload depends on it: the app gets
+/// a token (`aud` = this PDS, `lxm` = uploadBlob) from getServiceAuth and
+/// hands it to the video service, which uploads the processed video here.
+/// (createAccount takes service auth too, `userServiceAuthOptional`; it is
+/// verified in its handler: `super::server::create_account`.)
+pub const USER_SERVICE_AUTH_METHODS: &[&str] = &["com.atproto.repo.uploadBlob"];
 
 /// Admin methods the moderation service may call with service auth (the
 /// reference's `authVerifier.moderator`): a Bearer token on these is only
@@ -88,7 +108,8 @@ impl Credentials {
             Credentials::Session { did }
             | Credentials::AppPassword { did, .. }
             | Credentials::OAuth { did, .. }
-            | Credentials::Takendown { did } => Some(did),
+            | Credentials::Takendown { did }
+            | Credentials::UserServiceAuth { did } => Some(did),
             Credentials::Admin | Credentials::ModService { .. } => None,
         }
     }
@@ -97,7 +118,7 @@ impl Credentials {
     pub fn allows_repo(&self, collection: &str, action: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_repo(collection, action),
-            Credentials::Takendown { .. } | Credentials::ModService { .. } => false,
+            Credentials::Takendown { .. } | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => false,
             _ => true,
         }
     }
@@ -109,7 +130,7 @@ impl Credentials {
             Credentials::AppPassword { privileged, .. } => {
                 *privileged || !lxm.starts_with("chat.bsky.")
             }
-            Credentials::ModService { .. } => false,
+            Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => false,
             _ => true,
         }
     }
@@ -128,7 +149,7 @@ impl Credentials {
             Credentials::OAuth { scopes, .. } => scopes.allows_account(attr, action),
             // app passwords can't manage the account (see server.rs for specifics)
             Credentials::AppPassword { .. } => action == "read",
-            Credentials::Takendown { .. } | Credentials::ModService { .. } => false,
+            Credentials::Takendown { .. } | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => false,
             _ => true,
         }
     }
@@ -137,7 +158,10 @@ impl Credentials {
     pub fn allows_identity(&self, attr: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_identity(attr),
-            Credentials::AppPassword { .. } | Credentials::Takendown { .. } | Credentials::ModService { .. } => false,
+            Credentials::AppPassword { .. }
+            | Credentials::Takendown { .. }
+            | Credentials::ModService { .. }
+            | Credentials::UserServiceAuth { .. } => false,
             _ => true,
         }
     }
@@ -217,6 +241,9 @@ pub async fn authenticate(app: &App, parts: &Parts) -> XResult<Credentials> {
         {
             return verify_mod_service(app, tok.trim(), nsid).await;
         }
+        if USER_SERVICE_AUTH_METHODS.contains(&nsid) && has_lxm(tok.trim()) {
+            return verify_user_service_auth(app, tok.trim(), nsid).await;
+        }
         let creds = super::server::verify_bearer(app, tok).await?;
         if matches!(creds, Credentials::Takendown { .. }) && !TAKENDOWN_METHODS.contains(&nsid) {
             return Err(XrpcError::bad("InvalidToken", "Bad token scope"));
@@ -247,6 +274,41 @@ async fn verify_mod_service(app: &App, tok: &str, nsid: &str) -> XResult<Credent
     let trusted = [m.to_string(), format!("{m}#atproto_labeler")];
     let sa = verify_service_jwt_from(app, tok, Some(nsid), Some(&trusted)).await?;
     Ok(Credentials::ModService { iss: sa.iss })
+}
+
+/// The reference's `userServiceAuth`: a service JWT for `nsid` (`lxm` must
+/// match), `aud` exactly our service DID (no `#fragment`; there is no
+/// entryway), signed with the issuer's current `#atproto` key (an older,
+/// rotated key is refused), not expired. No `jti` replay check and no
+/// `iat` bound, as in the reference (the token lives at most an hour:
+/// getServiceAuth). The issuer must be an account hosted here: anything else
+/// (including a `did#service` issuer) is the reference's actor-store miss,
+/// 400 NotFound "Repo not found". Account status is the handler's business.
+async fn verify_user_service_auth(app: &App, tok: &str, nsid: &str) -> XResult<Credentials> {
+    let sa = verify_service_jwt(app, tok, Some(nsid)).await?;
+    let repo_not_found = || XrpcError::bad("NotFound", "Repo not found");
+    if sa.iss.contains('#') {
+        return Err(repo_not_found());
+    }
+    match app.account(&sa.iss).await {
+        Ok(_) => Ok(Credentials::UserServiceAuth { did: sa.iss }),
+        Err(e) if e.error == "AccountNotFound" => Err(repo_not_found()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Does `tok` (unverified) carry an `lxm` claim? The reference's
+/// `isDefinitelyServiceAuth`: session and OAuth tokens never do, so such a
+/// token is a service JWT. Undecodable tokens are not (they fail as
+/// sessions).
+fn has_lxm(tok: &str) -> bool {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use base64::Engine;
+    tok.split('.')
+        .nth(1)
+        .and_then(|p| B64.decode(p).ok())
+        .and_then(|b| serde_json::from_slice::<J>(&b).ok())
+        .is_some_and(|c| c.get("lxm").is_some_and(|l| !l.is_null()))
 }
 
 /// Is `tok` (unverified) a JWT issued by the configured moderation service?

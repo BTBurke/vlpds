@@ -70,6 +70,10 @@ async fn upload_blob(
         .to_string();
     creds.need_blob(&mime)?;
     // Deactivated accounts may upload (migration); taken-down ones may not.
+    // (Also with a user service JWT, where the reference skips the check:
+    // getServiceAuth refuses taken-down accounts an uploadBlob token, but
+    // one issued before the takedown would otherwise still upload for up to
+    // an hour.)
     let acct = app.account(&did).await?;
     if matches!(
         acct.status.as_deref(),

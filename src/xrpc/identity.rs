@@ -461,7 +461,9 @@ fn plc_signer(creds: &Credentials) -> XResult<String> {
             error: "InvalidToken".into(),
             message: "Bad token scope".into(),
         }),
-        Credentials::Admin | Credentials::ModService { .. } => Err(XrpcError::auth("user credentials required")),
+        Credentials::Admin | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => {
+            Err(XrpcError::auth("user credentials required"))
+        }
     }
 }
 

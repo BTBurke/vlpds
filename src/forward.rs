@@ -6,7 +6,8 @@
 //! bearer token's `sub` alone. Otherwise the routing DID comes from (in
 //! order) the `repo` / `did` /
 //! `handle` / `identifier` query parameter (handles resolved), the bearer
-//! token's `sub` (when that is ours the body is never parsed), then the
+//! token's `sub` (uploadBlob: or, for a user service JWT, which has none,
+//! its `iss`; when that is ours the body is never parsed), then the
 //! `repo` / `did` / `identifier` field of a JSON body (handles and emails
 //! resolved) and, for `com.atproto.admin.*`, the moderation `subject` (`did`,
 //! or the DID of its `uri`; also the `uri` query parameter) or the `account`
@@ -200,6 +201,29 @@ fn token_sub(req: &Request) -> Option<String> {
     }
     let c: Claims = serde_json::from_slice(&payload).ok()?;
     c.sub.0.filter(|s| s.starts_with("did:")).map(Cow::into_owned)
+}
+
+/// The DID of a Bearer JWT's `iss` (unverified, `#fragment` dropped:
+/// routing only; the owner verifies).
+fn token_iss(req: &Request) -> Option<String> {
+    let tok = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(tok.split('.').nth(1)?)
+        .ok()?;
+    #[derive(Deserialize)]
+    struct Claims<'a> {
+        #[serde(borrow, default)]
+        iss: Str<'a>,
+    }
+    let c: Claims = serde_json::from_slice(&payload).ok()?;
+    let iss = c.iss.0?;
+    let did = iss.split('#').next()?;
+    did.starts_with("did:").then(|| did.to_string())
 }
 
 // ---------- borrowed body routing ----------
@@ -449,7 +473,12 @@ async fn xrpc_target(
         }
         (None, None) => {}
     }
-    let sub = token_sub(&req);
+    let sub = match nsid {
+        // a user service JWT (the video service uploading for a user) has
+        // no `sub`: it is the issuer's
+        "com.atproto.repo.uploadBlob" => token_sub(&req).or_else(|| token_iss(&req)),
+        _ => token_sub(&req),
+    };
     if sub.as_deref().is_some_and(|s| router.remote_owner(s).is_none()) {
         // the caller's own account is ours: no body parse (it still routes
         // by it, so a write resent after its shard moved finds the new owner)
@@ -845,6 +874,10 @@ mod tests {
         assert_eq!(token_sub(&req(format!("DPoP {tok}"))).as_deref(), Some("did:plc:me"));
         let tok = format!("h.{}.s", b64(r#"{"sub":5}"#));
         assert_eq!(token_sub(&req(format!("Bearer {tok}"))), None);
+        let tok = format!("h.{}.s", b64(r#"{"iss":"did:plc:me#atproto","lxm":"x"}"#));
+        assert_eq!(token_iss(&req(format!("Bearer {tok}"))).as_deref(), Some("did:plc:me"));
+        assert_eq!(token_sub(&req(format!("Bearer {tok}"))), None);
+        assert_eq!(token_iss(&req(format!("DPoP {tok}"))), None);
     }
 
     #[tokio::test]

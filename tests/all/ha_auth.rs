@@ -551,3 +551,38 @@ async fn oauth_flow_across_nodes_single_use_cluster_wide() {
         assert_eq!(oks, 1, "exactly one refresh succeeds: {r1:?} {r2:?}");
     }
 }
+
+/// A user service JWT on uploadBlob (the video service uploading for a
+/// user) carries no `sub`: the other nodes route it by its `iss` to the
+/// account's owner, which verifies it and stores the blob as the user's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_service_auth_uploads_route_to_the_owner() {
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let a = node("husa-a", &store, None).await;
+    let b = node("husa-b", &store, None).await;
+    let c = node("husa-c", &store, None).await;
+    let nodes = [&a, &b, &c];
+    balanced(&nodes).await;
+    let acct = a.create_account("husa").await;
+    let owner = owner_of(&nodes, &acct.did);
+    let pds = a.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok()["did"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for n in nodes.iter().filter(|n| !std::ptr::eq(**n, owner)) {
+        let q = [("aud", pds.as_str()), ("lxm", "com.atproto.repo.uploadBlob")];
+        let tok = n.xrpc.get("com.atproto.server.getServiceAuth", &q, &acct.auth()).await.ok()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let bytes = format!("video bytes via {}", n.url).into_bytes();
+        let up = n.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "video/mp4", &Auth::Bearer(tok)).await.ok();
+        let cid = up["blob"]["ref"]["$link"].as_str().unwrap().to_string();
+        let embed = json!({"$type": "app.bsky.embed.video", "video": up["blob"]});
+        n.create_record(&acct, "app.bsky.feed.post", json!({"$type": "app.bsky.feed.post", "text": "v", "createdAt": now_iso(), "embed": embed}))
+            .await;
+        let g = get_blob(n, &acct.did, &cid).await;
+        assert_eq!(g.status, 200, "{}", g.text());
+        assert_eq!(g.body.as_ref() as &[u8], bytes.as_slice());
+    }
+}

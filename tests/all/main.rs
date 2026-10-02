@@ -100,6 +100,7 @@ mod sync11_property;
 mod takedown_routes;
 mod totp;
 mod untrusted_repo_data;
+mod user_service_auth;
 mod ref_auth;
 mod ref_ssrf;
 mod ref_invites;
