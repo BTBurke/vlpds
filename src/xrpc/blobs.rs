@@ -68,7 +68,7 @@ async fn upload_blob(
         .filter(|s| !s.is_empty())
         .unwrap_or("application/octet-stream")
         .to_string();
-    creds.require(creds.allows_blob(&mime))?;
+    creds.need_blob(&mime)?;
     // Deactivated accounts may upload (migration); taken-down ones may not.
     let acct = app.account(&did).await?;
     if matches!(

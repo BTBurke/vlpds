@@ -90,8 +90,14 @@ pub struct Config {
     pub moderation_mailer: Option<crate::mail::SharedMailer>,
     /// Email branding (`--email-brand-name` etc., crate::mail::Branding).
     pub email_branding: crate::mail::Branding,
-    /// Max uploadBlob size in bytes.
+    /// Max uploadBlob size in bytes (also describeServer's blobUploadLimit).
     pub max_blob_size: u64,
+    /// describeServer `links.privacyPolicy` / `links.termsOfService` /
+    /// `contact.email` (reference PDS_PRIVACY_POLICY_URL,
+    /// PDS_TERMS_OF_SERVICE_URL, PDS_CONTACT_EMAIL_ADDRESS).
+    pub privacy_policy_url: Option<String>,
+    pub terms_of_service_url: Option<String>,
+    pub contact_email_address: Option<String>,
     /// Unreferenced blobs older than this are deleted by the blob GC.
     pub blob_gc_grace: Duration,
     /// PLC directory: resolves did:plc documents and, with PLC registration
@@ -240,6 +246,9 @@ impl Default for Config {
             email_branding: Default::default(),
             cluster: None,
             max_blob_size: 100 << 20,
+            privacy_policy_url: None,
+            terms_of_service_url: None,
+            contact_email_address: None,
             blob_gc_grace: Duration::from_secs(6 * 3600),
             plc_url: crate::plc::DEFAULT_PLC_URL.into(),
             plc: Default::default(),

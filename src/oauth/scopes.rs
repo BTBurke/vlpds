@@ -970,6 +970,11 @@ mod tests {
                 .unwrap();
         assert!(p.matches_rpc("app.bsky.feed.getFeed", "did:web:api.bsky.app#bsky_appview"));
         assert!(!p.matches_rpc("app.bsky.feed.getFeed", "did:web:other.example#x"));
+        // reference tests/proxied/proxy-oauth-aud.test.ts: the proxy checks
+        // `did#serviceId`; the same DID with another service id, or the bare
+        // DID, does not match
+        assert!(!p.matches_rpc("app.bsky.feed.getFeed", "did:web:api.bsky.app#atproto_other"));
+        assert!(!p.matches_rpc("app.bsky.feed.getFeed", "did:web:api.bsky.app"));
         assert_eq!(
             p.to_scope_string(),
             "rpc:app.bsky.feed.getFeed?aud=did:web:api.bsky.app%23bsky_appview"

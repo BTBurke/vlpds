@@ -2841,3 +2841,28 @@ active level and is restored only by a build whose window contains it).
 9. Peer capability gating helper for new internal endpoints/messages
    (0.5 d), token-format levels (as needed), and an optional
    auto-finalize after a configured soak (0.5 d).
+
+## Reference test divergences (`tests/REFERENCE_COVERAGE.md`)
+
+The reference PDS's own test suite is mapped case by case in that file, which lists every deliberate divergence. These are the
+notable ones:
+
+- **Deleted accounts in firehose replays.** The reference deletes a deleted DID's earlier `repo_seq` rows. vlpds's firehose is its
+  append-only log, so a replay from before the deletion still carries that DID's earlier frames until retention drops the
+  segments. The shared guarantee is that `#account` with status `deleted` is the DID's last event, which consumers must treat as
+  a tombstone (`ref_sync::account_deletion_is_the_last_event_on_replay`).
+- **listRepos order** is `(slot, DID)`, because listings are served per shard, not by creation order.
+- **Fresh uploads are readable.** Blobs are written under their final key at upload, so getBlob serves an upload before any record
+  references it, until the blob GC collects it. The reference keeps uploads in a temp store.
+- **Proxy defaults.** `chat.bsky.*` needs an explicit `atproto-proxy`, and non-`app.bsky`/`tools.ozone` methods are 501. There is
+  no separate mod-service default for `tools.ozone.*`.
+- **Stricter sessions.** `revokeAppPassword` and `identity.updateHandle` require a full (non-app-password) session.
+
+These known gaps are tracked in that file and are not deliberate:
+
+- signing-key rotation writes no re-signed commit and emits no `#sync`;
+- duplicate backlinks (likes, reposts, follows, blocks) are not pruned;
+- admin methods have no mod-service service auth;
+- there are no interval invite codes;
+- there is no disposable-email blocklist;
+- there is no DNS TXT handle proof.

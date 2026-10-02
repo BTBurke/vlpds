@@ -310,7 +310,7 @@ async fn update_handle(
     Auth(creds): Auth,
     Json(inp): Json<UpdateHandleIn>,
 ) -> XResult<StatusCode> {
-    creds.require(creds.allows_identity("handle"))?;
+    creds.need_identity("handle")?;
     let did = creds
         .did()
         .ok_or_else(|| XrpcError::auth("user credentials required"))?
@@ -450,7 +450,7 @@ fn plc_signer(creds: &Credentials) -> XResult<String> {
     match creds {
         Credentials::Session { did } | Credentials::Takendown { did } => Ok(did.clone()),
         Credentials::OAuth { did, .. } => {
-            creds.require(creds.allows_identity("*"))?;
+            creds.need_identity("*")?;
             Ok(did.clone())
         }
         Credentials::AppPassword { .. } => Err(XrpcError {
@@ -532,7 +532,7 @@ struct SubmitPlcIn {
 /// atproto key is the account's signing key, and the first alias is the
 /// account's handle. Then #identity.
 async fn submit_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp): Json<SubmitPlcIn>) -> XResult<StatusCode> {
-    creds.require(creds.allows_identity("*"))?;
+    creds.need_identity("*")?;
     let did = creds.did().ok_or_else(|| XrpcError::auth("user credentials required"))?.to_string();
     let plc = plc_service(&app)?.clone();
     let op = inp.operation;

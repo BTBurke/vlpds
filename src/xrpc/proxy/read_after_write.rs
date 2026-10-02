@@ -93,18 +93,66 @@ fn accept_encoding(client: Option<&header::HeaderValue>) -> Option<header::Heade
     if v.split(',').all(|p| decodable(name(p)) || name(p).is_empty()) {
         return None;
     }
+    let named: Vec<&str> = v.split(',').map(name).collect();
     let mut out: Vec<String> = Vec::new();
     for part in v.split(',') {
         let n = name(part);
         let params = part.find(';').map(|i| part[i..].trim()).unwrap_or("");
         if n == "*" {
-            out.extend(["gzip", "deflate"].map(|c| format!("{c}{params}")));
+            // `*` stands only for the codings not named explicitly
+            // ("gzip, *;q=0" must not turn into "gzip, gzip;q=0")
+            let rest = ["gzip", "deflate"]
+                .into_iter()
+                .filter(|c| !named.iter().any(|x| x.eq_ignore_ascii_case(c)));
+            out.extend(rest.map(|c| format!("{c}{params}")));
         } else if decodable(n) {
             out.push(part.trim().to_string());
         }
     }
     let out = if out.is_empty() { "identity".to_string() } else { out.join(", ") };
     header::HeaderValue::from_str(&out).ok()
+}
+
+/// The reference's Accept-Encoding negotiation for the responses it may have
+/// to decode and re-encode (`@atproto-labs/xrpc-utils`
+/// `negotiateContentEncoding`): a malformed header is a 400 (`Invalid
+/// accept-encoding: "<part>"`), and one that rules out identity and every
+/// coding this PDS can decode is a 406.
+fn check_accept_encoding(client: Option<&header::HeaderValue>) -> XResult<()> {
+    let Some(v) = client.and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty()) else {
+        return Ok(());
+    };
+    let mut q_of: HashMap<String, f64> = HashMap::new();
+    for def in v.split(',') {
+        let invalid = || XrpcError::bad("InvalidRequest", format!("Invalid accept-encoding: \"{def}\""));
+        let parts: Vec<&str> = def.trim().splitn(3, ';').collect();
+        if parts.len() > 2 || parts[0].is_empty() || parts[0].contains('=') {
+            return Err(invalid());
+        }
+        let mut q = 1.0;
+        if let Some(params) = parts.get(1) {
+            let kv: Vec<&str> = params.splitn(3, '=').collect();
+            if kv.len() != 2 || !(kv[0] == "q" || kv[0] == "Q") {
+                return Err(invalid());
+            }
+            q = kv[1].trim().parse::<f64>().map_err(|_| invalid())?;
+            if !(q == 0.0 || (0.001..=1.0).contains(&q)) {
+                return Err(invalid());
+            }
+        }
+        q_of.insert(parts[0].to_ascii_lowercase(), q);
+    }
+    let q = |n: &str| q_of.get(n).or_else(|| q_of.get("*")).copied();
+    let identity_ok = q("identity").is_none_or(|q| q > 0.0);
+    let coded_ok = ["gzip", "deflate"].iter().any(|c| q(c).is_some_and(|q| q > 0.0));
+    if !identity_ok && !coded_ok {
+        return Err(xerr(
+            StatusCode::NOT_ACCEPTABLE,
+            "NotAcceptable",
+            "this service does not support any of the requested encodings",
+        ));
+    }
+    Ok(())
 }
 
 /// Codings applied to a body, in order (Content-Encoding lists them in the
@@ -705,6 +753,7 @@ fn munged_response(body: &J, lag: Option<i64>) -> Response {
 pub(super) async fn proxy(app: &App, target: &Target<'_>, mut f: Forward<'_>, acct: &CachedAcct, kind: Kind) -> XResult<Response> {
     let did = f.iss.expect("read-after-write needs the requester");
     let pq = f.path_and_query;
+    check_accept_encoding(f.headers.get(header::ACCEPT_ENCODING))?;
     f.accept_encoding = accept_encoding(f.headers.get(header::ACCEPT_ENCODING));
     let (parts, body) = send(app, target, f, Some(acct)).await?;
     if parts.status.as_u16() >= 400 {
@@ -835,6 +884,28 @@ mod tests {
         assert_eq!(accept_encoding(Some(&hv("gzip, br"))).unwrap(), "gzip");
         assert_eq!(accept_encoding(Some(&hv("br"))).unwrap(), "identity");
         assert_eq!(accept_encoding(Some(&hv("br;q=1, *;q=0.5"))).unwrap(), "gzip;q=0.5, deflate;q=0.5");
+        assert_eq!(accept_encoding(Some(&hv("gzip, *;q=0"))).unwrap(), "gzip, deflate;q=0");
+    }
+
+    #[test]
+    fn accept_encoding_negotiation() {
+        let hv = |s: &str| header::HeaderValue::from_str(s).unwrap();
+        let check = |s: &str| check_accept_encoding(Some(&hv(s))).map_err(|e| (e.status.as_u16(), e.message));
+        for ok in ["identity", "gzip, *;q=0", "invalid", "br", "gzip;q=0.5, deflate", "GZIP;Q=1", "*"] {
+            assert!(check(ok).is_ok(), "{ok}");
+        }
+        assert!(check_accept_encoding(None).is_ok());
+        for bad in [";q=1", "gzip;q=2", "gzip;foo=1", "gzip;q", "gzip;q=1;x", "gzip, ", "q=1"] {
+            assert_eq!(check(bad).unwrap_err().0, 400, "{bad}");
+        }
+        assert_eq!(check(";q=1").unwrap_err().1, "Invalid accept-encoding: \";q=1\"");
+        for none in ["invalid, *;q=0", "identity;q=0", "br, identity;q=0", "*;q=0"] {
+            assert_eq!(
+                check(none).unwrap_err(),
+                (406, "this service does not support any of the requested encodings".to_string()),
+                "{none}"
+            );
+        }
     }
 
     #[test]

@@ -296,7 +296,7 @@ async fn create_record(
     let mut inp = CreateRecordIn::from_tree(body.parse()?)?;
     crate::ratelimit::check_repo_write(creds.did(), crate::ratelimit::CREATE_POINTS)?;
     let did = authed_repo(&app, &creds, &inp.repo).await?;
-    creds.require(creds.allows_repo(&inp.collection, "create"))?;
+    creds.need_repo(&inp.collection, "create")?;
     check_path(&inp.collection, inp.rkey.as_deref())?;
     check_rkey_slur(inp.rkey.as_deref())?;
     // as the reference: no rkey = a fresh TID (validated against the schema's key)
@@ -378,10 +378,8 @@ async fn put_record(
     let mut inp = PutRecordIn::from_tree(body.parse()?)?;
     crate::ratelimit::check_repo_write(creds.did(), crate::ratelimit::UPDATE_POINTS)?;
     let did = authed_repo(&app, &creds, &inp.repo).await?;
-    creds.require(
-        creds.allows_repo(&inp.collection, "create")
-            && creds.allows_repo(&inp.collection, "update"),
-    )?;
+    creds.need_repo(&inp.collection, "create")?;
+    creds.need_repo(&inp.collection, "update")?;
     check_path(&inp.collection, Some(&inp.rkey))?;
     check_rkey_slur(Some(&inp.rkey))?;
     let schema = crate::lexicon::resolve_record_schema(&app, &inp.collection, inp.validate).await;
@@ -447,7 +445,7 @@ async fn delete_record(
 ) -> XResult<Json<J>> {
     crate::ratelimit::check_repo_write(creds.did(), crate::ratelimit::DELETE_POINTS)?;
     let did = authed_repo(&app, &creds, &inp.repo).await?;
-    creds.require(creds.allows_repo(&inp.collection, "delete"))?;
+    creds.need_repo(&inp.collection, "delete")?;
     check_path(&inp.collection, Some(&inp.rkey))?;
     let swap = parse_cid_opt(&inp.swap_commit)?;
     let swap_record = parse_cid_opt(&inp.swap_record)?.map(Some);
@@ -540,7 +538,7 @@ async fn apply_writes(
             "com.atproto.repo.applyWrites#update" => "update",
             _ => "delete",
         };
-        creds.require(creds.allows_repo(&collection, action))?;
+        creds.need_repo(&collection, action)?;
         check_path(&collection, rkey.as_deref())?;
         if action != "delete" {
             check_rkey_slur(rkey.as_deref())?;
@@ -718,8 +716,19 @@ async fn list_records(
     Query(q): Query<ListRecordsQ>,
 ) -> XResult<Response> {
     check_path(&q.collection, None)?;
-    let did = app.resolve_repo(&q.repo).await?;
-    super::sync::assert_available(&app, &did, creds.as_ref()).await?;
+    // reference listRecords: an unknown, taken-down or deactivated repo is
+    // `InvalidRequestError("Could not find repo: {repo}")`
+    let not_found = |e: XrpcError| {
+        if e.status == StatusCode::BAD_REQUEST && e.error.starts_with("Repo") {
+            XrpcError::bad("InvalidRequest", format!("Could not find repo: {}", q.repo))
+        } else {
+            e
+        }
+    };
+    let did = app.resolve_repo(&q.repo).await.map_err(not_found)?;
+    super::sync::assert_available(&app, &did, creds.as_ref())
+        .await
+        .map_err(not_found)?;
     let p = app.partition(&did)?;
     // lexicon: integer, minimum 1, maximum 100
     let limit = match q.limit {
@@ -855,7 +864,7 @@ async fn import_repo(
         .did()
         .ok_or_else(|| XrpcError::auth("user credentials required"))?
         .to_string();
-    creds.require(creds.allows_account("repo", "manage"))?;
+    creds.need_account("repo", "manage")?;
     let acct = app.account(&did).await?;
     if matches!(
         acct.status.as_deref(),

@@ -324,6 +324,15 @@ struct Args {
     /// Max uploadBlob size (MB).
     #[arg(long, env = "VLPDS_MAX_BLOB_MB", default_value_t = 100)]
     max_blob_mb: u64,
+    /// describeServer links.privacyPolicy (falls back to PDS_PRIVACY_POLICY_URL).
+    #[arg(long, env = "VLPDS_PRIVACY_POLICY_URL")]
+    privacy_policy_url: Option<String>,
+    /// describeServer links.termsOfService (falls back to PDS_TERMS_OF_SERVICE_URL).
+    #[arg(long, env = "VLPDS_TERMS_OF_SERVICE_URL")]
+    terms_of_service_url: Option<String>,
+    /// describeServer contact.email (falls back to PDS_CONTACT_EMAIL_ADDRESS).
+    #[arg(long, env = "VLPDS_CONTACT_EMAIL_ADDRESS")]
+    contact_email_address: Option<String>,
     /// Delete unreferenced blobs uploaded more than this many seconds ago.
     #[arg(long, env = "VLPDS_BLOB_GC_GRACE_SECS", default_value_t = 6 * 3600)]
     blob_gc_grace_secs: u64,
@@ -763,6 +772,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             args.email_disable_confirmation_link,
         ),
         max_blob_size: args.max_blob_mb << 20,
+        privacy_policy_url: flag_or_env(&args.privacy_policy_url, "PDS_PRIVACY_POLICY_URL"),
+        terms_of_service_url: flag_or_env(&args.terms_of_service_url, "PDS_TERMS_OF_SERVICE_URL"),
+        contact_email_address: flag_or_env(&args.contact_email_address, "PDS_CONTACT_EMAIL_ADDRESS"),
         blob_gc_grace: Duration::from_secs(args.blob_gc_grace_secs),
         plc_url: args.plc_url.clone(),
         plc: plc_config(&args)?,
@@ -870,4 +882,9 @@ async fn shutdown_signal() {
         _ = term.recv() => {}
         _ = tokio::signal::ctrl_c() => {}
     }
+}
+
+/// A non-empty flag value, else the reference PDS's environment variable.
+fn flag_or_env(v: &Option<String>, k: &str) -> Option<String> {
+    v.clone().filter(|v| !v.is_empty()).or_else(|| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }

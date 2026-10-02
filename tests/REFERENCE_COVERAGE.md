@@ -1,0 +1,815 @@
+# Reference PDS test coverage
+
+Every `it()` case in the reference TypeScript PDS's own suite (`bluesky-social/atproto` main,
+`packages/pds/tests/**/*.test.ts`, 51 files) mapped to the vlpds test that covers it, or to why it doesn't apply, or to the
+gap. Audited 2026-10-02. Each "covered" row was checked against what the vlpds test actually asserts, not just its name.
+
+Status values:
+
+- **covered**: an existing vlpds test asserts the same externally observable behavior.
+- **ported**: a new test in `tests/all/ref_*.rs` (or `oauth::ref_oauth`) ports the case.
+- **N/A**: the case tests something vlpds doesn't have or can't observe over the wire, such as SQLite/Kysely internals, TS unit
+  internals, browser (puppeteer) UI, entryway mode, Ozone/AppView behavior behind the proxy, or `it.skip` cases.
+- **divergent**: vlpds deliberately behaves differently (reason given; the notable ones are also in DESIGN.md).
+- **GAP**: not covered and not fixed here (reason given).
+
+## Summary
+
+| | Cases |
+|---|---:|
+| covered | 295 |
+| ported | 65 |
+| N/A | 64 |
+| divergent | 7 |
+| GAP (left) | 14 |
+| **total** | **445** |
+
+Some rows marked `ported` or `covered` also carry a partial divergence that the row explains, for example "ported + divergent".
+
+New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref_handles`, `ref_invites`,
+`ref_moderation`, `ref_plc`, `ref_proxy`, `ref_repo`, `ref_ssrf`, `ref_sync`, plus `oauth::ref_oauth`.
+
+## Product fixes made by this pass
+
+1. **Read-after-write Accept-Encoding negotiation** (`src/xrpc/proxy/read_after_write.rs`). A malformed `Accept-Encoding` is now
+   400 `Invalid accept-encoding: "<part>"`, and one that rules out identity and every decodable coding is 406 NotAcceptable.
+   Before, vlpds forwarded the header unchecked. Also, `*;q=0` next to an explicit coding no longer expands into a contradictory
+   `gzip, gzip;q=0`.
+2. **OAuth scope refusals** (`src/xrpc/authn.rs` `need_*`, used across repo/proxy/blobs/identity/server). A missing scope is now
+   403 `ScopeMissingError` `Missing required scope "<scope>"`, as the reference does. It was 403 `InsufficientScope` with a generic
+   message. A non-privileged app password calling a chat method through the proxy is now 400 InvalidToken "Bad token method".
+3. **Deactivation over OAuth drops delegated credentials** (`src/xrpc/server.rs` `delete_delegated_credentials`). This is the
+   reference's `deleteCredentials`: it drops all OAuth sessions, the remembered client authorizations, and every app password with
+   its sessions. Password sessions stay.
+4. **refreshSession with an access token** now fails with "Token could not be verified", the reference's jose `typ` check, instead
+   of "Bad token scope".
+5. **Writing into another account's repo** (create/put/delete/applyWrites) is now 401 AuthenticationRequired "Authentication
+   Required". It was 403 Forbidden. A missing Authorization header says "Authentication Required".
+6. **listRecords of an unknown, taken-down or deactivated repo** is now 400 InvalidRequest `Could not find repo: <repo>`, the
+   reference's message. The owner and admins still read their own repos.
+7. **describeServer** returns `blobUploadLimit`, `links.privacyPolicy`, `links.termsOfService` and `contact.email`. These come from
+   the new `--privacy-policy-url`, `--terms-of-service-url` and `--contact-email-address` flags, which fall back to the reference's
+   `PDS_*` variables.
+8. **createAccount "Email already taken"** echoes the address as the user typed it.
+
+## Notable divergences
+
+- **Account deletion and firehose replay.** The reference deletes a deleted DID's earlier `repo_seq` rows, so a replay contains only
+  the `#account` tombstone. vlpds's firehose is its append-only log, so a replay from before the deletion still carries that DID's
+  earlier frames until retention drops the segments. Both guarantee that `#account deleted` is the DID's last event
+  (`ref_sync::account_deletion_is_the_last_event_on_replay`). See DESIGN.md "Reference test divergences".
+- **listRepos order** is `(slot, DID)` (per shard), not creation order.
+- **getRepo `since`** returns a superset: the commit, all MST nodes and the newer records.
+- **Uploaded blobs before a record references them** are served by getBlob in vlpds. The reference keeps them in a temp store and
+  refuses.
+- **Proxy target defaults.** vlpds needs an explicit `atproto-proxy` for `chat.bsky.*` and answers 501 for namespaces other than
+  `app.bsky`/`tools.ozone`. The reference sends everything without a header to the AppView, and the listed `tools.ozone.*` methods
+  to its `modService`. vlpds sends `tools.ozone.*` to the AppView, because it has no separate mod-service config.
+- **Unresolvable proxy DIDs** (`did:foo#bar`) are 400 "could not resolve proxy did". The reference's resolver throws, which surfaces
+  as a 500.
+- **Stricter session requirements.** `revokeAppPassword` and `identity.updateHandle` need a full session; the reference accepts an
+  app-password session.
+- **disable/enableAccountInvites** act on the account's existing codes. The reference flips a flag that gates interval-generated
+  codes, which vlpds doesn't have.
+- **OAuth UI** has no forgot-password step and no deactivate button. Those are the XRPC flows, and the pages are English only.
+- **Legacy blob refs** are refused everywhere. The reference upgrades them on profile updates as a temporary hack.
+
+## Gaps left
+
+| Gap | Reference cases | Why not fixed here |
+|---|---|---|
+| Signing-key rotation doesn't re-sign the head. `admin.updateAccountSigningKey` emits `#identity` only. The served head stays signed by the old key until the next write, so a relay that verifies `getRepo` against the new DID doc fails. The reference writes an empty commit with the new key and emits `#sync`. | recovery "rotates keys for users" | Needs a worker `AccountOp` (worker.rs, owned by other lanes). Test `ref_account::ref_signing_key_rotation_resigns_the_repo` is `#[ignore]`d with a GAP reason. |
+| Duplicate likes/reposts/follows/blocks are not pruned. The reference's createRecord deletes the account's earlier record with the same subject in the same commit (`getBacklinkConflicts`). | crud "prevents duplicate likes/reposts/follows/blocks" (4) | Needs a backlink index across apply, import, reshard and migration. Test `ref_repo::ref_prevents_duplicate_backlinks` is `#[ignore]`d. |
+| Moderation-service service auth on admin methods. vlpds has no `modServiceDid`, so admin methods accept only admin Basic auth. | moderator-auth (4) | New config option plus a `require_admin` branch using the existing `verify_service_jwt`. |
+| Periodic user invite codes (`inviteInterval`/`inviteEpoch`) | invite-codes (2), invites-admin (1) | A feature vlpds doesn't implement. The reference default (interval unset) behaves like vlpds. |
+| Disposable-email domain blocklist | account "fails on disallowed emails", email-confirmation "badly formatted email" | Needs a vendored domain list. Malformed addresses are already rejected with the reference message. |
+| DNS TXT handle verification | handles "allows updating to a dns handles" (partly ported) | vlpds verifies only `https://<handle>/.well-known/atproto-did`. |
+
+---
+
+
+## Account lifecycle, migration, recovery, entryway, account manager
+
+### account-deactivation.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| deactivates account | covered | `account_deactivation::*` (`deactivate` fixture asserts 200) |
+| returns deactivated status | covered | `account_deactivation::returns_deactivated_status` |
+| no longer serves repo data | covered | `account_deactivation::no_longer_serves_repo_data` (RepoDeactivated on getRepo/getLatestCommit/listBlobs/sync.getRecord/describeRepo/getBlob; listRepos active=false) |
+| no longer resolves handle | covered | `account_deactivation::no_longer_resolves_handle` |
+| still allows login and returns status | covered | `account_deactivation::still_allows_login_and_returns_status` |
+| returns status on getSession | covered | `account_deactivation::still_allows_login_and_returns_status` |
+| does not allow writes | covered | `account_deactivation::does_not_allow_writes` (401 AccountDeactivated for create/put/delete/applyWrites) |
+| reactivates | covered | `account_deactivation::reactivates` |
+
+### account-deletion.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| requests account deletion | ported | token: `email_flows::account_deletion_flow`; mail to/subject/HTML: `ref_account::ref_delete_account_mail_and_taken_down_delete` |
+| fails account deletion with a bad token | covered | `email_flows::account_deletion_flow`; message "Token is invalid" in `ref_account::ref_delete_account_mail_and_taken_down_delete` |
+| fails account deletion with a bad password | covered | `email_flows::account_deletion_flow`; message "Invalid did or password" in `ref_account::ref_delete_account_mail_and_taken_down_delete` |
+| deletes account with a valid token & password | ported | deleting an already taken-down account: `ref_account::ref_delete_account_mail_and_taken_down_delete`; plain case `email_flows::account_deletion_flow` |
+| no longer lets the user log in | covered | `email_flows::account_deletion_flow`, `ref_account::ref_delete_account_mail_and_taken_down_delete` (message) |
+| no longer store the user account or repo | divergent | account/repo/handle/email/tokens gone: `email_flows::account_deletion_flow`. The reference also deletes the DID's earlier `repo_seq` rows (only the `#account` tombstone stays), so a cursor replay no longer contains them; vlpds's firehose is its append-only log, so a replay from before the deletion still carries that DID's earlier `#commit`/`#identity` frames until retention drops the segments |
+| deletes the users actor store | N/A | SQLite actor-store files; the vlpds equivalent (repo keys gone) is `email_flows::account_deletion_flow` (getRepo/getLatestCommit/listRecords fail) |
+| deletes relevant blobs | covered | `email_flows::account_deletion_flow` (getBlob fails) |
+| maintains blobs from other actors | covered | `email_flows::account_deletion_flow` (other DID's copy of the same CID still served) |
+| can delete an empty user | covered | `email_flows::can_delete_an_empty_user` |
+| can be performed by an administrator. | covered | `email_flows::admin_can_delete_account` |
+
+### account-status.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| takedown + activation triggers an error | covered | `account_status::takedown_plus_activation_is_an_error` |
+| activating a taken down account causes an error | covered | `account_status::deactivate_takedown_untakedown_activate` (one `#account` per transition stands in for the `sequenceEvts` spy) |
+| sequences an account status event when calling updateSubjectStatus without changing the status | covered | `account_status::sequences_account_event_without_status_change` |
+| allows to takedown, then deactivate, an account | covered | `account_status::takedown_then_deactivate_reports_both` |
+| throws when trying to activate a takedown account | covered | `account_status::cannot_activate_a_takendown_account` (AccountNotFound) |
+
+### account.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| serves the accounts system config | ported | `account::serves_the_accounts_system_config`; blobUploadLimit/links/contact: `ref_account::ref_describe_server_links_contact_and_blob_limit` (product fix) |
+| fails on invalid handles | covered | `account::fails_on_invalid_handles`; message check in `ref_account::ref_create_account_error_messages` |
+| email validation > succeeds on allowed emails | covered | every `create_account` fixture (`account::creates_an_account_with_plc_shaped_did_and_did_doc`) |
+| email validation > fails on disallowed emails | GAP | vlpds rejects malformed addresses ("This email address is not supported…") but has no disposable-domain blocklist (reference: `disposable-email-domains-js`); left: needs a vendored domain list |
+| creates an account | covered | `account::creates_an_account_with_plc_shaped_did_and_did_doc` |
+| generates a properly formatted PLC DID | covered | `plc::create_account_registers_the_genesis_op` (DID = hash of genesis op; handle, signing key, PDS endpoint) |
+| allows a custom set recovery key | covered | `plc::server_recovery_key_is_ahead_of_the_rotation_key` ([recoveryKey, server recovery key, rotation key]), `plc::create_account_registers_the_genesis_op` |
+| allows administrative email updates | covered | `account::allows_administrative_email_updates` |
+| disallows duplicate email addresses and handles | covered | `account::disallows_duplicate_email_addresses_and_handles`; exact messages: `ref_account::ref_create_account_error_messages` (product fix: echo the request's email spelling) |
+| disallows the email and handle of a deactivated account | covered | `account::disallows_the_email_and_handle_of_a_deactivated_account` |
+| validates input through lexicon schema | covered | `account::fails_on_invalid_handles` (all nine handles) |
+| disallows improperly formatted handles | covered | `account::disallows_improperly_formatted_handles`; messages in `ref_account::ref_create_account_error_messages` |
+| disallows reserved handles (john.bsky.io → UnsupportedDomain) | covered | `account::disallows_unsupported_domains`; message in `ref_account::ref_create_account_error_messages` |
+| disallows reserved handles (about/atp) | covered | `account::disallows_reserved_handles`; message in `ref_account::ref_create_account_error_messages` |
+| handles racing signups for same handle | covered | `account::handles_racing_signups_for_same_handle` |
+| fails on unauthenticated requests | covered | `account::login_and_authenticated_requests` |
+| logs in | covered | `account::login_and_authenticated_requests` |
+| can perform authenticated requests | covered | `account::login_and_authenticated_requests` |
+| can reset account password | ported | flow: `account::can_reset_account_password`; mail to/subject/HTML (handle): `ref_account::ref_password_reset_mail_and_expired_token` |
+| allows only single-use of password reset token | covered | `account::can_reset_account_password` |
+| changing password invalidates past refresh tokens | covered | `account::can_reset_account_password` (lowercased token; old refresh JWT refused) |
+| allows only unexpired password reset tokens | ported | `ref_account::ref_password_reset_mail_and_expired_token` (token aged 16 min → ExpiredToken; password unchanged) |
+| allows an admin to update password | covered | `account::allows_an_admin_to_update_password` |
+
+### account-migration.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| migrates an account | covered | `migration::migrate_account_with_records_and_blobs` (service-auth createAccount with DID, checkAccountStatus counters, importRepo, listMissingBlobs, blob upload, activation, old PDS deactivation, writes on new PDS) + `plc::migration_out_to_another_pds` (requestPlcOperationSignature → signPlcOperation → submitPlcOperation against a PLC directory). Ported remainder: preferences copy to the not-yet-active account (`ref_account::ref_preferences_on_deactivated_account`) and the PLC mail (`ref_account::ref_plc_operation_signature_mail`) |
+
+### recovery.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| recovers repos based on the sequencer | N/A | operator script restoring SQLite actor stores from the sequencer DB. vlpds has no separate actor stores: the log is the WAL and state is rebuilt from it on restart/takeover (`cold_start::*`, `fast_failover::*`, `firehose_backfill::*`) |
+| rotates keys for users | GAP | the reference's `rotate-keys` script updates PLC, writes an empty commit signed with the new key and sequences `#identity` + `#sync`. vlpds's `admin.updateAccountSigningKey` (`plc::signing_key_rotation_updates_the_directory`) updates PLC and emits `#identity`, but signs only the *next* commit with the new key: the head stays signed by the old key and no `#sync` is sent. Test `ref_account::ref_signing_key_rotation_resigns_the_repo` is `#[ignore]`d; fixing it needs a worker AccountOp (re-sign head, `#sync`) |
+
+### takedown-appeal.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| actor takedown allows appeal request. | ported | PDS side: plain login 401 AccountTakedown "Account has been taken down", `allowTakendown` session, appeal `createReport` forwarded with service auth (iss/aud/lxm): `ref_account::ref_takendown_session_appeal_is_forwarded`; also `moderation::takendown_actor_cannot_report_or_write`. Ozone `queryStatuses` snapshot is N/A (moderation service) |
+| allows a takendown actor to appeal an action through the PDS | covered | `proxy::takendown_session_can_appeal` (tools.ozone.inbox.appealActionedSubject proxied for the takendown scope) |
+| takendown actor is not allowed to create reports. | N/A | "Report not accepted from takendown account" is Ozone's check; the reference PDS forwards every createReport from a takendown-scope token, as vlpds does (`ref_account::ref_takendown_session_appeal_is_forwarded`, `proxy::create_report_goes_to_report_service`) |
+| takendown actor is not allowed to create records. | covered | `moderation::takendown_actor_cannot_report_or_write`; exact 400 InvalidToken "Bad token scope" in `ref_account::ref_takendown_session_appeal_is_forwarded` |
+
+### entryway.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| creates account. | N/A | entryway mode (PDS behind a separate entryway issuing tokens, `entrywayUrl` config); vlpds has no entryway mode |
+| auths with both services. | N/A | entryway mode |
+| updates handle from pds. | N/A | entryway mode (handle updates forwarded to the entryway) |
+| updates handle from entryway. | N/A | entryway mode |
+| resolves handle of local account via entryway. | N/A | entryway mode |
+| does not resolve handle from local account store. | N/A | entryway mode |
+| resolves handle of account behind entryway on another pds. | N/A | entryway mode |
+| fails to resolve unknown handle on service domain. | N/A | entryway mode (non-entryway equivalent: `handles::*` resolveHandle HandleNotFound) |
+| defers handle resolution over well-known to entryway. | N/A | entryway mode |
+| does not allow bringing own op to account creation. | N/A | entryway mode; vlpds refuses `plcOp` outright (400 InvalidRequest, `migration::migrate_account_with_records_and_blobs`) |
+
+### account-manager.test.ts
+
+Puppeteer tests of the reference's browser account-manager UI (`@atproto/oauth-provider-ui`). vlpds's web UI is its own; the XRPC flows behind each step are covered as noted.
+
+| case | status | vlpds |
+|---|---|---|
+| allows creating an account | N/A | browser UI; API: `account::creates_an_account_with_plc_shaped_did_and_did_doc`, `oauth::*` sign-up |
+| allows switching accounts | N/A | browser UI (OAuth device sessions) |
+| forgot about the ephemeral session when loading the page again | N/A | browser UI |
+| allows changing the password | N/A | browser UI; API: `account::can_reset_account_password` |
+| shows email 2FA as disabled until the email is verified | N/A | browser UI; API: `email_2fa::*` |
+| allows verifying the email address | N/A | browser UI; API: `email_flows::email_confirmation_and_update_flow` |
+| allows enabling and disabling email based 2FA | N/A | browser UI; API: `email_2fa::*` |
+| allows changing the username | N/A | browser UI; API: `handles::*` |
+| allows changing the email address | N/A | browser UI; API: `email_flows::email_confirmation_and_update_flow` |
+| allows signing out & signing back in | N/A | browser UI |
+| does not ask for a token when changing a non-verified email | N/A | browser UI; API: `email_flows::email_confirmation_and_update_flow` (tokenRequired=false) |
+| rejects racial slurs when changing username | N/A | browser UI; API: `handle_validation::*` |
+| rejects custom domain when not configured | N/A | browser UI |
+| allows deactivating & reactivating the account | N/A | browser UI; API: `account_deactivation::*` |
+| allows deleting the account | N/A | browser UI; API: `email_flows::account_deletion_flow` |
+
+### db.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| commits changes | N/A | Kysely/SQLite transaction wrapper internals |
+| rolls-back changes on failure | N/A | Kysely/SQLite transaction wrapper internals |
+| indicates isTransaction | N/A | Kysely/SQLite transaction wrapper internals |
+| asserts transaction | N/A | Kysely/SQLite transaction wrapper internals |
+| does not allow leaky transactions | N/A | Kysely/SQLite transaction wrapper internals |
+| ensures all inflight queries are rolled back | N/A | Kysely/SQLite transaction wrapper internals |
+
+### blob-transactor.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| BlobTransactor > drains the MIME stream without stalling other consumers | ported | TS unit test of the upload stream tee; observable part (25 MiB upload stored whole, CID over all bytes, JPEG sniffed over a generic content type): `ref_account::ref_large_upload_is_sniffed_and_hashed_whole` |
+
+## Auth, sessions, app passwords, email, OAuth, rate limits, SSRF
+
+### auth.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| provides valid access and refresh token on account creation. | covered | `auth::valid_tokens_on_account_creation` |
+| provides valid access and refresh token on session creation. | covered | `auth::valid_tokens_on_session_creation` |
+| allows session creation using email address. | covered | `auth::session_creation_using_email_address` (upper-cased email) |
+| fails on session creation with a bad password. | covered | `auth::bad_password_and_unknown_identifier_are_indistinguishable` (401 AuthenticationRequired, "Invalid identifier or password") |
+| returns identical error responses for unknown identifier and known-identifier-with-wrong-password. | covered | `auth::bad_password_and_unknown_identifier_are_indistinguishable` |
+| returns identical error responses ... in the OAuth sign-in flow. | ported | `oauth::ref_oauth::ref_oauth_sign_in_errors_are_indistinguishable`. vlpds signs in with HTML form posts (`/oauth/authorize/sign-in`, `/oauth/account/sign-in`), not the reference's JSON `/@atproto/oauth-provider/~api/sign-in`, so the test compares those responses; the wording is "Invalid handle or password" |
+| provides valid access and refresh token on session refresh. | covered | `auth::valid_tokens_on_session_refresh_and_chained_refresh` |
+| handles racing refreshes | covered | `auth::handles_racing_refreshes` |
+| refresh token provides new token with same id on multiple uses during grace period. | covered | `auth::refresh_reuse_within_grace_period_yields_same_token_id` |
+| refresh token is revoked after grace period completes. | ported | `ref_auth::ref_refresh_token_revoked_after_grace_period` (ages the stored `sess/{jti}` state). The reference's "row was cleaned up" check is SQL-internal (N/A) |
+| refresh token is revoked when session is deleted. | covered | `auth::refresh_token_revoked_when_session_deleted`; exact "Token has been revoked" in `ref_auth::ref_refresh_error_messages` |
+| access token cannot be used to refresh a session. | covered | `auth::access_token_cannot_refresh_and_refresh_token_cannot_access`; "Token could not be verified" in `ref_auth::ref_refresh_error_messages` (product fix: vlpds said "Bad token scope"; src/xrpc/server.rs `refresh_claims`) |
+| expired refresh token cannot be used to refresh a session. | covered | `auth::expired_refresh_token_cannot_be_used` (forged expired HS256 refresh JWT; ExpiredToken; deleteSession of it is OK) |
+| actor takedown disallows fresh session. | covered | `auth::actor_takedown_disallows_fresh_session` |
+| actor takedown disallows refresh session. | covered | `auth::actor_takedown_disallows_refresh_session` |
+| when 2FA is enabled > challenges for a 2FA token on session creation | covered | `auth::email_2fa_challenges_and_accepts_token` (was `#[ignore]`d as "replaced by TOTP"; vlpds has the email factor now, so un-ignored and passing), `email_2fa::sign_in_with_emailed_code` |
+| when 2FA is enabled > accepts a 2FA token after challenging on session creation | covered | `auth::email_2fa_challenges_and_accepts_token` (un-ignored). The mailer-spy `locale: undefined` check is TS-internal (N/A) |
+| when 2FA is enabled > rejects an invalid 2FA token after challenging on session creation | covered | `auth::email_2fa_rejects_invalid_token` (un-ignored), `email_2fa::sign_in_with_emailed_code` |
+
+### app-passwords.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| creates an app-specific password | covered | `app_passwords::app_password_lifecycle` |
+| creates a privileged app-specific password | covered | `app_passwords::app_password_lifecycle` |
+| creates a session with an app-specific password | covered | `app_passwords::app_password_lifecycle` |
+| creates a session with an app-specific password when the account has 2FA enabled | covered | `email_2fa::sign_in_with_emailed_code` ("app passwords bypass the factor"), `email_2fa::wrong_codes_lock_the_factor`, `totp::app_password_login_bypasses_totp` |
+| creates an access token for an app with a restricted scope | covered | `app_passwords::app_password_lifecycle` (`com.atproto.appPass` / `com.atproto.appPassPrivileged`) |
+| allows actions to be performed from app | covered | `app_passwords::app_password_lifecycle` |
+| restricts full access actions | covered | `app_passwords::app_password_lifecycle`; exact 400 InvalidToken "Bad token scope" in `ref_auth::ref_app_password_error_messages` |
+| restricts privileged app password actions (listConvos({})) | ported | `ref_auth::ref_app_password_error_messages` (400 InvalidToken "Bad token method"; product fix: vlpds answered 403 InsufficientScope, src/xrpc/authn.rs `need_rpc`). The call carries an explicit `atproto-proxy` header: vlpds refuses chat.bsky.* without one (`proxy::target_selection_and_rejections`), where the reference defaults it to the AppView. Group E (proxy) owns that difference |
+| restricts privileged app password actions (listConvos()) | ported | same test (the reference's duplicate case) |
+| restricts service auth token methods for non-privileged access tokens | covered | `app_passwords::app_password_lifecycle` (both casings); the reference's message in `ref_auth::ref_app_password_error_messages` |
+| allows privileged service auth token scopes for privileged access tokens | covered | `app_passwords::app_password_lifecycle` |
+| persists scope across refreshes | covered | `app_passwords::app_password_lifecycle` |
+| persists privileged scope across refreshes | covered | `app_passwords::app_password_lifecycle` |
+| lists available app-specific passwords | covered | `app_passwords::app_password_lifecycle` (listing from an app-password session; createdAt-descending order as the reference, not asserted) |
+| revokes an app-specific password | divergent | The reference revokes with the *app-password* session (`revokeAppPassword` takes ACCESS_STANDARD). vlpds requires a full session (`full_access` in `revoke_app_password`, commented "stricter than the reference"); `app_passwords::app_password_cannot_manage_account` asserts the refusal. vlpds is likewise stricter for `identity.updateHandle` (reference: ACCESS_STANDARD) |
+| no longer allows session refresh after revocation | covered | `app_passwords::app_password_lifecycle`; "Token has been revoked" in `ref_auth::ref_app_password_error_messages` |
+| no longer allows session creation after revocation | covered | `app_passwords::app_password_lifecycle`; "Invalid identifier or password" in `ref_auth::ref_app_password_error_messages` |
+
+### email-auth-factor.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| enables the auth factor without a token | covered | `email_2fa::toggles_like_the_reference` (a step-by-step port of this file) |
+| no-ops when the auth factor is already enabled | covered | `email_2fa::toggles_like_the_reference` |
+| does not request a factor change when emailAuthFactor is omitted | covered | `email_2fa::toggles_like_the_reference` |
+| rejects enabling the auth factor while changing email even if already enabled | covered | `email_2fa::toggles_like_the_reference` |
+| requires a confirmation token to disable the auth factor | covered | `email_2fa::toggles_like_the_reference` |
+| rejects the email auth factor change with an invalid token | covered | `email_2fa::toggles_like_the_reference` |
+| disables the auth factor with a valid token | covered | `email_2fa::toggles_like_the_reference` |
+| disables the auth factor with a requestEmailUpdate token | covered | `email_2fa::toggles_like_the_reference` |
+| no-ops when the auth factor is already disabled | covered | `email_2fa::toggles_like_the_reference` |
+| matches the account email case-insensitively | covered | `email_2fa::toggles_like_the_reference` |
+
+### email-confirmation.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| starts a user out unverified | covered | `email_flows::email_confirmation_and_update_flow` |
+| allows email update without token when unverified | covered | `email_flows::email_confirmation_and_update_flow` |
+| requests email confirmation | covered | `email_flows::email_confirmation_and_update_flow` (one mail to the address); subject "Email Confirmation" and HTML "Confirm your email" in `ref_auth::ref_email_confirmation_and_update_mails` |
+| fails email confirmation with a bad token (InvalidToken) | covered | `email_flows::email_confirmation_and_update_flow` |
+| fails email confirmation with a bad token (InvalidEmail) | covered | `email_flows::email_confirmation_and_update_flow` |
+| confirms email | covered | `email_flows::email_confirmation_and_update_flow` |
+| disallows email update without token when verified | covered | `email_flows::email_confirmation_and_update_flow` (TokenRequired) |
+| requests email update | covered | `email_flows::email_confirmation_and_update_flow`; subject "Email Update Requested" and HTML "Update your email" in `ref_auth::ref_email_confirmation_and_update_mails` |
+| fails email update with a bad token | covered | `email_flows::email_confirmation_and_update_flow` |
+| fails email update with a badly formatted email | GAP | The reference's case is a *disposable* domain (`bad-email@disposeamail.com`, rejected through the `disposable-email-domains-js` list). vlpds has no disposable-domain blocklist and accepts it. The same message for a syntactically invalid address is asserted in `ref_auth::ref_email_confirmation_and_update_mails`. Adding the list is a product decision (a dependency or a vendored list of ~100k domains), not a small fix |
+| fails email update with in-use email | covered | `email_flows::email_confirmation_and_update_flow`; exact message in `ref_auth::ref_email_confirmation_and_update_mails` |
+| updates email | covered | `email_flows::email_confirmation_and_update_flow` |
+
+### get-service-auth.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| issues a token whose aud matches a bare-DID input | covered | `service_auth::issues_verifiable_token_for_bare_did_aud` |
+| issues a token whose aud matches a combined did#serviceId input | covered | `service_auth::issues_token_for_did_service_id_aud` |
+| rejects malformed aud with InvalidRequest | covered | `service_auth::rejects_malformed_aud` |
+| rejects an aud with a non-atproto DID method | covered | `service_auth::rejects_malformed_aud` (`did:foo:bar`) |
+| rejects an aud with empty fragment | covered | `service_auth::rejects_malformed_aud` (`{pds}#`) |
+
+### moderator-auth.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| allows service auth requests from the configured appview did | GAP | vlpds has no `modServiceDid`: the admin methods (`require_admin` in src/xrpc/admin.rs) accept only admin Basic auth. The reference also accepts a service JWT from the configured moderation service (`authVerifier.moderator`/`modService`) on admin.getSubjectStatus/updateSubjectStatus/getAccountInfo(s)/sendEmail/getInviteCodes/(enable,disable)AccountInvites/disableInviteCodes and app.bsky.actor.getPreferences. An Ozone instance can't act on this PDS with service auth. Needs a config option and a verifier branch (`verify_service_jwt` already exists); left as a feature gap |
+| does not allow requests from another did | GAP | as above (reference: 401 UntrustedIss "Untrusted issuer") |
+| does not allow requests with a bad signature | GAP | as above ("jwt signature does not match jwt issuer"; vlpds's `verify_service_jwt` already produces this message for other callers) |
+| does not allow requests with a bad aud | GAP | as above ("jwt audience does not match service did"; same) |
+
+### rate-limits.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| rate limits by ip | ported | `ref_auth::ref_rate_limits_by_ip` (resetPassword: 50 per 5 min per IP, then 429 RateLimitExceeded "Rate Limit Exceeded") |
+| rate limits by a custom key | covered | `rate_limits::create_session_per_identifier_and_ip` (30 per identifier, another identifier unaffected), `rate_limits::create_session_identifier_variants_share_a_bucket` |
+
+### oauth.test.ts
+
+(The reference drives its React sign-in UI with puppeteer in French; vlpds has its own server-rendered English pages, driven with form posts in tests/all/oauth.rs.)
+
+| case | status | vlpds |
+|---|---|---|
+| Allows to sign-up through OAuth (prompt=create) | covered | `oauth::prompt_create_signs_up`, `oauth::sign_up_page_with_required_invites` |
+| Allows canceling the OAuth flow | covered | `oauth::account_chooser_prompts_and_denial` (deny -> `access_denied` redirect with state + iss), `oauth::response_modes_form_post_and_fragment` |
+| allows resetting the password | divergent | vlpds's OAuth pages have no "forgot password" step. Password reset is the XRPC requestPasswordReset/resetPassword flow (`smtp_mail::password_reset_is_mailed_over_smtp`, `email_flows`) used by the account web UI. Locale negotiation (`locale: 'fr'`) is N/A: the pages are English only |
+| restores the reset-password step after a page refresh | divergent | as above (no reset step in the OAuth UI) |
+| Allows to sign-in through OAuth | covered | `oauth::full_flow_create_record_refresh_and_revoke` ("remember this account" = the device cookie) |
+| remembers the session | covered | `oauth::account_chooser_prompts_and_denial` (remembered device accounts skip the password) |
+| revokes OAuth sessions on deactivation & requires re-activation on sign-in | ported (partly divergent) | Revocation: `oauth::ref_oauth::ref_account_deactivation_over_oauth` (product fix: OAuth deactivation now drops OAuth sessions, authorized clients and app passwords). Divergent: vlpds's account page has no "deactivate" button (deactivation is the XRPC method), and signing in to a deactivated account is refused ("This account is deactivated or suspended", `LoginError::Inactive`) instead of offering "Yes, reactivate my account" |
+| with 2FA > Allows to sign-in through OAuth | covered | `oauth::email_code_prompt_on_login` (code mailed on the password step, masked address hint, code step). `locale: 'fr'` reaching the mailer is N/A (English only) |
+| with 2FA > Prevents to sign-in through OAuth with invalid OTP | covered | `oauth::email_code_prompt_on_login` ("AAAAA-AAAAA" -> "Invalid sign-in code", then the right code) |
+
+### oauth-deactivation.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| rejects deactivation when the session lacks the status scope | ported | `oauth::ref_oauth::ref_account_deactivation_over_oauth`. Product fix: OAuth scope refusals were 403 `InsufficientScope` "credentials do not grant this action"; they are now the reference's 403 `ScopeMissingError` `Missing required scope "<scope>"` (src/xrpc/authn.rs `need_*`) |
+| rejects reactivation over OAuth with a message pointing at the account page | ported | same test (already implemented; message mentions the "account management page") |
+| deactivates the account when the status scope is granted | ported | same test (getRepoStatus `{did, active: false, status: "deactivated"}`) |
+| revokes app passwords on OAuth deactivation | ported | same test. Product fix: OAuth deactivation now deletes the app passwords (and their sessions) |
+| revokes the OAuth session that performed the deactivation | ported | same test (getSession 401 for that and every other OAuth session; the password session is kept, as in the reference). Product fix: OAuth deactivation now revokes all OAuth sessions and remembered authorizations. Control: `oauth::ref_oauth::ref_password_session_deactivation_keeps_credentials` |
+
+### oauth-lexicon.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| resolves permission sets hosted on the PDS itself | covered | `oauth::include_permission_set` (permission set published in a local repo, resolved, shown on consent, granted scope narrowed to it) |
+| fails to resolve lexicons that do not exist on the PDS | covered | `oauth::include_permission_set` (unresolvable `include:` -> `invalid_scope` at PAR). The reference calls the lexicon manager directly; its error text is TS-internal |
+
+### ssrf.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| with ssrf protection enabled > refuses to send registerPush to a non-unicast endpoint. | ported | `ref_ssrf::ref_with_ssrf_protection_enabled_nothing_is_sent` (vlpds's SSRF policy is on outside dev mode; service DID is a did:plc in the mock directory, endpoint `http://localhost:<port>`) |
+| with ssrf protection enabled > refuses to send unregisterPush to a non-unicast endpoint. | ported | same test |
+| with ssrf protection enabled > refuses to send createReport to a non-unicast endpoint. | ported | same test (atproto-proxy `did#atproto_labeler`) |
+| with ssrf protection disabled > sends registerPush to the endpoint. | ported | `ref_ssrf::ref_with_ssrf_protection_disabled_calls_are_sent` (dev mode) |
+| with ssrf protection disabled > sends unregisterPush to the endpoint. | ported | same test |
+| with ssrf protection disabled > sends createReport to the endpoint. | ported | same test |
+
+## Repo writes, validation, blobs, preferences, handles
+
+### crud.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| registers users | covered | `crud::registers_and_describes_repo` |
+| describes repo | covered | `crud::registers_and_describes_repo` |
+| creates records | covered | `crud::creates_gets_lists_and_deletes_records` |
+| CRUDs records with the semantic sugars | covered | `crud::creates_gets_lists_and_deletes_records` (the sugars are client-side wrappers over the same routes) |
+| attaches images to a post | ported + divergent | `ref_repo::ref_attaches_images_to_a_post` (unlisted until referenced, then listed and served; record carries the same ref). Divergent: the reference refuses `getBlob` before a record references the upload (temp store); vlpds writes uploads straight to their final key and serves them to anyone holding the CID until the GC sweep collects them |
+| creates records with the correct key described by the schema | covered | `crud::profile_gets_self_rkey` |
+| paginates > in forwards order | covered | `crud::paginates_list_records` |
+| paginates > in reverse order | covered | `crud::paginates_list_records` |
+| paginates > reverses | covered | `crud::paginates_list_records` (cursor = first/last rkey, reverse is exact reverse) |
+| deleteRecord > deletes a record if it exists | covered | `crud::creates_gets_lists_and_deletes_records`, `crud::delete_of_missing_record_is_a_noop` |
+| deleteRecord > no-ops if record doesn't exist | covered | `crud::delete_of_missing_record_is_a_noop` |
+| deleteRecord > does not delete the underlying block if it is referenced elsewhere | covered | `crud::delete_keeps_block_referenced_elsewhere` |
+| putRecord > creates a new record if it doesn't already exist | covered | `crud::put_record_creates_then_updates` |
+| putRecord > updates a record if it already exists | covered | `crud::put_record_creates_then_updates` |
+| putRecord > still works if repo is specified by handle | covered | `crud::put_record_by_handle` |
+| putRecord > does not produce commit on no-op update | covered | `crud::put_record_noop_does_not_commit` |
+| putRecord > fails on user mismatch | ported | `ref_repo::ref_writes_to_another_repo_are_auth_required` (was only `client_err` in `crud::write_requires_auth_and_matching_repo`; **fix**: 403 Forbidden -> 401 AuthenticationRequired) |
+| putRecord > fails on invalid record | ported | `ref_repo::ref_put_record_invalid_update_leaves_record` (the float case's message is "floats are not allowed" without the `$.record.description` path; the integer case names the field) |
+| putRecord > updates a legacy blob ref when updating profile | divergent | vlpds refuses legacy `{cid, mimeType}` blob refs on every write (`crud::rejects_legacy_blob_refs_and_bad_values`). The reference's profile-only upgrade is a `@TODO remove after migrating legacy blobs` hack; vlpds is a new PDS with no legacy-blob data to migrate |
+| defaults an undefined $type on records | covered | `crud::defaults_undefined_type` |
+| requires the schema to be known if explicitly validating | covered | `crud::unvalidated_writes_of_unknown_lexicons` (message names the NSID) |
+| does not require the schema to be known if not explicitly validating | covered | `crud::unvalidated_writes_of_unknown_lexicons` |
+| requires the $type to match the schema | covered | `crud::requires_type_to_match_collection` |
+| requires valid rkey | covered | `crud::requires_valid_rkey` |
+| validates the record on write | covered | `crud::validates_known_records_on_write` |
+| validates datetimes rigorously | covered | `crud::validates_known_records_on_write` |
+| unvalidated writes > disallows creation of unknown lexicons when validate is set to true | covered | `crud::unvalidated_writes_of_unknown_lexicons` |
+| unvalidated writes > allows creation of unknown lexicons when validate is not set to true | covered | `crud::unvalidated_writes_of_unknown_lexicons` |
+| unvalidated writes > allows update of unknown lexicons when validate is set to false | ported | `ref_repo::ref_updates_unknown_lexicon_records` |
+| unvalidated writes > applyWrites returns results with validation status | ported | `ref_repo::ref_apply_writes_results_carry_validation_status` |
+| unvalidated writes > correctly associates images with unknown record types | ported | `ref_repo::ref_images_in_unknown_record_types_are_associated` (association observed via listBlobs/getBlob and release on delete) |
+| unvalidated writes > enforces record type constraint even when unvalidated | covered | `crud::requires_type_to_match_collection` |
+| unvalidated writes > enforces blob ref format even when unvalidated | covered | `crud::rejects_legacy_blob_refs_and_bad_values` |
+| compare-and-swap > createRecord succeeds on proper commit cas | covered | `crud::create_record_swap_commit` |
+| compare-and-swap > createRecord fails on bad commit cas | covered | `crud::create_record_swap_commit` |
+| compare-and-swap > deleteRecord succeeds on proper commit cas | covered | `crud::delete_record_swap_commit_and_record` |
+| compare-and-swap > deleteRecord fails on bad commit cas | covered | `crud::delete_record_swap_commit_and_record` |
+| compare-and-swap > deleteRecord succeeds on proper record cas | covered | `crud::delete_record_swap_commit_and_record` |
+| compare-and-swap > deleteRecord fails on bad record cas | covered | `crud::delete_record_swap_commit_and_record` |
+| compare-and-swap > putRecord succeeds on proper commit cas | covered | `crud::put_record_swap_commit` |
+| compare-and-swap > putRecord fails on bad commit cas | covered | `crud::put_record_swap_commit` |
+| compare-and-swap > putRecord succeeds on proper record cas | covered | `crud::put_record_swap_record` |
+| compare-and-swap > putRecord fails on bad record cas | covered | `crud::put_record_swap_record` |
+| compare-and-swap > applyWrites succeeds on proper commit cas | covered | `crud::apply_writes_swap_commit` |
+| compare-and-swap > applyWrites fails on bad commit cas | covered | `crud::apply_writes_swap_commit` |
+| compare-and-swap > writes fail on values that can't reliably transform between cbor to lex | covered | `crud::rejects_values_too_deep_for_cbor` |
+| prevents duplicate likes | GAP | `ref_repo::ref_prevents_duplicate_backlinks` (`#[ignore]`): the reference's createRecord deletes the account's earlier like/repost with the same `subject.uri` in the same commit (`getBacklinkConflicts`). vlpds has no backlink index; adding one touches the worker apply path, import, reshard and migration, so not a small fix |
+| prevents duplicate reposts | GAP | same as above |
+| prevents duplicate blocks | GAP | same as above (follow/block keyed on `subject` DID) |
+| prevents duplicate follows | GAP | same as above |
+| doesn't serve taken-down record | covered | `moderation::takes_down_and_restores_records` (getRecord + listRecords) |
+| doesn't serve taken-down actor | ported | `ref_repo::ref_taken_down_actor_records_not_served` (**fix**: listRecords on an unknown/taken-down/deactivated repo was 400 RepoNotFound/RepoTakendown/RepoDeactivated; now the reference's 400 InvalidRequest "Could not find repo: {repo}". The self/admin exemption of `sync::assert_available` is kept) |
+
+### create-post.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| allows for creating posts with tags | covered | `create_post::creates_posts_with_tags` |
+| handles RichText tag facets as well | covered | `create_post::creates_posts_with_tag_facets` |
+
+### file-uploads.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| handles client abort | ported | `ref_repo::ref_upload_client_abort` (body stream fails mid-upload; server stays healthy, nothing stored) |
+| uploads files | covered | `file_uploads::uploads_references_and_serves_a_blob` (the reference's temp-key table rows are SQLite internals; the observable part is the returned ref/size/mime) |
+| can reference the file | covered | `file_uploads::uploads_references_and_serves_a_blob` |
+| after being referenced, the file is moved to permanent storage | covered | `file_uploads::uploads_references_and_serves_a_blob` (served by getBlob, listed by listBlobs) |
+| can fetch the file after being referenced | covered | `file_uploads::uploads_references_and_serves_a_blob` (bytes, content-type, CSP, nosniff) |
+| does not allow referencing a file that is outside blob constraints | covered | `file_uploads::rejects_blob_outside_lexicon_constraints` |
+| does not make a blob permanent if referencing failed | ported | `ref_repo::ref_failed_reference_does_not_make_blob_permanent` (observed as "not referenced": unlisted, later referencable; same temp-store divergence as above for getBlob) |
+| permits duplicate uploads of the same file | covered | `file_uploads::permits_duplicate_uploads` |
+| supports compression during upload | covered | `file_uploads::supports_gzip_upload` |
+| corrects a bad mimetype | covered | `file_uploads::mime_types` (PNG declared video/mp4 served as image/png) |
+| handles pngs | covered | `file_uploads::mime_types` |
+| handles unknown mimetypes | covered | `file_uploads::mime_types` |
+| handles text | covered | `file_uploads::mime_types` |
+| handles json | covered | `file_uploads::mime_types` |
+
+### blob-deletes.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| deletes blob when record is deleted | covered | `blob_deletes::deletes_blob_when_record_is_deleted` |
+| deletes blob when blob-ref in record is updated | covered | `blob_deletes::deletes_blob_when_ref_is_updated` |
+| does not delete blob when blob-ref in record is not updated | covered | `blob_deletes::keeps_blob_when_ref_is_not_updated` |
+| does not delete blob when blob is reused by another record in same commit | covered | `blob_deletes::keeps_blob_reused_by_another_record_in_same_commit` |
+| does delete blob from user blob store if another user is using it | covered | `blob_deletes::deletes_from_own_store_even_if_another_user_uses_it` |
+
+Note: vlpds deletes blob bytes in a GC sweep with a grace period (`blob_deletes::gc_grace_protects_recent_uploads`), not in the write transaction; the tests run a zero-grace sweep.
+
+### preferences.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| requires auth to set or put preferences. | covered | `preferences::requires_auth`; message in `ref_repo::ref_preferences_error_messages` (**fix**: missing-auth message "authentication required" -> the reference's "Authentication Required". Note: the reference's error *name* for a missing Authorization header is `AuthMissing` (auth-verifier.ts `AuthRequiredError(undefined, 'AuthMissing')`); vlpds and its suite use `AuthenticationRequired`, left as is) |
+| gets preferences, before any are set. | covered | `preferences::put_get_update_and_clear` |
+| only gets preferences in app.bsky namespace. | N/A | seeds a `com.atproto` pref through the TS actor store directly; over XRPC vlpds (like the reference) refuses non-app.bsky prefs, so there is no external way to plant one (`preferences::fails_outside_namespace`) |
+| puts preferences, all creates. | covered | `preferences::put_get_update_and_clear` (the "other namespace not clobbered" half is the same internal-store N/A) |
+| puts preferences, updates and removals. | covered | `preferences::put_get_update_and_clear` |
+| puts preferences, clearing them. | covered | `preferences::put_get_update_and_clear` |
+| fails putting preferences outside namespace. | covered | `preferences::fails_outside_namespace`; message in `ref_repo::ref_preferences_error_messages` |
+| fails putting preferences without $type. | covered | `preferences::fails_without_type`; message in `ref_repo::ref_preferences_error_messages` |
+| does not read permissioned preferences with an app password | covered | `preferences::app_password_cannot_read_write_or_remove_personal_details` |
+| does not write permissioned preferences with an app password | covered | same; message in `ref_repo::ref_preferences_error_messages` |
+| does not remove permissioned preferences with an app password | covered | same |
+| personalDetailsPref and declaredAgePref > declaredAgePref is computed and returned for authed user | covered | `preferences::declared_age_pref_is_computed_and_not_settable` |
+| personalDetailsPref and declaredAgePref > declaredAgePref is computed and returned for app password | covered | same |
+| personalDetailsPref and declaredAgePref > user cannot set declaredAgePref | covered | same |
+
+### races.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| handles races in record routes | covered | `races::concurrent_record_writes_all_land` (the reference stalls a transaction through actor-store internals; vlpds drives concurrent writes over XRPC and verifies the exported repo), plus `races::concurrent_swap_*` |
+
+### handles.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| resolves handles | covered | `handles::resolves_handles` |
+| does not resolve unknown handles | covered | `handles::resolves_handles`; message in `ref_handles::ref_handle_error_messages` |
+| resolves non-normalize handles | covered | `handles::resolves_handles` |
+| allows a user to change their handle | covered | `handles::user_changes_handle` |
+| updates their did document | covered | `handles::user_changes_handle` (alsoKnownAs) |
+| allows a user to login with their new handle | covered | `handles::user_changes_handle` |
+| does not allow taking a handle that already exists | covered | `handles::cannot_take_existing_handle`; exact message in `ref_handles::ref_handle_error_messages` |
+| handle updates are idempotent | covered | `handles::handle_updates_are_idempotent` |
+| if handle update fails, it does not update their did document | covered | `handles::cannot_take_existing_handle` |
+| disallows handles that do not resolve to a DID | covered | `handles::external_handle_must_resolve`; message in `ref_handles::ref_unresolvable_external_handle_message` |
+| validates input through lexicon schema | covered | `handles::validates_input_handle_syntax` |
+| applies PDS specific handle length constraints | covered | `handles::applies_pds_length_constraints` |
+| disallows reserved handles | covered | `handles::disallows_reserved_handles` |
+| allows updating to a dns handles | ported (partial) | `ref_handles::ref_updates_to_external_handle`: the update path (account + DID doc). The reference proves the handle with a mocked DNS TXT record; vlpds verifies only `https://{handle}/.well-known/atproto-did` (no DNS resolver dependency) and skips the proof in dev mode. DNS TXT verification is a GAP |
+| does not allow updating to an invalid dns handle | ported | `ref_handles::ref_unresolvable_external_handle_message` (non-dev mode) |
+| allows admin overrules of service domains | covered | `handles::admin_overrides_handles` |
+| allows admin override of reserved domains | covered | `handles::admin_overrides_handles` |
+| requires admin auth | covered | `handles::admin_update_requires_admin_auth`; error name in `ref_handles::ref_admin_update_handle_auth_message` |
+
+### handle-validation.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| validates service constraints | covered | `handle_validation::validates_service_constraints`, `handle_validation::rejects_handles_outside_service_domains` (unit test of `ensureHandleServiceConstraints`, exercised through createAccount) |
+| handles bad tlds | covered | `handle_validation::rejects_bad_tlds` |
+| validates handle length | covered + ported | `handle_validation::validates_handle_length`; the long-service-domain half in `ref_handles::ref_handle_length_with_long_service_domain` |
+
+## Sync, firehose, sequencer, server, PLC, moderation, invites
+
+### sync/sync.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| creates and syncs some records | covered | `sync::creates_and_syncs_records_then_deletes` (full export: signed v3 commit, MST contents == written records) |
+| syncs creates and deletes | covered | `sync::creates_and_syncs_records_then_deletes` |
+| syncs repo status | covered | `sync::repo_status_and_latest_commit` |
+| syncs latest repo commit | covered | `sync::repo_status_and_latest_commit` |
+| syncs `since` a given rev | covered | `sync::get_repo_since_returns_diff`. The reference's `< 10 blocks` bound is divergent: vlpds returns the commit, all MST nodes and the newer records (a superset; STATUS.md) |
+| sync a record proof | covered | `sync::record_inclusion_proof` |
+| sync a proof of non-existence | covered | `sync::record_non_inclusion_proof` |
+| repo takedown > returns takendown status | covered | `sync::repo_takedown_visibility` |
+| repo takedown > lists as takendown in listRepos | covered | `sync::repo_takedown_visibility` |
+| repo takedown > does not sync repo unauthed | covered | `sync::repo_takedown_visibility` (400 RepoTakendown) |
+| repo takedown > syncs repo to owner or admin | covered | `sync::repo_takedown_visibility` |
+| repo takedown > does not sync latest commit unauthed | covered | `sync::repo_takedown_visibility` |
+| repo takedown > does not sync a record proof unauthed | covered | `sync::repo_takedown_visibility` |
+
+### sync/list.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| lists hosted repos in order of creation | divergent | `sync_list::lists_all_hosted_repos` checks completeness, head and rev. The order is `(slot, DID)`, not creation order: the listing is served per shard (DESIGN.md "Online shard split/merge", listRepos) |
+| paginates listed hosted repos | covered | `sync_list::paginates_listed_repos` |
+
+### sync/subscribe-repos.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| emits sync event on account creation, matching temporary commit event. | covered | `subscribe_repos::sync_identity_account_events_on_creation` |
+| sync backfilled events | covered | `subscribe_repos::backfilled_events_rebuild_repos` |
+| syncs new events | covered | `subscribe_repos::cutover_from_backfill_to_live` |
+| handles no backfill | covered | `subscribe_repos::live_tail_without_cursor_has_no_backfill`. The reference's listener-count check is internal |
+| backfills only from provided cursor | covered | `subscribe_repos::backfills_only_from_provided_cursor` |
+| syncs handle changes (identity evts) | covered | `subscribe_repos::identity_events_on_handle_change` |
+| resends identity events on idempotent updates | covered | `subscribe_repos::identity_events_on_handle_change` (the third, repeated update re-sends `#identity`) |
+| syncs account events | covered | `subscribe_repos::account_events_deactivate_and_takedown` |
+| syncs interleaved account events | covered | `subscribe_repos::interleaved_account_events`. Divergent detail: vlpds revokes sessions on takedown, so the test logs in again before activating |
+| emits sync event on account activation | covered | `subscribe_repos::sync_event_on_account_activation` |
+| syncs account deletions (account evt) | covered | `subscribe_repos::account_deletion_events` |
+| account deletions invalidate all seq ops | divergent + ported | `ref_sync::account_deletion_is_the_last_event_on_replay`. The reference deletes the DID's earlier `repo_seq` rows. The vlpds log is the firehose and is immutable, so earlier events stay in a replay. The test checks the shared guarantee: `#account deleted` is the DID's last event, it appears exactly once, and the repo is gone |
+| sends info frame on out of date cursor | covered | `subscribe_repos::outdated_cursor_info_or_full_replay`. vlpds serves old cursors from the durable log when it can (full replay), and otherwise sends `#info OutdatedCursor` first |
+| errors on future cursor | covered | `subscribe_repos::errors_on_future_cursor` |
+
+### sync/invertible-ops.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| works | covered | `invertible_ops::every_commit_inverts_to_prev_data` (also `sync11_property::*`) |
+
+### sequencer.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| sends to outbox | covered | `sequencer::sends_to_outbox_in_order` (through the WebSocket rather than the TS `Outbox` class) |
+| handles cut over | covered | `sequencer::handles_cutover_while_writing` |
+| only gets events after cursor | covered | `sequencer::only_gets_events_after_cursor` |
+| buffers events that are not being read | covered | `sequencer::buffers_events_that_are_not_being_read` |
+| errors when buffer is overloaded | covered | `firehose_fanout::stalled_subscriber_is_cut_off_without_delaying_writes_or_others` (ConsumerTooSlow, then close). The bound is in bytes (`firehose_max_lag_bytes`), not the reference's event count `maxBufferSize` |
+| handles many open connections | covered | `sequencer::many_open_connections`, `subscribe_repos::many_open_connections_see_identical_streams` |
+| root block must be returned in sync event | covered | `sequencer::root_block_in_sync_event` |
+
+### server.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| preserves 404s. | covered | `server_basics::preserves_404s` |
+| error handler turns unknown errors into 500s. | N/A | It injects a throwing Express route into the TS app (internal). The vlpds XRPC error envelope is covered by `server_basics::malformed_json_and_missing_params_are_400` and `unknown_xrpc_method_without_appview` |
+| limits size of json input. | covered | `server_basics::limits_size_of_json_input` |
+| compresses large json responses | covered | `server_basics::compresses_large_json_and_car_responses_only` |
+| compresses large car file responses | covered | `server_basics::compresses_large_json_and_car_responses_only` |
+| does not compress small payloads | covered | `server_basics::compresses_large_json_and_car_responses_only` |
+| healthcheck succeeds when database is available. | covered | `server_basics::healthcheck` |
+| healthcheck fails when database is unavailable. (it.skip) | N/A | Skipped in the reference itself. It also needs a killable Postgres |
+
+### plc-operations.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| prevents submitting an operation that removes the server's rotation key | covered | `plc::sign_and_submit_plc_operations` (message asserted) |
+| prevents submitting an operation that incorrectly sets the signing key | covered | `plc::sign_and_submit_plc_operations` |
+| prevents submitting an operation that incorrectly sets the handle | covered | `plc::sign_and_submit_plc_operations` |
+| prevents submitting an operation that incorrectly sets the pds endpoint | covered | `plc::sign_and_submit_plc_operations` |
+| prevents submitting an operation that incorrectly sets the pds service type | covered | `plc::sign_and_submit_plc_operations` |
+| does not allow signing plc operation without a token | ported | `ref_plc::plc_signature_request_mail_and_token_errors` (the reference's error message). `plc::sign_and_submit_plc_operations` covered only the status |
+| requests a plc signature | ported | `ref_plc::plc_signature_request_mail_and_token_errors` (one mail to the account, subject "PLC Update Operation Requested", HTML contains "PLC update requested", carries a token) |
+| does not sign a plc operation with a bad token | covered | `plc::sign_and_submit_plc_operations`. The "Token is invalid" message is also asserted in `ref_plc::*` |
+| signs a plc operation with a valid token | covered | `plc::sign_and_submit_plc_operations` |
+| submits a valid operation | covered | `plc::sign_and_submit_plc_operations` |
+| emits an identity event after a valid operation | covered | `plc::sign_and_submit_plc_operations` (`#identity` on the firehose after submit) |
+
+### plc-rotation-key-override.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| uses the override for XRPC account creation | N/A | It tests the TS constructor-injection override (`plcRotationKey` over the hex config). vlpds takes one configured `RotationKey`, and `plc::create_account_registers_the_genesis_op` checks that the genesis op carries it |
+| uses the override for handle updates | N/A | Same TS-internal override (it calls `accountManager.updateHandle` directly). The behavior is covered by `plc::update_handle_submits_a_plc_update_first` |
+| uses the override for OAuth account creation | N/A | Same TS-internal override (`oauthProvider.accountManager.createAccount`). OAuth sign-up (`oauth::prompt_create_signs_up`) goes through the same `create_account_inner` as XRPC createAccount, so it registers with the same key |
+
+### moderation.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| takes down accounts | covered | `moderation::takes_down_and_restores_accounts` |
+| restores takendown accounts | covered | `moderation::takes_down_and_restores_accounts` |
+| takes down records | covered | `moderation::takes_down_and_restores_records` |
+| restores takendown records | covered | `moderation::takes_down_and_restores_records` |
+| blob takedown > takes down blobs | covered | `moderation::blob_takedown_lifecycle` |
+| blob takedown > removes blob from the store | N/A | It reads the TS blobstore directly (internal). The observable effect (getBlob 400 BlobNotFound) is in `moderation::blob_takedown_lifecycle` |
+| blob takedown > prevents blob from being referenced again. | covered | `moderation::blob_takedown_lifecycle` |
+| blob takedown > prevents blob from being reuploaded | covered | `moderation::blob_takedown_lifecycle` |
+| blob takedown > prevents image blob from being served. | covered | `moderation::blob_takedown_lifecycle` |
+| blob takedown > restores blob when takedown is removed | covered | `moderation::blob_takedown_lifecycle` |
+| blob takedown > prevents blobs of takendown accounts from being served. | ported | `ref_moderation::takendown_account_blobs_are_served_to_owner_and_admin_only`. `moderation::blob_takedown_lifecycle` lacked the "owner may still fetch" leg; it passes |
+
+### invite-codes.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| describes the fact that invites are required | covered | `invite_codes::describes_that_invites_are_required` |
+| succeeds with a valid code | covered | `invite_codes::valid_bad_and_missing_codes` |
+| fails on bad invite code | covered | `invite_codes::valid_bad_and_missing_codes` |
+| fails on invite code from takendown account | covered | `invite_codes::fails_on_invite_code_from_takendown_account` |
+| fails on used up invite code | covered | `invite_codes::fails_on_used_up_invite_code` |
+| handles racing invite code uses | covered | `invite_codes::handles_racing_invite_code_uses` |
+| allow users to get available user invites | GAP | Needs periodic user invite codes (`inviteInterval`/`inviteEpoch`), which vlpds does not implement: getAccountInviteCodes never generates codes. The reference test also backdates `actor.createdAt` in SQL. Left as a feature gap. The reference default (`inviteInterval` unset) behaves like vlpds |
+| admin gifted codes to not impact a users available codes | covered (partial) | `invite_codes::admin_gifted_codes_are_listed_for_the_account` (the 3 admin codes). The 2 self-generated codes depend on the same `inviteInterval` gap |
+| creates invites based on epoch | GAP | Same `inviteInterval`/`inviteEpoch` feature gap (it also inserts invite rows in SQL) |
+| prevents use of disabled codes | covered | `invite_codes::prevents_use_of_disabled_codes` |
+| does not allow disabling all admin codes | covered | `invite_codes::does_not_allow_disabling_all_admin_codes` |
+| creates many invite codes | covered | `invite_codes::creates_many_invite_codes` |
+
+### invites-admin.test.ts
+
+These are adapted: alice's own codes are admin-gifted, because vlpds has no `inviteInterval`.
+
+| case | status | vlpds |
+|---|---|---|
+| gets a list of invite codes by recency | ported | `ref_invites::lists_invite_codes_by_recency_and_paginates` |
+| paginates by recency | ported | `ref_invites::lists_invite_codes_by_recency_and_paginates` |
+| gets a list of invite codes by usage | ported | `ref_invites::lists_invite_codes_by_usage_and_paginates` |
+| paginates by usage | ported | `ref_invites::lists_invite_codes_by_usage_and_paginates` |
+| hydrates invites into admin.getAccountInfo | ported | `ref_invites::hydrates_invites_into_get_account_info` (also checks getAccountInfos) |
+| disables an account from getting additional invite codes | ported | `ref_invites::disables_and_reenables_account_invites` (`invitesDisabled` flag; no usable codes while disabled) |
+| allows setting reason when enabling and disabling invite codes | ported | `ref_invites::disables_and_reenables_account_invites` (the `note` is accepted) |
+| creates codes in the background but disables them | GAP | Interval-generated codes (`inviteInterval`) are not implemented; the reference test also reads SQL. Divergent mechanism: vlpds's disableAccountInvites disables the account's existing codes, while the reference only sets the flag that marks newly generated codes disabled |
+| re-enables an accounts invites | ported + divergent | `ref_invites::disables_and_reenables_account_invites`. vlpds re-enables the account's existing codes. The reference only clears the flag and then generates fresh codes, so codes an admin disabled by account through disableInviteCodes would stay disabled there but be re-enabled by vlpds |
+
+## Proxying (tests/proxied)
+
+### proxied/admin.test.ts
+
+These drive a real Ozone through the PDS proxy (`tools.ozone.*` → mod service). What they assert is Ozone's behavior (report/event/repo views, label state). The PDS's part — forwarding `tools.ozone.*` with service auth and relaying upstream errors — is generic proxying.
+
+| case | status | vlpds |
+|---|---|---|
+| creates reports of a repo. | covered | `proxy::create_report_goes_to_report_service` (createReport → configured report service, service-auth `lxm`/`aud`, body relayed) |
+| takes actions and resolves reports | N/A | Ozone moderation-event semantics; the PDS only forwards (`proxy::proxies_to_default_appview_with_service_auth_and_header_rules`) |
+| fetches moderation events. | N/A | Ozone view |
+| fetches repo details. | N/A | Ozone view |
+| fetches record details. | N/A | Ozone view |
+| fetches event details. | N/A | Ozone view |
+| fetches a list of events. | N/A | Ozone view |
+| searches repos. | N/A | Ozone view |
+| passes through errors. | covered | `proxy::maps_upstream_errors` (4xx name/message relayed, 500 → 502), `ref_proxy::ref_proxy_catchall_ok_and_error` |
+| takesdown and labels repos, and reverts. | covered | the PDS side (admin `updateSubjectStatus` takedown/restore of a repo, which Ozone calls): `moderation::takes_down_and_restores_accounts`; labels are Ozone's |
+| takesdown and labels records, and reverts. | covered | `moderation::takes_down_and_restores_records`; labels are Ozone's |
+
+### proxied/decompression-bound.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| stops parsing an oversized decoded error body. | ported | `ref_proxy::ref_proxy_oversized_error_body_is_not_parsed` (gzip bomb and an uncompressed >10 MiB body; the status is relayed, the error name is not). vlpds never decodes a compressed error body (the reference decodes up to the cap), so the bomb is never inflated |
+| rejects an oversized decoded read-after-write body. | ported | `ref_proxy::ref_proxy_oversized_read_after_write_body` (502 `upstream response too large`) |
+| rejects an oversized body that is not compressed. | ported | `ref_proxy::ref_proxy_oversized_read_after_write_body` (wire cap, 502). vlpds's cap is the reference default (10 MiB, not configurable) |
+
+### proxied/feedgen.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| performs basic proxy of getFeed | covered | `read_after_write::get_feed_service_auth_names_the_generator` (generator record lookup, token `aud` = feed generator DID, `lxm` = getFeedSkeleton, UnknownFeed) |
+
+### proxied/notif.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| proxies registerPush to notif service. | covered | `push::other_service_did_resolves_its_bsky_notif_endpoint`, `push::appview_service_did_goes_to_the_configured_appview` |
+| proxies unregisterPush to notif service. | covered | same tests (both methods) |
+
+### proxied/procedures.test.ts
+
+The muting state lives in the AppView; the PDS part is proxying a JSON procedure with service auth.
+
+| case | status | vlpds |
+|---|---|---|
+| maintains muted actors. | covered | generic POST proxy: `proxy::streams_post_bodies` (body, content-type, method relayed); mute state is AppView behavior (N/A) |
+| maintains muted actor lists. | covered | as above |
+| maintains notification last seen state. | covered | as above |
+
+### proxied/proxy-catchall.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| rejects when upstream unavailable | ported | `ref_proxy::ref_proxy_upstream_unavailable` (502 UpstreamFailure "Upstream service unreachable"); also `proxy::unreachable_upstream_is_502` |
+| successfully proxies requests | ported | `ref_proxy::ref_proxy_catchall_ok_and_error`; `proxy::target_selection_and_rejections` |
+| handles cancelled upstream requests | ported | `ref_proxy::ref_proxy_cancelled_upstream` (the broken body is not delivered as complete) |
+| handles failing upstream requests | covered | `proxy::maps_upstream_errors`; `ref_proxy::ref_proxy_catchall_ok_and_error` (500 → 502 FooBar / My message) |
+| handles cancelled downstream requests | ported | `ref_proxy::ref_proxy_cancelled_downstream` |
+
+### proxied/proxy-header.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| parses proxy header | ported | `ref_proxy::ref_proxy_header_errors` (every message over the wire). divergent (minor): `did:foo#bar`, `did:foo:bar#baz`, `foo#bar` — the reference's resolver throws PoorlyFormattedDid/UnsupportedDidMethod, which surfaces as a 500; vlpds answers 400 "could not resolve proxy did" |
+| proxies requests based on header | covered | `proxy::target_selection_and_rejections` (did:web target, path, service JWT verified: `iss`, bare-DID `aud`, `lxm`) |
+| fails on a non-existant did | ported | `ref_proxy::ref_proxy_header_errors`; `proxy::target_selection_and_rejections` |
+| fails when a service is not specified | ported | `ref_proxy::ref_proxy_header_errors` |
+| fails on a non-existant service | ported | `ref_proxy::ref_proxy_header_errors`; `proxy::target_selection_and_rejections` |
+| handles failing manual pipethroughs | ported | `ref_proxy::ref_proxy_header_errors` (getPreferences for another service → upstream 501 relayed) |
+
+### proxied/proxy-oauth-aud.test.ts
+
+The reference stubs the auth verifier and calls `proxyHandler` directly; it checks that the scope check sees `did#serviceId`.
+
+| case | status | vlpds |
+|---|---|---|
+| matches an OAuth rpc scope granted with combined did#serviceId aud | covered | `oauth::scopes::tests::rpc` (lib unit test) + the proxy checks `creds.allows_rpc(lxm, Target::scope_aud())` = `did#service_id` (src/xrpc/proxy.rs) |
+| rejects an OAuth rpc scope granted for a different service id | covered | `oauth::scopes::tests::rpc` (assertion added: same DID, other service id, and the bare DID don't match) |
+
+### proxied/read-after-write.test.ts
+
+| case | status | vlpds |
+|---|---|---|
+| handles read after write on profiles | covered | `read_after_write::profile_overlay_and_images` |
+| handles image formatting | covered | `read_after_write::profile_overlay_and_images` (avatar/banner CDN URLs) |
+| handles read after write on getAuthorFeed | covered | `read_after_write::feeds_get_new_posts` |
+| handles read after write on threads | covered | `read_after_write::threads_get_new_replies` |
+| handles read after write on a thread that is not found on appview | covered | `read_after_write::threads_get_new_replies` (NotFound → built locally, parents from the AppView) |
+| handles read after write on threads with record embeds (images/external) | covered | `read_after_write::threads_get_new_replies` (images#view, external#view CDN URLs) |
+| handles read after write on threads with record embeds (embed.record) | covered | `read_after_write::threads_get_new_replies` (record#view via getPosts) |
+| handles read after write on getTimeline | covered | `read_after_write::feeds_get_new_posts` |
+| passes the appview cursors through the timeline munge | ported | `ref_proxy::ref_read_after_write_timeline_cursors_and_since` (`cursor` and `startCursor`); `cursor` also in `feeds_get_new_posts` |
+| forwards since to the appview through the timeline munge | ported | `ref_proxy::ref_read_after_write_timeline_cursors_and_since` |
+| returns lag headers | covered | `read_after_write::feeds_get_new_posts`, `profile_overlay_and_images` |
+| negotiates encoding | ported | `ref_proxy::ref_read_after_write_encoding_negotiation` |
+| defaults to identity encoding | ported | same |
+| falls back to identity encoding | ported | same |
+| errors when failing to negotiate encoding | ported | same (406). **fixed**: vlpds did not negotiate; see product fixes |
+| errors on invalid content-encoding format | ported | same (400 `Invalid accept-encoding: ";q=1"`). **fixed** |
+
+### proxied/views.test.ts
+
+All 20 cases snapshot AppView views fetched through the PDS (`app.bsky.*` GETs). Their content is the AppView's; the PDS behavior (default AppView target, service auth, header allow-lists, error relay) is covered by `proxy::proxies_to_default_appview_with_service_auth_and_header_rules`, `proxy::maps_upstream_errors` and the read-after-write tests.
+
+| case | status | vlpds |
+|---|---|---|
+| actor.getProfile | covered | generic GET proxy (above) + `read_after_write::profile_overlay_and_images` |
+| actor.getProfiles | covered | generic GET proxy + read-after-write `Kind::Profiles` |
+| actor.getSuggestions | N/A | AppView view (generic proxy covered) |
+| actor.searchActor | N/A | AppView view |
+| actor.searchActorTypeahead | N/A | AppView view |
+| feed.getAuthorFeed | covered | `read_after_write::feeds_get_new_posts` |
+| feed.getListFeed | N/A | AppView view |
+| feed.getLikes | N/A | AppView view (`read_after_write::compressed_upstream_is_munged` proxies it) |
+| feed.getRepostedBy | N/A | AppView view |
+| feed.getPosts | N/A | AppView view |
+| feed.getTimeline | covered | `read_after_write::feeds_get_new_posts` |
+| unspecced.getPopularFeedGenerators | N/A | AppView view |
+| feed.getFeedGenerator | N/A | AppView view |
+| feed.getFeedGenerators | N/A | AppView view |
+| graph.getBlocks | N/A | AppView view |
+| graph.getFollows | N/A | AppView view |
+| graph.getFollowers | N/A | AppView view |
+| graph.getList | N/A | AppView view |
+| graph.getLists | N/A | AppView view |
+| graph.getListBlocks | N/A | AppView view |

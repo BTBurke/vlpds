@@ -55,7 +55,7 @@ async fn push(app: &App, creds: &Credentials, lxm: &'static str, body: &[u8]) ->
     let did = user_did(creds)?.to_string();
     let input: J = serde_json::from_slice(body).map_err(|_| bad("Request body must be a JSON object"))?;
     let service_did = check_input(&input)?;
-    creds.require(creds.allows_rpc(lxm, &format!("{service_did}#bsky_notif")))?;
+    creds.need_rpc(lxm, &format!("{service_did}#bsky_notif"))?;
     let acct = check_takedown(app, &did, false).await?;
     let target = push_target(app, service_did, lxm).await?;
     let body = Bytes::from(serde_json::to_vec(&input).map_err(XrpcError::from_err)?);

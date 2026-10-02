@@ -62,50 +62,113 @@ These are equal within the noise of a loaded machine. The tail latencies swing b
 
 ## Results
 
-Last full run: 2026-10-01: `cargo test --test all`, run 13 times (3 via cargo, 10 directly, plus `--test-threads=2` and `=64`); all green. `cargo test` adds 47 unit tests in `src/`, all passing.
+Last full run: 2026-10-02, after the reference-coverage pass (`tests/REFERENCE_COVERAGE.md`): `cargo test --test all` all green; `cargo test --lib` 191 passed, 12 ignored.
 
-**Totals:** 267 passed, 0 failed, 2 ignored, across 36 modules. The 2 ignored tests are the email-2FA cases in `auth`: vlpds replaces email sign-in codes with TOTP, which `totp` covers.
+**Totals:** 523 passed, 0 failed, 22 ignored, across 96 modules. The ignored tests are benchmarks and long-running scale/fault tests
+(run them with `--ignored`), plus two documented reference gaps: `ref_account::ref_signing_key_rotation_resigns_the_repo` and
+`ref_repo::ref_prevents_duplicate_backlinks`. The two email-2FA cases in `auth` that used to be ignored now run (vlpds has email 2FA).
 
-| Module | Pass | Fail | Ign | Notes |
-|---|---:|---:|---:|---|
-| account | 15 | 0 | 0 |  |
-| account_deactivation | 6 | 0 | 0 |  |
-| account_status | 8 | 0 | 0 |  |
-| app_passwords | 3 | 0 | 0 |  |
-| auth | 13 | 0 | 2 | ignored: email 2FA, replaced by TOTP by design |
-| blob_deletes | 6 | 0 | 0 |  |
-| blobs | 1 | 0 | 0 |  |
-| create_post | 2 | 0 | 0 |  |
-| crud | 30 | 0 | 0 |  |
-| email_flows | 6 | 0 | 0 |  |
-| file_uploads | 11 | 0 | 0 |  |
-| firehose_backfill | 2 | 0 | 0 |  |
-| go_checker | 2 | 0 | 0 | checker built once per run (`OnceLock`) |
-| handle_validation | 5 | 0 | 0 |  |
-| handles | 12 | 0 | 0 |  |
-| harness | 1 | 0 | 0 |  |
-| interop_crypto | 7 | 0 | 0 |  |
-| interop_data_model | 8 | 0 | 0 |  |
-| interop_mst | 8 | 0 | 0 |  |
-| interop_syntax | 15 | 0 | 0 |  |
-| invertible_ops | 1 | 0 | 0 |  |
-| invite_codes | 10 | 0 | 0 |  |
-| moderation | 5 | 0 | 0 |  |
-| oauth | 10 | 0 | 0 |  |
-| preferences | 6 | 0 | 0 |  |
-| proxy | 9 | 0 | 0 |  |
-| races | 4 | 0 | 0 |  |
-| rate_limits | 6 | 0 | 0 |  |
-| sequencer | 6 | 0 | 0 |  |
-| server_basics | 6 | 0 | 0 |  |
-| service_auth | 7 | 0 | 0 |  |
-| subscribe_repos | 14 | 0 | 0 | fixed sleeps replaced by `sync_subs` polling |
-| sync | 10 | 0 | 0 | `get_repo_since_returns_diff` was flaky (2 of 3 runs failed), fixed test-side; see below |
-| sync_list | 3 | 0 | 0 |  |
-| sync11_property | 3 | 0 | 0 |  |
-| totp | 6 | 0 | 0 |  |
+The `ref_*` modules port cases from the reference PDS's own test suite; `tests/REFERENCE_COVERAGE.md` maps every reference `it()` case to a
+vlpds test, an N/A reason, a documented divergence or a gap.
 
-The earlier failures are fixed in `src/`: `sequencer::buffers_events_that_are_not_being_read` and `sync`'s `getRepo`/`listBlobs` `since`.
+| Module | Pass | Fail | Ign |
+|---|---:|---:|---:|
+| account | 17 | 0 | 0 |
+| account_deactivation | 6 | 0 | 0 |
+| account_races | 5 | 0 | 0 |
+| account_status | 8 | 0 | 0 |
+| admin_cluster | 2 | 0 | 0 |
+| app_passwords | 3 | 0 | 0 |
+| auth | 15 | 0 | 0 |
+| auth_caches | 3 | 0 | 0 |
+| blob_deletes | 6 | 0 | 0 |
+| blob_gc_race | 2 | 0 | 0 |
+| blobs | 2 | 0 | 0 |
+| bulk_create | 2 | 0 | 0 |
+| cache_caps | 2 | 0 | 0 |
+| cbor_transcode | 2 | 0 | 1 |
+| checkpoint_stall | 1 | 0 | 2 |
+| cold_start | 3 | 0 | 2 |
+| commit_cpu | 2 | 0 | 0 |
+| compaction_polling | 0 | 0 | 2 |
+| cost_defaults | 2 | 0 | 1 |
+| create_post | 2 | 0 | 0 |
+| crud | 32 | 0 | 0 |
+| differential_shrike | 25 | 0 | 3 |
+| e2e_regressions | 6 | 0 | 0 |
+| email_2fa | 6 | 0 | 0 |
+| email_flows | 6 | 0 | 0 |
+| fast_failover | 3 | 0 | 0 |
+| file_uploads | 11 | 0 | 0 |
+| firehose_backfill | 2 | 0 | 0 |
+| firehose_fanout | 2 | 0 | 0 |
+| firehose_shards | 3 | 0 | 0 |
+| firehose_startup | 3 | 0 | 0 |
+| get_blocks_index | 1 | 0 | 0 |
+| go_checker | 2 | 0 | 0 |
+| ha_auth | 2 | 0 | 0 |
+| ha_liveness | 1 | 0 | 0 |
+| handle_validation | 6 | 0 | 0 |
+| handles | 14 | 0 | 0 |
+| harness | 1 | 0 | 0 |
+| internal_auth | 2 | 0 | 0 |
+| interop_crypto | 8 | 0 | 1 |
+| interop_data_model | 8 | 0 | 0 |
+| interop_mst | 8 | 0 | 0 |
+| interop_syntax | 15 | 0 | 0 |
+| invertible_ops | 1 | 0 | 0 |
+| invite_codes | 11 | 0 | 0 |
+| invites_optional | 1 | 0 | 0 |
+| lexicons | 6 | 0 | 0 |
+| list_repos_scale | 2 | 0 | 1 |
+| log_pipeline | 2 | 0 | 0 |
+| log_retention | 3 | 0 | 0 |
+| migration | 2 | 0 | 0 |
+| moderation | 7 | 0 | 0 |
+| mst_lazy | 8 | 0 | 4 |
+| oauth | 25 | 0 | 1 |
+| oauth_replay_durable | 2 | 0 | 0 |
+| ops_metrics | 1 | 0 | 0 |
+| plc | 10 | 0 | 0 |
+| preferences | 6 | 0 | 0 |
+| proxy | 11 | 0 | 0 |
+| proxy_fast_path | 4 | 0 | 0 |
+| push | 4 | 0 | 0 |
+| races | 4 | 0 | 0 |
+| rate_limit_config | 2 | 0 | 0 |
+| rate_limits | 7 | 0 | 0 |
+| read_after_write | 7 | 0 | 0 |
+| rebalance_handback | 2 | 0 | 0 |
+| record_encode | 3 | 0 | 0 |
+| ref_account | 8 | 0 | 1 |
+| ref_auth | 5 | 0 | 0 |
+| ref_handles | 5 | 0 | 0 |
+| ref_invites | 4 | 0 | 0 |
+| ref_moderation | 1 | 0 | 0 |
+| ref_plc | 1 | 0 | 0 |
+| ref_proxy | 9 | 0 | 0 |
+| ref_repo | 10 | 0 | 1 |
+| ref_ssrf | 2 | 0 | 0 |
+| ref_sync | 1 | 0 | 0 |
+| reshard | 13 | 0 | 0 |
+| revocation_gc | 1 | 0 | 0 |
+| secrets_at_rest | 4 | 0 | 0 |
+| segment_bytes | 0 | 0 | 1 |
+| segment_compression | 1 | 0 | 0 |
+| sequencer | 6 | 0 | 0 |
+| server_basics | 7 | 0 | 0 |
+| service_auth | 7 | 0 | 0 |
+| shard_ingest | 0 | 0 | 1 |
+| shrike_adopt | 8 | 0 | 0 |
+| signature_faults | 1 | 0 | 0 |
+| smtp_mail | 6 | 0 | 0 |
+| subscribe_repos | 14 | 0 | 0 |
+| sync | 10 | 0 | 0 |
+| sync11_property | 3 | 0 | 0 |
+| sync_list | 4 | 0 | 0 |
+| takedown_routes | 1 | 0 | 0 |
+| totp | 6 | 0 | 0 |
+| untrusted_repo_data | 2 | 0 | 0 |
 
 ## Speed pass (2026-10-01): test-side changes
 

@@ -403,7 +403,7 @@ fn standard_no_oauth(creds: &Credentials) -> XResult<String> {
 fn full_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> XResult<String> {
     match creds {
         Credentials::OAuth { did, .. } => {
-            creds.require(creds.allows_account(attr, action))?;
+            creds.need_account(attr, action)?;
             Ok(did.clone())
         }
         _ => full_access(creds),
@@ -414,7 +414,7 @@ fn full_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> XResu
 fn standard_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> XResult<String> {
     match creds {
         Credentials::OAuth { did, .. } => {
-            creds.require(creds.allows_account(attr, action))?;
+            creds.need_account(attr, action)?;
             Ok(did.clone())
         }
         _ => standard_no_oauth(creds),
@@ -1208,8 +1208,10 @@ fn refresh_claims(
         .jwt
         .verify_signature(tok.trim())
         .ok_or_else(|| invalid_token("Token could not be verified"))?;
+    // the reference's jose typ check (refresh+jwt) fails first for an
+    // access token: "Token could not be verified", not "Bad token scope"
     if c.scope != SCOPE_REFRESH {
-        return Err(bad_scope());
+        return Err(invalid_token("Token could not be verified"));
     }
     if c.aud != app.jwt.service_did || c.jti.is_none() {
         return Err(invalid_token("Malformed token"));
@@ -1253,12 +1255,25 @@ pub(super) fn invites_required(app: &App) -> bool {
 }
 
 async fn describe_server(State(app): AppState) -> Json<J> {
+    // As the reference: unset links and contact fields are omitted.
+    let mut links = serde_json::Map::new();
+    if let Some(u) = &app.config.privacy_policy_url {
+        links.insert("privacyPolicy".into(), json!(u));
+    }
+    if let Some(u) = &app.config.terms_of_service_url {
+        links.insert("termsOfService".into(), json!(u));
+    }
+    let mut contact = serde_json::Map::new();
+    if let Some(e) = &app.config.contact_email_address {
+        contact.insert("email".into(), json!(e));
+    }
     Json(json!({
         "did": app.jwt.service_did,
         "availableUserDomains": [format!(".{}", app.handle_domain)],
         "inviteCodeRequired": invites_required(&app),
-        "links": {},
-        "contact": {},
+        "blobUploadLimit": app.config.max_blob_size,
+        "links": links,
+        "contact": contact,
     }))
 }
 
@@ -1366,6 +1381,8 @@ pub(super) async fn create_account_inner(
             "No invite code provided",
         ));
     }
+    // the request's spelling, echoed in "Email already taken" as the reference does
+    let email_input = inp.email.as_deref().map(str::trim).unwrap_or_default().to_string();
     let email = match inp
         .email
         .as_deref()
@@ -1474,7 +1491,7 @@ pub(super) async fn create_account_inner(
             return Err(XrpcError::bad("HandleNotAvailable", format!("Handle already taken: {handle}")));
         }
         e?;
-        return Err(invalid_request(format!("Email already taken: {email}")));
+        return Err(invalid_request(format!("Email already taken: {email_input}")));
     }
     // Register the DID before anything about the account is written (the
     // reference sends the genesis op before creating the account row).
@@ -1917,8 +1934,48 @@ async fn deactivate_account(
     app.account(&did)
         .await
         .map_err(|_| invalid_request("Account not found"))?;
+    // the reference's `deleteCredentials` for OAuth callers
+    if matches!(creds, Credentials::OAuth { .. }) {
+        delete_delegated_credentials(&app, &did).await?;
+    }
     set_deactivated(&app, &did, true, inp.delete_after).await?;
     Ok(StatusCode::OK)
+}
+
+/// What the reference's `deactivateAccount({deleteCredentials: true})` drops
+/// (OAuth deactivation and the account page): every OAuth session, the
+/// remembered client authorizations and every app password with its
+/// sessions. Password sessions stay.
+pub(super) async fn delete_delegated_credentials(app: &App, did: &str) -> XResult<()> {
+    crate::oauth::store::revoke_all_sessions(app, did)
+        .await
+        .map_err(|e| XrpcError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error: "InternalServerError".into(),
+            message: e.description,
+        })?;
+    let mut dels: Vec<_> = scan_private(app, did, "oauth/authz/")
+        .await?
+        .into_iter()
+        .map(|(name, _)| pmut(did, &name, None))
+        .collect();
+    let mut names = Vec::new();
+    for (key, v) in scan_private(app, did, "apppass/").await? {
+        dels.push(pmut(did, &key, None));
+        if let Some(h) = serde_json::from_slice::<J>(&v).ok().and_then(|m| m["hash"].as_str().map(String::from)) {
+            dels.push(pmut(did, &format!("apphash/{h}"), None));
+        }
+        names.push(key.trim_start_matches("apppass/").to_string());
+    }
+    if !dels.is_empty() {
+        let e = ext(app);
+        let _g = e.lock(did).await;
+        app.put_private(did, dels).await?;
+    }
+    for name in names {
+        revoke_app_password_sessions(app, did, &name).await?;
+    }
+    Ok(())
 }
 
 async fn activate_account(State(app): AppState, Auth(creds): Auth) -> XResult<StatusCode> {
@@ -2707,7 +2764,7 @@ async fn get_service_auth(
         ));
     }
     match &creds {
-        Credentials::OAuth { .. } => creds.require(creds.allows_rpc(lxm.unwrap_or("*"), &q.aud))?,
+        Credentials::OAuth { .. } => creds.need_rpc(lxm.unwrap_or("*"), &q.aud)?,
         Credentials::AppPassword {
             privileged: false, ..
         } => {

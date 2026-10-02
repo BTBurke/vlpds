@@ -306,7 +306,6 @@ async fn enable_email_auth_factor(s: &TestServer, a: &TestAccount) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "vlpds deliberately replaces email sign-in codes with TOTP (updateEmail emailAuthFactor=true -> InvalidRequest); see tests/totp.rs"]
 async fn email_2fa_challenges_and_accepts_token() {
     let s = TestServer::spawn().await;
     let a = s.create_account("jane").await;
@@ -328,7 +327,6 @@ async fn email_2fa_challenges_and_accepts_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "vlpds deliberately replaces email sign-in codes with TOTP (updateEmail emailAuthFactor=true -> InvalidRequest); see tests/totp.rs"]
 async fn email_2fa_rejects_invalid_token() {
     let s = TestServer::spawn().await;
     let a = s.create_account("jane").await;

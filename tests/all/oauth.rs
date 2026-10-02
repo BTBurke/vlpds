@@ -770,7 +770,9 @@ async fn scope_enforcement() {
     assert_eq!(t.scope, scope);
     let r = create_post(&s, &key, &t.access, &acct.did, "app.bsky.feed.post").await;
     assert_eq!(r.status, 403, "{}", r.body);
-    assert_eq!(r.body["error"], "InsufficientScope");
+    // the reference's ScopeMissingError, naming the missing scope
+    assert_eq!(r.body["error"], "ScopeMissingError");
+    assert_eq!(r.body["message"], "Missing required scope \"repo:app.bsky.feed.post?action=create\"");
     let r = create_post(&s, &key, &t.access, &acct.did, "app.bsky.feed.like").await;
     assert_eq!(r.status, 200, "{}", r.body);
 
@@ -2793,3 +2795,7 @@ async fn bench_dpop_resource_requests() {
     let par = t0.elapsed().as_secs_f64() * 1e6 / (n / 2) as f64;
     println!("DPoP resource request: {seq:.0} us sequential, {par:.0} us/request at 16 in flight");
 }
+
+// Reference-suite ports that reuse this file's client simulation.
+#[path = "ref_oauth.rs"]
+mod ref_oauth;

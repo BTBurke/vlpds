@@ -1254,3 +1254,43 @@ pub const PNG_1X1: &[u8] = &[
     0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
     0x42, 0x60, 0x82,
 ];
+
+// ---- ref group A helpers ----
+
+/// The newest dev-mode mail sent to `email` (vlpds.admin.getDevMail):
+/// `{to, subject, body, html, purpose, token, sentAt}`.
+pub async fn latest_mail(s: &TestServer, email: &str) -> J {
+    let j = s.dev_mail(email).await.ok();
+    j["messages"].as_array().and_then(|m| m.last().cloned()).unwrap_or_else(|| panic!("no mail to {email}: {j}"))
+}
+
+/// Moves the stored email token for `purpose` `ms` milliseconds into the
+/// past (the reference tests rewrite `email_token.requestedAt`).
+pub async fn age_email_token(s: &TestServer, did: &str, purpose: &str, ms: u64) {
+    let name = format!("etok/{purpose}");
+    let raw = s.app.get_private(did, &name).await.ok().flatten().unwrap_or_else(|| panic!("no stored {name} token"));
+    let mut rec: J = serde_json::from_slice(&raw).unwrap();
+    rec["requested_at"] = json!(rec["requested_at"].as_u64().unwrap() - ms);
+    s.app
+        .put_private(
+            did,
+            vec![vlpds::segment::Mutation {
+                key: vlpds::state::private_key(did, &name).into(),
+                val: Some(serde_json::to_vec(&rec).unwrap().into()),
+            }],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("put_private: {}", e.message));
+}
+
+/// admin.updateSubjectStatus on a repoRef with `takedown: {applied}`.
+pub async fn set_repo_takedown(s: &TestServer, did: &str, applied: bool) {
+    s.xrpc
+        .post(
+            "com.atproto.admin.updateSubjectStatus",
+            &json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": did}, "takedown": {"applied": applied}}),
+            &Auth::Admin,
+        )
+        .await
+        .ok();
+}

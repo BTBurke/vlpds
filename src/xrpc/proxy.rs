@@ -1043,7 +1043,7 @@ async fn proxy_request(app: &App, req: Request) -> XResult<Response> {
         (None, Some(t)) => t,
         (None, None) => unreachable!(),
     };
-    creds.require(creds.allows_rpc(&lxm, &target.scope_aud()))?;
+    creds.need_rpc(&lxm, &target.scope_aud())?;
     if matches!(
         creds,
         Credentials::AppPassword {
@@ -1079,7 +1079,7 @@ async fn proxy_request(app: &App, req: Request) -> XResult<Response> {
         if lxm == GET_FEED {
             // the token is for the feed generator, which the AppView calls
             // with it
-            creds.require(creds.allows_rpc(GET_FEED_SKELETON, &target.scope_aud()))?;
+            creds.need_rpc(GET_FEED_SKELETON, &target.scope_aud())?;
             feed_did = feed_generator_did(app, pq).await?;
             fwd.aud = Some(&feed_did);
             fwd.lxm = GET_FEED_SKELETON;
@@ -1114,7 +1114,7 @@ async fn prefs_target<'a>(
         Some(h) => h.to_string(),
         None => local.clone(),
     };
-    creds.require(creds.allows_rpc(lxm, &aud))?;
+    creds.need_rpc(lxm, &aud)?;
     if aud == local {
         return Ok(None);
     }
@@ -1327,7 +1327,7 @@ async fn create_report(
 ) -> XResult<Response> {
     let did = user_did(&creds)?.to_string();
     let aud = compute_proxy_to(&app, &headers, CREATE_REPORT)?;
-    creds.require(creds.allows_rpc(CREATE_REPORT, &aud))?;
+    creds.need_rpc(CREATE_REPORT, &aud)?;
 
     let input: J = serde_json::from_slice(&body)
         .map_err(|_| XrpcError::bad("InvalidRequest", "Request body must be a JSON object"))?;

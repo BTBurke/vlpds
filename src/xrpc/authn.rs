@@ -111,6 +111,55 @@ impl Credentials {
         }
     }
 
+    /// `ok`, else the refusal: for OAuth the reference's
+    /// `ScopeMissingError` (403, `Missing required scope "<scope>"`, naming
+    /// the scope that would grant it), else [`Self::require`]'s.
+    fn require_scope(&self, ok: bool, scope: impl FnOnce() -> String) -> XResult<()> {
+        if ok {
+            return Ok(());
+        }
+        match self {
+            Credentials::OAuth { .. } => Err(XrpcError {
+                status: StatusCode::FORBIDDEN,
+                error: "ScopeMissingError".into(),
+                message: format!("Missing required scope \"{}\"", scope()),
+            }),
+            _ => self.require(false),
+        }
+    }
+
+    pub fn need_repo(&self, collection: &str, action: &str) -> XResult<()> {
+        self.require_scope(self.allows_repo(collection, action), || {
+            format!("repo:{collection}?action={action}")
+        })
+    }
+
+    pub fn need_rpc(&self, lxm: &str, aud: &str) -> XResult<()> {
+        // a non-privileged app password calling a privileged (chat) method:
+        // the reference's pipethrough "Bad token method"
+        if matches!(self, Credentials::AppPassword { .. }) && !self.allows_rpc(lxm, aud) {
+            return Err(XrpcError::bad("InvalidToken", "Bad token method"));
+        }
+        self.require_scope(self.allows_rpc(lxm, aud), || {
+            format!("rpc:{lxm}?aud={}", aud.replace('#', "%23"))
+        })
+    }
+
+    pub fn need_blob(&self, mime: &str) -> XResult<()> {
+        self.require_scope(self.allows_blob(mime), || format!("blob:{mime}"))
+    }
+
+    pub fn need_account(&self, attr: &str, action: &str) -> XResult<()> {
+        self.require_scope(self.allows_account(attr, action), || match action {
+            "read" => format!("account:{attr}"),
+            _ => format!("account:{attr}?action={action}"),
+        })
+    }
+
+    pub fn need_identity(&self, attr: &str) -> XResult<()> {
+        self.require_scope(self.allows_identity(attr), || format!("identity:{attr}"))
+    }
+
     pub fn require(&self, ok: bool) -> XResult<()> {
         if ok {
             Ok(())
@@ -129,7 +178,7 @@ pub async fn authenticate(app: &App, parts: &Parts) -> XResult<Credentials> {
         .headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| XrpcError::auth("authentication required"))?;
+        .ok_or_else(|| XrpcError::auth("Authentication Required"))?;
     if let Some(tok) = h.strip_prefix("Bearer ") {
         let creds = super::server::verify_bearer(app, tok).await?;
         if matches!(creds, Credentials::Takendown { .. }) {
@@ -215,11 +264,9 @@ pub async fn authed_repo(app: &App, creds: &Credentials, repo: &str) -> XResult<
         .ok_or_else(|| XrpcError::auth("user credentials required"))?;
     let target = app.resolve_repo(repo).await?;
     if *target != *did {
-        return Err(XrpcError {
-            status: StatusCode::FORBIDDEN,
-            error: "Forbidden".into(),
-            message: "token does not match repo".into(),
-        });
+        // reference createRecord/putRecord/deleteRecord/applyWrites:
+        // `if (did !== auth.credentials.did) throw new AuthRequiredError()`
+        return Err(XrpcError::auth("Authentication Required"));
     }
     Ok(target)
 }
