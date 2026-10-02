@@ -18,9 +18,10 @@ it is marked **(unverified)**.
 ## Background you need
 
 - **All durable state is in the object store** under `--prefix` in `--s3-bucket`:
-  `log/{log_id}/{ordinal}.seg` (each node incarnation's commit log), `state/{shard}/`
-  (one SlateDB per shard, its WAL disabled), `assign/{shard}` + `assign/layout`
-  (who owns what, and the slot -> shard map), `nodes/{node_id}` (node leases),
+  `log/{log_id}/{ordinal}.seg` (each node incarnation's commit log), `state/{id}/`
+  (one SlateDB per shard, its WAL disabled), `assign/{id}` + `assign/layout`
+  (who owns what, and the slot -> shard map; `{id}` is the shard id as 10
+  zero-padded decimal digits, e.g. shard 42 is `state/0000000042/`), `nodes/{node_id}` (node leases),
   `writers/{w}` (unique seq low byte per live node), `retain/{log_id}` (retention
   reports), `handle/`, `email/`, `blob/`. The local disk is only a SlateDB SST cache.
 - **Shards.** 65,536 hash slots grouped into shards (default `--shards 64`,
@@ -283,7 +284,7 @@ node's log` in the observer's logs; the dead node's exit code.
 for the minutes of a rolling deploy.
 
 **Do:** finish or roll back the deploy. **(unverified)** Mixed-version clusters are
-not tested beyond a deploy window; segment format changes (e.g. `VLSEG05`) need
+not tested beyond a deploy window; segment format changes (e.g. `VLSEG06`) need
 every reader upgraded before a writer emits the new format.
 
 ### VlpdsShardsUnowned
@@ -1222,7 +1223,10 @@ What to do:
 ### Shard split / merge
 
 `vlpds admin shard-split <shard> [--at <slot>]`, `shard-merge <left> <right>`,
-`reshard-abort` (only before the flip), `layout` to watch `op`. Every node's
+`reshard-abort` (only before the flip), `layout` to watch `op`. Shard ids are
+u32 and never reused: each split takes two new ids and each merge one from the
+layout's `next_id` (aborted ops' ids stay used), so ids grow past the shard
+count; they are not positions. Every node's
 `vlpds_shard_layout_shards` / `vlpds_shard_layout_version` follow the flip; the
 ownership alerts read the count from there.
 

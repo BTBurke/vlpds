@@ -580,7 +580,7 @@ struct CachedAcct {
     key_id: u64,
     status: Option<String>,
     /// (partition, epoch) it was read in: valid only while still owned in it
-    part: (u16, u64),
+    part: (crate::slots::ShardId, u64),
 }
 
 /// A minted service JWT and the (iss, aud, lxm, key id) it was minted for.

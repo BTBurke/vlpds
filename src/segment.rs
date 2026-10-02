@@ -4,6 +4,7 @@
 //! the materialized-state mutations (SlateDB puts/deletes) used to apply and
 //! replay them, each entry tagged with its shard and ownership epoch.
 
+use crate::slots::ShardId;
 use bytes::{BufMut, Bytes};
 
 #[derive(Clone, Debug)]
@@ -18,11 +19,11 @@ pub struct Mutation {
 // a *fence* object written at its next ordinal (If-None-Match), after which
 // the writer can never append again.
 //
-// "VLSEG05\n"
+// "VLSEG06\n"
 // header: log_id_len u16 | log_id | ordinal u64 | prefix_end u64
 //         | first_seq i64 | last_seq i64 | count u32 | codec u8 | body_len u32
 // body:   entry* (codec 0), or one zstd frame of them (codec 1)
-// entry:  seq i64 | shard u16 | epoch u64 | frame_len u32 | frame
+// entry:  seq i64 | shard u32 | epoch u64 | frame_len u32 | frame
 //         | mut_count u32 | (key_len u16 | key | val_len u32 (MAX = delete) | val)*
 //
 // The header is never compressed, so header-only reads (`parse_header` on
@@ -33,6 +34,7 @@ pub struct Mutation {
 // stored object back to exactly those bytes (codec byte reset to 0), so
 // entry offsets are the same in both. Real commits compress ~1.9-2.7x at
 // zstd level 1 in segments of 256 KiB and up (DESIGN.md "Log compression").
+// VLSEG06 widened the entry's shard tag to 32 bits (`slots::ShardId`).
 //
 // mut_count with its top bit set: bits 0-15 count the muts stored, bits
 // 16-30 the muts *derived* from the #commit frame, which come first (see
@@ -50,7 +52,9 @@ pub struct Mutation {
 // with a bounded number of probes (see `nodelog::in_prefix`).
 // ---------------------------------------------------------------------------
 
-pub const MAGIC: &[u8; 8] = b"VLSEG05\n";
+pub const MAGIC: &[u8; 8] = b"VLSEG06\n";
+/// Bytes of an entry before its frame: seq, shard, epoch, frame_len.
+const ENTRY_HEAD: usize = 8 + 4 + 8 + 4;
 
 /// Body codecs (the header's codec byte).
 pub const CODEC_NONE: u8 = 0;
@@ -91,7 +95,7 @@ pub struct SegHeader {
 
 pub struct SegEntry {
     pub seq: i64,
-    pub shard: u16,
+    pub shard: ShardId,
     pub epoch: u64,
     pub frame: Bytes,
     pub muts: Vec<Mutation>,
@@ -143,7 +147,7 @@ impl SegmentBuilder {
     pub fn push(
         &mut self,
         seq: i64,
-        shard: u16,
+        shard: ShardId,
         epoch: u64,
         write_frame: impl FnOnce(&mut Vec<u8>),
         muts: &[Mutation],
@@ -156,7 +160,7 @@ impl SegmentBuilder {
     pub fn push_derived(
         &mut self,
         seq: i64,
-        shard: u16,
+        shard: ShardId,
         epoch: u64,
         write_frame: impl FnOnce(&mut Vec<u8>),
         muts: &[Mutation],
@@ -171,7 +175,7 @@ impl SegmentBuilder {
         self.last_seq = seq;
         self.count += 1;
         self.body.put_i64(seq);
-        self.body.put_u16(shard);
+        self.body.put_u32(shard.0);
         self.body.put_u64(epoch);
         let len_at = self.body.len();
         self.body.put_u32(0);
@@ -345,7 +349,7 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<Option<(SegHeader, usize)>> {
 /// needed ([`decode`]): frames and values are slices of the uncompressed
 /// object. With `shard` set, only that shard's entries are returned
 /// (handoff replay).
-pub fn parse(data: Bytes, with_muts: bool, shard: Option<u16>) -> anyhow::Result<LogObject> {
+pub fn parse(data: Bytes, with_muts: bool, shard: Option<ShardId>) -> anyhow::Result<LogObject> {
     let data = decode(data)?;
     let Some((h, mut pos)) = parse_header(&data)? else {
         return Ok(LogObject::Fence { by: String::from_utf8_lossy(&data[8..]).into_owned() });
@@ -358,12 +362,12 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<u16>) -> anyhow::Result
     let count = h.count;
     let mut out = Vec::new();
     for _ in 0..count {
-        need(pos, 22)?;
+        need(pos, ENTRY_HEAD)?;
         let seq = i64::from_be_bytes(rd8(pos));
-        let sh = u16::from_be_bytes(data[pos + 8..pos + 10].try_into()?);
-        let epoch = u64::from_be_bytes(data[pos + 10..pos + 18].try_into()?);
-        let flen = u32::from_be_bytes(data[pos + 18..pos + 22].try_into()?) as usize;
-        pos += 22;
+        let sh = ShardId(u32::from_be_bytes(data[pos + 8..pos + 12].try_into()?));
+        let epoch = u64::from_be_bytes(rd8(pos + 12));
+        let flen = u32::from_be_bytes(data[pos + 20..pos + 24].try_into()?) as usize;
+        pos += ENTRY_HEAD;
         need(pos, flen + 4)?;
         let frame = data.slice(pos..pos + flen);
         pos += flen;
@@ -479,9 +483,9 @@ mod tests {
     fn roundtrip_and_filter() {
         let mut b = SegmentBuilder::new();
         let m = |k: &str, v: Option<&str>| Mutation { key: Bytes::from(k.to_string()), val: v.map(|v| Bytes::from(v.to_string())) };
-        b.push(10, 3, 7, |o| o.extend_from_slice(b"frame-a"), &[m("k1", Some("v1"))]);
-        b.push(11, 5, 1, |o| o.extend_from_slice(b"frame-b"), &[m("k2", None)]);
-        b.push(12, 3, 7, |_| {}, &[m("k3", Some("v3"))]);
+        b.push(10, ShardId(3), 7, |o| o.extend_from_slice(b"frame-a"), &[m("k1", Some("v1"))]);
+        b.push(11, ShardId(1 << 20), 1, |o| o.extend_from_slice(b"frame-b"), &[m("k2", None)]);
+        b.push(12, ShardId(3), 7, |_| {}, &[m("k3", Some("v3"))]);
         let mut obj = b.sealed_header("node-a.1", 42, 39);
         obj.extend_from_slice(&b.body);
         let LogObject::Segment(h, all) = parse(Bytes::from(obj.clone()), true, None).unwrap() else { panic!() };
@@ -492,7 +496,8 @@ mod tests {
         assert_eq!(all.len(), 3);
         assert_eq!(&all[1].frame[..], b"frame-b");
         assert!(all[1].muts[0].val.is_none());
-        let LogObject::Segment(_, only3) = parse(Bytes::from(obj), true, Some(3)).unwrap() else { panic!() };
+        assert_eq!((all[1].shard, all[1].epoch), (ShardId(1 << 20), 1));
+        let LogObject::Segment(_, only3) = parse(Bytes::from(obj), true, Some(ShardId(3))).unwrap() else { panic!() };
         assert_eq!(only3.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![10, 12]);
         assert!(matches!(parse(fence_object("node-b"), false, None).unwrap(), LogObject::Fence { by } if by == "node-b"));
     }
@@ -540,8 +545,8 @@ mod tests {
         all.push(extra);
         for in_place in [false, true] {
             let mut b = if in_place { SegmentBuilder::for_log("L") } else { SegmentBuilder::new() };
-            let r = b.push_derived(5, 1, 2, |o| frame.finish(5, o), &all, derived.len());
-            b.push(6, 1, 2, |o| o.extend_from_slice(b"plain"), &all[..1]);
+            let r = b.push_derived(5, ShardId(1), 2, |o| frame.finish(5, o), &all, derived.len());
+            b.push(6, ShardId(1), 2, |o| o.extend_from_slice(b"plain"), &all[..1]);
             let obj = b.seal("L", 9, 9);
             let off = if in_place { 0 } else { header_len("L") };
             assert_eq!(&obj[r.start + off..r.end + off], &bytes[..]);
@@ -569,7 +574,7 @@ mod tests {
         let mut ranges = Vec::new();
         for i in 0..200u32 {
             let m = Mutation { key: Bytes::from(format!("R/did:plc:aaaa{}\0app.bsky.feed.like/{i:08}", i % 7)), val: Some(Bytes::from(vec![b'v'; 40])) };
-            ranges.push(b.push(1000 + i as i64, (i % 3) as u16, 2, |o| o.extend_from_slice(format!("frame {i} {}", "x".repeat(64)).as_bytes()), &[m]));
+            ranges.push(b.push(1000 + i as i64, ShardId(70_000 + i % 3), 2, |o| o.extend_from_slice(format!("frame {i} {}", "x".repeat(64)).as_bytes()), &[m]));
         }
         let sealed = b.seal("node-a.7", 5, 3);
         let stored = compress(&sealed, 1).unwrap().expect("compressible");
@@ -580,20 +585,20 @@ mod tests {
         assert_eq!((h.body_len as usize, hl), (sealed.len() - hl, header_len("node-a.7")));
         let decoded = decode(Bytes::from(stored.clone())).unwrap();
         assert_eq!(&decoded[..], &sealed[..]);
-        let LogObject::Segment(h2, entries) = parse(Bytes::from(stored), true, Some(1)).unwrap() else { panic!() };
+        let LogObject::Segment(h2, entries) = parse(Bytes::from(stored), true, Some(ShardId(70_001))).unwrap() else { panic!() };
         assert_eq!(h2.codec, CODEC_NONE);
         assert_eq!(entries.len(), 67);
         for e in &entries {
             let i = (e.seq - 1000) as usize;
             assert_eq!(&e.frame[..], &sealed[ranges[i].clone()]);
-            assert_eq!(e.muts.len(), 1);
+            assert_eq!((e.muts.len(), e.shard, e.epoch), (1, ShardId(70_001), 2));
         }
         // level 0, fences and incompressible bodies are stored as they are
         assert!(compress(&sealed, 0).unwrap().is_none());
         assert!(compress(&fence_object("x"), 1).unwrap().is_none());
         let mut b = SegmentBuilder::new();
         let noise: Vec<u8> = (0..4096).map(|_| rand::random::<u8>()).collect();
-        b.push(1, 0, 0, |o| o.extend_from_slice(&noise), &[]);
+        b.push(1, ShardId(0), 0, |o| o.extend_from_slice(&noise), &[]);
         assert!(compress(&b.seal("L", 0, 0), 1).unwrap().is_none());
         // a corrupt body is an error, not a short segment
         let mut bad = compress(&sealed, 1).unwrap().unwrap();

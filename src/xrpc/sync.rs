@@ -769,7 +769,7 @@ fn json_response(body: Vec<u8>) -> Response {
     ([(header::CONTENT_TYPE, "application/json")], Body::from(body)).into_response()
 }
 
-fn unowned(shard: u16) -> XrpcError {
+fn unowned(shard: crate::slots::ShardId) -> XrpcError {
     XrpcError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         error: "PartitionUnavailable".into(),
@@ -907,7 +907,7 @@ async fn list_repos(State(app): AppState, Query(q): Query<ListReposQ>) -> XResul
             }
             Err(e) if repos.is_empty() => return Err(e),
             Err(e) => {
-                tracing::warn!(shard, "listRepos: owner page failed, ending the page early: {}", e.message);
+                tracing::warn!(shard = shard.0, "listRepos: owner page failed, ending the page early: {}", e.message);
                 break;
             }
         }
@@ -917,17 +917,17 @@ async fn list_repos(State(app): AppState, Query(q): Query<ListReposQ>) -> XResul
 }
 
 /// A page from the owner of `shard` (holding `pos`): its body and parsed form.
-async fn owner_page(app: &App, shard: u16, pos: &RepoPos, limit: usize) -> XResult<(Bytes, ReposPage)> {
+async fn owner_page(app: &App, shard: crate::slots::ShardId, pos: &RepoPos, limit: usize) -> XResult<(Bytes, ReposPage)> {
     let c = app.cluster.as_ref().ok_or_else(|| unowned(shard))?;
     let Some((owner, addr)) = c.owner_of(shard).filter(|(id, _)| *id != c.cfg.node_id) else {
         return Err(unowned(shard));
     };
     let body = super::internal::owner_list_repos(app, &addr, &list_cursor(pos), limit).await.map_err(|e| {
-        tracing::warn!(%owner, shard, "listRepos owner page: {}", e.message);
+        tracing::warn!(%owner, shard = shard.0, "listRepos owner page: {}", e.message);
         XrpcError { message: format!("shard {shard}: {}", e.message), ..unowned(shard) }
     })?;
     let page: ReposPage = serde_json::from_slice(&body).map_err(|e| {
-        tracing::warn!(%owner, shard, "listRepos owner page: {e}");
+        tracing::warn!(%owner, shard = shard.0, "listRepos owner page: {e}");
         unowned(shard)
     })?;
     Ok((body, page))
@@ -947,7 +947,7 @@ pub(super) struct ByCollectionQ {
 pub(super) async fn list_repos_by_collection_local(
     app: &App,
     q: &ByCollectionQ,
-) -> XResult<(Vec<String>, Vec<u16>)> {
+) -> XResult<(Vec<String>, Vec<crate::slots::ShardId>)> {
     if !super::syntax::valid_nsid(&q.collection) {
         return Err(XrpcError::bad(
             "InvalidRequest",
@@ -958,7 +958,7 @@ pub(super) async fn list_repos_by_collection_local(
     let fam = state::collection_family(&q.collection);
     let start = q.cursor.as_ref().map(|c| [state::collection_key(&q.collection, c), vec![0]].concat());
     let owned = app.partitions.owned();
-    let ids: Vec<u16> = owned.iter().map(|p| p.id).collect();
+    let ids: Vec<crate::slots::ShardId> = owned.iter().map(|p| p.id).collect();
     let mut scans = Vec::new();
     for p in owned {
         let (fam, start) = (fam.clone(), start.clone());
@@ -1005,7 +1005,7 @@ async fn list_repos_by_collection(
         query.push(("cursor", c.clone()));
     }
     let g = super::internal::gather(&app, "/internal/v1/sync/listReposByCollection", &query).await;
-    let mut covered: HashSet<u16> = owned.into_iter().collect();
+    let mut covered: HashSet<crate::slots::ShardId> = owned.into_iter().collect();
     for r in g.replies {
         covered.extend(r.owned);
         all.extend(serde_json::from_value::<Vec<String>>(r.body["repos"].clone()).unwrap_or_default());

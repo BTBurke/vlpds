@@ -7,7 +7,7 @@
 //! state, and anything before the flip can be aborted.
 
 use crate::cluster::{Assignment, Cluster, ShardHost, LAYOUT};
-use crate::slots::{Layout, Reshard};
+use crate::slots::{Layout, Reshard, ShardId};
 use object_store::{PutMode, UpdateVersion};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Plan {
     /// Split `shard` at slot `at` (default: the midpoint of its range).
-    Split { shard: u16, at: Option<u32> },
+    Split { shard: ShardId, at: Option<u32> },
     /// Merge two adjacent shards (`left` holds the lower slots).
-    Merge { left: u16, right: u16 },
+    Merge { left: ShardId, right: ShardId },
 }
 
 /// Policy hook (off by default): split a shard whose state or write rate
@@ -142,8 +142,8 @@ impl Cluster {
     }
 
     /// Clears `frozen == op` from shard `p`'s assignment (CAS on a fresh read).
-    async fn unfreeze(&self, p: u16, op: u64) -> anyhow::Result<()> {
-        let path = self.path(&format!("assign/{p:03}"));
+    async fn unfreeze(&self, p: ShardId, op: u64) -> anyhow::Result<()> {
+        let path = self.path(&format!("assign/{}", p.key()));
         loop {
             let Some((mut a, etag)) = self.get_json::<Assignment>(&path).await? else { return Ok(()) };
             if a.frozen != Some(op) {
@@ -152,7 +152,7 @@ impl Cluster {
             a.frozen = None;
             match self.put_json(&path, &a, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
                 Ok(e) => {
-                    tracing::info!(shard = p, op, "unfroze shard");
+                    tracing::info!(shard = p.0, op, "unfroze shard");
                     self.assigns.write().insert(p, (a, e));
                     return Ok(());
                 }
@@ -182,7 +182,7 @@ impl Cluster {
             return self.run_policy(host).await;
         };
         // 1. freeze the parents we hold (one barrier for all of them)
-        let mine: Vec<u16> = op.parents.iter().copied().filter(|p| self.is_owner(*p)).collect();
+        let mine: Vec<ShardId> = op.parents.iter().copied().filter(|p| self.is_owner(*p)).collect();
         if !mine.is_empty() {
             tracing::info!(op = op.id, shards = ?mine, "freezing reshard parents");
             if !self.close_and_release(host, mine, Vec::new(), Some(op.id)).await {
@@ -237,7 +237,7 @@ impl Cluster {
             let cached = self.assigns.read().get(&p).cloned();
             let a = match cached {
                 Some((a, _)) if a.frozen == Some(op.id) => a,
-                _ => match self.get_json::<Assignment>(&self.path(&format!("assign/{p:03}"))).await? {
+                _ => match self.get_json::<Assignment>(&self.path(&format!("assign/{}", p.key()))).await? {
                     Some((a, e)) => {
                         self.assigns.write().insert(p, (a.clone(), e));
                         a
@@ -282,7 +282,7 @@ impl Cluster {
         }
         // 5. take the children now (they are free shards in the new layout)
         let live_ids: HashSet<String> = self.peers().into_iter().map(|l| l.node_id).chain([self.cfg.node_id.clone()]).collect();
-        let ids: Vec<u16> = op.children.iter().map(|c| c.id).collect();
+        let ids: Vec<ShardId> = op.children.iter().map(|c| c.id).collect();
         let n = ids.len();
         self.acquire(host, ids, n, &live_ids, &HashMap::new(), 0, live_ids.len()).await?;
         crate::metrics::RESHARD_SECONDS.observe(started.elapsed().as_secs_f64());
@@ -294,8 +294,8 @@ impl Cluster {
     /// `seq_floor`). Never blindly: a retry (or a driver presumed dead that
     /// wakes up late) may only replace a fresh one, by CAS, so an assignment
     /// a node already took after the flip is never reset.
-    async fn write_child(&self, id: u16, floor: i64) -> anyhow::Result<()> {
-        let path = self.path(&format!("assign/{id:03}"));
+    async fn write_child(&self, id: ShardId, floor: i64) -> anyhow::Result<()> {
+        let path = self.path(&format!("assign/{}", id.key()));
         let fresh = Assignment { seq_floor: floor, ..Default::default() };
         loop {
             let mode = match self.get_json::<Assignment>(&path).await? {
@@ -320,7 +320,7 @@ impl Cluster {
     /// read of the layout confirms it.
     async fn unfreeze_stale(&self, host: &Arc<dyn ShardHost>, layout: &Layout) -> anyhow::Result<()> {
         let cur = layout.op.as_ref().map(|o| o.id);
-        let stale: Vec<(u16, u64)> = {
+        let stale: Vec<(ShardId, u64)> = {
             let assigns = self.assigns.read();
             layout.ids().into_iter().filter_map(|s| assigns.get(&s).and_then(|(a, _)| a.frozen).filter(|f| Some(*f) != cur).map(|f| (s, f))).collect()
         };
@@ -330,7 +330,7 @@ impl Cluster {
         let fresh = self.refresh_layout(host).await?;
         for (s, f) in stale {
             if fresh.contains(s) && fresh.op.as_ref().is_none_or(|o| o.id != f) {
-                tracing::warn!(shard = s, op = f, "unfreezing a shard left frozen by an aborted reshard");
+                tracing::warn!(shard = s.0, op = f, "unfreezing a shard left frozen by an aborted reshard");
                 self.unfreeze(s, f).await?;
             }
         }
@@ -363,9 +363,9 @@ impl Cluster {
             pick
         };
         let Some((shard, bytes, rate)) = pick else { return Ok(()) };
-        tracing::info!(shard, bytes, rate, "reshard policy: splitting");
+        tracing::info!(shard = shard.0, bytes, rate, "reshard policy: splitting");
         if let Err(e) = self.plan_reshard(host, Plan::Split { shard, at: None }).await {
-            tracing::warn!(shard, "reshard policy: plan failed: {e:#}");
+            tracing::warn!(shard = shard.0, "reshard policy: plan failed: {e:#}");
         }
         Ok(())
     }

@@ -80,9 +80,9 @@ struct Args {
 
     /// Shards (hash-slot ranges) of a new prefix's initial layout. Later the
     /// layout stored in the prefix wins; shards split and merge online
-    /// (`vlpds admin shard-split`, `--reshard-split-mb`).
-    #[arg(long, env = "VLPDS_SHARDS", default_value_t = 64)]
-    shards: u16,
+    /// (`vlpds admin shard-split`, `--reshard-split-mb`). At most 65,536.
+    #[arg(long, env = "VLPDS_SHARDS", default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..=65_536))]
+    shards: u32,
     /// Split policy: split a shard whose SSTs exceed this many MiB (0 = off).
     #[arg(long, env = "VLPDS_RESHARD_SPLIT_MB", default_value_t = 0)]
     reshard_split_mb: u64,
@@ -526,7 +526,7 @@ enum AdminCmd {
     Layout,
     /// Split a shard in two, online.
     ShardSplit {
-        shard: u16,
+        shard: u32,
         /// First slot of the upper half (default: the range's midpoint).
         #[arg(long)]
         at: Option<u32>,
@@ -536,8 +536,8 @@ enum AdminCmd {
     },
     /// Merge two adjacent shards (`left` holds the lower slots), online.
     ShardMerge {
-        left: u16,
-        right: u16,
+        left: u32,
+        right: u32,
         #[arg(long)]
         no_wait: bool,
     },

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vlpds::metrics as m;
 
-const SHARDS: u16 = 8;
+const SHARDS: u32 = 8;
 
 async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, advertise: Option<String>) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());
@@ -67,7 +67,7 @@ async fn takeover_replay_and_lease_metrics_move() {
 
     // writes in b's shards (a node creates accounts in shards it owns),
     // never checkpointed
-    let b_shards: Vec<u16> = b.app.partitions.owned().iter().map(|p| p.id).collect();
+    let b_shards: Vec<vlpds::slots::ShardId> = b.app.partitions.owned().iter().map(|p| p.id).collect();
     let layout = b.app.cluster.as_ref().unwrap().layout();
     let mut in_b = 0;
     for _ in 0..40 {

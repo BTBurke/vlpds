@@ -12,7 +12,7 @@ use std::time::Duration;
 use vlpds::nodelog::{read_head, Head};
 use vlpds::store::Store;
 
-const SHARDS: u16 = 8;
+const SHARDS: u32 = 8;
 const POST: &str = "app.bsky.feed.post";
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {

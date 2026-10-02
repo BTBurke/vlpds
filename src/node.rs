@@ -7,6 +7,7 @@ use crate::firehose::Firehose;
 use crate::nodelog::{self, LogBatch, LogEntry, NodeLog, ShardSink, Span};
 use crate::partition::{self, Partition};
 use crate::partitions::PartitionTable;
+use crate::slots::ShardId;
 use crate::remote::{self, Follower};
 use crate::store::Store;
 use crate::worker::{WorkerMsg, Workers};
@@ -112,13 +113,13 @@ impl Node {
     }
 
     /// Closes one shard (see [`ShardHost::close_many`]).
-    pub async fn close(&self, shard: u16) -> anyhow::Result<()> {
+    pub async fn close(&self, shard: ShardId) -> anyhow::Result<()> {
         self.close_many(vec![shard]).await.pop().map_or(Ok(()), |(_, r)| r)
     }
 
     /// Drops every worker's cached repos for `shards` and waits until each
     /// worker has done so.
-    async fn purge_worker_caches(&self, shards: &[u16]) {
+    async fn purge_worker_caches(&self, shards: &[ShardId]) {
         let mut acks = Vec::new();
         for w in self.workers.senders.iter() {
             for &shard in shards {
@@ -143,7 +144,7 @@ impl ShardHost for Node {
         self.log.durable_ordinal.load(Ordering::Acquire).wrapping_add(1)
     }
 
-    async fn open_many(&self, shards: Vec<(u16, u64, Vec<Span>)>) -> Vec<(u16, anyhow::Result<()>)> {
+    async fn open_many(&self, shards: Vec<(ShardId, u64, Vec<Span>)>) -> Vec<(ShardId, anyhow::Result<()>)> {
         use futures::StreamExt;
         if shards.is_empty() {
             return Vec::new();
@@ -151,7 +152,7 @@ impl ShardHost for Node {
         let started = Instant::now();
         let n = shards.len();
         // 1. open every shard's SlateDB concurrently
-        let opened: Vec<(u16, u64, Vec<Span>, anyhow::Result<Arc<slatedb::Db>>)> = futures::stream::iter(shards)
+        let opened: Vec<(ShardId, u64, Vec<Span>, anyhow::Result<Arc<slatedb::Db>>)> = futures::stream::iter(shards)
             .map(|(s, e, h)| async move {
                 let db = partition::open_db(&self.state_store, s, self.cache_dir.as_deref()).await.map(Arc::new);
                 (s, e, h, db)
@@ -169,7 +170,7 @@ impl ShardHost for Node {
         }
         let opened_ms = started.elapsed().as_millis() as u64;
         // 2. one batched replay of previous owners' log tails
-        let plan: Vec<(u16, &slatedb::Db, &[Span])> = ready.iter().map(|(s, _, h, db)| (*s, db.as_ref(), h.as_slice())).collect();
+        let plan: Vec<(ShardId, &slatedb::Db, &[Span])> = ready.iter().map(|(s, _, h, db)| (*s, db.as_ref(), h.as_slice())).collect();
         let replay_started = Instant::now();
         let replayed = match nodelog::replay_many(&self.store, &plan).await {
             Ok(r) => r,
@@ -189,7 +190,7 @@ impl ShardHost for Node {
         let replayed_ms = started.elapsed().as_millis() as u64;
         // 3. make replayed state durable, then serve (nothing to flush after
         //    a handback: the releaser checkpointed, so nothing was replayed)
-        let flushed: Vec<(u16, u64, Arc<slatedb::Db>, anyhow::Result<()>)> = futures::stream::iter(ready)
+        let flushed: Vec<(ShardId, u64, Arc<slatedb::Db>, anyhow::Result<()>)> = futures::stream::iter(ready)
             .map(|(s, e, _, db)| async move {
                 let r = if replayed == 0 {
                     Ok(())
@@ -263,7 +264,7 @@ impl ShardHost for Node {
         }
     }
 
-    async fn close_many(&self, shards: Vec<u16>) -> Vec<(u16, anyhow::Result<()>)> {
+    async fn close_many(&self, shards: Vec<ShardId>) -> Vec<(ShardId, anyhow::Result<()>)> {
         use futures::StreamExt;
         let started = Instant::now();
         let mut results = Vec::with_capacity(shards.len());
@@ -280,7 +281,7 @@ impl ShardHost for Node {
         if sinks.is_empty() {
             return results;
         }
-        let ids: Vec<u16> = sinks.iter().map(|k| k.id).collect();
+        let ids: Vec<ShardId> = sinks.iter().map(|k| k.id).collect();
         // 1. stop routing new work here
         for &s in &ids {
             self.table.set(s, None);
@@ -327,7 +328,7 @@ impl ShardHost for Node {
         let drained_ms = started.elapsed().as_millis() as u64;
         // 4. checkpoint + close so the successor replays nothing
         let ord = self.log.durable_ordinal.load(Ordering::Acquire);
-        let closed: Vec<(u16, anyhow::Result<()>)> = futures::stream::iter(drained)
+        let closed: Vec<(ShardId, anyhow::Result<()>)> = futures::stream::iter(drained)
             .map(|k| async move {
                 let r = async {
                     {
@@ -413,7 +414,7 @@ impl ShardHost for Node {
             .map(|p| layout.range_of(*p).ok_or_else(|| anyhow::anyhow!("parent {p} not in layout v{}", layout.version)))
             .collect::<anyhow::Result<_>>()?;
         // each child takes, from every parent it overlaps, the slots they share
-        let plans: Vec<(u16, Vec<(u16, u32, u32)>)> = op
+        let plans: Vec<(ShardId, Vec<(ShardId, u32, u32)>)> = op
             .children
             .iter()
             .map(|c| (c.id, parents.iter().filter(|p| p.lo < c.hi && c.lo < p.hi).map(|p| (p.id, p.lo.max(c.lo), p.hi.min(c.hi))).collect()))
@@ -428,7 +429,7 @@ impl ShardHost for Node {
         Ok(())
     }
 
-    fn shard_stats(&self) -> Vec<(u16, u64, u64)> {
+    fn shard_stats(&self) -> Vec<(ShardId, u64, u64)> {
         self.table
             .owned()
             .iter()

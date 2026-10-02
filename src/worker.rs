@@ -238,7 +238,7 @@ pub enum WorkerMsg {
     CreateRepo(CreateRepoReq),
     /// Forget cached repos of a partition this node no longer owns; replies
     /// once no repo state referencing it remains in this worker.
-    DropPartition(u16, oneshot::Sender<()>),
+    DropPartition(crate::slots::ShardId, oneshot::Sender<()>),
     Loaded {
         did: Arc<str>,
         res: anyhow::Result<Option<RepoState>>,
@@ -716,7 +716,10 @@ impl Worker {
                                 metrics::REPO_LOADS.with_label_values(&["error"]).inc();
                                 for r in buffered {
                                     let msg = format!("repo load failed: {e}");
-                                    r.fail(if msg.contains("not owned") { WriteError::Unavailable(msg) } else { WriteError::Internal(msg) });
+                                    // a shard closed under the load (moved, frozen, halted):
+                                    // nothing was applied, so the entry node may resend
+                                    let gone = msg.contains("not owned") || msg.contains("db is closed");
+                                    r.fail(if gone { WriteError::Unavailable(msg) } else { WriteError::Internal(msg) });
                                 }
                             }
                         }
@@ -1346,7 +1349,7 @@ const PRELOAD_CONCURRENCY: usize = 32;
 /// seeded with what it read, so it carries over to the next owner. Stops
 /// early if the workers shut down; a shard closed meanwhile just fails its
 /// loads (the worker drops stale ones).
-pub fn spawn_preload(workers: &Workers, shards: Vec<(u16, Arc<slatedb::Db>, Arc<crate::partition::RecentRepos>)>) {
+pub fn spawn_preload(workers: &Workers, shards: Vec<(crate::slots::ShardId, Arc<slatedb::Db>, Arc<crate::partition::RecentRepos>)>) {
     use futures::StreamExt;
     let senders = Arc::downgrade(&workers.senders);
     tokio::spawn(async move {
@@ -1366,7 +1369,7 @@ pub fn spawn_preload(workers: &Workers, shards: Vec<(u16, Arc<slatedb::Db>, Arc<
                     }
                     Ok(None) => Vec::new(),
                     Err(e) => {
-                        tracing::warn!(shard, "recent repos read failed: {e:#}");
+                        tracing::warn!(shard = shard.0, "recent repos read failed: {e:#}");
                         Vec::new()
                     }
                 }
@@ -2447,7 +2450,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_commit_waits_for_inflight_before_reload() {
         let store = crate::store::Store::memory(None);
-        let db = Arc::new(crate::partition::open_db(&store, 0, None).await.unwrap());
+        let db = Arc::new(crate::partition::open_db(&store, crate::slots::ShardId(0), None).await.unwrap());
         let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
         let log = NodeLog::start(
             store.clone(),
@@ -2456,7 +2459,7 @@ mod tests {
         );
         // the "sequencer" is this test: it decides when entries become durable
         let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(16);
-        let part = Arc::new(Partition { id: 0, epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() });
+        let part = Arc::new(Partition { id: crate::slots::ShardId(0), epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() });
         let p2 = part.clone();
         let workers = spawn(1, 100, Arc::new(move |_: &str| Some(p2.clone())), tokio::runtime::Handle::current());
         drop(part);
@@ -2505,7 +2508,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abandoned_writes_are_not_applied() {
         let store = crate::store::Store::memory(None);
-        let db = Arc::new(crate::partition::open_db(&store, 0, None).await.unwrap());
+        let db = Arc::new(crate::partition::open_db(&store, crate::slots::ShardId(0), None).await.unwrap());
         let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
         let log = NodeLog::start(
             store.clone(),
@@ -2513,7 +2516,7 @@ mod tests {
             merger_tx,
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(16);
-        let part = Arc::new(Partition { id: 0, epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() });
+        let part = Arc::new(Partition { id: crate::slots::ShardId(0), epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() });
         let p2 = part.clone();
         let workers = spawn(1, 100, Arc::new(move |_: &str| Some(p2.clone())), tokio::runtime::Handle::current());
         let w = workers.senders[0].clone();
@@ -2663,7 +2666,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn path_cache_unloads_then_evicts_by_bytes() {
         let store = crate::store::Store::memory(None);
-        let db = Arc::new(crate::partition::open_db(&store, 0, None).await.unwrap());
+        let db = Arc::new(crate::partition::open_db(&store, crate::slots::ShardId(0), None).await.unwrap());
         let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
         let log = NodeLog::start(
             store.clone(),
@@ -2671,7 +2674,7 @@ mod tests {
             merger_tx,
         );
         let (tx, _rx) = tokio::sync::mpsc::channel::<LogEntry>(16);
-        let part = Arc::new(Partition { id: 0, epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() });
+        let part = Arc::new(Partition { id: crate::slots::ShardId(0), epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() });
         // a fully loaded repo (as after an import or a rebuild)
         let repo = |name: &str, records: u32| {
             let did: Arc<str> = format!("did:plc:{name}").into();
@@ -2775,7 +2778,7 @@ mod tests {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let (part, mut rx) = rt.block_on(async {
             let store = crate::store::Store::memory(None);
-            let db = Arc::new(crate::partition::open_db(&store, 0, None).await.unwrap());
+            let db = Arc::new(crate::partition::open_db(&store, crate::slots::ShardId(0), None).await.unwrap());
             let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
             let log = NodeLog::start(
                 store.clone(),
@@ -2784,7 +2787,7 @@ mod tests {
             );
             std::mem::forget(_merger_rx);
             let (tx, rx) = tokio::sync::mpsc::channel::<LogEntry>(1 << 16);
-            (Arc::new(Partition { id: 0, epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() }), rx)
+            (Arc::new(Partition { id: crate::slots::ShardId(0), epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() }), rx)
         });
         let tid = |i: u64| Tid::from_parts(1_700_000_000_000_000 + i * 1_000_003, i % 1024).to_string();
         for records in [20u64, 5000] {

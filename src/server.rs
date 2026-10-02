@@ -27,7 +27,7 @@ pub struct Config {
     /// (median ms, lognormal sigma) injected on segment PUTs.
     pub inject_latency: Option<(f64, f64)>,
     /// Shards (slot ranges) in the keyspace; fixed per bucket prefix.
-    pub shards: u16,
+    pub shards: u32,
     pub workers: usize,
     pub cache_per_worker: usize,
     /// Approximate heap budget of the node's cached repos and their loaded

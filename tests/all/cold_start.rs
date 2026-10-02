@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use vlpds::state::bulk_did;
 use vlpds::worker::{CachedRepo, WorkerMsg};
 
-async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, shards: u16, f: impl FnOnce(&mut vlpds::server::Config)) -> TestServer {
+async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, shards: u32, f: impl FnOnce(&mut vlpds::server::Config)) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());
     TestServer::spawn_with(move |c| {
         c.memory_store = Some(store);
@@ -257,7 +257,7 @@ async fn restart_window(label: &str, tuned: bool) {
         let cfg = ThrottleConfig { wait_get_per_call: d, wait_put_per_call: d, wait_list_per_call: d, wait_delete_per_call: d, ..Default::default() };
         Arc::new(object_store::limit::LimitStore::new(ThrottledStore::new(object_store::memory::InMemory::new(), cfg), limit))
     };
-    let shards: u16 = 48;
+    let shards: u32 = 48;
     let set = move |c: &mut vlpds::server::Config| {
         c.workers = 2;
         // production-like leases: a saturated store must not fail-stop a node

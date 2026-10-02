@@ -13,7 +13,7 @@ use object_store::ObjectStoreExt;
 use std::sync::Arc;
 use std::time::Duration;
 
-const SHARDS: u16 = 8;
+const SHARDS: u32 = 8;
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());

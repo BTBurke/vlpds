@@ -164,7 +164,7 @@ pub struct SweepStats {
 /// Sweep state: where each partition's scan resumes.
 #[derive(Default)]
 pub struct Sweeper {
-    cursors: HashMap<u16, Vec<u8>>,
+    cursors: HashMap<crate::slots::ShardId, Vec<u8>>,
 }
 
 impl Sweeper {

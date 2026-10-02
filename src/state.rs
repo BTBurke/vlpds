@@ -394,7 +394,7 @@ pub fn did_hash(did: &str) -> u64 {
 
 /// Shard of `did` in the initial uniform layout of `shards` (layout v1).
 /// Splits and merges change it: route with `PartitionTable::shard_of`.
-pub fn partition_of(did: &str, shards: u16) -> u16 {
+pub fn partition_of(did: &str, shards: u32) -> crate::slots::ShardId {
     crate::slots::shard_of(did, shards)
 }
 

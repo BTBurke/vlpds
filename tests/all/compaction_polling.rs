@@ -81,7 +81,7 @@ const MODES: [(&str, CompactionPolling); 3] = [("slow", CompactionPolling::Slow)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn idle_requests_per_mode() {
-    let shards = env("IDLE_SHARDS", 8) as u16;
+    let shards = env("IDLE_SHARDS", 8) as u32;
     let secs = env("IDLE_SECS", 20);
     for (name, mode) in MODES {
         vlpds::partition::set_compaction_polling(mode);
@@ -89,7 +89,7 @@ async fn idle_requests_per_mode() {
         let store = vlpds::store::Store { raw: counting.clone(), ..vlpds::store::Store::memory(None) };
         let mut dbs = Vec::new();
         for s in 0..shards {
-            let db = vlpds::partition::open_db(&store, s, None).await.unwrap();
+            let db = vlpds::partition::open_db(&store, vlpds::slots::ShardId(s), None).await.unwrap();
             db.put(b"k", b"v").await.unwrap();
             db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
             dbs.push(db);
@@ -125,7 +125,7 @@ async fn unpaced_ingest_per_mode() {
         let cfg = ThrottleConfig { wait_get_per_call: latency, wait_put_per_call: latency, wait_list_per_call: latency, wait_delete_per_call: latency, ..Default::default() };
         let counting = Counting::new(Arc::new(ThrottledStore::new(object_store::memory::InMemory::new(), cfg)));
         let store = vlpds::store::Store { raw: counting.clone(), ..vlpds::store::Store::memory(None) };
-        let db = vlpds::partition::open_db(&store, 0, None).await.unwrap();
+        let db = vlpds::partition::open_db(&store, vlpds::slots::ShardId(0), None).await.unwrap();
         let did = "did:plc:ingestingestingestingest";
         let record = vec![0xa5u8; 260];
         let started = Instant::now();

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const SHARDS: u16 = 12;
+const SHARDS: u32 = 12;
 
 async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());
@@ -41,18 +41,18 @@ async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>) -> TestServe
     .await
 }
 
-fn owned(n: &TestServer) -> Vec<u16> {
+fn owned(n: &TestServer) -> Vec<vlpds::slots::ShardId> {
     n.app.partitions.owned().iter().map(|p| p.id).collect()
 }
 
 /// Per moved shard: (release -> serve, unavailable).
-type Gaps = Vec<(u16, Duration, Duration)>;
+type Gaps = Vec<(vlpds::slots::ShardId, Duration, Duration)>;
 
 /// Polls until `joiner` serves `want` shards.
 async fn watch_handback(nodes: &[&TestServer], joiner: &TestServer, raw: &object_store::memory::InMemory, want: usize) -> Gaps {
     let j = nodes.iter().position(|n| std::ptr::eq(*n, joiner)).unwrap();
     let jid = joiner.app.cluster.as_ref().unwrap().cfg.node_id.clone();
-    let (mut dropped, mut released): (HashMap<u16, Instant>, HashMap<u16, Instant>) = Default::default();
+    let (mut dropped, mut released): (HashMap<vlpds::slots::ShardId, Instant>, HashMap<vlpds::slots::ShardId, Instant>) = Default::default();
     let mut gaps = HashMap::new();
     let mut prev: Vec<Option<usize>> = vec![None; SHARDS as usize];
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -61,16 +61,16 @@ async fn watch_handback(nodes: &[&TestServer], joiner: &TestServer, raw: &object
         let mut cur: Vec<Option<usize>> = vec![None; SHARDS as usize];
         for (i, n) in nodes.iter().enumerate() {
             for s in owned(n) {
-                cur[s as usize] = Some(i);
+                cur[s.0 as usize] = Some(i);
             }
         }
-        for s in 0..SHARDS {
-            let (p, c) = (prev[s as usize], cur[s as usize]);
+        for s in (0..SHARDS).map(vlpds::slots::ShardId) {
+            let (p, c) = (prev[s.0 as usize], cur[s.0 as usize]);
             if p.is_some() && p != Some(j) && c.is_none() {
                 dropped.insert(s, now);
             }
             if c != Some(j) && !released.contains_key(&s) {
-                let path = object_store::path::Path::from(format!("vlpds/assign/{s:03}"));
+                let path = object_store::path::Path::from(format!("vlpds/assign/{}", s.key()));
                 if let Ok(r) = raw.get(&path).await {
                     let a: vlpds::cluster::Assignment = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
                     if a.owner.as_deref() == Some(jid.as_str()) {

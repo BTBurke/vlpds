@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const APPVIEW_DID: &str = "did:web:appview.test";
-const SHARDS: u16 = 4;
+const SHARDS: u32 = 4;
 
 /// A fake AppView that records the Authorization header of each request.
 async fn spawn_appview() -> (Arc<Mutex<Vec<String>>>, String) {
@@ -136,17 +136,17 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, appview: &s
 /// Waits until both nodes own shards and agree on who owns what.
 async fn balanced(nodes: &[&TestServer]) {
     for _ in 0..400 {
-        let owned: Vec<Vec<u16>> =
+        let owned: Vec<Vec<vlpds::slots::ShardId>> =
             nodes.iter().map(|n| n.app.partitions.owned().iter().map(|p| p.id).collect()).collect();
-        let all: HashSet<u16> = owned.iter().flatten().copied().collect();
+        let all: HashSet<vlpds::slots::ShardId> = owned.iter().flatten().copied().collect();
         let complete = owned.iter().all(|o| !o.is_empty())
             && all.len() == SHARDS as usize
             && owned.iter().map(|o| o.len()).sum::<usize>() == SHARDS as usize;
         let routed = complete
             && nodes.iter().all(|n| {
                 let c = n.app.cluster.as_ref().unwrap();
-                (0..SHARDS).all(|p| {
-                    let owner = nodes.iter().position(|m| m.app.partitions.get(p as usize).is_some()).unwrap();
+                (0..SHARDS).map(vlpds::slots::ShardId).all(|p| {
+                    let owner = nodes.iter().position(|m| m.app.partitions.get(p).is_some()).unwrap();
                     c.owner_of(p).map(|(id, _)| id) == Some(nodes[owner].app.cluster.as_ref().unwrap().cfg.node_id.clone())
                 })
             });
@@ -191,7 +191,7 @@ async fn takedown_applies_at_once_through_any_node() {
     let body = json!({"handle": handle, "password": PASSWORD, "email": email});
     let j = past_handoffs(|| n1.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None)).await.ok();
     let (did, auth) = (j["did"].as_str().unwrap().to_string(), Auth::Bearer(j["accessJwt"].as_str().unwrap().into()));
-    let p = vlpds::state::partition_of(&did, SHARDS) as usize;
+    let p = vlpds::state::partition_of(&did, SHARDS);
     let owner = nodes.iter().position(|n| n.app.partitions.get(p).is_some()).expect("owned");
     let (own, other) = (nodes[owner], nodes[1 - owner]);
     let status = |s: bool| {

@@ -3,20 +3,20 @@
 //! shards are acquired/released and as the layout changes (split/merge).
 
 use crate::partition::Partition;
-use crate::slots::Layout;
+use crate::slots::{Layout, ShardId};
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub struct PartitionTable {
     layout: RwLock<Arc<Layout>>,
-    open: RwLock<BTreeMap<u16, Arc<Partition>>>,
+    open: RwLock<BTreeMap<ShardId, Arc<Partition>>>,
 }
 
 impl PartitionTable {
     /// Starts with the uniform layout of `n` shards (replaced by the
     /// cluster's layout as soon as it is read).
-    pub fn new(n: u16) -> Arc<PartitionTable> {
+    pub fn new(n: u32) -> Arc<PartitionTable> {
         Arc::new(PartitionTable { layout: RwLock::new(Arc::new(Layout::uniform(n))), open: RwLock::default() })
     }
 
@@ -38,7 +38,7 @@ impl PartitionTable {
     }
 
     /// Shard owning a routing key (DID or private routing key).
-    pub fn shard_of(&self, key: &str) -> u16 {
+    pub fn shard_of(&self, key: &str) -> ShardId {
         self.layout.read().shard_of(key)
     }
 
@@ -56,13 +56,12 @@ impl PartitionTable {
         self.len() == 0
     }
 
-    /// The open shard with this id (any integer type; ids are u16).
-    pub fn get<I: TryInto<u16>>(&self, id: I) -> Option<Arc<Partition>> {
-        let id = id.try_into().ok()?;
+    /// The open shard with this id.
+    pub fn get(&self, id: ShardId) -> Option<Arc<Partition>> {
         self.open.read().get(&id).cloned()
     }
 
-    pub fn set(&self, id: u16, part: Option<Arc<Partition>>) {
+    pub fn set(&self, id: ShardId, part: Option<Arc<Partition>>) {
         let mut open = self.open.write();
         match part {
             Some(p) => open.insert(id, p),

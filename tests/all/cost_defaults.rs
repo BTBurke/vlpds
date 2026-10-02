@@ -81,7 +81,7 @@ fn flush() -> slatedb::config::FlushOptions {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn own_writes_visible_with_slow_manifest_poll() {
     let store = vlpds::store::Store::memory(None);
-    let db = vlpds::partition::open_db(&store, 0, None).await.unwrap();
+    let db = vlpds::partition::open_db(&store, vlpds::slots::ShardId(0), None).await.unwrap();
     let key = |i: u32| format!("k{i:05}").into_bytes();
     let check = |db: &slatedb::Db, round: u32, upto: u32| {
         let db = db.clone();
@@ -128,7 +128,7 @@ async fn own_writes_visible_with_slow_manifest_poll() {
 }
 
 /// Applied markers of every owned shard.
-async fn markers(s: &TestServer) -> Vec<(u16, Option<(String, u64)>)> {
+async fn markers(s: &TestServer) -> Vec<(vlpds::slots::ShardId, Option<(String, u64)>)> {
     let mut v = Vec::new();
     for p in s.app.partitions.owned() {
         v.push((p.id, p.db.get(vlpds::nodelog::META_APPLIED).await.unwrap().and_then(|b| vlpds::nodelog::decode_marker(&b))));
@@ -213,7 +213,7 @@ async fn deep_l0_ingest_keeps_up() {
     let latency = Duration::from_millis(env("INGEST_LATENCY_MS", 10));
     let cfg = ThrottleConfig { wait_get_per_call: latency, wait_put_per_call: latency, wait_list_per_call: latency, wait_delete_per_call: latency, ..Default::default() };
     let store = vlpds::store::Store { raw: Arc::new(ThrottledStore::new(object_store::memory::InMemory::new(), cfg)), ..vlpds::store::Store::memory(None) };
-    let db = vlpds::partition::open_db(&store, 0, None).await.unwrap();
+    let db = vlpds::partition::open_db(&store, vlpds::slots::ShardId(0), None).await.unwrap();
     let did = "did:plc:ingestingestingestingest";
     let record = vec![0xa5u8; 260];
     let started = Instant::now();

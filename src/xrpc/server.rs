@@ -473,7 +473,7 @@ pub(super) struct Ctl {
     at: u64,
     /// (partition, epoch) when read from a partition this node owns; None =
     /// read from the owning node
-    local: Option<(u16, u64)>,
+    local: Option<(crate::slots::ShardId, u64)>,
     /// sessions issued at or before these micros are revoked (until exp secs)
     before: Option<(u64, u64)>,
     /// revoked session family -> expiry (unix secs)
@@ -512,7 +512,7 @@ fn new_family_id() -> String {
     format!("{:016x}{}", crate::tid::now_micros(), random_hex(8))
 }
 
-async fn load_sets(app: &App, did: &str, local: Option<(u16, u64)>) -> XResult<Ctl> {
+async fn load_sets(app: &App, did: &str, local: Option<(crate::slots::ShardId, u64)>) -> XResult<Ctl> {
     let rows = if local.is_some() {
         scan_private(app, did, SEC).await?
     } else {

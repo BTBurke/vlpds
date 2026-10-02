@@ -107,7 +107,7 @@ async fn get_shard_layout(State(app): AppState, Auth(creds): Auth) -> XResult<Js
 
 #[derive(Deserialize)]
 struct SplitIn {
-    shard: u16,
+    shard: crate::slots::ShardId,
     at: Option<u32>,
     #[serde(default)]
     wait: bool,
@@ -115,8 +115,8 @@ struct SplitIn {
 
 #[derive(Deserialize)]
 struct MergeIn {
-    left: u16,
-    right: u16,
+    left: crate::slots::ShardId,
+    right: crate::slots::ShardId,
     #[serde(default)]
     wait: bool,
 }
@@ -566,12 +566,12 @@ impl SearchQ {
 /// Accounts on the shards this node owns, in (slot, did) order after the
 /// cursor, at most `limit`; plus the shards scanned. The local half of
 /// searchAccounts (also served to peers by /internal/v1/admin/searchAccounts).
-pub(super) async fn search_accounts_local(app: &App, q: &SearchQ) -> XResult<(Vec<AccountHit>, Vec<u16>)> {
+pub(super) async fn search_accounts_local(app: &App, q: &SearchQ) -> XResult<(Vec<AccountHit>, Vec<crate::slots::ShardId>)> {
     let (limit, email, after) = q.parsed()?;
     let layout = app.partitions.layout();
     let mut owned = app.partitions.owned();
     owned.sort_by_key(|p| layout.range_of(p.id).map_or(u32::MAX, |r| r.lo));
-    let ids: Vec<u16> = owned.iter().map(|p| p.id).collect();
+    let ids: Vec<crate::slots::ShardId> = owned.iter().map(|p| p.id).collect();
     let start = after.as_deref().map(|d| [state::account_key(d), vec![0]].concat());
     let mut out = Vec::new();
     for p in owned {
@@ -628,7 +628,7 @@ async fn search_accounts(
         query.push(("cursor", c.clone()));
     }
     let g = super::internal::gather(&app, "/internal/v1/admin/searchAccounts", &query).await;
-    let mut covered: std::collections::HashSet<u16> = owned.into_iter().collect();
+    let mut covered: std::collections::HashSet<crate::slots::ShardId> = owned.into_iter().collect();
     for r in g.replies {
         covered.extend(r.owned);
         hits.extend(serde_json::from_value::<Vec<AccountHit>>(r.body["accounts"].clone()).unwrap_or_default());
@@ -654,10 +654,10 @@ fn partial_fields(
     app: &App,
     res: &mut J,
     unreachable: Vec<String>,
-    covered: &std::collections::HashSet<u16>,
+    covered: &std::collections::HashSet<crate::slots::ShardId>,
     from: u32,
 ) {
-    let missing: Vec<u16> =
+    let missing: Vec<crate::slots::ShardId> =
         app.partitions.layout().shards.iter().filter(|r| r.hi > from && !covered.contains(&r.id)).map(|r| r.id).collect();
     if !unreachable.is_empty() {
         res["unreachableNodes"] = json!(unreachable);
@@ -1164,9 +1164,9 @@ impl InviteCodesQ {
 /// Invite codes on the shards this node owns that sort after the cursor, in
 /// order, at most `limit + 1` (so the merger knows whether more exist); plus
 /// the shards scanned. Also served to peers by /internal/v1/admin/inviteCodes.
-pub(super) async fn invite_codes_local(app: &App, q: &InviteCodesQ) -> XResult<(Vec<InviteCode>, Vec<u16>)> {
+pub(super) async fn invite_codes_local(app: &App, q: &InviteCodesQ) -> XResult<(Vec<InviteCode>, Vec<crate::slots::ShardId>)> {
     let (usage, limit, after) = q.parsed()?;
-    let owned: Vec<u16> = app.partitions.owned().iter().map(|p| p.id).collect();
+    let owned: Vec<crate::slots::ShardId> = app.partitions.owned().iter().map(|p| p.id).collect();
     let mut all: Vec<(InviteKey, InviteCode)> = scan_private_routing(app, "_invite:")
         .await?
         .into_iter()
@@ -1199,7 +1199,7 @@ async fn get_invite_codes(
         query.push(("cursor", c.clone()));
     }
     let g = super::internal::gather(&app, "/internal/v1/admin/inviteCodes", &query).await;
-    let mut covered: std::collections::HashSet<u16> = owned.into_iter().collect();
+    let mut covered: std::collections::HashSet<crate::slots::ShardId> = owned.into_iter().collect();
     for r in g.replies {
         covered.extend(r.owned);
         let codes = serde_json::from_value::<Vec<InviteCode>>(r.body["codes"].clone()).unwrap_or_default();

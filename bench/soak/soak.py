@@ -1250,7 +1250,7 @@ class Sampler:
                 continue
             try:
                 body = self.s3.get(m)
-                ids = {int(x) for x in re.findall(rb"/state/(\d{3,5})(?![0-9])", body)} - {sid}
+                ids = {int(x) for x in re.findall(rb"/state/(\d{10})(?![0-9])", body)} - {sid}
                 refs[sid] = ids
             except Exception:
                 pass

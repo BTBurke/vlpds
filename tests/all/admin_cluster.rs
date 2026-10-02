@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-const SHARDS: u16 = 8;
+const SHARDS: u32 = 8;
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());
@@ -35,17 +35,17 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
 /// "every node owns something" can still be mid-rebalance (e.g. 6/1/1), and
 /// later moves would carry a node's accounts off it.
 async fn balanced(nodes: &[&TestServer]) {
-    let mut stable_since: Option<(Vec<Vec<u16>>, std::time::Instant)> = None;
+    let mut stable_since: Option<(Vec<Vec<vlpds::slots::ShardId>>, std::time::Instant)> = None;
     for _ in 0..400 {
-        let owned: Vec<Vec<u16>> = nodes
+        let owned: Vec<Vec<vlpds::slots::ShardId>> = nodes
             .iter()
             .map(|n| {
-                let mut v: Vec<u16> = n.app.partitions.owned().iter().map(|p| p.id).collect();
+                let mut v: Vec<vlpds::slots::ShardId> = n.app.partitions.owned().iter().map(|p| p.id).collect();
                 v.sort();
                 v
             })
             .collect();
-        let all: HashSet<u16> = owned.iter().flatten().copied().collect();
+        let all: HashSet<vlpds::slots::ShardId> = owned.iter().flatten().copied().collect();
         let sizes: Vec<usize> = owned.iter().map(|o| o.len()).collect();
         let fair = sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1;
         let complete = all.len() == SHARDS as usize && sizes.iter().sum::<usize>() == SHARDS as usize;
@@ -114,7 +114,7 @@ async fn admin_listings_scatter_gather_across_nodes() {
         .iter()
         .map(|t| {
             let p = shard(&t.did);
-            [&a, &b, &c].iter().find(|s| s.app.partitions.get(p as usize).is_some()).map(|s| s.url.clone()).unwrap()
+            [&a, &b, &c].iter().find(|s| s.app.partitions.get(p).is_some()).map(|s| s.url.clone()).unwrap()
         })
         .collect();
     assert_eq!(owners.len(), 3, "accounts spread over all three nodes");

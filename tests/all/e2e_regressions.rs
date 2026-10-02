@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-const SHARDS: u16 = 8;
+const SHARDS: u32 = 8;
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());
@@ -36,17 +36,17 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
 /// still for 500 ms: "every node owns some" can still be mid-rebalance
 /// (e.g. 6/1/1), and the hand-backs after it move accounts off their node.
 async fn balanced(nodes: &[&TestServer]) {
-    let mut stable_since: Option<(Vec<Vec<u16>>, std::time::Instant)> = None;
+    let mut stable_since: Option<(Vec<Vec<vlpds::slots::ShardId>>, std::time::Instant)> = None;
     for _ in 0..400 {
-        let owned: Vec<Vec<u16>> = nodes
+        let owned: Vec<Vec<vlpds::slots::ShardId>> = nodes
             .iter()
             .map(|n| {
-                let mut v: Vec<u16> = n.app.partitions.owned().iter().map(|p| p.id).collect();
+                let mut v: Vec<vlpds::slots::ShardId> = n.app.partitions.owned().iter().map(|p| p.id).collect();
                 v.sort();
                 v
             })
             .collect();
-        let all: HashSet<u16> = owned.iter().flatten().copied().collect();
+        let all: HashSet<vlpds::slots::ShardId> = owned.iter().flatten().copied().collect();
         let routed = nodes.iter().all(|n| {
             let c = n.app.cluster.as_ref().unwrap();
             owned.iter().zip(nodes).all(|(shards, o)| {

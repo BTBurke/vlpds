@@ -1246,7 +1246,7 @@ mod tests {
     async fn put_seg(store: &crate::store::Store, log: &str, ord: u64, seq: i64, frame_len: usize) -> LogBatch {
         let frame = Bytes::from(vec![ord as u8; frame_len]);
         let mut b = SegmentBuilder::new();
-        b.push(seq, 0, 1, |o| o.extend_from_slice(&frame), &[]);
+        b.push(seq, crate::slots::ShardId(0), 1, |o| o.extend_from_slice(&frame), &[]);
         let mut obj = b.header(log, ord);
         obj.extend_from_slice(&b.body);
         store.raw.put(&crate::nodelog::segment_path(store, log, ord), PutPayload::from(obj)).await.unwrap();

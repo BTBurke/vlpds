@@ -30,7 +30,7 @@ pub fn routes() -> Router<Arc<App>> {
 /// table it forwards by, its log, peers, and where its firehose merger stands.
 async fn cluster_status(State(app): AppState, headers: HeaderMap) -> XResult<Json<J>> {
     check(&app, &headers)?;
-    let owned: Vec<u16> = app.partitions.owned().iter().map(|p| p.id).collect();
+    let owned: Vec<crate::slots::ShardId> = app.partitions.owned().iter().map(|p| p.id).collect();
     let (node, table, peers, lease_valid) = match &app.cluster {
         Some(c) => (
             c.cfg.node_id.clone(),
@@ -511,7 +511,7 @@ async fn sync_list_repos_by_collection(
 pub struct PeerReply {
     pub node: String,
     /// Shards the peer scanned (owned at the time).
-    pub owned: Vec<u16>,
+    pub owned: Vec<crate::slots::ShardId>,
     pub body: J,
 }
 

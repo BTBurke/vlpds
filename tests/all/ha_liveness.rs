@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-const SHARDS: u16 = 12;
+const SHARDS: u32 = 12;
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, clock_offset_ms: i64) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());

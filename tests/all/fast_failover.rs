@@ -12,7 +12,7 @@ use crate::common::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const SHARDS: u16 = 8;
+const SHARDS: u32 = 8;
 
 async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, advertise: Option<String>, ttl: Duration, renew: Duration) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());

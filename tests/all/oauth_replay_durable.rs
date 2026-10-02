@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-const SHARDS: u16 = 8;
+const SHARDS: u32 = 8;
 const PUBLIC: &str = "http://pds.replay.test";
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
@@ -39,16 +39,16 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
 /// Every shard owned exactly once between `nodes`, and their routing agrees.
 async fn balanced(nodes: &[&TestServer]) {
     for _ in 0..400 {
-        let owned: Vec<Vec<u16>> = nodes.iter().map(|n| n.app.partitions.owned().iter().map(|p| p.id).collect()).collect();
-        let all: HashSet<u16> = owned.iter().flatten().copied().collect();
+        let owned: Vec<Vec<vlpds::slots::ShardId>> = nodes.iter().map(|n| n.app.partitions.owned().iter().map(|p| p.id).collect()).collect();
+        let all: HashSet<vlpds::slots::ShardId> = owned.iter().flatten().copied().collect();
         let complete = owned.iter().all(|o| !o.is_empty())
             && all.len() == SHARDS as usize
             && owned.iter().map(|o| o.len()).sum::<usize>() == SHARDS as usize;
         let routed = complete
             && nodes.iter().all(|n| {
                 let c = n.app.cluster.as_ref().unwrap();
-                (0..SHARDS).all(|p| {
-                    let o = nodes.iter().position(|m| m.app.partitions.get(p as usize).is_some()).unwrap();
+                (0..SHARDS).map(vlpds::slots::ShardId).all(|p| {
+                    let o = nodes.iter().position(|m| m.app.partitions.get(p).is_some()).unwrap();
                     c.owner_of(p).map(|(id, _)| id) == Some(nodes[o].app.cluster.as_ref().unwrap().cfg.node_id.clone())
                 })
             });
@@ -124,7 +124,7 @@ async fn dpop_proof_replay_refused_after_owner_change() {
     let mut key = loop {
         let k = DpopKey { sk: SigningKey::random(&mut rand::rngs::OsRng), nonce: None };
         let p = vlpds::state::partition_of(&format!("oauth:jkt:{}", k.jkt()), SHARDS);
-        if a.app.partitions.get(p as usize).is_some() {
+        if a.app.partitions.get(p).is_some() {
             break k;
         }
     };

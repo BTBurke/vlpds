@@ -308,7 +308,7 @@ mod tests {
 
     async fn put(store: &Store, ord: u64, prefix_end: u64) {
         let mut b = SegmentBuilder::new();
-        b.push(1000 + ord as i64, 0, 1, |o| o.extend_from_slice(b"f"), &[]);
+        b.push(1000 + ord as i64, crate::slots::ShardId(0), 1, |o| o.extend_from_slice(b"f"), &[]);
         let mut obj = b.sealed_header("A", ord, prefix_end);
         obj.extend_from_slice(&b.body);
         store.raw.put(&segment_path(store, "A", ord), PutPayload::from(obj)).await.unwrap();

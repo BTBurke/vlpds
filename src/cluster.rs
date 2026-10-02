@@ -5,7 +5,7 @@
 //! Objects (all CAS via ETag or If-None-Match):
 //!   nodes/{node_id}     NodeLease {log_id, addr, writer, renewals, ..}  renewed by the node
 //!   writers/{w:03}      WriterClaim {node_id, log_id, confirmed}  unique seq low byte among live nodes
-//!   assign/{shard:03}   Assignment {owner, log_id, addr, epoch, seq_floor, history[Span], frozen}
+//!   assign/{id:010}     Assignment {owner, log_id, addr, epoch, seq_floor, history[Span], frozen}
 //!                       changes only when a shard moves: taken by CAS, or
 //!                       handed by its owner straight to a joiner (see `Handoff`)
 //!   assign/layout       Layout {version, shards[{id, lo, hi}], next_id, op}: the
@@ -29,7 +29,7 @@
 //!   reassigned under it.
 
 use crate::nodelog::Span;
-use crate::slots::{Layout, Reshard};
+use crate::slots::{Layout, Reshard, ShardId};
 use crate::store::Store;
 use object_store::path::Path;
 use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
@@ -89,7 +89,7 @@ pub struct Assignment {
 /// finds the same assignment and adopts it then.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Handoff {
-    pub shard: u16,
+    pub shard: ShardId,
     pub assignment: Assignment,
     /// ETag of the handed assignment (our release CAS later starts from it).
     pub etag: Option<String>,
@@ -101,7 +101,7 @@ pub struct ClusterConfig {
     pub addr: String,
     /// Shards of the initial (uniform) layout, used only if this prefix has
     /// no layout yet; splits and merges change the count later.
-    pub shards: u16,
+    pub shards: u32,
     pub ttl: Duration,
     pub renew_every: Duration,
     pub skew: Duration,
@@ -141,11 +141,11 @@ pub trait ShardHost: Send + Sync + 'static {
     async fn wait_seq_floor(&self, _seq: i64) {}
     /// Replay each shard's `history` (previous owners' spans) and start
     /// serving them. Batched so a takeover reads a dead log once for all shards.
-    async fn open_many(&self, shards: Vec<(u16, u64, Vec<Span>)>) -> Vec<(u16, anyhow::Result<()>)>;
+    async fn open_many(&self, shards: Vec<(ShardId, u64, Vec<Span>)>) -> Vec<(ShardId, anyhow::Result<()>)>;
     /// Stop accepting writes for `shards`, drain (one barrier segment for all
     /// of them), checkpoint, close. A shard may be released only if its close
     /// succeeded: otherwise entries of it may still be in flight.
-    async fn close_many(&self, shards: Vec<u16>) -> Vec<(u16, anyhow::Result<()>)>;
+    async fn close_many(&self, shards: Vec<ShardId>) -> Vec<(ShardId, anyhow::Result<()>)>;
     /// Waits until nothing is queued or in flight on our log (before fencing
     /// it on shutdown). False if it did not quiesce in time.
     async fn quiesce(&self) -> bool {
@@ -168,7 +168,7 @@ pub trait ShardHost: Send + Sync + 'static {
     }
     /// (shard, approximate state bytes, log entries applied so far) of the
     /// shards open here, for the reshard policy.
-    fn shard_stats(&self) -> Vec<(u16, u64, u64)> {
+    fn shard_stats(&self) -> Vec<(ShardId, u64, u64)> {
         Vec::new()
     }
     /// Joiner: asks each of `peers` to learn our lease now (and follow our
@@ -207,7 +207,7 @@ pub(crate) type Versioned<T> = (T, Option<String>);
 
 /// When the split policy last planned, and per shard the mutation count last
 /// seen (and when).
-pub(crate) type PolicyState = (Option<Instant>, HashMap<u16, (u64, Instant)>);
+pub(crate) type PolicyState = (Option<Instant>, HashMap<ShardId, (u64, Instant)>);
 
 pub struct Cluster {
     pub cfg: ClusterConfig,
@@ -220,19 +220,19 @@ pub struct Cluster {
     expires_local_ms: AtomicU64,
     valid_until: RwLock<Instant>,
     /// Routing table: shard -> (owner node, addr)
-    table: RwLock<BTreeMap<u16, (String, String)>>,
-    owned: RwLock<HashSet<u16>>,
+    table: RwLock<BTreeMap<ShardId, (String, String)>>,
+    owned: RwLock<HashSet<ShardId>>,
     /// Live peers (node_id -> lease), refreshed every step.
     peers: RwLock<HashMap<String, NodeLease>>,
     /// Peer leases as last observed (node_id -> etag, lease, when it changed).
     seen: RwLock<HashMap<String, Seen>>,
     /// Assignment cache (with ETags), refreshed from a LIST every step:
     /// every shard id with an assignment object, retired ones included.
-    pub(crate) assigns: RwLock<BTreeMap<u16, Versioned<Assignment>>>,
+    pub(crate) assigns: RwLock<BTreeMap<ShardId, Versioned<Assignment>>>,
     /// The shard map and its ETag (`assign/layout`), refreshed in the same LIST.
     pub(crate) layout: RwLock<(Arc<Layout>, Option<String>)>,
     /// When we last opened each shard (handbacks prefer older ones).
-    opened_at: RwLock<HashMap<u16, Instant>>,
+    opened_at: RwLock<HashMap<ShardId, Instant>>,
     /// Split policy (reshard.rs; off by default).
     pub(crate) policy: RwLock<crate::reshard::Policy>,
     /// Policy state: when it last planned, and per shard the entry count
@@ -278,7 +278,7 @@ pub struct Cluster {
     /// already opened it is ours from before (e.g. a release CAS that failed)
     /// and must not be adopted again: its history minus our span would
     /// replay older owners' writes over ours.
-    opened: RwLock<HashMap<u16, u64>>,
+    opened: RwLock<HashMap<ShardId, u64>>,
 }
 
 fn now_ms() -> u64 {
@@ -616,23 +616,23 @@ impl Cluster {
         self.alone.load(Ordering::Acquire)
     }
 
-    pub fn is_owner(&self, shard: u16) -> bool {
+    pub fn is_owner(&self, shard: ShardId) -> bool {
         self.owned.read().contains(&shard)
     }
 
-    pub fn owned(&self) -> Vec<u16> {
-        let mut v: Vec<u16> = self.owned.read().iter().copied().collect();
+    pub fn owned(&self) -> Vec<ShardId> {
+        let mut v: Vec<ShardId> = self.owned.read().iter().copied().collect();
         v.sort();
         v
     }
 
     /// (node_id, addr) owning `shard`, from the routing table.
-    pub fn owner_of(&self, shard: u16) -> Option<(String, String)> {
+    pub fn owner_of(&self, shard: ShardId) -> Option<(String, String)> {
         self.table.read().get(&shard).cloned()
     }
 
     /// The assignment of `shard` as last read (or written) by this node.
-    pub fn assignment(&self, shard: u16) -> Option<Assignment> {
+    pub fn assignment(&self, shard: ShardId) -> Option<Assignment> {
         self.assigns.read().get(&shard).map(|(a, _)| a.clone())
     }
 
@@ -804,7 +804,7 @@ impl Cluster {
 
     /// Whether `a` names this incarnation at an epoch it hasn't opened yet:
     /// a peer handed the shard to us.
-    fn handed_to_us(&self, shard: u16, a: &Assignment) -> bool {
+    fn handed_to_us(&self, shard: ShardId, a: &Assignment) -> bool {
         a.owner.as_deref() == Some(&self.cfg.node_id)
             && a.log_id.as_deref() == Some(&self.log_id)
             && !self.is_owner(shard)
@@ -837,7 +837,7 @@ impl Cluster {
 
     /// Starts serving shards whose assignment already names us (handed by
     /// their previous owner): replay the history before our own span.
-    async fn adopt(&self, host: &Arc<dyn ShardHost>, shards: Vec<(u16, Assignment)>) -> anyhow::Result<()> {
+    async fn adopt(&self, host: &Arc<dyn ShardHost>, shards: Vec<(ShardId, Assignment)>) -> anyhow::Result<()> {
         if shards.is_empty() {
             return Ok(());
         }
@@ -857,7 +857,7 @@ impl Cluster {
 
     /// Opens shards we now own and routes them to us; one that fails to open
     /// is released (nothing was logged for it).
-    pub(crate) async fn open_acquired(&self, host: &Arc<dyn ShardHost>, shards: Vec<(u16, u64, Vec<Span>)>) -> anyhow::Result<()> {
+    pub(crate) async fn open_acquired(&self, host: &Arc<dyn ShardHost>, shards: Vec<(ShardId, u64, Vec<Span>)>) -> anyhow::Result<()> {
         {
             let mut opened = self.opened.write();
             let (mut at, now) = (self.opened_at.write(), Instant::now());
@@ -873,7 +873,7 @@ impl Cluster {
                 }
                 Err(e) => {
                     // nothing was logged for it: release with an empty span
-                    tracing::error!(shard = s, "open failed: {e:#}; releasing");
+                    tracing::error!(shard = s.0, "open failed: {e:#}; releasing");
                     self.owned.write().remove(&s);
                     self.release(s, host.next_ordinal(), host.seq_high(), None, None).await?;
                 }
@@ -1054,12 +1054,12 @@ impl Cluster {
     async fn read_assignments(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
         use futures::StreamExt;
         let full = self.steps.fetch_add(1, Ordering::Relaxed).is_multiple_of(FULL_RESYNC_STEPS);
-        let mut listed: BTreeMap<u16, Option<String>> = BTreeMap::new();
+        let mut listed: BTreeMap<ShardId, Option<String>> = BTreeMap::new();
         let mut layout_etag = None;
         for (name, etag) in self.list("assign").await? {
             if name == "layout" {
                 layout_etag = Some(etag);
-            } else if let Ok(s) = name.parse::<u16>() {
+            } else if let Some(s) = ShardId::from_key(&name) {
                 listed.insert(s, etag);
             }
         }
@@ -1070,7 +1070,7 @@ impl Cluster {
                 self.refresh_layout(host).await?;
             }
         }
-        let stale: Vec<u16> = {
+        let stale: Vec<ShardId> = {
             let cache = self.assigns.read();
             listed
                 .iter()
@@ -1081,8 +1081,8 @@ impl Cluster {
                 .map(|(s, _)| *s)
                 .collect()
         };
-        let fetched: Vec<(u16, Option<Versioned<Assignment>>)> = futures::stream::iter(stale)
-            .map(|s| async move { self.get_json::<Assignment>(&self.path(&format!("assign/{s:03}"))).await.map(|a| (s, a)) })
+        let fetched: Vec<(ShardId, Option<Versioned<Assignment>>)> = futures::stream::iter(stale)
+            .map(|s| async move { self.get_json::<Assignment>(&self.path(&format!("assign/{}", s.key()))).await.map(|a| (s, a)) })
             .buffered(32)
             .collect::<Vec<_>>()
             .await
@@ -1113,6 +1113,12 @@ impl Cluster {
     pub(crate) fn install_layout(&self, host: &Arc<dyn ShardHost>, l: Layout, etag: Option<String>) -> Arc<Layout> {
         let mut cur = self.layout.write();
         if l.version < cur.0.version {
+            return cur.0.clone();
+        }
+        if l.next_id < cur.0.next_id {
+            // every layout write derives from the current one, so the id
+            // allocator only grows; one that went back would reuse ids
+            tracing::error!(version = l.version, next_id = l.next_id.0, ours = cur.0.next_id.0, "shard layout's id allocator went backwards: ignored");
             return cur.0.clone();
         }
         let changed = l.version > cur.0.version;
@@ -1201,7 +1207,7 @@ impl Cluster {
         if let Some(s) = self.owned().into_iter().find(|s| {
             assigns.get(s).is_none_or(|(a, _)| a.owner.as_deref() != Some(&self.cfg.node_id) || a.log_id.as_deref() != Some(&self.log_id))
         }) {
-            tracing::error!(shard = s, "a shard we hold was reassigned: fail-stop");
+            tracing::error!(shard = s.0, "a shard we hold was reassigned: fail-stop");
             host.lost();
             return Ok(());
         }
@@ -1222,7 +1228,7 @@ impl Cluster {
             return Ok(());
         }
         // 4a. shards a peer handed us whose nudge we missed
-        let handed: Vec<(u16, Assignment)> = layout
+        let handed: Vec<(ShardId, Assignment)> = layout
             .ids()
             .into_iter()
             .filter_map(|s| assigns.get(&s).filter(|(a, _)| self.handed_to_us(s, a)).map(|(a, _)| (s, a.clone())))
@@ -1234,7 +1240,7 @@ impl Cluster {
         //      no longer hold. Left alone it would never be served (we look
         //      alive, so nobody takes it over). Nothing of it was logged
         //      since its close, so our span may end now.
-        let unreleased: Vec<u16> = layout
+        let unreleased: Vec<ShardId> = layout
             .ids()
             .into_iter()
             .filter(|s| {
@@ -1248,9 +1254,9 @@ impl Cluster {
             .collect();
         for s in unreleased {
             let frozen = layout.op.as_ref().filter(|o| o.parents.contains(&s)).map(|o| o.id);
-            tracing::warn!(shard = s, "retrying the release of a shard we closed");
+            tracing::warn!(shard = s.0, "retrying the release of a shard we closed");
             if let Err(e) = self.release(s, host.durable_end(), host.seq_high(), None, frozen).await {
-                tracing::warn!(shard = s, "release retry failed: {e:#}");
+                tracing::warn!(shard = s.0, "release retry failed: {e:#}");
             }
         }
         let owned = self.owned();
@@ -1267,11 +1273,11 @@ impl Cluster {
             let keep = layout.shards.len().div_ceil(settled.len() + 1);
             if owned.len() > keep {
                 tracing::info!(owned = owned.len(), keep, live = live.len(), "handing back extra shards");
-                let busy: HashSet<u16> = layout.op.iter().flat_map(|o| o.parents.clone()).collect();
-                let mut cands: Vec<u16> = owned.iter().copied().filter(|s| !busy.contains(s)).collect();
+                let busy: HashSet<ShardId> = layout.op.iter().flat_map(|o| o.parents.clone()).collect();
+                let mut cands: Vec<ShardId> = owned.iter().copied().filter(|s| !busy.contains(s)).collect();
                 let at = self.opened_at.read().clone();
                 cands.sort_by_key(|s| (at.get(s).copied(), std::cmp::Reverse(*s)));
-                let extras: Vec<u16> = cands.into_iter().take(owned.len() - keep).collect();
+                let extras: Vec<ShardId> = cands.into_iter().take(owned.len() - keep).collect();
                 let to = self.short_of(&settled, fair);
                 if !self.close_and_release(host, extras, to, None).await {
                     return Ok(());
@@ -1313,7 +1319,7 @@ impl Cluster {
     pub(crate) async fn acquire(
         &self,
         host: &Arc<dyn ShardHost>,
-        candidates: Vec<u16>,
+        candidates: Vec<ShardId>,
         want: usize,
         live_ids: &HashSet<String>,
         dead_logs: &HashMap<String, String>,
@@ -1380,7 +1386,7 @@ impl Cluster {
         // trip, not one per shard (~2 s at 25 ms PUTs, bench 2026-10-02 §2)
         let cas: Vec<_> = futures::stream::iter(picked)
             .map(|(s, newa, mode, history)| async move {
-                let r = self.put_json(&self.path(&format!("assign/{s:03}")), &newa, mode).await;
+                let r = self.put_json(&self.path(&format!("assign/{}", s.key())), &newa, mode).await;
                 (s, newa, history, r)
             })
             .buffer_unordered(32)
@@ -1456,7 +1462,7 @@ impl Cluster {
     /// fail-stop instead, and a successor fences our log and replays it to
     /// the fence. False if we fail-stopped. `frozen`: release them frozen
     /// for that reshard op (never handed out; `to` must be empty).
-    pub(crate) async fn close_and_release(&self, host: &Arc<dyn ShardHost>, shards: Vec<u16>, mut to: Vec<(NodeLease, usize)>, frozen: Option<u64>) -> bool {
+    pub(crate) async fn close_and_release(&self, host: &Arc<dyn ShardHost>, shards: Vec<ShardId>, mut to: Vec<(NodeLease, usize)>, frozen: Option<u64>) -> bool {
         use futures::StreamExt;
         if shards.is_empty() {
             return true;
@@ -1477,7 +1483,7 @@ impl Cluster {
                     done.push(s);
                 }
                 Err(e) => {
-                    tracing::error!(shard = s, "close failed: {e:#}");
+                    tracing::error!(shard = s.0, "close failed: {e:#}");
                     ok = false;
                 }
             }
@@ -1537,8 +1543,8 @@ impl Cluster {
     /// with an open span for it starting at the log ordinal its lease last
     /// published). CAS against the cached assignment; re-read once on a
     /// conflict. Returns the handoff for `to`.
-    async fn release(&self, shard: u16, end: u64, seq_floor: i64, to: Option<&NodeLease>, frozen: Option<u64>) -> anyhow::Result<Option<Handoff>> {
-        let path = self.path(&format!("assign/{shard:03}"));
+    async fn release(&self, shard: ShardId, end: u64, seq_floor: i64, to: Option<&NodeLease>, frozen: Option<u64>) -> anyhow::Result<Option<Handoff>> {
+        let path = self.path(&format!("assign/{}", shard.key()));
         let mut cur = self.assigns.read().get(&shard).cloned().filter(|(_, e)| e.is_some());
         for attempt in 0..2 {
             let (mut a, etag) = match cur.take() {
@@ -1663,13 +1669,13 @@ mod tests {
 
     #[derive(Default)]
     struct Host {
-        opened: Mutex<Vec<(u16, u64, Vec<Span>)>>,
-        closed: Mutex<Vec<Vec<u16>>>,
+        opened: Mutex<Vec<(ShardId, u64, Vec<Span>)>>,
+        closed: Mutex<Vec<Vec<ShardId>>>,
         ord: AtomicU64,
         seq: AtomicI64,
         floors: Mutex<Vec<i64>>,
         lost: AtomicU64,
-        fail_close: Mutex<HashSet<u16>>,
+        fail_close: Mutex<HashSet<ShardId>>,
         nudged: Mutex<Vec<(String, Vec<Handoff>)>>,
     }
 
@@ -1687,7 +1693,7 @@ mod tests {
         async fn wait_seq_floor(&self, seq: i64) {
             self.floors.lock().push(seq);
         }
-        async fn open_many(&self, v: Vec<(u16, u64, Vec<Span>)>) -> Vec<(u16, anyhow::Result<()>)> {
+        async fn open_many(&self, v: Vec<(ShardId, u64, Vec<Span>)>) -> Vec<(ShardId, anyhow::Result<()>)> {
             v.into_iter()
                 .map(|(s, e, h)| {
                     self.opened.lock().push((s, e, h));
@@ -1695,7 +1701,7 @@ mod tests {
                 })
                 .collect()
         }
-        async fn close_many(&self, v: Vec<u16>) -> Vec<(u16, anyhow::Result<()>)> {
+        async fn close_many(&self, v: Vec<ShardId>) -> Vec<(ShardId, anyhow::Result<()>)> {
             self.closed.lock().push(v.clone());
             let fail = self.fail_close.lock().clone();
             v.into_iter().map(|s| (s, if fail.contains(&s) { Err(anyhow::anyhow!("barrier timed out")) } else { Ok(()) })).collect()
@@ -1733,7 +1739,7 @@ mod tests {
     /// A real segment holding one entry at `seq` (fence/replay parse it).
     fn segment(log_id: &str, ord: u64, seq: i64) -> PutPayload {
         let mut b = crate::segment::SegmentBuilder::new();
-        b.push(seq, 0, 1, |_| {}, &[]);
+        b.push(seq, crate::slots::ShardId(0), 1, |_| {}, &[]);
         let mut data = b.header(log_id, ord);
         data.extend_from_slice(&b.body);
         PutPayload::from(data)
@@ -1783,7 +1789,7 @@ mod tests {
         }
         for ord in 4..6u64 {
             let mut b = crate::segment::SegmentBuilder::new();
-            b.push(200 + ord as i64, 0, 1, |_| {}, &[]);
+            b.push(200 + ord as i64, crate::slots::ShardId(0), 1, |_| {}, &[]);
             let mut data = b.sealed_header(log, ord, 3);
             data.extend_from_slice(&b.body);
             store.raw.put(&crate::nodelog::segment_path(&store, log, ord), PutPayload::from(data)).await.unwrap();
@@ -1890,7 +1896,7 @@ mod tests {
         a.step(&ha_dyn).await.unwrap(); // hands 4 to b; the nudge is dropped
         assert_eq!(ha.nudged.lock()[0].1.len(), 4);
         b.step(&hb_dyn).await.unwrap();
-        assert_eq!(b.owned(), vec![4, 5, 6, 7]);
+        assert_eq!(b.owned(), [4, 5, 6, 7].map(ShardId).to_vec());
         for (_, epoch, hist) in hb.opened.lock().iter() {
             assert_eq!((*epoch, hist.len(), hist[0].end), (2, 1, Some(3)), "replays a's closed span only");
         }
@@ -1898,12 +1904,12 @@ mod tests {
         // re-adopt it with a's span as its history (which would drop b's own
         // span); it retries the release and takes it back the normal way,
         // replaying its own closed span too
-        b.owned.write().remove(&7);
+        b.owned.write().remove(&ShardId(7));
         b.step(&hb_dyn).await.unwrap();
         let opened = hb.opened.lock().clone();
         assert_eq!(opened.len(), 5);
         let (s, epoch, hist) = opened.last().unwrap();
-        assert_eq!((*s, *epoch, hist.len()), (7, 3, 2), "{hist:?}");
+        assert_eq!((*s, *epoch, hist.len()), (ShardId(7), 3, 2), "{hist:?}");
         assert_eq!((hist[1].log_id.as_str(), hist[1].epoch, hist[1].end.is_some()), (b.log_id.as_str(), 2, true), "b's span closed and replayed");
     }
 
@@ -1921,21 +1927,21 @@ mod tests {
         b.step(&hb_dyn).await.unwrap();
         a.step(&ha_dyn).await.unwrap(); // a first sees b
         tokio::time::sleep(Duration::from_millis(250)).await;
-        ha.fail_close.lock().insert(7); // a releases 7..4 (highest first)
+        ha.fail_close.lock().insert(ShardId(7)); // a releases 7..4 (highest first)
         a.step(&ha_dyn).await.unwrap();
         assert_eq!(ha.lost.load(Ordering::SeqCst), 1, "fail-stop on a failed close");
-        assert_eq!(a.owned(), vec![0, 1, 2, 3, 7]);
-        let get = |s: u16| {
+        assert_eq!(a.owned(), [0, 1, 2, 3, 7].map(ShardId).to_vec());
+        let get = |s: ShardId| {
             let store = store.clone();
             async move {
-                let r = store.raw.get(&Path::from(format!("{}/assign/{s:03}", store.prefix))).await.unwrap();
+                let r = store.raw.get(&Path::from(format!("{}/assign/{}", store.prefix, s.key()))).await.unwrap();
                 serde_json::from_slice::<Assignment>(&r.bytes().await.unwrap()).unwrap()
             }
         };
-        let s7 = get(7).await;
+        let s7 = get(ShardId(7)).await;
         assert_eq!(s7.owner.as_deref(), Some("a"), "not released");
         assert_eq!(s7.history.last().unwrap().end, None, "span left open: a successor ends it at the fence");
-        assert_eq!(get(6).await.owner.as_deref(), Some("b"), "the closed ones are handed to b");
+        assert_eq!(get(ShardId(6)).await.owner.as_deref(), Some("b"), "the closed ones are handed to b");
     }
 
     /// Wall clocks minutes apart: liveness doesn't care (O3). With the old
@@ -2075,7 +2081,7 @@ mod tests {
         stalls.arm("list", "assign");
         stalls.arm("get", "nodes/a");
         stalls.arm("list", &format!("log/{}", a.log_id));
-        stalls.arm("put", "assign/003");
+        stalls.arm("put", "assign/0000000003");
         let (hb, hb_dyn) = host();
         while b.owned().len() < 8 {
             let _ = b.step(&hb_dyn).await; // a stalled call fails the step

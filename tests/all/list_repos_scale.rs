@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vlpds::state;
 
-async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, shards: u16) -> TestServer {
+async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, shards: u32) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());
     TestServer::spawn_with(move |c| {
         c.memory_store = Some(store);
@@ -32,18 +32,18 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, shards: u16
 /// split (none over ceil(shards / nodes)), every routing table agrees, and it holds still
 /// for 500 ms: "each owns some" can still be mid-rebalance (e.g. 6/1/1), and
 /// a later hand-back closes a shard `populate` is writing into.
-async fn balanced(nodes: &[&TestServer], shards: u16) {
-    let mut stable_since: Option<(Vec<Vec<u16>>, std::time::Instant)> = None;
+async fn balanced(nodes: &[&TestServer], shards: u32) {
+    let mut stable_since: Option<(Vec<Vec<vlpds::slots::ShardId>>, std::time::Instant)> = None;
     for _ in 0..400 {
-        let owned: Vec<Vec<u16>> = nodes
+        let owned: Vec<Vec<vlpds::slots::ShardId>> = nodes
             .iter()
             .map(|n| {
-                let mut v: Vec<u16> = n.app.partitions.owned().iter().map(|p| p.id).collect();
+                let mut v: Vec<vlpds::slots::ShardId> = n.app.partitions.owned().iter().map(|p| p.id).collect();
                 v.sort();
                 v
             })
             .collect();
-        let all: HashSet<u16> = owned.iter().flatten().copied().collect();
+        let all: HashSet<vlpds::slots::ShardId> = owned.iter().flatten().copied().collect();
         let routed = nodes.iter().all(|n| {
             let c = n.app.cluster.as_ref().unwrap();
             owned.iter().zip(nodes).all(|(ss, o)| {
@@ -71,7 +71,7 @@ async fn balanced(nodes: &[&TestServer], shards: u16) {
     panic!("cluster never balanced");
 }
 
-async fn cluster(prefix: &str, shards: u16) -> Vec<TestServer> {
+async fn cluster(prefix: &str, shards: u32) -> Vec<TestServer> {
     let store = Arc::new(object_store::memory::InMemory::new());
     let mut nodes = Vec::new();
     for x in ["a", "b", "c"] {
@@ -83,17 +83,17 @@ async fn cluster(prefix: &str, shards: u16) -> Vec<TestServer> {
 
 /// Writes `n` synthetic repos (bulk DIDs; every 50th deactivated) into the
 /// owning nodes' shard DBs. Returns (did -> rev).
-async fn populate(nodes: &[TestServer], shards: u16, n: u64) -> std::collections::HashMap<String, String> {
+async fn populate(nodes: &[TestServer], shards: u32, n: u64) -> std::collections::HashMap<String, String> {
     let mut by_shard: Vec<Vec<(String, u64)>> = vec![Vec::new(); shards as usize];
     for i in 0..n {
         let did = state::bulk_did(i);
-        by_shard[state::partition_of(&did, shards) as usize].push((did, i));
+        by_shard[state::partition_of(&did, shards).0 as usize].push((did, i));
     }
     let mut want = std::collections::HashMap::new();
     let commit = Cid::dag_cbor(b"commit");
     let data = Cid::dag_cbor(b"data");
     for (shard, dids) in by_shard.into_iter().enumerate() {
-        let p = nodes.iter().find_map(|s| s.app.partitions.get(shard)).expect("shard owner");
+        let p = nodes.iter().find_map(|s| s.app.partitions.get(vlpds::slots::ShardId(shard as u32))).expect("shard owner");
         for chunk in dids.chunks(5000) {
             let mut wb = slatedb::WriteBatch::new();
             for (did, i) in chunk {

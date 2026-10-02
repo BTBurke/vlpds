@@ -542,9 +542,13 @@ the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
   versioned layout (`assign/layout`; `--shards N` uniform ranges, default
   64, when a prefix is created), which splits and merges change online (see "Online
   shard split/merge"). A shard is the unit of ownership and state: one
-  SlateDB at `state/{id}/` and an assignment object `assign/{id}`.
+  SlateDB at `state/{id}/` and an assignment object `assign/{id}`, where
+  `{id}` is its u32 shard id as 10 zero-padded decimal digits
+  (`state/0000000042/`; `slots::ShardId::key`), so keys LIST in id order and
+  read like the plain numbers in logs and the admin API.
 - **One log per node incarnation.** A node group-commits every shard's entries,
-  tagged `(shard, epoch)`, into `log/{log_id}/{ordinal}.seg`. Up to K
+  tagged `(shard, epoch)` (u32 shard id, u64 epoch; segment format
+  `VLSEG06`, `src/segment.rs`), into `log/{log_id}/{ordinal}.seg`. Up to K
   segment PUTs are in flight (`--log-inflight`, default 4), each written with
   `If-None-Match: *` at its ordinal; completions are finalized strictly in
   ordinal order (see "Pipelined segment PUTs"). A write is acked only after
@@ -858,11 +862,28 @@ handback's, and every node routes by the same versioned map.
 **The layout is data.** `assign/layout` (JSON, CAS on its ETag) holds
 `{version, shards: [{id, lo, hi}], next_id, op_seq, op}`: contiguous slot
 ranges covering `[0, 65536)`, each naming a *shard id*. Ids are stable,
-never reused identifiers (`state/{id:03}`, `assign/{id:03}`, the `shard`
-tag of log entries), no longer positions in a uniform split: a split
-allocates two new ids, a merge one. The first node of a prefix creates
-version 1 as `--shards` uniform ranges with ids 0..n (the uniform layout
-of before). `version` increases only when routing changes (a flip below).
+never reused identifiers (`state/{id}/`, `assign/{id}` with `{id}` as 10
+digits, the `shard` tag of log entries), no longer positions in a uniform
+split: a split allocates two new ids, a merge one. The first node of a
+prefix creates version 1 as `--shards` uniform ranges with ids 0..n (the
+uniform layout of before).
+
+*Shard ids* are u32 (`slots::ShardId`; JSON and logs show the number).
+`next_id` is the allocator: every id below it was handed out, none at or
+above it was. `Layout::alloc` takes ids from it when an op is planned and
+the plan's CAS of the layout advances it past them, so an allocation
+happens exactly once (a planner that loses the CAS re-plans from the newer
+layout and gets fresh ids) and survives an abort or a crash-resume (the
+resuming driver reads the op, it never allocates again). Every layout write
+derives from the current object, so `next_id` only grows; a node refuses
+to install a layout whose `next_id` went back. Never reusing ids is what
+makes stale state safe: an aborted op's half-made clone, a retired
+parent's directory or a crashed driver's late write can only ever name an
+id no live shard has. 16-bit ids (VLSEG05 and before) allowed ~65k
+lifetime split/merge ops, too few for an automatic policy; 32 bits allow
+~4.3 B (`alloc` errors rather than wrapping at `u32::MAX`). The slot space
+stays 16-bit, so at most 65,536 shards exist at once (`--shards` is capped
+there). `version` increases only when routing changes (a flip below).
 The object sits under `assign/`, so the LIST every step already makes for
 assignments returns its ETag: nodes GET it only when it changed, and the
 steady state costs no extra request. Each node installs the layout it read

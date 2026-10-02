@@ -35,7 +35,7 @@ async fn one_shard_sustains_bulk_ingest() {
         Arc::new(ThrottledStore::new(object_store::memory::InMemory::new(), cfg))
     };
     let store = vlpds::store::Store { raw, ..vlpds::store::Store::memory(None) };
-    let db = vlpds::partition::open_db(&store, 0, None).await.unwrap();
+    let db = vlpds::partition::open_db(&store, vlpds::slots::ShardId(0), None).await.unwrap();
 
     let did = "did:plc:ingestingestingestingest";
     let record = vec![0xa5u8; 260]; // a typical post's DAG-CBOR

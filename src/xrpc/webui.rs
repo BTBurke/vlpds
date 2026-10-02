@@ -92,7 +92,7 @@ async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json
             message: "admin credentials required".into(),
         });
     }
-    let owned: Vec<u16> = app.partitions.owned().iter().map(|p| p.id).collect();
+    let owned: Vec<crate::slots::ShardId> = app.partitions.owned().iter().map(|p| p.id).collect();
     let durable = app.log.durable_ordinal.load(Ordering::Acquire);
     let durable = (durable != u64::MAX).then_some(durable);
     let sources: Vec<J> = {

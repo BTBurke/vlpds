@@ -1519,26 +1519,39 @@ def s3_get(key):
     return body if st == 200 else None
 
 
+def _zstd_decompress(data, size):
+    try:
+        import zstandard  # optional; else the zstd CLI
+        return zstandard.ZstdDecompressor().decompress(data, max_output_size=size)
+    except ImportError:
+        return subprocess.run(["zstd", "-d", "-c"], input=data, capture_output=True, check=True).stdout
+
+
 def parse_log_object(b):
-    """VLSEG03 segment -> {'kind': 'segment', ordinal, prefix_end, first_seq, last_seq, seqs}; VLFENCE -> {'kind': 'fence', by}."""
+    """VLSEG06 segment (src/segment.rs) -> {'kind': 'segment', ordinal, prefix_end, first_seq, last_seq, seqs};
+    VLFENCE -> {'kind': 'fence', by}. Entries: seq i64 | shard u32 | epoch u64 | frame_len u32 | frame | muts."""
     import struct
     if b[:8] == b"VLFENCE\n":
         return {"kind": "fence", "by": b[8:].decode(errors="replace")}
-    if b[:8] != b"VLSEG03\n":
+    if b[:8] != b"VLSEG06\n":
         return {"kind": "unknown"}
     o = 8
     (n,) = struct.unpack_from(">H", b, o)
     o += 2
     log_id = b[o:o + n].decode()
     o += n
-    ordinal, prefix_end, first_seq, last_seq, count = struct.unpack_from(">QQqqI", b, o)
-    o += 36
+    ordinal, prefix_end, first_seq, last_seq, count, codec, body_len = struct.unpack_from(">QQqqIBI", b, o)
+    o += 41
+    if codec == 1:  # zstd body behind the uncompressed header
+        b = b[:o] + _zstd_decompress(b[o:], body_len)
     seqs = []
     for _ in range(count):
-        seq, _shard, _epoch, flen = struct.unpack_from(">qHQI", b, o)
-        o += 22 + flen
+        seq, _shard, _epoch, flen = struct.unpack_from(">qIQI", b, o)
+        o += 24 + flen
         (mc,) = struct.unpack_from(">I", b, o)
         o += 4
+        if mc & 0x80000000:  # bits 16-30 count muts derived from the frame (not stored)
+            mc &= 0xFFFF
         for _ in range(mc):
             (kl,) = struct.unpack_from(">H", b, o)
             o += 2 + kl

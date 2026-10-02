@@ -25,6 +25,7 @@
 use crate::cluster::Assignment;
 use crate::metrics;
 use crate::nodelog::{self, NodeLog};
+use crate::slots::ShardId;
 use crate::store::Store;
 use futures::StreamExt;
 use object_store::path::Path;
@@ -59,7 +60,7 @@ impl Default for Config {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Report {
     /// shard -> highest epoch the log's owner opened it at
-    pub opened: BTreeMap<u16, u64>,
+    pub opened: BTreeMap<ShardId, u64>,
     /// highest seq deleted by this node (including reports of dead logs it
     /// folded in when it deleted them)
     pub pruned_seq: i64,
@@ -341,7 +342,7 @@ impl Retention {
             }
             let (assigns, reports) = known.as_ref().unwrap();
             if let Some(s) = needed_by(&x, assigns, reports) {
-                tracing::debug!(log = %x, shard = s, "dead log still needed for replay");
+                tracing::debug!(log = %x, shard = s.0, "dead log still needed for replay");
                 stats.needed += 1;
                 stats.segments += held(x.clone(), fence).await?;
                 continue;
@@ -399,21 +400,21 @@ impl Retention {
 }
 
 /// Assignments (by shard id) and every log's report.
-type Known = (BTreeMap<u16, Assignment>, HashMap<String, Report>);
+type Known = (BTreeMap<ShardId, Assignment>, HashMap<String, Report>);
 
 /// Every shard assignment, by shard id (retired shards' included).
-async fn read_assignments(store: &Store) -> anyhow::Result<BTreeMap<u16, Assignment>> {
+async fn read_assignments(store: &Store) -> anyhow::Result<BTreeMap<ShardId, Assignment>> {
     let prefix = Path::from(format!("{}/assign", store.prefix));
-    let names: Vec<u16> = store
+    let names: Vec<ShardId> = store
         .raw
         .list(Some(&prefix))
-        .filter_map(|m| async move { m.ok().and_then(|m| m.location.filename().and_then(|f| f.parse::<u16>().ok())) })
+        .filter_map(|m| async move { m.ok().and_then(|m| m.location.filename().and_then(ShardId::from_key)) })
         .collect()
         .await;
     let mut out = BTreeMap::new();
-    let got: Vec<anyhow::Result<(u16, Option<Assignment>)>> = futures::stream::iter(names)
+    let got: Vec<anyhow::Result<(ShardId, Option<Assignment>)>> = futures::stream::iter(names)
         .map(|s| async move {
-            match store.raw.get(&Path::from(format!("{}/assign/{s:03}", store.prefix))).await {
+            match store.raw.get(&Path::from(format!("{}/assign/{}", store.prefix, s.key()))).await {
                 Ok(r) => Ok((s, Some(serde_json::from_slice(&r.bytes().await?)?))),
                 Err(object_store::Error::NotFound { .. }) => Ok((s, None)),
                 Err(e) => Err(e.into()),
@@ -436,7 +437,7 @@ async fn read_assignments(store: &Store) -> anyhow::Result<BTreeMap<u16, Assignm
 /// move forward, so once that is reported `x` is never read for the shard.
 /// A frozen shard (a split or merge parent) never replays again: its last
 /// owner closed it with every span applied and flushed, so it needs nothing.
-fn needed_by(x: &str, assigns: &BTreeMap<u16, Assignment>, reports: &HashMap<String, Report>) -> Option<u16> {
+fn needed_by(x: &str, assigns: &BTreeMap<ShardId, Assignment>, reports: &HashMap<String, Report>) -> Option<ShardId> {
     for (&s, a) in assigns {
         if a.frozen.is_some() {
             continue;
@@ -486,7 +487,7 @@ mod tests {
     }
 
     /// A one-entry segment sealed with `prefix_end`.
-    async fn put_seg(store: &Store, log: &str, ord: u64, prefix_end: u64, shard: u16, epoch: u64, seq: i64) {
+    async fn put_seg(store: &Store, log: &str, ord: u64, prefix_end: u64, shard: ShardId, epoch: u64, seq: i64) {
         let mut b = SegmentBuilder::new();
         let m = Mutation { key: Bytes::from(format!("{log}/{ord}")), val: Some(Bytes::from_static(b"v")) };
         b.push(seq, shard, epoch, |o| o.extend_from_slice(b"frame"), &[m]);
@@ -509,9 +510,9 @@ mod tests {
         Config { window, interval: Duration::from_secs(3600), max_deletes: 1000 }
     }
 
-    async fn put_assign(store: &Store, shard: u16, history: Vec<Span>) {
+    async fn put_assign(store: &Store, shard: ShardId, history: Vec<Span>) {
         let a = Assignment { epoch: history.last().map_or(0, |s| s.epoch), history, ..Default::default() };
-        store.raw.put(&Path::from(format!("{}/assign/{shard:03}", store.prefix)), PutPayload::from(serde_json::to_vec(&a).unwrap())).await.unwrap();
+        store.raw.put(&Path::from(format!("{}/assign/{}", store.prefix, shard.key())), PutPayload::from(serde_json::to_vec(&a).unwrap())).await.unwrap();
     }
 
     /// Our own log: nothing young, nothing a crash replay could need, and
@@ -522,14 +523,14 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let ncfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(10), lease_ok: None };
         let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
-        let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, 3, None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: 3, epoch: 7, db, apply_lock: Default::default(), applied: Default::default(), recent: Default::default() }));
+        let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, ShardId(3), None).await.unwrap());
+        log.sinks.insert(Arc::new(ShardSink { id: ShardId(3), epoch: 7, db, apply_lock: Default::default(), applied: Default::default(), recent: Default::default() }));
         let send = |i: usize| {
             let log = log.clone();
             async move {
                 let (atx, arx) = tokio::sync::oneshot::channel();
                 let e = nodelog::LogEntry {
-                    shard: 3,
+                    shard: ShardId(3),
                     frames: vec![crate::events::Frame { prefix: format!("e{i}").into_bytes(), suffix: Vec::new(), derived_muts: 0 }],
                     muts: vec![Mutation { key: Bytes::from(format!("k{i}")), val: Some(Bytes::from_static(b"v")) }],
                     ack: Some(Box::new(move |r| {
@@ -559,7 +560,7 @@ mod tests {
         let nodelog::Head::Segment(h5) = nodelog::read_head(&store, "L", 5).await.unwrap() else { panic!() };
         assert!(floor > 0 && floor < h5.first_seq, "floor {floor} = last seq of segment 4");
         assert_eq!(nodelog::first_free(&store, "L").await.unwrap(), (6, false));
-        assert_eq!(r.state.lock().written.as_ref().unwrap().opened.get(&3), Some(&7));
+        assert_eq!(r.state.lock().written.as_ref().unwrap().opened.get(&ShardId(3)), Some(&7));
         // the window holds young segments regardless
         send(6).await;
         send(7).await;
@@ -567,7 +568,7 @@ mod tests {
         let r2 = Retention::new(store.clone(), log.clone(), cfg(Duration::from_secs(3600)), members(&["L"], true));
         assert_eq!(r2.pass().await.unwrap(), Pass::default());
         // a closed shard holds the floor for a grace period
-        log.sinks.remove(3);
+        log.sinks.remove(ShardId(3));
         assert_eq!(log.sinks.replay_floor(), 7);
     }
 
@@ -580,8 +581,8 @@ mod tests {
         let ncfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(10), lease_ok: None };
         let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
         log.durable_ordinal.store(4, std::sync::atomic::Ordering::Release); // as if 0..=4 were durable
-        let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, 1, None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: 1, epoch: 2, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default() }));
+        let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, ShardId(1), None).await.unwrap());
+        log.sinks.insert(Arc::new(ShardSink { id: ShardId(1), epoch: 2, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default() }));
         log.checkpoint_all().await;
         assert!(db.get(nodelog::META_APPLIED).await.unwrap().is_none(), "no marker at 4 < insert floor 5");
         assert_eq!(log.sinks.replay_floor(), 4, "capped at the last durable segment");
@@ -603,12 +604,12 @@ mod tests {
         let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
         // dead log D: shard 0 (epoch 1) in 0..4, a crash hole at 4, garbage at 5
         for ord in 0..4 {
-            put_seg(&store, "D", ord, ord, 0, 1, 100 + ord as i64).await;
+            put_seg(&store, "D", ord, ord, ShardId(0), 1, 100 + ord as i64).await;
         }
-        put_seg(&store, "D", 5, 4, 0, 1, 105).await; // sealed while 4 was in flight
-        let rep = Report { opened: [(0, 1)].into(), pruned_seq: 42 };
+        put_seg(&store, "D", 5, 4, ShardId(0), 1, 105).await; // sealed while 4 was in flight
+        let rep = Report { opened: [(ShardId(0), 1)].into(), pruned_seq: 42 };
         store.raw.put(&report_path(&store, "D"), PutPayload::from(serde_json::to_vec(&rep).unwrap())).await.unwrap();
-        put_assign(&store, 0, vec![Span { log_id: "D".into(), epoch: 1, start: 0, end: Some(4) }, Span { log_id: "B".into(), epoch: 2, start: 0, end: None }]).await;
+        put_assign(&store, ShardId(0), vec![Span { log_id: "D".into(), epoch: 1, start: 0, end: Some(4) }, Span { log_id: "B".into(), epoch: 2, start: 0, end: None }]).await;
         let r = Retention::new(store.clone(), log.clone(), cfg(Duration::ZERO), members(&["B"], true));
         let dead = |r: &Retention| r.state.lock().dead.unwrap();
         assert_eq!(r.pass().await.unwrap(), Pass::default(), "not fenced: left alone");
@@ -618,8 +619,8 @@ mod tests {
         assert_eq!(dead(&r), DeadLogs { needed: 1, segments: 4, ..Default::default() });
         assert_eq!(ordinals(&store, "D").await, vec![0, 1, 2, 3, 4, 5]);
         // not the leader: never touches dead logs
-        let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, 0, None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: 0, epoch: 2, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default() }));
+        let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, ShardId(0), None).await.unwrap());
+        log.sinks.insert(Arc::new(ShardSink { id: ShardId(0), epoch: 2, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default() }));
         let follower = Retention::new(store.clone(), log.clone(), cfg(Duration::ZERO), members(&["B"], false));
         assert_eq!(follower.pass().await.unwrap(), Pass::default());
         let p = r.pass().await.unwrap();
@@ -633,7 +634,7 @@ mod tests {
         // its (applied) span reads nothing and doesn't fail
         assert_eq!(nodelog::first_free(&store, "D").await.unwrap(), (4, true));
         let history = vec![Span { log_id: "D".into(), epoch: 1, start: 0, end: Some(4) }];
-        assert_eq!(nodelog::replay_shard(&store, 0, &db, &history).await.unwrap(), 0);
+        assert_eq!(nodelog::replay_shard(&store, ShardId(0), &db, &history).await.unwrap(), 0);
         assert_eq!(r.pass().await.unwrap(), Pass::default(), "retired");
     }
 
@@ -641,15 +642,15 @@ mod tests {
     fn needed_by_requires_a_later_opener() {
         let sp = |log: &str, epoch| Span { log_id: log.into(), epoch, start: 0, end: None };
         let a = |h: Vec<Span>| Assignment { history: h, ..Default::default() };
-        let mut assigns: BTreeMap<u16, Assignment> = [(0, a(vec![sp("X", 1), sp("Y", 2)])), (1, a(vec![sp("Y", 3)])), (3, a(vec![sp("X", 4), sp("Z", 5), sp("X", 6)]))].into();
+        let mut assigns: BTreeMap<ShardId, Assignment> = [(ShardId(0), a(vec![sp("X", 1), sp("Y", 2)])), (ShardId(1), a(vec![sp("Y", 3)])), (ShardId(3), a(vec![sp("X", 4), sp("Z", 5), sp("X", 6)]))].into();
         // a frozen split parent whose last span is in X never needs X again
-        assigns.insert(9, Assignment { frozen: Some(1), ..a(vec![sp("X", 2)]) });
+        assigns.insert(ShardId(9), Assignment { frozen: Some(1), ..a(vec![sp("X", 2)]) });
         let mut reports = HashMap::new();
-        reports.insert("Y".to_string(), Report { opened: [(0, 2)].into(), pruned_seq: 0 });
-        assert_eq!(needed_by("X", &assigns, &reports), Some(3), "X holds shard 3's last span");
-        reports.insert("Z".to_string(), Report { opened: [(3, 5)].into(), pruned_seq: 0 });
-        assert_eq!(needed_by("X", &assigns, &reports), Some(3), "Z opened it before X's second span");
-        reports.insert("W".to_string(), Report { opened: [(3, 7)].into(), pruned_seq: 0 });
+        reports.insert("Y".to_string(), Report { opened: [(ShardId(0), 2)].into(), pruned_seq: 0 });
+        assert_eq!(needed_by("X", &assigns, &reports), Some(ShardId(3)), "X holds shard 3's last span");
+        reports.insert("Z".to_string(), Report { opened: [(ShardId(3), 5)].into(), pruned_seq: 0 });
+        assert_eq!(needed_by("X", &assigns, &reports), Some(ShardId(3)), "Z opened it before X's second span");
+        reports.insert("W".to_string(), Report { opened: [(ShardId(3), 7)].into(), pruned_seq: 0 });
         assert_eq!(needed_by("X", &assigns, &reports), None);
         assert_eq!(needed_by("Q", &assigns, &HashMap::new()), None);
     }

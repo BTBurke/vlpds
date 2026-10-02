@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vlpds::state::bulk_did;
 
-async fn node(stagger: bool, every: Duration, shards: u16, store_ms: u64) -> TestServer {
+async fn node(stagger: bool, every: Duration, shards: u32, store_ms: u64) -> TestServer {
     let store: Arc<dyn object_store::ObjectStore> = {
         use object_store::throttle::{ThrottleConfig, ThrottledStore};
         let d = Duration::from_millis(store_ms);
@@ -60,7 +60,7 @@ fn env<T: std::str::FromStr>(k: &str, d: T) -> T {
 }
 
 async fn stall(label: &str, stagger: bool) {
-    let shards: u16 = env("STALL_SHARDS", 128);
+    let shards: u32 = env("STALL_SHARDS", 128);
     let repos: u64 = env("STALL_REPOS", 20_000);
     let rate: u64 = env("STALL_RATE", 3000);
     let secs: u64 = env("STALL_SECS", 30);

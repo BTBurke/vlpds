@@ -23,6 +23,7 @@ use crate::events::Frame;
 use crate::metrics;
 use crate::segment::{self, LogObject, Mutation, SegmentBuilder};
 use crate::stats::STATS;
+use crate::slots::ShardId;
 use crate::store::Store;
 use bytes::Bytes;
 use object_store::path::Path;
@@ -47,7 +48,7 @@ pub const META_APPLIED: &[u8] = b"meta/applied2";
 pub const META_RECENT: &[u8] = b"meta/recent";
 
 pub struct LogEntry {
-    pub shard: u16,
+    pub shard: ShardId,
     pub frames: Vec<Frame>,
     pub muts: Vec<Mutation>,
     pub ack: Option<AckFn>,
@@ -251,7 +252,7 @@ impl Watermark {
 
 /// A shard this node applies into.
 pub struct ShardSink {
-    pub id: u16,
+    pub id: ShardId,
     pub epoch: u64,
     pub db: Arc<Db>,
     /// Held (write) across apply + ack of a segment; export readers take it
@@ -264,7 +265,7 @@ pub struct ShardSink {
 }
 
 pub struct ShardSinks {
-    map: RwLock<HashMap<u16, Arc<ShardSink>>>,
+    map: RwLock<HashMap<ShardId, Arc<ShardSink>>>,
     /// The log's last durable ordinal (`NodeLog::durable_ordinal`).
     durable: Arc<AtomicU64>,
     retain: Mutex<Retain>,
@@ -284,13 +285,13 @@ struct Retain {
     /// insert floor (the log's next ordinal when the sink was inserted:
     /// none of the shard's entries at this epoch are below it) until a
     /// checkpoint at or past the insert floor is durable, then its ordinal + 1.
-    floors: HashMap<u16, (u64, u64)>,
+    floors: HashMap<ShardId, (u64, u64)>,
     /// replay floors of recently closed shards (see RETIRED_GRACE)
     retired: Vec<(u64, Instant)>,
     /// shard -> highest epoch opened here. Opening replays and flushes every
     /// earlier span, so from then on the shard's durable state never replays
     /// a span from before that epoch.
-    opened: std::collections::BTreeMap<u16, u64>,
+    opened: std::collections::BTreeMap<ShardId, u64>,
 }
 
 impl Default for ShardSinks {
@@ -303,7 +304,7 @@ impl ShardSinks {
     pub fn new(durable: Arc<AtomicU64>) -> ShardSinks {
         ShardSinks { map: RwLock::default(), durable, retain: Mutex::default() }
     }
-    pub fn get(&self, id: u16) -> Option<Arc<ShardSink>> {
+    pub fn get(&self, id: ShardId) -> Option<Arc<ShardSink>> {
         self.map.read().get(&id).cloned()
     }
     /// A shard opened (replayed and flushed) at `s.epoch`: it starts applying.
@@ -317,7 +318,7 @@ impl ShardSinks {
         }
         self.map.write().insert(s.id, s);
     }
-    pub fn remove(&self, id: u16) -> Option<Arc<ShardSink>> {
+    pub fn remove(&self, id: ShardId) -> Option<Arc<ShardSink>> {
         let mut r = self.retain.lock();
         if let Some((floor, _)) = r.floors.remove(&id) {
             r.retired.push((floor, Instant::now()));
@@ -330,24 +331,24 @@ impl ShardSinks {
     }
 
     /// State mutations applied into `id` since it opened here.
-    pub fn applied_entries(&self, id: u16) -> u64 {
+    pub fn applied_entries(&self, id: ShardId) -> u64 {
         self.get(id).map_or(0, |s| s.applied.load(Ordering::Relaxed))
     }
 
     /// The ordinal a checkpoint marker for `shard` must reach (its insert
     /// floor): a marker below it is ambiguous (it can name the end of an
     /// earlier span of this log for the shard, and replay would start there).
-    fn insert_floor(&self, shard: u16) -> Option<u64> {
+    fn insert_floor(&self, shard: ShardId) -> Option<u64> {
         self.retain.lock().floors.get(&shard).map(|f| f.1)
     }
 
     /// Whether a checkpoint of `shard` at `ordinal` is already durable.
-    fn checkpointed_at(&self, shard: u16, ordinal: u64) -> bool {
+    fn checkpointed_at(&self, shard: ShardId, ordinal: u64) -> bool {
         self.retain.lock().floors.get(&shard).is_some_and(|f| ordinal >= f.1 && f.0 == ordinal + 1)
     }
 
     /// A checkpoint marker at `ordinal` is durable for `shard`.
-    fn checkpointed(&self, shard: u16, ordinal: u64) {
+    fn checkpointed(&self, shard: ShardId, ordinal: u64) {
         if let Some(f) = self.retain.lock().floors.get_mut(&shard) {
             if ordinal >= f.1 {
                 f.0 = f.0.max(ordinal + 1);
@@ -370,7 +371,7 @@ impl ShardSinks {
     }
 
     /// shard -> highest epoch this log's owner has opened it at.
-    pub fn opened(&self) -> std::collections::BTreeMap<u16, u64> {
+    pub fn opened(&self) -> std::collections::BTreeMap<ShardId, u64> {
         self.retain.lock().opened.clone()
     }
 }
@@ -637,7 +638,7 @@ struct Sealed {
     data: Bytes,
     frames: Vec<(i64, std::ops::Range<usize>)>,
     /// muts grouped by shard, in log order
-    muts: BTreeMap<u16, Vec<Mutation>>,
+    muts: BTreeMap<ShardId, Vec<Mutation>>,
     acks: Vec<(Option<AckFn>, Option<Arc<AtomicU32>>, Instant)>,
     last_seq: i64,
     put_secs: f64,
@@ -648,7 +649,7 @@ struct Sealed {
 struct Open {
     seg: SegmentBuilder,
     frames: Vec<(i64, std::ops::Range<usize>)>,
-    muts: BTreeMap<u16, Vec<Mutation>>,
+    muts: BTreeMap<ShardId, Vec<Mutation>>,
     acks: Vec<(Option<AckFn>, Option<Arc<AtomicU32>>, Instant)>,
 }
 
@@ -663,7 +664,7 @@ impl Open {
         // *acked*. But replay only applies entries whose epoch matches a span,
         // so the successor never saw it: an acked write lost. Refuse it.
         let Some(epoch) = sinks.get(e.shard).map(|s| s.epoch) else {
-            tracing::warn!(shard = e.shard, "log entry for a shard this node no longer holds: rejected");
+            tracing::warn!(shard = e.shard.0, "log entry for a shard this node no longer holds: rejected");
             if let Some(p) = e.pending {
                 p.fetch_sub(1, Ordering::Release);
             }
@@ -996,7 +997,7 @@ async fn run_finalizer(
                     guards.push(sink.apply_lock.clone().write_owned().await);
                     targets.push((sink, muts));
                 }
-                None => tracing::error!(shard, ordinal = s.ordinal, "durable entries for a shard we no longer hold; its owner will replay them"),
+                None => tracing::error!(shard = shard.0, ordinal = s.ordinal, "durable entries for a shard we no longer hold; its owner will replay them"),
             }
         }
         let t = Instant::now();
@@ -1018,7 +1019,7 @@ async fn run_finalizer(
         });
         for (shard, r) in futures::future::join_all(writes).await {
             if let Err(e) = r {
-                tracing::error!(shard, "state apply failed: {e}; exiting");
+                tracing::error!(shard = shard.0, "state apply failed: {e}; exiting");
                 crate::lifecycle::fail_stop(4, "state_apply");
             }
         }
@@ -1086,14 +1087,14 @@ fn marker_span(history: &[Span], log: &str, ord: u64) -> Option<usize> {
 
 /// Brings a shard's SlateDB up to date from the log spans of its previous
 /// owners (chronological), starting after its applied marker.
-pub async fn replay_shard(store: &Store, shard: u16, db: &Db, history: &[Span]) -> anyhow::Result<u64> {
+pub async fn replay_shard(store: &Store, shard: ShardId, db: &Db, history: &[Span]) -> anyhow::Result<u64> {
     replay_many(store, &[(shard, db, history)]).await
 }
 
 /// Replays many shards at once (e.g. taking over a dead node's shards): each
 /// log segment is fetched once (16 in flight, applied in order) and its
 /// entries dispatched to every shard whose span covers it. Returns segments read.
-pub async fn replay_many(store: &Store, shards: &[(u16, &Db, &[Span])]) -> anyhow::Result<u64> {
+pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> anyhow::Result<u64> {
     use futures::StreamExt;
     // per shard: the spans still to apply, with the ordinal to start from
     let mut todo: Vec<Vec<(Span, u64)>> = Vec::with_capacity(shards.len());
@@ -1227,7 +1228,7 @@ mod tests {
     use super::*;
     use crate::segment::SegmentBuilder;
 
-    fn seg_bytes(log: &str, ord: u64, shard: u16, epoch: u64, key: &str) -> Vec<u8> {
+    fn seg_bytes(log: &str, ord: u64, shard: ShardId, epoch: u64, key: &str) -> Vec<u8> {
         let mut b = SegmentBuilder::new();
         let m = Mutation { key: Bytes::from(key.to_string()), val: Some(Bytes::from_static(b"v")) };
         b.push(1000 + ord as i64, shard, epoch, |_| {}, &[m]);
@@ -1236,7 +1237,7 @@ mod tests {
         obj
     }
 
-    async fn put_seg(store: &Store, log: &str, ord: u64, shard: u16, epoch: u64, key: &str) {
+    async fn put_seg(store: &Store, log: &str, ord: u64, shard: ShardId, epoch: u64, key: &str) {
         store.raw.put(&segment_path(store, log, ord), PutPayload::from(seg_bytes(log, ord, shard, epoch, key))).await.unwrap();
     }
 
@@ -1250,7 +1251,7 @@ mod tests {
     #[tokio::test]
     async fn replay_aba_keeps_middle_span() {
         let store = Store::memory(None);
-        let shard = 7u16;
+        let shard = ShardId(70_007);
         put_seg(&store, "A", 0, shard, 1, "a0").await;
         put_seg(&store, "A", 1, shard, 1, "a1").await;
         put_seg(&store, "B", 0, shard, 2, "b0").await;
@@ -1294,7 +1295,7 @@ mod tests {
     #[tokio::test]
     async fn replay_rejects_holes_and_mislabeled_segments() {
         let store = Store::memory(None);
-        let shard = 1u16;
+        let shard = ShardId(1);
         put_seg(&store, "A", 0, shard, 1, "a0").await;
         // ordinal 1 missing inside the closed span [0, 3)
         put_seg(&store, "A", 2, shard, 1, "a2").await;
@@ -1348,11 +1349,11 @@ mod tests {
     async fn conflict_resolution() {
         let store = Store::memory(None);
         let path = segment_path(&store, "A", 0);
-        let ours = Bytes::from(seg_bytes("A", 0, 1, 1, "k"));
+        let ours = Bytes::from(seg_bytes("A", 0, ShardId(1), 1, "k"));
         assert_eq!(resolve_conflict(&store, &path, &ours).await, Conflict::Missing);
         store.raw.put(&path, PutPayload::from_bytes(ours.clone())).await.unwrap();
         assert_eq!(resolve_conflict(&store, &path, &ours).await, Conflict::Ours);
-        let other = Bytes::from(seg_bytes("A", 0, 1, 1, "other"));
+        let other = Bytes::from(seg_bytes("A", 0, ShardId(1), 1, "other"));
         assert_eq!(resolve_conflict(&store, &path, &other).await, Conflict::Other);
         store.raw.put(&path, PutPayload::from_bytes(segment::fence_object("B"))).await.unwrap();
         assert_eq!(resolve_conflict(&store, &path, &ours).await, Conflict::Fenced);
@@ -1415,7 +1416,7 @@ mod tests {
     /// A log on `store` with K = `k`, owning `shard` (epoch 1) into a DB
     /// under its own prefix. Segments hold one entry each (`entry` makes
     /// entries bigger than max_segment_bytes).
-    async fn test_log(store: &Store, k: usize, shard: u16, max_segment_bytes: usize) -> (Arc<NodeLog>, Arc<Db>, mpsc::UnboundedReceiver<LogBatch>) {
+    async fn test_log(store: &Store, k: usize, shard: ShardId, max_segment_bytes: usize) -> (Arc<NodeLog>, Arc<Db>, mpsc::UnboundedReceiver<LogBatch>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let cfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes, hedge_after: Duration::from_secs(10), lease_ok: None };
         let log = NodeLog::start_with_inflight(store.clone(), cfg, k, tx);
@@ -1424,7 +1425,7 @@ mod tests {
         (log, db, rx)
     }
 
-    fn entry(shard: u16, key: String, val_len: usize, ack: Option<AckFn>) -> LogEntry {
+    fn entry(shard: ShardId, key: String, val_len: usize, ack: Option<AckFn>) -> LogEntry {
         LogEntry {
             shard,
             frames: vec![Frame { prefix: key.clone().into_bytes(), suffix: Vec::new(), derived_muts: 0 }],
@@ -1436,7 +1437,7 @@ mod tests {
     }
 
     /// Sends `n` one-entry segments; returns the order acks arrived in.
-    async fn send_n(log: &NodeLog, shard: u16, n: usize) -> Arc<Mutex<Vec<usize>>> {
+    async fn send_n(log: &NodeLog, shard: ShardId, n: usize) -> Arc<Mutex<Vec<usize>>> {
         let acked = Arc::new(Mutex::new(Vec::new()));
         for i in 0..n {
             let a = acked.clone();
@@ -1461,9 +1462,9 @@ mod tests {
     async fn out_of_order_completion_finalizes_in_order() {
         let (fs, store) = fault_store();
         fs.delays.lock().insert(0, Duration::from_millis(300));
-        let (log, db, mut merger) = test_log(&store, 4, 3, 1024).await;
+        let (log, db, mut merger) = test_log(&store, 4, ShardId(3), 1024).await;
         let mut live = log.live.subscribe();
-        let acked = send_n(&log, 3, 4).await;
+        let acked = send_n(&log, ShardId(3), 4).await;
         tokio::time::sleep(Duration::from_millis(80)).await;
         for o in 1..4 {
             assert!(exists(&store, o).await, "segment {o} landed");
@@ -1498,8 +1499,8 @@ mod tests {
     async fn crash_hole_is_fenced_and_never_read_past() {
         let (fs, store) = fault_store();
         fs.holds.lock().insert(1); // its PUT never lands: the node "crashed"
-        let (log, _db, mut merger) = test_log(&store, 4, 3, 1024).await;
-        let acked = send_n(&log, 3, 4).await;
+        let (log, _db, mut merger) = test_log(&store, 4, ShardId(3), 1024).await;
+        let acked = send_n(&log, ShardId(3), 4).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(*acked.lock(), vec![0], "acks stop at the hole");
         assert_eq!(merger.try_recv().unwrap().ordinal, 0);
@@ -1522,12 +1523,12 @@ mod tests {
         // replay: the dead span ends at the fence; an open span stops at the hole
         let fresh = |name: &'static str| {
             let s = Store { prefix: name.into(), ..store.clone() };
-            async move { crate::partition::open_db(&s, 3, None).await.unwrap() }
+            async move { crate::partition::open_db(&s, crate::slots::ShardId(3), None).await.unwrap() }
         };
         for (name, end) in [("r1", Some(1)), ("r2", None)] {
             let db = fresh(name).await;
             let history = vec![span("L", 1, 0, end)];
-            assert_eq!(replay_many(&store, &[(3, &db, &history)]).await.unwrap(), 1, "{name}");
+            assert_eq!(replay_many(&store, &[(ShardId(3), &db, &history)]).await.unwrap(), 1, "{name}");
             assert!(db.get(b"k0").await.unwrap().is_some());
             for k in ["k1", "k2", "k3"] {
                 assert!(db.get(k.as_bytes()).await.unwrap().is_none(), "{name}: {k} replayed past the hole");
@@ -1554,7 +1555,7 @@ mod tests {
         const N: usize = 30_000;
         for k in [1, 2, 4] {
             let store = Store::memory(Some((25.0, 0.5)));
-            let (log, _db, mut merger) = test_log(&store, k, 0, 256 << 10).await;
+            let (log, _db, mut merger) = test_log(&store, k, ShardId(0), 256 << 10).await;
             tokio::spawn(async move { while merger.recv().await.is_some() {} });
             let done = Arc::new(AtomicUsize::new(0));
             let all = Arc::new(tokio::sync::Notify::new());
@@ -1567,7 +1568,7 @@ mod tests {
                         all.notify_one();
                     }
                 });
-                log.tx.send(entry(0, format!("k{i:08}"), 1000, Some(ack))).await.ok().unwrap();
+                log.tx.send(entry(ShardId(0), format!("k{i:08}"), 1000, Some(ack))).await.ok().unwrap();
             }
             all.notified().await;
             let secs = t.elapsed().as_secs_f64();

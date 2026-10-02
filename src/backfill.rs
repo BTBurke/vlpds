@@ -463,7 +463,7 @@ mod tests {
 
     async fn put_seg(store: &Store, log: &str, ord: u64, seq: i64) {
         let mut b = SegmentBuilder::new();
-        b.push(seq, 0, 1, |o| o.extend_from_slice(b"frame"), &[]);
+        b.push(seq, crate::slots::ShardId(0), 1, |o| o.extend_from_slice(b"frame"), &[]);
         let mut obj = b.header(log, ord);
         obj.extend_from_slice(&b.body);
         store.raw.put(&segment_path(store, log, ord), PutPayload::from(obj)).await.unwrap();
@@ -481,7 +481,7 @@ mod tests {
         store.raw.put(&segment_path(&store, "A", 3), PutPayload::from_bytes(segment::fence_object("B"))).await.unwrap();
         for ord in 4..7u64 {
             let mut b = SegmentBuilder::new();
-            b.push(1000 + ord as i64, 0, 1, |o| o.extend_from_slice(b"garbage"), &[]);
+            b.push(1000 + ord as i64, crate::slots::ShardId(0), 1, |o| o.extend_from_slice(b"garbage"), &[]);
             let mut obj = b.sealed_header("A", ord, 3);
             obj.extend_from_slice(&b.body);
             store.raw.put(&segment_path(&store, "A", ord), PutPayload::from(obj)).await.unwrap();
@@ -533,7 +533,7 @@ mod tests {
     async fn put_multi(store: &Store, log: &str, ord: u64, prefix_end: u64, seqs: &[i64]) {
         let mut b = SegmentBuilder::new();
         for seq in seqs {
-            b.push(*seq, 0, 1, |o| o.extend_from_slice(format!("{log}:{seq}").as_bytes()), &[]);
+            b.push(*seq, crate::slots::ShardId(0), 1, |o| o.extend_from_slice(format!("{log}:{seq}").as_bytes()), &[]);
         }
         let mut obj = b.sealed_header(log, ord, prefix_end);
         obj.extend_from_slice(&b.body);

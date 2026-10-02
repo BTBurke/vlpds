@@ -1015,7 +1015,7 @@ async fn wait_until(what: &str, deadline: Duration, f: impl Fn() -> bool) {
 /// writing lazily on top of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn replay_after_kill_reconstructs_nodes() {
-    const SHARDS: u16 = 4;
+    const SHARDS: u32 = 4;
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let node = |id: &'static str| {
         let store = store.clone();
@@ -1582,7 +1582,7 @@ async fn reshard_carries_nodes() {
     for st in random_steps(&mut rng, accts.len(), 150) {
         run_step(&s, &accts, &st).await;
     }
-    let kids: Vec<u16> = r["op"]["children"].as_array().unwrap().iter().map(|c| c["id"].as_u64().unwrap() as u16).collect();
+    let kids: Vec<vlpds::slots::ShardId> = r["op"]["children"].as_array().unwrap().iter().map(|c| vlpds::slots::ShardId(c["id"].as_u64().unwrap() as u32)).collect();
     let r = admin("vlpds.admin.mergeShards", json!({"left": kids[0], "right": kids[1], "wait": true})).await;
     assert_eq!(r["done"], json!(true), "{r}");
     vlpds::mst_store::NODE_CACHE.clear();

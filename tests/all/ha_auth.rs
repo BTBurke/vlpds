@@ -16,7 +16,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-const SHARDS: u16 = 8;
+const SHARDS: u32 = 8;
 
 /// A cluster node. `public` overrides the public URL (OAuth: every node
 /// must present the same issuer), the node still forwards to its own address.
@@ -48,25 +48,25 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, public: Opt
 /// (retry) while a shard moves, which the single-shot steps below would
 /// take for a failure.
 async fn balanced(nodes: &[&TestServer]) {
-    let mut stable_since: Option<(Vec<Vec<u16>>, std::time::Instant)> = None;
+    let mut stable_since: Option<(Vec<Vec<vlpds::slots::ShardId>>, std::time::Instant)> = None;
     for _ in 0..400 {
-        let owned: Vec<Vec<u16>> = nodes
+        let owned: Vec<Vec<vlpds::slots::ShardId>> = nodes
             .iter()
             .map(|n| {
-                let mut v: Vec<u16> = n.app.partitions.owned().iter().map(|p| p.id).collect();
+                let mut v: Vec<vlpds::slots::ShardId> = n.app.partitions.owned().iter().map(|p| p.id).collect();
                 v.sort();
                 v
             })
             .collect();
-        let all: HashSet<u16> = owned.iter().flatten().copied().collect();
+        let all: HashSet<vlpds::slots::ShardId> = owned.iter().flatten().copied().collect();
         let sizes: Vec<usize> = owned.iter().map(|o| o.len()).collect();
         let fair = sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1;
         let complete = fair && all.len() == SHARDS as usize && sizes.iter().sum::<usize>() == SHARDS as usize;
         let routed = complete
             && nodes.iter().all(|n| {
                 let c = n.app.cluster.as_ref().unwrap();
-                (0..SHARDS).all(|p| {
-                    let owner = nodes.iter().position(|m| m.app.partitions.get(p as usize).is_some()).unwrap();
+                (0..SHARDS).map(vlpds::slots::ShardId).all(|p| {
+                    let owner = nodes.iter().position(|m| m.app.partitions.get(p).is_some()).unwrap();
                     c.owner_of(p).map(|(id, _)| id) == Some(nodes[owner].app.cluster.as_ref().unwrap().cfg.node_id.clone())
                 })
             });
@@ -89,7 +89,7 @@ async fn balanced(nodes: &[&TestServer]) {
 
 fn owner_of<'a>(nodes: &[&'a TestServer], key: &str) -> &'a TestServer {
     let p = vlpds::state::partition_of(key, SHARDS);
-    nodes.iter().find(|n| n.app.partitions.get(p as usize).is_some()).expect("owned")
+    nodes.iter().find(|n| n.app.partitions.get(p).is_some()).expect("owned")
 }
 
 /// Retries `f` (through a shard handoff) until it returns Some.
@@ -150,7 +150,7 @@ async fn takedowns_and_revocations_are_cluster_wide_and_survive_failover() {
 
     // an account owned by a; everything below goes through b and c
     let acct = a.create_account("hat").await;
-    assert!(a.app.partitions.get(vlpds::state::partition_of(&acct.did, SHARDS) as usize).is_some());
+    assert!(a.app.partitions.get(vlpds::state::partition_of(&acct.did, SHARDS)).is_some());
     let rec = b.create_record(&acct, "app.bsky.feed.post", post_record("taken down soon")).await;
     let keep = c.create_record(&acct, "app.bsky.feed.post", post_record("stays")).await;
     let up = c

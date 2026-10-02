@@ -1,9 +1,10 @@
 //! A shard handle. Shards are the unit of ownership and state: each has its
-//! own SlateDB (`state/{shard:03}`), while all shards owned by a node share the
+//! own SlateDB (`state/{id:010}`), while all shards owned by a node share the
 //! node's commit log (see nodelog.rs).
 
 pub use crate::nodelog::{seq_floor, AckFn, LogEntry, Watermark};
 use crate::nodelog::NodeLog;
+use crate::slots::ShardId;
 use crate::store::Store;
 use slatedb::Db;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub struct Partition {
-    pub id: u16,
+    pub id: ShardId,
     /// Ownership epoch (from the shard assignment).
     pub epoch: u64,
     pub db: Arc<Db>,
@@ -371,7 +372,7 @@ fn gc_options() -> slatedb::config::GarbageCollectorOptions {
 
 pub async fn open_db(
     store: &Store,
-    partition: u16,
+    partition: ShardId,
     cache_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<Db> {
     // Per-shard LSM shape. A whole repo lives in one shard, so one shard must
@@ -417,7 +418,7 @@ pub async fn open_db(
         // Local disk cache of SST parts: restarts and takeovers start warm
         // instead of turning every cold repo load into object store GETs.
         let oc = &mut settings.object_store_cache_options;
-        oc.root_folder = Some(dir.join(format!("{partition:03}")));
+        oc.root_folder = Some(dir.join(partition.key()));
         oc.cache_on_flush = true;
         oc.cache_on_compaction = true;
     }
@@ -505,8 +506,8 @@ impl object_store::ObjectStore for Redirect {
 }
 
 /// Where shard `id`'s SlateDB lives.
-pub fn db_path(store: &Store, id: u16) -> String {
-    format!("{}/state/{:03}", store.prefix, id)
+pub fn db_path(store: &Store, id: ShardId) -> String {
+    format!("{}/state/{}", store.prefix, id.key())
 }
 
 /// Creates shard `child`'s SlateDB as a clone of `sources` (shard id, slots
@@ -515,10 +516,10 @@ pub fn db_path(store: &Store, id: u16) -> String {
 /// references the sources' SSTs (pinned by a checkpoint in each source)
 /// until its compaction rewrites them. The sources must be closed (all
 /// their state in SSTs). Idempotent: a retry finds the clone initialized.
-pub async fn clone_db(store: &Store, child: u16, sources: &[(u16, u32, u32)]) -> anyhow::Result<()> {
+pub async fn clone_db(store: &Store, child: ShardId, sources: &[(ShardId, u32, u32)]) -> anyhow::Result<()> {
     use std::ops::Bound;
     anyhow::ensure!(!sources.is_empty(), "clone of shard {child} without sources");
-    let spec = |&(id, lo, hi): &(u16, u32, u32)| {
+    let spec = |&(id, lo, hi): &(ShardId, u32, u32)| {
         let (a, b) = crate::state::slot_range_keys(lo, hi);
         slatedb::CloneSourceSpec::new(db_path(store, id)).with_projection_range((Bound::Included(a), Bound::Excluded(b)))
     };
@@ -774,7 +775,7 @@ mod tests {
             let (mut write, mut sst, mut logical) = (Duration::ZERO, 0u64, 0usize);
             for half in ["scan", "get"] {
                 let store = Store { prefix: format!("bench-{codec:?}-{half}"), ..Store::memory(None) };
-                let db = open_db(&store, 0, None).await.unwrap();
+                let db = open_db(&store, ShardId(0), None).await.unwrap();
                 let t = cpu();
                 logical = 0;
                 for r in 0..copies {
@@ -795,7 +796,7 @@ mod tests {
                 db.close().await.unwrap();
                 write = cpu() - t;
                 sst = 0;
-                let prefix = object_store::path::Path::from(format!("{}/state/000", store.prefix));
+                let prefix = object_store::path::Path::from(format!("{}/state/0000000000", store.prefix));
                 let mut list = store.raw.list(Some(&prefix));
                 use futures::StreamExt;
                 while let Some(m) = list.next().await {
@@ -806,7 +807,7 @@ mod tests {
                 }
                 stores.push(store);
             }
-            let db = open_db(&stores[0], 0, None).await.unwrap();
+            let db = open_db(&stores[0], crate::slots::ShardId(0), None).await.unwrap();
             let t = cpu();
             let mut n = 0;
             let mut it = db.scan(b"R/".to_vec()..b"R0".to_vec()).await.unwrap();
@@ -816,7 +817,7 @@ mod tests {
             let scan = cpu() - t;
             drop(it);
             db.close().await.unwrap();
-            let db = open_db(&stores[1], 0, None).await.unwrap();
+            let db = open_db(&stores[1], crate::slots::ShardId(0), None).await.unwrap();
             let step = (records.len() / 5000).max(1);
             let t = cpu();
             let mut gets = 0;
@@ -847,7 +848,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn deferred_compactor_compacts() {
         let store = Store { prefix: "compact".into(), ..Store::memory(None) };
-        let db = open_db(&store, 0, None).await.unwrap();
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
         for i in 0..8u32 {
             for j in 0..200u32 {
                 db.put(format!("k{j:04}"), format!("value {i} {j} {}", "x".repeat(100))).await.unwrap();
@@ -870,7 +871,7 @@ mod tests {
         let cp = m.checkpoints().iter().filter_map(|c| Some(c.expire_time? - c.create_time)).max().expect("compactor checkpoint");
         assert_eq!(cp.num_seconds() as u64, checkpoint_lifetime().as_secs());
         db.close().await.unwrap();
-        let db = open_db(&store, 0, None).await.unwrap();
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
         assert_eq!(db.get(b"k0123").await.unwrap().as_deref(), Some(format!("value 7 123 {}", "x".repeat(100)).as_bytes()));
         db.close().await.unwrap();
     }
@@ -888,7 +889,7 @@ mod tests {
         let store = Store { raw: Arc::new(ThrottledStore::new(mem, cfg)), ..Store::memory(None) };
         for round in ["fresh", "reopen"] {
             let t = std::time::Instant::now();
-            let db = open_db(&store, 0, None).await.unwrap();
+            let db = open_db(&store, ShardId(0), None).await.unwrap();
             let open = t.elapsed();
             db.put(b"k", b"v").await.unwrap();
             db.close().await.unwrap();
@@ -922,7 +923,7 @@ mod clone_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn split_and_merge_by_clone() {
         let store = Store { prefix: "clone".into(), ..Store::memory(None) };
-        let db = open_db(&store, 0, None).await.unwrap();
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
         for s in [0u16, 100, 32767, 32768, 50000, 65535] {
             for i in 0..50 {
                 db.put(k(s, &format!("h/did{i:03}")), format!("v{s}-{i}")).await.unwrap();
@@ -930,18 +931,18 @@ mod clone_tests {
         }
         db.put(crate::nodelog::META_APPLIED, b"m").await.unwrap();
         db.close().await.unwrap();
-        clone_db(&store, 1, &[(0, 0, 32768)]).await.unwrap();
-        clone_db(&store, 1, &[(0, 0, 32768)]).await.expect("a retried clone is a no-op");
-        clone_db(&store, 2, &[(0, 32768, 65536)]).await.unwrap();
+        clone_db(&store, ShardId(1), &[(ShardId(0), 0, 32768)]).await.unwrap();
+        clone_db(&store, ShardId(1), &[(ShardId(0), 0, 32768)]).await.expect("a retried clone is a no-op");
+        clone_db(&store, ShardId(2), &[(ShardId(0), 32768, 65536)]).await.unwrap();
         // an empty parent clones too
-        open_db(&store, 9, None).await.unwrap().close().await.unwrap();
-        clone_db(&store, 10, &[(9, 0, 100)]).await.unwrap();
-        let e = open_db(&store, 10, None).await.unwrap();
+        open_db(&store, ShardId(9), None).await.unwrap().close().await.unwrap();
+        clone_db(&store, ShardId(10), &[(ShardId(9), 0, 100)]).await.unwrap();
+        let e = open_db(&store, ShardId(10), None).await.unwrap();
         assert_eq!(count(&e).await, 0);
         e.close().await.unwrap();
 
-        let c1 = open_db(&store, 1, None).await.unwrap();
-        let c2 = open_db(&store, 2, None).await.unwrap();
+        let c1 = open_db(&store, ShardId(1), None).await.unwrap();
+        let c2 = open_db(&store, ShardId(2), None).await.unwrap();
         assert!(c1.get(crate::nodelog::META_APPLIED).await.unwrap().is_none(), "shard-wide keys stay with the parent");
         assert!(c1.get(k(100, "h/did001")).await.unwrap().is_some());
         assert!(c1.get(k(50000, "h/did001")).await.unwrap().is_none());
@@ -967,12 +968,12 @@ mod clone_tests {
         assert!(c1.get(k(100, "h/did001")).await.unwrap().is_some());
         c1.close().await.unwrap();
         c2.close().await.unwrap();
-        clone_db(&store, 3, &[(1, 0, 32768), (2, 32768, 65536)]).await.unwrap();
-        let m = open_db(&store, 3, None).await.unwrap();
+        clone_db(&store, ShardId(3), &[(ShardId(1), 0, 32768), (ShardId(2), 32768, 65536)]).await.unwrap();
+        let m = open_db(&store, ShardId(3), None).await.unwrap();
         assert_eq!(count(&m).await, 600 + 150);
         m.put(k(65535, "h/zz"), "z").await.unwrap();
         m.close().await.unwrap();
-        let m = open_db(&store, 3, None).await.unwrap();
+        let m = open_db(&store, ShardId(3), None).await.unwrap();
         assert!(m.get(k(65535, "h/zz")).await.unwrap().is_some());
         assert!(m.get(k(100, "h/new9001")).await.unwrap().is_some());
         m.close().await.unwrap();
@@ -1005,7 +1006,7 @@ mod clone_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn merging_a_splits_halves_keeps_their_shared_l0s() {
         let store = Store { prefix: "smc".into(), ..Store::memory(None) };
-        let db = open_db(&store, 0, None).await.unwrap();
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
         let slots = [10u16, 20000, 32767, 32768, 40000, 65535];
         let mut wb = slatedb::WriteBatch::new();
         for s in slots {
@@ -1013,10 +1014,10 @@ mod clone_tests {
         }
         db.write(wb).await.unwrap();
         db.close().await.unwrap(); // flushes them into one L0, spanning both halves
-        clone_db(&store, 1, &[(0, 0, 32768)]).await.unwrap();
-        clone_db(&store, 2, &[(0, 32768, 65536)]).await.unwrap();
-        clone_db(&store, 3, &[(1, 0, 32768), (2, 32768, 65536)]).await.unwrap();
-        let m = open_db(&store, 3, None).await.unwrap();
+        clone_db(&store, ShardId(1), &[(ShardId(0), 0, 32768)]).await.unwrap();
+        clone_db(&store, ShardId(2), &[(ShardId(0), 32768, 65536)]).await.unwrap();
+        clone_db(&store, ShardId(3), &[(ShardId(1), 0, 32768), (ShardId(2), 32768, 65536)]).await.unwrap();
+        let m = open_db(&store, ShardId(3), None).await.unwrap();
         let ids: Vec<_> = m.manifest().l0().iter().map(|v| v.id).collect();
         compact_away_l0(&m).await;
         let mut lost = Vec::new();
@@ -1044,14 +1045,14 @@ mod clone_tests {
         let seed: u64 = std::env::var("SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let store = Store { prefix: format!("gen{seed}"), ..Store::memory(None) };
-        let mut model: std::collections::BTreeMap<Vec<u8>, (u16, String, u16, usize)> = Default::default();
+        let mut model: std::collections::BTreeMap<Vec<u8>, (u16, String, ShardId, usize)> = Default::default();
         // (id, lo, hi, db)
-        let mut shards: Vec<(u16, u32, u32, Db)> = Vec::new();
-        for i in 0..4u16 {
-            let lo = i as u32 * 16384;
-            shards.push((i, lo, lo + 16384, open_db(&store, i, None).await.unwrap()));
+        let mut shards: Vec<(ShardId, u32, u32, Db)> = Vec::new();
+        for i in 0..4u32 {
+            let lo = i * 16384;
+            shards.push((ShardId(i), lo, lo + 16384, open_db(&store, ShardId(i), None).await.unwrap()));
         }
-        let mut next_id = 4u16;
+        let mut next_id = 4u32;
         let mut n = 0u64;
         let mut log: Vec<String> = Vec::new();
         for step in 0..40 {
@@ -1084,7 +1085,7 @@ mod clone_tests {
                 }
                 db.close().await.unwrap();
                 let mid = (lo + hi) / 2;
-                let (a, b) = (next_id, next_id + 1);
+                let (a, b) = (ShardId(next_id), ShardId(next_id + 1));
                 next_id += 2;
                 clone_db(&store, a, &[(id, lo, mid)]).await.unwrap();
                 clone_db(&store, b, &[(id, mid, hi)]).await.unwrap();
@@ -1097,7 +1098,7 @@ mod clone_tests {
                 let (y, ylo, yhi, ydb) = shards.remove(i);
                 xdb.close().await.unwrap();
                 ydb.close().await.unwrap();
-                let m = next_id;
+                let m = ShardId(next_id);
                 next_id += 1;
                 clone_db(&store, m, &[(x, xlo, xhi), (y, ylo, yhi)]).await.unwrap();
                 log.push(format!("step {step}: merge {x} [{xlo},{xhi}) + {y} [{ylo},{yhi}) -> {m}"));
@@ -1111,7 +1112,7 @@ mod clone_tests {
     }
 
     /// Every key of `model` reads back its value from the shard holding its slot.
-    async fn check(shards:&[(u16, u32, u32, Db)], model: &std::collections::BTreeMap<Vec<u8>, (u16, String, u16, usize)>, log: &[String], seed: u64, step: usize, when: &str) {
+    async fn check(shards: &[(ShardId, u32, u32, Db)], model: &std::collections::BTreeMap<Vec<u8>, (u16, String, ShardId, usize)>, log: &[String], seed: u64, step: usize, when: &str) {
         let mut missing = Vec::new();
         for (key, (slot, v, wid, wstep)) in model {
             let (id, _, _, db) = shards.iter().find(|(_, lo, hi, _)| (*slot as u32) >= *lo && (*slot as u32) < *hi).unwrap();
@@ -1137,7 +1138,7 @@ mod clone_tests {
     #[tokio::test]
     async fn family_scan_skips_other_families() {
         let store = Store { prefix: "fam".into(), ..Store::memory(None) };
-        let db = open_db(&store, 0, None).await.unwrap();
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
         for s in [3u16, 7, 9, 65535] {
             for f in ["C/x\0", "R/", "a/", "h/", "n/", "p/"] {
                 db.put(k(s, &format!("{f}d{s}")), b"").await.unwrap();
