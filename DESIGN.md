@@ -1365,9 +1365,12 @@ handle keys) were gone from the shard and from every later clone of it.
 This was `split_and_merge_under_write_load`'s rare "acked record lost"
 (the merged shard compacted only when its L0 ran deep under load). vlpds
 builds slatedb (and slatedb-common) from the fork
-`github.com/jazware/slatedb`, branch `vlpds-0.17-batch-next`, rev
-`fc2aae0a` (0.17.0 = upstream `c1e36fc` plus this fix, its test update, and
-the synchronous-`next` / `next_batch` scan fast path, via
+`github.com/jazware/slatedb`, branch `vlpds-0.17-submit-dest-guard`, rev
+`68106cc0` (0.17.0 = upstream `c1e36fc` plus this fix, its test update,
+the synchronous-`next` / `next_batch` scan fast path, and a compactor guard:
+an admin-submitted spec, i.e. reshard GC's forced compactions, is failed
+instead of promoted when it collides with a claimed job's destination or
+sources, which the executor's `assert!` would otherwise panic on; via
 `[patch.crates-io]`), whose `Manifest::cloned_from_union` gives repeated
 L0 view ids fresh ids (same timestamp; the union has no L0 watermark that
 could name the old ones). Pending an upstream report; drop the patch once
