@@ -733,16 +733,82 @@ pub fn encode_leaf(entries: &[(Arc<[u8]>, Cid)], out: &mut Vec<u8>) {
     cbor::write_array_head(out, entries.len());
     let mut prev_key: &[u8] = &[];
     for (key, val) in entries {
-        let p = count_prefix_len(prev_key, key);
-        out.extend_from_slice(&[0xa4, 0x61, b'k']);
-        cbor::write_bytes(out, &key[p..]);
-        out.extend_from_slice(&[0x61, b'p']);
-        cbor::write_uint(out, p as u64);
-        out.extend_from_slice(&[0x61, b't', 0xf6, 0x61, b'v']);
-        out.extend_from_slice(&cbor::link_bytes(val));
+        encode_leaf_entry(out, prev_key, key, val);
         prev_key = key;
     }
     out.extend_from_slice(&[0x61, b'l', 0xf6]);
+}
+
+/// One entry of a leaf (`encode_leaf`): `key` prefix-compressed against
+/// the entry before it.
+#[inline]
+fn encode_leaf_entry(out: &mut Vec<u8>, prev_key: &[u8], key: &[u8], val: &Cid) {
+    let p = count_prefix_len(prev_key, key);
+    out.extend_from_slice(&[0xa4, 0x61, b'k']);
+    cbor::write_bytes(out, &key[p..]);
+    out.extend_from_slice(&[0x61, b'p']);
+    cbor::write_uint(out, p as u64);
+    out.extend_from_slice(&[0x61, b't', 0xf6, 0x61, b'v']);
+    out.extend_from_slice(&cbor::link_bytes(val));
+}
+
+/// [`encode_leaf`] one entry at a time, from keys the caller doesn't keep
+/// (an export's record stream): the entries are written after room for
+/// the head, which [`finish`](LeafEncoder::finish) fills in once their
+/// count is known. Same bytes, no copy; the buffers are reused from leaf to
+/// leaf.
+#[derive(Default)]
+pub struct LeafEncoder {
+    /// `LEAF_HEAD_ROOM` bytes of room, then the entries.
+    buf: Vec<u8>,
+    head: Vec<u8>,
+    prev: Vec<u8>,
+    n: usize,
+}
+
+/// `{"e": [` with the longest array head (9 bytes).
+const LEAF_HEAD_ROOM: usize = 3 + 9;
+
+impl LeafEncoder {
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.buf.resize(LEAF_HEAD_ROOM, 0);
+        self.prev.clear();
+        self.n = 0;
+    }
+
+    /// Appends an entry (keys in ascending order).
+    pub fn push(&mut self, key: &[u8], val: &Cid) {
+        if self.buf.len() < LEAF_HEAD_ROOM {
+            self.clear();
+        }
+        encode_leaf_entry(&mut self.buf, &self.prev, key, val);
+        self.prev.clear();
+        self.prev.extend_from_slice(key);
+        self.n += 1;
+    }
+
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// The leaf's block. Call once per [`clear`](LeafEncoder::clear).
+    pub fn finish(&mut self) -> &[u8] {
+        if self.buf.len() < LEAF_HEAD_ROOM {
+            self.clear();
+        }
+        self.head.clear();
+        self.head.extend_from_slice(&[0xa2, 0x61, b'e']);
+        cbor::write_array_head(&mut self.head, self.n);
+        let start = LEAF_HEAD_ROOM - self.head.len();
+        self.buf[start..LEAF_HEAD_ROOM].copy_from_slice(&self.head);
+        self.buf.extend_from_slice(&[0x61, b'l', 0xf6]);
+        &self.buf[start..]
+    }
 }
 
 #[inline]
@@ -827,11 +893,24 @@ fn write_blocks(
 /// maximal prefix lengths (the first entry's is 0), and no child pointers
 /// in a height-0 node. Heights across nodes are checked by `load_from_blocks`.
 pub fn decode_node(data: &[u8], c: Cid) -> std::result::Result<Node, MstError> {
-    match decode_node_fast(data, c) {
+    match decode_node_fast(data, c, None) {
         Some(n) => Ok(n),
         // anything the fast path doesn't take (every invalid node, and
         // valid ones it doesn't recognize, if there were any): the generic
         // decoder decides, with its error
+        None => decode_node_reference(data, c),
+    }
+}
+
+/// [`decode_node`] of a node whose height is known (`height` >= 1: its
+/// parent's minus one) and whose bytes are trusted to hash to `c` (a
+/// node this PDS encoded, read back from its own store): the keys aren't
+/// hashed for their heights; every other check is made. A node with keys
+/// gets `height`; one without (only a root can be) gets -1 as from
+/// [`decode_node`].
+pub fn decode_trusted_node(data: &[u8], c: Cid, height: i32) -> std::result::Result<Node, MstError> {
+    match decode_node_fast(data, c, Some(height)) {
+        Some(n) => Ok(n),
         None => decode_node_reference(data, c),
     }
 }
@@ -850,7 +929,7 @@ pub fn decode_node(data: &[u8], c: Cid) -> std::result::Result<Node, MstError> {
 /// mutated blocks); every check that one makes is made here: exact fields,
 /// links or null, keys ascending, valid and of one height, canonical
 /// prefix lengths, no children under height 0, no trailing bytes.
-fn decode_node_fast(data: &[u8], c: Cid) -> Option<Node> {
+fn decode_node_fast(data: &[u8], c: Cid, known_height: Option<i32>) -> Option<Node> {
     let mut r = cbor::Cursor::new(data);
     // {"e": [...
     if !r.lit(&[0xa2, 0x61, b'e']) {
@@ -902,11 +981,16 @@ fn decode_node_fast(data: &[u8], c: Cid) -> Option<Node> {
         if !valid_key(&key) {
             return None;
         }
-        let h = height_for_key(&key);
-        if height < 0 {
-            height = h;
-        } else if h != height {
-            return None;
+        match known_height {
+            Some(h) => height = h,
+            None => {
+                let h = height_for_key(&key);
+                if height < 0 {
+                    height = h;
+                } else if h != height {
+                    return None;
+                }
+            }
         }
         entries.push(Entry::Value { key: Arc::from(&key[..]), val });
         if let Some(t) = t {
@@ -2143,5 +2227,58 @@ mod tests {
         for (what, b) in bad {
             assert!(ok(b).is_err(), "{what} accepted");
         }
+    }
+
+    /// An export's streamed leaf encoding and trusted interior decode give
+    /// what `encode_leaf` / `decode_node` give, on every node of a tree
+    /// with leaves of 1 to dozens of entries (one- and two-byte array
+    /// heads), the encoder reused from leaf to leaf.
+    #[test]
+    fn leaf_encoder_and_trusted_decode_match() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let mut t = Tree::new();
+        for i in 0..3000u32 {
+            let k = format!("app.bsky.feed.post/{:013x}", rng.gen::<u64>() >> 12);
+            t.insert_no_proof(k.as_bytes(), Cid::dag_cbor(&i.to_be_bytes())).unwrap();
+        }
+        // a run of keys under one prefix (long, shared prefixes)
+        for i in 0..40u32 {
+            t.insert_no_proof(format!("z.col/{i:04}").as_bytes(), leaf()).unwrap();
+        }
+        t.root_cid().unwrap();
+        let mut enc = LeafEncoder::default();
+        let (mut leaves, mut interior) = (0, 0);
+        t.walk_blocks(&mut |c, b| {
+            let n = decode_node(b, c).unwrap();
+            if n.height == 0 {
+                enc.clear();
+                let mut recs: Vec<(Arc<[u8]>, Cid)> = Vec::new();
+                for e in &n.entries {
+                    let Entry::Value { key, val } = e else { panic!() };
+                    enc.push(key, val);
+                    recs.push((key.clone(), *val));
+                }
+                let mut want = Vec::new();
+                encode_leaf(&recs, &mut want);
+                assert_eq!(want, b);
+                assert_eq!(enc.finish(), b);
+                leaves += 1;
+            } else {
+                let tn = decode_trusted_node(b, c, n.height).unwrap();
+                assert_eq!(tn.height, n.height);
+                assert_eq!(format!("{:?}", tn.entries), format!("{:?}", n.entries));
+                interior += 1;
+            }
+        })
+        .unwrap();
+        assert!(leaves > 500 && interior > 100, "{leaves} leaves, {interior} interior");
+        let mut big = LeafEncoder::default();
+        let recs: Vec<(Arc<[u8]>, Cid)> = (0..30u32).map(|i| (Arc::from(format!("a/{i:03}").as_bytes()), leaf())).collect();
+        for (k, v) in &recs {
+            big.push(k, v);
+        }
+        let mut want = Vec::new();
+        encode_leaf(&recs, &mut want);
+        assert_eq!(big.finish(), &want[..]);
     }
 }

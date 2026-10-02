@@ -268,7 +268,8 @@ async fn scan_records(
     };
     let mut out = Buffered { chunks: Vec::new(), bytes: 0, resume_at: None, _permit: None };
     let (mut held_mb, cap) = (0u32, EXPORT_BUFFER_MAX_MB.load(std::sync::atomic::Ordering::Relaxed));
-    let mut batch = Vec::with_capacity(EXPORT_BATCH);
+    let new_batch = || crate::mst_store::Records::with_capacity(EXPORT_BATCH);
+    let mut batch = new_batch();
     loop {
         let kv = match iter.next().await {
             Ok(Some(kv)) => kv,
@@ -278,7 +279,7 @@ async fn scan_records(
                 return Err(e.into());
             }
         };
-        let (cid, bytes) = match state::decode_record_value(&kv.value) {
+        let (cid, bytes) = match state::record_value_parts(&kv.value) {
             Ok(v) => v,
             Err(e) => {
                 let _ = tx.send(Err(e.to_string())).await;
@@ -286,8 +287,8 @@ async fn scan_records(
             }
         };
         let key = &kv.key[prefix.len()..];
-        batch.push((Arc::from(key), cid));
-        if batch.len() == EXPORT_BATCH && tx.send(Ok(std::mem::replace(&mut batch, Vec::with_capacity(EXPORT_BATCH)))).await.is_err() {
+        batch.push(key, cid);
+        if batch.len() == EXPORT_BATCH && tx.send(Ok(std::mem::replace(&mut batch, new_batch()))).await.is_err() {
             // the walk is gone (it failed: a finished one has read every
             // record): stop, leaving the rest to a second scan
             out.resume_at.get_or_insert_with(|| key.to_vec());
@@ -314,7 +315,7 @@ async fn scan_records(
         }
         let Some(chunk) = out.chunks.last_mut() else { unreachable!() };
         let was = chunk.len();
-        car::write_block(chunk, &cid, &bytes);
+        car::write_block(chunk, &cid, bytes);
         out.bytes += chunk.len() - was;
     }
     if !batch.is_empty() {
@@ -405,8 +406,8 @@ async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Respon
             match iter.next().await {
                 Ok(Some(kv)) => {
                     if since.is_none_or(|s| state::record_value_rev(&kv.value) > s) {
-                        if let Ok((cid, bytes)) = state::decode_record_value(&kv.value) {
-                            car::write_block(&mut buf, &cid, &bytes);
+                        if let Ok((cid, bytes)) = state::record_value_parts(&kv.value) {
+                            car::write_block(&mut buf, &cid, bytes);
                         }
                     }
                     if buf.len() >= CHUNK && tx.send(Ok(Bytes::from(std::mem::replace(&mut buf, Vec::with_capacity(CHUNK + 4096))))).await.is_err() {

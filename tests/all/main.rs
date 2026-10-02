@@ -7,6 +7,12 @@
 
 mod common;
 
+/// `--features bench-jemalloc`: the server's allocator, for benches
+/// (CPU per op); the suite otherwise runs on the system allocator.
+#[cfg(feature = "bench-jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod account_deactivation;
 mod account_races;
 mod admin_cli;

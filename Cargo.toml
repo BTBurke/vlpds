@@ -9,6 +9,9 @@ autotests = false
 [features]
 default = ["jemalloc", "slatedb-metrics"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# The test binary (benches) on jemalloc, the server's allocator: the system
+# allocator costs an export ~1.5x the instructions (DESIGN "Measured")
+bench-jemalloc = ["jemalloc"]
 # A/B alternative: cargo build --release --no-default-features --features mimalloc
 mimalloc = ["dep:mimalloc"]
 # CPU profiling (bench/obs/README.md): --pyroscope-url pushes 100 Hz pprof-rs

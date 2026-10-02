@@ -1836,7 +1836,8 @@ root through the store).
   CID, in batches, to the MST walk on a blocking thread
   (`mst_lazy::export_blocks` over `mst_store::FedSource`: the `M/` range
   read ahead, leaves encoded straight from their records and checked
-  against their links, one path in memory), and keeps the record blocks in
+  against their links, one path in memory; the root is checked against the
+  commit, the `M/` nodes below it are not re-hashed: see "Measured"), and keeps the record blocks in
   a bounded buffer until the nodes are out (the CAR puts every node first:
   same bytes as before). The buffer is 1 MiB grants from a process-wide
   256 MiB, at most 64 MiB per export; records past it are read again by a
@@ -1887,6 +1888,7 @@ the full-tree mode is removed).
 | getBlocks: interior node / record / leaf | 95.8k / 62.3k / 43.9k/s | 82.6k / 57.6k / 21.5k/s |
 | getRepo, 100k records (22.5 MB), 4 clients | 47 /s | 16 /s (two `R/` scans; one since Oct 2: below) |
 | Process CPU per getRepo export / leaf getBlocks (Oct 2, below) | 112 ms / 98 µs | 148 ms / 196 µs (269 ms / 253 µs before) |
+| Instructions per getRepo export, system allocator / jemalloc (Oct 2, below) | 1,382 M / 908 M | 1,575 M / 1,057 M (1,631 M / 1,101 M before) |
 
 - The RSS rows include the writes' own state, which in these runs lives
   in the in-memory object store and memtables (5x more state bytes per
@@ -1920,6 +1922,44 @@ the full-tree mode is removed).
   noisy to rank precisely (medians 16.5 / 12.2 / 7.2 exports/s, each
   spanning 4-24/s). The remaining gap is the walk itself (`M/` reads and
   hash checks, leaf encode and hash) and the scan feeding it.
+- Export follow-up (Oct 2). `bench_readers` also reports instructions
+  retired per operation (macOS `proc_pid_rusage`): unlike CPU time, the
+  same on a performance or an efficiency core and under load (CPU per
+  export spread 105-159 ms across runs of one binary at load 20-70;
+  instructions ±1%). Profile (`sample`, 4 concurrent exports): ~75% of an
+  export is the `R/` scan inside SlateDB's `DbIterator::next` (~11k
+  instructions per row: a boxed future per iterator layer per row, so
+  allocator traffic, `RowEntry` moves and the merge heap), ~8% the `M/`
+  read-ahead scan (same per-row cost), ~10% the walk (leaf encode and
+  SHA-256, interior decode; the hash was ~1/3 of it, `M/` nodes ~60% of
+  that), ~6% hyper. SHA-256 is the hardware one: `sha2` 0.10 with `asm`
+  takes the ARMv8 SHA2 instructions on aarch64 and SHA-NI on x86-64 (the
+  `asm` feature only swaps the software fallback there), detected at run
+  time. Changes: the export no longer re-hashes the persisted nodes below
+  the root, nor their keys for heights (`mst_lazy::export_blocks`: the root
+  is still checked against the commit's data link, every leaf and rebuilt
+  subtree against its parent's link; the `M/` blocks are ones this PDS
+  encoded and hashed before writing them under their CIDs, imports
+  included (their blocks are hash-checked first), and SlateDB checks each
+  SST block's CRC32 when it reads it, so bit rot fails the read; a wrong
+  node would still mostly fail its children's link checks, else reach the
+  CAR as a block not hashing to its CID; the worker's and readers' walks,
+  which cache what they load, keep the check); record batches to the walk
+  are keys back to back in one buffer (no `Arc` per record), leaves
+  encoded entry by entry without a copy, record values decoded borrowed.
+  5 interleaved rounds against the previous head and the last full-tree
+  commit (the old bench patched to report the same numbers): instructions
+  per 22.5 MB export 1,631 M -> 1,575 M (-3.4%; full tree 1,382 M) on the
+  system allocator the test binary uses, 1,101 M -> 1,057 M (-4%; full
+  tree 908 M) on jemalloc (`--features bench-jemalloc`); CPU medians 144 ->
+  137 ms (full 120) and 118 -> 112 ms (full 92), within the run-to-run
+  spread. The gap to a resident tree is now ~1.15x (was ~1.2x measured
+  this way; the 148 vs 112 ms above were 4 rounds of CPU time), most of it
+  the `M/` read-ahead's SlateDB rows and the leaf hashing that checks the
+  records against the signed tree. The test binary's allocator alone costs
+  an export ~50% more instructions than jemalloc (the server's), so
+  benches of scan-heavy paths overstate them. What is left to win is
+  mostly in SlateDB's iterator stack (the fork), not in this walk.
 - Leaf getBlocks is an index lookup plus a walk to the leaf's key; cold
   leaves (the bench's random leaves are mostly cold) cost a small `R/`
   range scan each, now shared with their siblings: 196 µs of CPU (median of

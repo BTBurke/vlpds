@@ -16,7 +16,7 @@
 
 use crate::cid::{Cid, CODEC_DAG_CBOR};
 use crate::metrics;
-use crate::mst::{Entry, MstError, Node, MAX_DEPTH};
+use crate::mst::{Entry, LeafEncoder, MstError, Node, MAX_DEPTH};
 use crate::mst_lazy::{Key, Source};
 use crate::state;
 use slatedb::DbReadOps;
@@ -287,9 +287,45 @@ fn forward_range(
     Ok(())
 }
 
-/// A batch of a repo's records (key order) for a [`FedSource`], or the
-/// scan's error.
-pub type RecordBatch = std::result::Result<Vec<(Key, Cid)>, String>;
+/// A batch of a repo's records in key order for a [`FedSource`]: the keys
+/// back to back in one buffer (no allocation per record), each record's
+/// key end and CID.
+#[derive(Default)]
+pub struct Records {
+    keys: Vec<u8>,
+    recs: Vec<(u32, Cid)>,
+}
+
+impl Records {
+    pub fn with_capacity(n: usize) -> Self {
+        Records { keys: Vec::with_capacity(n * 32), recs: Vec::with_capacity(n) }
+    }
+
+    pub fn push(&mut self, key: &[u8], cid: Cid) {
+        self.keys.extend_from_slice(key);
+        self.recs.push((self.keys.len() as u32, cid));
+    }
+
+    pub fn len(&self) -> usize {
+        self.recs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.recs.is_empty()
+    }
+
+    fn get(&self, i: usize) -> (&[u8], &Cid) {
+        let start = match i {
+            0 => 0,
+            _ => self.recs[i - 1].0 as usize,
+        };
+        let (end, cid) = &self.recs[i];
+        (&self.keys[start..*end as usize], cid)
+    }
+}
+
+/// A batch of records for a [`FedSource`], or the scan's error.
+pub type RecordBatch = std::result::Result<Records, String>;
 
 /// [`ScanSource`] fed by a producer on the runtime (one forward `R/` scan
 /// in batches, `export_repo`): the scan runs ahead of the walk instead of
@@ -297,29 +333,37 @@ pub type RecordBatch = std::result::Result<Vec<(Key, Cid)>, String>;
 pub struct FedSource<N: Source> {
     pub nodes: N,
     rx: RefCell<tokio::sync::mpsc::Receiver<RecordBatch>>,
-    cur: RefCell<std::vec::IntoIter<(Key, Cid)>>,
-    peeked: RefCell<Option<(Key, Cid)>>,
+    /// The batch being read, and its next record.
+    cur: RefCell<(Records, usize)>,
 }
 
 impl<N: Source> FedSource<N> {
     pub fn new(nodes: N, rx: tokio::sync::mpsc::Receiver<RecordBatch>) -> Self {
-        FedSource { nodes, rx: RefCell::new(rx), cur: RefCell::new(Vec::new().into_iter()), peeked: RefCell::new(None) }
+        FedSource { nodes, rx: RefCell::new(rx), cur: RefCell::new((Records::default(), 0)) }
     }
 
-    /// The next record (blocking: the blocking pool only).
-    fn next(&self) -> Result<Option<(Key, Cid)>> {
-        if let Some(r) = self.peeked.borrow_mut().take() {
-            return Ok(Some(r));
-        }
+    /// Hands `f` the records in (`lo`, `hi`) in key order: those at or
+    /// below `lo` are skipped (a range the caller had, or the parent's own
+    /// keys), the first at or above `hi` stays for the next range. Blocking
+    /// (the blocking pool only).
+    fn range(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, mut f: impl FnMut(&[u8], &Cid)) -> Result<()> {
         let mut cur = self.cur.borrow_mut();
+        let (batch, pos) = &mut *cur;
         loop {
-            if let Some(r) = cur.next() {
-                return Ok(Some(r));
+            while *pos < batch.len() {
+                let (k, c) = batch.get(*pos);
+                if hi.is_some_and(|hi| k >= hi) {
+                    return Ok(());
+                }
+                if lo.is_none_or(|lo| k > lo) {
+                    f(k, c);
+                }
+                *pos += 1;
             }
             match self.rx.borrow_mut().blocking_recv() {
-                Some(Ok(b)) => *cur = b.into_iter(),
+                Some(Ok(b)) => (*batch, *pos) = (b, 0),
                 Some(Err(e)) => return Err(MstError::Store(e)),
-                None => return Ok(None),
+                None => return Ok(()),
             }
         }
     }
@@ -331,7 +375,12 @@ impl<N: Source> Source for FedSource<N> {
     }
 
     fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()> {
-        forward_range(|| self.next(), &self.peeked, lo, hi, out)
+        self.range(lo, hi, |k, c| out.push((Arc::from(k), *c)))
+    }
+
+    fn leaf_records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, enc: &mut LeafEncoder) -> Result<()> {
+        enc.clear();
+        self.range(lo, hi, |k, c| enc.push(k, c))
     }
 }
 

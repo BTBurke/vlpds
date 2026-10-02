@@ -291,6 +291,12 @@ pub fn decode_record_value(v: &Bytes) -> anyhow::Result<(Cid, Bytes)> {
     ))
 }
 
+/// [`decode_record_value`], borrowing the record's bytes.
+pub fn record_value_parts(v: &[u8]) -> anyhow::Result<(Cid, &[u8])> {
+    anyhow::ensure!(v.len() >= CID_BYTES_LEN + 8, "short record value");
+    Ok((Cid::from_bytes(&v[..CID_BYTES_LEN])?, &v[CID_BYTES_LEN + 8..]))
+}
+
 /// Rev of the commit that last wrote a record value.
 pub fn record_value_rev(v: &[u8]) -> u64 {
     v.get(CID_BYTES_LEN..CID_BYTES_LEN + 8).map(|b| u64::from_be_bytes(b.try_into().unwrap())).unwrap_or(0)

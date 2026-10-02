@@ -1340,6 +1340,7 @@ where
 {
     let t = Instant::now();
     let cpu0 = process_cpu();
+    let ins0 = process_instructions();
     let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let tasks: Vec<_> = (0..conc)
         .map(|w| {
@@ -1359,6 +1360,7 @@ where
     }
     let ops = n.load(std::sync::atomic::Ordering::Relaxed);
     CPU_PER_OP.lock().unwrap().push((process_cpu() - cpu0) / ops.max(1) as f64 * 1e6);
+    INS_PER_OP.lock().unwrap().push((process_instructions() - ins0) as f64 / ops.max(1) as f64);
     ops as f64 / t.elapsed().as_secs_f64()
 }
 
@@ -1366,6 +1368,31 @@ where
 /// operation of each `throughput` call, in µs: what a run costs, which a
 /// shared machine disturbs less than the rate.
 static CPU_PER_OP: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
+
+/// Instructions retired per operation of each `throughput` call (macOS;
+/// 0 elsewhere): unlike CPU time, the same on a performance or an
+/// efficiency core and under load, so A/B runs on a shared laptop compare.
+static INS_PER_OP: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
+
+/// The process's instructions retired so far (`proc_pid_rusage`,
+/// `rusage_info_v4::ri_instructions`; 0 off macOS).
+fn process_instructions() -> u64 {
+    if !cfg!(target_os = "macos") {
+        return 0;
+    }
+    unsafe extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buf: *mut u64) -> i32;
+        fn getpid() -> i32;
+    }
+    // rusage_info_v4: a 16-byte uuid, then u64s; ri_instructions is the
+    // 30th of them (index 29), ri_cycles the next. 64 u64s cover the struct.
+    let mut b = [0u64; 64];
+    const RUSAGE_INFO_V4: i32 = 4;
+    if unsafe { proc_pid_rusage(getpid(), RUSAGE_INFO_V4, b.as_mut_ptr()) } != 0 {
+        return 0;
+    }
+    b[2 + 29]
+}
 
 /// Process CPU seconds (CLOCK_PROCESS_CPUTIME_ID).
 fn process_cpu() -> f64 {
@@ -1383,7 +1410,9 @@ fn process_cpu() -> f64 {
 /// Read paths on one repo (`VLPDS_READ_RECORDS`, default 100k) after a
 /// restart and one write (the node holds the root and one path):
 /// sync.getRecord proofs of random keys, getBlocks of random interior
-/// nodes / leaves / records, getRepo exports.
+/// nodes / leaves / records, getRepo exports. Reports process CPU and
+/// instructions per operation; `--features bench-jemalloc` runs it on the
+/// server's allocator, `VLPDS_READ_ONLY=getRepo` one phase.
 /// `cargo test --profile dev-release --test all mst_lazy::bench_readers -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
@@ -1464,9 +1493,10 @@ async fn bench_readers() {
         })
         .await };
         let line = format!(
-            "{n} records: sync.getRecord {get_record:.0}/s; getBlocks interior {gb_interior:.0}/s, record {gb_records:.0}/s, leaf {gb_leaves:.1}/s; getRepo {get_repo:.2}/s ({:.1} MB); CPU us/op {:?}",
+            "{n} records: sync.getRecord {get_record:.0}/s; getBlocks interior {gb_interior:.0}/s, record {gb_records:.0}/s, leaf {gb_leaves:.1}/s; getRepo {get_repo:.2}/s ({:.1} MB); CPU us/op {:?}; M instructions/op {:?}",
             r.body.len() as f64 / 1e6,
-            std::mem::take(&mut *CPU_PER_OP.lock().unwrap()).iter().map(|c| c.round() as u64).collect::<Vec<_>>()
+            std::mem::take(&mut *CPU_PER_OP.lock().unwrap()).iter().map(|c| c.round() as u64).collect::<Vec<_>>(),
+            std::mem::take(&mut *INS_PER_OP.lock().unwrap()).iter().map(|c| (c / 1e6).round() as u64).collect::<Vec<_>>()
         );
         eprintln!("{line}");
         report.push(line);

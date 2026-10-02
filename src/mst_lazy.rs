@@ -27,7 +27,7 @@
 //! (interior nodes), 2 the hybrid (height-1 subtrees rebuilt from records).
 
 use crate::cid::Cid;
-use crate::mst::{decode_node, encode_node, height_for_key, Entry, MstError, Node, Tree, MAX_DEPTH};
+use crate::mst::{decode_node, decode_trusted_node, encode_node, height_for_key, Entry, LeafEncoder, MstError, Node, Tree, MAX_DEPTH};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
@@ -53,6 +53,19 @@ pub trait Source {
     /// Records with `lo < key < hi` in key order (`R/` range scan; `None`
     /// bounds are open).
     fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()>;
+    /// [`records`](Source::records) as a leaf's entries: `enc` (cleared
+    /// first) gets them in key order. An export's leaves; a source
+    /// streaming its records encodes them from its buffers, without a key
+    /// copy per record.
+    fn leaf_records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, enc: &mut LeafEncoder) -> Result<()> {
+        let mut recs = Vec::new();
+        self.records(lo, hi, &mut recs)?;
+        enc.clear();
+        for (k, c) in &recs {
+            enc.push(k, c);
+        }
+        Ok(())
+    }
 }
 
 /// What loading cost (cumulative per [`LazyTree`] or export).
@@ -161,7 +174,20 @@ pub fn persisted_node(b: Arc<[u8]>, cid: &Cid, height: Option<i32>) -> Result<Op
     if Cid::dag_cbor(&b) != *cid {
         return Err(MstError::Invalid("persisted node doesn't hash to its cid"));
     }
-    let mut n = decode_node(&b, *cid)?;
+    let n = decode_node(&b, *cid)?;
+    fix_height(b, n, height)
+}
+
+/// [`persisted_node`] without the hash check or the keys' heights, for an
+/// export's nodes below the root (see [`export_blocks`]): `b` is a block
+/// this PDS encoded and hashed before writing it under `cid`, read back
+/// through SlateDB's per-block CRC32.
+fn trusted_node(b: Arc<[u8]>, cid: &Cid, height: i32) -> Result<Option<Arc<Node>>> {
+    let n = decode_trusted_node(&b, *cid, height)?;
+    fix_height(b, n, Some(height))
+}
+
+fn fix_height(b: Arc<[u8]>, mut n: Node, height: Option<i32>) -> Result<Option<Arc<Node>>> {
     match height {
         Some(h) if n.height < 0 => n.height = h,
         Some(h) if n.height != h => return Err(MstError::Invalid("persisted node at the wrong height")),
@@ -842,6 +868,18 @@ pub fn persisted_blocks<'a>(root: &Cid, blocks: &[(Cid, &'a [u8])], persist_min:
 /// nodes by CID, lower subtrees rebuilt from their record ranges (which a
 /// real export reads with the one forward `R/` scan that also yields the
 /// records). Memory: one root-to-leaf path of nodes.
+///
+/// Checks: the root is hash-checked against `root` (the signed commit's
+/// data link), and every leaf and every subtree rebuilt from records
+/// against its parent's link, so the records exported are the ones the
+/// commit signs. Persisted nodes below the root are not re-hashed (nor
+/// their keys, for their heights): they are blocks this PDS encoded and
+/// hashed itself before writing them under their CIDs, and SlateDB checks
+/// each SST block's CRC32 when it reads it, so corruption at rest fails the
+/// read. A node that is wrong anyway (a bug) shows as its children not
+/// matching their links (failing the export), or else as a block not
+/// hashing to its CID in the CAR. The repo worker's and readers' walks
+/// keep the check (`persisted_node`): they cache what they load.
 pub fn export_blocks(
     root: Cid,
     persist_min: i32,
@@ -866,8 +904,6 @@ pub fn export_blocks(
         }
         Ok(())
     }
-    /// Reused buffers: a leaf's records, its block.
-    type Scratch = (Vec<(Key, Cid)>, Vec<u8>);
     #[allow(clippy::too_many_arguments)]
     fn visit(
         n: &Node,
@@ -877,7 +913,7 @@ pub fn export_blocks(
         src: &dyn Source,
         f: &mut dyn FnMut(Cid, &[u8]),
         stats: &mut LoadStats,
-        scratch: &mut Scratch,
+        enc: &mut LeafEncoder,
         depth: usize,
     ) -> Result<()> {
         if depth > MAX_DEPTH {
@@ -893,22 +929,19 @@ pub fn export_blocks(
                 // checks it (a leaf holds every key between its parent's
                 // separators, all of height 0 in the tree the link was
                 // computed from), so no key heights or node to build
-                let (recs, buf) = scratch;
-                recs.clear();
-                buf.clear();
-                src.records(clo.as_deref(), chi.as_deref(), recs)?;
+                src.leaf_records(clo.as_deref(), chi.as_deref(), enc)?;
                 stats.scans += 1;
-                stats.scanned_records += recs.len() as u64;
-                crate::mst::encode_leaf(recs, buf);
-                if Cid::dag_cbor(buf) != *c {
+                stats.scanned_records += enc.len() as u64;
+                let block = enc.finish();
+                if Cid::dag_cbor(block) != *c {
                     return Err(MstError::Invalid("subtree rebuilt from records doesn't match its link"));
                 }
-                f(*c, buf);
+                f(*c, block);
                 continue;
             }
             let child = export_subtree(src, persist_min, *c, n.height - 1, clo.as_deref(), chi.as_deref(), stats)?;
             if child.height >= persist_min && !child.entries.iter().any(|e| matches!(e, Entry::Child { node: Some(_), .. })) {
-                visit(&child, clo, chi, persist_min, src, f, stats, scratch, depth + 1)?;
+                visit(&child, clo, chi, persist_min, src, f, stats, enc, depth + 1)?;
             } else {
                 // rebuilt from records: fully loaded (blocks kept), walk it
                 // in place
@@ -919,7 +952,7 @@ pub fn export_blocks(
         }
         Ok(())
     }
-    visit(&r, None, None, persist_min, src, f, &mut stats, &mut (Vec::new(), Vec::new()), 0)?;
+    visit(&r, None, None, persist_min, src, f, &mut stats, &mut LeafEncoder::default(), 0)?;
     Ok(stats)
 }
 
@@ -935,8 +968,12 @@ fn export_subtree(
     stats: &mut LoadStats,
 ) -> Result<Arc<Node>> {
     if height >= persist_min {
-        if let Some(n) = read_node(src, &cid, Some(height), stats)? {
-            return Ok(n);
+        if let Some(b) = src.node(&cid)? {
+            stats.node_reads += 1;
+            stats.node_bytes += b.len() as u64;
+            if let Some(n) = trusted_node(b, &cid, height)? {
+                return Ok(n);
+            }
         }
         stats.fallbacks += 1;
     }
