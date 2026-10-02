@@ -1,0 +1,611 @@
+# Prometheus alerting rules for vlpds.
+#
+# Every alert carries `severity` (page | ticket), a summary, and a runbook_url
+# anchor into ops/RUNBOOK.md (one section per alert, heading = alert name).
+#
+# Assumptions (edit to match the deployment):
+# - Nodes are scraped under job="vlpds" (bench/obs/prometheus/prometheus.yml
+#   and deploy/ansible/roles/alloy/templates/vlpds-bench-monitoring.alloy.j2
+#   both use that name). The bench scrape configs list ~30 ports that are
+#   usually down: load these rules only against a Prometheus that scrapes the
+#   real cluster's nodes, or VlpdsNodeDown fires for every idle bench port.
+# - One cluster per Prometheus. With several, add a cluster label to the
+#   targets and to every `sum(...)` / `count(...)` below (`by (cluster)`).
+# - The recording rules in group vlpds-constants hold the two numbers no
+#   metric exports (see RUNBOOK.md "Metric gaps"): the shard count
+#   (--shards, default 256; changes with every online split/merge) and the
+#   per-node memory limit used for the RSS alerts.
+#
+# Thresholds: the design numbers are ~40-50 ms p50 / ~150 ms p99 commit ack
+# on S3 Standard, ~25 ms segment PUTs, hedging after 100 ms, a 3 s forward
+# deadline, and a lease renewal ceiling of 0.4 x TTL = 4 s at the default
+# 10 s TTL. Thresholds derived from those are marked "design"; the rest are
+# marked "guess" and should be tuned against a week of production data.
+
+groups:
+  - name: vlpds-constants
+    rules:
+      # Expected number of shards in the layout (--shards when the prefix was
+      # created, +1 per split, -1 per merge). `vlpds admin layout` prints it.
+      - record: vlpds:expected_shards
+        expr: vector(256)
+      # Memory available to one vlpds process (host RAM or cgroup limit).
+      # DESIGN.md "Initial deployment sizing": 64 GB owner nodes.
+      - record: vlpds:memory_limit_bytes
+        expr: vector(64 * 1024 * 1024 * 1024)
+
+  # ---------------------------------------------------------------------------
+  # Node liveness and fail-stops
+  # ---------------------------------------------------------------------------
+  - name: vlpds-liveness
+    rules:
+      - alert: VlpdsNodeDown
+        expr: up{job="vlpds"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "vlpds node {{ $labels.instance }} has not answered a scrape for 2 minutes"
+          description: >-
+            Peers take its shards over after TTL + skew (12 s at the default
+            TTL) or within 3-5 s if its port refuses connections, so writes
+            should already be served elsewhere; capacity is reduced and a
+            second loss may overload the rest.
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsnodedown"
+
+      # The process exits on purpose (fail-stop) when its lease lapses, its
+      # log is fenced, a shard is reassigned under it, a close fails or a
+      # segment upload / state apply fails (exit codes 2-5). The
+      # lease_events_total{event="lost"} increment happens right before
+      # exit(5) and is almost never scraped, so restarts are detected by the
+      # process CPU-time gauge going backwards.
+      - alert: VlpdsNodeRestarted
+        expr: resets(vlpds_process_cpu_seconds_total{job="vlpds",mode="user"}[15m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "vlpds node {{ $labels.instance }} restarted (fail-stop, crash, OOM or deploy)"
+          description: >-
+            The process CPU counter reset in the last 15 minutes. Check the
+            previous incarnation's exit code and last error log line.
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsnoderestarted"
+
+      - alert: VlpdsNodeCrashLooping
+        expr: resets(vlpds_process_cpu_seconds_total{job="vlpds",mode="user"}[1h]) >= 3
+        labels:
+          severity: page
+        annotations:
+          summary: "vlpds node {{ $labels.instance }} restarted {{ $value }} times in an hour"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsnodecrashlooping"
+
+      # A node saw a peer miss a renewal and its port refuse connections:
+      # the peer's process is gone (kill -9, crash, OOM) and its shards are
+      # being taken over now.
+      - alert: VlpdsPeerPresumedDead
+        expr: sum by (instance) (increase(vlpds_lease_events_total{job="vlpds",event="peer_refused"}[10m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} presumed a peer dead (missed renewal + connection refused)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdspeerpresumeddead"
+
+      - alert: VlpdsMixedVersions
+        expr: count(count by (rev) (vlpds_build_info{job="vlpds"})) > 1
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "vlpds nodes have run {{ $value }} different git revisions for over an hour (stuck rolling deploy?)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsmixedversions"
+
+  # ---------------------------------------------------------------------------
+  # Shard ownership
+  # ---------------------------------------------------------------------------
+  - name: vlpds-ownership
+    rules:
+      # A dead node's series go stale on its failed scrape, so its shards
+      # count as unowned until a peer opens them: normally 3-5 s (refused
+      # probe) or ~12 s (TTL + skew) plus replay. 2 minutes is far past that
+      # (design). `or vector(0)` keeps it firing when every node is down.
+      - alert: VlpdsShardsUnowned
+        expr: (sum(vlpds_owned_partitions{job="vlpds"}) or vector(0)) < vlpds:expected_shards
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Only {{ $value }} shards are owned by a live node (expected {{ with query \"vlpds:expected_shards\" }}{{ . | first | value }}{{ end }})"
+          description: >-
+            Writes and getRecord-style reads for repos in the missing shards
+            fail (503 PartitionUnavailable / ShardMoved resends time out).
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsshardsunowned"
+
+      # Safety does not depend on this (fencing + CAS assignments), but two
+      # nodes both reporting a shard for 5 minutes means a zombie that has not
+      # fail-stopped, or vlpds:expected_shards is stale after a split.
+      - alert: VlpdsShardsOverOwned
+        expr: sum(vlpds_owned_partitions{job="vlpds"}) > vlpds:expected_shards
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Nodes report {{ $value }} owned shards, more than the expected shard count"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsshardsoverowned"
+
+      # A full rolling deploy moves every shard about twice (out to peers and
+      # back). Four opens per shard per hour is more than any deploy (guess).
+      - alert: VlpdsOwnershipFlapping
+        expr: sum(increase(vlpds_lease_events_total{job="vlpds",event="opened"}[1h])) > 4 * vlpds:expected_shards
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} shard opens in the last hour: shards are moving repeatedly"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsownershipflapping"
+
+      # Nodes take shards up to ceil(shards / live nodes) and hand extras back
+      # to joiners, so a node far above the fair share for 30 minutes means
+      # handback is not happening (guess: 1.5x).
+      - alert: VlpdsOwnershipImbalanced
+        expr: >-
+          max(vlpds_owned_partitions{job="vlpds"})
+            > 1.5 * scalar(vlpds:expected_shards) / count(up{job="vlpds"} == 1)
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A vlpds node owns {{ $value }} shards, over 1.5x the fair share"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsownershipimbalanced"
+
+  # ---------------------------------------------------------------------------
+  # Write path (commit log)
+  # ---------------------------------------------------------------------------
+  - name: vlpds-writes
+    rules:
+      # Design: ~150 ms p99 on S3 Standard. 500 ms is >3x that (guess).
+      - alert: VlpdsCommitLatencyHigh
+        expr: >-
+          histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_commit_durable_seconds_bucket{job="vlpds"}[5m]))) > 0.5
+          and on (instance) sum by (instance) (rate(vlpds_commit_durable_seconds_count{job="vlpds"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Commit ack p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }} (design ~150 ms)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscommitlatencyhigh"
+
+      # 2 s: half the 4 s lease renewal ceiling and close to the 3 s forward
+      # deadline, past which forwarded writes fail (design-derived).
+      - alert: VlpdsCommitLatencyCritical
+        expr: >-
+          histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_commit_durable_seconds_bucket{job="vlpds"}[5m]))) > 2
+          and on (instance) sum by (instance) (rate(vlpds_commit_durable_seconds_count{job="vlpds"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Commit ack p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }}: forwarded writes start failing at 3 s"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscommitlatencycritical"
+
+      # Entries are waiting for the sequencer but no segment became durable
+      # for 2 minutes: the log is wedged (segment PUTs retry forever).
+      - alert: VlpdsCommitLogStalled
+        expr: >-
+          max by (instance) (vlpds_sequencer_queue_depth{job="vlpds"}) > 0
+          and on (instance) sum by (instance) (rate(vlpds_segments_total{job="vlpds"}[2m])) == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }} has {{ $value }} log entries queued and no durable segment in 2 minutes"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscommitlogstalled"
+
+      # now - own watermark, in microseconds. Idle logs advertise the clock
+      # (lag ~0); under load it is about one segment PUT. Only meaningful
+      # while the node owns shards (the gauge is not updated otherwise).
+      # 2 s (guess, half the lease ceiling).
+      - alert: VlpdsWatermarkLagHigh
+        expr: >-
+          max by (instance) (vlpds_watermark_lag_microseconds{job="vlpds"}) > 2e6
+          and on (instance) vlpds_owned_partitions{job="vlpds"} > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}'s log watermark is {{ $value | humanize }}us behind its clock"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdswatermarklaghigh"
+
+      # Design: ~25 ms PUTs; a hedge starts at 100 ms. 250 ms p99 means hedges
+      # are not saving the tail (guess).
+      - alert: VlpdsSegmentPutLatencyHigh
+        expr: >-
+          histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_segment_put_seconds_bucket{job="vlpds"}[5m]))) > 0.25
+          and on (instance) sum by (instance) (rate(vlpds_segment_put_seconds_count{job="vlpds"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Segment PUT p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }} (design ~25 ms, hedge at 100 ms)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssegmentputlatencyhigh"
+
+      # result="already_exists" is a lost hedge race (verified by content),
+      # not an error.
+      - alert: VlpdsSegmentPutErrors
+        expr: sum by (instance) (rate(vlpds_segment_put_attempts_total{job="vlpds",result="error"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | humanize }} failed segment PUT attempts/s (retried until durable)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssegmentputerrors"
+
+      - alert: VlpdsWritesShed
+        expr: sum by (instance) (rate(vlpds_writes_shed_total{job="vlpds"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} is rejecting {{ $value | humanize }} writes/s with 503 Overloaded (--max-inflight-writes)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdswritesshed"
+
+      - alert: VlpdsWriteInternalErrors
+        expr: sum by (instance, kind) (rate(vlpds_write_errors_total{job="vlpds",kind=~"internal|unavailable"}[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | humanize }} writes/s failing with kind={{ $labels.kind }}"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdswriteinternalerrors"
+
+      # 5xx share of locally served XRPC (proxied appview calls excluded:
+      # their 5xx are the upstream's). 5% (guess).
+      - alert: VlpdsHttp5xxHigh
+        expr: >-
+          sum by (instance) (rate(vlpds_http_requests_total{job="vlpds",status=~"5..",method!="_proxy_or_unmatched"}[5m]))
+            / sum by (instance) (rate(vlpds_http_requests_total{job="vlpds",method!="_proxy_or_unmatched"}[5m])) > 0.05
+          and on (instance) sum by (instance) (rate(vlpds_http_requests_total{job="vlpds",method!="_proxy_or_unmatched"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of XRPC requests on {{ $labels.instance }} return 5xx"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdshttp5xxhigh"
+
+  # ---------------------------------------------------------------------------
+  # Forwarding between nodes
+  # ---------------------------------------------------------------------------
+  - name: vlpds-forwarding
+    rules:
+      # result="5xx" includes "owner unreachable" and "past its 3 s TTFB
+      # deadline". 5% (guess).
+      - alert: VlpdsForwardErrorsHigh
+        expr: >-
+          sum by (instance) (rate(vlpds_forwards_total{job="vlpds",result="5xx"}[5m]))
+            / sum by (instance) (rate(vlpds_forwards_total{job="vlpds"}[5m])) > 0.05
+          and on (instance) sum by (instance) (rate(vlpds_forwards_total{job="vlpds"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of requests {{ $labels.instance }} forwards to shard owners fail with 5xx"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsforwarderrorshigh"
+
+      # Forwarded time to the owner's response head. 1 s p99 is a third of
+      # the 3 s deadline (guess).
+      - alert: VlpdsForwardLatencyHigh
+        expr: >-
+          histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_forward_seconds_bucket{job="vlpds"}[5m]))) > 1
+          and on (instance) sum by (instance) (rate(vlpds_forward_seconds_count{job="vlpds"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Forward p99 from {{ $labels.instance }} is {{ $value | humanizeDuration }} (deadline 3 s)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsforwardlatencyhigh"
+
+      # Resends of writes answered 503 RepoLoading / ShardMoved / unreachable.
+      # Bursts are normal for a few seconds around a restart or handoff; a
+      # sustained rate is not (guess: 50/s for 10 minutes).
+      - alert: VlpdsWriteResendsSustained
+        expr: sum by (instance, reason) (rate(vlpds_write_retries_total{job="vlpds"}[5m])) > 50
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} resends {{ $value | humanize }} writes/s (reason={{ $labels.reason }})"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdswriteresendssustained"
+
+  # ---------------------------------------------------------------------------
+  # Firehose
+  # ---------------------------------------------------------------------------
+  - name: vlpds-firehose
+    rules:
+      # Seq assignment of a batch's oldest event -> emit. Includes the PUT,
+      # the peer stream and waiting for the minimum watermark of every log
+      # (so also the largest clock offset between nodes). 2 s (guess).
+      - alert: VlpdsFirehoseEmitDelayHigh
+        expr: >-
+          histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_firehose_emit_delay_seconds_bucket{job="vlpds"}[5m]))) > 2
+          and on (instance) sum by (instance) (rate(vlpds_firehose_emit_delay_seconds_count{job="vlpds"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Firehose emit delay p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }}"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsfirehoseemitdelayhigh"
+
+      - alert: VlpdsFirehoseEmitDelayCritical
+        expr: >-
+          histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_firehose_emit_delay_seconds_bucket{job="vlpds"}[5m]))) > 20
+          and on (instance) sum by (instance) (rate(vlpds_firehose_emit_delay_seconds_count{job="vlpds"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Firehose emit delay p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }}: relays see stale data"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsfirehoseemitdelaycritical"
+
+      # The cluster commits but this node's merger emitted nothing for 5
+      # minutes: the merge is held at some log's watermark.
+      - alert: VlpdsFirehoseStalled
+        expr: >-
+          sum by (instance) (rate(vlpds_firehose_events_total{job="vlpds"}[5m])) == 0
+          and on () sum(rate(vlpds_commits_total{job="vlpds"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}'s firehose emitted nothing in 5 minutes while the cluster is committing"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsfirehosestalled"
+
+      # Subscribers more than --firehose-max-lag-mb (128 MiB) behind are cut
+      # off with ConsumerTooSlow. A few are normal; a cluster-wide rate means
+      # the server is the slow side (guess: 0.1/s).
+      - alert: VlpdsFirehoseConsumersTooSlow
+        expr: sum by (instance) (rate(vlpds_firehose_disconnects_total{job="vlpds",reason="too_slow"}[10m])) > 0.1
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} cuts off {{ $value | humanize }} firehose subscribers/s with ConsumerTooSlow"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsfirehoseconsumerstooslow"
+
+      # A log over the merger's byte budget (--firehose-merge-queue-mb,
+      # default 256 MiB) is read back from S3 instead: some log's watermark
+      # is far behind the others.
+      - alert: VlpdsFirehoseMergeSpilling
+        expr: sum by (instance) (increase(vlpds_firehose_merge_spills_total{job="vlpds"}[10m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}'s firehose merger spilled a log to S3 read-back"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsfirehosemergespilling"
+
+      # Peer followers dropped for falling behind the 128 MiB live ring; they
+      # catch up from S3 (slower, more GETs).
+      - alert: VlpdsPeerLogStreamLagging
+        expr: sum by (instance) (increase(vlpds_log_stream_lagged_total{job="vlpds"}[10m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} dropped a peer log stream that fell behind its live ring"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdspeerlogstreamlagging"
+
+  # ---------------------------------------------------------------------------
+  # Object store and control plane
+  # ---------------------------------------------------------------------------
+  - name: vlpds-object-store
+    rules:
+      # Control-plane calls (leases' peers LIST, assignments, fences) given
+      # up at min(TTL, 5 s). Lease renewals are not bounded and not counted
+      # here, but a store slow enough to time these out is past the 4 s
+      # renewal ceiling, where nodes fail-stop.
+      - alert: VlpdsControlPlaneTimeouts
+        expr: sum by (instance, op) (increase(vlpds_cluster_store_timeouts_total{job="vlpds"}[5m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: control-plane {{ $labels.op }} calls timed out (5 s deadline) in the last 5 minutes"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscontrolplanetimeouts"
+
+      # The same on two or more nodes at once: a store brownout, which stops
+      # every node once renewals take over 4 s (DESIGN "Renewal RTT ceiling").
+      - alert: VlpdsObjectStoreBrownout
+        expr: count(sum by (instance) (increase(vlpds_cluster_store_timeouts_total{job="vlpds"}[5m])) > 0) >= 2
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $value }} vlpds nodes are timing out object-store control-plane calls: cluster-wide fail-stop risk"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorebrownout"
+
+      # SlateDB's own instrumented store (feature slatedb-metrics, on by
+      # default): every SlateDB request, success or error, by component
+      # (db, reader, gc, compactor). SlateDB retries failures (guess: 1/s).
+      - alert: VlpdsObjectStoreErrors
+        expr: sum by (instance, component) (rate(slatedb_object_store_error_count_total{job="vlpds"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | humanize }} SlateDB object-store errors/s (component={{ $labels.component }})"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstoreerrors"
+
+      # SlateDB request latency (buckets 1 ms .. 10 s). 1 s p99 (guess).
+      - alert: VlpdsObjectStoreLatencyHigh
+        expr: >-
+          histogram_quantile(0.99, sum by (instance, le) (rate(slatedb_object_store_request_duration_seconds_bucket{job="vlpds"}[5m]))) > 1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "SlateDB object-store p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }}"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorelatencyhigh"
+
+      # L0 stalls block SlateDB writes, i.e. segment apply, i.e. acks.
+      - alert: VlpdsSlateDbL0Stalls
+        expr: sum by (instance) (increase(slatedb_db_l0_stall_count_total{job="vlpds"}[10m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: SlateDB writes stalled on too many L0 SSTs (compaction behind)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsslatedbl0stalls"
+
+  # ---------------------------------------------------------------------------
+  # Checkpoints, replay bound, retention
+  # ---------------------------------------------------------------------------
+  - name: vlpds-durability
+    rules:
+      # Every owned shard is checkpointed once per --checkpoint-every (10 s)
+      # while the log moves; none for 10 minutes on a node writing segments
+      # means a successor's replay keeps growing.
+      - alert: VlpdsCheckpointsStalled
+        expr: >-
+          sum by (instance) (rate(vlpds_checkpoint_shard_seconds_count{job="vlpds"}[5m])) == 0
+          and on (instance) sum by (instance) (rate(vlpds_segments_total{job="vlpds"}[5m])) > 0
+          and on (instance) vlpds_owned_partitions{job="vlpds"} > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} writes segments but has checkpointed no shard in 10+ minutes"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscheckpointsstalled"
+
+      # Segments kept only because a crash replay could need them, expressed
+      # as seconds of this node's log. Checkpoints every 10 s plus the 2 min
+      # memory of closed shards put the normal value at a few minutes; 15
+      # minutes (guess) means a successor would replay that much.
+      - alert: VlpdsReplayBacklogHigh
+        expr: >-
+          max by (instance) (vlpds_retention_replay_hold_segments{job="vlpds"})
+            / on (instance) sum by (instance) (rate(vlpds_segments_total{job="vlpds"}[10m])) > 900
+          and on (instance) sum by (instance) (rate(vlpds_segments_total{job="vlpds"}[10m])) > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A takeover of {{ $labels.instance }}'s shards would replay ~{{ $value | humanizeDuration }} of its log"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsreplaybackloghigh"
+
+      # A pass runs every 60 s on every node.
+      - alert: VlpdsRetentionFailing
+        expr: >-
+          sum by (instance) (increase(vlpds_retention_ticks_total{job="vlpds",result="error"}[1h]))
+            > 0.5 * sum by (instance) (increase(vlpds_retention_ticks_total{job="vlpds"}[1h]))
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Most log retention passes on {{ $labels.instance }} failed in the last hour (log storage grows)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsretentionfailing"
+
+      - alert: VlpdsRetentionNotRunning
+        expr: >-
+          sum by (instance) (rate(vlpds_retention_ticks_total{job="vlpds"}[15m])) == 0
+          and on (instance) up{job="vlpds"} == 1
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} has run no log retention pass in 15+ minutes"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsretentionnotrunning"
+
+  # ---------------------------------------------------------------------------
+  # Memory, caches, runtime
+  # ---------------------------------------------------------------------------
+  - name: vlpds-resources
+    rules:
+      - alert: VlpdsMemoryHigh
+        expr: vlpds_process_resident_bytes{job="vlpds"} > on () group_left 0.85 * vlpds:memory_limit_bytes
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} RSS is {{ $value | humanize1024 }}B, over 85% of the memory limit"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsmemoryhigh"
+
+      - alert: VlpdsMemoryCritical
+        expr: vlpds_process_resident_bytes{job="vlpds"} > on () group_left 0.95 * vlpds:memory_limit_bytes
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }} RSS is {{ $value | humanize1024 }}B, over 95% of the memory limit: OOM kill imminent"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsmemorycritical"
+
+      # Share of queued requests whose repo was not cached (a cold load from
+      # SlateDB). 20% sustained (guess) means the repo cache is too small
+      # for the active set or shards keep moving.
+      - alert: VlpdsRepoCacheMissRateHigh
+        expr: >-
+          sum by (instance) (rate(vlpds_repo_cache_lookups_total{job="vlpds",result="miss"}[10m]))
+            / sum by (instance) (rate(vlpds_repo_cache_lookups_total{job="vlpds"}[10m])) > 0.2
+          and on (instance) sum by (instance) (rate(vlpds_repo_cache_lookups_total{job="vlpds"}[10m])) > 10
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of repo lookups on {{ $labels.instance }} are cold loads"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsrepocachemissratehigh"
+
+      - alert: VlpdsRepoLoadErrors
+        expr: sum by (instance) (rate(vlpds_repo_loads_total{job="vlpds",result="error"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: cold repo loads are failing ({{ $value | humanize }}/s)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsrepoloaderrors"
+
+      # A persisted MST node or rebuilt subtree didn't match its link: the
+      # repo was rebuilt from its records instead. Should never happen.
+      - alert: VlpdsLazyMstInvalid
+        expr: sum by (instance) (increase(vlpds_lazy_mst_fallbacks_total{job="vlpds",reason="invalid"}[1h])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} found a persisted MST that didn't match its root and rebuilt it"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdslazymstinvalid"
+
+      # Bounded in-memory caches (session/oauth tokens, proxy accounts and
+      # JWTs, DID docs, lexicons, ...) at their entry cap. A full LRU is not
+      # an error by itself; this is a hint to raise --cache-budget-mb when
+      # it coincides with latency (guess: 98% for 6 h).
+      - alert: VlpdsCacheAtCapacity
+        expr: >-
+          vlpds_cache_entries{job="vlpds"} / vlpds_cache_capacity_entries{job="vlpds"} > 0.98
+          and vlpds_cache_capacity_entries{job="vlpds"} > 0
+        for: 6h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}'s {{ $labels.cache }} cache has been at its entry cap for 6 hours"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscacheatcapacity"
+
+      # Merger queue near its byte budget (256 MiB default); past it, logs
+      # spill to S3 read-back.
+      - alert: VlpdsFirehoseMergeQueueNearBudget
+        expr: vlpds_firehose_merge_queue_bytes{job="vlpds"} > 0.8 * 256 * 1024 * 1024
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}'s firehose merger holds {{ $value | humanize1024 }}B waiting for the min watermark"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsfirehosemergequeuenearbudget"
+
+      # Fraction of wall time the 10 ms ticker could not run (runtime threads
+      # blocked or starved). 5% (guess).
+      - alert: VlpdsRuntimeStalls
+        expr: rate(vlpds_runtime_late_seconds_total{job="vlpds"}[5m]) > 0.05
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}'s tokio runtime is late {{ $value | humanizePercentage }} of the time"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsruntimestalls"
+
+      - alert: VlpdsRuntimeSaturated
+        expr: rate(vlpds_tokio_busy_seconds_total{job="vlpds"}[5m]) / vlpds_tokio_workers{job="vlpds"} > 0.9
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}'s tokio workers are {{ $value | humanizePercentage }} busy"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsruntimesaturated"
