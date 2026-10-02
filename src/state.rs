@@ -15,8 +15,7 @@
 //! C/{coll}\0{did}         -> empty (collection index; slot of the DID)
 //! b/{did}\0{cid}\0{path}  -> empty (blob references)
 //! p/{routing}\0{name}     -> private per-account state (slot of the routing key)
-//! L/{did}                 -> record count u64 (large repos: preloaded on shard open)
-//! M/{did}\0{cid digest}   -> MST node block, height >= 1 (`--lazy-mst`; DESIGN.md "Partial MSTs")
+//! M/{did}\0{cid digest}   -> MST node block, height >= 1 (DESIGN.md "Partial MSTs")
 
 use crate::cid::{Cid, CID_BYTES_LEN};
 use crate::tid::Tid;
@@ -117,17 +116,7 @@ pub fn private_prefix(did: &str) -> Vec<u8> {
     keyed(did, b"p/", &[did.as_bytes(), b"\0"])
 }
 
-/// Large-repo index: one key per repo with at least the pin threshold of
-/// records (written with the commit that crosses it, deleted below half of
-/// it), so a new owner finds the repos to preload with one short scan. A
-/// hint: a stale key only costs a load.
-pub fn large_repo_key(did: &str) -> Vec<u8> {
-    keyed(did, LARGE_REPO_FAMILY, &[did.as_bytes()])
-}
-
-pub const LARGE_REPO_FAMILY: &[u8] = b"L/";
-
-/// A persisted interior MST node of `did`'s current tree (lazy MSTs): the
+/// A persisted interior MST node of `did`'s current tree: the
 /// node block, keyed by its CID's digest (every node is dag-cbor sha-256).
 /// Written and deleted in the commit's state batch, so `M/{did}` holds
 /// exactly the interior nodes of the tree at `h/{did}`'s data root.

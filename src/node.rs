@@ -223,7 +223,7 @@ impl ShardHost for Node {
         }
         crate::metrics::OWNED_PARTITIONS.set(self.table.owned().len() as i64);
         tracing::info!(shards = n, segments_replayed = replayed, opened_ms, replayed_ms, elapsed_ms = started.elapsed().as_millis() as u64, "shards opened");
-        // 4. warm the shards' large and recently written repos (served
+        // 4. warm the shards' recently written repos (served
         //    already; loads in the background)
         crate::worker::spawn_preload(&self.workers, preload);
         results

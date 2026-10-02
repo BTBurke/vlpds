@@ -555,8 +555,8 @@ every 60 s; a pass that hangs on a store call would look like this
 **Means:** RSS over 85% of `vlpds:memory_limit_bytes` for 10 minutes.
 
 **Confirm:** `vlpds_jemalloc_bytes{stat}` (allocated vs resident vs retained),
-`sum by (instance) (vlpds_repo_cache_bytes)` vs `--repo-cache-mb` (16 GiB default;
-pinned large repos don't count toward it), `vlpds_cache_bytes`
+`sum by (instance) (vlpds_repo_cache_bytes)` (loaded MST paths) vs `--repo-cache-mb`
+(4 GiB default), `mst_store` node cache (`--lazy-mst-node-cache-mb`, 256 MiB), `vlpds_cache_bytes`
 (`--cache-budget-mb`, default 10% of RAM/cgroup), SlateDB `--block-cache-mb`
 (4 GiB), `vlpds_firehose_ring_bytes`, `vlpds_log_live_ring_bytes`,
 `vlpds_firehose_merge_queue_bytes`, `slatedb_db_total_mem_size_bytes`.
@@ -574,11 +574,12 @@ replay). Then fix as in [VlpdsMemoryHigh](#vlpdsmemoryhigh).
 ### VlpdsRepoCacheMissRateHigh
 
 **Means:** over 20% of repo lookups for queued requests start a cold load
-(SlateDB scan + MST rebuild/verify) for 30 minutes.
+(head + account reads, `M/` prefetch, MST root and paths) for 30 minutes.
 
 **Confirm:** `vlpds_repo_evictions_total` rate, `vlpds_repo_cache_bytes` near
 `--repo-cache-mb`/workers, `vlpds_cached_repos` near `--cache-per-worker`
-(50,000), ownership churn (each move empties the cache for those shards).
+(50,000), ownership churn (each move empties the cache for those shards),
+`vlpds_lazy_mst_fallbacks_total` (opens rebuilt from all records: slow).
 
 **Do:** raise `--repo-cache-mb` / `--cache-per-worker` if memory allows; stop churn.
 
@@ -591,7 +592,7 @@ errors). Requests for those repos fail.
 
 ### VlpdsLazyMstInvalid
 
-**Means:** a lazily opened repo's persisted MST node (or rebuilt subtree) did not
+**Means:** a repo's persisted MST node (or rebuilt subtree) did not
 match its link; the repo was rebuilt from its records (correct result, slower).
 It indicates inconsistent derived state and should not happen.
 

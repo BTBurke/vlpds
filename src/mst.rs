@@ -1229,7 +1229,9 @@ impl Tree {
     }
 
     /// Where every node of a fully written tree sits (cid -> first key,
-    /// height); an empty root has no key and is left out.
+    /// height); an empty root has no key and is left out. Tests: the
+    /// oracle for [`NodeIndex`] (the server builds it by a streamed walk).
+    #[cfg(test)]
     pub fn node_refs(&self, out: &mut HashMap<Cid, NodeRef>) -> Result<()> {
         fn rec(n: &Node, out: &mut HashMap<Cid, NodeRef>, depth: usize) -> Result<()> {
             if depth > MAX_DEPTH {
@@ -1304,8 +1306,9 @@ impl Tree {
         rec(&self.root, &mut buf, f, 0)
     }
 
-    /// The block of node `cid`, looked up in `index` (which must cover this
-    /// tree's version for a None to be final).
+    /// The block of node `cid` of a fully loaded tree, looked up in `index`
+    /// (which must cover this tree's version for a None to be final). Tests.
+    #[cfg(test)]
     pub fn find_node(&self, cid: &Cid, index: &NodeIndex) -> Result<Option<Vec<u8>>> {
         if self.root.cid == Some(*cid) {
             return Ok(Some(self.root.block()?.into_owned()));
@@ -1317,7 +1320,8 @@ impl Tree {
     }
 
     /// The block of the node at `height` on the path to `key`, if that
-    /// node's CID is `cid` (the tree must be fully written).
+    /// node's CID is `cid` (the tree must be fully written). Tests.
+    #[cfg(test)]
     pub fn node_block(&self, cid: &Cid, key: &[u8], height: i32) -> Result<Option<Vec<u8>>> {
         let mut n: &Node = &self.root;
         loop {
@@ -1385,6 +1389,8 @@ pub struct NodeIndex {
 }
 
 impl NodeIndex {
+    /// The index of a fully loaded tree at `rev` (tests).
+    #[cfg(test)]
     pub fn build(tree: &Tree, rev: u64) -> Result<NodeIndex> {
         let mut map = HashMap::new();
         tree.node_refs(&mut map)?;
@@ -1392,8 +1398,8 @@ impl NodeIndex {
         Ok(NodeIndex { map, from: rev, to: rev, live })
     }
 
-    /// An index of the given nodes at `rev` (a lazy repo's: built from a
-    /// streamed walk of the whole tree).
+    /// An index of the given nodes at `rev` (built from a streamed walk of
+    /// the whole tree from a snapshot).
     pub fn from_refs(map: HashMap<Cid, NodeRef>, rev: u64) -> NodeIndex {
         let live = map.len();
         NodeIndex { map, from: rev, to: rev, live }

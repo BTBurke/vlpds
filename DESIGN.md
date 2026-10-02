@@ -24,7 +24,7 @@ uploading, ack both in order), and **no per-commit MST storage churn**.
 
 ```
  XRPC (axum) ──► RepoRouter ── hash(did) ──► shard workers (N ≈ cores)
-                                               │  per-repo in-memory MST (Arc, copy-on-write)
+                                               │  per-repo MST paths in memory (Arc, copy-on-write)
                                                │  apply ops → new root, diff blocks,
                                                │  sync-1.1 inversion proof, sign commit
                                                ▼
@@ -44,9 +44,9 @@ uploading, ack both in order), and **no per-commit MST storage churn**.
 
 ### 1. Repo shards (CPU path)
 - DID → shard by hash. A shard owns its repos' in-memory state:
-  `RepoState { head: commit cid + rev, mst: Arc<Node>, key: SigningKey }`, LRU-bounded by
-  count (`--cache-per-worker`) and approximate bytes (`--repo-cache-mb`; ~240 B of MST
-  heap per record). Large repos are pinned and preloaded (§2).
+  `RepoState { head: commit cid + rev, mst: LazyTree, key: SigningKey }`, where the
+  MST holds only the paths recent operations visited (§2). LRU-bounded by count
+  (`--cache-per-worker`) and approximate bytes of the loaded paths (`--repo-cache-mb`).
 - Writes to one repo are processed in order. A write does not wait for the
   previous commit to be durable; it builds on the in-memory head. Writes are
   acked in log order, so a client never sees commit N+1 acked before N.
@@ -66,58 +66,73 @@ uploading, ack both in order), and **no per-commit MST storage churn**.
     (duplicate create, failed `swapRecord`) fails alone, not the whole batch;
   - every write in the batch is acked with the shared commit cid/rev.
 
-### 2. MST is derived state, not stored
-> **The default is now lazy MSTs (`--lazy-mst`, "Partial MSTs" below):**
-> interior nodes (height >= 1) are also persisted, under `M/`, in each
-> commit's state batch, and the worker holds only the paths writes visit.
-> This section describes the full-tree mode (`--lazy-mst=false`), which
-> stays for comparison; leaves are still derived from `R/` in both.
-
-The MST is fully determined by the set of `(key, record CID)` pairs. So:
-- Only **records** are persisted (`R/{did}/{collection}/{rkey}` → cid + bytes).
-- On cold load: range-scan the repo's records (contiguous in the LSM, usually 1–2
-  SST blocks), rebuild the MST (~1 ms per 1k records), and **verify the rebuilt root
-  equals `head.data`**. This verification also gives a free integrity check.
-- MST nodes needed by the firehose (diff + proof) are already in the log segment.
-- `getRepo` / `getRecord` proofs / `getBlocks` are served from the in-memory tree
-  (an Arc snapshot gives consistent exports while writes continue). Internal
-  nodes (height >= 1) keep their encoded block after each write, so exports
-  and proofs copy them; leaves (~3/4 of the bytes) re-encode on demand.
-- `getBlocks` finds nodes by CID through a per-repo `NodeIndex` (node CID ->
-  first key in its subtree + height; the node is found by descending to that
-  key and checking the CID). It is built lazily, with one walk, the first time a
-  request asks for a node. After that the repo worker advances it with each
-  commit's written nodes. It covers a rev range, so a miss inside that range
-  is final. A broken commit chain (importRepo) or too many stale entries drops
-  it, and the next request rebuilds it. Nothing is persisted.
-- **Large repos are pinned.** A cold load costs ~1.5 µs of CPU and ~240 B of
-  heap per record (real repos: 594k records, 0.9 s, 130 MB; a 5–10 M-record
-  repo is 1–2 GB and 8–15 s). Repos with at least `--pin-repo-records`
-  (500k) records are never evicted by the LRU (they don't count toward its
-  entry or byte budget; they unpin below half the threshold). Crossing the
-  threshold logs a private-state entry `L/{did}` → record count, so when a
-  shard opens (startup, takeover, handback) its new owner scans `L/` and
-  preloads those repos in the background, 4 at a time per node, before
-  their first write. The key is a hint: a stale one costs a load.
-  Metrics: `vlpds_repo_cache_bytes`, `vlpds_repo_cache_pinned`,
-  `vlpds_repo_load_by_size_seconds{records}`, `vlpds_repo_preloads_total`.
-- **Recently written repos are preloaded too.** Each shard keeps the
+### 2. MST: interior nodes persisted, leaves derived, paths loaded on demand
+The MST is fully determined by the set of `(key, record CID)` pairs, so
+records are the truth and the tree is mostly derived. Details, options
+considered and measurements: "Partial MSTs".
+- **Records** are persisted (`R/{did}\0{collection}/{rkey}` → cid + bytes),
+  and so are the tree's **interior nodes** (height >= 1, ~1/4 of the
+  nodes): `M/{did}\0{cid}` → node block, +28 B/record. They are put and
+  deleted in the commit's own state batch, so `M/{did}` holds exactly the
+  interior nodes of the tree at `h/{did}`'s data root. The puts are derived
+  from the #commit CAR at replay (no log bytes); the deletes (~7 × 33 B)
+  are stored in the segment. **Leaves** are never stored: a leaf is rebuilt
+  from the `R/` range between its parent's separator keys.
+- A repo's worker holds only the **paths** recent operations visited
+  (`mst_lazy::LazyTree`: unvisited subtrees are `Child { node: None, cid }`),
+  ~10–20 KB per written repo whatever its size. A write at key K needs K's
+  search path and its two neighbours' (the spines a delete merges; sync 1.1
+  proofs carry them); everything else stays unloaded. Mutations, CIDs and
+  proofs are `mst::Tree`'s own code on the partial tree, so commits are
+  byte-identical to a fully loaded tree's.
+- **Cold open:** read the repo's `M/` range with one scan (up to
+  `--lazy-mst-prefetch-kb`, 1 MiB: repos up to ~35k records), then the root
+  by `head.data` and the first request's paths: ~1 object-store round trip,
+  or 7–11 dependent node reads for larger repos, at any size (no O(n)
+  rebuild). Before a cached repo's requests run, a no-I/O pass checks their
+  paths are loaded; missing ones are loaded on the blocking pool, so the
+  worker thread never waits on the store.
+- **Verification.** Every loaded node is hash-checked against the link its
+  parent holds (a rebuilt leaf too), and the root is `head.data`. A root or
+  node that is missing or wrong means `M/` is: the open rebuilds the whole
+  tree from `R/`, checks the root against `head.data`, and backfills `M/`
+  through the log (`vlpds_lazy_mst_fallbacks_total{reason}`). importRepo,
+  genesis records and account deletion write or clear the whole node set.
+- **Readers** never touch the worker's tree. A repo's `DurableView` (the
+  partial tree at its latest durable commit) is paired with a SlateDB
+  snapshot taken under the apply lock, so `M/` and `R/` there are that
+  version: getRecord proofs walk the snapshot; getRepo streams the tree
+  from it (`M/` read ahead, leaves rebuilt from the same forward `R/` scan
+  that yields the records, one path in memory); getBlocks answers loaded
+  nodes, `M/` point reads, record CIDs (the `c/` index) and, last, leaves
+  through a per-repo `NodeIndex` (leaf CID → its first key + height, built
+  by one streamed walk the first time a request asks for a leaf, then
+  advanced by the worker with each commit's written nodes; it covers a rev
+  range, so a miss inside it is final). Loaded nodes are kept process-wide
+  by CID (`--lazy-mst-node-cache-mb`): content-addressed, so valid in any
+  version that links them.
+- **Path cache.** A cached repo is charged ~2 KB plus the heap of its
+  loaded nodes (`vlpds_repo_cache_bytes`); `--repo-cache-mb` bounds that
+  per node. Over budget, the least recently used idle repos (nothing in
+  flight, so every loaded node is in `M/`/`R/`) drop back to their root,
+  then the least recently used repos are evicted. A repo charged over
+  1 MiB (an import, a rebuild, a repo written without pause) drops all but
+  the nodes its in-flight commits wrote right away.
+- **Recently written repos are preloaded.** Each shard keeps the
   repos it committed to most recently (`--preload-recent`, 2,048 per
   shard; `partition::RecentRepos`, touched once per commit batch) and
   writes the list, newest first, as `meta/recent` with its checkpoints and
   at close, only when its members changed. The shard's next owner (a
   restart, takeover or handback) reads it right after the open, seeds its
-  own set with it, and loads those repos in the background, 32 at a time
-  per node, interleaved across shards, beside the large-repo preloads; the
-  index reads of all newly opened shards run at once, so they don't queue
+  own set with it, and opens those repos in the background (root and `M/`
+  prefetch), 32 at a time per node, interleaved across shards; the reads
+  of all newly opened shards' sets run at once, so they don't queue
   behind the request-driven loads they are meant to spare. Bulk creation
-  doesn't touch the set. Metric: `vlpds_repo_preloads_total{kind}`.
-- Escape hatch if even preloads are too slow (≥10M records): periodically
-  write an MST snapshot object so a cold load doesn't need an O(n) rebuild.
-  Not needed for v1.
+  doesn't touch the set. Metric: `vlpds_repo_preloads_total{result}`.
 
-Persisted state per commit drops from ~15 KV operations to about 2: the record and
-the repo head.
+Persisted state per commit: the records, the repo head and the commit's
+interior nodes (~3.3–3.5 KB into SlateDB per commit, ~7 node puts and ~7
+deletes), all in one state batch.
 
 ### 3. Log = WAL = firehose
 > **Superseded by the HA section below:** the log is per *node*, with up to K
@@ -1161,12 +1176,12 @@ one node, the survivors stay under ~60% CPU, i.e.
   today's load** (~7 busy cores = 2 survivors × 6 cores × 60%).
 - **At 10× (~25 busy cores): 3 × 24 cores / 128 GB, or ~8 Advance-1**
   (7 survivors × 6 cores × 60% ≈ 25).
-- **Memory.** 32 GB requires partial MSTs ("Partial MSTs") and a
-  `--repo-cache-mb` well below its 16 GB default (the block cache adds
-  4 GB + a quarter for metadata by default). Full trees at ~240 B/record
-  don't fit: one hour of real writers is ~850 GB of trees. With partial
-  MSTs, a day's writers' paths are ~5 GB per node today and ~50–75 GB at
-  10× on 3 nodes (hence 128 GB). The persisted interior nodes (`M/`,
+- **Memory.** 32 GB works because of partial MSTs ("Partial MSTs"): full
+  trees at ~240 B/record wouldn't fit (one hour of real writers is ~850 GB
+  of trees). A day's writers' paths are ~5 GB per node today and ~50–75 GB
+  at 10× on 3 nodes (hence 128 GB); `--repo-cache-mb` (4 GiB by default)
+  bounds them, and an evicted path costs a few `M/` reads to load again
+  (the block cache adds 4 GB + a quarter for metadata by default). The persisted interior nodes (`M/`,
   +28 B/record) are ~220 GB per node's share at 3 nodes; they live in the
   object store, and the NVMe disk cache holds the hot part.
 - **Network.** Proxying is ~0.27 Gbit/s per node each direction today, and
@@ -1210,8 +1225,8 @@ fan-out nodes: not planned" for when that would change.
 Fixed slots with a shard map, the per-node log, node leases and
 assignments are done ("HA"). Still open:
 - Signing keys KMS-wrapped (§4; plaintext today).
-- ~~Partial MSTs wired in (required by 32 GB nodes).~~ Done: `--lazy-mst`,
-  on by default ("Partial MSTs", "As built").
+- ~~Partial MSTs wired in (required by 32 GB nodes).~~ Done, and the only
+  mode ("Partial MSTs", "As built").
 - Backups ("Backups and restore").
 
 ## Read replicas and fan-out nodes: not planned
@@ -1228,10 +1243,13 @@ serves ~25 full subscribers at 20x and ~5 at 100x). Before adding either,
 prefer a DID-aware load balancer (removes the extra proxy hop) and more full
 nodes.
 
-## Partial MSTs (`--lazy-mst`, on by default)
+## Partial MSTs
 
-**Problem.** Section 2 keeps the whole tree of every cached repo in memory and
-rebuilds it from `R/` on a cold load. Real writers in one hour (~188k repos)
+The design record of §2's MST (built; the full-tree mode it replaced, and
+compares against below, is removed).
+
+**Problem.** The first design kept the whole tree of every cached repo in
+memory and rebuilt it from `R/` on a cold load (records only stored). Real writers in one hour (~188k repos)
 have median 7.3k, mean 19.4k and p99 169k records. At ~215–250 B/record that
 is ~850 GB of trees for one hour of writers, while a 256 GB node caches only
 ~35k average active repos. A write to a cold repo costs O(n): it scans
@@ -1430,11 +1448,15 @@ derived, and every loaded node is verified against its parent's link.
 5. Only if the write volume matters at the 100x target: checkpoint-window
    write-back with an `m/{did}` marker.
 
-### As built (`--lazy-mst`, default on since Oct 2026)
-`--lazy-mst=false` keeps the full-tree mode (section 2) for comparison. The
-suite runs in each mode: `VLPDS_LAZY_MST=0|1|2` (2 = lazy with every idle
-repo's paths dropped after each worker pass, so every operation walks from
-the root through the store).
+### As built (Oct 2026; the only mode)
+The full-tree mode (`--lazy-mst=false`, whole trees rebuilt from `R/` on
+every cold load, large repos pinned and preloaded from an `L/` index) was
+kept for comparison while this was measured, then removed. Tests check the
+node against an independent reference instead: a full `mst::Tree` built
+in-test from the same acknowledged writes (`tests/all/mst_lazy.rs`). The
+suite also runs with `VLPDS_LAZY_MST_UNLOAD_IDLE=1` (every idle repo's
+paths dropped after each worker pass, so every operation walks from the
+root through the store).
 
 - **Stage 1: `M/` write-through.** `state::mst_node_key` =
   `0x01 ‖ slot ‖ M/{did}\0{cid digest}` (slot-prefixed, so splits and merges
@@ -1443,12 +1465,11 @@ the root through the store).
   through the links the CAR carries, so proof-only neighbours are re-put,
   idempotently); they are *derived* muts: replay rebuilds them from the
   #commit frame (`segment::derive_commit_muts_n`: an entry deriving more
-  muts than the base set derives the node puts too, so the mode is a
-  property of the entry, not of the replaying node). The deletes (the
+  muts than the base set derives the node puts too). The deletes (the
   replaced nodes, from `LazyTree::write_diff_blocks`) are stored muts.
   Repo creation with genesis records, `importRepo` (`ReplaceRepo`) and
   account deletion write or clear the whole set. A repo whose `M/` is
-  missing or wrong (a store from the full-tree mode, a bug) is rebuilt from
+  missing or wrong (a bug, a lost key range) is rebuilt from
   `R/` on open and backfilled through the log
   (`vlpds_lazy_mst_fallbacks_total{reason}`).
 - **Stage 2: lazy worker.** `RepoState::mst` is a `LazyTree`. A cold open
@@ -1472,13 +1493,14 @@ the root through the store).
   the `M/` range read ahead, leaves rebuilt from one forward `R/` scan, one
   path in memory). getBlocks: loaded nodes, `M/` point reads (interior),
   record CIDs as before, then leaves via the repo's `NodeIndex` (built once
-  by a streamed walk, advanced by the worker per commit, as in the full
-  mode; a miss in an index covering the view is final), each found by a
+  by a streamed walk, advanced by the worker per commit; a miss in an
+  index covering the view is final), each found by a
   proof walk to its key. Loaded nodes are kept process-wide by CID
   (`mst_store::NODE_CACHE`, `--lazy-mst-node-cache-mb`, 256 MiB): nodes are
   content-addressed, so an entry is valid in any version that links it.
-- **Stage 4: path cache.** A lazy repo is charged `REPO_BASE + heap of its
-  loaded nodes`; `--repo-cache-mb` bounds that per worker. Over budget, the
+- **Stage 4: path cache.** A repo is charged `REPO_BASE + heap of its
+  loaded nodes`; `--repo-cache-mb` (4 GiB per node by default, was 16 GiB
+  of whole trees) bounds that, split per worker. Over budget, the
   least recently used idle repos (nothing in flight: every loaded node is
   then in `M/`/`R/`) drop back to their root, and their view is
   republished unloaded. A repo over 1 MiB (an import, a rebuild, a repo
@@ -1486,9 +1508,9 @@ the root through the store).
   commits wrote (`RepoState::inflight`; their state isn't applied yet, and
   every node above a changed one changed too), all of it once idle; so a
   repo that is never idle stays bounded (tested: ~1 MiB peak under 32
-  concurrent writers over 12k records). Pinning and `L/` preloads are off in lazy
-  mode (kept for the full-tree mode); recent-repo preloads remain (now an
-  `M/` prefetch).
+  concurrent writers over 12k records). Pinning, `L/` preloads and the
+  per-repo record counts are gone with the full-tree mode; recent-repo
+  preloads remain (now an `M/` prefetch).
 - **Stage 5: not needed.** See the measurements: at 10× today's load (3.3k
   commits/s, 9k bursts) the extra state writes are ~11 MB/s cluster-wide
   (~30 MB/s in bursts) into memtables, far from a SlateDB limit, so the
@@ -1496,7 +1518,8 @@ the root through the store).
 
 ### Measured, lazy vs full trees (Oct 2026, M4 Pro, dev-release, in-process)
 `tests/all/mst_lazy.rs` `bench_*` and `worker::tests::bench_commit_cpu`
-(commands in their doc comments).
+(commands in their doc comments; they measure the lazy side only now that
+the full-tree mode is removed).
 
 | | full trees | lazy |
 |---|---|---|

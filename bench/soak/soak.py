@@ -1080,7 +1080,7 @@ GAUGE_KEEP = ("vlpds_process_resident_bytes", "vlpds_process_threads", "vlpds_to
               "vlpds_shard_layout_version", "vlpds_cache_bytes", "vlpds_cache_entries", "vlpds_repo_cache_bytes",
               "vlpds_cached_repos", "vlpds_jemalloc_bytes", "vlpds_retention_replay_hold_segments",
               "vlpds_firehose_merge_queue_bytes", "vlpds_log_live_ring_bytes", "vlpds_firehose_ring_bytes",
-              "vlpds_http_server_connections_open", "vlpds_repo_cache_pinned")
+              "vlpds_http_server_connections_open")
 
 
 def pct(xs, p):

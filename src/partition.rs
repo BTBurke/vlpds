@@ -1006,7 +1006,7 @@ mod clone_tests {
         assert_eq!(scan(b"a/", Some(k(7, "a/d7\0"))).await, vec!["a/d9", "a/d65535"]);
         assert_eq!(scan(b"p/", Some(k(9, "a/"))).await, vec!["p/d9", "p/d65535"]);
         assert_eq!(scan(b"C/x\0", None).await.len(), 4);
-        assert!(scan(b"L/", None).await.is_empty());
+        assert!(scan(b"M/", None).await.is_empty());
         db.close().await.unwrap();
     }
 }

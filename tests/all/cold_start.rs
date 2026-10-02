@@ -135,8 +135,8 @@ async fn writes_survive_a_handback() {
 }
 
 /// A shard's recently written repos survive a restart: the node that opens
-/// it next loads them before any request asks (the large-repo preload's
-/// path, from the set persisted with the checkpoint).
+/// it next loads them before any request asks (from the set persisted with
+/// the checkpoint).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recent_repos_preloaded_after_restart() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
@@ -156,8 +156,7 @@ async fn recent_repos_preloaded_after_restart() {
         let info = eventually(Duration::from_secs(10), || async { cache_info(&b, &did).await })
             .await
             .unwrap_or_else(|| panic!("repo {i} not preloaded"));
-        // a lazy repo doesn't count its records (its tree isn't loaded)
-        assert!(!info.large && (info.records == 2 || vlpds::server::default_lazy_mst()), "{info:?}");
+        assert!(info.loaded_nodes >= 1, "{info:?}");
     }
     for i in 10..30 {
         assert!(cache_info(&b, &bulk_did(i)).await.is_none(), "only written repos are preloaded");
@@ -349,7 +348,7 @@ async fn restart_window(label: &str, tuned: bool) {
     eprintln!(
         "[{label}] writes that found their repo cold: {}; recent repos preloaded: {}",
         vlpds::metrics::REPO_CACHE.with_label_values(&["miss"]).get() - misses0,
-        vlpds::metrics::REPO_PRELOADS.with_label_values(&["recent", "loaded"]).get()
+        vlpds::metrics::REPO_PRELOADS.with_label_values(&["loaded"]).get()
     );
     for l in vlpds::metrics::render().lines().filter(|l| l.starts_with("vlpds_repo_preloads_total")) {
         eprintln!("[{label}] {l}");

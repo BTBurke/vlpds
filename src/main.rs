@@ -102,30 +102,21 @@ struct Args {
     /// Cached repos per worker.
     #[arg(long, default_value_t = 50_000)]
     cache_per_worker: usize,
-    /// Approximate heap budget for cached repos on this node (MiB; in-memory
-    /// MSTs at ~240 B per record). Least recently used repos are evicted past
-    /// it or past --cache-per-worker; pinned repos don't count. 0 = no byte bound.
-    #[arg(long, env = "VLPDS_REPO_CACHE_MB", default_value_t = 16384)]
+    /// Approximate heap budget for cached repos on this node (MiB): their
+    /// loaded MST paths (DESIGN.md "Partial MSTs": ~10-20 KB per written
+    /// repo, ~3 KB once back to its root). Past it, idle repos drop back to
+    /// their root, then the least recently used are evicted (as past
+    /// --cache-per-worker). 0 = no byte bound.
+    #[arg(long, env = "VLPDS_REPO_CACHE_MB", default_value_t = 4096)]
     repo_cache_mb: usize,
-    /// Repos with at least this many records are pinned in the repo cache
-    /// and preloaded when their shard opens (a takeover or handback), so a
-    /// first write doesn't wait out a multi-second cold load. 0 = off.
-    #[arg(long, env = "VLPDS_PIN_REPO_RECORDS", default_value_t = vlpds::worker::DEFAULT_PIN_RECORDS)]
-    pin_repo_records: u64,
-    /// Lazy MSTs (DESIGN.md "Partial MSTs"): keep only the MST paths writes
-    /// visit (~10-20 KB per repo instead of ~240 B/record), persist interior
-    /// nodes under M/ in each commit's state batch, and open a cold repo with
-    /// one M/ read instead of a scan of all its records. --repo-cache-mb then
-    /// bounds the loaded paths; --pin-repo-records doesn't apply.
-    #[arg(long, env = "VLPDS_LAZY_MST", default_value_t = vlpds::server::DEFAULT_LAZY_MST, action = clap::ArgAction::Set)]
-    lazy_mst: bool,
-    /// Lazy cold open: read up to this much of the repo's M/ range with one
-    /// scan (KiB; the average active repo's is ~0.5 MB), so a disk-cache miss
-    /// is ~1 object-store round trip instead of 7-11 dependent ones.
+    /// Cold open: read up to this much of the repo's M/ range (its persisted
+    /// interior MST nodes) with one scan (KiB; the average active repo's is
+    /// ~0.5 MB), so a disk-cache miss is ~1 object-store round trip instead
+    /// of 7-11 dependent ones.
     #[arg(long, env = "VLPDS_LAZY_MST_PREFETCH_KB", default_value_t = (vlpds::worker::DEFAULT_PREFETCH_BYTES >> 10) as u64)]
     lazy_mst_prefetch_kb: u64,
-    /// Lazy MSTs: MiB of loaded MST nodes kept for readers (getRecord proofs,
-    /// getBlocks) and path fetches, process-wide, by CID.
+    /// MiB of loaded MST nodes kept for readers (getRecord proofs, getBlocks)
+    /// and path fetches, process-wide, by CID.
     #[arg(long, env = "VLPDS_LAZY_MST_NODE_CACHE_MB", default_value_t = (vlpds::mst_store::DEFAULT_NODE_CACHE_BYTES >> 20) as u64)]
     lazy_mst_node_cache_mb: u64,
     /// Segment size cap (MiB; fractions allow small segments in HA tests, so
@@ -539,8 +530,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         workers: args.workers.unwrap_or_else(default_workers).max(1),
         cache_per_worker: args.cache_per_worker,
         repo_cache_bytes: args.repo_cache_mb << 20,
-        pin_repo_records: args.pin_repo_records,
-        lazy_mst: args.lazy_mst,
+
         lazy_mst_prefetch_bytes: (args.lazy_mst_prefetch_kb << 10) as usize,
         lazy_mst_unload_idle: false,
         lazy_mst_node_cache_bytes: (args.lazy_mst_node_cache_mb << 20) as usize,

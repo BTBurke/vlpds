@@ -210,7 +210,7 @@ ts("Cold loads by result, evictions", [rate("vlpds_repo_loads_total", by="result
    desc="stale = a load finished after its shard moved (dropped, reloaded)")
 ts("Cold load latency", quantiles("vlpds_repo_load_seconds", qs=(0.5, 0.99, 0.999)), "s")
 ts("Cached repos", [t(f"sum(vlpds_cached_repos{{{I}}})", "cached")], "short")
-ts("Records per cold-loaded repo", quantiles("vlpds_repo_load_records", qs=(0.5, 0.99)), "short")
+ts("M/ bytes prefetched per cold open", quantiles("vlpds_lazy_mst_prefetch_bytes", qs=(0.5, 0.99)), "bytes")
 
 # ---------------------------------------------------------------- HTTP
 row("HTTP server")

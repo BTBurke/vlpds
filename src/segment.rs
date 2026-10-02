@@ -413,11 +413,9 @@ pub fn derive_commit_muts(frame: &[u8]) -> anyhow::Result<Vec<Mutation>> {
 }
 
 /// The `n` muts an entry derives from its #commit frame: those of
-/// [`derive_commit_muts`], followed (when `n` is larger: a commit of a lazy
-/// MST node) by the `M/` puts of the commit's interior MST nodes
-/// (`mst_lazy::persisted_blocks`, in CAR order). So whether a commit
-/// persisted its nodes is a property of the entry, not of the node
-/// replaying it.
+/// [`derive_commit_muts`], followed (when `n` is larger: the commit wrote
+/// interior MST nodes) by the `M/` puts of the commit's interior MST nodes
+/// (`mst_lazy::persisted_blocks`, in CAR order).
 pub fn derive_commit_muts_n(frame: &[u8], n: usize) -> anyhow::Result<Vec<Mutation>> {
     let muts = derive(frame, Some(n))?;
     anyhow::ensure!(muts.len() == n, "{} muts derived from the #commit frame, {n} expected", muts.len());

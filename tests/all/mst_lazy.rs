@@ -13,12 +13,13 @@
 //! `cargo test --profile dev-release --test all mst_lazy::bench -- --ignored --nocapture`
 //! (`VLPDS_LAZY_SIZES=10000,100000,1000000`).
 //!
-//! Through the server (`--lazy-mst`): a lazy node and a full-tree node fed
-//! the same writes agree on every commit, proof, export, getBlocks answer
-//! and collection index; `M/` is exactly the interior node set after
-//! writes, kill -9 + replay, reshards and fallbacks; a hot repo's loaded
-//! paths stay bounded. Server benchmarks: `bench_cold_write`,
-//! `bench_readers`, `bench_rss` (ignored; DESIGN.md "Partial MSTs").
+//! Through the server: a node holding almost nothing in memory agrees with
+//! an independent reference (a full `mst::Tree` fed the same acknowledged
+//! writes) on every commit, proof, export, getBlocks answer and collection
+//! index; `M/` is exactly the interior node set after writes, kill -9 +
+//! replay, reshards and fallbacks; a hot repo's loaded paths stay bounded.
+//! Server benchmarks: `bench_cold_write`, `bench_readers`, `bench_rss`
+//! (ignored; DESIGN.md "Partial MSTs").
 
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use std::collections::{BTreeMap, HashMap};
@@ -560,25 +561,19 @@ fn bench() {
 }
 
 // ---------------------------------------------------------------------------
-// end to end: lazy nodes (`--lazy-mst`) vs full-tree nodes
+// end to end: a node against an independent reference
 // ---------------------------------------------------------------------------
 
 use crate::common::*;
 
-/// A node in a given MST mode. Lazy nodes hold almost nothing: one repo per
-/// worker at most and no loaded paths once a repo is idle, so writes and
-/// reads keep opening repos and walking from the root through the store.
-async fn mode_node(lazy: bool, prefetch: usize, store: Option<Arc<dyn object_store::ObjectStore>>) -> TestServer {
+/// A node holding almost nothing: one repo per worker at most and no loaded
+/// paths once a repo is idle, so writes and reads keep opening repos and
+/// walking from the root through the store.
+async fn lazy_node(prefetch: usize) -> TestServer {
     TestServer::spawn_with(move |c| {
-        c.lazy_mst = lazy;
-        if lazy {
-            c.lazy_mst_unload_idle = true;
-            c.lazy_mst_prefetch_bytes = prefetch;
-            c.cache_per_worker = 1;
-        }
-        if let Some(s) = store {
-            c.memory_store = Some(s);
-        }
+        c.lazy_mst_unload_idle = true;
+        c.lazy_mst_prefetch_bytes = prefetch;
+        c.cache_per_worker = 1;
     })
     .await
 }
@@ -591,17 +586,234 @@ fn commit_blocks(f: &Frame) -> Vec<(Cid, Vec<u8>)> {
     blocks.into_iter().filter(|(c, _)| *c != roots[0]).map(|(c, b)| (c, b.to_vec())).collect()
 }
 
-/// Everything of a #commit that doesn't depend on the node's key, DID and
-/// clock: ops, prevData, the new data root and the CAR's other blocks (MST
-/// nodes with sync 1.1 proofs, records), in order.
-fn commit_shape(f: &Frame) -> (J, Option<Cid>, Cid, Vec<(Cid, Vec<u8>)>) {
-    let c = f.commit().unwrap();
-    let ops = json!(c.ops.iter().map(|o| format!("{o:?}")).collect::<Vec<_>>());
-    let data = match Value::decode(&c.blocks[&c.commit]).unwrap().get("data") {
-        Some(Value::Link(d)) => *d,
-        _ => panic!("commit without data"),
-    };
-    (ops, c.prev_data, data, commit_blocks(f))
+/// One write of a step, as the repo worker applies it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Kind {
+    Create,
+    /// applyWrites#update: the record must exist.
+    Update,
+    /// putRecord (upsert).
+    Put,
+    Delete,
+}
+
+/// A #commit as the reference expects it: ops (action, path, cid, prev) in
+/// path order, prevData, the new data root, and the commit's MST blocks
+/// (sync 1.1 proofs, neighbours included) in CAR order.
+#[derive(Debug, PartialEq)]
+struct ExpCommit {
+    ops: Vec<(String, String, Option<Cid>, Option<Cid>)>,
+    prev_data: Cid,
+    data: Cid,
+    mst: Vec<(Cid, Vec<u8>)>,
+}
+
+/// An independent reference for one repo: a fully loaded `mst::Tree`, fed
+/// the writes the server acknowledged in the repo worker's order (request
+/// order, one commit per write request) with the record CIDs it answered.
+/// Its commits, proofs and blocks are what the full tree produces; a node
+/// (partial trees loaded from `M/` and `R/`) must match them byte for byte.
+struct RefRepo {
+    tree: Tree,
+    /// Commits expected and not checked yet, in order.
+    commits: Vec<ExpCommit>,
+}
+
+impl RefRepo {
+    fn new() -> RefRepo {
+        RefRepo { tree: Tree::new(), commits: Vec::new() }
+    }
+
+    /// The step's writes, (kind, path) in request order.
+    fn writes(step: &Step) -> Vec<(Kind, String)> {
+        match step {
+            Step::Create(_, c, r, _) => vec![(Kind::Create, format!("{c}/{r}"))],
+            Step::Put(_, c, r, _) => vec![(Kind::Put, format!("{c}/{r}"))],
+            Step::Delete(_, c, r) => vec![(Kind::Delete, format!("{c}/{r}"))],
+            Step::Batch(_, ws) => ws
+                .iter()
+                .map(|w| {
+                    let kind = match w["$type"].as_str().unwrap() {
+                        "com.atproto.repo.applyWrites#create" => Kind::Create,
+                        "com.atproto.repo.applyWrites#update" => Kind::Update,
+                        _ => Kind::Delete,
+                    };
+                    (kind, format!("{}/{}", w["collection"].as_str().unwrap(), w["rkey"].as_str().unwrap()))
+                })
+                .collect(),
+        }
+    }
+
+    /// Checks the server's answer to `step` against the reference and applies
+    /// it: rejected exactly when the reference says so (a create of an
+    /// existing record, an update of a missing one), a commit exactly when
+    /// one is due (deleteRecord of a missing record makes none).
+    fn apply(&mut self, step: &Step, r: &Resp) {
+        let writes = Self::writes(step);
+        let mut overlay: HashMap<&str, bool> = HashMap::new();
+        let mut ok = true;
+        for (kind, path) in &writes {
+            let cur = overlay.get(path.as_str()).copied().unwrap_or_else(|| self.tree.get(path.as_bytes()).unwrap().is_some());
+            ok &= match kind {
+                Kind::Create => !cur,
+                Kind::Update => cur,
+                Kind::Put | Kind::Delete => true,
+            };
+            overlay.insert(path, *kind != Kind::Delete);
+        }
+        if !ok {
+            assert_ne!(r.status, 200, "{step:?} should fail: {}", r.text());
+            return;
+        }
+        assert_eq!(r.status, 200, "{step:?}: {}", r.text());
+        let lone_delete = matches!(step, Step::Delete(..));
+        if lone_delete && self.tree.get(writes[0].1.as_bytes()).unwrap().is_none() {
+            assert!(r.json.get("commit").is_none(), "{step:?}: a missing record's delete commits nothing");
+            return;
+        }
+        assert!(r.json.get("commit").is_some(), "{step:?}: no commit: {}", r.text());
+        let cid_of = |i: usize| -> Cid {
+            let v = match step {
+                Step::Batch(..) => &r.json["results"][i]["cid"],
+                _ => &r.json["cid"],
+            };
+            Cid::parse(v.as_str().unwrap_or_else(|| panic!("{step:?}: no cid in {}", r.text()))).unwrap()
+        };
+        let prev_data = self.tree.root_cid().unwrap();
+        let mut net: BTreeMap<String, (Option<Cid>, Option<Cid>)> = BTreeMap::new();
+        for (i, (kind, path)) in writes.iter().enumerate() {
+            let (prev, new) = match kind {
+                Kind::Delete => (self.tree.remove(path.as_bytes()).unwrap(), None),
+                _ => {
+                    let c = cid_of(i);
+                    (self.tree.insert(path.as_bytes(), c).unwrap(), Some(c))
+                }
+            };
+            net.entry(path.clone()).or_insert((prev, None)).1 = new;
+        }
+        let ops = net
+            .into_iter()
+            .filter(|(_, (prev, new))| prev != new)
+            .map(|(path, (prev, new))| {
+                let action = match (prev, new) {
+                    (None, Some(_)) => "create",
+                    (Some(_), Some(_)) => "update",
+                    _ => "delete",
+                };
+                (action.to_string(), path, new, prev)
+            })
+            .collect();
+        let mut mst = Vec::new();
+        let data = self.tree.write_diff_blocks(&mut mst).unwrap();
+        // a commit that changes nothing still carries the root node
+        if !mst.iter().any(|(c, _)| *c == data) {
+            mst.push(self.tree.root_block().unwrap());
+        }
+        self.commits.push(ExpCommit { ops, prev_data, data, mst });
+    }
+
+    /// Checks a #commit frame against the next expected commit: ops,
+    /// prevData, data, the MST blocks byte for byte and in order, then
+    /// exactly the new records (each block hashing to its CID).
+    fn check_commit(what: &str, exp: &ExpCommit, f: &Frame) {
+        let c = f.commit().unwrap();
+        let ops: Vec<(String, String, Option<Cid>, Option<Cid>)> = c.ops.iter().map(|o| (o.action.clone(), o.path.clone(), o.cid, o.prev)).collect();
+        assert_eq!(ops, exp.ops, "{what}: ops");
+        assert_eq!(c.prev_data, Some(exp.prev_data), "{what}: prevData");
+        let data = match Value::decode(&c.blocks[&c.commit]).unwrap().get("data") {
+            Some(Value::Link(d)) => *d,
+            _ => panic!("{what}: commit without data"),
+        };
+        assert_eq!(data, exp.data, "{what}: data");
+        let blocks = commit_blocks(f);
+        assert!(blocks.len() >= exp.mst.len() && blocks[..exp.mst.len()] == exp.mst[..], "{what}: MST blocks differ:\n got {:?}\n want {:?}", blocks.iter().map(|b| b.0).collect::<Vec<_>>(), exp.mst.iter().map(|b| b.0).collect::<Vec<_>>());
+        let mut want: Vec<Cid> = Vec::new();
+        for (_, _, new, _) in &exp.ops {
+            if let Some(n) = new.filter(|n| !want.contains(n)) {
+                want.push(n);
+            }
+        }
+        let recs = &blocks[exp.mst.len()..];
+        assert_eq!(recs.iter().map(|b| b.0).collect::<Vec<_>>(), want, "{what}: record blocks");
+        for (cid, b) in recs {
+            assert_eq!(Cid::dag_cbor(b), *cid);
+        }
+    }
+
+    /// The repo as `s` serves it agrees with the reference: getRepo (every
+    /// MST node byte for byte in order, then the records in key order),
+    /// getRecord proofs of present and absent keys, getBlocks of every node
+    /// and some records, describeRepo's collections and checkAccountStatus.
+    async fn check_repo(&self, s: &TestServer, a: &TestAccount) {
+        let did = &a.did;
+        let get = |nsid: &'static str, q: Vec<(&'static str, String)>| {
+            let x = s.xrpc.clone();
+            async move { x.get_multi(nsid, &q, &Auth::None).await }
+        };
+        let mut nodes = Vec::new();
+        self.tree.walk_blocks(&mut |c, b| nodes.push((c, b.to_vec()))).unwrap();
+        let mut recs: Vec<(Vec<u8>, Cid)> = Vec::new();
+        self.tree.walk(&mut |k, c| recs.push((k.to_vec(), c)));
+        // getRepo
+        let r = get("com.atproto.sync.getRepo", vec![("did", did.clone())]).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let tail = car_tail(&r.body);
+        assert!(tail.len() >= nodes.len() && tail[..nodes.len()] == nodes[..], "{did}: getRepo MST blocks differ ({} vs {} nodes)", tail.len(), nodes.len());
+        let got: Vec<Cid> = tail[nodes.len()..].iter().map(|b| b.0).collect();
+        assert_eq!(got, recs.iter().map(|r| r.1).collect::<Vec<_>>(), "{did}: getRepo records");
+        let record_bytes: HashMap<Cid, Vec<u8>> = tail[nodes.len()..].iter().cloned().collect();
+        for (c, b) in &record_bytes {
+            assert_eq!(Cid::dag_cbor(b), *c);
+        }
+        // getRecord proofs, present and absent keys
+        let mut keys: Vec<(String, String)> = Vec::new();
+        for c in ["com.example.feed.post", "com.example.feed.like", "com.example.thing", "com.example.rare", "com.example.none"] {
+            for k in 0..40 {
+                keys.push((c.into(), format!("k{k}")));
+            }
+        }
+        for (c, r) in keys.iter().step_by(3) {
+            let path = format!("{c}/{r}");
+            let p = get("com.atproto.sync.getRecord", vec![("did", did.clone()), ("collection", c.clone()), ("rkey", r.clone())]).await;
+            let mut want = self.tree.proof_blocks(path.as_bytes()).unwrap();
+            match self.tree.get(path.as_bytes()).unwrap() {
+                Some(rc) => {
+                    assert_eq!(p.status, 200, "{path}: {}", p.text());
+                    want.push((rc, record_bytes[&rc].clone()));
+                }
+                None => assert!(p.status == 200 || p.status == 400, "{path}: {}", p.text()),
+            }
+            if p.status == 200 {
+                assert!(car_tail(&p.body) == want, "{did}: getRecord {path} differs");
+            }
+        }
+        // getBlocks of every MST node (the empty tree's root aside) and a few records
+        let mut want: Vec<(&'static str, String)> = vec![("did", did.clone())];
+        let asked: Vec<Cid> = nodes.iter().map(|n| n.0).chain(recs.iter().take(5).map(|r| r.1)).collect();
+        want.extend(asked.iter().map(|c| ("cids", c.to_string())));
+        let g = get("com.atproto.sync.getBlocks", want).await;
+        assert_eq!(g.status, 200, "{}", g.text());
+        let (_, blocks) = vlpds::car::read_car(&g.body).unwrap();
+        let got: HashMap<Cid, Vec<u8>> = blocks.into_iter().map(|(c, b)| (c, b.to_vec())).collect();
+        let expected: HashMap<Cid, Vec<u8>> = nodes.iter().cloned().chain(recs.iter().take(5).map(|r| (r.1, record_bytes[&r.1].clone()))).collect();
+        assert!(got == expected, "{did}: getBlocks differs ({} blocks vs {})", got.len(), expected.len());
+        // collection index
+        let mut colls: Vec<String> = recs.iter().map(|(k, _)| String::from_utf8(k.clone()).unwrap().split_once('/').unwrap().0.to_string()).collect();
+        colls.dedup();
+        let mut listed: Vec<String> = get("com.atproto.repo.describeRepo", vec![("repo", did.clone())]).await.ok()["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect();
+        listed.sort();
+        assert_eq!(listed, colls, "{did}: describeRepo collections");
+        // migration counts: the commit, the nodes (not an empty root), the distinct records
+        let m = s.xrpc.get("com.atproto.server.checkAccountStatus", &[], &a.auth()).await.ok();
+        let non_empty = nodes.iter().filter(|(c, b)| !vlpds::mst::decode_node(b, *c).unwrap().entries.is_empty()).count();
+        let distinct: std::collections::HashSet<Cid> = recs.iter().map(|r| r.1).collect();
+        assert_eq!(m["repoBlocks"], json!(1 + non_empty + distinct.len()), "{did}: checkAccountStatus");
+    }
 }
 
 /// CAR blocks after the first (the commit), in order.
@@ -705,33 +917,50 @@ fn thing(coll: &str, n: i64) -> J {
     json!({"$type": coll, "n": n, "createdAt": "2026-10-01T00:00:00.000Z"})
 }
 
+/// The XRPC call of a step.
+fn step_request(accts: &[TestAccount], step: &Step) -> (&'static str, J) {
+    match step {
+        Step::Create(a, c, r, n) => ("com.atproto.repo.createRecord", json!({"repo": accts[*a].did, "collection": c, "rkey": r, "record": thing(c, *n)})),
+        Step::Put(a, c, r, n) => ("com.atproto.repo.putRecord", json!({"repo": accts[*a].did, "collection": c, "rkey": r, "record": thing(c, *n)})),
+        Step::Delete(a, c, r) => ("com.atproto.repo.deleteRecord", json!({"repo": accts[*a].did, "collection": c, "rkey": r})),
+        Step::Batch(a, w) => ("com.atproto.repo.applyWrites", json!({"repo": accts[*a].did, "writes": w})),
+    }
+}
+
 async fn run_step(s: &TestServer, accts: &[TestAccount], step: &Step) -> u16 {
-    let (nsid, a, body) = match step {
-        Step::Create(a, c, r, n) => ("com.atproto.repo.createRecord", *a, json!({"repo": accts[*a].did, "collection": c, "rkey": r, "record": thing(c, *n)})),
-        Step::Put(a, c, r, n) => ("com.atproto.repo.putRecord", *a, json!({"repo": accts[*a].did, "collection": c, "rkey": r, "record": thing(c, *n)})),
-        Step::Delete(a, c, r) => ("com.atproto.repo.deleteRecord", *a, json!({"repo": accts[*a].did, "collection": c, "rkey": r})),
-        Step::Batch(a, w) => ("com.atproto.repo.applyWrites", *a, json!({"repo": accts[*a].did, "writes": w})),
+    let a = match step {
+        Step::Create(a, ..) | Step::Put(a, ..) | Step::Delete(a, ..) | Step::Batch(a, _) => *a,
     };
+    let (nsid, body) = step_request(accts, step);
     s.xrpc.post(nsid, &body, &accts[a].auth()).await.status
 }
 
-/// The same writes on a lazy node and a full-tree node produce the same
-/// firehose commits (ops, prevData, data, every MST node and record block in
+/// Runs `step` on `s` and applies it to the step account's reference.
+async fn ref_step(s: &TestServer, accts: &[TestAccount], refs: &mut [RefRepo], step: &Step) {
+    let a = match step {
+        Step::Create(a, ..) | Step::Put(a, ..) | Step::Delete(a, ..) | Step::Batch(a, _) => *a,
+    };
+    let (nsid, body) = step_request(accts, step);
+    let r = s.xrpc.post(nsid, &body, &accts[a].auth()).await;
+    refs[a].apply(step, &r);
+}
+
+/// Writes on a node holding almost nothing in memory match an independent
+/// reference (a full `mst::Tree` fed the same acknowledged writes): every
+/// firehose commit (ops, prevData, data, every MST node and record block in
 /// order: sync 1.1 proofs included), getRepo CARs, getRecord proofs,
-/// getBlocks answers, collection index and migration counts; and the lazy
-/// node's `M/` is exactly its trees' interior nodes. Only the commit blocks
-/// differ (each node signs with its own key, DID and clock).
+/// getBlocks answers, the collection index and migration counts; and the
+/// node's `M/` is exactly its trees' interior nodes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn lazy_node_matches_full_node() {
+async fn lazy_node_matches_reference() {
     for (seed, prefetch) in [(1u64, 4usize << 20), (2, 0)] {
-        let full = mode_node(false, 0, None).await;
-        let lazy = mode_node(true, prefetch, None).await;
+        let s = lazy_node(prefetch).await;
         let fetches0 = vlpds::metrics::LAZY_MST_FETCHES.with_label_values(&["ok"]).get();
         let unloads0 = vlpds::metrics::LAZY_MST_UNLOADS.get();
-        let mut accts = (Vec::new(), Vec::new());
+        let mut accts = Vec::new();
+        let mut refs: Vec<RefRepo> = (0..3).map(|_| RefRepo::new()).collect();
         for i in 0..3 {
-            accts.0.push(full.create_account(&format!("fm{i}")).await);
-            accts.1.push(lazy.create_account(&format!("lm{i}")).await);
+            accts.push(s.create_account(&format!("lm{i}")).await);
         }
         // deep trees: 1,600 records each (5 levels), mostly unloaded
         for i in 0..3usize {
@@ -742,82 +971,25 @@ async fn lazy_node_matches_full_node() {
                         json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "com.example.feed.like", "rkey": r, "value": thing("com.example.feed.like", k as i64)})
                     })
                     .collect();
-                for (s, a) in [(&full, &accts.0[i]), (&lazy, &accts.1[i])] {
-                    s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok();
-                }
+                ref_step(&s, &accts, &mut refs, &Step::Batch(i, writes)).await;
             }
+            refs[i].commits.clear();
         }
-        let (mut sf, mut sl) = (full.subscribe_from_now().await, lazy.subscribe_from_now().await);
+        let mut sub = s.subscribe_from_now().await;
         let mut rng = StdRng::seed_from_u64(seed);
         for step in random_steps(&mut rng, 3, 400) {
-            let (a, b) = (run_step(&full, &accts.0, &step).await, run_step(&lazy, &accts.1, &step).await);
-            assert_eq!(a, b, "{step:?}");
+            ref_step(&s, &accts, &mut refs, &step).await;
         }
-        let shapes = |frames: Vec<Frame>, accts: &[TestAccount]| -> Vec<Vec<_>> {
-            accts.iter().map(|a| frames.iter().filter(|f| f.kind() == "#commit" && f.did() == Some(&a.did)).map(commit_shape).collect()).collect()
-        };
-        let (cf, cl) = (shapes(sf.drain(Duration::from_millis(500)).await, &accts.0), shapes(sl.drain(Duration::from_millis(500)).await, &accts.1));
-        for i in 0..3 {
-            assert!(cf[i].len() > 60, "commits seen: {}", cf[i].len());
-            assert_eq!(cf[i].len(), cl[i].len(), "account {i}: commit count");
-            for (j, (f, l)) in cf[i].iter().zip(&cl[i]).enumerate() {
-                assert!(f == l, "account {i} commit {j} differs:\n full {f:?}\n lazy {l:?}");
+        let frames = sub.drain(Duration::from_millis(500)).await;
+        for (i, a) in accts.iter().enumerate() {
+            let commits: Vec<&Frame> = frames.iter().filter(|f| f.kind() == "#commit" && f.did() == Some(&a.did)).collect();
+            assert!(commits.len() > 60, "commits seen: {}", commits.len());
+            assert_eq!(commits.len(), refs[i].commits.len(), "account {i}: commit count");
+            for (j, (f, exp)) in commits.iter().zip(&refs[i].commits).enumerate() {
+                RefRepo::check_commit(&format!("account {i} commit {j}"), exp, f);
             }
-        }
-        for i in 0..3 {
-            let (df, dl) = (&accts.0[i].did, &accts.1[i].did);
-            let get = |s: &TestServer, nsid: &'static str, q: Vec<(&'static str, String)>| {
-                let x = s.xrpc.clone();
-                async move { x.get_multi(nsid, &q, &Auth::None).await }
-            };
-            // getRepo
-            let (rf, rl) = (get(&full, "com.atproto.sync.getRepo", vec![("did", df.clone())]).await, get(&lazy, "com.atproto.sync.getRepo", vec![("did", dl.clone())]).await);
-            assert!(rf.status == 200 && rl.status == 200);
-            let (bf, bl) = (car_tail(&rf.body), car_tail(&rl.body));
-            assert!(bf == bl, "account {i}: getRepo blocks differ ({} vs {})", bf.len(), bl.len());
-            // getRecord proofs, present and absent keys
-            let mut keys: Vec<(String, String)> = Vec::new();
-            for c in ["com.example.feed.post", "com.example.feed.like", "com.example.thing", "com.example.rare", "com.example.none"] {
-                for k in 0..40 {
-                    keys.push((c.into(), format!("k{k}")));
-                }
-            }
-            for (c, r) in keys.iter().step_by(3) {
-                let (pf, pl) = (
-                    get(&full, "com.atproto.sync.getRecord", vec![("did", df.clone()), ("collection", c.clone()), ("rkey", r.clone())]).await,
-                    get(&lazy, "com.atproto.sync.getRecord", vec![("did", dl.clone()), ("collection", c.clone()), ("rkey", r.clone())]).await,
-                );
-                assert_eq!(pf.status, pl.status);
-                assert!(car_tail(&pf.body) == car_tail(&pl.body), "account {i}: getRecord {c}/{r} differs");
-            }
-            // getBlocks of every MST node (the empty tree's root aside) and a few records
-            let repo = Repo::from_car(&rf.body).unwrap();
-            let commit = Value::decode(&repo.blocks[&repo.root]).unwrap();
-            let Some(Value::Link(data)) = commit.get("data") else { panic!() };
-            let tree = Tree::load_from_blocks(&repo.blocks, *data).unwrap();
-            let mut nodes = Vec::new();
-            tree.walk_blocks(&mut |c, _| nodes.push(c)).unwrap();
-            let mut want: Vec<(&'static str, String)> = vec![("did", String::new())];
-            want.extend(nodes.iter().chain(repo.order.iter().skip(1 + nodes.len()).take(5)).map(|c| ("cids", c.to_string())));
-            want[0].1 = df.clone();
-            let gf = get(&full, "com.atproto.sync.getBlocks", want.clone()).await;
-            want[0].1 = dl.clone();
-            let gl = get(&lazy, "com.atproto.sync.getBlocks", want).await;
-            assert_eq!((gf.status, gl.status), (200, 200), "{}", gl.text());
-            assert!(gf.body == gl.body, "account {i}: getBlocks differs");
-            // collection index
-            let (xf, xl) = (
-                get(&full, "com.atproto.repo.describeRepo", vec![("repo", df.clone())]).await.ok()["collections"].clone(),
-                get(&lazy, "com.atproto.repo.describeRepo", vec![("repo", dl.clone())]).await.ok()["collections"].clone(),
-            );
-            assert_eq!(xf, xl, "account {i}: describeRepo collections");
-            // migration counts
-            let (mf, ml) = (
-                full.xrpc.get("com.atproto.server.checkAccountStatus", &[], &accts.0[i].auth()).await.ok(),
-                lazy.xrpc.get("com.atproto.server.checkAccountStatus", &[], &accts.1[i].auth()).await.ok(),
-            );
-            assert_eq!(mf["repoBlocks"], ml["repoBlocks"], "account {i}: checkAccountStatus");
-            check_stored_nodes(&lazy, dl).await;
+            refs[i].check_repo(&s, a).await;
+            check_stored_nodes(&s, &a.did).await;
         }
         eprintln!("inline reads so far: {}", vlpds::metrics::LAZY_MST_FETCHES.with_label_values(&["inline"]).get());
         let fetches = vlpds::metrics::LAZY_MST_FETCHES.with_label_values(&["ok"]).get() - fetches0;
@@ -848,7 +1020,6 @@ async fn replay_after_kill_reconstructs_nodes() {
     let node = |id: &'static str| {
         let store = store.clone();
         TestServer::spawn_with(move |c| {
-            c.lazy_mst = true;
             c.lazy_mst_unload_idle = true;
             c.memory_store = Some(store);
             c.shards = SHARDS;
@@ -901,20 +1072,21 @@ async fn replay_after_kill_reconstructs_nodes() {
     assert_eq!(fallbacks, fallbacks0, "lazy opens fell back to a rebuild from records");
 }
 
-/// A lazy open whose `M/` nodes are missing or wrong (a bug, or a store
-/// switched from the full-tree mode) rebuilds the tree from the records,
-/// still serves exactly, and backfills `M/` through the log.
+/// An open whose `M/` nodes are missing or wrong (a bug, or a lost
+/// family) rebuilds the tree from the records, still serves exactly (against
+/// the reference), and backfills `M/` through the log.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lazy_open_rebuilds_missing_or_bad_nodes() {
-    let s = mode_node(true, 4 << 20, None).await;
-    let full = mode_node(false, 0, None).await;
-    let (a, f) = (s.create_account("fbl").await, full.create_account("fbf").await);
+    let s = lazy_node(4 << 20).await;
+    let accts = vec![s.create_account("fbl").await];
+    let a = &accts[0];
+    let mut refs = vec![RefRepo::new()];
     let mut rng = StdRng::seed_from_u64(11);
-    let steps = random_steps(&mut rng, 1, 300);
-    for st in &steps {
-        assert_eq!(run_step(&s, std::slice::from_ref(&a), st).await, run_step(&full, std::slice::from_ref(&f), st).await);
+    for st in random_steps(&mut rng, 1, 300) {
+        ref_step(&s, &accts, &mut refs, &st).await;
     }
     check_stored_nodes(&s, &a.did).await;
+    refs[0].check_repo(&s, a).await;
     let Ok(p) = s.app.partition(&a.did) else { panic!() };
     let nodes = stored_nodes(&s, &a.did).await;
     assert!(nodes.len() > 3, "an interior tree");
@@ -942,11 +1114,9 @@ async fn lazy_open_rebuilds_missing_or_bad_nodes() {
         // nodes are cached by CID process-wide: read this repo's from the store
         vlpds::mst_store::NODE_CACHE.clear();
         let st = Step::Create(0, "com.example.thing".into(), format!("after-{case}"), 5);
-        assert_eq!(run_step(&s, std::slice::from_ref(&a), &st).await, 200);
-        assert_eq!(run_step(&full, std::slice::from_ref(&f), &st).await, 200);
+        ref_step(&s, &accts, &mut refs, &st).await;
         assert!(vlpds::metrics::LAZY_MST_FALLBACKS.with_label_values(&[reason]).get() > n0, "{case}: no fallback");
-        let (rl, rf) = (s.xrpc.get("com.atproto.sync.getRepo", &[("did", &a.did)], &Auth::None).await, full.xrpc.get("com.atproto.sync.getRepo", &[("did", &f.did)], &Auth::None).await);
-        assert!(car_tail(&rl.body) == car_tail(&rf.body), "{case}: getRepo differs");
+        refs[0].check_repo(&s, a).await;
         // the backfill is applied with the commit after it
         check_stored_nodes(&s, &a.did).await;
     }
@@ -960,18 +1130,16 @@ fn env_or<T: std::str::FromStr>(k: &str, d: T) -> T {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
-/// A single node (id `id`, 4 shards) on `store` in a given MST mode, with
-/// nothing preloaded or pinned (every first write is a cold open).
-async fn bench_node(id: &str, store: Arc<dyn object_store::ObjectStore>, lazy: bool, prefetch: usize, workers: usize) -> TestServer {
+/// A single node (id `id`, 4 shards) on `store`, with nothing preloaded
+/// (every first write is a cold open).
+async fn bench_node(id: &str, store: Arc<dyn object_store::ObjectStore>, prefetch: usize, workers: usize) -> TestServer {
     let id = id.to_string();
     let s = TestServer::spawn_with(move |c| {
-        c.lazy_mst = lazy;
         c.lazy_mst_prefetch_bytes = prefetch;
         c.memory_store = Some(store);
         c.shards = 4;
         c.workers = workers;
         c.preload_recent = 0;
-        c.pin_repo_records = 0;
         c.cluster = Some(vlpds::cluster::ClusterConfig { node_id: id, addr: c.public_url.clone(), shards: 4, ..Default::default() });
     })
     .await;
@@ -1030,9 +1198,9 @@ fn pct(v: &mut [f64], p: f64) -> f64 {
 }
 
 /// Cold first write per repo size after a restart, every object-store GET
-/// delayed 20 ms (an S3 miss; nothing in the block cache): full trees (an
-/// `R/` scan of the whole repo), lazy with the `M/` prefetch (one scan of
-/// the repo's node range) and lazy without (dependent node reads).
+/// delayed 20 ms (an S3 miss; nothing in the block cache), per `M/`
+/// prefetch cap (one scan of the repo's node range; 0 = dependent node
+/// reads).
 /// `VLPDS_COLD_SIZES=1000,10000,100000,1000000 VLPDS_COLD_REPOS=3
 /// cargo test --profile dev-release --test all mst_lazy::bench_cold_write -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1043,12 +1211,12 @@ async fn bench_cold_write() {
     let per: usize = env_or("VLPDS_COLD_REPOS", 3);
     let delay = Duration::from_millis(env_or("VLPDS_COLD_GET_MS", 20));
     let repo_sizes: Vec<u32> = sizes.iter().flat_map(|&n| std::iter::repeat_n(n, per)).collect();
-    // populate once (a lazy node: it writes M/), then each mode restarts on
-    // its own copy of the store, cold
+    // populate once, then each cap restarts on its own copy of the store,
+    // cold
     let base = Arc::new(object_store::memory::InMemory::new());
     {
         let t = Instant::now();
-        let s = bench_node("cw", base.clone(), true, 4 << 20, 4).await;
+        let s = bench_node("cw", base.clone(), 4 << 20, 4).await;
         bulk_populate(&s, &repo_sizes).await;
         vlpds::server::shutdown(&s.app).await;
         eprintln!("populated {} repos in {:.1}s", repo_sizes.len(), t.elapsed().as_secs_f64());
@@ -1056,18 +1224,18 @@ async fn bench_cold_write() {
     // a node on the store until its post-import compactions are done, so
     // none runs (reading SSTs) during the measured writes
     {
-        let s = bench_node("cw", base.clone(), true, 0, 4).await;
+        let s = bench_node("cw", base.clone(), 0, 4).await;
         tokio::time::sleep(Duration::from_secs(env_or("VLPDS_COLD_SETTLE_SECS", 20))).await;
         vlpds::server::shutdown(&s.app).await;
     }
     let mut report = Vec::new();
     let prefetch_kb: Vec<usize> = std::env::var("VLPDS_COLD_PREFETCH_KB").unwrap_or("4096,256,0".into()).split(',').map(|s| s.parse().unwrap()).collect();
-    let modes: Vec<(String, bool, usize)> = prefetch_kb.iter().map(|kb| (format!("lazy, prefetch {kb} KiB"), true, kb << 10)).chain([("full".to_string(), false, 0)]).collect();
-    for (label, lazy, prefetch) in modes {
+    for kb in prefetch_kb {
+        let label = format!("prefetch {kb} KiB");
         vlpds::partition::bump_cache_epoch();
         vlpds::mst_store::NODE_CACHE.clear();
         let throttled = Arc::new(ThrottledStore::new(base.fork(), ThrottleConfig::default()));
-        let s = bench_node("cw", throttled.clone(), lazy, prefetch, 4).await;
+        let s = bench_node("cw", throttled.clone(), kb << 10, 4).await;
         throttled.config_mut(|c| c.wait_get_per_call = delay);
         let mut lat: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
         let mut gets: BTreeMap<u32, Vec<f64>> = BTreeMap::new();
@@ -1117,10 +1285,10 @@ where
     n.load(std::sync::atomic::Ordering::Relaxed) as f64 / t.elapsed().as_secs_f64()
 }
 
-/// Read paths on one repo (`VLPDS_READ_RECORDS`, default 100k) in both
-/// modes, after a restart and one write (a lazy node holds the root and one
-/// path): sync.getRecord proofs of random keys, getBlocks of random
-/// interior nodes / leaves / records, getRepo exports.
+/// Read paths on one repo (`VLPDS_READ_RECORDS`, default 100k) after a
+/// restart and one write (the node holds the root and one path):
+/// sync.getRecord proofs of random keys, getBlocks of random interior
+/// nodes / leaves / records, getRepo exports.
 /// `cargo test --profile dev-release --test all mst_lazy::bench_readers -- --ignored --nocapture`
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
@@ -1129,16 +1297,16 @@ async fn bench_readers() {
     let secs: f64 = env_or("VLPDS_READ_SECS", 4.0);
     let base = Arc::new(object_store::memory::InMemory::new());
     {
-        let s = bench_node("rd", base.clone(), true, 4 << 20, 4).await;
+        let s = bench_node("rd", base.clone(), 4 << 20, 4).await;
         bulk_populate(&s, &[n]).await;
         vlpds::server::shutdown(&s.app).await;
     }
     let did = vlpds::state::bulk_did(0);
     let mut report = Vec::new();
-    for (label, lazy) in [("lazy", true), ("full", false)] {
+    {
         vlpds::partition::bump_cache_epoch();
         vlpds::mst_store::NODE_CACHE.clear();
-        let s = bench_node("rd", Arc::new(base.fork()), lazy, 4 << 20, 4).await;
+        let s = bench_node("rd", Arc::new(base.fork()), 4 << 20, 4).await;
         create_post(&s, &did).await;
         // the repo's keys and node CIDs (from an export)
         let r = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &did)], &Auth::None).await;
@@ -1198,7 +1366,7 @@ async fn bench_readers() {
         })
         .await;
         let line = format!(
-            "{label}: {n} records: sync.getRecord {get_record:.0}/s; getBlocks interior {gb_interior:.0}/s, record {gb_records:.0}/s, leaf {gb_leaves:.1}/s; getRepo {get_repo:.2}/s ({:.1} MB)",
+            "{n} records: sync.getRecord {get_record:.0}/s; getBlocks interior {gb_interior:.0}/s, record {gb_records:.0}/s, leaf {gb_leaves:.1}/s; getRepo {get_repo:.2}/s ({:.1} MB)",
             r.body.len() as f64 / 1e6
         );
         eprintln!("{line}");
@@ -1210,9 +1378,9 @@ async fn bench_readers() {
 
 /// Memory of a node holding many repos (`VLPDS_RSS_REPOS`, default 20k)
 /// of Zipf sizes (rank r: `VLPDS_RSS_MAX` / r records, default 1M at rank
-/// 1; ~10.5M records in all) after one write to each, lazy first, then full
-/// trees, each on a fresh restart (block cache 64 MiB, cold). RSS grows by
-/// what the node keeps for the repos: their trees (full) or paths (lazy).
+/// 1; ~10.5M records in all) after one write to each, on a fresh restart
+/// (block cache 64 MiB, cold). RSS grows by what the node keeps for the
+/// repos: their loaded paths.
 /// Run alone (the block cache size is process-wide):
 /// `cargo test --profile dev-release --test all mst_lazy::bench_rss -- --ignored --nocapture --test-threads 1`
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -1226,7 +1394,7 @@ async fn bench_rss() {
     let base = Arc::new(object_store::memory::InMemory::new());
     {
         let t = Instant::now();
-        let s = bench_node("rss", base.clone(), true, 4 << 20, 8).await;
+        let s = bench_node("rss", base.clone(), 4 << 20, 8).await;
         bulk_populate(&s, &sizes).await;
         vlpds::server::shutdown(&s.app).await;
         eprintln!("populated {repos} repos, {total} records in {:.0}s", t.elapsed().as_secs_f64());
@@ -1235,17 +1403,10 @@ async fn bench_rss() {
     order.shuffle(&mut StdRng::seed_from_u64(3));
     let order = Arc::new(order);
     let mut report = Vec::new();
-    // one mode per process (`VLPDS_RSS_MODE=lazy|full`) measures cleanly:
-    // memory the first mode freed would be reused by the second
-    let modes: Vec<(&str, bool)> = match std::env::var("VLPDS_RSS_MODE").as_deref() {
-        Ok("lazy") => vec![("lazy", true)],
-        Ok("full") => vec![("full", false)],
-        _ => vec![("lazy", true), ("full", false)],
-    };
-    for (label, lazy) in modes {
+    {
         vlpds::partition::bump_cache_epoch();
         vlpds::mst_store::NODE_CACHE.clear();
-        let s = bench_node("rss", base.clone(), lazy, vlpds::worker::DEFAULT_PREFETCH_BYTES, 8).await;
+        let s = bench_node("rss", base.clone(), vlpds::worker::DEFAULT_PREFETCH_BYTES, 8).await;
         tokio::time::sleep(Duration::from_secs(2)).await;
         let rss0 = vlpds::metrics::resident_bytes().unwrap_or(0);
         let t = Instant::now();
@@ -1265,7 +1426,7 @@ async fn bench_rss() {
         let rss1 = vlpds::metrics::resident_bytes().unwrap_or(0);
         let cache: i64 = (0..8).map(|w| vlpds::metrics::REPO_CACHE_BYTES.with_label_values(&[&w.to_string()]).get()).sum();
         let line = format!(
-            "{label}: {repos} repos / {total} records, one write each in {took:.1}s (p50 {:.1} ms, p99 {:.1} ms): RSS +{:.0} MB ({:.0} -> {:.0} MB), repo cache {:.0} MB, node cache {:.0} MB",
+            "{repos} repos / {total} records, one write each in {took:.1}s (p50 {:.1} ms, p99 {:.1} ms): RSS +{:.0} MB ({:.0} -> {:.0} MB), repo cache {:.0} MB, node cache {:.0} MB",
             pct(&mut lat, 0.5),
             pct(&mut lat, 0.99),
             (rss1 as f64 - rss0 as f64) / 1e6,
@@ -1289,7 +1450,7 @@ async fn bench_rss() {
 /// them without falling back to a rebuild from records.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reshard_carries_nodes() {
-    let s = mode_node(true, 4 << 20, None).await;
+    let s = lazy_node(4 << 20).await;
     let mut accts = Vec::new();
     for i in 0..8 {
         accts.push(s.create_account(&format!("rsn{i}")).await);
@@ -1340,7 +1501,7 @@ async fn reshard_carries_nodes() {
 /// key set, getRepo against the records).
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn hot_repo_paths_stay_bounded() {
-    let s = TestServer::spawn_with(|c| c.lazy_mst = true).await;
+    let s = TestServer::spawn().await;
     let a = s.create_account("hot").await;
     let mut live = std::collections::BTreeSet::new();
     for b in 0..60u64 {

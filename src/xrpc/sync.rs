@@ -212,19 +212,19 @@ async fn get_checkout(
     export_repo(&app, &q.did, None).await
 }
 
-/// A lazy export reads up to this much of the repo's `M/` range with one
-/// scan (~28 B/record: a 1M-record repo's), point reads beyond.
+/// An export reads up to this much of the repo's `M/` range with one scan
+/// (~28 B/record: a 1M-record repo's), point reads beyond.
 const EXPORT_PREFETCH_BYTES: usize = 64 << 20;
 
-/// Streams the repo CAR: commit, MST nodes (walked on a blocking thread from
-/// the durable in-memory tree; a lazy repo's streamed from the snapshot:
-/// interior nodes from `M/`, leaves rebuilt from one forward `R/` scan,
-/// one path in memory), then records from a matching SlateDB snapshot.
-/// Memory stays bounded (~1 MiB chunks) regardless of repo size.
+/// Streams the repo CAR: commit, MST nodes (streamed on a blocking thread
+/// from the snapshot: interior nodes from `M/`, leaves rebuilt from one
+/// forward `R/` scan, one path in memory), then records from the same
+/// SlateDB snapshot. Memory stays bounded (~1 MiB chunks) regardless of
+/// repo size.
 async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Response> {
     const CHUNK: usize = 1 << 20;
     let (view, snap) = app.repo_view(did).await?;
-    let (head, tree, lazy) = (view.head.clone(), view.tree.clone(), view.lazy);
+    let head = view.head.clone();
     drop(view);
     let prefix = state::record_prefix(did);
     let did: Arc<str> = did.into();
@@ -234,10 +234,7 @@ async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Respon
         car::write_header(&mut buf, &head.commit);
         car::write_block(&mut buf, &head.commit, &head.commit_block);
         let tx2 = tx.clone();
-        let pre = match lazy {
-            true => crate::mst_store::prefetch(&*snap, &did, EXPORT_PREFETCH_BYTES).await.map(|p| p.0).unwrap_or_default(),
-            false => Default::default(),
-        };
+        let pre = crate::mst_store::prefetch(&*snap, &did, EXPORT_PREFETCH_BYTES).await.map(|p| p.0).unwrap_or_default();
         let (snap2, root) = (snap.clone(), head.data);
         let walked = tokio::task::spawn_blocking(move || {
             let mut emit = |c: Cid, b: &[u8]| {
@@ -246,16 +243,11 @@ async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Respon
                     let _ = tx2.blocking_send(Ok(Bytes::from(std::mem::replace(&mut buf, Vec::with_capacity(CHUNK + 4096)))));
                 }
             };
-            let r = match lazy {
-                false => tree.walk_blocks(&mut emit),
-                true => {
-                    let rt = tokio::runtime::Handle::current();
-                    let nodes = crate::mst_store::DbSource::new(&*snap2, &did, &rt).with_prefetched(Some(&pre));
-                    crate::mst_store::ScanSource::open(&*snap2, &did, nodes, &rt)
-                        .and_then(|scan| crate::mst_lazy::export_blocks(root, 1, &scan, &mut emit))
-                        .map(|_| ())
-                }
-            };
+            let rt = tokio::runtime::Handle::current();
+            let nodes = crate::mst_store::DbSource::new(&*snap2, &did, &rt).with_prefetched(Some(&pre));
+            let r = crate::mst_store::ScanSource::open(&*snap2, &did, nodes, &rt)
+                .and_then(|scan| crate::mst_lazy::export_blocks(root, 1, &scan, &mut emit))
+                .map(|_| ());
             (r, buf)
         })
         .await;
@@ -345,10 +337,7 @@ async fn get_blocks(
     };
     let todo = rest(&found);
     if !todo.is_empty() {
-        found.extend(match view.lazy {
-            true => lazy_nodes(&view, &snap, &did, todo, false).await?,
-            false => find_nodes(&view, todo, false).await?,
-        });
+        found.extend(lazy_nodes(&view, &snap, &did, todo, false).await?);
     }
     // records, by the record CID index (c/ keys) of the matching snapshot
     for c in rest(&found) {
@@ -361,10 +350,7 @@ async fn get_blocks(
     // the rest can only be nodes: build the index from this view if needed
     let todo = rest(&found);
     if !todo.is_empty() {
-        found.extend(match view.lazy {
-            true => lazy_nodes(&view, &snap, &did, todo, true).await?,
-            false => find_nodes(&view, todo, true).await?,
-        });
+        found.extend(lazy_nodes(&view, &snap, &did, todo, true).await?);
     }
     let missing: Vec<String> = want
         .iter()
@@ -415,49 +401,6 @@ async fn find_record(snap: &slatedb::DbSnapshot, did: &str, cid: &Cid) -> XResul
     Ok(None)
 }
 
-/// MST node blocks by CID from the repo's node index (O(depth) each). With
-/// `build`, an index that doesn't cover this view's version is rebuilt from
-/// the view (one walk, on the blocking pool), then kept up to date by the
-/// repo worker; without, nothing is found unless one already covers it.
-async fn find_nodes(
-    view: &Arc<crate::worker::DurableView>,
-    cids: Vec<Cid>,
-    build: bool,
-) -> XResult<Vec<(Cid, Vec<u8>)>> {
-    use crate::mst::{MstError, NodeIndex};
-    fn get(view: &crate::worker::DurableView, ix: &NodeIndex, cids: &[Cid]) -> Result<Vec<(Cid, Vec<u8>)>, MstError> {
-        let mut out = Vec::new();
-        for c in cids {
-            if let Some(b) = view.tree.find_node(c, ix)? {
-                out.push((*c, b));
-            }
-        }
-        Ok(out)
-    }
-    let rev = view.head.rev.0;
-    {
-        let mut cell = view.nodes.lock();
-        if let Some(ix) = cell.index.as_ref().filter(|ix| ix.covers(rev)) {
-            return get(view, ix, &cids).map_err(XrpcError::from_err);
-        }
-        if !build {
-            return Ok(Vec::new());
-        }
-        // from now on the worker reports written nodes, so the index built
-        // below can catch up with commits made meanwhile
-        cell.wanted = true;
-    }
-    let view = view.clone();
-    tokio::task::spawn_blocking(move || {
-        let ix = NodeIndex::build(&view.tree, rev)?;
-        let out = get(&view, &ix, &cids)?;
-        view.nodes.lock().install(ix);
-        Ok::<_, MstError>(out)
-    })
-    .await
-    .map_err(XrpcError::from_err)?
-    .map_err(XrpcError::from_err)
-}
 
 #[derive(Deserialize)]
 struct SyncRecordQ {
@@ -484,10 +427,7 @@ async fn sync_get_record(
     let mut out = Vec::new();
     car::write_header(&mut out, &head.commit);
     car::write_block(&mut out, &head.commit, &head.commit_block);
-    let proof = match view.lazy {
-        false => view.tree.proof_blocks(path.as_bytes()),
-        true => lazy_proof(&view, &snap, &q.did, &path).await?,
-    };
+    let proof = lazy_proof(&view, &snap, &q.did, &path).await?;
     for (c, b) in proof.map_err(XrpcError::from_err)? {
         car::write_block(&mut out, &c, &b);
     }
@@ -502,7 +442,7 @@ async fn sync_get_record(
     Ok(car_response(out))
 }
 
-/// A lazy view's proof of `path`: its loaded nodes, the rest read from the
+/// A view's proof of `path`: its loaded nodes, the rest read from the
 /// view's snapshot (`M/` nodes, a leaf from its record range), checked
 /// against their links, without touching the shared tree.
 async fn lazy_proof(
@@ -514,12 +454,12 @@ async fn lazy_proof(
     Ok(crate::mst_store::proof_blocks(&view.tree.root, &**snap, did, path.as_bytes()).await)
 }
 
-/// MST node blocks of a lazy view by CID: its loaded nodes, then `M/` point
+/// MST node blocks of a view by CID: its loaded nodes, then `M/` point
 /// reads on its snapshot (which holds exactly the interior nodes of the
 /// view's tree); with `walk`, the rest (leaves) by the repo's node index
-/// (as the full-tree mode's, but built by one streamed walk of the whole
-/// tree from the snapshot, then advanced by the worker per commit), each
-/// found by a proof walk to its key. A miss in an index covering the view
+/// (built by one streamed walk of the whole tree from the snapshot, then
+/// advanced by the worker per commit), each found by a proof walk to its
+/// key. A miss in an index covering the view
 /// is final, so unknown CIDs don't walk the tree again.
 async fn lazy_nodes(
     view: &Arc<crate::worker::DurableView>,

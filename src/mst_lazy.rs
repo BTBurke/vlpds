@@ -1,7 +1,6 @@
 //! Partial, lazily loaded MSTs (DESIGN.md "Partial MSTs"). The repo worker
-//! keeps every repo's tree as a [`LazyTree`]: with `--lazy-mst` only the
-//! visited paths are loaded (from `M/` and `R/`, `crate::mst_store`), without
-//! it the tree is fully loaded and nothing is persisted.
+//! keeps every repo's tree as a [`LazyTree`]: only the visited paths are
+//! loaded (from `M/` and `R/`, `crate::mst_store`).
 //!
 //! A repo's tree is kept as an [`mst::Tree`](crate::mst::Tree) whose
 //! unvisited subtrees stay unloaded (`Entry::Child { node: None, cid }`).
@@ -54,18 +53,6 @@ pub trait Source {
     /// Records with `lo < key < hi` in key order (`R/` range scan; `None`
     /// bounds are open).
     fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()>;
-}
-
-/// A source with nothing in it (a fully loaded tree never reads).
-pub struct NoSource;
-
-impl Source for NoSource {
-    fn node(&self, _: &Cid) -> Result<Option<Arc<[u8]>>> {
-        Err(MstError::NotLoaded)
-    }
-    fn records(&self, _: Option<&[u8]>, _: Option<&[u8]>, _: &mut Vec<(Key, Cid)>) -> Result<()> {
-        Err(MstError::NotLoaded)
-    }
 }
 
 /// What loading cost (cumulative per [`LazyTree`] or export).
@@ -406,10 +393,6 @@ pub struct LazyTree {
     /// The partial tree (`mst::Tree` does every mutation and encoding).
     pub tree: Tree,
     persist_min: i32,
-    /// false: a fully loaded tree whose nodes aren't persisted (the
-    /// full-tree mode): operations never walk or read, and a write's
-    /// persistence diff is empty.
-    lazy: bool,
     /// Persisted nodes (height >= persist_min, by their last written cid)
     /// on this batch's mutation walks:
     /// (cid, a key in the node's subtree, height). Replaced ones are deleted.
@@ -441,23 +424,14 @@ impl LazyTree {
                 t
             }
         };
-        Ok(LazyTree { tree, persist_min, lazy: true, seen: Vec::new(), stats })
-    }
-
-    /// A fully loaded tree in the full-tree mode (nothing persisted).
-    pub fn full(tree: Tree) -> LazyTree {
-        LazyTree { tree, persist_min: 1, lazy: false, seen: Vec::new(), stats: LoadStats::default() }
+        Ok(LazyTree { tree, persist_min, seen: Vec::new(), stats })
     }
 
     /// A fully loaded tree whose nodes of height >= `persist_min` are
     /// persisted (a new or imported repo, or one rebuilt from its records):
     /// it can be unloaded and walked lazily from now on.
     pub fn loaded(tree: Tree, persist_min: i32) -> LazyTree {
-        LazyTree { tree, persist_min, lazy: true, seen: Vec::new(), stats: LoadStats::default() }
-    }
-
-    pub fn is_lazy(&self) -> bool {
-        self.lazy
+        LazyTree { tree, persist_min, seen: Vec::new(), stats: LoadStats::default() }
     }
 
     pub fn persist_min(&self) -> i32 {
@@ -467,9 +441,6 @@ impl LazyTree {
     /// Loads one path (see [`Mode`]); with `note` (mutation walks), notes
     /// the persisted nodes it passes as candidates for deletion.
     fn walk(&mut self, key: &[u8], mut mode: Mode, note: bool, src: &dyn Source) -> Result<()> {
-        if !self.lazy {
-            return Ok(());
-        }
         // most walks find their path loaded: check that without
         // `Arc::make_mut`, which copies every node shared with a view
         if let Some(path) = self.loaded_path(key, mode, note) {
@@ -613,9 +584,6 @@ impl LazyTree {
     /// key and node of the current one). Unloaded subtrees come from `src` in
     /// key order, so a [`Source`] over one forward record scan serves it.
     pub fn load_all(&mut self, src: &dyn Source) -> Result<()> {
-        if !self.lazy {
-            return Ok(());
-        }
         #[allow(clippy::too_many_arguments)]
         fn rec(n: &mut Arc<Node>, lo: Option<Key>, hi: Option<Key>, pm: i32, src: &dyn Source, stats: &mut LoadStats, depth: usize) -> Result<()> {
             if depth > MAX_DEPTH {
@@ -654,7 +622,7 @@ impl LazyTree {
                 Entry::Value { .. } => true,
             })
         }
-        !self.lazy || rec(&self.tree.root)
+        rec(&self.tree.root)
     }
 
     pub fn get(&mut self, key: &[u8], src: &dyn Source) -> Result<Option<Cid>> {
@@ -684,15 +652,6 @@ impl LazyTree {
     /// whose first key is in an unloaded subtree are left out; all have
     /// keys of their own but interior ones, which `M/` finds by CID).
     pub fn write_diff_blocks_with_refs(&mut self, out: &mut Vec<(Cid, Vec<u8>)>, report: Option<&mut Vec<(Cid, crate::mst::NodeRef)>>) -> Result<(Cid, Persist)> {
-        if !self.lazy {
-            return Ok((
-                match report {
-                    Some(r) => self.tree.write_diff_blocks_with_refs(out, r)?,
-                    None => self.tree.write_diff_blocks(out)?,
-                },
-                Persist::default(),
-            ));
-        }
         let start = out.len();
         let mut refs = Vec::new();
         let root = self.tree.write_diff_blocks_with_refs(out, &mut refs)?;
@@ -770,9 +729,6 @@ impl LazyTree {
     /// subtree changed by such a commit has its (new) CID in `keep`, and so
     /// does every node above it, which are kept and descended into.
     pub fn unload_except(&mut self, keep: &HashSet<Cid>) {
-        if !self.lazy {
-            return;
-        }
         fn rec(n: &mut Arc<Node>, keep: &HashSet<Cid>) {
             if !n.entries.iter().any(|e| matches!(e, Entry::Child { node: Some(_), .. })) {
                 return;
@@ -797,9 +753,6 @@ impl LazyTree {
     /// Drops loaded subtrees more than `depth` levels below the root (clean
     /// ones: call after a write). `unload(0)` keeps just the root.
     pub fn unload(&mut self, depth: usize) {
-        if !self.lazy {
-            return;
-        }
         fn rec(n: &mut Arc<Node>, depth: usize) {
             if !n.entries.iter().any(|e| matches!(e, Entry::Child { node: Some(_), .. })) {
                 return;
