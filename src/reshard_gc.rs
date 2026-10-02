@@ -1,34 +1,17 @@
-//! Retired-state GC for online split/merge (DESIGN.md "Online shard
-//! split/merge", "Retired state GC").
-//!
+//! Retired-state GC for online split/merge (DESIGN.md "Retired state GC").
 //! A split or merge leaves its parents' state dirs behind: the children are
-//! SlateDB clones that read the parents' SSTs in place ("external SSTs")
-//! until compaction rewrites them, and size-tiered compaction may never
-//! rewrite a quiet child's bottom run. Two halves:
+//! SlateDB clones reading the parents' SSTs in place until compaction
+//! rewrites them, which size-tiered compaction may never do for a quiet
+//! child's bottom run. So:
 //!
 //! - **Forced detach** (every node, for the shards it holds): a shard still
 //!   reading inherited SSTs `detach_after` after we opened it gets one
-//!   compaction submitted that rewrites its tree from the newest source
-//!   holding an inherited SST down to its oldest sorted run. Once the
-//!   compactor's read-guard checkpoints of the older manifests expire,
-//!   SlateDB's own detach GC (in the shard's DB) deletes the checkpoint the
-//!   clone pinned in each parent and drops the parent from the manifest.
-//! - **Dir GC** (the owner of slot 0's shard, like dead-log retention): a
-//!   state dir whose shard is out of the layout (a retired parent, or an
-//!   aborted op's half-made clone) is deleted once no checkpoint is left in
-//!   its manifest (every clone that reads its SSTs, transitively, holds one;
-//!   so do readers and named backups), no manifest in the bucket lists its
-//!   SSTs, and its manifest has not changed for `grace`; never while a
-//!   reshard op is pending. Then its `assign/` record goes. Bounded work
-//!   per pass; deletes are idempotent and resumable (SlateDB's
-//!   `delete_db` marker).
-//!
-//! An idle dir pass is skipped (no requests but the layout GET) while the
-//! layout is unchanged since a full pass that found nothing out of the
-//! layout, at most [`FULL_PASS_EVERY`] apart (see `ReshardGc::dir_pass`).
-//!
-//! Optionally (`full_every`) every held shard gets a full compaction once
-//! per interval, which also drops tombstones in its bottom run.
+//!   rewriting compaction; SlateDB's own detach GC then releases the parents.
+//! - **Dir GC** (the owner of slot 0's shard): a state dir out of the layout
+//!   is deleted once no checkpoint is left in its manifest, no manifest
+//!   lists its SSTs, and its manifest is older than `grace`; then its
+//!   `assign/` record goes.
+//! - Optionally (`full_every`), a full compaction of every held shard.
 
 use crate::cluster::Assignment;
 use crate::metrics;
@@ -46,28 +29,23 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Time between passes.
     pub interval: Duration,
-    /// Dir GC: a retired dir is deleted only once its newest manifest is
-    /// this old (None = no dir or assign/ GC).
+    /// None = no dir or assign/ GC.
     pub grace: Option<Duration>,
-    /// Dir GC: dirs deleted per pass at most (and 4x that many checked).
+    /// Dirs deleted per pass at most (and 4x that many checked).
     pub max_dirs: usize,
-    /// Forced detach: a shard still reading inherited SSTs this long after
-    /// we opened it gets a rewriting compaction (None = off).
+    /// None = no forced detach.
     pub detach_after: Option<Duration>,
-    /// Forced compactions in flight per node at most.
+    /// Forced compactions in flight per node.
     pub max_inflight: usize,
-    /// Opt-in: a full compaction of every held shard once per this.
     pub full_every: Option<Duration>,
 }
 
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
-pub const DEFAULT_GRACE: Duration = Duration::from_secs(3600);
-pub const DEFAULT_DETACH_AFTER: Duration = Duration::from_secs(300);
-/// A dir pass LISTs `state/` and `assign/` at least this often even while
-/// the skip rule says nothing can be there: a safety net for whatever it
-/// doesn't foresee (see `ReshardGc::dir_pass`).
+const DEFAULT_GRACE: Duration = Duration::from_secs(3600);
+const DEFAULT_DETACH_AFTER: Duration = Duration::from_secs(300);
+/// A dir pass LISTs at least this often even while the skip rule says
+/// nothing can be there: a safety net (see `ReshardGc::dir_pass`).
 pub const FULL_PASS_EVERY: Duration = Duration::from_secs(3600);
 
 impl Default for Config {
@@ -76,23 +54,20 @@ impl Default for Config {
     }
 }
 
-/// A test hook: asked at a named point, true = stop there.
+/// Test hook: true = stop at this named point, as a crash would.
 pub type PhaseHook = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
-/// What the GC needs from the node.
 pub struct Hooks {
-    /// Whether this node runs dir GC (owns the shard holding slot 0).
+    /// Whether this node runs dir GC.
     pub leader: Box<dyn Fn() -> bool + Send + Sync>,
-    /// Our node lease is valid (checked before each delete).
+    /// Checked before each delete.
     pub lease_ok: Box<dyn Fn() -> bool + Send + Sync>,
-    /// The shard DBs open here.
     pub owned: Box<dyn Fn() -> Vec<(ShardId, Arc<Db>)> + Send + Sync>,
-    /// Test hook, asked at "deleted-dir" (a dir is gone, its assignment not
-    /// yet): true stops the pass there, as a crash would.
+    /// Asked at "deleted-dir" (a dir is gone, its assignment not yet).
     pub crash_at: Option<PhaseHook>,
 }
 
-/// Why a retired dir is kept (the `vlpds_reshard_gc_retired_dirs` states).
+/// Why a retired dir is kept (`vlpds_reshard_gc_retired_dirs` states).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Held {
     /// A live checkpoint in its manifest: a clone (child, grandchild) that
@@ -118,20 +93,16 @@ impl Held {
     }
 }
 
-/// What one dir-GC pass did and saw.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Pass {
-    /// Dirs of shards out of the layout found.
+    /// Dirs of shards out of the layout.
     pub retired: usize,
     pub deleted_dirs: usize,
     pub deleted_objects: usize,
     pub deleted_assigns: usize,
-    /// Checked dirs kept, by reason.
     pub held: HashMap<Held, usize>,
-    /// Skipped: a reshard op is pending.
     pub op_pending: bool,
-    /// Skipped: the layout is the one an earlier pass found nothing to do
-    /// under (no LISTs).
+    /// The layout is the one an earlier pass found nothing to do under.
     pub skipped: bool,
 }
 
@@ -152,17 +123,14 @@ impl Kind {
 
 #[derive(Default)]
 struct State {
-    /// compactions we submitted, by shard
     inflight: HashMap<ShardId, (Compaction, Kind, Instant)>,
-    /// when we first saw each shard open here
+    /// When we first saw each shard open here.
     seen: HashMap<ShardId, Instant>,
-    /// last full compaction submitted per shard (opt-in)
     last_full: HashMap<ShardId, Instant>,
-    /// dir GC resumes checking after this id (round robin)
+    /// Dir GC resumes checking after this id (round robin).
     cursor: Option<ShardId>,
-    /// The layout of the last full dir pass, if it found no dir and no
-    /// assignment out of the layout, and when that pass started. While
-    /// the layout stays this one, passes skip their LISTs.
+    /// The layout of the last full dir pass, if it found nothing out of the
+    /// layout, and when that pass started.
     idle: Option<(Layout, Instant)>,
 }
 
@@ -182,7 +150,6 @@ impl ReshardGc {
         Arc::new(ReshardGc { store, cfg, hooks, st: Mutex::default() })
     }
 
-    /// Runs both halves every `interval`, forever.
     pub fn spawn(self: &Arc<Self>) {
         metrics::init_reshard_gc_counters();
         let me = self.clone();
@@ -221,12 +188,8 @@ impl ReshardGc {
         slatedb::admin::AdminBuilder::new(crate::partition::db_path(&self.store, id), self.store.raw.clone()).build()
     }
 
-    // ---- forced detach (and opt-in full compactions) ----
-
-    /// Every held shard: follows the compactions we submitted, and submits
-    /// one (at most `max_inflight` in flight) for a shard that still reads
-    /// inherited SSTs `detach_after` after we first saw it, or is due a
-    /// full compaction.
+    /// Follows the compactions we submitted, and submits one for each held
+    /// shard due a forced detach or a full compaction.
     pub async fn compaction_pass(&self) -> anyhow::Result<()> {
         let owned = (self.hooks.owned)();
         let now = Instant::now();
@@ -281,19 +244,16 @@ impl ReshardGc {
             } else {
                 continue;
             };
-            // the spec from the stored manifest: the compactor validates
-            // against it, and the writer's view lags its results
             let admin = self.admin(id);
-            // never next to an active compaction: SlateDB promotes a
-            // submitted spec without checking it against claimed jobs, so
-            // ours (into the bottom run) could share a destination with a
-            // running one, and the worker's executor panics on two jobs for
-            // one destination (fixed in the fork on
-            // vlpds-0.17-submit-dest-guard; this narrows the race to the
-            // gap between this read and the submit until that lands)
+            // Never next to an active compaction: SlateDB promotes a submitted
+            // spec without checking it against claimed jobs, and the worker
+            // panics on two jobs for one destination (fixed in the fork on
+            // vlpds-0.17-submit-dest-guard; this narrows the race until then).
             if admin.read_compactions(None).await?.is_some_and(|cs| cs.recent_compactions().any(|c| c.active())) {
                 continue;
             }
+            // the stored manifest: the compactor validates against it, and the
+            // writer's view lags its results
             let Some(latest) = admin.read_manifest(None).await? else { continue };
             let Some(spec) = rewrite_spec(&latest, kind == Kind::Full) else { continue };
             match admin.submit_compaction(spec).await {
@@ -314,10 +274,8 @@ impl ReshardGc {
         Ok(())
     }
 
-    // ---- dir GC ----
-
-    async fn read_layout(&self) -> anyhow::Result<Option<Layout>> {
-        match self.store.raw.get(&Path::from(format!("{}/assign/layout", self.store.prefix))).await {
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &Path) -> anyhow::Result<Option<T>> {
+        match self.store.raw.get(path).await {
             Ok(r) => Ok(Some(serde_json::from_slice(&r.bytes().await?)?)),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(e.into()),
@@ -325,48 +283,36 @@ impl ReshardGc {
     }
 
     async fn read_assignment(&self, id: ShardId) -> anyhow::Result<Option<Assignment>> {
-        match self.store.raw.get(&assign_path(&self.store, id)).await {
-            Ok(r) => Ok(Some(serde_json::from_slice(&r.bytes().await?)?)),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        self.get_json(&assign_path(&self.store, id)).await
     }
 
-    /// Shard ids with a dir under `state/`.
     async fn state_dirs(&self) -> anyhow::Result<BTreeSet<ShardId>> {
         let r = self.store.raw.list_with_delimiter(Some(&Path::from(format!("{}/state", self.store.prefix)))).await?;
         Ok(r.common_prefixes.iter().filter_map(|p| p.filename().and_then(ShardId::from_key)).collect())
     }
 
-    /// Shard ids with an `assign/` record.
     async fn assign_records(&self) -> anyhow::Result<BTreeSet<ShardId>> {
         let r = self.store.raw.list_with_delimiter(Some(&Path::from(format!("{}/assign", self.store.prefix)))).await?;
         Ok(r.objects.iter().filter_map(|m| m.location.filename().and_then(ShardId::from_key)).collect())
     }
 
-    /// One pass: retired state dirs, then orphaned assignments.
+    /// Retired state dirs, then orphaned assignments.
     ///
-    /// Skipped after the layout GET (no LISTs, nothing deleted) when the
-    /// layout equals the one of a full pass at most [`FULL_PASS_EVERY`] ago
-    /// that found no retired dir (deletable, held for any reason, or an
-    /// aborted op's clone) and no orphaned assignment. Things out of the
-    /// layout only appear through a layout change: a dir or record of a
-    /// shard id below `next_id` is made by an op (the layout carries it,
-    /// then drops it at the flip or abort) or by a shard's owner while the
-    /// shard is in the layout (leaving it is a change). A pass with
+    /// Skipped after the layout GET when the layout equals that of a full
+    /// pass at most [`FULL_PASS_EVERY`] ago that found nothing out of the
+    /// layout: things out of the layout only appear through a layout change
+    /// (an op's children, or a shard leaving the layout). A pass with
     /// anything left, a pending op, an error or a lost leadership forgets
-    /// what it learned, so the next pass is full. A skip never deletes; it
-    /// only defers work, by at most FULL_PASS_EVERY for anything the rule
-    /// doesn't foresee (e.g. a stale former owner rewriting a deleted
-    /// shard's record).
+    /// what it learned. A skip never deletes; it only defers work, by at
+    /// most FULL_PASS_EVERY for anything the rule doesn't foresee (e.g. a
+    /// stale former owner rewriting a deleted shard's record).
     pub async fn dir_pass(&self) -> anyhow::Result<Pass> {
         let mut pass = Pass::default();
         let Some(grace) = self.cfg.grace else { return Ok(pass) };
-        // A shard's owner reads through its in-memory manifest, refreshed
-        // every manifest poll: one that still lists a parent's SSTs must be
-        // replaced before the parent goes, whatever the configured grace.
+        // An owner's in-memory manifest that still lists a parent's SSTs is
+        // replaced only at its next manifest poll.
         let grace = if cfg!(test) { grace } else { grace.max(crate::partition::manifest_poll_interval() * 3) };
-        let layout = self.read_layout().await;
+        let layout = self.get_json::<Layout>(&Path::from(format!("{}/{}", self.store.prefix, crate::cluster::LAYOUT))).await;
         let started = Instant::now();
         {
             let mut st = self.st.lock();
@@ -376,13 +322,12 @@ impl ReshardGc {
                     return Ok(pass);
                 }
             }
-            // a full pass (or an error) from here: it re-learns
             st.idle = None;
         }
         let Some(layout) = layout? else { return Ok(pass) };
         if layout.op.is_some() {
-            // a pending op (or one resuming after a crash) may still clone
-            // from its parents or write its children's assignments
+            // it may still clone from its parents or write its children's
+            // assignments
             pass.op_pending = true;
             return Ok(pass);
         }
@@ -392,7 +337,7 @@ impl ReshardGc {
         let retired: Vec<ShardId> = dirs.iter().copied().filter(|s| !live.contains(s) && *s < layout.next_id).collect();
         pass.retired = retired.len();
         metrics::RESHARD_GC_RETIRED.with_label_values(&["total"]).set(retired.len() as i64);
-        // round robin from the cursor, so held dirs don't starve the rest
+        // round robin, so held dirs don't starve the rest
         let start = self.st.lock().cursor;
         let mut order: Vec<ShardId> = retired.iter().copied().filter(|s| start.is_none_or(|c| *s > c)).collect();
         order.extend(retired.iter().copied().filter(|s| start.is_some_and(|c| *s <= c)));
@@ -454,8 +399,7 @@ impl ReshardGc {
         Ok(pass)
     }
 
-    /// Whether retired dir `x` may go (Ok), else why it is kept. Its
-    /// manifest must hold no live checkpoint and be older than `grace`.
+    /// Ok: retired dir `x` may go.
     async fn check_dir(&self, x: ShardId, grace: Duration) -> anyhow::Result<Result<(), Held>> {
         if self.read_assignment(x).await?.is_some_and(|a| a.owner.is_some()) {
             tracing::warn!(shard = x.0, "a shard out of the layout has an owner: its state is kept");
@@ -463,7 +407,7 @@ impl ReshardGc {
         }
         let dir = crate::partition::db_path(&self.store, x);
         let Some(m) = self.admin(x).read_manifest(None).await? else {
-            // a delete that stopped half-way finishes; anything else is left
+            // a delete that stopped half-way finishes
             return Ok(match self.store.raw.head(&Path::from(format!("{dir}/.deleting"))).await {
                 Ok(_) => Ok(()),
                 Err(object_store::Error::NotFound { .. }) => Err(Held::Other),
@@ -488,8 +432,8 @@ impl ReshardGc {
         Ok(Ok(()))
     }
 
-    /// Which of `xs` some manifest under `state/` (other than its own)
-    /// lists with SSTs it still reads.
+    /// Which of `xs` some other manifest under `state/` lists with SSTs it
+    /// still reads.
     async fn referenced(&self, dirs: &BTreeSet<ShardId>, xs: &[ShardId]) -> anyhow::Result<HashSet<ShardId>> {
         let paths: HashMap<String, ShardId> = xs.iter().map(|x| (crate::partition::db_path(&self.store, *x), *x)).collect();
         let lists: Vec<anyhow::Result<Vec<String>>> = futures::stream::iter(dirs.iter().copied())
@@ -511,7 +455,7 @@ impl ReshardGc {
         Ok(out)
     }
 
-    /// Deletes `assign/{x}` unless it names an owner. True if it was there.
+    /// Unless it names an owner. True if it was there.
     async fn delete_assignment(&self, x: ShardId) -> anyhow::Result<bool> {
         match self.read_assignment(x).await? {
             None => Ok(false),
@@ -536,17 +480,15 @@ fn assign_path(store: &Store, id: ShardId) -> Path {
     Path::from(format!("{}/assign/{}", store.prefix, id.key()))
 }
 
-/// Whether a shard's manifest still lists SSTs of another DB it reads.
 pub fn has_inherited(m: &VersionedManifest) -> bool {
     m.external_dbs().iter().any(|e| !e.sst_ids.is_empty())
 }
 
 /// The compaction that stops a shard reading inherited SSTs: its tree from
-/// the newest source (L0 view or sorted run) holding one down to the oldest
-/// sorted run, merged into that run (`full`: every source). A suffix of the
-/// tree is always a valid compaction: it holds every L0 older than its
-/// first and every sorted run, so recency order is kept, and the output is
-/// the bottom run (where tombstones are dropped). None: nothing to do.
+/// the newest source holding one down to the oldest sorted run (`full`:
+/// every source). A suffix of the tree is always a valid compaction: it
+/// keeps recency order, and the output is the bottom run (where tombstones
+/// are dropped). None: nothing to do.
 pub fn rewrite_spec(m: &VersionedManifest, full: bool) -> Option<CompactionSpec> {
     let inherited: Vec<_> = m.external_dbs().iter().flat_map(|e| e.sst_ids.iter()).collect();
     // logical order: L0 newest -> oldest, then sorted runs highest id -> 0

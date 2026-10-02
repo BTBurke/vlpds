@@ -1,6 +1,4 @@
-//! The shards this node currently has open, and the layout (slot ranges ->
-//! shard ids) it routes by. Every shard in single-node mode; changes as
-//! shards are acquired/released and as the layout changes (split/merge).
+//! The shards this node has open, and the layout it routes by.
 
 use crate::partition::Partition;
 use crate::slots::{Layout, ShardId};
@@ -14,8 +12,7 @@ pub struct PartitionTable {
 }
 
 impl PartitionTable {
-    /// Starts with the uniform layout of `n` shards (replaced by the
-    /// cluster's layout as soon as it is read).
+    /// Starts with the uniform layout of `n` shards until the cluster's is read.
     pub fn new(n: u32) -> Arc<PartitionTable> {
         Arc::new(PartitionTable { layout: RwLock::new(Arc::new(Layout::uniform(n))), open: RwLock::default() })
     }
@@ -24,12 +21,12 @@ impl PartitionTable {
         self.layout.read().clone()
     }
 
-    /// Installs `l` whatever its version (the cluster's layout at startup).
+    /// Installs `l` whatever its version.
     pub fn replace_layout(&self, l: Arc<Layout>) {
         *self.layout.write() = l;
     }
 
-    /// Installs a newer layout (older versions are ignored).
+    /// Ignores older versions.
     pub fn set_layout(&self, l: Arc<Layout>) {
         let mut cur = self.layout.write();
         if l.version > cur.version || (l.version == cur.version && l.op != cur.op) {
@@ -37,17 +34,15 @@ impl PartitionTable {
         }
     }
 
-    /// Shard owning a routing key (DID or private routing key).
     pub fn shard_of(&self, key: &str) -> ShardId {
         self.layout.read().shard_of(key)
     }
 
-    /// The open shard owning `key`, if this node serves it.
     pub fn for_key(&self, key: &str) -> Option<Arc<Partition>> {
         self.get(self.shard_of(key))
     }
 
-    /// Shards in the layout (owned or not).
+    /// Shards in the layout, owned or not.
     pub fn len(&self) -> usize {
         self.layout.read().shards.len()
     }
@@ -56,7 +51,6 @@ impl PartitionTable {
         self.len() == 0
     }
 
-    /// The open shard with this id.
     pub fn get(&self, id: ShardId) -> Option<Arc<Partition>> {
         self.open.read().get(&id).cloned()
     }
@@ -69,7 +63,6 @@ impl PartitionTable {
         };
     }
 
-    /// Shards open on this node, by id.
     pub fn owned(&self) -> Vec<Arc<Partition>> {
         self.open.read().values().cloned().collect()
     }

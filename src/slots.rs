@@ -8,33 +8,27 @@ use sha2::{Digest, Sha256};
 
 pub const SLOTS: u32 = 65_536;
 
-/// A shard's id: a stable name for one SlateDB (`state/{key}/`), one
-/// assignment (`assign/{key}`) and the `shard` tag of log entries. Ids are
-/// allocated from [`Layout::next_id`] (CAS-advanced with the layout) and
+/// Names one SlateDB (`state/{key}/`), one assignment (`assign/{key}`) and
+/// the `shard` tag of log entries. Ids come from [`Layout::next_id`] and are
 /// never reused, so a stale clone or a crashed op's leftovers can never be
-/// mistaken for a later shard. 32 bits: ~4.3 B lifetime split/merge ops.
-/// JSON and logs show the plain number; object keys use [`ShardId::key`].
+/// mistaken for a later shard.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ShardId(pub u32);
 
 impl ShardId {
-    /// Digits in [`key`](Self::key) (`u32::MAX` has 10).
+    /// `u32::MAX` has 10 digits.
     pub const KEY_WIDTH: usize = 10;
 
-    /// Object-key form: 10 zero-padded decimal digits (`assign/0000000042`,
-    /// `state/0000000042/`), so keys LIST in id order and read like the ids
-    /// in logs, metrics and the admin API.
+    /// Zero-padded so keys LIST in id order.
     pub fn key(self) -> String {
         format!("{:010}", self.0)
     }
 
-    /// Parses [`key`](Self::key)'s form exactly (10 ASCII digits).
     pub fn from_key(s: &str) -> Option<ShardId> {
         (s.len() == Self::KEY_WIDTH && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok().map(ShardId)).flatten()
     }
 
-    /// The id after this one (None at `u32::MAX`: ids exhausted).
     pub fn next(self) -> Option<ShardId> {
         self.0.checked_add(1).map(ShardId)
     }
@@ -103,12 +97,10 @@ pub struct Reshard {
     pub id: u64,
     /// Adjacent shards being replaced, in slot order (1 = split, 2 = merge).
     pub parents: Vec<ShardId>,
-    /// Their replacement, covering the same slots.
     pub children: Vec<ShardRange>,
     /// Node completing it once every parent is frozen.
     pub driver: String,
-    /// Fields of a newer feature level, kept when this node CASes the
-    /// object (DESIGN.md "Rolling upgrades": tolerant control objects).
+    /// Fields of a newer feature level, kept across our CAS writes.
     #[serde(default, flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -119,32 +111,25 @@ impl Reshard {
     }
 }
 
-/// The shard map: contiguous slot ranges covering [0, 65536), each naming a
-/// stable shard id (`assign/layout`, CAS on its ETag). `version` grows when
-/// routing changes; `op` is a split/merge being prepared.
+/// `assign/layout`: contiguous slot ranges covering [0, 65536). `version`
+/// grows when routing changes; `op` is a split/merge being prepared.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Layout {
     pub version: u64,
-    /// In slot order.
     pub shards: Vec<ShardRange>,
-    /// The shard-id allocator: every id below it has been handed out (to a
-    /// shard, or to an op's children whether the op flipped or not), none at
-    /// or above it has. It only grows, and only by a CAS of this object
-    /// (`with_op` / `flipped` past [`Layout::alloc`]'s ids), so ids are
-    /// never reused.
+    /// Every id below it has been handed out (to a shard, or to an op's
+    /// children whether the op flipped or not). Only grows, by a CAS of this
+    /// object, so ids are never reused.
     pub next_id: ShardId,
-    /// Ops planned so far (op ids).
     pub op_seq: u64,
     pub op: Option<Reshard>,
-    /// Fields of a newer feature level, kept when this node CASes the
-    /// object (DESIGN.md "Rolling upgrades": tolerant control objects).
+    /// Fields of a newer feature level, kept across our CAS writes.
     #[serde(default, flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Layout {
-    /// Version 1: `n` uniform ranges with ids 0..n (`shard_of_slot`).
-    /// `n` is capped at 65,536 (one slot per shard).
+    /// Version 1: `n` (at most 65,536) uniform ranges with ids 0..n.
     pub fn uniform(n: u32) -> Layout {
         let n = n.clamp(1, SLOTS);
         let shards = (0..n)
@@ -156,20 +141,17 @@ impl Layout {
         Layout { version: 1, shards, next_id: ShardId(n), op_seq: 0, op: None, extra: Default::default() }
     }
 
-    /// The next `n` unused ids, from `next_id`. Allocating is planning an
-    /// op: `with_op` advances `next_id` past them and the layout's CAS makes
-    /// that stick exactly once (a lost CAS re-plans from the newer layout).
+    /// The next `n` unused ids. `with_op` advances `next_id` past them; the
+    /// layout's CAS makes that stick exactly once.
     pub fn alloc(&self, n: u32) -> anyhow::Result<Vec<ShardId>> {
         let end = self.next_id.0.checked_add(n).ok_or_else(|| anyhow::anyhow!("shard ids exhausted (next_id {})", self.next_id))?;
         Ok((self.next_id.0..end).map(ShardId).collect())
     }
 
-    /// `next_id` once `op`'s children are used up (never below the current).
     fn next_id_after(&self, op: &Reshard) -> ShardId {
         op.children.iter().filter_map(|c| c.id.next()).fold(self.next_id, ShardId::max)
     }
 
-    /// Contiguous, covering, ids unique and below `next_id`.
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.shards.is_empty(), "empty layout");
         anyhow::ensure!(self.shards[0].lo == 0 && self.shards.last().unwrap().hi == SLOTS, "layout must cover [0, 65536)");
@@ -188,7 +170,6 @@ impl Layout {
         Ok(())
     }
 
-    /// Index (in slot order) of the shard holding `slot`.
     pub fn index_of_slot(&self, slot: u16) -> usize {
         self.shards.partition_point(|r| r.hi <= slot as u32).min(self.shards.len() - 1)
     }
@@ -197,7 +178,7 @@ impl Layout {
         self.shards[self.index_of_slot(slot)].id
     }
 
-    /// Shard owning a routing key (DID or private routing key).
+    /// `key`: a DID or a private routing key.
     pub fn shard_of(&self, key: &str) -> ShardId {
         self.shard_of_slot(slot_of(key))
     }
@@ -214,13 +195,7 @@ impl Layout {
         self.shards.iter().map(|r| r.id).collect()
     }
 
-    /// The shard after `id` in slot order.
-    pub fn next_after(&self, id: ShardId) -> Option<ShardId> {
-        let i = self.shards.iter().position(|r| r.id == id)?;
-        self.shards.get(i + 1).map(|r| r.id)
-    }
-
-    /// Plans splitting `id` at slot `at` (default: the midpoint).
+    /// Splits at slot `at` (default: the midpoint).
     pub fn plan_split(&self, id: ShardId, at: Option<u32>, driver: &str) -> anyhow::Result<Reshard> {
         anyhow::ensure!(self.op.is_none(), "a reshard is already in progress");
         let r = self.range_of(id).ok_or_else(|| anyhow::anyhow!("no shard {id} in layout v{}", self.version))?;
@@ -238,7 +213,7 @@ impl Layout {
         })
     }
 
-    /// Plans merging adjacent shards `left` and `right` (slot order).
+    /// `left` and `right` must be adjacent, in slot order.
     pub fn plan_merge(&self, left: ShardId, right: ShardId, driver: &str) -> anyhow::Result<Reshard> {
         anyhow::ensure!(self.op.is_none(), "a reshard is already in progress");
         let i = self.shards.iter().position(|r| r.id == left).ok_or_else(|| anyhow::anyhow!("no shard {left} in layout v{}", self.version))?;
@@ -253,16 +228,14 @@ impl Layout {
         })
     }
 
-    /// This layout with `op` planned. Its children's ids are used up now,
-    /// whether it flips or is aborted: a child's state is cloned from its
-    /// parents as frozen *for this op*, so a later op must never find (and
-    /// reuse) an aborted op's clone under the same id.
+    /// Uses up `op`'s child ids now, whether it flips or is aborted: a
+    /// child's state is cloned from its parents as frozen *for this op*, so
+    /// a later op must never find (and reuse) an aborted op's clone.
     pub fn with_op(&self, op: Reshard) -> Layout {
         let next_id = self.next_id_after(&op);
         Layout { op_seq: op.id, op: Some(op), next_id, ..self.clone() }
     }
 
-    /// The next version: `op`'s parents replaced by its children.
     pub fn flipped(&self, op: &Reshard) -> anyhow::Result<Layout> {
         let first = self.shards.iter().position(|r| r.id == op.parents[0]).ok_or_else(|| anyhow::anyhow!("parent {} not in layout", op.parents[0]))?;
         for (k, p) in op.parents.iter().enumerate() {
@@ -278,20 +251,16 @@ impl Layout {
 }
 
 /// Shard `k` of `n` of the slot space (`subscribeRepos?shard=k/n`): the
-/// slots `s` with `s * n / 65536 == k`, i.e. what `shard_of_slot` puts in
-/// shard k of an n-shard layout. For n dividing a cluster's shard count (or
-/// vice versa) the boundaries line up with the cluster's shards.
+/// slots `shard_of_slot` puts in shard k of an n-shard uniform layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotRange {
     pub k: u32,
     pub n: u32,
-    /// slots [lo, hi)
     pub lo: u32,
     pub hi: u32,
 }
 
 impl SlotRange {
-    /// k < n <= 65,536.
     pub fn new(k: u32, n: u32) -> Option<SlotRange> {
         if n == 0 || n > SLOTS || k >= n {
             return None;

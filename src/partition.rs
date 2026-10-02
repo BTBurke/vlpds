@@ -1,6 +1,6 @@
-//! A shard handle. Shards are the unit of ownership and state: each has its
-//! own SlateDB (`state/{id:010}`), while all shards owned by a node share the
-//! node's commit log (see nodelog.rs).
+//! A shard handle and its SlateDB: settings, shared caches, compaction,
+//! and clones for split/merge. All shards on a node share its commit log
+//! (nodelog.rs).
 
 pub use crate::nodelog::{seq_floor, AckFn, LogEntry, Watermark};
 use crate::nodelog::NodeLog;
@@ -13,30 +13,24 @@ use tokio::sync::mpsc;
 
 pub struct Partition {
     pub id: ShardId,
-    /// Ownership epoch (from the shard assignment).
     pub epoch: u64,
     pub db: Arc<Db>,
     /// Held (write) by the log finalizer across apply + ack; export readers
     /// take it (read) to pair a durable repo view with a SlateDB snapshot.
     pub apply_lock: Arc<tokio::sync::RwLock<()>>,
-    /// The node log's intake (shared by every shard on this node).
+    /// The node log's intake.
     pub tx: mpsc::Sender<LogEntry>,
-    /// The node log's watermark.
     pub wm: Arc<Watermark>,
     pub log: Arc<NodeLog>,
-    /// Repos recently written here (preloaded by the shard's next owner).
     pub recent: Arc<RecentRepos>,
 }
 
-/// Default bound of [`RecentRepos`] per shard (`--preload-recent`).
 pub const DEFAULT_RECENT_REPOS: usize = 2048;
 
-/// The repos a shard committed to most recently, newest first, bounded.
-/// Persisted with each checkpoint and at close (`nodelog::META_RECENT`,
-/// only when the set's members changed), and preloaded by the shard's next
-/// owner ([`crate::worker::spawn_preload`]), so the first writes after a
-/// restart, takeover or handback find their repos warm (DESIGN.md §2). A
-/// hint: a stale entry costs one load.
+/// The repos a shard committed to most recently, newest first. Persisted
+/// with checkpoints (`nodelog::META_RECENT`) and preloaded by the shard's
+/// next owner, so the first writes after a takeover or handback find their
+/// repos warm. A hint: a stale entry costs one load.
 pub struct RecentRepos {
     cap: usize,
     inner: parking_lot::Mutex<(lru::LruCache<Arc<str>, ()>, bool)>,
@@ -58,7 +52,6 @@ impl RecentRepos {
         self.cap
     }
 
-    /// `did` committed (a worker, once per commit batch).
     pub fn touch(&self, did: &Arc<str>) {
         if self.cap == 0 {
             return;
@@ -86,12 +79,11 @@ impl RecentRepos {
         }
     }
 
-    /// Whether the set changed since the last `take_dirty`.
     pub fn is_dirty(&self) -> bool {
         self.inner.lock().1
     }
 
-    /// The set, newest first, if its members changed since the last call.
+    /// Newest first, if its members changed since the last call.
     pub fn take_dirty(&self) -> Option<bytes::Bytes> {
         let mut g = self.inner.lock();
         if !std::mem::take(&mut g.1) {
@@ -110,22 +102,19 @@ impl RecentRepos {
     }
 }
 
-/// One SST block/meta cache shared by every shard DB in the process. SlateDB's
-/// default is a private 512 MiB block + 128 MiB meta cache per Db, which at
-/// 256 shards per node (the old default) let the caches grow toward ~160 GiB
-/// as reads touch more shards (the RSS creep seen at 1M–10M repos).
+/// One block/meta cache shared by every shard DB in the process: SlateDB's
+/// default private caches per Db grow with the shard count.
 static BLOCK_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(4 << 30);
 
-/// Size of the shared block cache (the meta cache gets a quarter on top).
-/// Takes effect only before the first shard DB opens.
+/// The meta cache gets a quarter on top. Takes effect only before the first
+/// shard DB opens.
 pub fn set_block_cache_bytes(n: u64) {
     BLOCK_CACHE_BYTES.store(n.max(64 << 20), std::sync::atomic::Ordering::Relaxed);
 }
 
 static CACHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Benchmarks: DBs opened from now on don't see what the shared cache holds
-/// for earlier opens of the same path (a restart starts cold).
+/// Benchmarks: DBs opened from now on start cold, as after a restart.
 pub fn bump_cache_epoch() {
     CACHE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -145,14 +134,11 @@ fn shared_db_cache() -> Arc<dyn slatedb::db_cache::DbCache> {
         .clone()
 }
 
-/// The shared SST metadata cache (bloom filters, indexes, stats): read-mostly
-/// shards under RwLocks with CLOCK eviction, so a hit takes a shared lock
-/// and sets one bit. Foyer (the block cache) takes its shard's mutex on every
-/// hit to update eviction state, and every point read of a repo checks the
-/// same few SSTs' filters (one DB per repo's shard, up to 32 L0s plus the
-/// sorted runs): the threads serialized on those hot keys. Point reads of one
-/// 10M-record repo spent 32-66% of CPU spinning on that lock (getRecord
-/// 24k/s on the laptop, 35k/s on benchbox with 32 IO threads vs 63k with 6).
+/// The shared SST metadata cache (filters, indexes, stats): RwLock shards
+/// with CLOCK eviction, so a hit takes a shared lock and sets one bit.
+/// Foyer takes its shard's mutex on every hit, and every point read of a
+/// repo checks the same few SSTs' filters: threads serialized on those hot
+/// keys.
 pub struct MetaCache {
     shards: Vec<parking_lot::RwLock<MetaShard>>,
     shard_bytes: usize,
@@ -168,7 +154,7 @@ struct MetaShard {
 struct MetaSlot {
     entry: slatedb::db_cache::CachedEntry,
     size: usize,
-    /// CLOCK bit: set on a hit, cleared by an eviction sweep that spares it
+    /// CLOCK bit
     used: std::sync::atomic::AtomicBool,
 }
 
@@ -253,8 +239,8 @@ impl slatedb::db_cache::DbCache for MetaCache {
     }
 }
 
-/// SST block compression for shard DBs (`--sst-compression`). Each SST
-/// records its codec, so a DB written with another one stays readable.
+/// Each SST records its codec, so a DB written with another one stays
+/// readable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SstCompression {
     None,
@@ -286,53 +272,40 @@ impl SstCompression {
 
 static SST_COMPRESSION: parking_lot::RwLock<SstCompression> = parking_lot::RwLock::new(SstCompression::Zstd);
 
-/// Codec for shard DBs opened from now on (and their compaction output).
 pub fn set_sst_compression(c: SstCompression) {
     *SST_COMPRESSION.write() = c;
 }
 
-/// SlateDB GC (`--slatedb-gc-min-age`): an SST no manifest or checkpoint
-/// references is deleted once it is this old, counted from its *creation*.
-/// It only guards SSTs written but not yet in a manifest (SlateDB also caps
-/// the cutoff at the oldest running compaction and the newest L0), so it
-/// doesn't protect reads: an SST created long ago and replaced now passes
-/// any min age at once. Reads are protected by the compactor's checkpoint
-/// lifetime below. (It was 24 h, which kept every SST a bulk import
-/// replaced, ~3x the live bytes, for a day; see DESIGN.md §4.)
+/// SlateDB GC deletes an unreferenced SST once it is this old, counted from
+/// its *creation*. It only guards SSTs written but not yet in a manifest,
+/// so it doesn't protect reads: the compactor's checkpoint lifetime does.
 static GC_MIN_AGE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10 * 60);
 
 pub fn set_gc_min_age(d: Duration) {
     GC_MIN_AGE_SECS.store(d.as_secs(), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Compactor checkpoint lifetime (`--slatedb-checkpoint-lifetime`). Before
-/// each manifest update that replaces SSTs, the compactor writes a
+/// Before each manifest update that replaces SSTs, the compactor writes a
 /// checkpoint of the old manifest that lives this long, so GC keeps the
-/// replaced SSTs for reads that started on it: a scan or snapshot (a
-/// 10M-record getRepo streaming to a slow client, listRepos) must finish
-/// within it. SlateDB's default is 15 min. It also bounds how long a bulk
-/// import's replaced SSTs linger after each compaction.
-// (unit tests: 1 s, so forced detaches in reshard_gc tests complete)
+/// replaced SSTs for reads that started on it: a scan or snapshot (a big
+/// getRepo to a slow client) must finish within it. It also bounds how long
+/// replaced SSTs linger. Unit tests: 1 s, so forced detaches complete.
 static CHECKPOINT_LIFETIME_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(if cfg!(test) { 1 } else { 3600 });
 
 pub fn set_checkpoint_lifetime(d: Duration) {
     CHECKPOINT_LIFETIME_SECS.store(d.as_secs().max(60), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Tests only: [`set_checkpoint_lifetime`] without its 60 s floor (a
-/// forced detach waits out the compactor's checkpoints before SlateDB
-/// releases the parent; see `reshard_gc`).
+/// Tests only: without the 60 s floor (a forced detach waits out the
+/// compactor's checkpoints).
 #[doc(hidden)]
 pub fn set_checkpoint_lifetime_unchecked(d: Duration) {
     CHECKPOINT_LIFETIME_SECS.store(d.as_secs().max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// How often each shard DB's garbage collector runs SlateDB's clone detach:
-/// once a shard reads no SST of a split/merge parent any more (in its
-/// manifest and every manifest a live checkpoint names), it deletes the
-/// checkpoint the clone pinned in the parent and drops the parent from its
-/// manifest (`reshard_gc` then deletes the parent's dir). SlateDB's default
-/// is 10 min; each run reads the shard's manifest.
+/// How often each shard DB's GC runs SlateDB's clone detach, which releases
+/// a split/merge parent once no live manifest reads its SSTs (then
+/// `reshard_gc` deletes the parent's dir). Each run reads the manifest.
 static DETACH_INTERVAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(600_000);
 
 pub fn set_detach_interval(d: Duration) {
@@ -343,16 +316,12 @@ fn checkpoint_lifetime() -> Duration {
     Duration::from_secs(CHECKPOINT_LIFETIME_SECS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// How often a shard DB re-reads its manifest (`--slatedb-manifest-poll`,
-/// SlateDB's default is 1 s). Each poll is two GETs (a probe of the next
-/// manifest id, usually a 404, plus its GC boundary file), the largest
-/// fixed per-shard request line (bench/results/cost-model-2026-10-02). The
-/// node is the only writer of its shards' DBs, so reads never wait on it:
-/// writes land in the memtable and the writer's own flushes update its
-/// manifest in place. A poll only picks up the compactor's results, and
-/// every flush's manifest CAS already reloads on a conflict. The one case
-/// that waits on it, a writer whose view of L0 is full, is refreshed every
-/// `FAST_POLL` while L0 runs deep instead (`spawn_compactor`).
+/// How often a shard DB re-reads its manifest (two GETs per poll per
+/// shard). The node is the only writer of its shards' DBs, so reads never
+/// wait on it: a poll only picks up the compactor's results, and every
+/// flush's manifest CAS already reloads on a conflict. The one case that
+/// waits on it, a writer whose view of L0 is full, is refreshed every
+/// `FAST_POLL` instead (`spawn_deep_refresh`).
 static MANIFEST_POLL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10_000);
 
 pub fn set_manifest_poll_interval(d: Duration) {
@@ -366,12 +335,9 @@ pub(crate) fn manifest_poll_interval() -> Duration {
     Duration::from_millis(MANIFEST_POLL_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// The compactor's and compaction worker's poll interval while L0 is
-/// shallow (`--compaction-poll`; adaptive polling's slow mode and `slow`).
-/// The coordinator reads two files per poll and the worker one, two GETs
-/// each. Nothing waits on it while L0 stays shallow (shallow L0s cost only
-/// bloom-filtered read amplification), and a deep L0 switches to
-/// `FAST_POLL`.
+/// The compactor's and worker's poll interval while L0 is shallow. Nothing
+/// waits on it then (shallow L0s cost only bloom-filtered read
+/// amplification), and a deep L0 switches to `FAST_POLL`.
 static SLOW_POLL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(30_000);
 
 pub fn set_compaction_poll_interval(d: Duration) {
@@ -393,24 +359,21 @@ fn gc_options() -> slatedb::config::GarbageCollectorOptions {
     }
 }
 
-/// A node's local SST disk cache (`--cache-dir`, `--disk-cache-mb`): one
-/// directory per shard under `dir`, each capped at `shard_bytes`.
+/// One directory per shard under `dir`, each capped at `shard_bytes`.
 #[derive(Clone, Debug)]
 pub struct DiskCache {
     pub dir: std::path::PathBuf,
     pub shard_bytes: u64,
 }
 
-/// SlateDB's own per-DB default (16 GiB), kept when `--disk-cache-mb` is unset.
-pub const DEFAULT_DISK_CACHE_SHARD_BYTES: u64 = 16 << 30;
-/// The smallest per-shard cap: a few of SlateDB's 4 MiB cache parts.
-pub const MIN_DISK_CACHE_SHARD_BYTES: u64 = 64 << 20;
+/// SlateDB's own per-DB default.
+const DEFAULT_DISK_CACHE_SHARD_BYTES: u64 = 16 << 30;
+/// A few of SlateDB's 4 MiB cache parts.
+const MIN_DISK_CACHE_SHARD_BYTES: u64 = 64 << 20;
 
-/// The per-shard disk cache cap for a node budget of `node_bytes` when
-/// `shards` shards exist: the budget divided by every shard (not just those
-/// owned now), so the caps sum to at most the budget even if this node ends
-/// up holding every shard (a failover, the first node up). An explicit
-/// `per_shard` wins.
+/// The node budget divided by every shard, not just those owned now, so
+/// the caps sum to at most the budget even if this node ends up holding
+/// every shard. An explicit `per_shard` wins.
 pub fn disk_cache_shard_bytes(node_bytes: Option<u64>, per_shard: Option<u64>, shards: usize) -> u64 {
     let b = match (per_shard, node_bytes) {
         (Some(p), _) => p,
@@ -420,8 +383,6 @@ pub fn disk_cache_shard_bytes(node_bytes: Option<u64>, per_shard: Option<u64>, s
     b.max(MIN_DISK_CACHE_SHARD_BYTES)
 }
 
-/// A node's disk cache flags: `--cache-dir`, `--disk-cache-mb` (node
-/// budget) and `--disk-cache-shard-mb` (explicit per-shard cap).
 #[derive(Clone, Debug)]
 pub struct DiskCacheConfig {
     pub dir: std::path::PathBuf,
@@ -430,38 +391,19 @@ pub struct DiskCacheConfig {
 }
 
 impl DiskCacheConfig {
-    /// The cache a shard opens with while `shards` shards exist (the layout's
-    /// plus a split/merge's children: both are open during the op).
     pub fn for_shards(&self, shards: usize) -> DiskCache {
         DiskCache { dir: self.dir.clone(), shard_bytes: disk_cache_shard_bytes(self.node_bytes, self.shard_bytes, shards) }
     }
 }
 
-/// The settings [`open_db`] opens a shard with.
 fn shard_settings(partition: ShardId, cache: Option<&DiskCache>) -> slatedb::Settings {
-    // Per-shard LSM shape. A whole repo lives in one shard, so one shard must
-    // absorb a bulk import (bench 2026-10-02 §4). With 8 MiB L0s and
-    // SlateDB's default cap of 8, L0 filled in ~2 s at 25 MB/s and then
-    // waited a full compaction cycle (coordinator poll 5 s + worker poll
-    // 5 s ± 2.5 + commit 1 s + manifest poll 1 s): 4-11 s write stalls, and
-    // since the finalizer awaits every shard's apply, the whole node stalled.
-    // Now L0 holds 32 x 16 MiB = 512 MiB, more than a slow cycle's worth of
-    // ingest, so compaction catches up without backpressure (one shard,
-    // 2M records, 10 ms store calls: worst write 11.8 s -> 6 ms at 50k
-    // records/s, 34 ms at 80k/s; tests/all/shard_ingest.rs). L0s live in the
-    // object store and are bloom-filtered, so the cost is read
-    // amplification only while compaction lags. Compactor polling is
-    // adaptive (`spawn_compactor`): 30 s polls while L0 is shallow, 500 ms
-    // (plus writer manifest refreshes) while it runs deep, so unpaced bursts
-    // are absorbed without the idle GETs of always-fast polls
-    // (tests/all/compaction_polling.rs, tests/all/cost_defaults.rs).
-    //
-    // Memory: the active memtable freezes at 16 MiB (the 10 s node
-    // checkpoint flushes idle shards' sooner), so memtables total at most
-    // min(shards x 16 MiB, ingest rate x 10 s). `max_unflushed_bytes` only
-    // binds on a shard whose flushes are blocked, and while one shard is
-    // blocked the node log's finalizer stops feeding every shard, so the
-    // blocked shard's 128 MiB is the only excess: no node-wide budget needed.
+    // A whole repo lives in one shard, so one shard must absorb a bulk
+    // import: L0 holds more than a slow compaction cycle's worth of ingest
+    // (a full L0 stalls the finalizer, and so the whole node). L0s are
+    // bloom-filtered, so the cost is read amplification only while
+    // compaction lags. `max_unflushed_bytes` only binds on a shard whose
+    // flushes are blocked, and then the finalizer stops feeding every shard:
+    // no node-wide memtable budget needed. DESIGN.md §4 has the numbers.
     let mut settings = slatedb::Settings {
         wal_enabled: false,
         flush_interval: Some(Duration::from_millis(100)),
@@ -473,14 +415,11 @@ fn shard_settings(partition: ShardId, cache: Option<&DiskCache>) -> slatedb::Set
         manifest_poll_interval: manifest_poll_interval(),
         compression_codec: SST_COMPRESSION.read().codec(),
         garbage_collector_options: Some(gc_options()),
-        // started after the open (`spawn_compactor`): half of an open's
-        // sequential store calls were the embedded compactor's startup
+        // started after the open (`spawn_compactor`)
         compactor_options: None,
         ..Default::default()
     };
     if let Some(c) = cache {
-        // Local disk cache of SST parts: restarts and takeovers start warm
-        // instead of turning every cold repo load into object store GETs.
         let oc = &mut settings.object_store_cache_options;
         oc.root_folder = Some(c.dir.join(partition.key()));
         oc.max_cache_size_bytes = Some(c.shard_bytes as usize);
@@ -518,12 +457,11 @@ pub async fn open_db(
     Ok(db)
 }
 
-/// A shard cloned from others (split/merge, DESIGN.md "Online shard
-/// split/merge") reads its ancestors' SSTs in place until compaction
-/// rewrites them. The DB itself resolves them through its manifest, but a
-/// standalone compactor and compaction worker only know the DB's root, so
-/// they get a store that redirects those SST paths to their owners. The
-/// set only shrinks after the open (compaction drops external SSTs).
+/// A cloned shard reads its ancestors' SSTs in place until compaction
+/// rewrites them. The DB resolves them through its manifest, but a
+/// standalone compactor and worker only know the DB's root, so they get a
+/// store that redirects those SST paths. The set only shrinks after the
+/// open.
 fn external_sst_redirect(db: &Db, path: &str, raw: Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore> {
     let m = db.manifest();
     let ext = m.external_dbs();
@@ -579,36 +517,30 @@ impl object_store::ObjectStore for Redirect {
     }
 }
 
-/// Where shard `id`'s SlateDB lives.
 pub fn db_path(store: &Store, id: ShardId) -> String {
     format!("{}/state/{}", store.prefix, id.key())
 }
 
 /// Creates shard `child`'s SlateDB as a clone of `sources` (shard id, slots
-/// [lo, hi)), each projected to its slots: a split clones one parent per
-/// child, a merge clones both parents into one. O(manifest): the child
-/// references the sources' SSTs (pinned by a checkpoint in each source)
-/// until its compaction rewrites them. The sources must be closed (all
-/// their state in SSTs). Idempotent: a retry finds the clone initialized.
+/// [lo, hi)), each projected to its slots. O(manifest): the child references
+/// the sources' SSTs. The sources must be closed (all their state in SSTs).
+/// Idempotent.
 pub async fn clone_db(store: &Store, child: ShardId, sources: &[(ShardId, u32, u32)]) -> anyhow::Result<()> {
     use std::ops::Bound;
     anyhow::ensure!(!sources.is_empty(), "clone of shard {child} without sources");
     let admin = slatedb::admin::AdminBuilder::new(db_path(store, child), store.raw.clone()).build();
     let name = clone_checkpoint_name(child);
-    // Done already (a retried or resumed op). SlateDB's own retry check
-    // wants every source named in the clone's manifest, which a source
-    // with no SSTs of its own (a split child that took no writes) isn't.
+    // Our own retry check: SlateDB's wants every source named in the
+    // clone's manifest, which a source with no SSTs of its own isn't.
     if admin.read_manifest(None).await?.is_some_and(|m| m.initialized()) {
         drop_clone_checkpoints(store, &name, sources).await;
         return Ok(());
     }
     // Read each source at a checkpoint of our own, named for the child, and
-    // drop it once the clone is initialized (the clone pins what it reads
-    // with its final checkpoints, which have no expiry). SlateDB would take
-    // an unnamed 5 min one, which nothing could drop for a source the
-    // clone's manifest doesn't name, and which would hold a retired parent
-    // (reshard_gc keeps a dir while any checkpoint is live). A resumed
-    // clone reuses the named one.
+    // drop it once the clone is initialized (the clone's final checkpoints
+    // pin what it reads). SlateDB's own unnamed one could never be dropped
+    // for a source the clone's manifest doesn't name, and would hold a
+    // retired parent (reshard_gc keeps a dir while any checkpoint lives).
     let mut specs = Vec::with_capacity(sources.len());
     for &(id, lo, hi) in sources {
         let src = slatedb::admin::AdminBuilder::new(db_path(store, id), store.raw.clone()).build();
@@ -631,16 +563,14 @@ pub async fn clone_db(store: &Store, child: ShardId, sources: &[(ShardId, u32, u
     Ok(())
 }
 
-/// How long a clone's source checkpoints live if the clone never gets to
-/// drop them (a driver that died mid-clone and no one resumed it).
+/// If the clone never gets to drop them (a driver died mid-clone).
 const CLONE_CHECKPOINT_LIFETIME: Duration = Duration::from_secs(3600);
 
 fn clone_checkpoint_name(child: ShardId) -> String {
     format!("vlpds-clone-{}", child.key())
 }
 
-/// Deletes the source checkpoints `clone_db` took for a clone (best effort:
-/// they expire on their own).
+/// Best effort: they expire on their own.
 async fn drop_clone_checkpoints(store: &Store, name: &str, sources: &[(ShardId, u32, u32)]) {
     for &(id, ..) in sources {
         let src = slatedb::admin::AdminBuilder::new(db_path(store, id), store.raw.clone()).build();
@@ -658,14 +588,10 @@ async fn drop_clone_checkpoints(store: &Store, name: &str, sources: &[(ShardId, 
 
 const SST_BLOCK_SIZE: slatedb::SstBlockSize = slatedb::SstBlockSize::Block16Kib;
 
-/// Runs a shard's compactor (coordinator + one worker writing the DB's SST
-/// format) until the DB closes. Started after the open instead of inside it:
-/// the embedded compactor's startup (~12 sequential store calls) doubled the
-/// time from a takeover or handback to serving (tests/all/rebalance_handback.rs;
-/// `open_calls` below: 465 -> 225 ms at 20 ms per call). L0 SSTs flushed
-/// meanwhile wait for it, like any compaction cycle. Its outputs aren't
-/// written into the local SST disk cache (`cache_on_compaction`); reads
-/// cache them.
+/// Runs a shard's compactor (coordinator + one worker) until the DB
+/// closes. Started after the open instead of inside it: the embedded
+/// compactor's startup (~12 sequential store calls) delayed serving after a
+/// takeover or handback.
 fn spawn_compactor(db: &Db, path: String, raw: Arc<dyn object_store::ObjectStore>, codec: Option<slatedb::config::CompressionCodec>) {
     spawn_deep_refresh(db);
     let mut status = db.subscribe();
@@ -682,11 +608,9 @@ fn spawn_compactor(db: &Db, path: String, raw: Arc<dyn object_store::ObjectStore
                 }
             };
             // SlateDB marks the DB closed *before* its final memtable flush,
-            // and that flush waits for L0 room when L0 is full (a close
-            // under bulk ingest: a handback, or freezing a hot shard to
-            // split it). So keep compacting until the DB is gone (every
-            // handle dropped), at most CLOSE_GRACE: stopping at the close
-            // mark deadlocked such a close forever.
+            // which waits for L0 room when L0 is full (a close under bulk
+            // ingest). So keep compacting until every handle is dropped, at
+            // most CLOSE_GRACE: stopping at the close mark deadlocks.
             let closed = async {
                 while status.borrow_and_update().close_reason.is_none() {
                     if status.changed().await.is_err() {
@@ -717,13 +641,10 @@ fn spawn_compactor(db: &Db, path: String, raw: Arc<dyn object_store::ObjectStore
     });
 }
 
-/// While the writer's L0 runs deep (>= `DEEP_L0`), re-reads its manifest
-/// every `FAST_POLL` instead of waiting for the (10 s) manifest poll. A
-/// writer only learns that compaction freed L0 from a manifest read: its
-/// flushes' CAS conflicts reload it, but once its view of L0 is full no
-/// flush runs, and only a refresh unblocks it. Holds a handle until the
-/// DB is closed (a DB dropped unclosed is fenced by its next opener, which
-/// closes it too).
+/// While the writer's L0 runs deep, re-reads its manifest every
+/// `FAST_POLL`: once its view of L0 is full no flush runs (whose CAS
+/// conflicts would reload it), and only a refresh unblocks it. Holds a
+/// handle until the DB is closed.
 fn spawn_deep_refresh(db: &Db) {
     let db = db.clone();
     let mut status = db.subscribe();
@@ -746,19 +667,16 @@ fn spawn_deep_refresh(db: &Db) {
     });
 }
 
-/// How long a closed shard's compactor keeps running for its final flush
-/// (see `spawn_compactor`) if some handle outlives the close.
+/// How long a closed shard's compactor keeps running for its final flush.
 const CLOSE_GRACE: Duration = Duration::from_secs(60);
 
-/// How a shard's compactor polls for work (`--compaction-polling`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompactionPolling {
-    /// `--compaction-poll` (30 s) always: cheapest idle, but an unpaced bulk
-    /// ingest into one shard fills L0 between cycles and backpressures.
+    /// Cheapest idle, but an unpaced bulk ingest into one shard fills L0
+    /// between cycles and backpressures.
     Slow,
-    /// 500 ms polls always: ~10x the idle GETs.
     Fast,
-    /// Slow while L0 is shallow, fast while it is deep (the default).
+    /// Slow while L0 is shallow, fast while it is deep.
     Adaptive,
 }
 
@@ -776,7 +694,6 @@ impl std::str::FromStr for CompactionPolling {
 
 static COMPACTION_POLLING: parking_lot::RwLock<CompactionPolling> = parking_lot::RwLock::new(CompactionPolling::Adaptive);
 
-/// Compaction polling of shard DBs opened from now on.
 pub fn set_compaction_polling(p: CompactionPolling) {
     *COMPACTION_POLLING.write() = p;
 }
@@ -785,17 +702,16 @@ fn compaction_polling() -> CompactionPolling {
     *COMPACTION_POLLING.read()
 }
 
-/// Poll interval of the fast mode (the slow one is `slow_poll()`).
 const FAST_POLL: Duration = Duration::from_millis(500);
-/// Adaptive: go fast at this many L0 SSTs (a quarter of `l0_max_ssts`: the
-/// writer is producing them faster than slow cycles drain them), back to
-/// slow once L0 has stayed at or below `CALM_L0` for `CALM_FOR`.
+/// Adaptive: go fast at this many L0 SSTs (the writer is producing them
+/// faster than slow cycles drain them), back to slow once L0 has stayed at
+/// or below `CALM_L0` for `CALM_FOR`.
 const DEEP_L0: usize = 8;
 const CALM_L0: usize = 2;
 const CALM_FOR: Duration = Duration::from_secs(15);
 
-/// Resolves when an adaptive compactor in mode `fast` should switch. Reads
-/// L0 from the DB's status (holding no handle, so the DB can drop).
+/// Resolves when an adaptive compactor in mode `fast` should switch. Holds
+/// no DB handle, so the DB can drop.
 async fn mode_change(status: &tokio::sync::watch::Receiver<slatedb::DbStatus>, fast: bool) {
     let mut calm_since = None;
     loop {
@@ -815,7 +731,6 @@ async fn mode_change(status: &tokio::sync::watch::Receiver<slatedb::DbStatus>, f
     }
 }
 
-/// A shard's compaction coordinator and worker, polling slow or fast.
 async fn build_compactor(
     path: &str,
     raw: &Arc<dyn object_store::ObjectStore>,
