@@ -1,8 +1,8 @@
 //! Outbound HTTP clients: one builder per role, each client built once and
 //! shared, so connections are pooled and reused (DESIGN.md "HTTP").
 //!
-//! - [`PeerClient`]: node-to-node (forwarding, internal calls). h2c prior
-//!   knowledge, large windows, keepalive PINGs, a few connections per peer.
+//! - [`PeerClient`]: node-to-node (forwarding, internal calls). h2 over
+//!   peer mTLS, large windows, keepalive PINGs, a few connections per peer.
 //! - [`public`]: operator-configured upstreams (AppView, report service, PLC
 //!   directory, relays). h2 via ALPN on https, a pooled HTTP/1.1 on http.
 //!   The AppView proxy has its own: [`proxy`] (https, one client per IO
@@ -777,9 +777,12 @@ pub fn guarded(dev_mode: bool) -> &'static reqwest::Client {
     }
 }
 
-/// Node-to-node client: `n` independent h2 clients (one connection per
-/// peer each), picked round-robin per request: `app.http.get(url)` spreads
-/// calls over the connections.
+/// Node-to-node client: h2 over peer mTLS (TLS 1.3, ALPN h2, https only;
+/// `crate::peer_tls`), `n` independent clients per peer origin (one
+/// connection to that peer each), picked round-robin per request:
+/// `app.http.get(url)` spreads calls over the connections. Each origin's TLS
+/// config checks that the server's certificate names the node the cluster
+/// expects at that origin ([`PeerClient::set_registry`]).
 ///
 /// Bulk downloads ([`is_bulk`]: repo exports, blobs, block fetches; large,
 /// unauthenticated, streamed to clients at their pace) go over `n` other
@@ -788,26 +791,23 @@ pub fn guarded(dev_mode: bool) -> &'static reqwest::Client {
 /// ones every other forward shares (and [`stall::Watched`] drops a body
 /// whose client stopped reading).
 ///
-/// Cleartext (h2c prior knowledge): one set of clients for every peer. Peer
-/// mTLS ([`PeerClient::with_tls`], `crate::peer_tls`): h2 over TLS 1.3
-/// (ALPN h2), https only, one set per peer origin, so each origin's TLS
-/// config checks that the server's certificate names the node whose lease
-/// advertises that origin ([`PeerClient::set_registry`]). Windows, PINGs,
-/// timeouts and connection counts are the same either way.
+/// A lone node (no peer TLS, [`PeerClient::lone`]) has no peers to call:
+/// its requests fail without reaching anyone.
 #[derive(Clone)]
 pub struct PeerClient(Arc<PeerInner>);
 
 struct PeerInner {
     n: usize,
-    /// cleartext peers (also the TLS mode's fallback: never, see `pool_for`)
-    plain: Pool,
-    tls: Option<TlsPeers>,
+    /// None: a lone node
+    tls: Option<Arc<crate::peer_tls::PeerTls>>,
+    registry: Arc<std::sync::OnceLock<Registry>>,
+    /// per origin; a handful of peers, so a scan
+    origins: parking_lot::RwLock<Vec<(Arc<str>, Arc<Pool>)>>,
 }
 
 /// `n` clients for regular calls and `n` for bulk downloads.
 struct Pool {
     clients: Vec<reqwest::Client>,
-    /// for [`is_bulk`] paths (empty: share `clients`)
     bulk: Vec<reqwest::Client>,
     next: AtomicUsize,
 }
@@ -820,7 +820,7 @@ impl Pool {
     }
 
     fn pick(&self, path: &str) -> &reqwest::Client {
-        let c = if !self.bulk.is_empty() && is_bulk(path) { &self.bulk } else { &self.clients };
+        let c = if is_bulk(path) { &self.bulk } else { &self.clients };
         if c.len() == 1 {
             return &c[0];
         }
@@ -828,17 +828,11 @@ impl Pool {
     }
 }
 
-/// Node ids whose lease advertises an origin (`scheme://host:port`).
+/// Node ids the cluster expects at an origin (`https://host:port`): the
+/// nodes whose lease or routing-table entry names it.
 pub type Registry = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 
-struct TlsPeers {
-    tls: Arc<crate::peer_tls::PeerTls>,
-    registry: Arc<std::sync::OnceLock<Registry>>,
-    /// per origin; a handful of peers, so a scan
-    origins: parking_lot::RwLock<Vec<(Arc<str>, Arc<Pool>)>>,
-}
-
-/// Origins kept before ones no lease names any more are dropped.
+/// Origins kept before ones the registry no longer names are dropped.
 const MAX_ORIGINS: usize = 256;
 
 /// Peer calls whose responses are bulk downloads (see [`PeerClient`]).
@@ -858,82 +852,75 @@ pub fn split_origin(url: &str) -> (&str, &str) {
     }
 }
 
+/// A lone node's peer client: https only, trusting no CA, so every request
+/// fails (there is no peer to reach).
+fn refusing() -> &'static reqwest::Client {
+    static C: LazyLock<reqwest::Client> = LazyLock::new(|| {
+        let tls = rustls::ClientConfig::builder_with_provider(crate::peer_tls::provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3 with the ring provider")
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        base("peer").https_only(true).use_preconfigured_tls(tls).build().expect("reqwest client")
+    });
+    &C
+}
+
 impl PeerClient {
-    /// Cleartext (h2c) peers.
-    pub fn new(n: usize) -> reqwest::Result<PeerClient> {
-        Ok(PeerClient(Arc::new(PeerInner { n, plain: Pool::build(n, peer_builder)?, tls: None })))
+    /// Peers over mTLS with `tls`'s certificate and CA. Until
+    /// [`PeerClient::set_registry`] (a client that isn't a node: tests,
+    /// tools) any node of the cluster CA is accepted at any origin.
+    pub fn new(n: usize, tls: Arc<crate::peer_tls::PeerTls>) -> PeerClient {
+        PeerClient(Arc::new(PeerInner { n, tls: Some(tls), registry: Default::default(), origins: Default::default() }))
     }
 
-    /// Peers over mTLS with `tls`'s certificate and CA.
-    pub fn with_tls(n: usize, tls: Arc<crate::peer_tls::PeerTls>) -> reqwest::Result<PeerClient> {
-        let tls = TlsPeers { tls, registry: Default::default(), origins: Default::default() };
-        // (unused in TLS mode: built so `pick` has something to give tests)
-        let plain = Pool { clients: vec![reqwest::Client::new()], bulk: Vec::new(), next: AtomicUsize::new(0) };
-        Ok(PeerClient(Arc::new(PeerInner { n, plain, tls: Some(tls) })))
+    /// A lone node's: no peer TLS, no peers (requests fail).
+    pub fn lone() -> PeerClient {
+        PeerClient(Arc::new(PeerInner { n: 1, tls: None, registry: Default::default(), origins: Default::default() }))
     }
 
-    /// Wraps one existing client (tests).
-    pub fn single(c: reqwest::Client) -> PeerClient {
-        let plain = Pool { clients: vec![c], bulk: Vec::new(), next: AtomicUsize::new(0) };
-        PeerClient(Arc::new(PeerInner { n: 1, plain, tls: None }))
-    }
-
-    /// Peer TLS on.
-    pub fn is_tls(&self) -> bool {
-        self.0.tls.is_some()
-    }
-
-    /// Where TLS clients look up which node an origin should be (the
-    /// cluster's leases); set once, after the cluster is joined. Until then
-    /// (and for an origin no lease names) any node of the cluster CA is
-    /// accepted.
+    /// Where the client looks up which node(s) an origin should present
+    /// (the cluster's leases and routing table); set once, right after the
+    /// cluster is joined. An origin it names no node for is refused.
     pub fn set_registry(&self, r: Registry) {
-        if let Some(t) = &self.0.tls {
-            let _ = t.registry.set(r);
-        }
+        let _ = self.0.registry.set(r);
     }
 
-    /// A cleartext client (tests; not for peer calls in TLS mode).
-    pub fn pick(&self) -> &reqwest::Client {
-        self.0.plain.pick("")
-    }
-
-    /// The client for a call to `url` (bulk downloads on their own
-    /// connections; with TLS, the URL origin's own clients).
+    /// The client for a call to `url`: the URL origin's own clients, bulk
+    /// downloads on their own connections.
     pub fn client_for(&self, url: &str) -> reqwest::Client {
+        let Some(tls) = &self.0.tls else { return refusing().clone() };
         let (origin, rest) = split_origin(url);
         let path = rest.split_once('?').map_or(rest, |(p, _)| p);
-        match &self.0.tls {
-            None => self.0.plain.pick(path).clone(),
-            Some(t) => self.origin_pool(t, origin).pick(path).clone(),
-        }
+        self.origin_pool(tls, origin).pick(path).clone()
     }
 
-    fn origin_pool(&self, t: &TlsPeers, origin: &str) -> Arc<Pool> {
-        if let Some((_, p)) = t.origins.read().iter().find(|(o, _)| **o == *origin) {
+    fn origin_pool(&self, tls: &Arc<crate::peer_tls::PeerTls>, origin: &str) -> Arc<Pool> {
+        let inner = &self.0;
+        if let Some((_, p)) = inner.origins.read().iter().find(|(o, _)| **o == *origin) {
             return p.clone();
         }
-        let mut origins = t.origins.write();
+        let mut origins = inner.origins.write();
         if let Some((_, p)) = origins.iter().find(|(o, _)| **o == *origin) {
             return p.clone();
         }
         if origins.len() >= MAX_ORIGINS {
             // addresses churned (new IPs per restart): keep the live ones
-            if let Some(r) = t.registry.get() {
+            if let Some(r) = inner.registry.get() {
                 origins.retain(|(o, _)| !r(o).is_empty());
             }
         }
         let o: Arc<str> = origin.into();
-        let (reg, key) = (t.registry.clone(), o.clone());
-        let expect = crate::peer_tls::Expect::Lookup(Arc::new(move || reg.get().map(|r| r(&key)).unwrap_or_default()));
-        let config = t.tls.client_config(expect, &[b"h2"]);
-        let pool = Pool::build(self.0.n, || peer_builder().https_only(true).use_preconfigured_tls(config.clone()))
+        let (reg, key) = (inner.registry.clone(), o.clone());
+        let expect = crate::peer_tls::Expect::Lookup(Arc::new(move || reg.get().map(|r| r(&key))));
+        let config = tls.client_config(expect, &[b"h2"]);
+        let pool = Pool::build(inner.n, || peer_builder().https_only(true).use_preconfigured_tls(config.clone()))
             .map(Arc::new)
             .unwrap_or_else(|e| {
                 // (building a client only fails on a bad TLS backend: never
                 // with a preconfigured rustls config)
                 tracing::error!(origin, "peer TLS client: {e}");
-                Arc::new(Pool { clients: vec![reqwest::Client::new()], bulk: Vec::new(), next: AtomicUsize::new(0) })
+                Arc::new(Pool { clients: vec![refusing().clone()], bulk: vec![refusing().clone()], next: AtomicUsize::new(0) })
             });
         origins.push((o, pool.clone()));
         pool
@@ -954,15 +941,13 @@ impl PeerClient {
         self.client_for(u).request(method, u)
     }
 
-    /// The websocket TLS connector for a log stream from `node` (None:
-    /// cleartext). HTTP/1.1 by ALPN: the stream is an upgrade.
-    pub fn ws_connector(&self, node: Option<&str>) -> Option<tokio_tungstenite::Connector> {
-        let t = self.0.tls.as_ref()?;
-        let expect = match node {
-            Some(n) => crate::peer_tls::Expect::Node(n.to_string()),
-            None => crate::peer_tls::Expect::Any,
-        };
-        Some(tokio_tungstenite::Connector::Rustls(Arc::new(t.tls.client_config(expect, &[b"http/1.1"]))))
+    /// The TLS connector for a log stream (`wss://`) from `node`, checking
+    /// the server is that node; None on a lone node. HTTP/1.1 by ALPN: the
+    /// stream is an upgrade.
+    pub fn ws_connector(&self, node: &str) -> Option<tokio_tungstenite::Connector> {
+        let tls = self.0.tls.as_ref()?;
+        let config = tls.client_config(crate::peer_tls::Expect::Node(node.to_string()), &[b"http/1.1"]);
+        Some(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
     }
 }
 
@@ -976,9 +961,8 @@ impl PeerClient {
 pub const PEER_STREAM_WINDOW: u32 = 1 << 20;
 pub const PEER_CONNECTION_WINDOW: u32 = 64 << 20;
 
-/// Peers speak h2 (h2c, or over TLS with peer mTLS; the listener is HTTP/1 +
-/// HTTP/2 auto). With HTTP/1.1,
-/// forwarding ~10k writes/s at ~100 ms each needed ~1k concurrent
+/// Peers speak h2 over TLS (the peer listener is HTTP/1 + HTTP/2 auto,
+/// ALPN h2 / http/1.1). With HTTP/1.1, forwarding ~10k writes/s at ~100 ms each needed ~1k concurrent
 /// connections per peer: beyond the 256 pooled ones every request opened and
 /// closed a TCP connection, and at 50k/s across 3 nodes the forwards blew
 /// the TTFB deadline and the cluster collapsed to ~2k/s (bench 2026-10-02).
@@ -1055,7 +1039,7 @@ impl<S: tower::Service<R>, R> tower::Service<R> for Counted<S> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -1083,13 +1067,21 @@ mod tests {
         // unread_forwarded_bodies_dont_stall_other_forwards)
     }
 
+    /// A TLS peer listener of `ca` serving `router`; returns its base URL.
+    pub(crate) async fn tls_peer(ca: &crate::peer_tls::tests::TestCa, id: &str, router: axum::Router) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}", l.local_addr().unwrap());
+        let opts = crate::server::ServeOptions { tls: Some(ca.node(id).server_config()), ..Default::default() };
+        tokio::spawn(crate::server::serve_with(l, router, opts));
+        url
+    }
+
     #[tokio::test]
     async fn peer_connections_are_reused() {
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/", l.local_addr().unwrap());
+        let ca = crate::peer_tls::tests::TestCa::new();
         let router = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
-        tokio::spawn(crate::server::serve(l, router));
-        let peers = PeerClient::new(3).unwrap();
+        let url = format!("{}/", tls_peer(&ca, "server", router).await);
+        let peers = PeerClient::new(3, ca.node("client"));
         let count = || crate::metrics::HTTP_CLIENT_CONNECTS.with_label_values(&["peer"]).get();
         let before = count();
         for _ in 0..60 {
@@ -1100,6 +1092,24 @@ mod tests {
         // one connection per client (other tests may connect concurrently)
         let opened = count() - before;
         assert!((3..10).contains(&opened), "{opened} connections for 60 requests");
+        // never cleartext
+        assert!(peers.get(url.replace("https://", "http://")).send().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_node_refuses_origins_the_cluster_doesnt_name() {
+        let ca = crate::peer_tls::tests::TestCa::new();
+        let router = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let url = tls_peer(&ca, "server", router).await;
+        let peers = PeerClient::new(1, ca.node("client"));
+        let known = url.clone();
+        peers.set_registry(Arc::new(move |o: &str| if o == known { vec!["server".to_string()] } else { Vec::new() }));
+        assert_eq!(peers.get(format!("{url}/")).send().await.unwrap().status(), 200);
+        // the same server at an origin no lease or route names
+        let alias = url.replace("127.0.0.1", "localhost");
+        assert!(peers.get(format!("{alias}/")).send().await.is_err());
+        // a lone node reaches no one
+        assert!(PeerClient::lone().get(format!("{url}/")).send().await.is_err());
     }
 
     /// An upstream answering every request with 3,000 bytes after `delay`;

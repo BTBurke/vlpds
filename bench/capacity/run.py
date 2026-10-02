@@ -20,7 +20,9 @@ Nodes: --mode native (processes) or docker (one container per node:
 seccomp unconfined, nofile 1M, no cgroup limits; the release binary is
 bind-mounted into DOCKER_IMAGE (default ubuntu:24.04), or DOCKER_BIN=image
 uses the image's own `vlpds`). Ports --base-port.. (benchbox's Alloy scrapes
-2700-2715 and 7100-7105/7700-7705 every second into the vlpds dashboard).
+2700-2715 and 7100-7105/7700-7705 every second into the vlpds dashboard);
+each node's mTLS peer listener on --base-port+100.., all nodes sharing the
+dev-mode --peer-tls-dir <state>/peer-tls (the first node creates the CA).
 
 Every --scrape-s (1 s) every node's /metrics (vlpds_*/slatedb_* family sums,
 no histogram buckets) and MinIO's cluster metrics (S3 requests by API, bytes)
@@ -57,7 +59,7 @@ S3 = os.environ.get("BENCH_S3", "http://127.0.0.1:9200")
 BUCKET = "vlpds"
 SCRATCH = os.environ.get("BENCH_SCRATCH") or os.path.join(PKG, "target", "capacity-scratch")
 ADMIN = "dev-admin-token"
-INTERNAL = "dev-internal-token"
+ADMIN_AUTH = {"Authorization": "Basic " + base64.b64encode(f"admin:{ADMIN}".encode()).decode()}
 SHARDS = 64  # the server default (--shards); passed explicitly to every node
 GRAFANA = os.environ.get("GRAFANA_URL", "http://127.0.0.1:3300")
 
@@ -211,6 +213,8 @@ class Node:
         self.name = f"n{i+1}"
         self.port = cfg.base_port + i
         self.url = f"http://127.0.0.1:{self.port}"
+        self.peer_port = cfg.base_port + 100 + i
+        self.tls_dir = os.path.join(cfg.state_dir, "peer-tls")
         self.dir = os.path.join(cfg.state_dir, self.name)
         os.makedirs(self.dir, exist_ok=True)
         self.logpath = os.path.join(self.dir, "server.log")
@@ -222,7 +226,8 @@ class Node:
         c = self.cfg
         a = [exe, "--listen", f"127.0.0.1:{self.port}", "--public-url", self.url, "--s3-endpoint", S3,
              "--prefix", c.prefix, "--no-rate-limits", "--dev-mode",
-             "--node-id", self.name, "--advertise-url", self.url,
+             "--node-id", self.name, "--peer-listen", f"127.0.0.1:{self.peer_port}",
+             "--advertise-url", f"https://127.0.0.1:{self.peer_port}", "--peer-tls-dir", self.tls_dir,
              "--workers", str(c.workers), "--io-threads", str(c.io_threads),
              "--block-cache-mb", str(c.block_cache_mb), "--repo-cache-mb", str(c.repo_cache_mb),
              "--cache-budget-mb", str(c.cache_budget_mb),
@@ -236,6 +241,7 @@ class Node:
 
     def start(self, timeout=600):
         mark = os.path.getsize(self.logpath) if os.path.exists(self.logpath) else 0
+        os.makedirs(self.tls_dir, exist_ok=True)
         if self.cfg.mode == "native":
             self.f = open(self.logpath, "ab")
             env = dict(os.environ)
@@ -250,7 +256,7 @@ class Node:
             run = ["docker", "run", "-d", "--name", self.container, "--network", "host", "--ipc", "host",
                    "--log-driver", "none", "--security-opt", "seccomp=unconfined",
                    "--ulimit", "nofile=1048576:1048576", "--user", f"{os.getuid()}:{os.getgid()}",
-                   "-e", "RUST_LOG=info,slatedb=warn", "-v", f"{self.dir}:{self.dir}"]
+                   "-e", "RUST_LOG=info,slatedb=warn", "-v", f"{self.dir}:{self.dir}", "-v", f"{self.tls_dir}:{self.tls_dir}"]
             if not own:
                 run += ["-v", f"{BIN}:/opt/vlpds:ro"]
             run += ["--entrypoint", "/bin/sh", image, "-c", "exec " + cmd]
@@ -329,7 +335,8 @@ def wait_converged(nodes, shards=SHARDS, timeout=180):
         try:
             ms = [node_metrics(n.url) or {} for n in nodes]
             owned = [int(m.get("vlpds_owned_partitions", 0)) for m in ms]
-            tables = [json.loads(http("GET", n.url + "/internal/v1/cluster", headers={"x-vlpds-internal": INTERNAL})[1])["table"] for n in nodes]
+            # owner per shard, in slot order (None = unowned)
+            tables = [json.loads(http("GET", n.url + "/xrpc/vlpds.admin.getClusterStatus", headers=ADMIN_AUTH)[1])["table"] for n in nodes]
             if sum(owned) >= shards and min(owned) > 0 and all(all(x for x in tb) for tb in tables):
                 log(f"cluster converged {owned} in {time.time()-t:.1f}s")
                 return time.time() - t

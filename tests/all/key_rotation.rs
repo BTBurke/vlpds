@@ -257,7 +257,7 @@ async fn cluster_node(id: &str, store: &Arc<dyn object_store::ObjectStore>, plc:
         c.plc = PlcConfig { rotation_key: Some(RotationKey::Key(rot)), ..Default::default() };
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: 4,
             ttl: Duration::from_secs(2),
             renew_every: Duration::from_millis(200),

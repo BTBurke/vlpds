@@ -363,7 +363,7 @@ async fn per_node_commands_cover_the_cluster() {
             c.shards = SHARDS;
             c.cluster = Some(vlpds::cluster::ClusterConfig {
                 node_id: id,
-                addr: c.public_url.clone(),
+                addr: peer_url(c),
                 shards: SHARDS,
                 ttl: Duration::from_millis(1500),
                 renew_every: Duration::from_millis(100),

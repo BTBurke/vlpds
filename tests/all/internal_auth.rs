@@ -1,5 +1,6 @@
-//! Node-to-node endpoint auth: the internal token (not the admin token
-//! outside dev mode) and the private-put key scope.
+//! Node-to-node endpoint auth (on the mTLS peer listener): the internal
+//! token (not the admin token outside dev mode) and the private-put key
+//! scope.
 
 use crate::common::*;
 use base64::Engine;
@@ -7,16 +8,14 @@ use base64::Engine;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 async fn cluster_status(s: &TestServer, token: &str) -> u16 {
-    let rb = s.xrpc.http.get(format!("{}/internal/v1/cluster", s.url)).header("x-vlpds-internal", token);
+    let rb = peer_client().get(format!("{}/internal/v1/cluster", s.peer_url)).header("x-vlpds-internal", token);
     s.xrpc.send(rb).await.status
 }
 
 async fn private_put(s: &TestServer, routing: &str, key: &[u8]) -> Resp {
     let body = json!({"routing": routing, "muts": [[B64.encode(key), B64.encode(b"x")]]});
-    let rb = s
-        .xrpc
-        .http
-        .post(format!("{}/internal/v1/private/put", s.url))
+    let rb = peer_client()
+        .post(format!("{}/internal/v1/private/put", s.peer_url))
         .header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN)
         .json(&body);
     s.xrpc.send(rb).await

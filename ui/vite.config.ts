@@ -7,7 +7,7 @@ declare const process: { env: Record<string, string | undefined> }
 // `just dev-ui` runs this against a local vlpds (VLPDS_URL, default :2620).
 const target = process.env.VLPDS_URL ?? 'http://127.0.0.1:2620'
 const proxy = Object.fromEntries(
-  ['/xrpc', '/oauth', '/metrics', '/internal', '/.well-known'].map((p) => [p, { target, changeOrigin: false }]),
+  ['/xrpc', '/oauth', '/metrics', '/.well-known'].map((p) => [p, { target, changeOrigin: false }]),
 )
 
 export default defineConfig({

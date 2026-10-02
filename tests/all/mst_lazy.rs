@@ -1128,7 +1128,7 @@ async fn replay_after_kill_reconstructs_nodes() {
             c.checkpoint_every = Duration::from_secs(3600);
             c.cluster = Some(vlpds::cluster::ClusterConfig {
                 node_id: id.into(),
-                addr: c.public_url.clone(),
+                addr: peer_url(c),
                 shards: SHARDS,
                 ttl: Duration::from_secs(2),
                 renew_every: Duration::from_millis(200),
@@ -1315,7 +1315,7 @@ async fn bench_node(id: &str, store: Arc<dyn object_store::ObjectStore>, prefetc
         c.shards = 4;
         c.workers = workers;
         c.preload_recent = 0;
-        c.cluster = Some(vlpds::cluster::ClusterConfig { node_id: id, addr: c.public_url.clone(), shards: 4, ..Default::default() });
+        c.cluster = Some(vlpds::cluster::ClusterConfig { node_id: id, addr: peer_url(c), shards: 4, ..Default::default() });
     })
     .await;
     wait_until("all shards owned", Duration::from_secs(60), || s.app.partitions.owned().len() == 4).await;

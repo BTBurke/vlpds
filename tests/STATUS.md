@@ -76,7 +76,7 @@ part of this run.
 scale/fault tests (run them with `--ignored`): `cbor_transcode::bench`, `checkpoint_stall::stall_*`,
 `cold_start::restart_window_*`, `compaction_polling::*`, `cost_defaults::deep_l0_ingest_keeps_up`,
 `differential_shrike::{json,syntax}_reference_oracle` and `real_records_from_clickhouse`, `interop_crypto::sign_verify_bench`,
-`list_repos_scale::enumeration_bench`, `mst_lazy::bench*`, `oauth::bench_dpop_resource_requests`, `peer_tls::bench_ab`,
+`list_repos_scale::enumeration_bench`, `mst_lazy::bench*`, `oauth::bench_dpop_resource_requests`,
 `segment_bytes::segment_bytes_per_commit`, `shard_ingest::one_shard_sustains_bulk_ingest`. No reference gap is ignored any
 more: `ref_account::ref_signing_key_rotation_resigns_the_repo` and `ref_repo::ref_prevents_duplicate_backlinks` now run
 and pass.
@@ -147,7 +147,7 @@ vlpds test, an N/A reason, a documented divergence or a gap.
 | mst_lazy | 10 | 0 | 5 |
 | oauth | 26 | 0 | 1 |
 | oauth_replay_durable | 2 | 0 | 0 |
-| peer_tls | 4 | 0 | 1 |
+| peer_tls | 4 | 0 | 0 |
 | ops_metrics | 1 | 0 | 0 |
 | plc | 10 | 0 | 0 |
 | preferences | 6 | 0 | 0 |

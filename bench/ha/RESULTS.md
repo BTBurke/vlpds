@@ -33,7 +33,7 @@ python3 bench/ha/hactl.py list         # scenario catalogue
 
 | Variable | Default | What it sets |
 |---|---|---|
-| `VLPDS_HA_NODE_ARGS` | see below | Node flag template. Placeholders: `{listen} {url} {advertise} {s3} {prefix} {id} {ttl_ms} {partitions}`. |
+| `VLPDS_HA_NODE_ARGS` | see below | Node flag template. Placeholders: `{listen} {url} {peer_listen} {advertise} {tls_dir} {s3} {prefix} {id} {ttl_ms} {partitions}`. |
 | `VLPDS_HA_PARTITIONS` | 64 | Shard count: passed as `--shards`, and used for the probe shard mapping. |
 | `VLPDS_HA_TTL_MS` | 3000 | Lease TTL. |
 | `VLPDS_HA_RATE` | 150 | Writes/s per loadgen. |
@@ -42,15 +42,23 @@ python3 bench/ha/hactl.py list         # scenario catalogue
 | `VLPDS_HA_LOG_INFLIGHT` | 4 | Segment PUTs in flight per node log (`--log-inflight`). |
 | `VLPDS_HA_CLEANUP` | 1 | Delete the scenario's bucket prefix once its results are recorded. Deletion runs through `mc` in `vlpds-minio:local`. |
 | `VLPDS_HA_RETENTION_S` | 45 | `--log-retention` of the `retention-*` scenarios, in seconds. |
-| `VLPDS_HA_INTERNAL_TOKEN` | `dev-internal-token` | The `x-vlpds-internal` token. It falls back to the admin token on 401, for older dev-mode builds. |
+| `VLPDS_HA_INTERNAL_TOKEN` | `dev-internal-token` | The `x-vlpds-internal` token for the harness's status calls. |
+| `VLPDS_HA_PEER_TLS_DIR` | `bench/ha/out/peer-tls` | The nodes' shared dev-mode `--peer-tls-dir`: the first node creates the cluster CA, each node its certificate; the harness reads node status (`/internal/v1/cluster`) on each node's mTLS peer listener with that node's certificate. |
 | `VLPDS_HA_BASE_PORT`, `VLPDS_BIN_DIR`, `VLPDS_HA_S3`, `VLPDS_HA_IMAGE`, `VLPDS_HA_DOCKER_S3` | | As before. |
 
 The default node template is:
 
 ```
---listen {listen} --public-url {url} --advertise-url {advertise} --s3-endpoint {s3} --prefix {prefix}
---node-id {id} --lease-ttl-ms {ttl_ms} --shards {partitions} --no-rate-limits --dev-mode --workers 2 --io-threads 3 --firehose-ring-mb 256
+--listen {listen} --public-url {url} --peer-listen {peer_listen} --advertise-url {advertise} --peer-tls-dir {tls_dir}
+--s3-endpoint {s3} --prefix {prefix} --node-id {id} --lease-ttl-ms {ttl_ms} --shards {partitions} --no-rate-limits
+--dev-mode --workers 2 --io-threads 3 --firehose-ring-mb 256
 ```
+
+Peers talk mTLS only (packages/vlpds DESIGN.md "Exposure"): node `i`'s peer
+listener is on `BASE_PORT+800+i`, behind its peer faultproxy (`+200+i`, the
+advertised `https://` address); containers publish it on `+1400+i`.
+`bench/ha/upgrade.sh`'s default previous release is the first build with
+`--peer-tls-dir` (older builds' cleartext peers can't join).
 
 **Harness changes for the new design:**
 - **Shard mapping:** the probe mapping now follows `src/slots.rs`: `(top 16 bits of sha256(did)) * N / 65536`.

@@ -22,7 +22,7 @@ async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, advertise: O
         c.checkpoint_every = Duration::from_secs(3600);
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: advertise.unwrap_or_else(|| c.public_url.clone()),
+            addr: advertise.unwrap_or_else(|| peer_url(c)),
             shards: SHARDS,
             ttl: Duration::from_secs(6),
             renew_every: Duration::from_millis(200),
@@ -60,7 +60,7 @@ async fn takeover_replay_and_lease_metrics_move() {
     // dead as soon as it misses a renewal
     let refusing = {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        format!("http://{}", l.local_addr().unwrap())
+        format!("https://{}", l.local_addr().unwrap())
     };
     let b = node(&idb, &store, Some(refusing)).await;
     wait_for("b gets its share", Duration::from_secs(10), || owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize).await;

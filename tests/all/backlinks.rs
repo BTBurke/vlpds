@@ -332,7 +332,7 @@ async fn replay_after_kill_reproduces_the_index() {
             c.checkpoint_every = Duration::from_secs(3600);
             c.cluster = Some(vlpds::cluster::ClusterConfig {
                 node_id: id.into(),
-                addr: c.public_url.clone(),
+                addr: peer_url(c),
                 shards: SHARDS,
                 ttl: Duration::from_secs(2),
                 renew_every: Duration::from_millis(200),

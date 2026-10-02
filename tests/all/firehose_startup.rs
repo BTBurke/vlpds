@@ -26,7 +26,7 @@ pub(crate) async fn node_with(id: &str, store: &Arc<object_store::memory::InMemo
         c.shards = SHARDS;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: SHARDS,
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),
@@ -153,14 +153,14 @@ pub(crate) fn mismatch(what: &str, got: &[(i64, Vec<u8>)], want: &[(i64, Vec<u8>
 async fn log_stream_serves_only_the_named_log() {
     let store = Arc::new(object_store::memory::InMemory::new());
     let a = node("ls-a", &store).await;
-    let rb = a.xrpc.http.get(format!("{}/internal/v1/cluster", a.url)).header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN);
+    let rb = peer_client().get(format!("{}/internal/v1/cluster", a.peer_url)).header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN);
     let log = a.xrpc.send(rb).await.ok()["log"].as_str().expect("log id").to_string();
     let connect = |log: String| {
-        let url = format!("{}/internal/v1/log/stream?log={log}", a.url.replacen("http", "ws", 1));
+        let url = format!("{}/internal/v1/log/stream?log={log}", a.peer_url.replacen("https", "wss", 1));
         async move {
             let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str()).unwrap();
             req.headers_mut().insert("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN.parse().unwrap());
-            tokio_tungstenite::connect_async(req).await
+            tokio_tungstenite::connect_async_tls_with_config(req, None, false, peer_client().ws_connector("ls-a")).await
         }
     };
     let (mut ws, _) = connect(log.clone()).await.expect("own log streams");

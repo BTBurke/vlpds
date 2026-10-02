@@ -1,7 +1,8 @@
 # Peer mTLS A/B (2026-10-02, laptop)
 
 `cargo test --profile dev-release --test all peer_tls::bench_ab -- --ignored --nocapture`
-on an Apple M4 Pro (other agents' work idle). Two in-process nodes, in-memory
+(at e582865; the cleartext peer mode, and with it this A/B, were removed
+afterwards: peers talk mTLS only) on an Apple M4 Pro (other agents' work idle). Two in-process nodes, in-memory
 store, split listeners (public + peer) either way; `h2c` = cleartext peer
 listener, `mtls` = TLS 1.3 (ring, ECDSA P-256 certs) with client certs. Two
 rounds, modes alternating. CPU is the whole process (both nodes and the

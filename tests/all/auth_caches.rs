@@ -122,7 +122,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, appview: &s
         c.dev_mode = true;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: SHARDS,
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),

@@ -74,6 +74,11 @@ use std::time::{Duration, Instant};
 
 /// Forwarded-request marker; its value is the internal token.
 pub const FORWARDED_HEADER: &str = "x-vlpds-forwarded";
+/// Names the node a `vlpds.admin.*` call is for (`vlpds admin` per-node
+/// maintenance: rotate-plc-keys, rewrap-secrets). The node a client reaches
+/// relays it to that node over peer mTLS: operators reach nodes through
+/// `--listen` only, peer listeners take node certificates only.
+pub const NODE_HEADER: &str = "x-vlpds-node";
 const MAX_JSON_BODY: usize = 4 << 20;
 /// Owner time-to-first-byte for quick local work (repo/sync reads and
 /// writes, sessions, admin, OAuth).
@@ -603,6 +608,9 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
         }
     }
     let token = app.map(|a| a.config.internal_token.as_str());
+    if let Some(r) = relay_to_node(app, client, &mut req, token) {
+        return r.await;
+    }
     let retry = app.is_some_and(|a| a.config.retry_unapplied_writes);
     if router.alone() {
         // Served here without the routing work. A write can still find its
@@ -797,6 +805,35 @@ fn tracked_body(body: Body, p: Arc<Progress>) -> reqwest::Body {
             std::task::Poll::<Option<Result<bytes::Bytes, axum::Error>>>::Ready(None)
         }));
     reqwest::Body::wrap_stream(s)
+}
+
+/// An admin call naming another node ([`NODE_HEADER`]): forwarded to it
+/// (it serves the call as forwarded, under the caller's admin credentials).
+/// None: served here (no header, this node, or not an admin call).
+fn relay_to_node<'a>(
+    app: Option<&crate::xrpc::App>,
+    client: &'a crate::http::PeerClient,
+    req: &mut Request,
+    token: Option<&'a str>,
+) -> Option<impl std::future::Future<Output = Response> + 'a> {
+    if !req.uri().path().starts_with("/xrpc/vlpds.admin.") {
+        return None;
+    }
+    let node = req.headers().get(NODE_HEADER)?.to_str().ok()?.to_string();
+    let cluster = app?.cluster.as_deref()?;
+    if node == cluster.cfg.node_id {
+        return None;
+    }
+    let addr = cluster.peers().into_iter().find(|l| l.node_id == node).map(|l| l.addr);
+    let req = std::mem::replace(req, Request::new(Body::empty()));
+    Some(async move {
+        let Some(addr) = addr else {
+            let message = format!("no live node {node:?} in this cluster");
+            return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error": "NodeNotFound", "message": message}))).into_response();
+        };
+        // maintenance runs as long as it takes (the CLI waits 10 min)
+        forward(client, &addr, req, token, FORWARD_MAX).await
+    })
 }
 
 fn unavailable(message: String) -> Response {
@@ -1068,11 +1105,18 @@ mod tests {
         }
     }
 
-    /// A node whose routing sends every DID to `owner`, serving "local" for
-    /// whatever it keeps; returns its base URL.
-    async fn spawn_node(name: &'static str, owner: Option<String>) -> String {
+    /// The test cluster's CA (one per test binary).
+    fn test_ca() -> &'static crate::peer_tls::tests::TestCa {
+        static CA: std::sync::LazyLock<crate::peer_tls::tests::TestCa> = std::sync::LazyLock::new(crate::peer_tls::tests::TestCa::new);
+        &CA
+    }
+
+    /// A node whose routing sends every DID to `owner` (a peer URL),
+    /// serving "local" for whatever it keeps; returns its client URL and its
+    /// mTLS peer URL.
+    async fn spawn_node(name: &'static str, owner: Option<String>) -> (String, String) {
         let r: Arc<dyn Router> = Arc::new(Fixed(owner));
-        let client = crate::http::PeerClient::single(reqwest::Client::new());
+        let client = crate::http::PeerClient::new(1, test_ca().node(name));
         let app = axum::Router::new()
             .route(
                 "/xrpc/{nsid}",
@@ -1085,16 +1129,18 @@ mod tests {
                 let (r, client) = (r.clone(), client.clone());
                 async move { route(&*r, &client, req, next).await }
             }));
+        let peer = crate::http::tests::tls_peer(test_ca(), name, app.clone()).await;
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-        url
+        (url, peer)
     }
 
-    /// An owner that accepts connections and reads, but never answers.
+    /// An owner that accepts connections and reads, but never answers (not
+    /// even the TLS handshake).
     async fn frozen_owner() -> String {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", l.local_addr().unwrap());
+        let url = format!("https://{}", l.local_addr().unwrap());
         tokio::spawn(async move {
             let mut held = Vec::new();
             while let Ok((s, _)) = l.accept().await {
@@ -1114,7 +1160,7 @@ mod tests {
             .body(Body::from(r#"{"repo":"did:plc:x"}"#))
             .unwrap();
         let t = Instant::now();
-        let r = forward(&crate::http::PeerClient::single(reqwest::Client::new()), &owner, req, None, Duration::from_millis(300)).await;
+        let r = forward(&crate::http::PeerClient::new(1, test_ca().node("n")), &owner, req, None, Duration::from_millis(300)).await;
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(r.headers().get("retry-after").unwrap(), "1");
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
@@ -1122,7 +1168,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&b).contains("PartitionUnavailable"));
 
         // through the layer, with the production deadline for a quick call
-        let node = spawn_node("n", Some(owner)).await;
+        let (node, _) = spawn_node("n", Some(owner)).await;
         let t = Instant::now();
         let r = reqwest::Client::new()
             .get(format!("{node}/xrpc/com.atproto.repo.getRecord?repo=did:plc:x"))
@@ -1145,8 +1191,6 @@ mod tests {
         use crate::http::{stall, PeerClient};
         const CHUNK: usize = 64 << 10;
         const BODY: usize = 2 << 20; // more than a stream window
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let owner = format!("http://{}", l.local_addr().unwrap());
         let router = axum::Router::new().route(
             "/xrpc/{nsid}",
             axum::routing::get(|| async {
@@ -1154,8 +1198,8 @@ mod tests {
                 Body::from_stream(futures::stream::iter(chunks))
             }),
         );
-        tokio::spawn(crate::server::serve(l, router));
-        let peers = PeerClient::new(1).unwrap();
+        let owner = crate::http::tests::tls_peer(test_ca(), "owner", router).await;
+        let peers = PeerClient::new(1, test_ca().node("entry"));
         let fwd = |path: &'static str| {
             let req = Request::builder().uri(path).body(Body::empty()).unwrap();
             forward(&peers, &owner, req, None, TTFB_SLOW)
@@ -1201,8 +1245,8 @@ mod tests {
     #[tokio::test]
     async fn client_forwarded_marker_is_stripped() {
         // b owns nothing locally (everything routes to a); a serves locally
-        let a = spawn_node("a", None).await;
-        let b = spawn_node("b", Some(a.clone())).await;
+        let (_, a) = spawn_node("a", None).await;
+        let (b, _) = spawn_node("b", Some(a)).await;
         let http = reqwest::Client::new();
         // a forged marker does not make b serve locally, nor reach a's handler
         let r = http

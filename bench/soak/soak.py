@@ -786,6 +786,10 @@ class Node:
         self.name = f"n{i+1}"
         self.port = cfg.base_port + i
         self.url = f"http://127.0.0.1:{self.port}"
+        # mTLS peer listener; every node shares the dev-mode peer TLS dir
+        # (the first node creates the CA, each its own certificate)
+        self.peer_port = cfg.base_port + 100 + i
+        self.tls_dir = os.path.join(cfg.state_dir, "peer-tls")
         self.dir = os.path.join(cfg.state_dir, self.name)
         os.makedirs(self.dir, exist_ok=True)
         self.logpath = os.path.join(self.dir, "server.log")
@@ -796,7 +800,9 @@ class Node:
     def args(self):
         c = self.cfg
         a = [VLPDS, "--listen", f"127.0.0.1:{self.port}", "--public-url", self.url, "--s3-endpoint", S3_URL,
-             "--prefix", c.prefix, "--no-rate-limits", "--dev-mode", "--node-id", self.name, "--advertise-url", self.url,
+             "--prefix", c.prefix, "--no-rate-limits", "--dev-mode", "--node-id", self.name,
+             "--peer-listen", f"127.0.0.1:{self.peer_port}", "--advertise-url", f"https://127.0.0.1:{self.peer_port}",
+             "--peer-tls-dir", self.tls_dir,
              "--shards", str(c.shards), "--workers", str(c.workers), "--io-threads", str(c.io_threads),
              "--block-cache-mb", str(c.block_cache_mb), "--repo-cache-mb", str(c.repo_cache_mb),
              "--cache-budget-mb", str(c.cache_budget_mb), "--log-retention", c.log_retention,

@@ -171,7 +171,8 @@ pub struct Follower {
 
 /// Registers the log as a firehose source of `fh` and follows it. `addr`
 /// returns the peer's base URL while it is alive, None once it's dead.
-/// `tls`: peer mTLS (`wss://`), checking the server is the log's node.
+/// `tls`: peer mTLS (`wss://`), checking the server is the log's node (None
+/// on a lone node: nothing streams).
 pub fn follow_log(
     log_id: &str,
     fh: &Firehose,
@@ -276,12 +277,16 @@ async fn stream_live(
     addr: &(dyn Fn() -> Option<String> + Send + Sync),
     tls: Option<tokio_tungstenite::Connector>,
 ) -> anyhow::Result<()> {
+    // peer mTLS only: wss:// to the peer listener, checking it is the log's node
+    let tls = tls.ok_or_else(|| anyhow::anyhow!("no peer TLS on this node (a lone node): can't stream {base}'s log"))?;
+    let Some(rest) = base.strip_prefix("https://") else {
+        anyhow::bail!("peer address {base:?} isn't https:// (peers talk mTLS only)");
+    };
     // name the log: the address may already serve a later incarnation's log
-    let url = format!("{}/internal/v1/log/stream?log={log_id}", base.replacen("http", "ws", 1));
+    let url = format!("wss://{rest}/internal/v1/log/stream?log={log_id}");
     let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str())?;
     req.headers_mut().insert("x-vlpds-internal", token.parse()?);
-    // (http(s) -> ws(s) above; with peer TLS the base is https://)
-    let connect = tokio_tungstenite::connect_async_tls_with_config(req, None, false, tls);
+    let connect = tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(tls));
     let (mut ws, _) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, connect)
         .await
         .map_err(|_| anyhow::anyhow!("log stream connect to {base} timed out"))??;

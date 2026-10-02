@@ -27,7 +27,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
         c.inject_latency = Some((8.0, 1.0));
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: SHARDS,
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),

@@ -147,7 +147,7 @@ async fn spawn_env(dev_mode: bool) -> Env {
         plc_url: "http://127.0.0.1:1".into(),
         ..Default::default()
     };
-    server::spawn(cfg, listener).await.unwrap();
+    server::spawn(cfg, listener, None).await.unwrap();
     Env {
         url: format!("http://{addr}"),
         http: reqwest::Client::new(),
@@ -420,7 +420,7 @@ async fn unreachable_upstream_is_502() {
         dev_mode: true,
         ..Default::default()
     };
-    server::spawn(cfg, listener).await.unwrap();
+    server::spawn(cfg, listener, None).await.unwrap();
     let http = reqwest::Client::new();
     let v: J = http
         .post(format!(

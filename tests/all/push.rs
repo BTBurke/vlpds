@@ -95,7 +95,7 @@ async fn spawn_env(with_appview: bool) -> Env {
         plc_url: "http://127.0.0.1:1".into(),
         ..Default::default()
     };
-    vlpds::server::spawn(cfg, listener).await.unwrap();
+    vlpds::server::spawn(cfg, listener, None).await.unwrap();
     Env { url: format!("http://{addr}"), http: reqwest::Client::new(), appview, push }
 }
 

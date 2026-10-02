@@ -30,7 +30,7 @@ async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>) -> TestServe
         c.shards = SHARDS;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: SHARDS,
             ttl: Duration::from_secs(5),
             renew_every: Duration::from_secs(1),

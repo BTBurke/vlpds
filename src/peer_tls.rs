@@ -1,6 +1,16 @@
 //! Peer mTLS: node-to-node traffic (forwards, `/internal/*` calls, log
 //! streams) over TLS 1.3 with client certificates, both ends verified
 //! against a cluster CA (DESIGN.md "Exposure", ops/RUNBOOK.md "Peer TLS").
+//! It is the only node-to-node transport: a node with peers has
+//! `--peer-listen`, `--peer-tls-dir` and an `https://` `--advertise-url`; a
+//! lone node has none of them, no peer listener and no `/internal/*`.
+//!
+//! Files. A peer TLS directory holds `ca.crt` (the cluster CA, PEM; several
+//! = all trusted) and this node's `<node-id>.crt` / `<node-id>.key`: what
+//! `vlpds admin tls ca --out DIR` and `vlpds admin tls issue --out DIR`
+//! write ([`Files::in_dir`]). In `--dev-mode` a node fills its directory
+//! itself ([`dev_files`]): a CA once (under a lock, so processes sharing the
+//! directory share the CA) and its own certificate from `ca.key`.
 //!
 //! Identity. A node certificate carries
 //! - a URI SAN `vlpds://node/<node-id>` (its `--node-id`; required: a cert
@@ -22,8 +32,9 @@
 //!   valid for the advertise URL's host, and name the node the caller
 //!   expects there: the node(s) whose lease advertises that origin
 //!   ([`Expect::Lookup`], the HTTP peer client) or the log's node (log
-//!   streams, [`Expect::Node`]). An origin no lease names (a stale routing
-//!   entry) accepts any node of the cluster.
+//!   streams, [`Expect::Node`]). An origin neither a lease nor the routing
+//!   table names is refused; a client that isn't a node (tests, tools: no
+//!   registry) accepts any node of the cluster.
 //! - At startup the node's own certificate must chain to the CA, match its
 //!   key, and name `--node-id`.
 //!
@@ -219,6 +230,12 @@ pub struct Files {
 type Stamp = Vec<Option<(std::time::SystemTime, u64)>>;
 
 impl Files {
+    /// `node_id`'s files in a peer TLS directory (`--peer-tls-dir`):
+    /// `ca.crt`, `<node-id>.crt`, `<node-id>.key`.
+    pub fn in_dir(dir: &Path, node_id: &str) -> Files {
+        Files { ca: dir.join("ca.crt"), cert: dir.join(format!("{node_id}.crt")), key: dir.join(format!("{node_id}.key")) }
+    }
+
     fn read(&self) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         let r = |p: &Path, what: &str| std::fs::read(p).with_context(|| format!("reading the peer TLS {what} {}", p.display()));
         Ok((r(&self.ca, "CA")?, r(&self.cert, "certificate")?, r(&self.key, "key")?))
@@ -379,12 +396,13 @@ impl PeerTls {
 /// Which node a client expects at the other end.
 #[derive(Clone)]
 pub enum Expect {
-    /// Any node of the cluster.
+    /// Any node of the cluster (a client that isn't a node: tests, tools).
     Any,
     /// This node.
     Node(String),
-    /// One of the nodes this returns (asked at each handshake); none = any.
-    Lookup(Arc<dyn Fn() -> Vec<String> + Send + Sync>),
+    /// One of the nodes this returns (asked at each handshake; none =
+    /// refused), or any node while it returns None (no registry set).
+    Lookup(Arc<dyn Fn() -> Option<Vec<String>> + Send + Sync>),
 }
 
 impl std::fmt::Debug for Expect {
@@ -477,13 +495,13 @@ impl ServerCertVerifier for ServerAuth {
         };
         self.tls.current().server_verifier.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now).map_err(fail)?;
         let want = match &self.expect {
-            Expect::Any => Vec::new(),
-            Expect::Node(n) => vec![n.clone()],
+            Expect::Any => None,
+            Expect::Node(n) => Some(vec![n.clone()]),
             Expect::Lookup(f) => f(),
         };
         match node_id_of(end_entity) {
             None => Err(fail(identity_refused())),
-            Some(got) if !want.is_empty() && !want.contains(&got) => {
+            Some(got) if want.as_ref().is_some_and(|w| !w.contains(&got)) => {
                 tracing::warn!(server = ?server_name, got, ?want, "peer TLS: the peer's certificate names another node");
                 Err(fail(identity_refused()))
             }
@@ -523,15 +541,6 @@ impl ResolvesClientCert for OwnCert {
         true
     }
 }
-
-/// The node id of a TLS connection's client certificate (server side).
-pub fn peer_node(conn: &rustls::ServerConnection) -> Option<String> {
-    node_id_of(conn.peer_certificates()?.first()?)
-}
-
-/// Request extension on the peer listener: the calling node, from its cert.
-#[derive(Clone, Debug)]
-pub struct PeerNode(pub Arc<str>);
 
 // ---------- issuing (vlpds admin tls) ----------
 
@@ -610,113 +619,71 @@ pub fn write_pair(dir: &Path, name: &str, issued: &Issued, force: bool) -> Resul
     Ok((crt, key))
 }
 
-// ---------- startup policy ----------
+// ---------- dev mode ----------
 
-/// How this node treats peer traffic, decided at startup ([`peer_mode`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PeerMode {
-    /// No peers can reach this node (no `--peer-listen`, a loopback
-    /// `--advertise-url`) and not dev mode: `/internal/*` isn't mounted and
-    /// forwarded markers are ignored.
-    Lone,
-    /// `--peer-listen` with peer mTLS.
-    Tls,
-    /// A cluster-capable node without TLS: `--dev-mode` or `--peer-insecure`.
-    Cleartext,
+/// Days a dev-mode certificate is issued for; one expiring within
+/// [`DEV_RENEW_DAYS`] is re-issued at startup.
+const DEV_DAYS: u32 = 365;
+const DEV_RENEW_DAYS: i64 = 7;
+
+/// `--dev-mode` with `--peer-tls-dir`: makes `dir` usable for `node_id` and
+/// returns its files. Under an exclusive lock on `dir/.lock` (processes
+/// sharing the directory, e.g. a local multi-node cluster, start at once):
+/// - no `ca.crt`: creates a cluster CA (`ca.crt`, `ca.key`);
+/// - `<node-id>.crt` missing, not from that CA, expiring within a week, or
+///   not valid for one of `hosts`: issues it from `ca.key` (an error if
+///   there is none).
+///
+/// Hosts across machines share the CA by copying `ca.crt` and `ca.key` into
+/// each one's directory before their nodes start (bench/xhost). `hosts` gets
+/// `127.0.0.1` and `localhost` added: local tools may call any node's peer
+/// listener by loopback.
+pub fn dev_files(dir: &Path, node_id: &str, hosts: &[String]) -> Result<Files> {
+    check_node_id(node_id)?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let lock = std::fs::File::create(dir.join(".lock")).with_context(|| format!("creating {}/.lock", dir.display()))?;
+    lock.lock().with_context(|| format!("locking {}/.lock", dir.display()))?;
+    let files = Files::in_dir(dir, node_id);
+    if !files.ca.exists() {
+        write_pair(dir, "ca", &create_ca("vlpds dev cluster CA", 3650)?, true)?;
+        tracing::info!(dir = %dir.display(), "dev mode: created a peer TLS cluster CA");
+    }
+    let mut hosts = hosts.to_vec();
+    for h in ["127.0.0.1", "localhost"] {
+        if !hosts.iter().any(|x| x == h) {
+            hosts.push(h.to_string());
+        }
+    }
+    let current = || -> Result<()> {
+        let (ca, cert, key) = files.read()?;
+        let m = Material::from_pem(&ca, &cert, &key)?;
+        ensure!(m.node_id == node_id, "it names node {:?}", m.node_id);
+        ensure!(m.cert_not_after > chrono::Utc::now().timestamp() + DEV_RENEW_DAYS * 86400, "it expires within {DEV_RENEW_DAYS} days");
+        let have = cert_info(&CertificateDer::pem_slice_iter(&cert).next().context("no certificate")??)?.hosts;
+        ensure!(hosts.iter().all(|h| have.contains(h)), "it isn't valid for all of {hosts:?}");
+        Ok(())
+    };
+    if let Err(why) = current() {
+        let read = |p: &Path| std::fs::read_to_string(p).with_context(|| format!("dev mode: issuing a peer TLS certificate needs {}", p.display()));
+        let n = issue_node(&read(&files.ca)?, &read(&dir.join("ca.key"))?, node_id, &hosts, DEV_DAYS)?;
+        write_pair(dir, node_id, &n, true)?;
+        tracing::info!(dir = %dir.display(), node_id, ?hosts, why = %format!("{why:#}"), "dev mode: issued this node's peer TLS certificate");
+    }
+    Ok(files)
 }
 
-/// What [`peer_mode`] looks at.
-#[derive(Clone, Debug, Default)]
-pub struct PeerPolicy {
-    pub dev_mode: bool,
-    /// `--peer-listen` is set.
-    pub peer_listen: bool,
-    /// `--advertise-url` (or the public URL it defaults to).
-    pub advertise_url: String,
-    /// `--peer-tls-*` are set.
-    pub tls: bool,
-    /// `--peer-insecure`.
-    pub insecure: bool,
-}
-
-/// Whether `url`'s host is a loopback address (or `localhost`).
-pub fn is_loopback_url(url: &str) -> bool {
-    let Some(h) = reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)) else { return false };
-    let h = h.trim_start_matches('[').trim_end_matches(']');
-    match h.parse::<std::net::IpAddr>() {
-        Ok(ip) => ip.is_loopback(),
-        Err(_) => h == "localhost" || h.ends_with(".localhost"),
-    }
-}
-
-/// The startup rule (DESIGN.md "Exposure"): a node peers can reach
-/// (`--peer-listen`, or an `--advertise-url` that isn't loopback) runs peer
-/// mTLS, unless `--dev-mode` or `--peer-insecure` (the operator vouches for
-/// an encrypted private network such as WireGuard); otherwise it refuses
-/// to start. A node no peer can reach (one host, the single-host Ansible
-/// role) needs nothing.
-pub fn peer_mode(p: &PeerPolicy) -> Result<PeerMode> {
-    let https = p.advertise_url.starts_with("https://");
-    if p.tls {
-        ensure!(!p.insecure, "--peer-insecure and --peer-tls-* contradict each other: drop one");
-        ensure!(p.peer_listen, "peer TLS (--peer-tls-*) is served on --peer-listen: set it (and point --advertise-url at it)");
-        ensure!(https, "with peer TLS, --advertise-url must be https://<host>:<--peer-listen port> (got {:?})", p.advertise_url);
-        return Ok(PeerMode::Tls);
-    }
-    ensure!(
-        !https || !p.peer_listen,
-        "--advertise-url is https:// but peer TLS is off: set --peer-tls-ca, --peer-tls-cert and --peer-tls-key"
-    );
-    let reachable = p.peer_listen || !is_loopback_url(&p.advertise_url);
-    if !reachable {
-        return Ok(if p.dev_mode { PeerMode::Cleartext } else { PeerMode::Lone });
-    }
-    if p.dev_mode || p.insecure {
-        return Ok(PeerMode::Cleartext);
-    }
-    bail!(
-        "refusing to start: peers can reach this node (--advertise-url {:?}{}) but node-to-node traffic would be cleartext \
-         (forwarded requests carry users' tokens). Set --peer-listen with --peer-tls-ca/--peer-tls-cert/--peer-tls-key \
-         (`vlpds admin tls ca` / `vlpds admin tls issue`; ops/RUNBOOK.md \"Peer TLS\"), or pass --peer-insecure if peer \
-         traffic stays on a private encrypted network such as WireGuard",
-        p.advertise_url,
-        if p.peer_listen { ", --peer-listen" } else { "" }
-    )
+/// The host of a URL (DNS name or IP address, no brackets).
+pub fn url_host(url: &str) -> Result<String> {
+    let u = reqwest::Url::parse(url).with_context(|| format!("parsing {url:?}"))?;
+    let h = u.host_str().with_context(|| format!("{url:?} has no host"))?;
+    Ok(h.trim_start_matches('[').trim_end_matches(']').to_string())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn policy(advertise: &str) -> PeerPolicy {
-        PeerPolicy { advertise_url: advertise.into(), ..Default::default() }
-    }
-
-    #[test]
-    fn startup_policy() {
-        // single host: nothing new needed (the Ansible role's settings)
-        assert_eq!(peer_mode(&policy("http://127.0.0.1:2583")).unwrap(), PeerMode::Lone);
-        assert_eq!(peer_mode(&policy("http://localhost:2583")).unwrap(), PeerMode::Lone);
-        assert_eq!(peer_mode(&PeerPolicy { dev_mode: true, ..policy("http://127.0.0.1:2583") }).unwrap(), PeerMode::Cleartext);
-        // reachable without TLS: refused outside dev mode
-        let e = peer_mode(&policy("http://10.0.0.5:2583")).unwrap_err().to_string();
-        assert!(e.contains("refusing to start") && e.contains("--peer-insecure"), "{e}");
-        let e = peer_mode(&PeerPolicy { peer_listen: true, ..policy("http://127.0.0.1:2584") }).unwrap_err().to_string();
-        assert!(e.contains("refusing to start"), "{e}");
-        // ... unless dev mode or the operator vouches for the network
-        assert_eq!(peer_mode(&PeerPolicy { dev_mode: true, ..policy("http://10.0.0.5:2583") }).unwrap(), PeerMode::Cleartext);
-        assert_eq!(peer_mode(&PeerPolicy { insecure: true, peer_listen: true, ..policy("http://10.0.0.5:2584") }).unwrap(), PeerMode::Cleartext);
-        // TLS needs the peer listener and an https advertise URL
-        let tls = PeerPolicy { tls: true, peer_listen: true, ..policy("https://10.0.0.5:2584") };
-        assert_eq!(peer_mode(&tls).unwrap(), PeerMode::Tls);
-        assert!(peer_mode(&PeerPolicy { peer_listen: false, ..tls.clone() }).is_err());
-        assert!(peer_mode(&PeerPolicy { advertise_url: "http://10.0.0.5:2584".into(), ..tls.clone() }).is_err());
-        assert!(peer_mode(&PeerPolicy { insecure: true, ..tls.clone() }).is_err());
-        // https advertised without TLS configured
-        assert!(peer_mode(&PeerPolicy { tls: false, insecure: true, ..tls }).is_err());
-    }
-
-    /// A CA and node certs for tests.
+    /// A CA and node certs for tests (crate::http, crate::forward use it too).
     pub(crate) struct TestCa {
         pub ca: Issued,
     }
@@ -777,6 +744,44 @@ mod tests {
         write_pair(&dir, "n1", &other, true).unwrap();
         assert!(t.reload(true).is_err());
         assert_eq!(t.node_id(), "n1");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dev_dir_shares_one_ca_and_issues_node_certs() {
+        let dir = std::env::temp_dir().join(format!("vlpds-peer-tls-dev-{}", rand::random::<u64>()));
+        // concurrent first starts: one CA
+        let hosts = vec!["10.0.0.5".to_string()];
+        let files: Vec<Files> = std::thread::scope(|s| {
+            let (dir, hosts) = (&dir, &hosts);
+            let hs: Vec<_> = (0..4).map(|i| s.spawn(move || dev_files(dir, &format!("n{i}"), hosts).unwrap())).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let ca = std::fs::read(&files[0].ca).unwrap();
+        for (i, f) in files.iter().enumerate() {
+            let t = PeerTls::load(f.clone()).unwrap();
+            assert_eq!(t.node_id(), format!("n{i}"));
+            let info = cert_info(&CertificateDer::pem_slice_iter(&std::fs::read(&f.cert).unwrap()).next().unwrap().unwrap()).unwrap();
+            for h in ["10.0.0.5", "127.0.0.1", "localhost"] {
+                assert!(info.hosts.iter().any(|x| x == h), "{:?}", info.hosts);
+            }
+        }
+        // a restart reuses the cert; a new advertise host re-issues it
+        let before = std::fs::read(&files[0].cert).unwrap();
+        dev_files(&dir, "n0", &hosts).unwrap();
+        assert_eq!(std::fs::read(&files[0].cert).unwrap(), before);
+        dev_files(&dir, "n0", &["node0.test".to_string()]).unwrap();
+        assert_ne!(std::fs::read(&files[0].cert).unwrap(), before);
+        assert_eq!(std::fs::read(&files[0].ca).unwrap(), ca, "the CA stays");
+        // a replaced CA (copied in from another host) re-issues against it
+        let other = create_ca("other", 30).unwrap();
+        write_pair(&dir, "ca", &other, true).unwrap();
+        let f = dev_files(&dir, "n1", &hosts).unwrap();
+        PeerTls::load(f).unwrap();
+        // without the CA key nothing can be issued
+        std::fs::remove_file(dir.join("ca.key")).unwrap();
+        let e = dev_files(&dir, "n9", &hosts).unwrap_err().to_string();
+        assert!(e.contains("ca.key"), "{e}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -22,9 +22,11 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PKG="$(cd "$HERE/../.." && pwd)"
-# The first build with feature levels (cluster/version, exit 7): the oldest
-# "previous release" these scenarios can run against.
-PREV_PINNED=a9d1df7
+# The oldest "previous release" these scenarios can run against: the first
+# build with peer mTLS as the only node-to-node transport (--peer-tls-dir;
+# hactl's NODE_ARGS use it, and an older build's cleartext peers can't talk
+# to a newer one). Found by the flag's introduction, so it survives rebases.
+PREV_PINNED="$(git -C "$PKG" log --reverse --format=%h -S'peer_tls_dir: Option' -- src/main.rs | head -1)"
 export VLPDS_UPGRADE_DIR="${VLPDS_UPGRADE_DIR:-$PKG/target/upgrade}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$VLPDS_UPGRADE_DIR/target}"
 export VLPDS_BIN_DIR="${VLPDS_BIN_DIR:-$VLPDS_UPGRADE_DIR/new}"

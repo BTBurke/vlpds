@@ -29,36 +29,23 @@ struct Args {
     /// (public: only behind a proxy that blocks /metrics).
     #[arg(long, env = "VLPDS_METRICS_LISTEN")]
     metrics_listen: Option<String>,
-    /// A second app listener for peers (node-to-node forwarding and
-    /// /internal), served with the large peer HTTP/2 windows and stream
-    /// count, over mTLS with --peer-tls-*; point --advertise-url at it.
-    /// Once set, --listen gets the smaller client settings (DESIGN.md
-    /// "HTTP"), 404s /internal/* and ignores forwarded markers. Unset =
-    /// peers share --listen, which keeps the peer settings (cleartext:
-    /// --dev-mode or --peer-insecure only, unless no peer can reach this
-    /// node).
-    #[arg(long, env = "VLPDS_PEER_LISTEN")]
+    /// The peer listener: node-to-node traffic (forwards, /internal, log
+    /// streams) over mTLS only (--peer-tls-dir), with the large peer HTTP/2
+    /// windows and stream count; --advertise-url names it to peers
+    /// (https://<host>:<this port>). The three come together: set for a node
+    /// with peers, unset for a lone node (no peer listener, no /internal/*,
+    /// no peer calls). --listen always serves clients only (DESIGN.md
+    /// "Exposure").
+    #[arg(long, env = "VLPDS_PEER_LISTEN", requires_all = ["peer_tls_dir", "advertise_url"])]
     peer_listen: Option<String>,
-    /// Peer mTLS: the cluster CA certificate(s), PEM (several = all
-    /// trusted, for a CA rotation). With --peer-tls-cert and
-    /// --peer-tls-key; needs --peer-listen and an https:// --advertise-url
-    /// (DESIGN.md "Exposure", `vlpds admin tls`). Re-read on SIGHUP and
-    /// when the files change.
-    #[arg(long, env = "VLPDS_PEER_TLS_CA", requires_all = ["peer_tls_cert", "peer_tls_key"])]
-    peer_tls_ca: Option<std::path::PathBuf>,
-    /// Peer mTLS: this node's certificate (PEM, leaf first), with a
-    /// vlpds://node/<--node-id> URI SAN and the --advertise-url host.
-    #[arg(long, env = "VLPDS_PEER_TLS_CERT", requires_all = ["peer_tls_ca", "peer_tls_key"])]
-    peer_tls_cert: Option<std::path::PathBuf>,
-    /// Peer mTLS: this node's private key (PEM, PKCS#8).
-    #[arg(long, env = "VLPDS_PEER_TLS_KEY", requires_all = ["peer_tls_ca", "peer_tls_cert"])]
-    peer_tls_key: Option<std::path::PathBuf>,
-    /// Allow cleartext node-to-node traffic outside --dev-mode on a node
-    /// peers can reach: only when that traffic stays on a private
-    /// encrypted network such as WireGuard (forwarded requests carry users'
-    /// tokens).
-    #[arg(long, env = "VLPDS_PEER_INSECURE", conflicts_with = "peer_tls_ca")]
-    peer_insecure: bool,
+    /// Peer mTLS directory: ca.crt (the cluster CA, PEM; several = all
+    /// trusted, for a CA rotation), <node-id>.crt and <node-id>.key (what
+    /// `vlpds admin tls ca|issue --out DIR` write). Re-read on SIGHUP and
+    /// when the files change. With --dev-mode a node creates what's
+    /// missing: the CA once (nodes sharing the directory share it) and its
+    /// own certificate from ca.key.
+    #[arg(long, env = "VLPDS_PEER_TLS_DIR", requires = "peer_listen")]
+    peer_tls_dir: Option<std::path::PathBuf>,
     /// Connections open at once per listener; at the cap new ones wait in
     /// the accept queue (0 = no cap).
     #[arg(long, env = "VLPDS_MAX_CONNECTIONS", default_value_t = vlpds::server::DEFAULT_MAX_CONNECTIONS)]
@@ -534,8 +521,9 @@ struct Args {
     /// its shards immediately). Default "single".
     #[arg(long, env = "VLPDS_NODE_ID")]
     node_id: Option<String>,
-    /// URL peers use to reach this node (default: public_url).
-    #[arg(long, env = "VLPDS_ADVERTISE_URL")]
+    /// URL peers use to reach this node: https://<host>:<--peer-listen
+    /// port>, a host its peer certificate names. Only with --peer-listen.
+    #[arg(long, env = "VLPDS_ADVERTISE_URL", requires = "peer_listen")]
     advertise_url: Option<String>,
     /// Node lease TTL. Renewal and skew margin are TTL/5 each. A node's
     /// renewal (one CAS PUT) must complete within (TTL - skew)/2 = 0.4 x TTL
@@ -552,8 +540,8 @@ struct Args {
     /// a forwarding node passes the client address over the internal token).
     #[arg(long, env = "VLPDS_TRUSTED_PROXIES", value_delimiter = ',')]
     trusted_proxies: Vec<String>,
-    /// HTTP/2 connections to each peer node (h2c, or h2 over peer mTLS);
-    /// requests round-robin.
+    /// HTTP/2 connections (over peer mTLS) to each peer node; requests
+    /// round-robin.
     #[arg(long, env = "VLPDS_PEER_CONNECTIONS", default_value_t = vlpds::http::DEFAULT_PEER_CONNECTIONS)]
     peer_connections: usize,
     /// `x-ratelimit-bypass` header value that skips rate limits.
@@ -770,7 +758,11 @@ fn tls_main(cmd: TlsCmd) -> anyhow::Result<()> {
             let n = peer_tls::issue_node(&read(&ca)?, &read(&ca_key)?, &node_id, &hosts, days)?;
             let (crt, key) = peer_tls::write_pair(&out, &node_id, &n, force)?;
             println!("node certificate: {}\nnode key (0600): {}", crt.display(), key.display());
-            println!("run the node with --peer-tls-ca {} --peer-tls-cert {} --peer-tls-key {}", ca.display(), crt.display(), key.display());
+            let dir_ca = out.join("ca.crt");
+            if std::fs::canonicalize(&ca).ok() != std::fs::canonicalize(&dir_ca).ok() {
+                println!("copy {} to {} (the node's directory holds ca.crt too)", ca.display(), dir_ca.display());
+            }
+            println!("run the node with --node-id {node_id} --peer-tls-dir {} (without ca.key)", out.display());
         }
         TlsCmd::Show { cert } => {
             use rustls::pki_types::pem::PemObject;
@@ -1019,41 +1011,34 @@ async fn run(args: Args) -> anyhow::Result<()> {
             ..Default::default()
         }),
     };
-    // node-to-node exposure (DESIGN.md "Exposure"): refuse a cleartext
-    // cluster outside dev mode unless --peer-insecure
+    // node-to-node exposure (DESIGN.md "Exposure"): peers talk mTLS on the
+    // peer listener; a lone node has neither (clap: the flags come together)
     let node_id = args.node_id.clone().unwrap_or_else(|| "single".into());
     let advertise_url = args.advertise_url.clone().unwrap_or_else(|| args.public_url.clone());
-    let peer_mode = vlpds::peer_tls::peer_mode(&vlpds::peer_tls::PeerPolicy {
-        dev_mode: args.dev_mode,
-        peer_listen: args.peer_listen.is_some(),
-        advertise_url: advertise_url.clone(),
-        tls: args.peer_tls_ca.is_some(),
-        insecure: args.peer_insecure,
-    })?;
-    let peer_tls = match (&args.peer_tls_ca, &args.peer_tls_cert, &args.peer_tls_key) {
-        (Some(ca), Some(cert), Some(key)) => {
-            vlpds::peer_tls::check_node_id(&node_id)?;
-            let files = vlpds::peer_tls::Files { ca: ca.clone(), cert: cert.clone(), key: key.clone() };
-            let t = vlpds::peer_tls::PeerTls::load(files).map_err(|e| e.context("peer TLS (--peer-tls-*)"))?;
+    let peer_tls = match &args.peer_tls_dir {
+        Some(dir) => {
             anyhow::ensure!(
-                t.node_id() == node_id,
-                "--peer-tls-cert names node {:?} but --node-id is {node_id:?}",
-                t.node_id()
+                advertise_url.starts_with("https://"),
+                "--advertise-url must be https://<host>:<--peer-listen port> (peers talk mTLS only), got {advertise_url:?}"
             );
+            vlpds::peer_tls::check_node_id(&node_id)?;
+            let files = if args.dev_mode {
+                vlpds::peer_tls::dev_files(dir, &node_id, &[vlpds::peer_tls::url_host(&advertise_url)?])?
+            } else {
+                vlpds::peer_tls::Files::in_dir(dir, &node_id)
+            };
+            let t = vlpds::peer_tls::PeerTls::load(files).map_err(|e| e.context(format!("peer TLS (--peer-tls-dir {})", dir.display())))?;
+            anyhow::ensure!(t.node_id() == node_id, "{node_id}.crt names node {:?} but --node-id is {node_id:?}", t.node_id());
             let (cert_exp, ca_exp) = t.not_after();
             tracing::info!(node = %t.node_id(), cert_not_after = cert_exp, ca_not_after = ca_exp, "peer mTLS on");
             t.spawn_reloader();
             Some(t)
         }
-        _ => None,
-    };
-    match peer_mode {
-        vlpds::peer_tls::PeerMode::Lone => tracing::info!("no peer can reach this node (loopback --advertise-url, no --peer-listen): /internal/* not mounted"),
-        vlpds::peer_tls::PeerMode::Cleartext if !args.dev_mode => {
-            tracing::warn!("--peer-insecure: node-to-node traffic (forwarded user tokens included) is cleartext h2c; keep it on a private encrypted network")
+        None => {
+            tracing::info!("lone node (no --peer-listen): no peer listener, no /internal/*, no peer calls");
+            None
         }
-        _ => {}
-    }
+    };
     let reshard_gc = Some(vlpds::reshard_gc::Config {
         grace: opt_duration(&args.reshard_gc_grace)?,
         detach_after: opt_duration(&args.forced_detach_after)?,
@@ -1154,7 +1139,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
         trusted_proxies: args.trusted_proxies.clone(),
         peer_connections: args.peer_connections,
         peer_tls,
-        serve_internal: peer_mode != vlpds::peer_tls::PeerMode::Lone,
         rate_limit_bypass_key: args.rate_limit_bypass_key.clone(),
         cluster: Some(vlpds::cluster::ClusterConfig {
             node_id,
@@ -1223,28 +1207,16 @@ async fn run(args: Args) -> anyhow::Result<()> {
     vlpds::oauth::gc::spawn_gc(app.clone());
     vlpds::xrpc::key_rotation::spawn_recovery(app.clone());
     tokio::spawn(vlpds::xrpc::request_crawl(app.clone()));
-    let router = server::router(&app);
     // Keep serving through a graceful shutdown: peers forward to us until
     // our handoff nudges reach them, and a forward we drop mid-request is
     // ambiguous to them (a client 503), while one we answer "not owned"
     // (ShardMoved) they resend to the new owner.
-    let max_connections = args.max_connections;
-    let (public, router) = match peer_listener {
-        Some(l) => {
-            let tls = app.config.peer_tls.as_ref().map(|t| t.server_config());
-            let mtls = tls.is_some();
-            let opts = server::ServeOptions { h2: server::H2Profile::Peer, max_connections, tls };
-            tokio::spawn(server::serve_with(l, router, opts));
-            tracing::info!(
-                peer_listen = args.peer_listen.as_deref().unwrap_or(""),
-                mtls,
-                "peer listener (peer HTTP/2 settings; --listen has the client ones and no /internal/*)"
-            );
-            (server::H2Profile::Public, server::public_router(&app))
-        }
-        None => (server::H2Profile::Peer, router),
-    };
-    let opts = server::ServeOptions { h2: public, max_connections, tls: None };
+    if let Some(l) = peer_listener {
+        server::spawn_peer_listener(&app, l)?;
+        tracing::info!(peer_listen = args.peer_listen.as_deref().unwrap_or(""), "peer listener (mTLS, peer HTTP/2 settings)");
+    }
+    let router = server::public_router(&app);
+    let opts = server::ServeOptions { h2: server::H2Profile::Public, max_connections: args.max_connections, tls: None };
     let mut serving = tokio::spawn(server::serve_with(listener, router, opts));
     tokio::select! {
         r = &mut serving => r?,

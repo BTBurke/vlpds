@@ -1,7 +1,12 @@
 //! Shared harness for the vlpds conformance suite.
 //!
 //! - `TestServer::spawn()` boots an in-process PDS (in-memory object store,
-//!   dev mode) on 127.0.0.1:0.
+//!   dev mode) on 127.0.0.1:0, with an mTLS peer listener (`peer_url`) and
+//!   a node certificate from the suite's CA ([`test_ca`]): in-process nodes
+//!   sharing a store form a cluster over peer mTLS, as processes do. A
+//!   cluster test advertises [`peer_url`] (`ClusterConfig::addr`) and calls
+//!   `/internal/*` with [`peer_client`]. `TestServer::spawn_lone` has no
+//!   peer listener (a lone node).
 //! - `Xrpc` is a small typed client: `get`/`post` return a `Resp` with status,
 //!   decoded JSON and helpers to assert success or a specific XRPC error.
 //! - `TestAccount` + `TestServer::create_account` for account fixtures.
@@ -74,7 +79,37 @@ pub struct TestServer {
     pub app: Arc<vlpds::xrpc::App>,
     pub addr: SocketAddr,
     pub url: String,
+    /// The mTLS peer listener (`https://`; empty on a lone node).
+    pub peer_url: String,
     pub xrpc: Xrpc,
+}
+
+/// The suite's cluster CA (one per test binary): every [`TestServer`]'s
+/// node certificate comes from it.
+pub fn test_ca() -> &'static vlpds::peer_tls::Issued {
+    static CA: std::sync::LazyLock<vlpds::peer_tls::Issued> =
+        std::sync::LazyLock::new(|| vlpds::peer_tls::create_ca("vlpds test cluster CA", 30).unwrap());
+    &CA
+}
+
+/// Peer TLS material for node `id`, from [`test_ca`].
+pub fn node_tls(id: &str) -> Arc<vlpds::peer_tls::PeerTls> {
+    let ca = test_ca();
+    let n = vlpds::peer_tls::issue_node(&ca.cert_pem, &ca.key_pem, id, &["127.0.0.1".into(), "localhost".into()], 30).unwrap();
+    vlpds::peer_tls::PeerTls::from_pem(&ca.cert_pem, &n.cert_pem, &n.key_pem).unwrap()
+}
+
+/// A peer client of the test cluster (mTLS as node "test-peer", any node
+/// accepted): `/internal/*` calls at `TestServer::peer_url`.
+pub fn peer_client() -> &'static vlpds::http::PeerClient {
+    static C: std::sync::LazyLock<vlpds::http::PeerClient> = std::sync::LazyLock::new(|| vlpds::http::PeerClient::new(1, node_tls("test-peer")));
+    &C
+}
+
+/// In a `TestServer::spawn_with` closure: this node's peer listener URL,
+/// what a cluster test advertises (`ClusterConfig::addr`).
+pub fn peer_url(c: &vlpds::server::Config) -> String {
+    c.cluster.as_ref().expect("the harness presets cluster.addr").addr.clone()
 }
 
 impl TestServer {
@@ -82,13 +117,27 @@ impl TestServer {
         Self::spawn_with(|_| {}).await
     }
 
+    /// A node with an mTLS peer listener; its node certificate names
+    /// `cluster.node_id` as `f` leaves it ("single" by default).
     pub async fn spawn_with(f: impl FnOnce(&mut vlpds::server::Config)) -> TestServer {
+        let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let peer_url = format!("https://{}", peer.local_addr().unwrap());
+        Self::spawn_inner(Some((peer, peer_url)), f).await
+    }
+
+    /// A lone node: no peer listener, no peer TLS, no `/internal/*`.
+    pub async fn spawn_lone(f: impl FnOnce(&mut vlpds::server::Config)) -> TestServer {
+        Self::spawn_inner(None, f).await
+    }
+
+    async fn spawn_inner(peer: Option<(tokio::net::TcpListener, String)>, f: impl FnOnce(&mut vlpds::server::Config)) -> TestServer {
         init_tracing();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}");
+        let peer_url = peer.as_ref().map(|(_, u)| u.clone()).unwrap_or_default();
         let mut cfg = vlpds::server::Config {
             dev_mode: true,
             public_url: url.clone(),
@@ -96,17 +145,23 @@ impl TestServer {
             // suite drives thousands of writes from one IP and DID.
             // tests/rate_limits.rs turns them on.
             rate_limits_enabled: false,
+            cluster: peer.is_some().then(|| vlpds::cluster::ClusterConfig { node_id: "single".into(), addr: peer_url.clone(), ..Default::default() }),
             // small ring is fine; tests are tiny
             ..Default::default()
         };
         f(&mut cfg);
-        let (app, addr) = vlpds::server::spawn(cfg, listener)
+        if peer.is_some() && cfg.peer_tls.is_none() {
+            let id = cfg.cluster.as_ref().map_or("single".to_string(), |c| c.node_id.clone());
+            cfg.peer_tls = Some(node_tls(&id));
+        }
+        let (app, addr) = vlpds::server::spawn(cfg, listener, peer.map(|(l, _)| l))
             .await
             .expect("spawn server");
         TestServer {
             app,
             addr,
             url: url.clone(),
+            peer_url,
             xrpc: Xrpc::new(&url),
         }
     }

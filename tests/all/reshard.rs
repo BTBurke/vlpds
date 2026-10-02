@@ -116,7 +116,7 @@ async fn node_with(id: &str, store: &Arc<object_store::memory::InMemory>, f: imp
         c.shards = SHARDS;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: SHARDS,
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),
@@ -711,7 +711,7 @@ async fn policy_splits_a_hot_shard() {
         c.shards = SHARDS;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: "rspol".into(),
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: SHARDS,
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),

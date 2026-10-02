@@ -353,7 +353,7 @@ async fn account_load_failures_are_not_account_not_found() {
             c.dev_mode = true;
             c.cluster = Some(vlpds::cluster::ClusterConfig {
                 node_id: "kek".into(),
-                addr: c.public_url.clone(),
+                addr: peer_url(c),
                 shards: 4,
                 ttl: Duration::from_millis(1500),
                 renew_every: Duration::from_millis(100),

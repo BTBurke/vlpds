@@ -60,7 +60,7 @@ async fn spawn_with(f: impl FnOnce(&mut vlpds::server::Config)) -> Srv {
         ..Default::default()
     };
     f(&mut cfg);
-    let (app, _) = vlpds::server::spawn(cfg, listener).await.unwrap();
+    let (app, _) = vlpds::server::spawn(cfg, listener, None).await.unwrap();
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -2554,7 +2554,7 @@ async fn sign_up_page_with_required_invites() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let cfg = vlpds::server::Config { dev_mode: true, public_url: base.clone(), invite_required: true, ..Default::default() };
-    let (app, _) = vlpds::server::spawn(cfg, listener).await.unwrap();
+    let (app, _) = vlpds::server::spawn(cfg, listener, None).await.unwrap();
     let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
     let s = Srv { app, base, http };
     let key = DpopKey::new();
@@ -2839,7 +2839,7 @@ async fn bench_dpop_resource_requests() {
         inject_latency: inject.map(|ms| (ms, 0.0)),
         ..Default::default()
     };
-    let (app, _) = vlpds::server::spawn(cfg, listener).await.unwrap();
+    let (app, _) = vlpds::server::spawn(cfg, listener, None).await.unwrap();
     let http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
     let s = Srv { app, base, http };
     let acct = create_account(&s, "benchy").await;

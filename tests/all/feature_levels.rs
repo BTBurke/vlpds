@@ -24,7 +24,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, levels: Win
         c.shards = SHARDS;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: SHARDS,
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),
@@ -126,8 +126,9 @@ async fn scatter_gather_404_is_unsupported_not_unreachable() {
     // an "old build": a server that 404s every path, with a renewed (draining,
     // so it takes no shards) lease
     let old = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let old_addr = format!("http://{}", old.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(old, axum::Router::new()).await.unwrap() });
+    let old_addr = format!("https://{}", old.local_addr().unwrap());
+    let opts = vlpds::server::ServeOptions { tls: Some(node_tls("fl-old").server_config()), ..Default::default() };
+    tokio::spawn(vlpds::server::serve_with(old, axum::Router::new(), opts));
     let ghost_store = store.clone();
     let ghost = tokio::spawn(async move {
         use object_store::ObjectStoreExt;

@@ -81,23 +81,20 @@ it is marked **(unverified)**.
 `--metrics-listen` (default `127.0.0.1:9583`; on the app port with
 `--dev-mode` or `--metrics-listen app`, which is public unless a proxy blocks
 it). Peer traffic (forwards, which carry users' tokens; `/internal/*`; log
-streams) goes to `--advertise-url` (DESIGN.md "Exposure"):
-- **Cluster:** `--peer-listen` with peer mTLS (`--peer-tls-ca`,
-  `--peer-tls-cert`, `--peer-tls-key`; [Peer TLS](#peer-tls-mtls-between-nodes)),
-  `--advertise-url https://<host>:<peer port>`. The peer listener serves
-  everything `--listen` does plus `/internal/*` (`/metrics` and
-  `/debug/pprof` only where `--listen` has them), with the peer HTTP/2
+streams) goes to `--advertise-url` over peer mTLS, the only node-to-node
+transport (DESIGN.md "Exposure"):
+- **Cluster:** `--peer-listen`, `--peer-tls-dir` ([Peer TLS](#peer-tls-mtls-between-nodes))
+  and `--advertise-url https://<host>:<peer port>`, always together. The peer
+  listener serves everything `--listen` does plus `/internal/*` (`/metrics`
+  and `/debug/pprof` only where `--listen` has them), with the peer HTTP/2
   settings, to clients with a node certificate of the cluster CA only.
-  `--listen` then 404s `/internal/*` and drops `x-vlpds-forwarded`,
-  `x-vlpds-internal` and `x-vlpds-client-ip` from requests (served as the
-  client requests they are).
-- **Single host** (no `--peer-listen`, a loopback `--advertise-url`, as the
-  Ansible role runs it): nothing to set; `/internal/*` isn't mounted.
-- **Cleartext peers** (no TLS, peers reach `--listen` or `--peer-listen`):
-  `--dev-mode`, or `--peer-insecure` when the traffic stays on a private
-  encrypted network (WireGuard/Tailscale). Anything else refuses to start
-  ("refusing to start: peers can reach this node ..."). Block `/internal/`
-  at the edge either way (the Ansible Caddy does).
+- **Single host** (none of the three, as the Ansible role runs it): a lone
+  node; no peer listener, no `/internal/*`, no peer calls.
+
+Either way `--listen` serves clients only: it 404s `/internal/*` and drops
+`x-vlpds-forwarded`, `x-vlpds-internal` and `x-vlpds-client-ip` from requests
+(served as the client requests they are). Block `/internal/` at the edge
+anyway (the Ansible Caddy does).
 
 Production refuses the MinIO default S3 credentials, and
 `vlpds.admin.bulkCreate` needs `--dev-mode` or `--allow-bulk-create`.
@@ -158,9 +155,8 @@ its own log, so it never counts): that survives a node that never comes back.
 | Flag (env) | Default | Bounds | Past it |
 |---|---|---|---|
 | `--max-connections` (`VLPDS_MAX_CONNECTIONS`) | 50,000 | open connections per listener | accepts pause (connections wait in the accept queue) |
-| `--peer-listen` (`VLPDS_PEER_LISTEN`) | unset | a second listener for peers, with the large h2 windows (mTLS with `--peer-tls-*`); point `--advertise-url` at it. Then `--listen` gets the client settings (1 MiB / 8 MiB windows, 256 streams per connection) and no `/internal/*` | - |
-| `--peer-tls-ca` / `--peer-tls-cert` / `--peer-tls-key` (`VLPDS_PEER_TLS_CA` / `_CERT` / `_KEY`) | unset | peer mTLS on `--peer-listen` and in the peer clients ([Peer TLS](#peer-tls-mtls-between-nodes)); re-read on SIGHUP and on file change (60 s poll) | a node cert from another CA, for another node or host: handshake refused (`vlpds_peer_tls_handshake_failures_total`) |
-| `--peer-insecure` (`VLPDS_PEER_INSECURE`) | off | allows cleartext peer traffic outside `--dev-mode` on a node peers can reach | - |
+| `--peer-listen` (`VLPDS_PEER_LISTEN`) | unset (lone node) | the peer listener (mTLS), with the large h2 windows (4 MiB / 64 MiB, 1,024 streams); needs `--peer-tls-dir` and `--advertise-url` pointing at it. `--listen` always has the client settings (1 MiB / 8 MiB windows, 256 streams per connection) | - |
+| `--peer-tls-dir` (`VLPDS_PEER_TLS_DIR`) | unset | `ca.crt`, `<node-id>.crt`, `<node-id>.key` for peer mTLS on `--peer-listen` and in the peer clients ([Peer TLS](#peer-tls-mtls-between-nodes)); re-read on SIGHUP and on file change (60 s poll); `--dev-mode` creates what's missing | a node cert from another CA, for another node or host: handshake refused (`vlpds_peer_tls_handshake_failures_total`) |
 | `--max-exports` (`VLPDS_MAX_EXPORTS`) | 32 | getRepo exports streaming at once | waits 10 s for a slot, then 503 `Overloaded` (`vlpds_sync_exports_ended_total{reason="shed"}`) |
 | `--export-stall-secs` (`VLPDS_EXPORT_STALL_SECS`) | 60 | how long an export waits for a client that reads nothing | export ended, body errors (`reason="stalled"`) |
 | `--max-queued-reads` (`VLPDS_MAX_QUEUED_READS`) | 20,000 | repo-view reads (getRepo, getRecord, getBlocks, ...) queued at the repo workers | 503 `Overloaded` |
@@ -1351,7 +1347,7 @@ it, so heavy stalls risk lease lapses.
 
 **Means:** `vlpds_peer_tls_cert_expiry_seconds{cert}` (notAfter, Unix seconds)
 is under 14 days away: `cert="node"` is this node's certificate, `cert="ca"`
-the earliest-expiring CA in `--peer-tls-ca`. Once a node cert expires every
+the earliest-expiring CA in `ca.crt` (`--peer-tls-dir`). Once a node cert expires every
 peer refuses it (forwards to and from it fail, its log stream stalls every
 peer's firehose), and the node won't start or reload with it.
 
@@ -1383,7 +1379,7 @@ SANs, or a node id other than the lease at that address says).
 certificate` (client) warn logs name the address and reason.
 
 **Do:** compare `vlpds admin tls show` of each node's cert with its
-`--node-id` and `--advertise-url` host, and their `--peer-tls-ca` files (all
+`--node-id` and `--advertise-url` host, and their `ca.crt` files (all
 nodes must trust the CA every node's cert comes from; mid CA rotation, both).
 
 ---
@@ -1662,11 +1658,11 @@ deploy such a build (it logs `TEST BUILD` at startup).
 ### Adding a node
 
 1. Pick a **unique** `--node-id`. Same bucket, prefix, KEK flags, `--jwt-secret`,
-   `--admin-token`, `--internal-token`, `--peer-tls-ca`; issue its node
-   certificate (`vlpds admin tls issue --node-id <id> --host <advertise host>`,
-   [Peer TLS](#peer-tls-mtls-between-nodes)); set `--peer-listen` and
-   `--advertise-url https://<host>:<peer port>` to an address all peers can
-   reach. Nodes don't go in `--trusted-proxies`: a forwarding node
+   `--admin-token`, `--internal-token`, `ca.crt`; issue its node
+   certificate into its `--peer-tls-dir` (`vlpds admin tls issue --node-id <id>
+   --host <advertise host>`, [Peer TLS](#peer-tls-mtls-between-nodes)); set
+   `--peer-listen` and `--advertise-url https://<host>:<peer port>` to an
+   address all peers can reach. Nodes don't go in `--trusted-proxies`: a forwarding node
    passes the client address over the internal token (DESIGN "Rate limits");
    list only real proxies (load balancers) there.
 2. Start it. After it greets every peer, each peer above the new fair share
@@ -1679,7 +1675,8 @@ deploy such a build (it logs `TEST BUILD` at startup).
 ### Peer TLS (mTLS between nodes)
 
 Node-to-node traffic (forwards, `/internal/*`, log streams) runs h2 over TLS
-1.3 with client certificates on `--peer-listen` (DESIGN.md "Exposure"). A
+1.3 with client certificates on `--peer-listen` (DESIGN.md "Exposure"); there
+is no cleartext mode. A
 node certificate names its node with a URI SAN `vlpds://node/<node-id>` and
 carries the DNS name or IP of its `--advertise-url` host; both serverAuth and
 clientAuth. Peers check, besides the chain: the host, and that the cert names
@@ -1704,23 +1701,26 @@ vlpds admin tls show ./pki/node-a.crt
 ```
 
 Install `ca.crt`, `node-a.crt` and `node-a.key` (0600, readable by the vlpds
-user) on the node and run it with:
+user) in one directory on the node (not `ca.key`) and run it with:
 
 ```sh
---peer-listen 0.0.0.0:2584 --advertise-url https://10.0.0.5:2584 \
---peer-tls-ca /run/vlpds/ca.crt --peer-tls-cert /run/vlpds/node-a.crt --peer-tls-key /run/vlpds/node-a.key
+--node-id node-a --peer-listen 0.0.0.0:2584 --advertise-url https://10.0.0.5:2584 \
+--peer-tls-dir /run/vlpds/peer-tls
 ```
 
 Startup refuses a cert that doesn't chain to the CA, is expired, lacks the
 `vlpds://node/` SAN, names another `--node-id`, or doesn't match the key; and
-TLS without `--peer-listen` or with an `http://` advertise URL. Keep
-`--listen` behind the edge proxy as before and `--peer-listen` reachable only
-by peers (it refuses anyone without a node cert, but needn't be public).
+an `http://` advertise URL (`--peer-listen`, `--peer-tls-dir` and
+`--advertise-url` go together). Keep `--listen` behind the edge proxy as
+before and `--peer-listen` reachable only by peers (it refuses anyone without
+a node cert, but needn't be public).
 
-Turning TLS on in a running cleartext cluster: a TLS node only calls `https://`
-peers and its peer listener only takes node certs, so mixed nodes can't forward
-to each other or stream logs (the firehose stalls until all match). Switch all
-nodes in one window: stop all (SIGTERM), start all with TLS.
+**Dev mode** (local or bench clusters): point every node at one
+`--peer-tls-dir`; the first node creates `ca.crt` + `ca.key` (under a lock)
+and each node issues its own certificate from them at startup. Across hosts,
+copy `ca.crt` and `ca.key` into each host's directory before starting its
+nodes (bench/xhost does). Never in production: the CA key sits next to the
+nodes.
 
 **Renew a node certificate** (alert [VlpdsPeerTlsCertExpiring](#vlpdspeertlscertexpiring)
 `cert="node"`; no restart):
@@ -1737,13 +1737,13 @@ nodes in one window: stop all (SIGTERM), start all with TLS.
 
 **Rotate the CA** (`cert="ca"`, or a suspected CA key leak):
 1. `vlpds admin tls ca --out ./pki-new`.
-2. On every node, make `--peer-tls-ca` a bundle of old + new CA
+2. On every node, make `ca.crt` in `--peer-tls-dir` a bundle of old + new CA
    (`cat pki/ca.crt pki-new/ca.crt > ca.crt`), then SIGHUP (or wait for the
    poll). Every node now trusts certs from either CA.
 3. Issue each node a cert from the new CA (`--ca ./pki-new/ca.crt --ca-key
    ./pki-new/ca.key`), install, SIGHUP, one node at a time; check
    `vlpds_peer_tls_handshake_failures_total` stays flat.
-4. Once every node presents a new-CA cert, make `--peer-tls-ca` the new CA
+4. Once every node presents a new-CA cert, make `ca.crt` the new CA
    alone on every node and SIGHUP. After a key leak, also restart the nodes
    (pooled connections authenticated under the old CA close then) and rotate
    `--internal-token`.

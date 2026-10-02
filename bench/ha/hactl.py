@@ -9,9 +9,15 @@ verification.
 
 Every node gets two faultproxy instances (bench/ha/faultproxy):
   * an HTTP proxy in front of MinIO (its S3 endpoint), so S3 faults hit one node
-  * a TCP proxy in front of its port that it *advertises* to peers, so peer
-    traffic (request forwarding, partition streams) can be cut or slowed
-    while clients (loadgen, checker) still reach it directly.
+  * a TCP proxy in front of its mTLS peer listener (--peer-listen) that it
+    *advertises* to peers, so peer traffic (request forwarding, log streams)
+    can be cut or slowed while clients (loadgen, checker) still reach its
+    public port directly.
+
+Peers talk mTLS only: nodes run --dev-mode with one shared --peer-tls-dir
+(PEER_TLS_DIR), where the first node creates the cluster CA and each node
+its certificate. The harness reads a node's status (/internal/v1/cluster)
+on its peer listener with that node's own certificate.
 
 Outputs land in bench/ha/out/<run-id>/<scenario>/ (node logs, loadgen logs,
 checker output, probe CSV, result.json); a summary table is appended to
@@ -25,6 +31,7 @@ import json
 import os
 import random
 import signal
+import ssl
 import subprocess
 import sys
 import threading
@@ -44,25 +51,27 @@ FHAUDIT = os.path.join(HERE, "fhaudit", "fhaudit")
 S3 = os.environ.get("VLPDS_HA_S3", "127.0.0.1:9200")
 ADMIN = "dev-admin-token"
 # x-vlpds-internal (node-to-node / status) token: VLPDS_INTERNAL_TOKEN on the
-# nodes; dev default. Older builds took the admin token there (dev mode only).
+# nodes; dev default.
 INTERNAL = os.environ.get("VLPDS_HA_INTERNAL_TOKEN", "dev-internal-token")
+# Shared dev-mode peer TLS directory (CA + node certs, created by the nodes).
+PEER_TLS_DIR = os.environ.get("VLPDS_HA_PEER_TLS_DIR", os.path.join(HERE, "out", "peer-tls"))
 PARTITIONS = int(os.environ.get("VLPDS_HA_PARTITIONS", "64"))  # shards
 TTL_MS = int(os.environ.get("VLPDS_HA_TTL_MS", "3000"))
 RATE = float(os.environ.get("VLPDS_HA_RATE", "150"))  # writes/s per loadgen (one per node)
-# Node command line (after the binary). Placeholders: {listen} {url} {advertise}
-# {s3} {prefix} {id} {ttl_ms} {partitions}. Override for other designs/flags.
+# Node command line (after the binary). Placeholders: {listen} {url}
+# {peer_listen} {advertise} {tls_dir} {s3} {prefix} {id} {ttl_ms}
+# {partitions}. Override for other designs/flags.
 NODE_ARGS = os.environ.get(
     "VLPDS_HA_NODE_ARGS",
-    "--listen {listen} --public-url {url} --advertise-url {advertise} --s3-endpoint {s3} --prefix {prefix} "
+    "--listen {listen} --public-url {url} --peer-listen {peer_listen} --advertise-url {advertise} "
+    "--peer-tls-dir {tls_dir} --s3-endpoint {s3} --prefix {prefix} "
     "--node-id {id} --lease-ttl-ms {ttl_ms} --shards {partitions} --no-rate-limits --dev-mode --workers 2 "
     "--io-threads 3 --firehose-ring-mb 256",
 )
+# Ports: node i listens on BASE_PORT+i (public), +800+i (peer, mTLS); its peer
+# faultproxy on +200+i (advertised) / +400+i (ctl); S3 proxy +2300+i / +2500+i;
+# containers publish +600+i (public) and +1400+i (peer).
 BASE_PORT = int(os.environ.get("VLPDS_HA_BASE_PORT", "7100"))
-# Ownership observation (optional): the /internal/v1/cluster status endpoint if
-# the build has one, else the first of these gauges a node exports. If neither
-# exists, convergence is not observed (scenarios still run; verdicts rest on
-# verify / checker / firehose audits).
-OWNED_METRICS = os.environ.get("VLPDS_HA_OWNED_METRICS", "vlpds_owned_shards,vlpds_owned_partitions").split(",")
 # Injected median latency (ms) on every node's segment PUTs (--inject-put-ms,
 # lognormal sigma 0.5), so segment PUTs overlap and K > 1 is exercised; 0 = off.
 INJECT_PUT_MS = float(os.environ.get("VLPDS_HA_INJECT_PUT_MS", "25"))
@@ -106,16 +115,28 @@ def spawn(args, out_path, env=None):
     return p
 
 
-def http(method, url, body=None, headers=None, timeout=10.0):
+def http(method, url, body=None, headers=None, timeout=10.0, context=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     if data is not None:
         req.add_header("content-type", "application/json")
     for k, v in (headers or {}).items():
         req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout, context=context) as r:
         raw = r.read()
         return r.status, raw
+
+
+def peer_tls_context(node_id):
+    """mTLS client context for peer listeners: the shared dev CA, and node
+    `node_id`'s certificate (any node's is accepted; each node's exists once
+    it has started)."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.load_verify_locations(os.path.join(PEER_TLS_DIR, "ca.crt"))
+    ctx.load_cert_chain(os.path.join(PEER_TLS_DIR, f"{node_id}.crt"), os.path.join(PEER_TLS_DIR, f"{node_id}.key"))
+    ctx.set_alpn_protocols(["http/1.1"])
+    return ctx
 
 
 def partition_of(did, n=PARTITIONS):
@@ -170,6 +191,7 @@ class Node:
         self.id = f"n{idx}"
         self.port = BASE_PORT + idx
         self.url = f"http://127.0.0.1:{self.port}"
+        self.peer_port = BASE_PORT + 800 + idx
         self.prefix = prefix
         self.outdir = outdir
         self.extra = extra or []
@@ -178,12 +200,14 @@ class Node:
         self.exits = []  # (time, returncode)
         self.bin = None  # this node's vlpds binary (two-build scenarios); None = VLPDS
         self.s3 = Proxy("http", f"127.0.0.1:{BASE_PORT + 2300 + idx}", S3, f"127.0.0.1:{BASE_PORT + 2500 + idx}", os.path.join(outdir, f"{self.id}.s3proxy.log"))
-        self.peer = Proxy("tcp", f"127.0.0.1:{BASE_PORT + 200 + idx}", f"127.0.0.1:{self.port}", f"127.0.0.1:{BASE_PORT + 400 + idx}", os.path.join(outdir, f"{self.id}.peerproxy.log"))
-        self.advertise = f"http://127.0.0.1:{BASE_PORT + 200 + idx}"
+        self.peer = Proxy("tcp", f"127.0.0.1:{BASE_PORT + 200 + idx}", f"127.0.0.1:{self.peer_port}", f"127.0.0.1:{BASE_PORT + 400 + idx}", os.path.join(outdir, f"{self.id}.peerproxy.log"))
+        self.advertise = f"https://127.0.0.1:{BASE_PORT + 200 + idx}"
 
     def start(self):
+        os.makedirs(PEER_TLS_DIR, exist_ok=True)
         args = [self.bin or VLPDS] + NODE_ARGS.format(
-            listen=f"127.0.0.1:{self.port}", url=self.url, advertise=self.advertise,
+            listen=f"127.0.0.1:{self.port}", url=self.url, peer_listen=f"127.0.0.1:{self.peer_port}",
+            advertise=self.advertise, tls_dir=PEER_TLS_DIR,
             s3=f"http://127.0.0.1:{BASE_PORT + 2300 + self.idx}", prefix=self.prefix, id=self.id,
             ttl_ms=TTL_MS, partitions=PARTITIONS).split() + self.extra
         env = {"RUST_LOG": "info,slatedb=warn", "VLPDS_NO_RATE_LIMITS": "true"}  # load tests
@@ -218,12 +242,10 @@ class Node:
         self.alive()
 
     def status(self, timeout=2.0):
-        try:
-            _, raw = http("GET", self.url + "/internal/v1/cluster", headers={"x-vlpds-internal": INTERNAL}, timeout=timeout)
-        except urllib.error.HTTPError as e:
-            if e.code not in (401, 403):
-                raise
-            _, raw = http("GET", self.url + "/internal/v1/cluster", headers={"x-vlpds-internal": ADMIN}, timeout=timeout)
+        """/internal/v1/cluster on the node's peer listener (mTLS, this
+        node's own dev certificate; not through its fault proxy)."""
+        _, raw = http("GET", f"https://127.0.0.1:{self.peer_port}/internal/v1/cluster",
+                      headers={"x-vlpds-internal": INTERNAL}, timeout=timeout, context=peer_tls_context(self.id))
         return json.loads(raw)
 
     def metrics(self):
@@ -293,13 +315,14 @@ class CNode(Node):
         self.id = f"n{idx}"
         self.port = BASE_PORT + 600 + idx
         self.url = f"http://127.0.0.1:{self.port}"
+        self.peer_port = BASE_PORT + 1400 + idx
         self.prefix, self.outdir, self.extra = prefix, outdir, extra or []
         self.env = dict(env or {})
         self.name = f"vha-{self.id}"
         self.exits = []
         self.proc = None
         self.s3 = self.peer = _NoProxy()
-        self.advertise = f"http://{self.name}:2583"
+        self.advertise = f"https://{self.name}:2584"
         self.skew = CNode.skews.get(self.id)
         self.started_at = 0
         self.runs = 0
@@ -307,15 +330,20 @@ class CNode(Node):
     def start(self):
         docker("rm", "-f", self.name, check=False)
         docker("network", "create", DOCKER_NET, check=False)
-        args = NODE_ARGS.format(listen="0.0.0.0:2583", url=self.url, advertise=self.advertise, s3=DOCKER_S3,
-                                prefix=self.prefix, id=self.id, ttl_ms=TTL_MS, partitions=PARTITIONS).split() + self.extra
+        os.makedirs(PEER_TLS_DIR, exist_ok=True)
+        args = NODE_ARGS.format(listen="0.0.0.0:2583", url=self.url, peer_listen="0.0.0.0:2584", advertise=self.advertise,
+                                tls_dir=PEER_TLS_DIR, s3=DOCKER_S3, prefix=self.prefix, id=self.id, ttl_ms=TTL_MS,
+                                partitions=PARTITIONS).split() + self.extra
         env = []
         for k, v in {**base_env(), **self.env}.items():
             env += ["-e", f"{k}={v}"]
         if self.skew:
             env += ["-e", f"LD_PRELOAD={FAKETIME_LIB}", "-e", f"FAKETIME={self.skew}", "-e", "DONT_FAKE_MONOTONIC=1"]
+        # the shared peer TLS dir at the same path, files owned by us (the
+        # harness reads each node's key for its status calls)
         docker("run", "-d", "--name", self.name, "--network", DOCKER_NET, "-p", f"127.0.0.1:{self.port}:2583",
-               "--cpus", "2", *env, DOCKER_IMAGE, *args)
+               "-p", f"127.0.0.1:{self.peer_port}:2584", "-v", f"{PEER_TLS_DIR}:{PEER_TLS_DIR}",
+               "--user", f"{os.getuid()}:{os.getgid()}", "--cpus", "2", *env, DOCKER_IMAGE, *args)
         self.runs += 1
         self.started_at = time.time()
         self._logpump()
@@ -375,24 +403,13 @@ def wait_ready(nodes, timeout=30):
 
 
 def ownership(nodes):
-    """{node id: owned partition ids} for nodes that answer. Uses the
-    /internal/v1/cluster status endpoint when the build has one; otherwise
-    falls back to the vlpds_owned_partitions gauge ({id: count})."""
+    """{node id: owned shard ids} for live nodes that answer their status."""
     out = {}
     for n in nodes:
         if not n.alive():
             continue
         try:
             out[n.id] = n.status()["owned"]
-        except urllib.error.HTTPError:
-            try:
-                m = n.metrics()
-                for name in OWNED_METRICS:
-                    if name in m:
-                        out[n.id] = int(m[name])
-                        break
-            except Exception:
-                pass
         except Exception:
             pass
     return out
@@ -400,18 +417,17 @@ def ownership(nodes):
 
 def layout_shards(nodes):
     """Shard ids of the cluster's current layout (splits and merges change
-    them; /internal/v1/cluster "layout"), or None on builds without one.
-    Every live node must agree on it (None if they don't yet)."""
+    them; /internal/v1/cluster "layout") that every live node agrees on, []
+    while a split/merge is in flight or they disagree, None if no node
+    answered."""
     seen = set()
     for n in nodes:
         if not n.alive():
             continue
         try:
-            l = n.status().get("layout")
+            l = n.status()["layout"]
         except Exception:
             continue
-        if not l:
-            return None
         if l.get("op"):
             return []  # a split/merge in flight: not converged yet
         seen.add(tuple(sorted(l["shards"])))
@@ -421,22 +437,15 @@ def layout_shards(nodes):
 
 
 def converged(nodes, expect_nodes=None):
-    """Every partition owned exactly once by a live node (and, optionally,
-    spread over `expect_nodes` nodes within fair share). With only counts
-    (no status endpoint) this checks the counts sum to PARTITIONS. With a
-    shard layout (online split/merge) the shards are the layout's."""
+    """Every shard of the layout owned exactly once by a live node (and,
+    optionally, spread over `expect_nodes` nodes within fair share)."""
     shards = layout_shards(nodes)
-    if shards == []:
-        return False, {"layout": "changing or disagreeing"}
-    want = len(shards) if shards else PARTITIONS
+    if not shards:
+        return False, {"layout": "changing, disagreeing or unobserved"}
+    want = len(shards)
     own = ownership(nodes)
     if not own:
-        # ownership not observable on this build: treat "all live nodes healthy" as converged
-        live = [n for n in nodes if n.alive()]
-        return bool(live) and all(n.ready() for n in live), {"unobserved": True}
-    if all(isinstance(v, int) for v in own.values()):
-        ok = sum(own.values()) == want and (not expect_nodes or len([1 for v in own.values() if v]) >= min(expect_nodes, want))
-        return ok, own
+        return False, own
     seen = {}
     for nid, ps in own.items():
         for p in ps:

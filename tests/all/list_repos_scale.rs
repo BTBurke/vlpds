@@ -17,7 +17,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, shards: u32
         c.shards = shards;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards,
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),

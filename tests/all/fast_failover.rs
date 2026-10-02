@@ -21,7 +21,7 @@ async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, advertise: O
         c.shards = SHARDS;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: advertise.unwrap_or_else(|| c.public_url.clone()),
+            addr: advertise.unwrap_or_else(|| peer_url(c)),
             shards: SHARDS,
             ttl,
             renew_every: renew,
@@ -50,7 +50,7 @@ async fn refusing_addr() -> String {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let a = l.local_addr().unwrap();
     drop(l);
-    format!("http://{a}")
+    format!("https://{a}")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

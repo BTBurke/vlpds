@@ -90,8 +90,8 @@ pub struct App {
     pub did_resolver: Arc<crate::did_resolver::DidResolver>,
     /// Cluster membership (None = single node owning every partition).
     pub cluster: Option<Arc<crate::cluster::Cluster>>,
-    /// Internal node-to-node HTTP client (h2c, a few connections per peer;
-    /// derefs to the next `reqwest::Client` round-robin).
+    /// Internal node-to-node HTTP client (h2 over peer mTLS, a few
+    /// connections per peer, round-robin; refuses everything on a lone node).
     pub http: crate::http::PeerClient,
     /// This node's commit log (shared by its shards; peers stream it).
     pub log: Arc<crate::nodelog::NodeLog>,
@@ -268,8 +268,6 @@ impl IntoResponse for XrpcError {
 type XResult<T> = Result<T, XrpcError>;
 
 pub fn router(app: Arc<App>) -> Router {
-    // node-to-node routes: not mounted on a node no peer can reach
-    let internal = if app.config.serve_internal { internal::routes() } else { Router::new() };
     let r = Router::new()
         .route(
             "/xrpc/_health",
@@ -289,7 +287,7 @@ pub fn router(app: Arc<App>) -> Router {
         ))
         .merge(proxy::routes())
         .merge(oauth::routes())
-        .merge(internal)
+        .merge(internal::routes())
         .merge(crate::profiling::routes())
         .merge(ratelimits::routes())
         .merge(feature_level::routes())

@@ -147,7 +147,7 @@ async fn node_with(id: &str, store: &Arc<dyn object_store::ObjectStore>, retenti
         c.firehose_ring_bytes = ring_bytes;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: 8,
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),
@@ -415,7 +415,7 @@ async fn pruning_below_the_cursor_under_a_seek_is_not_outdated() {
             c.log_retention = None; // PruneRace is the only deleter
             c.cluster = Some(vlpds::cluster::ClusterConfig {
                 node_id: "race".into(),
-                addr: c.public_url.clone(),
+                addr: peer_url(c),
                 shards: 4,
                 ttl: Duration::from_millis(1500),
                 renew_every: Duration::from_millis(100),

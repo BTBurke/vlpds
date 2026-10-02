@@ -19,7 +19,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
         c.shards = SHARDS;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: SHARDS,
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),
@@ -178,7 +178,7 @@ async fn admin_listings_scatter_gather_across_nodes() {
     let r = a.xrpc.get("com.atproto.admin.searchAccounts", &[("email", &prefix), ("limit", "100")], &Auth::Admin).await.ok();
     assert_eq!(r["accounts"].as_array().unwrap().len(), 9);
     // the internal endpoint wants the internal token, not admin credentials
-    let rb = a.xrpc.http.get(format!("{}/internal/v1/admin/searchAccounts", b.url));
+    let rb = peer_client().get(format!("{}/internal/v1/admin/searchAccounts", b.peer_url));
     assert_eq!(a.xrpc.send(rb).await.status, 401);
 
     // a "live" peer that never answers: reported, not silently dropped. Its
@@ -187,7 +187,7 @@ async fn admin_listings_scatter_gather_across_nodes() {
     // dead (and dropped from the peers) within ~150 ms, which under load
     // could happen between the two listings below.
     let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead_addr = format!("http://{}", dead.local_addr().unwrap());
+    let dead_addr = format!("https://{}", dead.local_addr().unwrap());
     drop(dead);
     let ghost_store = store.clone();
     let ghost = tokio::spawn(async move {

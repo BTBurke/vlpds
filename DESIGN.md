@@ -482,7 +482,7 @@ load it should stay flat (a rising rate means pool churn).
 
 | Role | Used for | Settings |
 |---|---|---|
-| peer | forwarding, internal calls | h2c prior knowledge, or with peer mTLS h2 over TLS 1.3 (ALPN h2, https only, one client set per peer origin so each checks that origin's node identity); 1 MiB stream / 64 MiB conn windows; PING every 10 s (also idle), dead after 5 s; TCP keepalive 30 s; nodelay; connect 1 s; 15 s total per request (client default; forwards override it with their own deadlines, 3 s to the response head); `--peer-connections` (default 4) connections per peer, round-robin, and as many again for bulk downloads (forwarded getRepo, getBlob, getBlocks) |
+| peer | forwarding, internal calls | h2 over peer mTLS, TLS 1.3 (ALPN h2, https only, one client set per peer origin so each checks that origin's node identity; a lone node's refuses everything); 1 MiB stream / 64 MiB conn windows; PING every 10 s (also idle), dead after 5 s; TCP keepalive 30 s; nodelay; connect 1 s; 15 s total per request (client default; forwards override it with their own deadlines, 3 s to the response head); `--peer-connections` (default 4) connections per peer, round-robin, and as many again for bulk downloads (forwarded getRepo, getBlob, getBlocks) |
 | public | PLC, requestCrawl, Cloud KMS (5 s per call) | h2 by ALPN on https, HTTP/1.1 on http with 1,024 idle per host; idle close 60 s; h2 PING 20 s / 10 s; TCP keepalive; connect 5 s, read 30 s |
 | proxy | configured AppView / report service | `http://`: hyper HTTP/1.1 connections, one pool per host with a slot per IO thread: a connection goes back to the slot of the thread that finished its body, a request takes from its own slot, else from another slot, else connects; at most 1,024 connections per host (idle + busy; past that a request waits for one, `vlpds_http_client_pool_waits_total`); idle close 60 s, retry once if a reused connection was closed before the request went out; `https://`: public's settings as one client per IO thread. No read timeout: the proxy arms a 10 s head deadline and a 30 s body-idle timer only while the upstream makes it wait. Responses up to 128 KiB (by Content-Length) are read whole before the client gets them (the connection goes back at once); larger ones stream through unbuffered under the write-stall deadline (below); compressed ones as the upstream encoded them (Content-Encoding/-Length kept, never decoded or re-compressed; the client's Accept-Encoding is forwarded, for the read-after-write methods only its decodable codings: §8); a client that goes away mid-body closes the upstream connection. Request bodies go upstream as the client encoded them (the server's request decompression covers local routes only), and an h1 connection whose upload is still going when its response ends is not pooled. At most 64 proxied requests per account in flight on its owner (until each body is done); more are 429 `RateLimitExceeded`. CORS preflights are answered locally (no auth, no upstream) |
 | guarded | user-derived URLs: did:web, handle `.well-known`, OAuth client metadata, lexicons, DID-doc service endpoints | public's settings, 32 idle per host, plus a resolver that drops non-public addresses (outside dev mode); pair with `check_outbound_url` |
@@ -552,14 +552,23 @@ is refused; unbounded, they peaked at 165 and 994 requests were refused.
 bearer tokens and DPoP proofs), the `/internal/*` routes (private state
 puts/gets, OAuth replay claims, cluster hellos and nudges, admin
 scatter-gather) and the log streams every firehose merges. It all goes to the
-peer's `--advertise-url`, and is authenticated by the shared internal token
+peer's `--advertise-url`, always over peer mTLS (`src/peer_tls.rs`; there is
+no cleartext peer mode), and is authorized by the shared internal token
 (`x-vlpds-internal`, or the value of the `x-vlpds-forwarded` marker; at least
-32 bytes, constant-time compare) plus, in a cluster, peer mTLS
-(`src/peer_tls.rs`):
+32 bytes, constant-time compare) as a second factor:
 
+- **Two kinds of node.** A node with peers sets `--peer-listen`,
+  `--peer-tls-dir` and an `https://` `--advertise-url` (pointing at the
+  peer listener; clap requires the three together). A lone node sets none:
+  no peer listener, no `/internal/*` anywhere, and its peer client refuses
+  every call (`PeerClient::lone`), so a second node that shows up in its
+  bucket gets 503s, not a cleartext path. `--peer-listen` stays its own
+  flag (rather than implied by `--peer-tls-dir`) because the bind address
+  and the advertised one differ in practice (`0.0.0.0` vs a host name, a
+  fault proxy in bench/ha, a container port).
 - **Peer listener.** `--peer-listen` serves the full app (XRPC, OAuth,
-  `/internal/*`) with the peer h2 profile; with `--peer-tls-*` over TLS 1.3
-  (rustls, ring), client certificates required. `--listen` then serves
+  `/internal/*`) with the peer h2 profile over TLS 1.3 (rustls, ring),
+  client certificates required. `--listen` always serves
   `server::public_router`: `/internal/*` answers 404 and the peer-only
   headers (`x-vlpds-forwarded`, `x-vlpds-internal`, `x-vlpds-client-ip`) are
   dropped before anything reads them, so a client's forwarded marker is just
@@ -574,11 +583,21 @@ peer's `--advertise-url`, and is authenticated by the shared internal token
   remains the authorization. The client checks the chain, the host (as any
   TLS client), and the node: the HTTP peer client keeps one set of
   connections per peer origin, and each origin's verifier asks the cluster
-  which node ids' leases advertise that origin (any CA node if none does: a
-  stale routing entry); a log stream expects the log's node. So a
-  certificate for node X served at node Y's address is refused, even on one
-  host. At startup the node's own cert must chain to the CA, match its key
-  and name `--node-id`.
+  which node ids a lease or the routing table puts at that origin (none:
+  refused); a log stream expects the log's node. So a certificate for node
+  X served at node Y's address is refused, even on one host. (A client
+  that isn't a node, such as tests' and tools' `PeerClient` without a
+  registry, accepts any node of the CA.) At startup the node's own cert
+  must chain to the CA, match its key and name `--node-id`.
+- **Files.** `--peer-tls-dir` holds `ca.crt`, `<node-id>.crt` and
+  `<node-id>.key`, the layout `vlpds admin tls ca|issue --out DIR` writes.
+  In `--dev-mode` a node fills it itself (`peer_tls::dev_files`): under a
+  lock on `DIR/.lock` it creates the CA once (`ca.crt`, `ca.key`) and
+  issues its own certificate (advertise host plus `127.0.0.1`/`localhost`)
+  when it's missing, from another CA, expiring within a week or missing a
+  host. Processes on one host share a directory; across hosts the harness
+  copies `ca.crt` + `ca.key` to each host's directory first (bench/xhost).
+  Outside dev mode nothing is generated (the CA key stays offline).
 - **Rotation.** CA, cert and key are re-read on SIGHUP and on file change (60
   s poll); a set that fails those checks is refused (counted, logged) and
   the old one stays. The CA file may hold several CAs (rotation by trusting
@@ -587,16 +606,12 @@ peer's `--advertise-url`, and is authenticated by the shared internal token
   Unix seconds) feeds `VlpdsPeerTlsCertExpiring` (< 14 days),
   `vlpds_peer_tls_reloads_total{result}` and
   `vlpds_peer_tls_handshake_failures_total{side}` the other two TLS alerts.
-- **Startup rule** (`peer_tls::peer_mode`). A node peers can reach
-  (`--peer-listen` set, or an `--advertise-url` host that isn't loopback)
-  must run peer mTLS, unless `--dev-mode` or `--peer-insecure` (the operator
-  vouches for a private encrypted network such as WireGuard); otherwise it
-  refuses to start. TLS requires `--peer-listen` and an `https://` advertise
-  URL. A node no peer can reach (no `--peer-listen`, a loopback advertise
-  URL: the single-host Ansible deployment) needs nothing and doesn't mount
-  `/internal/*` at all (`Config::serve_internal`). Local multi-node benches
-  and tests run in dev mode (cleartext); `tests/all/peer_tls.rs` runs a
-  3-node mTLS cluster in-process.
+- **Tests and benches.** Every in-process `TestServer` is a peer-TLS node
+  (a peer listener, a cert from the suite's in-memory CA; cluster tests
+  advertise `common::peer_url`, call `/internal/*` with
+  `common::peer_client`); `TestServer::spawn_lone` is a lone node. Process
+  clusters (bench/ha, capacity, soak, xhost) run `--dev-mode` with a shared
+  `--peer-tls-dir`. The single-host Ansible deployment is a lone node.
 
 An edge proxy must still not pass `/internal/` (nor `/metrics`, `/debug/`)
 from the internet: the Ansible role's Caddy answers 404 for them and
@@ -607,7 +622,7 @@ on `--metrics-listen` (default `127.0.0.1:9583`; on the app port only with
 Cost (laptop A/B, `bench/results/peer-mtls-2026-10-02`, 2 in-process
 nodes): forwarded getRecord 104-105 µs CPU/request and 0.88-0.89 ms p50 /
 1.31-1.34 ms p99 with mTLS vs 104-108 µs and 0.89-0.92 / 1.34-1.38 ms over
-h2c; forwarded writes and the log-stream path (write at the owner to the
+h2c (the cleartext mode since removed); forwarded writes and the log-stream path (write at the owner to the
 peer's merged firehose, ~5 ms p50) equal within noise. The TLS handshake
 happens once per pooled connection (`--peer-connections` x 2 per peer, one
 per log stream), so steady state pays only the AES-GCM record layer.
@@ -632,18 +647,17 @@ fill a connection window. Cost: one allocation and an uncontended shard
 lock per watched body, an uncontended lock per chunk; small proxied
 responses (the common case) are buffered and not watched.
 
-Server (`server::serve_with`, HTTP/1.1 + h2 auto, h2c or, with
-`ServeOptions::tls`, over TLS with ALPN h2 / http/1.1 and a 10 s handshake
-deadline on the connection's task): h1 header read timeout 30 s
+Server (`server::serve_with`, HTTP/1.1 + h2 auto: cleartext on `--listen`
+and `--metrics-listen`, and on `--peer-listen` over TLS (`ServeOptions::tls`)
+with ALPN h2 / http/1.1 and a 10 s handshake deadline on the connection's
+task): h1 header read timeout 30 s
 (slowloris; also the idle keep-alive bound), 32 KiB header list, PING every
 20 s with a 10 s timeout, rapid-reset limits at hyper/h2's defaults (20
 pending accept resets, 1,024 local error resets; CVE-2023-44487). h2 windows
 and streams by profile: *peer* (4 MiB stream / 64 MiB connection windows,
 1,024 streams per connection; the peer client's own stream window is 1 MiB) and *public* (1 MiB / 8
-MiB, 256 streams). Peers forward to `--advertise-url`, which is `--listen`
-unless `--peer-listen` adds a second listener for them: then `--peer-listen`
-serves the peer profile and `--listen` the public one; without it
-`--listen` keeps the peer profile (peers use it). A client's buffered
+MiB, 256 streams). `--peer-listen` serves the peer profile and `--listen`
+the public one. A client's buffered
 request bytes and concurrent requests per connection scale with these. At
 most `--max-connections` (50,000) connections per listener: at the cap the
 listener stops accepting (new ones wait in the accept queue); an upgraded
@@ -1838,7 +1852,7 @@ recipient, or a peer that left).
   never queues in front of commit PUTs (and, since the cross-host failover
   runs, a third for the control plane, with requests in flight bounded per
   pool: §7).
-- **HTTP/2** (h2c) with large flow-control windows (4 MiB stream / 64 MiB
+- **HTTP/2** (h2c then; peers now speak it over mTLS) with large flow-control windows (4 MiB stream / 64 MiB
   connection); default 64 KiB windows split request bodies into tiny DATA
   frames and trip h2's flood guard.
 - **jemalloc** over mimalloc: same throughput, much better tail (p99.9 162 ms

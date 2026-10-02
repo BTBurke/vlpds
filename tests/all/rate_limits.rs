@@ -107,15 +107,16 @@ async fn create_session_per_identifier_and_ip() {
     // another identifier has its own bucket
     let a = s.create_account("rl").await;
     s.create_session(&a.handle, PASSWORD).await.ok();
-    // admin and internal requests bypass
-    let rb = s
-        .xrpc
-        .http
-        .post(format!("{}/xrpc/com.atproto.server.createSession", s.url))
-        .json(&json!({"identifier": "ghost.vlpds.test", "password": "wrong"}));
-    let r = s.xrpc.send(rb.try_clone().unwrap().header("x-vlpds-internal", ADMIN_TOKEN)).await;
+    // admin and internal (a peer's, on the peer listener) requests bypass
+    let body = json!({"identifier": "ghost.vlpds.test", "password": "wrong"});
+    let internal = peer_client().post(format!("{}/xrpc/com.atproto.server.createSession", s.peer_url)).json(&body);
+    let r = s.xrpc.send(internal.header("x-vlpds-internal", ADMIN_TOKEN)).await;
     assert_eq!(r.status, 401, "internal bypass: {}", r.text());
     assert!(r.header("ratelimit-limit").is_none());
+    let rb = s.xrpc.http.post(format!("{}/xrpc/com.atproto.server.createSession", s.url)).json(&body);
+    // a client's copy of the header counts for nothing
+    let r = s.xrpc.send(rb.try_clone().unwrap().header("x-vlpds-internal", ADMIN_TOKEN)).await;
+    r.err(429, "RateLimitExceeded");
     use base64::Engine;
     let basic = base64::engine::general_purpose::STANDARD.encode(format!("admin:{ADMIN_TOKEN}"));
     let r = s.xrpc.send(rb.try_clone().unwrap().header("authorization", format!("Basic {basic}"))).await;

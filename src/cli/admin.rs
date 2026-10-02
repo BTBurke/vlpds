@@ -5,8 +5,9 @@
 //! cluster operations (cluster-status, cluster finalize/lower, rotate-plc-keys,
 //! rewrap-secrets, check-repo). Each is admin XRPC against any node (`--url`, Basic
 //! `admin:<token>`); DID-keyed calls are routed to the repo's owner by
-//! the node, per-node maintenance (rotate-plc-keys, rewrap-secrets) is sent
-//! to every node `getClusterStatus` lists. Human output by default,
+//! the node, per-node maintenance (rotate-plc-keys, rewrap-secrets) goes to
+//! every node `getClusterStatus` lists, through the `--url` node, which
+//! relays it over peer mTLS (`forward::NODE_HEADER`). Human output by default,
 //! `--json` for the raw results. ops/RUNBOOK.md "Admin CLI" maps pdsadmin
 //! commands to these.
 
@@ -197,11 +198,6 @@ impl Client {
         Client { http: reqwest::Client::new(), base: url.trim_end_matches('/').to_string(), token: token.to_string() }
     }
 
-    /// The same client for another node.
-    fn at(&self, url: &str) -> Client {
-        Client { base: url.trim_end_matches('/').to_string(), ..self.clone() }
-    }
-
     fn url(&self, nsid: &str) -> String {
         format!("{}/xrpc/{nsid}", self.base)
     }
@@ -212,6 +208,12 @@ impl Client {
 
     pub async fn post(&self, nsid: &str, body: &J) -> Result<J> {
         self.send(nsid, self.http.post(self.url(nsid)).json(body), true).await
+    }
+
+    /// [`Client::post`] for node `node`, relayed by this one.
+    async fn post_to_node(&self, node: &str, nsid: &str, body: &J) -> Result<J> {
+        let rb = self.http.post(self.url(nsid)).header(crate::forward::NODE_HEADER, node).json(body);
+        self.send(nsid, rb, true).await.with_context(|| format!("node {node}"))
     }
 
     /// Without admin credentials (createAccount).
@@ -635,28 +637,39 @@ where
     Ok(())
 }
 
-/// The base URLs of every node in the cluster (getClusterStatus `nodes`),
-/// or just `c`'s for a single node.
-async fn node_urls(c: &Client) -> Result<Vec<(String, String)>> {
+/// Every node of the cluster (getClusterStatus `nodes`) with its peer
+/// address, or None for `c`'s node alone (a single node).
+async fn cluster_nodes(c: &Client) -> Result<Vec<(String, String, Option<String>)>> {
     let r = c.get("vlpds.admin.getClusterStatus", &[]).await?;
-    let nodes: Vec<(String, String)> = r["nodes"]
+    let nodes: Vec<(String, String, Option<String>)> = r["nodes"]
         .as_array()
-        .map(|v| v.iter().filter_map(|n| Some((n["node"].as_str()?.to_string(), n["addr"].as_str()?.to_string()))).collect())
+        .map(|v| {
+            v.iter()
+                .filter_map(|n| {
+                    let id = n["node"].as_str()?.to_string();
+                    Some((id.clone(), n["addr"].as_str()?.to_string(), Some(id)))
+                })
+                .collect()
+        })
         .unwrap_or_default();
     if nodes.is_empty() {
         let name = r["node"].as_str().filter(|n| !n.is_empty()).unwrap_or("this node");
-        return Ok(vec![(name.to_string(), c.base.clone())]);
+        return Ok(vec![(name.to_string(), c.base.clone(), None)]);
     }
     Ok(nodes)
 }
 
-/// Sends a per-node maintenance call to every node (or `--node-only`),
-/// then a table of `cols` per node and the totals.
+/// Sends a per-node maintenance call to every node (relayed by `c`'s; or
+/// `--node-only`), then a table of `cols` per node and the totals.
 async fn per_node(c: &Client, node_only: bool, opts: &Opts, out: &mut dyn Write, nsid: &str, body: J, cols: &[&str]) -> Result<()> {
-    let nodes = if node_only { vec![("this node".to_string(), c.base.clone())] } else { node_urls(c).await? };
+    let nodes = if node_only { vec![("this node".to_string(), c.base.clone(), None)] } else { cluster_nodes(c).await? };
     let (mut results, mut failed) = (Vec::new(), 0usize);
-    for (node, url) in &nodes {
-        match c.at(url).post(nsid, &body).await {
+    for (node, url, id) in &nodes {
+        let r = match id {
+            Some(id) => c.post_to_node(id, nsid, &body).await,
+            None => c.post(nsid, &body).await,
+        };
+        match r {
             Ok(r) => {
                 failed += r["failed"].as_u64().unwrap_or(0) as usize;
                 results.push(json!({"node": node, "url": url, "ok": true, "result": r}));

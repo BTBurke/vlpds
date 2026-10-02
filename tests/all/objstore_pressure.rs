@@ -120,7 +120,7 @@ async fn node(id: &str, store: &Arc<Pressure>) -> TestServer {
         c.checkpoint_every = Duration::from_millis(200);
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: SHARDS,
             ttl: Duration::from_secs(3),
             renew_every: Duration::from_millis(200),

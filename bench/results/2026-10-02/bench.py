@@ -36,7 +36,7 @@ S3 = "http://127.0.0.1:9200"
 SCRATCH = os.environ.get("BENCH_SCRATCH", "/tmp/scratch/bench")
 os.makedirs(SCRATCH, exist_ok=True)
 ADMIN = "dev-admin-token"
-INTERNAL = "dev-internal-token"
+ADMIN_AUTH = {"Authorization": "Basic " + __import__("base64").b64encode(f"admin:{ADMIN}".encode()).decode()}
 # Remote hosts (bench/benchbox): BENCH_OUT_DIR = where the JSONL goes (default:
 # next to this script); BENCH_MINIO_DATA = MinIO's data dir on local disk, so
 # cleanup deletes the prefix directory directly (no aws CLI needed) and empties
@@ -138,7 +138,11 @@ class Node:
         if inject:
             args += ["--inject-put-ms", str(inject)]
         if node_id:
-            args += ["--node-id", node_id, "--advertise-url", self.url]
+            # a cluster node: peers talk mTLS on port+100, every node sharing
+            # the dev-mode peer TLS dir (the first creates the CA)
+            peer = f"127.0.0.1:{port + 100}"
+            args += ["--node-id", node_id, "--peer-listen", peer, "--advertise-url", f"https://{peer}",
+                     "--peer-tls-dir", os.path.join(SCRATCH, "peer-tls")]
         args += list(extra) + os.environ.get("VLPDS_EXTRA", "").split()
         self.args = args
 
@@ -455,7 +459,8 @@ def wait_converged(nodes, timeout=120):
     while time.time() - t < timeout:
         try:
             owned = [msum(metrics(nd.url), "vlpds_owned_partitions") for nd in nodes]
-            tables = [json.loads(http("GET", nd.url + "/internal/v1/cluster", headers={"x-vlpds-internal": INTERNAL})[1])["table"] for nd in nodes]
+            # owner per shard, in slot order (None = unowned)
+            tables = [json.loads(http("GET", nd.url + "/xrpc/vlpds.admin.getClusterStatus", headers=ADMIN_AUTH)[1])["table"] for nd in nodes]
             if sum(owned) >= 256 and min(owned) > 0 and all(all(x for x in tb) for tb in tables):
                 log(f"cluster converged {owned} in {time.time()-t:.1f}s")
                 return time.time() - t

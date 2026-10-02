@@ -1,10 +1,9 @@
 //! Node-to-node endpoints (cluster mode). Authenticated with the shared
 //! internal token (`Config::internal_token`, not the admin token) in
-//! `x-vlpds-internal`, and, with peer mTLS, by the caller's node
-//! certificate at the `--peer-listen` listener (crate::peer_tls). Served
-//! only there once `--peer-listen` is set (`server::public_router` 404s
-//! them), and not at all on a node no peer can reach
-//! (`Config::serve_internal`).
+//! `x-vlpds-internal`, and by the caller's node certificate: served only on
+//! the mTLS peer listener (`--peer-listen`, crate::peer_tls;
+//! `server::public_router` 404s them on `--listen`). A lone node has no
+//! peer listener, so no `/internal/*`.
 
 use super::*;
 use crate::segment::Mutation;

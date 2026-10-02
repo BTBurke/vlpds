@@ -23,7 +23,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
         c.shards = SHARDS;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: SHARDS,
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),
@@ -178,7 +178,7 @@ async fn limits_change_cluster_wide_and_overrides_exempt() {
     store.put(&path, br#"{"version": 9, "limiters": {"global-ip": {"points": "many"}}}"#.to_vec().into()).await.unwrap();
     for s in [&a, &b] {
         // dev mode: the admin token doubles as the internal token
-        let rb = s.xrpc.http.post(format!("{}/internal/v1/ratelimits/reload", s.url)).header("x-vlpds-internal", ADMIN_TOKEN);
+        let rb = peer_client().post(format!("{}/internal/v1/ratelimits/reload", s.peer_url)).header("x-vlpds-internal", ADMIN_TOKEN);
         let r = s.xrpc.send(rb).await.ok();
         assert_eq!((r["configVersion"].as_u64(), r["configError"]["version"].as_u64()), (Some(2), Some(9)), "{r}");
     }

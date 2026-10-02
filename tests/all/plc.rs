@@ -428,7 +428,7 @@ async fn rotation_key_rotation() {
             c.shards = 4;
             c.cluster = Some(vlpds::cluster::ClusterConfig {
                 node_id: "rot".into(),
-                addr: c.public_url.clone(),
+                addr: peer_url(c),
                 shards: 4,
                 ttl: std::time::Duration::from_millis(1500),
                 renew_every: std::time::Duration::from_millis(100),

@@ -39,7 +39,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
         c.log_retention = Some(vlpds::retention::Config { window: Duration::from_secs(3600), interval: Duration::from_millis(100), max_deletes: 100, fence_retention: None });
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
-            addr: c.public_url.clone(),
+            addr: peer_url(c),
             shards: SHARDS,
             ttl: Duration::from_millis(1500),
             renew_every: Duration::from_millis(100),
