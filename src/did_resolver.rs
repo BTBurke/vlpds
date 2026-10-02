@@ -36,13 +36,15 @@ pub struct DidResolver {
     http: reqwest::Client,
     /// Not guarded: the operator-configured PLC directory may be local.
     plc_http: reqwest::Client,
-    cache: Arc<Mutex<HashMap<String, (Instant, Arc<J>)>>>,
-    negative: Mutex<HashMap<String, (Instant, ResolveError)>>,
-    refreshed: Mutex<HashMap<String, (Instant, ())>>,
+    cache: Arc<Mutex<TtlMap<Arc<J>>>>,
+    negative: Mutex<TtlMap<ResolveError>>,
+    refreshed: Mutex<TtlMap<()>>,
 }
 
+type TtlMap<V> = HashMap<String, (Instant, V)>;
+
 /// When full, entries older than `ttl` go, else all of them.
-fn bounded_insert<V>(m: &mut HashMap<String, (Instant, V)>, k: &str, v: V, ttl: Duration, cap: usize) {
+fn bounded_insert<V>(m: &mut TtlMap<V>, k: &str, v: V, ttl: Duration, cap: usize) {
     if m.len() >= cap && !m.contains_key(k) {
         m.retain(|_, (at, _)| at.elapsed() < ttl);
         if m.len() >= cap {

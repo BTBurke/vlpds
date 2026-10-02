@@ -22,12 +22,14 @@ const TOKEN_CACHE_SHARDS: usize = 64;
 /// status are not cached: callers check them on every request. A full shard
 /// drops its expired entries, then all of them.
 pub struct TokenCache<V> {
-    /// signature segment -> (whole token, value, exp unix secs)
-    shards: Vec<parking_lot::Mutex<HashMap<Box<str>, (Box<str>, V, u64)>>>,
+    shards: Vec<TokenShard<V>>,
     kind: crate::caches::Cache,
     /// Tests: a cap of its own instead of the process-wide one.
     fixed_cap: Option<usize>,
 }
+
+/// signature segment -> (whole token, value, exp unix secs)
+type TokenShard<V> = parking_lot::Mutex<HashMap<Box<str>, (Box<str>, V, u64)>>;
 
 impl<V: Send> crate::caches::Len for TokenCache<V> {
     fn len(&self) -> usize {
@@ -60,7 +62,7 @@ impl<V: Clone> TokenCache<V> {
 
     /// The signature is random-looking, so its last bytes pick the shard
     /// without hashing the token.
-    fn slot<'t>(&self, token: &'t str) -> (&parking_lot::Mutex<HashMap<Box<str>, (Box<str>, V, u64)>>, &'t str) {
+    fn slot<'t>(&self, token: &'t str) -> (&TokenShard<V>, &'t str) {
         let sig = token.rsplit_once('.').map_or(token, |(_, s)| s);
         let b = sig.as_bytes();
         let tail = b[b.len().saturating_sub(4)..].iter().fold(0usize, |h, &x| h.wrapping_mul(131).wrapping_add(x as usize));

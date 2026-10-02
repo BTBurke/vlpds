@@ -27,8 +27,10 @@ const INLINE_BUDGET: Duration = Duration::from_secs(3);
 const LEXICON_COLLECTION: &str = "com.atproto.lexicon.schema";
 const MAX_CAR_BYTES: usize = 1 << 20;
 
+type LexiconCache = parking_lot::Mutex<HashMap<String, (Instant, J)>>;
+
 /// Stale entries are the fallback while a publisher is unreachable.
-static CACHE: LazyLock<Arc<parking_lot::Mutex<HashMap<String, (Instant, J)>>>> =
+static CACHE: LazyLock<Arc<LexiconCache>> =
     LazyLock::new(|| crate::caches::track(crate::caches::Cache::PermissionSets, Default::default()));
 static OVERRIDES: LazyLock<parking_lot::Mutex<HashMap<String, String>>> =
     LazyLock::new(Default::default);
