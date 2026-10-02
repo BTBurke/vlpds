@@ -4,8 +4,8 @@ Found by `tests/all/differential_shrike.rs` (vlpds vs shrike) and
 `checker-rs` (shrike's sync verifier on a vlpds firehose), with the
 TypeScript reference as the tiebreaker (`@atproto/syntax` 0.7.5,
 `@atproto/lex-json` 0.1.6 / `lex-data` 0.1.7, via `syntax_oracle.mjs` /
-`json_oracle.mjs` here) and the atproto interop fixtures. Nothing has been
-filed upstream. Each issue has a minimal repro against shrike alone; the
+`json_oracle.mjs` here) and the atproto interop fixtures. Filed upstream as
+https://github.com/jcalabro/shrike/issues/3 (2026-10-02). Each issue has a minimal repro against shrike alone; the
 differential suite pins every one (it fails when shrike changes, so the
 workaround can be dropped).
 
