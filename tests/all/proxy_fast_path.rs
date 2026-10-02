@@ -136,8 +136,13 @@ async fn upstream_connections_are_reused() {
     for _ in 0..50 {
         get("seq").await;
     }
+    // Not one: a connection goes back to the pool of the thread that read
+    // its response to the end, and a request on a thread whose pool is
+    // empty connects (it doesn't look in the other threads' pools), so
+    // even sequential requests spread connections over the IO threads and
+    // the count drifts up when tasks hop threads (2-10 under 14 CPU hogs).
     let seq = accepted.load(Ordering::Relaxed);
-    assert!(seq <= 8, "{seq} connections for 50 sequential requests");
+    assert!(seq <= 16, "{seq} connections for 50 sequential requests");
     for _ in 0..20 {
         futures::future::join_all((0..32).map(|_| get("par"))).await;
     }

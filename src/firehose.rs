@@ -638,26 +638,33 @@ impl Firehose {
                 out.finish(&events::error_frame("FutureCursor", "cursor in the future")).await;
                 return Err("future_cursor");
             }
-            // older than the ring: stream it from the S3 segments first, until
-            // the ring reaches back to it (it moves while we backfill)
-            loop {
-                if !self.backfill_to_ring(out, &mut last, shard).await? {
-                    out.send(&info_frame("OutdatedCursor", "cursor is older than the retained history; starting from the oldest available event")).await?;
-                    last = last.max(self.ring_floor.load(Ordering::Acquire));
-                }
-                if last >= self.ring_floor.load(Ordering::Acquire) {
-                    break;
-                }
-            }
+            // older than the ring: stream it from the S3 segments first
+            self.catch_up(out, &mut last, shard).await?;
         }
         // Live. A subscriber more than `allowance` bytes behind the head is
         // dropped: the configured bound, or (a cursor replaying the ring)
         // what it started with, so it may catch up but not fall further back.
         let mut allowance = None;
+        // stream offset up to which this subscriber got the ring's batches
+        // (None: it came from S3 or hasn't been sent any yet)
+        let mut sent_to: Option<u64> = None;
         loop {
             head.borrow_and_update();
             let (batches, complete) = self.from_ring(last);
             if !complete {
+                // The ring is a memory budget, not the lag rule: it can drop
+                // batches a subscriber within its allowance hasn't been sent
+                // (a ring smaller than the allowance; or a backfill handing
+                // over right at the ring floor as the next batch evicts it).
+                // Those catch up from S3 again; only one past its allowance
+                // is too slow.
+                let lag = sent_to.map(|p| self.head.borrow().saturating_sub(p));
+                let within = lag.is_none_or(|l| l <= allowance.unwrap_or(self.max_lag_bytes));
+                if within && self.store.read().is_some() {
+                    self.catch_up(out, &mut last, shard).await?;
+                    sent_to = None;
+                    continue;
+                }
                 out.finish(&events::error_frame("ConsumerTooSlow", "fell behind the in-memory window")).await;
                 return Err("too_slow");
             }
@@ -696,9 +703,25 @@ impl Firehose {
                 };
                 metrics::FIREHOSE_SENT.inc_by(sent as u64);
                 last = b.last;
+                sent_to = Some(b.end);
                 while let Ok(c) = out.ctl.try_recv() {
                     out.control(Some(c)).await?;
                 }
+            }
+        }
+    }
+
+    /// Streams (`last`, ring floor] from the S3 segments until the ring
+    /// reaches back to `last` (the floor moves while it backfills); history
+    /// that's gone is skipped with an `OutdatedCursor` info.
+    async fn catch_up<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>, last: &mut i64, shard: Option<SlotRange>) -> Result<(), &'static str> {
+        loop {
+            if !self.backfill_to_ring(out, last, shard).await? {
+                out.send(&info_frame("OutdatedCursor", "cursor is older than the retained history; starting from the oldest available event")).await?;
+                *last = (*last).max(self.ring_floor.load(Ordering::Acquire));
+            }
+            if *last >= self.ring_floor.load(Ordering::Acquire) {
+                return Ok(());
             }
         }
     }

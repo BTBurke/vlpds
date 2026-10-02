@@ -145,6 +145,19 @@ impl Node {
         }
     }
 
+    /// A key in this subtree for a [`NodeRef`]: the node's own first value
+    /// if it has one (no walk down to the leftmost leaf, a chain of cold
+    /// nodes in a big repo), else the subtree's first key.
+    fn subtree_key(&self) -> Option<&Arc<[u8]>> {
+        self.entries
+            .iter()
+            .find_map(|e| match e {
+                Entry::Value { key, .. } => Some(key),
+                Entry::Child { .. } => None,
+            })
+            .or_else(|| self.first_key())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -772,7 +785,7 @@ fn write_blocks(
         }
     };
     nm.dirty = false;
-    if let (Some(refs), Some(k)) = (refs.as_mut(), nm.first_key()) {
+    if let (Some(refs), Some(k)) = (refs.as_mut(), nm.subtree_key()) {
         refs.push((c, (k.clone(), nm.height)));
     }
     Ok(c)
@@ -1216,7 +1229,7 @@ impl Tree {
                 return Err(MstError::Invalid("tree too deep"));
             }
             let c = n.cid.ok_or(MstError::Invalid("unwritten node"))?;
-            if let Some(k) = n.first_key() {
+            if let Some(k) = n.subtree_key() {
                 out.insert(c, (k.clone(), n.height));
             }
             for e in &n.entries {
@@ -1340,8 +1353,9 @@ impl Tree {
 
 // ---------- node index (getBlocks) ----------
 
-/// Where a node sits: a key in its subtree (the first) and its height. The
-/// node is the one at that height on the path from the root to the key.
+/// Where a node sits: a key in its subtree (its own first value, see
+/// `Node::subtree_key`) and its height. The node is the one at that height
+/// on the path from the root to the key.
 pub type NodeRef = (Arc<[u8]>, i32);
 
 /// Node CID -> [`NodeRef`] for one repo, so getBlocks finds MST nodes by

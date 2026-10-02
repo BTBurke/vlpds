@@ -341,6 +341,11 @@ impl ShardSinks {
         self.retain.lock().floors.get(&shard).map(|f| f.1)
     }
 
+    /// Whether a checkpoint of `shard` at `ordinal` is already durable.
+    fn checkpointed_at(&self, shard: u16, ordinal: u64) -> bool {
+        self.retain.lock().floors.get(&shard).is_some_and(|f| ordinal >= f.1 && f.0 == ordinal + 1)
+    }
+
     /// A checkpoint marker at `ordinal` is durable for `shard`.
     fn checkpointed(&self, shard: u16, ordinal: u64) {
         if let Some(f) = self.retain.lock().floors.get_mut(&shard) {
@@ -529,6 +534,8 @@ impl NodeLog {
 
     /// Writes an applied marker for every shard and flushes their memtables,
     /// bounding how much of this log a successor must replay after a crash.
+    /// Shards already checkpointed at the current durable ordinal are
+    /// skipped (`checkpoint_shard`): an idle node flushes nothing.
     /// One shard after another: the background loop
     /// ([`NodeLog::spawn_checkpoints`]) spreads them over its interval instead.
     pub async fn checkpoint_all(&self) {
@@ -555,6 +562,17 @@ impl NodeLog {
         // this log for the shard (A -> B -> A), and replay would start
         // there (DESIGN.md "Log retention"). Its replay marker stands.
         if self.sinks.insert_floor(s.id).is_none_or(|f| ord < f) {
+            return;
+        }
+        // Nothing new since its last checkpoint, which was at this same
+        // ordinal: every write into the shard comes from a segment <= ord
+        // (or a checkpoint), so its marker and memtable are durable as of
+        // ord already, and its replay floor is ord + 1. Another flush would
+        // only rewrite the marker: an L0 SST PUT, a manifest CAS and later
+        // compactions per shard per interval on an idle node (cost model
+        // 2026-10-02). A shard with no entries while the log moves is still
+        // checkpointed, so a successor's replay stays as short as before.
+        if self.sinks.checkpointed_at(s.id, ord) && !s.recent.is_dirty() {
             return;
         }
         let t = Instant::now();

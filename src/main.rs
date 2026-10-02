@@ -158,11 +158,22 @@ struct Args {
     /// SlateDB SST block compression: none, lz4 or zstd.
     #[arg(long, env = "VLPDS_SST_COMPRESSION", default_value = "zstd")]
     sst_compression: String,
-    /// Shard compactors' polling: slow (5 s, cheapest idle), fast (500 ms)
+    /// Shard compactors' polling: slow (--compaction-poll, cheapest idle), fast (500 ms)
     /// or adaptive (slow until a shard's L0 runs deep, then fast until it
     /// drains; absorbs unpaced bulk ingests without the idle cost).
     #[arg(long, env = "VLPDS_COMPACTION_POLLING", default_value = "adaptive")]
     compaction_polling: String,
+    /// Shard compactor and compaction worker poll interval while L0 is
+    /// shallow (adaptive's slow mode, and `slow`). Each poll is ~6 GETs per
+    /// shard; a deep L0 switches to 500 ms polls regardless.
+    #[arg(long, env = "VLPDS_COMPACTION_POLL", default_value = "30s")]
+    compaction_poll: String,
+    /// How often each shard DB re-reads its SlateDB manifest (2 GETs per
+    /// shard per poll). The node is its shards' only writer, so reads see
+    /// their own writes regardless; a poll only picks up compaction results,
+    /// and a writer with a deep L0 refreshes every 500 ms anyway.
+    #[arg(long, env = "VLPDS_SLATEDB_MANIFEST_POLL", default_value = "10s")]
+    slatedb_manifest_poll: String,
     /// Log segment body compression: zstd level (0 = store segments
     /// uncompressed). Level 1 stores real commits ~2x smaller for ~4-6 µs
     /// of CPU per commit (DESIGN.md "Log compression").
@@ -473,6 +484,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     vlpds::partition::set_block_cache_bytes(args.block_cache_mb << 20);
     vlpds::partition::set_sst_compression(args.sst_compression.parse()?);
     vlpds::partition::set_compaction_polling(args.compaction_polling.parse()?);
+    vlpds::partition::set_compaction_poll_interval(vlpds::retention::parse_duration(&args.compaction_poll)?);
+    vlpds::partition::set_manifest_poll_interval(vlpds::retention::parse_duration(&args.slatedb_manifest_poll)?);
     vlpds::partition::set_gc_min_age(vlpds::retention::parse_duration(&args.slatedb_gc_min_age)?);
     vlpds::partition::set_checkpoint_lifetime(vlpds::retention::parse_duration(&args.slatedb_checkpoint_lifetime)?);
     vlpds::segment::set_compression_level(args.log_compression);

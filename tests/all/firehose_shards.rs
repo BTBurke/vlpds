@@ -12,6 +12,22 @@ async fn sub_shard(s: &TestServer, cursor: i64, k: u32, n: u32) -> Sub {
     Sub::connect(&format!("ws://{}/xrpc/com.atproto.sync.subscribeRepos?cursor={cursor}&shard={k}/{n}", s.addr)).await
 }
 
+/// Reads `sub` up to the event `last` (None: the stream carries nothing, so
+/// it's drained until idle). Waiting for a known last event rather than for
+/// idleness: under load the first frame of a replay can trail by more than
+/// any idle gap.
+async fn read_to(mut sub: Sub, last: Option<i64>) -> Vec<Frame> {
+    match last {
+        Some(last) => sub.until(FH_TIMEOUT, |fs| fs.last().and_then(|f| f.seq()).is_some_and(|q| q >= last)).await,
+        None => sub.drain(IDLE).await,
+    }
+}
+
+/// The last event of `full` in `range`.
+fn last_in(full: &[(i64, Vec<u8>)], range: SlotRange) -> Option<i64> {
+    full.iter().rev().find(|(_, raw)| Frame::decode(raw).ok().and_then(|f| f.did().map(|d| range.contains(slot_of(d)))).unwrap_or(false)).map(|e| e.0)
+}
+
 /// (seq, raw frame) of the message frames.
 fn events(fs: &[Frame]) -> Vec<(i64, Vec<u8>)> {
     fs.iter().filter_map(|f| f.seq().map(|q| (q, f.raw.clone()))).collect()
@@ -56,7 +72,8 @@ async fn sharded_streams_partition_the_full_stream() {
     let s = TestServer::spawn().await;
     activity(&s, 10, 3).await;
     s.settled_now().await;
-    let full_frames = s.subscribe(Some(0)).await.drain(IDLE).await;
+    let head = s.app.firehose.last_emitted.load(std::sync::atomic::Ordering::Acquire);
+    let full_frames = read_to(s.subscribe(Some(0)).await, Some(head)).await;
     let full = events(&full_frames);
     assert!(full.len() >= 40, "{} events", full.len());
     let mut used: Vec<u32> = full_frames.iter().filter_map(|f| f.did().map(|d| slot_of(d) as u32)).collect();
@@ -67,7 +84,10 @@ async fn sharded_streams_partition_the_full_stream() {
         // at n = 65,536 (one slot each) subscribe to the slots in use plus a
         // few empty ones; the rest carry nothing
         let ks: Vec<u32> = if n > 16 { used.iter().copied().chain([0, 1, 65_535]).collect() } else { (0..n).collect() };
-        let drained = futures::future::join_all(ks.iter().map(|k| async { sub_shard(&s, 0, *k, n).await.drain(IDLE).await })).await;
+        let drained = futures::future::join_all(
+            ks.iter().map(|k| async { read_to(sub_shard(&s, 0, *k, n).await, last_in(&full, SlotRange::new(*k, n).unwrap())).await }),
+        )
+        .await;
         for k in 0..n {
             match ks.iter().position(|x| *x == k) {
                 Some(i) => shards.push(drained[i].clone()),
@@ -79,11 +99,8 @@ async fn sharded_streams_partition_the_full_stream() {
     // a cursor from the full stream: exactly the slice's events after it
     let mid = full[full.len() / 2].0;
     let range = SlotRange::new(1, 2).unwrap();
-    let got = events(&sub_shard(&s, mid, 1, 2).await.drain(IDLE).await);
-    let want: Vec<(i64, Vec<u8>)> = s
-        .subscribe(Some(mid))
-        .await
-        .drain(IDLE)
+    let got = events(&read_to(sub_shard(&s, mid, 1, 2).await, last_in(&full, range).filter(|q| *q > mid)).await);
+    let want: Vec<(i64, Vec<u8>)> = read_to(s.subscribe(Some(mid)).await, Some(head))
         .await
         .into_iter()
         .filter(|f| f.did().is_some_and(|d| range.contains(slot_of(d))))

@@ -31,12 +31,21 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
     .await
 }
 
-/// Waits until every node owns some shards, together they own each once,
-/// and every node's routing table names those owners.
+/// Waits until the nodes own every shard once between them in a fair split
+/// (none over ceil(shards / nodes)), every routing table names those owners, and it holds
+/// still for 500 ms: "every node owns some" can still be mid-rebalance
+/// (e.g. 6/1/1), and the hand-backs after it move accounts off their node.
 async fn balanced(nodes: &[&TestServer]) {
-    for _ in 0..200 {
-        let owned: Vec<Vec<u16>> =
-            nodes.iter().map(|n| n.app.partitions.owned().iter().map(|p| p.id).collect()).collect();
+    let mut stable_since: Option<(Vec<Vec<u16>>, std::time::Instant)> = None;
+    for _ in 0..400 {
+        let owned: Vec<Vec<u16>> = nodes
+            .iter()
+            .map(|n| {
+                let mut v: Vec<u16> = n.app.partitions.owned().iter().map(|p| p.id).collect();
+                v.sort();
+                v
+            })
+            .collect();
         let all: HashSet<u16> = owned.iter().flatten().copied().collect();
         let routed = nodes.iter().all(|n| {
             let c = n.app.cluster.as_ref().unwrap();
@@ -45,12 +54,20 @@ async fn balanced(nodes: &[&TestServer]) {
                 shards.iter().all(|p| c.owner_of(*p).is_some_and(|(owner, _)| &owner == id))
             })
         });
-        if owned.iter().all(|o| !o.is_empty())
-            && all.len() == SHARDS as usize
-            && owned.iter().map(|o| o.len()).sum::<usize>() == SHARDS as usize
-            && routed
-        {
-            return;
+        let sizes: Vec<usize> = owned.iter().map(|o| o.len()).collect();
+        // the cluster's rule: nobody over ceil(shards / nodes), so e.g. 6/6/4
+        let fair = sizes.iter().all(|&k| k > 0 && k <= (SHARDS as usize).div_ceil(nodes.len()));
+        if fair && all.len() == SHARDS as usize && sizes.iter().sum::<usize>() == SHARDS as usize && routed {
+            match &stable_since {
+                Some((prev, at)) if *prev == owned => {
+                    if at.elapsed() >= Duration::from_millis(500) {
+                        return;
+                    }
+                }
+                _ => stable_since = Some((owned, std::time::Instant::now())),
+            }
+        } else {
+            stable_since = None;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

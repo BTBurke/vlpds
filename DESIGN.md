@@ -193,18 +193,48 @@ swappable.
   freezing a hot shard to split it) that flush waits for a compaction;
   stopping at the mark deadlocked such a close.
 - **Adaptive compaction polling** (`--compaction-polling`, default
-  adaptive). SlateDB's compactor and worker poll every 5 s: cheap idle, but
-  an unpaced bulk ingest into one shard fills L0 (32 x 16 MiB) between
-  cycles and stalls. Always-fast (500 ms) polls fix that at ~4x the idle
-  requests. Adaptive runs slow polls while L0 is shallow and restarts the
-  compactor with fast polls once L0 reaches 8 SSTs, back to slow after 15 s
-  at <= 2 (a graceful worker stop hands claimed jobs back). Measured
-  (tests/all/compaction_polling.rs, in-memory store with 10 ms per call,
-  M4 Pro): idle 3.20 / 3.24 / 13.97 requests per shard per second (slow /
-  adaptive / fast; mostly the writer's own 1 s manifest poll); 2M records
-  unpaced into one shard: worst write 10.7 s / 1.6 s / 1.3 s, time in
-  writes over 250 ms 25.5 s / 2.2 s / 2.5 s of the run, throughput 71k /
-  376k / 374k records/s.
+  adaptive). Slow polls are cheap idle, but an unpaced bulk ingest into one
+  shard fills L0 (32 x 16 MiB) between cycles and stalls. Always-fast
+  (500 ms) polls fix that at ~4x the idle requests. Adaptive runs slow
+  polls (`--compaction-poll`, 30 s; it was SlateDB's 5 s) while L0 is
+  shallow and restarts the compactor with fast polls once L0 reaches 8
+  SSTs, back to slow after 15 s at <= 2 (a graceful worker stop hands
+  claimed jobs back). Measured with the old 5 s slow polls and 1 s
+  manifest poll (tests/all/compaction_polling.rs, in-memory store with
+  10 ms per call, M4 Pro): idle 3.20 / 3.24 / 13.97 requests per shard per
+  second (slow / adaptive / fast; mostly the writer's own 1 s manifest
+  poll); 2M records unpaced into one shard: worst write 10.7 s / 1.6 s /
+  1.3 s, time in writes over 250 ms 25.5 s / 2.2 s / 2.5 s of the run,
+  throughput 71k / 376k / 374k records/s.
+- **Polling defaults (cost, latency-neutral).** Per-shard polling was the
+  largest fixed GET line of the object-store bill (3.26 GETs/s per shard,
+  835/s at 256 shards; bench/results/cost-model-2026-10-02 "Defaults
+  changed"). Each SlateDB "read latest" of a sequenced file is two GETs (a
+  probe of id + 1, usually a 404, plus its `gc/*.boundary` file):
+  - *DB manifest poll* (`--slatedb-manifest-poll`, 10 s; SlateDB's default
+    1 s). The node is its shards' only writer: writes land in the memtable,
+    and its own flushes update its manifest in place, so reads see its
+    writes at once whatever the poll (tests/all/cost_defaults.rs). A poll
+    only picks up compaction results, which every flush's manifest CAS
+    reloads anyway on a conflict. The one wait on it is a writer whose
+    view of L0 is full (no flush runs, so only a manifest read shows the
+    freed slots): while L0 is >= 8 deep the writer refreshes every 500 ms
+    (`partition::spawn_deep_refresh`), as often as the compactor's fast
+    polls. (SlateDB also uses this interval as the L0 upload retry
+    backoff, after its object-store layer's own retries are exhausted.)
+  - *Compactor and worker slow polls* 30 s (were 5 s): while L0 is
+    shallow nothing waits on them, and a deep L0 switches to 500 ms.
+  Together 3.2 -> 0.4 GETs/s per shard. Unpaced 2M-record single-shard
+  ingest is unchanged within run-to-run noise (tests/all/cost_defaults.rs
+  `deep_l0_ingest_keeps_up`, 3 runs each, old vs new polls: worst write
+  0.14–1.12 s vs 0.18–1.17 s, 207k–378k vs 227k–416k records/s).
+- **Bucket settings (deploy).** Replaced SSTs and expired log segments are
+  deleted for good, so: on **GCS, disable bucket soft delete** (on by
+  default, 7 days: every deleted segment and replaced SST would stay
+  billable for a week, ~0.6 TB of log plus compaction churn at Bluesky's
+  rate); on **S3 and R2, add the lifecycle rule that aborts incomplete
+  multipart uploads** (§6 "Aborted multipart uploads"; vlpds itself uses
+  multipart only for large blobs). MinIO needs neither.
 - **What keeps replaced SSTs.** A scan or snapshot reads the SSTs of the
   manifest it started with. Before each manifest update that replaces SSTs,
   SlateDB's compactor writes a *checkpoint* of the old manifest that expires
@@ -449,6 +479,14 @@ the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
   spread evenly. Metrics: `vlpds_checkpoint_shard_seconds`, and the 10 ms
   ticker's lateness `vlpds_runtime_tick_late_seconds` /
   `vlpds_runtime_late_seconds_total` (runtime threads blocked or starved).
+  A shard already checkpointed at the log's current durable ordinal is
+  skipped: its marker and memtable are durable as of that ordinal (every
+  write into a shard comes from a log segment or a checkpoint), so another
+  flush would only rewrite the marker, an L0 SST PUT plus a manifest CAS
+  per shard per interval on an idle node. While the log moves, every shard
+  is still checkpointed each pass, including shards with no new entries:
+  a successor's replay starts no earlier than before, and replay floors
+  (retention) advance with the log.
   Checkpoints were never a burst: `checkpoint_all` goes one shard at a time
   (~37 ms each, store-bound). In-process (tests/all/checkpoint_stall.rs,
   256 shards, 8,000 writes/s, 3 runtime threads, 10 ms store) neither
@@ -1002,7 +1040,7 @@ roughly **200–500k commits/s at peak**. Reads plus AppView proxying:
 | Hot MSTs in memory | 500k active × ~150 KB ≈ 75 GB cluster-wide | ~1.5 GB/node at 50 nodes |
 | Cold repo activations | 100–500 M/day ≈ 1–6k/s avg, ~20k/s peak | ~600 KB read each, 3–12 GB/s aggregate; local NVMe SST cache + MST snapshots for big repos |
 | Commit CPU | ~70 µs × 500k/s ≈ 35 cores | Not the bottleneck at cluster scale |
-| Firehose volume | 500k ev/s × ~1.5 KB ≈ 750 MB/s per full subscriber | Needs a fan-out tier and sharded subscriptions |
+| Firehose volume | 500k ev/s × ~1.5 KB ≈ 750 MB/s per full subscriber | Sharded subscriptions (`?shard=k/n`) |
 
 ### What breaks if we just raise P
 The current design ties four things to one *partition*: ownership/lease,
@@ -1045,14 +1083,10 @@ differently:
 6. **Separate tiers:**
    - *Write/owner nodes* (16–32 cores): ~50–150 of them at 500k commits/s
      peak, sized by write throughput and hot-repo memory.
-   - *Read/proxy nodes*: stateless. They forward writes to owners, serve
-     AppView proxying from a cached signing-key/status index, and serve
-     record reads from SlateDB read-only replicas (`DbReader`) for
-     stale-tolerant reads.
-   - *Firehose fan-out nodes*: consume the node logs, serve subscribers, and
-     offer cursor backfill straight from S3 segments. They also serve sharded
-     subscriptions (`?shard=k/n` by DID hash, implemented: §5) for consumers
-     that can't take the full ~750 MB/s.
+   - *Read/proxy and firehose fan-out nodes*: not planned (see "Read
+     replicas and fan-out nodes: not planned"); full nodes serve proxying and
+     the firehose, and sharded subscriptions (`?shard=k/n`, §5) split the
+     stream for consumers that can't take all of it.
 7. **Global indexes at 5 B scale.**
    - Handles: S3 objects for uniqueness, plus a cache.
    - listRepos (implemented): repos come in (slot, DID) order, the cursor
@@ -1126,20 +1160,227 @@ proxy traffic and concurrently active repos).
   are rebuilt from the commit's CAR at replay (`segment::derive_commit_muts`).
 
 ### Separate tiers
-- **Read/proxy tier**: stateless, behind the load balancer.
-  - Serves AppView proxying from an in-memory signing-key/status cache with
-    cached service JWTs. Record reads come from SlateDB `DbReader` replicas;
-    writes forward to the owners.
-  - At 1–2 M req/s the limit is mostly network (~5 KB average response ⇒
-    5–10 GB/s): **2 nodes today, 10–16 × 25 Gbps at 20×**.
-- **Firehose fan-out tier.** Merges the node logs and serves relays,
-  including cursor backfill from S3.
-  - Today ~3 MB/s per subscriber, so **2 nodes** cover HA.
-  - At 100×, ~300 MB/s per subscriber × tens of subscribers ⇒ **4–8 nodes**.
-    Sharded subscriptions become important here.
+None. Full nodes serve proxying and the firehose; see "Read replicas and
+fan-out nodes: not planned" for when that would change.
 
 ### Must happen before any production data
 - **Switch hashing to fixed 65,536 slots → shard map.** `hash % P` can never
   be changed later without rewriting every partition.
 - **Per-node log + node leases + shard-assignment map**, for PUT cost and
   lease overhead (see "Planet scale").
+
+## Read replicas and fan-out nodes: not planned
+
+Separate read/proxy nodes (SlateDB `DbReader` replicas) and firehose fan-out
+nodes were designed and rejected for now: full nodes cover both jobs well
+past Bluesky's scale. Three full nodes serve today's proxy traffic, and a full
+firehose subscriber is ~12 Mbit/s at today's ~345 commits/s. Relays that need
+to split the stream use `?shard=k/n` and per-shard `listRepos` cursors. The
+thresholds where a dedicated tier would start to pay: proxy traffic above
+~300k req/s (a reader is NIC-bound at ~210k proxied req/s per 10 Gbit), or
+dozens of full-firehose subscribers at 20-100x write load (a 10 Gbit node
+serves ~25 full subscribers at 20x and ~5 at 100x). Before adding either,
+prefer a DID-aware load balancer (removes the extra proxy hop) and more full
+nodes.
+
+## Partial MSTs (design + prototype; not wired in)
+
+**Problem.** Section 2 keeps the whole tree of every cached repo in memory and
+rebuilds it from `R/` on a cold load. Real writers in one hour (~188k repos)
+have median 7.3k, mean 19.4k and p99 169k records. At ~215–250 B/record that
+is ~850 GB of trees for one hour of writers, while a 256 GB node caches only
+~35k average active repos. A write to a cold repo costs O(n): it scans
+~315 B/record of `R/` (record bytes included) plus ~0.25–0.33 µs/record of
+MST CPU. The goal: memory proportional to the **paths** being written, and a
+cold write costing O(log n) node reads.
+
+**Key fact.** A write at key K only touches three root-to-bottom search
+paths: K's own, its predecessor P's (the right spine that a delete merges),
+and its successor S's (the left spine). `prove_mutation` only walks K's path.
+The prototype checks this claim byte for byte (below). The catch: recomputing
+the root needs the CID of every sibling hanging off those paths, and each of
+those CIDs covers its whole subtree.
+
+### Options (measured with `tests/all/mst_lazy.rs` `bench`, in-memory store)
+Shared numbers: node blocks total **79–80 B/record** on the real repo and on
+synthetic repos with a real collection mix and TIDs. A write's path is 8–12
+nodes deep for 10k–1M records (9 on the 43.6k real repo). A commit emits 8–12
+MST blocks.
+
+| | (a) persist every node | (b) persist interior (h>=1) | (c) derived-only, rebuild by key range | (d) persist h>=2 |
+|---|---|---|---|---|
+| extra state bytes / record | 79 B (+25% of `R/` raw, ~+60% zstd: hashes don't compress) | **28 B** (+9% / ~+22%) | 0 | 7.5 B |
+| cold write: dependent reads | depth (8–12) | depth−1 (7–11) + 1 `R/` scan of ~7 records | **O(n)**: every sibling's CID needs its whole subtree, i.e. a full `R/` scan + hash per write | depth−2 + 1 scan of ~25–50 records |
+| `M/` puts / commit (100k repo) | 7.7–8.2 nodes, ~5.0 KB | 6.9–7.0 nodes, ~4.5–4.9 KB | 0 | 6 nodes, ~4.0–4.2 KB |
+| `M/` deletes / commit | ~8 | ~7 | 0 | ~6 |
+| getBlocks of a node CID | point read | point read (interior); leaf needs a locator | walk | point read (h>=2) |
+
+- **(c) fails the goal.** The MST layout is a pure function of the keys, so
+  any subtree *can* be rebuilt from an `R/` range scan. But the root CID
+  depends on all n keys, so every write pays the scan. For a p99 repo that
+  is 59 MB of `R/` and ~40 ms of CPU per write. Its only useful form is
+  **(c′)**: keep interior nodes resident and drop leaves (rebuilt per write
+  from ~7 records). That cuts memory 2.3x (93 vs 215 B/record) but leaves
+  the O(n) cold load as it is.
+- **(a)** buys point-read getBlocks for leaves. It costs 3x the storage of
+  (b) and saves only one small `R/` scan per write. A leaf's key range
+  usually shares an SST block with the records being written anyway.
+- **(d)** saves 1 node write per commit and 3.7x of storage compared with
+  (b). The cost: each cold write scans 25–50 records (~10–16 KB of `R/`)
+  instead of ~7, and 1.5–2x more resident nodes.
+
+**Choice: (b), interior nodes persisted, leaves derived.** It has the lowest
+cold-write I/O per stored byte. It is also the smallest change to the
+"records are the truth" model: leaves, which are 3/4 of the nodes, stay
+derived, and every loaded node is verified against its parent's link.
+
+### Design
+- **Layout.** `M/{did}\0{cid digest}` → node block. The key is slot-prefixed
+  like `R/` (`state::keyed`), so resharding moves it with the shard's slot
+  range and nothing else changes. Lookups use the CID the parent links to,
+  and every read is hash-checked.
+- **Loading.**
+  - Open = read the root by `head.data`. A root that is missing (a small
+    repo whose root is a leaf, or a repo not yet backfilled) means a full
+    rebuild from `R/` plus a backfill of its interior nodes.
+  - Each op walks K, then "before K", then "after K" (`mst_lazy::Mode`).
+    - A child of height >= 1 is read from `M/`.
+    - A leaf is rebuilt from `R/(lo, hi)`. The bounds are the separator keys
+      inherited down the path, so the scan returns exactly the leaf's keys.
+    - A rebuilt leaf must hash to the link, otherwise `Invalid`. This keeps
+      today's root check per path.
+    - A missing `M/` node falls back to an `R/` rebuild of that subtree,
+      which is self-healing.
+  - Mutations, CIDs and proof marking are `mst::Tree`'s own code, running on
+    the partial tree (unloaded children are `Child { node: None, cid }`).
+- **Persistence.** The puts and deletes go in the commit's state batch,
+  atomic with `R/` and `h/`.
+  - Puts = the written blocks with height >= 1, except proof-only
+    neighbours, which are already stored.
+  - Deletes = persisted nodes seen on the batch's walks that are no longer
+    at their position (height, a key below them) in the new tree. Every
+    replaced node lies on those walks.
+  - Invariant (tested): after every commit, `M/` holds **exactly** the
+    interior nodes of the tree at `head.data`. No garbage, nothing missing.
+  - Replay: puts come from the commit CAR's blocks (height of a block = the
+    height of any key in it; a node without keys is interior), so they add
+    no log bytes. Deletes (~7 × 33 B) ride in the segment's `extra` muts:
+    ~+4% segment bytes.
+- **Invariants.**
+  - The root CID, the commit's MST blocks (in order), getRecord proofs and
+    getRepo's blocks are byte-identical to the full tree's.
+  - Sync 1.1 completeness: creates and deletes carry the neighbour nodes,
+    because the P and S spines are loaded before `prove_mutation` runs (it
+    ignores `Partial`, so a missing neighbour would have silently shrunk
+    the proof; the tests compare full block lists).
+- **Cache policy.**
+  - Unit: the loaded path nodes, in one LRU per worker by bytes (`heap_bytes`).
+  - Eviction turns a clean subtree back into `{node: None, cid}`; the root
+    always stays. Dirty nodes are pinned until their commit is written, and
+    only clean subtrees are dropped. Unloading happens between commits only:
+    the delete check relies on a batch's walked nodes staying loaded until
+    its write.
+  - "Large repo" pinning and `L/` preloads become unnecessary: a 1M-record
+    repo opens with one read.
+- **Snapshots / DurableView.** A view keeps its `Arc` root as today. A reader
+  that hits an unloaded child reads `M/`/`R/` *as of a SlateDB snapshot*
+  taken with the view. Otherwise a later commit may have deleted the node or
+  changed the leaf's records, and the hash check would fail. A read-only
+  cursor loads into a private copy and never mutates the shared view.
+  getRecord proofs: walk K on the view (one path). On a mismatch (no
+  snapshot), retry on the newest view.
+- **getRepo.** It streams from a DB snapshot with no resident tree. It does a
+  pre-order DFS: interior nodes are point reads (or one prefix scan of
+  `M/{did}`, 28 B/record, which is 11x less than `R/`), and leaves come from
+  the same forward `R/` scan that yields the records, since leaves come up
+  in key order. Memory is one path.
+- **getBlocks / NodeIndex.**
+  - Interior CIDs are a direct `M/` point read, so no index is needed.
+  - Leaf CIDs need a locator: keep `NodeIndex` (built by one streaming
+    export walk, then advanced per commit as today), or persist
+    `l/{did}\0{cid8}` → first key (~12 B/record more). Leaf-node getBlocks
+    is rare, so the walk is the default.
+- **Storage format.** `M/` is a new family. vlpds is unshipped, so there is
+  no migration: bulk import and `importRepo` write `M/` (backfill =
+  `mst_lazy::build_tree` + `persisted_nodes`).
+
+### Prototype results (`src/mst_lazy.rs`; `tests/all/mst_lazy.rs`)
+- **Correctness.** The lazy tree runs in lockstep with `mst::Tree`.
+  - Workloads:
+    - random histories: 36 seeds × 80 commits of 1–6 ops, any mix of
+      create, update, delete and delete-missing, 40% of commits cold and the
+      rest warm with random unloads, persist height 0/1/2 (also passes at
+      1,200 seeds);
+    - the real repo `~/repo.car` (43,649 records): 1,200 commits of appends,
+      random-rkey creates, updates and deletes, at heights 1 and 2.
+  - Checked against the full tree: equal previous values, root CIDs, commit
+    block lists, getRecord proofs, `get` and getRepo block streams.
+  - The store's node set equals the reference tree's interior set after
+    every commit.
+  - A store with nodes missing, or with no nodes at all, still rebuilds
+    exactly. A corrupted record is caught.
+- **Measured** (dev-release profile, M4 Pro, in-memory store, so I/O is
+  counted, not timed). Per cold write, option (b):
+
+| repo | full tree heap | cold write: CPU / `M/` reads / `R/` recs | resident after | `M/` put B / commit | steady CPU full vs lazy | getRepo walk vs export |
+|---|---|---|---|---|---|---|
+| real 43.6k | 9.2 MB | 10–13 µs / 8.1 / ~7 | **9–13 KB** | 2.7–4.2 KB | 3.1 vs 6.7 µs | 0.7 vs 7.4 ms |
+| 10k | 2.1 MB | 8–11 µs / 7 / ~7 | 10 KB | 3.2 KB | 3.0 vs 5.6 µs | 0.2 vs 1.6 ms |
+| 100k | 21.5 MB | 12–13 µs / 7 / ~6 | 13–15 KB | 4.8 KB | 4.2 vs 7.0 µs | 1.4 vs 16.6 ms |
+| 1M | 215 MB | 16–18 µs / 11 / ~7 | 17 KB | 5.6 KB | 5.2 vs 10.6 µs | 13.8 vs 169 ms |
+
+- The cold write's latency is its dependent `M/` reads. From the SlateDB
+  NVMe cache (~50–100 µs each) that is **~0.5–1.1 ms at any size**. Today
+  it is O(n): ~40 ms of CPU plus 59 MB of `R/` for a 169k-record repo.
+  Reads that miss to S3 cost ~20–40 ms each and are dependent. Mitigation:
+  for repos with `M/` under ~1 MiB (<~35k records, which covers the median
+  and the mean), read the whole `M/{did}` prefix in one read-ahead scan and
+  keep only the path. Larger repos do point reads, and their top levels
+  stay cached.
+- In steady state, lazy costs ~2x the full tree's MST CPU: 3 walks per op
+  and the delete check. That is 3–5 µs more per commit, against ~70 µs of
+  commit CPU in total.
+- **The cost is write amplification.** State bytes per commit grow from
+  ~740 B to ~3.5–6.3 KB, plus ~7–11 tombstones. CID keys don't coalesce in
+  the memtable, so every commit to a hot repo rewrites its top path. That
+  is fine at today's 2k commits/s (~10 MB/s). At the 200k/s headroom target
+  it is ~1 GB/s into SlateDB before compaction. The fix, if needed:
+  write-back per checkpoint window. Keep dirty interior nodes resident,
+  persist only the window's final versions, and record in
+  `m/{did}` → (root, rev) which version `M/` holds. A stale marker after a
+  crash means falling back to an `R/` rebuild of the stale subtrees. Hot
+  repos then pay ~1 path per window instead of per commit.
+
+### Recommendation and sizing effect
+**Wire it in, behind the existing `RepoState::tree` API, in stages.**
+- **Memory.** Resident memory per active repo goes from ~215 B × records
+  to ~10–20 KB of paths.
+- **Capacity.** A 256 GB node's ~35k cacheable average repos becomes, at a
+  64 GB MST budget, ~4M repos' write paths, and the root alone is ~1 KB. An
+  hour of writers, ~188k repos × ~15 KB ≈ **3 GB instead of ~850 GB**. The
+  3 × 256 GB cluster stops being memory-bound on MSTs, so the cache budget
+  can shrink and the memory can go to the SlateDB block cache instead.
+- **Cold-load tail.** It no longer depends on repo size: ~8–12 dependent
+  reads. The p99 169k-record repo goes from ~40 ms of CPU + 59 MB of I/O to
+  ~1 ms (cached) or one 5 MB `M/` prefix scan (not cached). Pinning large
+  repos and `L/` preloads can be retired.
+- **Costs.** +28 B/record of state (~+9% raw; ~0.5 TB, ~$11/mo at crawl scale) and
+  ~4–6 KB more state writes per commit.
+
+**Stages.**
+1. `M/` family, written through in the state batch. Puts derived from the
+   CAR at replay, deletes in `extra`. Backfill on bulk import and
+   `importRepo`, and on first full load. The worker still keeps full trees;
+   CI asserts `M/` == interior set.
+2. Lazy open behind a flag. `load_tree` = root read. Worker ops call
+   `prepare` (the 3 walks), and the existing write path is unchanged
+   (`write_diff_blocks` + `Persist`). Byte-level lockstep checks run against
+   a full rebuild in debug builds, and `sync11_property` + `go_checker` run
+   in lazy mode.
+3. Readers: DurableView carries a SlateDB snapshot. Proofs and getRecord use
+   read-only lazy cursors, getRepo streams the export, getBlocks reads `M/`
+   (leaf locator via the export walk).
+4. Byte-budgeted path LRU replaces the per-repo LRU. Retire pinning and `L/`
+   preloads, and add the small-repo `M/` prefix prefetch.
+5. Only if the write volume matters at the 100x target: checkpoint-window
+   write-back with an `m/{did}` marker.

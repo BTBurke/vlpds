@@ -1,0 +1,107 @@
+//! The write path's CPU work changed without changing its output: commit
+//! signatures (RFC 6979 nonce on hardware SHA-256, src/crypto.rs) and the
+//! getBlocks node index keying each written node by its own first value
+//! instead of its subtree's leftmost key (src/mst.rs `subtree_key`).
+use crate::common::*;
+use std::collections::HashSet;
+
+/// Signatures are the RFC 6979 ones: equal to RustCrypto k256's
+/// (deterministic, low-S) for many keys, and over every message length
+/// around the SHA-256 block boundaries.
+#[test]
+fn commit_signatures_match_k256_across_keys_and_lengths() {
+    use k256::ecdsa::signature::Signer;
+    for k in 0..64u32 {
+        let kp = vlpds::crypto::Keypair::generate();
+        let sk = k256::ecdsa::SigningKey::from_slice(&kp.to_bytes()).unwrap();
+        for len in (0..200usize).step_by(if k == 0 { 1 } else { 37 }) {
+            let msg: Vec<u8> = (0..len).map(|i| (i as u32 * 31 + k) as u8).collect();
+            let theirs: k256::ecdsa::Signature = sk.sign(&msg);
+            let theirs = theirs.normalize_s().unwrap_or(theirs);
+            assert_eq!(kp.sign(&msg)[..], theirs.to_bytes()[..], "key {k} len {len}");
+        }
+        // the commit object a worker signs
+        let data = vlpds::cid::Cid::dag_cbor(format!("data {k}").as_bytes());
+        let (_, block) = vlpds::worker::sign_commit("did:plc:abcdefghijklmnopqrstuvwx", "3lbcdefghij22", &data, &kp);
+        let unsigned = vlpds::events::encode_commit("did:plc:abcdefghijklmnopqrstuvwx", "3lbcdefghij22", &data, None);
+        let theirs: k256::ecdsa::Signature = sk.sign(&unsigned);
+        let theirs = theirs.normalize_s().unwrap_or(theirs);
+        let want = vlpds::events::encode_commit(
+            "did:plc:abcdefghijklmnopqrstuvwx",
+            "3lbcdefghij22",
+            &data,
+            Some(&theirs.to_bytes()),
+        );
+        assert_eq!(&block[..], &want[..]);
+    }
+}
+
+async fn get_blocks(s: &TestServer, did: &str, cids: &[Cid]) -> Resp {
+    let mut q = vec![("did", did.to_string())];
+    q.extend(cids.iter().map(|c| ("cids", c.to_string())));
+    s.xrpc.get_multi("com.atproto.sync.getBlocks", &q, &Auth::None).await
+}
+
+async fn assert_nodes_served(s: &TestServer, did: &str) -> Vec<Cid> {
+    let repo = s.get_repo(did).await;
+    let mut nodes = Vec::new();
+    repo.tree().walk_blocks(&mut |c, _| nodes.push(c)).unwrap();
+    for chunk in nodes.chunks(100) {
+        let r = get_blocks(s, did, chunk).await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        let (_, blocks) = vlpds::car::read_car(&r.body).unwrap();
+        assert_eq!(blocks.len(), chunk.len());
+        for (c, b) in blocks {
+            assert_eq!(Some(b), repo.blocks.get(&c).map(|v| &v[..]), "{c}");
+        }
+    }
+    nodes
+}
+
+/// A repo deep enough for internal nodes that start with a child pointer
+/// (their subtree key is not their leftmost leaf key): the index built on
+/// first use and then advanced by commits finds every node, and nodes the
+/// later commits replaced are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_index_serves_deep_trees_across_commits() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("deep").await;
+    let write = |rkey: String, del: bool| {
+        if del {
+            json!({"$type": "com.atproto.repo.applyWrites#delete", "collection": "app.bsky.feed.post", "rkey": rkey})
+        } else {
+            json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "rkey": rkey, "value": post_record(&rkey)})
+        }
+    };
+    // pseudo-random TID-shaped rkeys, so inserts land all over the tree
+    let rkey = |i: u64| {
+        let t = vlpds::tid::Tid::from_parts(1_700_000_000_000_000 + (i * 2_654_435_761) % 100_000_000_000, i % 1024);
+        t.to_string()
+    };
+    for batch in 0..8u64 {
+        let writes: Vec<J> = (0..150).map(|j| write(rkey(batch * 150 + j), false)).collect();
+        s.xrpc
+            .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth())
+            .await
+            .ok();
+    }
+    let nodes1 = assert_nodes_served(&s, &a.did).await;
+    assert!(nodes1.len() > 100, "{} nodes", nodes1.len());
+    // commits after the index exists: inserts, deletes, one-op commits
+    for round in 0..6u64 {
+        let mut writes: Vec<J> = (0..40).map(|j| write(rkey(10_000 + round * 40 + j), false)).collect();
+        writes.extend((0..20).map(|j| write(rkey(round * 150 + j * 7), true)));
+        s.xrpc
+            .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth())
+            .await
+            .ok();
+        s.post(&a, &format!("single {round}")).await;
+    }
+    let nodes2 = assert_nodes_served(&s, &a.did).await;
+    let now: HashSet<Cid> = nodes2.iter().copied().collect();
+    let gone: Vec<Cid> = nodes1.iter().filter(|c| !now.contains(c)).copied().collect();
+    assert!(!gone.is_empty());
+    for c in gone.iter().take(50) {
+        get_blocks(&s, &a.did, &[*c]).await.err(400, "BlockNotFound");
+    }
+}

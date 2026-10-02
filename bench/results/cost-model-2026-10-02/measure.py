@@ -173,6 +173,9 @@ PLANS = {
     "s1024b": [("settle", 0, 120), ("idle", 0, 300), ("avg", 345, 900)],
     "s1024": [("settle", 0, 180), ("idle", 0, 420), ("avg", 345, 900)],
     "smoke": [("idle", 0, 30), ("avg", 345, 60)],
+    # "Defaults changed" (RESULTS.md): fresh idle, avg, then idle after writes, run once with the
+    # binary before the change and once after (BENCH_BIN), 256 shards, 100k repos
+    "defaults": [("settle", 0, 120), ("idle", 0, 300), ("avg", 345, 600), ("idle2", 0, 300)],
 }
 
 

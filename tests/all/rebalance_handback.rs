@@ -84,8 +84,11 @@ async fn watch_handback(nodes: &[&TestServer], joiner: &TestServer, raw: &object
                 gaps.insert(s, (now - r, now - d));
             }
         }
+        // (judged on this poll's snapshot: re-reading the joiner here could
+        // count shards it opened during the polls above, never recorded)
+        let have = cur.iter().filter(|c| **c == Some(j)).count();
         prev = cur;
-        if owned(joiner).len() >= want {
+        if have >= want {
             let mut v: Gaps = gaps.into_iter().map(|(s, (r, d))| (s, r, d)).collect();
             v.sort();
             return v;

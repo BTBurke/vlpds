@@ -85,6 +85,11 @@ impl RecentRepos {
         }
     }
 
+    /// Whether the set changed since the last `take_dirty`.
+    pub fn is_dirty(&self) -> bool {
+        self.inner.lock().1
+    }
+
     /// The set, newest first, if its members changed since the last call.
     pub fn take_dirty(&self) -> Option<bytes::Bytes> {
         let mut g = self.inner.lock();
@@ -308,6 +313,45 @@ fn checkpoint_lifetime() -> Duration {
     Duration::from_secs(CHECKPOINT_LIFETIME_SECS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
+/// How often a shard DB re-reads its manifest (`--slatedb-manifest-poll`,
+/// SlateDB's default is 1 s). Each poll is two GETs (a probe of the next
+/// manifest id, usually a 404, plus its GC boundary file), the largest
+/// fixed per-shard request line (bench/results/cost-model-2026-10-02). The
+/// node is the only writer of its shards' DBs, so reads never wait on it:
+/// writes land in the memtable and the writer's own flushes update its
+/// manifest in place. A poll only picks up the compactor's results, and
+/// every flush's manifest CAS already reloads on a conflict. The one case
+/// that waits on it, a writer whose view of L0 is full, is refreshed every
+/// `FAST_POLL` while L0 runs deep instead (`spawn_compactor`).
+static MANIFEST_POLL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10_000);
+
+pub fn set_manifest_poll_interval(d: Duration) {
+    MANIFEST_POLL_MS.store((d.as_millis() as u64).max(100), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn manifest_poll_interval() -> Duration {
+    if cfg!(test) {
+        return Duration::from_secs(1); // unit tests wait for compaction results
+    }
+    Duration::from_millis(MANIFEST_POLL_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The compactor's and compaction worker's poll interval while L0 is
+/// shallow (`--compaction-poll`; adaptive polling's slow mode and `slow`).
+/// The coordinator reads two files per poll and the worker one, two GETs
+/// each. Nothing waits on it while L0 stays shallow (shallow L0s cost only
+/// bloom-filtered read amplification), and a deep L0 switches to
+/// `FAST_POLL`.
+static SLOW_POLL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(30_000);
+
+pub fn set_compaction_poll_interval(d: Duration) {
+    SLOW_POLL_MS.store((d.as_millis() as u64).max(100), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn slow_poll() -> Duration {
+    Duration::from_millis(SLOW_POLL_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 fn gc_options() -> slatedb::config::GarbageCollectorOptions {
     use slatedb::config::{GarbageCollectorDirectoryOptions, GarbageCollectorOptions};
     let min_age = Duration::from_secs(GC_MIN_AGE_SECS.load(std::sync::atomic::Ordering::Relaxed));
@@ -334,9 +378,10 @@ pub async fn open_db(
     // records/s, 34 ms at 80k/s; tests/all/shard_ingest.rs). L0s live in the
     // object store and are bloom-filtered, so the cost is read
     // amplification only while compaction lags. Compactor polling is
-    // adaptive (`spawn_compactor`): SlateDB's 5 s polls while L0 is shallow,
-    // 500 ms while it runs deep, so unpaced bursts are absorbed without the
-    // ~4x idle GETs of always-fast polls (tests/all/compaction_polling.rs).
+    // adaptive (`spawn_compactor`): 30 s polls while L0 is shallow, 500 ms
+    // (plus writer manifest refreshes) while it runs deep, so unpaced bursts
+    // are absorbed without the idle GETs of always-fast polls
+    // (tests/all/compaction_polling.rs, tests/all/cost_defaults.rs).
     //
     // Memory: the active memtable freezes at 16 MiB (the 10 s node
     // checkpoint flushes idle shards' sooner), so memtables total at most
@@ -352,6 +397,7 @@ pub async fn open_db(
         l0_max_ssts_per_key: 32,
         // room for the active memtable plus l0_flush_parallelism (4) uploads
         max_unflushed_bytes: 128 << 20,
+        manifest_poll_interval: manifest_poll_interval(),
         compression_codec: SST_COMPRESSION.read().codec(),
         garbage_collector_options: Some(gc_options()),
         // started after the open (`spawn_compactor`): half of an open's
@@ -487,6 +533,7 @@ const SST_BLOCK_SIZE: slatedb::SstBlockSize = slatedb::SstBlockSize::Block16Kib;
 /// written into the local SST disk cache (`cache_on_compaction`); reads
 /// cache them.
 fn spawn_compactor(db: &Db, path: String, raw: Arc<dyn object_store::ObjectStore>, codec: Option<slatedb::config::CompressionCodec>) {
+    spawn_deep_refresh(db);
     let mut status = db.subscribe();
     let watch = db.subscribe();
     tokio::spawn(async move {
@@ -536,6 +583,35 @@ fn spawn_compactor(db: &Db, path: String, raw: Arc<dyn object_store::ObjectStore
     });
 }
 
+/// While the writer's L0 runs deep (>= `DEEP_L0`), re-reads its manifest
+/// every `FAST_POLL` instead of waiting for the (10 s) manifest poll. A
+/// writer only learns that compaction freed L0 from a manifest read: its
+/// flushes' CAS conflicts reload it, but once its view of L0 is full no
+/// flush runs, and only a refresh unblocks it. Holds a handle until the
+/// DB is closed (a DB dropped unclosed is fenced by its next opener, which
+/// closes it too).
+fn spawn_deep_refresh(db: &Db) {
+    let db = db.clone();
+    let mut status = db.subscribe();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(FAST_POLL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                r = status.changed() => if r.is_err() { return },
+                _ = tick.tick() => {
+                    if status.borrow().current_manifest.l0().len() >= DEEP_L0 {
+                        let _ = db.refresh_manifest().await;
+                    }
+                }
+            }
+            if status.borrow().close_reason.is_some() {
+                return;
+            }
+        }
+    });
+}
+
 /// How long a closed shard's compactor keeps running for its final flush
 /// (see `spawn_compactor`) if some handle outlives the close.
 const CLOSE_GRACE: Duration = Duration::from_secs(60);
@@ -543,8 +619,8 @@ const CLOSE_GRACE: Duration = Duration::from_secs(60);
 /// How a shard's compactor polls for work (`--compaction-polling`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompactionPolling {
-    /// SlateDB's 5 s polls: cheapest idle, but an unpaced bulk ingest into
-    /// one shard fills L0 between cycles and backpressures for seconds.
+    /// `--compaction-poll` (30 s) always: cheapest idle, but an unpaced bulk
+    /// ingest into one shard fills L0 between cycles and backpressures.
     Slow,
     /// 500 ms polls always: ~10x the idle GETs.
     Fast,
@@ -575,8 +651,7 @@ fn compaction_polling() -> CompactionPolling {
     *COMPACTION_POLLING.read()
 }
 
-/// Poll interval of the slow (SlateDB default) and fast modes.
-const SLOW_POLL: Duration = Duration::from_secs(5);
+/// Poll interval of the fast mode (the slow one is `slow_poll()`).
 const FAST_POLL: Duration = Duration::from_millis(500);
 /// Adaptive: go fast at this many L0 SSTs (a quarter of `l0_max_ssts`: the
 /// writer is producing them faster than slow cycles drain them), back to
@@ -619,7 +694,7 @@ async fn build_compactor(
     } else if fast {
         FAST_POLL
     } else {
-        SLOW_POLL
+        slow_poll()
     };
     let opts = CompactorOptions { worker: None, checkpoint_lifetime: checkpoint_lifetime(), poll_interval: poll, ..Default::default() };
     let worker_opts = CompactionWorkerOptions { compression_codec: codec, compactions_poll_interval: poll, ..Default::default() };

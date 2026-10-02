@@ -18,7 +18,8 @@ use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use prometheus::IntCounter;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -492,17 +493,17 @@ impl Worker {
                 if let Some(q) = queued {
                     let did = q.did().clone();
                     if let Some(buf) = self.loading.get_mut(&did) {
-                        metrics::REPO_CACHE.with_label_values(&["loading"]).inc();
+                        CACHE_LOADING.inc();
                         buf.push(q);
                     } else if self.cache.contains(&did) {
-                        metrics::REPO_CACHE.with_label_values(&["hit"]).inc();
+                        CACHE_HIT.inc();
                         let g = groups.entry(did.clone()).or_insert_with(|| {
                             order.push(did.clone());
                             Vec::new()
                         });
                         g.push(q);
                     } else {
-                        metrics::REPO_CACHE.with_label_values(&["miss"]).inc();
+                        CACHE_MISS.inc();
                         self.start_load(q);
                     }
                 }
@@ -1187,6 +1188,15 @@ fn size_bucket(records: u64) -> &'static str {
     }
 }
 
+// Per-message / per-op counters, resolved once (`with_label_values` hashes
+// the label and takes a lock on every call).
+static CACHE_HIT: LazyLock<IntCounter> = LazyLock::new(|| metrics::REPO_CACHE.with_label_values(&["hit"]));
+static CACHE_MISS: LazyLock<IntCounter> = LazyLock::new(|| metrics::REPO_CACHE.with_label_values(&["miss"]));
+static CACHE_LOADING: LazyLock<IntCounter> = LazyLock::new(|| metrics::REPO_CACHE.with_label_values(&["loading"]));
+static OPS_CREATE: LazyLock<IntCounter> = LazyLock::new(|| metrics::OPS.with_label_values(&["create"]));
+static OPS_UPDATE: LazyLock<IntCounter> = LazyLock::new(|| metrics::OPS.with_label_values(&["update"]));
+static OPS_DELETE: LazyLock<IntCounter> = LazyLock::new(|| metrics::OPS.with_label_values(&["delete"]));
+
 /// Net change per path within one commit: (value before the commit, value after).
 struct Batch {
     ops: BTreeMap<String, (Option<Cid>, Option<Cid>)>,
@@ -1269,12 +1279,9 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Resu
                 continue;
             }
         }
-        let new_paths: HashSet<String> = req
-            .writes
-            .iter()
-            .map(|w| w.path())
-            .filter(|p| !batch.ops.contains_key(p))
-            .collect();
+        // each write's path, formatted once for the checks and the apply
+        let paths: Vec<String> = req.writes.iter().map(Write::path).collect();
+        let new_paths = paths.iter().filter(|p| !batch.ops.contains_key(*p)).collect::<HashSet<_>>().len();
         let incoming_bytes: usize = req
             .writes
             .iter()
@@ -1284,12 +1291,12 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Resu
             })
             .sum();
         if !batch.is_empty()
-            && (batch.ops.len() + new_paths.len() > MAX_COMMIT_OPS
+            && (batch.ops.len() + new_paths > MAX_COMMIT_OPS
                 || batch.record_bytes + incoming_bytes > MAX_COMMIT_RECORD_BYTES)
         {
             flush(st, std::mem::replace(&mut batch, Batch::new()), clock_id)?;
         }
-        match validate(st, &req.writes) {
+        match validate(st, &req.writes, &paths) {
             Ok(()) => {}
             Err(e) => {
                 let _ = req.reply.send(Err(e));
@@ -1297,8 +1304,7 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Resu
             }
         }
         let mut outcomes = Vec::with_capacity(req.writes.len());
-        for w in req.writes {
-            let path = w.path();
+        for (w, path) in req.writes.into_iter().zip(paths) {
             match w {
                 Write::Create {
                     cid, bytes, blobs, ..
@@ -1337,9 +1343,9 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Resu
 
 /// Checks a request against the current tree (including earlier writes in
 /// the batch) without mutating anything, so applyWrites stays atomic.
-fn validate(st: &RepoState, writes: &[Write]) -> Result<(), WriteError> {
-    let mut overlay: HashMap<String, Option<Cid>> = HashMap::new();
-    for w in writes {
+fn validate(st: &RepoState, writes: &[Write], paths: &[String]) -> Result<(), WriteError> {
+    let mut overlay: HashMap<&str, Option<Cid>> = HashMap::new();
+    for (w, path) in writes.iter().zip(paths) {
         let (coll, rkey) = match w {
             Write::Create {
                 collection, rkey, ..
@@ -1356,8 +1362,7 @@ fn validate(st: &RepoState, writes: &[Write]) -> Result<(), WriteError> {
                 "invalid record path {coll}/{rkey}"
             )));
         }
-        let path = w.path();
-        let cur = match overlay.get(&path) {
+        let cur = match overlay.get(path.as_str()) {
             Some(v) => *v,
             None => st
                 .tree
@@ -1401,7 +1406,7 @@ fn validate(st: &RepoState, writes: &[Write]) -> Result<(), WriteError> {
                 None
             }
         };
-        overlay.insert(path, new);
+        overlay.insert(path.as_str(), new);
     }
     Ok(())
 }
@@ -1432,8 +1437,13 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
 
     let mut ops = Vec::with_capacity(batch.ops.len());
     let mut muts = Vec::with_capacity(batch.ops.len() + 1);
-    let mut car_bytes =
-        Vec::with_capacity(commit_block.len() + mst_blocks.len() * 300 + batch.record_bytes + 128);
+    // exact up to the varints: header ~60, each block varint + 36-byte CID
+    let mut car_bytes = Vec::with_capacity(
+        96 + commit_block.len()
+            + mst_blocks.iter().map(|(_, b)| b.len() + 40).sum::<usize>()
+            + batch.record_bytes
+            + batch.records.len() * 40,
+    );
     car::write_header(&mut car_bytes, &commit);
     car::write_block(&mut car_bytes, &commit, &commit_block);
     for (c, b) in &mst_blocks {
@@ -1525,7 +1535,11 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
     STATS.ops.fetch_add(ops.len() as u64, Ordering::Relaxed);
     metrics::COMMITS.inc();
     for op in &ops {
-        metrics::OPS.with_label_values(&[op.action]).inc();
+        match op.action {
+            "create" => OPS_CREATE.inc(),
+            "update" => OPS_UPDATE.inc(),
+            _ => OPS_DELETE.inc(),
+        }
     }
     metrics::COMMIT_OPS.observe(ops.len() as f64);
     metrics::COMMIT_REQUESTS.observe(batch.waiters.len() as f64);
@@ -2098,6 +2112,88 @@ mod tests {
         while probes.iter().any(|p| p.send(WorkerMsg::Shutdown).is_ok()) {
             assert!(Instant::now() < deadline, "repo workers still running");
             std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Thread CPU seconds (CLOCK_THREAD_CPUTIME_ID).
+    fn thread_cpu() -> f64 {
+        #[repr(C)]
+        struct Ts(i64, i64);
+        unsafe extern "C" {
+            fn clock_gettime(clk: i32, ts: *mut Ts) -> i32;
+        }
+        let clk = if cfg!(target_os = "macos") { 16 } else { 3 };
+        let mut t = Ts(0, 0);
+        unsafe { clock_gettime(clk, &mut t) };
+        t.0 as f64 + t.1 as f64 * 1e-9
+    }
+
+    /// CPU per commit of the worker's commit path (validate, MST insert,
+    /// diff blocks + node refs, sign, CAR, #commit frame, mutations) plus
+    /// its ack (durable view swap), one createRecord per commit, on repos
+    /// of 20 / 5000 TID-keyed posts. Measurement only:
+    /// `cargo test --release --lib bench_commit_cpu -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_commit_cpu() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let (part, mut rx) = rt.block_on(async {
+            let store = crate::store::Store::memory(None);
+            let db = Arc::new(crate::partition::open_db(&store, 0, None).await.unwrap());
+            let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
+            let log = NodeLog::start(
+                store.clone(),
+                NodeLogConfig { log_id: "t".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(1), lease_ok: None },
+                merger_tx,
+            );
+            std::mem::forget(_merger_rx);
+            let (tx, rx) = tokio::sync::mpsc::channel::<LogEntry>(1 << 16);
+            (Arc::new(Partition { id: 0, epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() }), rx)
+        });
+        let tid = |i: u64| Tid::from_parts(1_700_000_000_000_000 + i * 1_000_003, i % 1024).to_string();
+        for records in [20u64, 5000] {
+            let did: Arc<str> = format!("did:plc:bench{records}").into();
+            let key = Keypair::generate();
+            let mut tree = Tree::new();
+            for i in 0..records {
+                tree.insert_no_proof(format!("app.bsky.feed.post/{}", tid(i)).as_bytes(), Cid::dag_cbor(&i.to_be_bytes())).unwrap();
+            }
+            let root = tree.root_cid().unwrap();
+            let head = Head { commit: root, data: root, rev: Tid(1), commit_block: Bytes::new() };
+            let acct: state::Account = serde_json::from_value(serde_json::json!({
+                "did": &*did, "handle": "t.test", "signing_key": hex::encode(key.to_bytes()), "password_hash": "", "created_at": "",
+            }))
+            .unwrap();
+            let mut st = finish_load(part.clone(), did.clone(), tree, head, key, acct).unwrap();
+            st.collections.insert("app.bsky.feed.post".into(), records as u32);
+            st.nodes.lock().wanted = true;
+            let mut next = records;
+            let mut one = |st: &mut RepoState| {
+                let rkey = tid(next);
+                next += 1;
+                let bytes = Bytes::from(format!("{{\"$type\":\"app.bsky.feed.post\",\"text\":\"post {rkey} {}\",\"createdAt\":\"2026-10-01T00:00:00.000Z\"}}", "x".repeat(120)));
+                let (reply, _rx) = oneshot::channel();
+                let w = Write::Create { collection: "app.bsky.feed.post".into(), rkey, cid: Cid::dag_cbor(&bytes), bytes, blobs: Vec::new() };
+                process(st, vec![Queued::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None })], 7).unwrap();
+                while let Ok(e) = rx.try_recv() {
+                    settle(e);
+                }
+            };
+            for _ in 0..2000 {
+                one(&mut st);
+            }
+            let mut best = f64::MAX;
+            // BENCH_ROUNDS: more rounds, e.g. to attach a sampler
+            let rounds = std::env::var("BENCH_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(7);
+            for _ in 0..rounds {
+                let n = 3000;
+                let t = thread_cpu();
+                for _ in 0..n {
+                    one(&mut st);
+                }
+                best = best.min((thread_cpu() - t) / n as f64 * 1e6);
+            }
+            println!("bench_commit_cpu records={records}: {best:.2} us/commit (thread CPU, best of {rounds})");
         }
     }
 }

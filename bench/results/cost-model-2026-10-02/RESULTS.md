@@ -18,6 +18,11 @@ runs in-region, so egress is $0.
 | Sizing scenario today (50 M repos, 25 B records, 2k/s peak), 3 / 256, defaults / tuned | $3,354 / $1,203 | $3,328 / $1,177 | $2,988 / $1,051 | same as Bluesky today |
 | Sizing 100x writes (200k/s peak), 8 / 1,024, defaults / tuned (+ K=1) | $19,599 / $10,615 | $18,686 / $9,702 | $16,486 / $8,397 | storage of ~209 TB, segment PUTs, polling |
 
+> **Defaults changed after these runs** (section "Defaults changed" at the end): manifest poll 10 s,
+> compactor/worker slow polls 30 s, idle checkpoints skipped. With them the model prices Bluesky today
+> at 3 nodes / 256 shards at **$2,521 (S3) / $2,500 (GCS) / $2,244 (R2)**, and 8 / 1,024 at $7,182 S3.
+> The tables below are the measured runs and the projections at the *previous* defaults.
+
 How the costs scale, in order of impact:
 1. **Requests cost far more than storage at Bluesky's write rate.** State plus log is ~4.9 TB
    (~$110/mo on S3).
@@ -372,7 +377,7 @@ What the knobs do:
   per shard are 63% of polling. Each node is the only writer of its shards' DBs, and the compactor
   runs in-process, so a 10–30 s poll costs only a delay in picking up compaction results. That means L0s
   linger; the 32 x 16 MiB L0 budget covers it. 10 s saves ~$500/mo at 256 shards and ~$2k/mo at 1,024.
-  Not a flag yet: it is `Settings.manifest_poll_interval` in `partition::open_db`.
+  Now `--slatedb-manifest-poll`, default 10 s ("Defaults changed").
 - **Compactor and worker polls** (5 s while adaptive polling is slow) are another 1.2 GET/s per shard.
   30 s saves ~$270/mo (256) or ~$1.1k/mo (1,024). Adaptive polling already keeps them slow, so raising
   the slow interval to 30 s is the change.
@@ -380,7 +385,9 @@ What the knobs do:
   new: the marker write dirties the memtable. 30 s saves ~$590/mo and 60 s ~$810/mo at 3/256. The cost
   is a longer crash replay (more log to re-read) and a slower retention floor. Cheaper still, and code
   only: skip the flush for shards whose applied ordinal hasn't moved since their last checkpoint (or
-  checkpoint idle shards every few minutes). That removes the idle-shard flushes entirely.
+  checkpoint idle shards every few minutes). That removes the idle-shard flushes entirely. Done for
+  shards already checkpointed at the log's ordinal ("Defaults changed"); per-shard skipping while the
+  log moves would lengthen a successor's replay, so it isn't done.
 - **Segment linger** (not implemented; a minimum time between seals). One node's log PUTs ~27 times a
   second regardless of load, which is $350/node/mo on S3. A 100 ms linger cuts that to ~9/s for +~50 ms
   mean ack latency. At 100x the size cap governs instead, so linger does nothing there.
@@ -448,10 +455,84 @@ blobs still referenced in Feb 2026, with no derived thumbnails or transcodes.
 - `measure.py`: the run driver (population, phases, scrapes).
 - `analyze.py`: per-phase rates.
 - `cost_model.py`: fit, validate, project, price and sensitivity. `python3 cost_model.py` re-derives
-  every table here.
+  every table here (its baseline is now the new defaults; "previous defaults" is a sensitivity row).
+- `compare.py`, `raw_defaults_before.jsonl`, `raw_defaults_after.jsonl`, `compare_output.md`: the
+  "Defaults changed" before/after runs.
 - `model_output.md` / `model_output.json`: its output. `tuned_table.md`: the tuned table.
 - `raw.jsonl` (1 node, 256 shards), `raw1024.jsonl` (1,024 shards), `raw3.jsonl` (3 nodes): every
   scrape, with labeled `vlpds_object_store_requests_total` / `_bytes_total`,
   `slatedb_object_store_request_count_total`, control-plane and segment counters, plus family sums.
 - The MinIO prefixes (`costmodel`, `cost1024`, `costsmoke`), MinIO's `.trash`, and the node caches and
   logs were deleted after the runs.
+
+## Defaults changed (2026-10-01 evening)
+Latency-neutral cost changes only (user policy: no latency-for-cost trades, so no segment linger and
+checkpoints stay at 10 s):
+
+| knob | before | now | flag |
+|---|---|---|---|
+| SlateDB DB manifest poll | 1 s | **10 s** | `--slatedb-manifest-poll` |
+| compactor + worker polls while L0 is shallow (adaptive slow mode) | 5 s | **30 s** | `--compaction-poll` |
+| fast polls while L0 >= 8 (adaptive) | 500 ms | 500 ms, plus a writer manifest refresh every 500 ms | |
+| checkpoint of a shard already checkpointed at the log's durable ordinal | marker write + L0 flush | **skipped** | |
+
+Why these don't cost latency (DESIGN.md §4 "Polling defaults", HA "Checkpoints"):
+- The node is its shards' only writer. Reads see its writes immediately (memtable, then its own flushes'
+  manifest); a poll only picks up compaction results, which each flush's manifest CAS reloads anyway.
+  The one place a writer waits on a manifest read is a full L0, so while L0 is deep it refreshes every
+  500 ms. Tested: `tests/all/cost_defaults.rs` (`own_writes_visible_with_slow_manifest_poll`; unpaced
+  2M-record single-shard ingest, 3 runs each, old vs new polls: worst write 0.14–1.12 s vs 0.18–1.17 s,
+  throughput 207k–378k vs 227k–416k records/s, i.e. within noise).
+- A skipped checkpoint has nothing to write: no segment arrived since that shard's last one. While the
+  log moves every shard is still checkpointed each pass, so successors replay no more than before and
+  replay floors (retention) still advance with the log (`idle_checkpoint_writes_nothing`).
+
+### Measured (`measure.py run --plan defaults`, `compare.py`)
+Same method as above: 1 node, 256 shards, local MinIO, injected 30 ms segment PUTs and 20/30 ms
+state-pool latency, 100 k repos (real/32 distribution), the binary before the change and then after it,
+on the same prefix. Phases: fresh idle (5 min), 345 commits/s (10 min), idle after writes (5 min).
+Requests/s:
+
+| run | phase | commits/s | segment PUT | SST PUT | manifest CAS | compactions CAS | polling GETs | SST GET | LIST | Class A | Class B | S3 req $/mo per node |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| before | idle (fresh) | 0 | 0 | 0 | 0 | 0 | 818 | 0 | 0.4 | 0.6 | 822 | $872 |
+| after | idle (fresh) | 0 | 0 | 0 | 0 | 0 | **103** | 0 | 0.4 | 0.6 | **107** | **$121** |
+| before | avg | 344 | 27.7 | 11.0 | 12.7 | 9.5 | 904 | 37.2 | 4.7 | 63.0 | 946 | $1,895 |
+| after | avg | 344 | 28.2 | 11.6 | 13.2 | 11.4 | **266** | 47.1 | 4.6 | 66.6 | **318** | **$1,418** |
+| before | idle after writes (steady 90 s window) | 0 | 0 | 6.9 | 7.2 | 0.6 | 836 | 1.4 | 0.5 | 15.3 | 837 | $1,081 |
+| after | idle after writes (steady 90 s window) | 0 | 0 | **0** | **0** | **0** | **102** | 0 | 0.4 | **0.6** | **102** | **$115** |
+
+(The whole idle-after-writes phases average $2,053 before and $987 after: both include ~2 min of
+compaction draining the avg phase's L0s and one 10-min GC pass. The steady windows are 90 s after
+the drain with no GC pass in them; the GC passes' LIST/CAS/delete_batch spikes are the same in both.)
+
+- **Idle:** polling 818 -> 103 GETs/s (3.2 -> 0.40 per shard, the analytic 2(1/10 + 2/30 + 1/30) =
+  0.40). An idle node that has written no longer flushes: SST PUTs 6.9/s and manifest CAS 7.2/s -> 0 once
+  compaction drains ($1,081 -> $115/mo per node).
+- **345 commits/s:** Class B -66% (946 -> 318/s), Class A unchanged within noise (63 -> 67/s): every
+  shard still gets entries every pass at this rate (~1.35 commits/s/shard), so the checkpoint skip does
+  nothing under load, as expected. Request cost per node -25% ($1,895 -> $1,418/mo at S3 prices).
+- **Model check.** The updated model (`DEFAULT_KNOBS` now 10 s / 30 s / 30 s) predicts the after-avg
+  phase at 70.2 A / 189 B; measured 66.6 A / 318 B. The extra ~130 GETs/s are adaptive fast-mode
+  episodes: with 30 s slow cycles plus min 4 sources, a shard's L0 reaches the deep mark (8) during
+  steady load now and then, and while fast the compactor and the writer's refresh poll every 500 ms
+  (per-scrape polling swings 118–816/s). That costs ~$135/mo per node at S3 prices and is not in the
+  model; the projections below are ~10–15% low on Class B under load because of it. (SST GETs differ
+  because the before run loaded repos cold: 42.8 vs 1.1 loads/s.)
+
+### Model with the new defaults (`python3 cost_model.py`; `model_output.md`)
+| scenario | nodes | shards | previous defaults S3 / GCS / R2 | new defaults S3 / GCS / R2 |
+|---|---|---|---|---|
+| Bluesky today | 3 | 256 | $3,290 / $3,268 / $2,936 | **$2,521 / $2,500 / $2,244** |
+| Bluesky today | 8 | 1,024 | $10,256 / $10,235 / $9,237 | **$7,182 / $7,161 / $6,471** |
+
+The remaining big lines at 3 / 256 are segment PUTs ($1,078 S3) and checkpoint flushes under load
+($1,070): both latency trades to cut further (linger, longer checkpoints), so they stay.
+
+### Bucket settings (deploy; DESIGN.md §4 "Bucket settings")
+- **GCS: disable bucket soft delete.** The 7-day default keeps every deleted log segment and replaced
+  SST billable for a week.
+- **S3 / R2: lifecycle rule aborting incomplete multipart uploads** (DESIGN.md §6). vlpds only uses
+  multipart for large blobs; parts of uploads whose process died are billed until aborted.
+
+The MinIO prefix `costdef` and the node caches were deleted after the runs.

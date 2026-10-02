@@ -23,7 +23,6 @@ Coefficients come from measure.py runs (raw.jsonl, raw1024.jsonl,
 raw3.jsonl in this directory); `fit()` re-derives them and `validate()`
 compares the model against every measured phase.
 """
-import glob
 import json
 import math
 import os
@@ -90,7 +89,8 @@ GC_INTERVAL_S = 600
 
 def phase_list():
     ps = []
-    for f in sorted(glob.glob(os.path.join(HERE, "raw*.jsonl"))):
+    # the fit/validation runs (raw_defaults_*.jsonl is the "Defaults changed" before/after: compare.py)
+    for f in (os.path.join(HERE, n) for n in ("raw.jsonl", "raw1024.jsonl", "raw3.jsonl")):
         ps += analyze.phases(f)
     return ps
 
@@ -186,9 +186,10 @@ def fit(ps):
 
 # ---------------------------------------------------------------- model
 DEFAULT_KNOBS = {
-    "db_manifest_poll_s": 1.0,   # SlateDB Settings.manifest_poll_interval
-    "compactor_poll_s": 5.0,     # CompactorOptions.poll_interval (adaptive: 5 s while L0 is shallow)
-    "worker_poll_s": 5.0,        # CompactionWorkerOptions.compactions_poll_interval
+    # defaults since "Defaults changed" in RESULTS.md (were 1 s / 5 s / 5 s: PREVIOUS_KNOBS)
+    "db_manifest_poll_s": 10.0,  # --slatedb-manifest-poll (SlateDB Settings.manifest_poll_interval)
+    "compactor_poll_s": 30.0,    # --compaction-poll (CompactorOptions.poll_interval while L0 is shallow)
+    "worker_poll_s": 30.0,       # --compaction-poll (CompactionWorkerOptions.compactions_poll_interval)
     "gc_interval_s": 600.0,      # SlateDB GC directory interval
     "checkpoint_s": 10.0,        # node checkpoint sleep between sequential passes
     "t_flush_s": None,           # per-shard flush time in a checkpoint pass (None = measured)
@@ -200,6 +201,10 @@ DEFAULT_KNOBS = {
     "raw_bytes_per_commit": 5370,  # uncompressed segment bytes / commit (real data)
     "compaction_bytes_per_commit": 2000,
 }
+
+
+# what the 2026-10-02 measurement runs used (validation reproduces them with these)
+PREVIOUS_KNOBS = {"db_manifest_poll_s": 1.0, "compactor_poll_s": 5.0, "worker_poll_s": 5.0}
 
 
 def seg_puts_per_node(c, cps_node, k):
@@ -226,8 +231,9 @@ def requests(c, nodes, shards, cps_avg, loads_s, knobs=None, checkpoints=True):
     poll_scale = poll / c["poll_analytic_per_shard"]
     s_node = shards / nodes
     segs = nodes * seg_puts_per_node(c, cps_avg / nodes, k)
-    # checkpoints flush every owned shard once the node's log has a durable segment, even when
-    # no further writes arrive (each pass writes the applied marker); a fresh idle node doesn't
+    # checkpoints flush every owned shard while the node's log moves. Before "Defaults changed"
+    # they also did with no further writes (each pass wrote the applied marker: "always", used
+    # to validate one2/idle); now a pass skips shards already checkpointed at the log's ordinal
     fl = nodes * sst_puts_per_node(c, s_node, k) if (cps_avg > 0 or checkpoints == "always") else 0.0
     step = k["lease_ttl_s"] / 5 / 2.0  # control-plane step interval relative to TTL 10 s
     return {
@@ -304,12 +310,11 @@ def project(c, scen, nodes, shards, knobs=None):
 
 
 SENSITIVITY = [
-    ("baseline (defaults)", {}),
+    ("baseline (defaults: manifest poll 10 s, compactor/worker 30 s)", {}),
+    ("previous defaults (manifest poll 1 s, compactor/worker 5 s)", PREVIOUS_KNOBS),
     ("DB manifest poll 5 s", {"db_manifest_poll_s": 5}),
-    ("DB manifest poll 10 s", {"db_manifest_poll_s": 10}),
     ("DB manifest poll 30 s", {"db_manifest_poll_s": 30}),
-    ("compactor + worker polls 30 s", {"compactor_poll_s": 30, "worker_poll_s": 30}),
-    ("manifest 10 s + compactor/worker 30 s", {"db_manifest_poll_s": 10, "compactor_poll_s": 30, "worker_poll_s": 30}),
+    ("compactor + worker polls 60 s", {"compactor_poll_s": 60, "worker_poll_s": 60}),
     ("checkpoint every 30 s", {"checkpoint_s": 30}),
     ("checkpoint every 60 s", {"checkpoint_s": 60}),
     ("segment linger 50 ms", {"linger_s": 0.05}),
@@ -321,8 +326,8 @@ SENSITIVITY = [
     ("segment cap 32 MiB", {"max_segment_mb": 32}),
     ("S3 Express-like latency (6 ms PUTs, t_flush 15 ms)", {"put_latency_mean_s": 0.006, "t_flush_s": 0.015}),
     ("GC interval 30 min", {"gc_interval_s": 1800}),
-    ("all tuned: manifest 10 s, polls 30 s, checkpoint 30 s, linger 100 ms",
-     {"db_manifest_poll_s": 10, "compactor_poll_s": 30, "worker_poll_s": 30, "checkpoint_s": 30, "linger_s": 0.10}),
+    ("all tuned (latency trades): defaults + checkpoint 30 s, linger 100 ms",
+     {"checkpoint_s": 30, "linger_s": 0.10}),
 ]
 
 
@@ -351,7 +356,7 @@ def validate(c, ps):
         ttl = 10.0 if p["phase"].startswith("one/") else 30.0
         # one2/idle followed writes in the same incarnation (checkpoints keep flushing)
         ck = "always" if p["phase"] in ("one2/idle",) else True
-        req = requests(c, p["nodes"], p["shards"], p["commits_s"], p["repo_loads_s"], {"lease_ttl_s": ttl}, ck)
+        req = requests(c, p["nodes"], p["shards"], p["commits_s"], p["repo_loads_s"], dict(PREVIOUS_KNOBS, lease_ttl_s=ttl), ck)
         ma = sum(v[0] for v in req.values())
         mb = sum(v[1] for v in req.values())
         rows.append({"run": f"{p['prefix']} {p['phase']}", "nodes": p["nodes"], "shards": p["shards"], "commits_s": p["commits_s"],

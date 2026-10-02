@@ -59,7 +59,9 @@ pub struct CommitFrame<'a> {
 /// `#commit`. Body keys in canonical order:
 /// ops rev seq repo time blobs since blocks commit rebase tooBig prevData
 pub fn commit_frame(c: &CommitFrame) -> Frame {
-    let mut p = Vec::with_capacity(64 + c.ops.len() * 120);
+    // sized to fit (a realloc of the suffix copies the whole CAR again)
+    let ops_len: usize = c.ops.iter().map(|op| 128 + op.path.len()).sum();
+    let mut p = Vec::with_capacity(48 + c.rev.len() + ops_len);
     header(&mut p, "#commit");
     write_map_head(&mut p, if c.prev_data.is_some() { 12 } else { 11 });
     write_text(&mut p, "ops");
@@ -81,7 +83,9 @@ pub fn commit_frame(c: &CommitFrame) -> Frame {
     write_text(&mut p, "rev");
     write_text(&mut p, c.rev);
 
-    let mut s = Vec::with_capacity(c.blocks.len() + 200);
+    let mut s = Vec::with_capacity(
+        c.blocks.len() + 192 + c.repo.len() + c.time.len() + c.since.map_or(0, str::len),
+    );
     write_text(&mut s, "repo");
     write_text(&mut s, c.repo);
     write_text(&mut s, "time");
