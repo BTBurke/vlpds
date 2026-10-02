@@ -1,0 +1,297 @@
+//! Outbound email over SMTP (DESIGN.md "Email").
+//!
+//! `xrpc::server::deliver` hands each `Mail` (email confirmation, email
+//! update, password reset, account deletion, PLC operation, admin sendEmail)
+//! to the node's mailer on the request path. [`SmtpMailer::send`] only
+//! enqueues it on a bounded channel (`try_send`: never blocks; a full queue
+//! drops the mail and counts it); a background task sends up to
+//! `concurrency` at a time over a pooled lettre transport, retrying
+//! transient failures (4xx replies, connection errors, timeouts) with
+//! backoff. Permanent (5xx) rejections are not retried.
+//!
+//! Multi-node: each node sends the mail for the requests it handles. Email
+//! tokens live in the account's shared private state, so any node can verify
+//! a token another node mailed; nothing here assumes a single node. A node's
+//! queue is in memory: mail still queued when it stops is lost (the user asks
+//! again), as with the reference PDS's in-process nodemailer.
+//!
+//! Unconfigured, the node keeps the log-only mailer (`xrpc::LogMailer`).
+//! Neither mailer logs the token or body above debug level.
+
+use crate::xrpc::{Mail, Mailer};
+use lettre::message::{header::ContentType, Mailbox};
+use lettre::transport::smtp::PoolConfig;
+use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
+use prometheus::{
+    exponential_buckets, register_histogram, register_int_counter, register_int_counter_vec,
+    register_int_gauge, Histogram, IntCounter, IntCounterVec, IntGauge,
+};
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
+use tokio::sync::{mpsc, Semaphore};
+
+/// TCP connect (and, in lettre, each SMTP command's read/write) timeout.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// One whole send attempt: connect, EHLO/STARTTLS/AUTH, envelope and DATA.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Mails queued per node before new ones are dropped.
+pub const DEFAULT_QUEUE: usize = 1024;
+/// Sends in flight per node (also the SMTP connection pool's size).
+pub const DEFAULT_CONCURRENCY: usize = 4;
+/// Waits before the 2nd, 3rd and 4th attempts (each +-25% jitter).
+pub const DEFAULT_BACKOFF: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(60),
+];
+
+// ---- metrics (registered in the default registry, served at /metrics) ----
+macro_rules! lazy {
+    ($name:ident: $t:ty = $e:expr) => {
+        pub static $name: LazyLock<$t> = LazyLock::new(|| $e.unwrap());
+    };
+}
+lazy!(MAIL_MESSAGES: IntCounterVec = register_int_counter_vec!("vlpds_mail_messages_total", "Outbound mail by result (sent; failed: permanent rejection or retries exhausted; dropped: queue full or mailer stopped) and purpose", &["result", "purpose"]));
+lazy!(MAIL_RETRIES: IntCounter = register_int_counter!("vlpds_mail_retries_total", "SMTP send attempts retried after a transient failure (4xx, connection error, timeout)"));
+lazy!(MAIL_QUEUE: IntGauge = register_int_gauge!("vlpds_mail_queue_depth", "Mails queued or being sent (all of this process's SMTP mailers)"));
+lazy!(MAIL_SEND_SECONDS: Histogram = register_histogram!("vlpds_mail_send_seconds", "One successful SMTP send, enqueue to accepted (incl. retries)", exponential_buckets(0.01, 2.0, 14).unwrap()));
+
+/// A node's mailer, held in `server::Config` (which is `Clone + Debug`).
+#[derive(Clone)]
+pub struct SharedMailer(pub Arc<dyn Mailer>);
+
+impl std::fmt::Debug for SharedMailer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedMailer")
+    }
+}
+
+impl std::ops::Deref for SharedMailer {
+    type Target = dyn Mailer;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SmtpConfig {
+    /// `smtp://[user:pass@]host[:port]` (STARTTLS when offered, port 587;
+    /// `?tls=required` insists on it; `?tls=none` is plaintext, port 25) or
+    /// `smtps://...` (implicit TLS, port 465). A path sets the EHLO name.
+    /// Nodemailer's URL form, as the reference PDS's PDS_EMAIL_SMTP_URL.
+    pub url: String,
+    /// From header and envelope sender: `addr@host` or `Name <addr@host>`.
+    pub from: String,
+    pub queue: usize,
+    pub concurrency: usize,
+    pub backoff: Vec<Duration>,
+    pub connect_timeout: Duration,
+    pub send_timeout: Duration,
+}
+
+impl SmtpConfig {
+    pub fn new(url: impl Into<String>, from: impl Into<String>) -> Self {
+        SmtpConfig {
+            url: url.into(),
+            from: from.into(),
+            queue: DEFAULT_QUEUE,
+            concurrency: DEFAULT_CONCURRENCY,
+            backoff: DEFAULT_BACKOFF.to_vec(),
+            connect_timeout: CONNECT_TIMEOUT,
+            send_timeout: SEND_TIMEOUT,
+        }
+    }
+}
+
+/// The startup choice: an SMTP mailer when a URL and from address are set
+/// (flags, VLPDS_EMAIL_*, or the reference PDS's PDS_EMAIL_SMTP_URL /
+/// PDS_EMAIL_FROM_ADDRESS), else None (log-only) with one log line. Setting
+/// only one of them is an error, as in the reference PDS. Must run inside
+/// the tokio runtime (it spawns the sender task).
+pub fn from_flags(url: Option<String>, from: Option<String>) -> anyhow::Result<Option<SharedMailer>> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let url = url.filter(|v| !v.is_empty()).or_else(|| env("PDS_EMAIL_SMTP_URL"));
+    let from = from.filter(|v| !v.is_empty()).or_else(|| env("PDS_EMAIL_FROM_ADDRESS"));
+    match (url, from) {
+        (None, None) => {
+            tracing::info!("email disabled (no --email-smtp-url): mail is logged without its token and not sent");
+            Ok(None)
+        }
+        (Some(url), Some(from)) => {
+            let m = SmtpMailer::start(SmtpConfig::new(url, from))?;
+            Ok(Some(SharedMailer(Arc::new(m))))
+        }
+        _ => anyhow::bail!("partial email config: set both --email-smtp-url and --email-from-address (or neither)"),
+    }
+}
+
+/// Queues mail for a background SMTP sender.
+pub struct SmtpMailer {
+    tx: mpsc::Sender<Mail>,
+}
+
+impl SmtpMailer {
+    /// Validates the config, builds the pooled transport and spawns the
+    /// sender task (needs a tokio runtime).
+    pub fn start(cfg: SmtpConfig) -> anyhow::Result<SmtpMailer> {
+        let from: Mailbox = cfg
+            .from
+            .parse()
+            .map_err(|e| anyhow::anyhow!("--email-from-address {:?}: {e}", cfg.from))?;
+        let (transport, host) = transport(&cfg)?;
+        tracing::info!(smtp_host = %host, from = %from, "email enabled (SMTP)");
+        let (tx, rx) = mpsc::channel(cfg.queue.max(1));
+        tokio::spawn(run(rx, transport, from, cfg));
+        Ok(SmtpMailer { tx })
+    }
+}
+
+impl Mailer for SmtpMailer {
+    fn send(&self, mail: &Mail) {
+        match self.tx.try_send(mail.clone()) {
+            Ok(()) => MAIL_QUEUE.inc(),
+            Err(e) => {
+                let why = match e {
+                    mpsc::error::TrySendError::Full(_) => "queue full",
+                    mpsc::error::TrySendError::Closed(_) => "mailer stopped",
+                };
+                MAIL_MESSAGES.with_label_values(&["dropped", &mail.purpose]).inc();
+                tracing::warn!(to = %mail.to, purpose = %mail.purpose, "mail dropped: {why}");
+            }
+        }
+    }
+}
+
+/// Splits a URL's query into `tls=` and the rest (for the nodemailer default).
+fn normalize_url(url: &str) -> anyhow::Result<String> {
+    let (base, query) = url.split_once('?').unwrap_or((url, ""));
+    let mut params: Vec<&str> = query.split('&').filter(|p| !p.is_empty()).collect();
+    let tls = params.iter().position(|p| p.starts_with("tls="));
+    if base.starts_with("smtp://") {
+        match tls.map(|i| params[i]) {
+            // nodemailer's smtp://: upgrade with STARTTLS when the server offers it
+            None => params.push("tls=opportunistic"),
+            Some("tls=none") => {
+                params.remove(tls.unwrap());
+            }
+            Some("tls=required" | "tls=opportunistic") => {}
+            Some(other) => anyhow::bail!("--email-smtp-url: unknown {other} (required, opportunistic, none)"),
+        }
+    } else if !base.starts_with("smtps://") {
+        anyhow::bail!("--email-smtp-url must be smtp:// or smtps://");
+    }
+    Ok(if params.is_empty() { base.to_string() } else { format!("{base}?{}", params.join("&")) })
+}
+
+/// The transport and its host (for logs; the URL may hold a password).
+fn transport(cfg: &SmtpConfig) -> anyhow::Result<(AsyncSmtpTransport<Tokio1Executor>, String)> {
+    let url = normalize_url(&cfg.url)?;
+    let host = url
+        .split_once("://")
+        .map(|(_, r)| r)
+        .and_then(|r| r.split(['/', '?']).next())
+        .map(|r| r.rsplit('@').next().unwrap_or(r).to_string())
+        .unwrap_or_default();
+    // Never echo the URL: it may carry credentials.
+    let t = AsyncSmtpTransport::<Tokio1Executor>::from_url(&url)
+        .map_err(|e| anyhow::anyhow!("--email-smtp-url (host {host:?}): {e}"))?
+        .timeout(Some(cfg.connect_timeout))
+        .pool_config(PoolConfig::new().max_size(cfg.concurrency.max(1) as u32))
+        .build();
+    Ok((t, host))
+}
+
+async fn run(
+    mut rx: mpsc::Receiver<Mail>,
+    transport: AsyncSmtpTransport<Tokio1Executor>,
+    from: Mailbox,
+    cfg: SmtpConfig,
+) {
+    let slots = Arc::new(Semaphore::new(cfg.concurrency.max(1)));
+    let cfg = Arc::new(cfg);
+    while let Some(mail) = rx.recv().await {
+        let Ok(slot) = slots.clone().acquire_owned().await else { break };
+        let (t, from, cfg) = (transport.clone(), from.clone(), cfg.clone());
+        tokio::spawn(async move {
+            send_one(&t, &from, &cfg, mail).await;
+            MAIL_QUEUE.dec();
+            drop(slot);
+        });
+    }
+}
+
+fn message(from: &Mailbox, m: &Mail) -> anyhow::Result<Message> {
+    let to: Mailbox = m.to.parse().map_err(|e| anyhow::anyhow!("recipient: {e}"))?;
+    Ok(Message::builder()
+        .from(from.clone())
+        .to(to)
+        .subject(m.subject.as_str())
+        .header(ContentType::TEXT_PLAIN)
+        .body(m.body.clone())?)
+}
+
+/// Transient: worth another attempt (4xx, network, TLS, timeout).
+/// Permanent 5xx replies and client-side errors are not.
+fn retryable(e: &lettre::transport::smtp::Error) -> bool {
+    !(e.is_permanent() || e.is_client())
+}
+
+/// `d` +-25%.
+fn jitter(d: Duration) -> Duration {
+    d.mul_f64(0.75 + rand::random::<f64>() * 0.5)
+}
+
+async fn send_one(t: &AsyncSmtpTransport<Tokio1Executor>, from: &Mailbox, cfg: &SmtpConfig, mail: Mail) {
+    let started = std::time::Instant::now();
+    let fail = |why: &str, attempts: usize| {
+        MAIL_MESSAGES.with_label_values(&["failed", &mail.purpose]).inc();
+        tracing::warn!(to = %mail.to, purpose = %mail.purpose, attempts, "mail not sent: {why}");
+    };
+    let msg = match message(from, &mail) {
+        Ok(m) => m,
+        Err(e) => return fail(&format!("invalid message: {e}"), 0),
+    };
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let (retry, why) = match tokio::time::timeout(cfg.send_timeout, t.send(msg.clone())).await {
+            Ok(Ok(_)) => {
+                MAIL_MESSAGES.with_label_values(&["sent", &mail.purpose]).inc();
+                MAIL_SEND_SECONDS.observe(started.elapsed().as_secs_f64());
+                tracing::info!(to = %mail.to, purpose = %mail.purpose, attempts = attempt, "mail sent");
+                return;
+            }
+            Ok(Err(e)) => (retryable(&e), e.to_string()),
+            Err(_) => (true, format!("send timed out after {:?}", cfg.send_timeout)),
+        };
+        let Some(wait) = cfg.backoff.get(attempt - 1).filter(|_| retry) else {
+            return fail(&why, attempt);
+        };
+        MAIL_RETRIES.inc();
+        tracing::info!(to = %mail.to, purpose = %mail.purpose, attempt, "mail send failed, retrying: {why}");
+        tokio::time::sleep(jitter(*wait)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_defaults_follow_nodemailer() {
+        assert_eq!(normalize_url("smtp://u:p@h:587").unwrap(), "smtp://u:p@h:587?tls=opportunistic");
+        assert_eq!(normalize_url("smtp://h?tls=none").unwrap(), "smtp://h");
+        assert_eq!(normalize_url("smtp://h?tls=required").unwrap(), "smtp://h?tls=required");
+        assert_eq!(normalize_url("smtps://u:p@h").unwrap(), "smtps://u:p@h");
+        assert!(normalize_url("http://h").is_err());
+        assert!(normalize_url("smtp://h?tls=bogus").is_err());
+    }
+
+    #[tokio::test]
+    async fn partial_config_is_an_error() {
+        assert!(from_flags(Some("smtp://h".into()), Some(String::new())).is_err() || std::env::var("PDS_EMAIL_FROM_ADDRESS").is_ok());
+        assert!(SmtpMailer::start(SmtpConfig::new("smtp://h", "not an address")).is_err());
+        let (_, host) = transport(&SmtpConfig::new("smtps://user:secret@mail.example.com:465/ehlo", "a@b.c")).unwrap();
+        assert_eq!(host, "mail.example.com:465");
+    }
+}

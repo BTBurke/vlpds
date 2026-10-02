@@ -32,6 +32,7 @@ mod differential_shrike;
 mod e2e_regressions;
 mod fast_failover;
 mod email_flows;
+mod smtp_mail;
 mod file_uploads;
 mod firehose_backfill;
 mod firehose_fanout;

@@ -81,6 +81,9 @@ pub struct Config {
     pub crawlers: Vec<String>,
     /// Dev mode: email/password-reset tokens are returned/logged instead of mailed.
     pub dev_mode: bool,
+    /// This node's outbound email (`--email-smtp-url`, crate::mail). None:
+    /// the process-wide mailer (logs only, unless `xrpc::set_mailer`).
+    pub mailer: Option<crate::mail::SharedMailer>,
     /// Max uploadBlob size in bytes.
     pub max_blob_size: u64,
     /// Unreferenced blobs older than this are deleted by the blob GC.
@@ -231,6 +234,7 @@ impl Default for Config {
             report_service: None,
             crawlers: Vec::new(),
             dev_mode: true,
+            mailer: None,
             cluster: None,
             max_blob_size: 100 << 20,
             blob_gc_grace: Duration::from_secs(6 * 3600),

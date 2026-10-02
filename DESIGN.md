@@ -1720,3 +1720,34 @@ through a break-glass role, access logging. After wrapping, backups hold
 only wrapped keys, but the KMS key becomes part of the backup: lose it
 and no restored account can sign, so every account would need a PLC
 rotation. It needs its own multi-region replica and deletion protection.
+
+## Email
+
+Email confirmation, email update, password reset, account deletion, PLC
+operation and admin `sendEmail` mail go out over SMTP (`src/mail.rs`, lettre
+over rustls) when configured:
+
+| Flag | Env | Reference PDS env (also read) |
+|---|---|---|
+| `--email-smtp-url` (alias `--smtp-url`) | `VLPDS_EMAIL_SMTP_URL` | `PDS_EMAIL_SMTP_URL` |
+| `--email-from-address` (alias `--email-from`) | `VLPDS_EMAIL_FROM_ADDRESS` | `PDS_EMAIL_FROM_ADDRESS` |
+
+The URL follows the reference PDS's (nodemailer) form:
+`smtp://user:pass@host[:port]` upgrades with STARTTLS when offered (port 587;
+`?tls=required` insists, `?tls=none` is plaintext on 25), `smtps://` is
+implicit TLS (465). Set both or neither, as in the reference. Neither: mail is
+logged (recipient, subject, purpose; token and body only at debug) and not
+sent; dev mode keeps every mail in the per-node dev mailbox
+(`vlpds.admin.getDevMail`) either way.
+
+The request path never waits on SMTP: `deliver` enqueues on a bounded queue
+(1,024; full drops and counts) and a background task sends up to 4 at a time
+over a pooled transport. Connect (and per-command) timeout 10 s, 30 s per
+attempt; transient failures (4xx, network, timeout) retry after ~2 s, 10 s and
+60 s, 5xx rejections do not. Metrics:
+`vlpds_mail_messages_total{result=sent|failed|dropped,purpose}`,
+`vlpds_mail_retries_total`, `vlpds_mail_queue_depth`, `vlpds_mail_send_seconds`.
+Each node mails for the requests it handles; tokens live in the account's
+private state, so any node verifies them. Queued mail is lost if the node
+stops (the user asks again). The reference's separate moderation mailer
+(`PDS_MODERATION_EMAIL_*`) is not split out: admin mail uses the same one.

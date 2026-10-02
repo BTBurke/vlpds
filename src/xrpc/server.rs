@@ -632,7 +632,10 @@ pub struct LogMailer;
 
 impl Mailer for LogMailer {
     fn send(&self, m: &Mail) {
-        tracing::info!(to = %m.to, subject = %m.subject, purpose = %m.purpose, token = ?m.token, "mail (log mailer)");
+        // Never the token or body at info: they are credentials. Dev mode
+        // keeps them in the dev mailbox (vlpds.admin.getDevMail).
+        tracing::info!(to = %m.to, subject = %m.subject, purpose = %m.purpose, "mail (log mailer: email disabled, not sent)");
+        tracing::debug!(to = %m.to, purpose = %m.purpose, token = ?m.token, body = %m.body, "mail (log mailer) contents");
     }
 }
 
@@ -661,7 +664,12 @@ pub(super) fn deliver(
         token: token.map(str::to_string),
         sent_at: crate::events::now_rfc3339(),
     };
-    MAILER.get_or_init(|| Box::new(LogMailer)).send(&mail);
+    // The node's own mailer (--email-smtp-url, crate::mail; queues, never
+    // blocks), else the process-wide one (LogMailer unless `set_mailer`).
+    match &app.config.mailer {
+        Some(m) => m.send(&mail),
+        None => MAILER.get_or_init(|| Box::new(LogMailer)).send(&mail),
+    }
     if app.config.dev_mode {
         let e = ext(app);
         let mut box_ = e.dev_mail.lock();

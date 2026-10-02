@@ -17,6 +17,7 @@ mod webui;
 pub use blobs::spawn_blob_gc;
 pub use server::{drop_revocation, reset_token_did, revocation_expired, spawn_reserved_key_gc, sweep_reserved_keys};
 pub use sync::request_crawl;
+pub use server::{set_mailer, LogMailer, Mail, Mailer};
 
 /// Imports shared by every XRPC module (they `use super::*`).
 #[allow(unused_imports)]

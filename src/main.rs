@@ -248,6 +248,16 @@ struct Args {
     /// well-known dev secrets are accepted.
     #[arg(long, env = "VLPDS_DEV_MODE")]
     dev_mode: bool,
+    /// Send email over SMTP: smtp://[user:pass@]host[:port] (STARTTLS when
+    /// offered; ?tls=required|none) or smtps://... (implicit TLS). Falls back
+    /// to the reference PDS's PDS_EMAIL_SMTP_URL. Unset: mail is only logged
+    /// (DESIGN.md "Email").
+    #[arg(long, alias = "smtp-url", env = "VLPDS_EMAIL_SMTP_URL", hide_env_values = true)]
+    email_smtp_url: Option<String>,
+    /// From address for email ("addr@host" or "Name <addr@host>"); falls
+    /// back to PDS_EMAIL_FROM_ADDRESS. Required with --email-smtp-url.
+    #[arg(long, alias = "email-from", env = "VLPDS_EMAIL_FROM_ADDRESS")]
+    email_from_address: Option<String>,
     /// Max uploadBlob size (MB).
     #[arg(long, env = "VLPDS_MAX_BLOB_MB", default_value_t = 100)]
     max_blob_mb: u64,
@@ -550,6 +560,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         report_service: url_did(&args.report_service)?,
         crawlers: args.crawlers.clone(),
         dev_mode: args.dev_mode,
+        mailer: vlpds::mail::from_flags(args.email_smtp_url.clone(), args.email_from_address.clone())?,
         max_blob_size: args.max_blob_mb << 20,
         blob_gc_grace: Duration::from_secs(args.blob_gc_grace_secs),
         plc_url: args.plc_url.clone(),

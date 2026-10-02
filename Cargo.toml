@@ -77,6 +77,8 @@ tower = { version = "0.5", features = ["util"] }
 # embedded web UI (ui/dist, built by `just ui`; build.rs leaves a placeholder)
 rust-embed = { version = "8", features = ["mime-guess"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "decompression-gzip", "decompression-deflate"] }
+# outbound email (src/mail.rs): async SMTP over rustls (ring, webpki roots), no native-tls
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "pool", "hostname", "builder", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 
 [[test]]
 name = "all"
