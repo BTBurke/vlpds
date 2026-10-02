@@ -1,13 +1,7 @@
-//! Blobs: uploadBlob (streamed to the object store), sync.getBlob,
-//! sync.listBlobs, repo.listMissingBlobs, and the unreferenced-blob GC.
-//!
-//! Layout: `{prefix}/blob/{did}/{cid}` holds the bytes, with the MIME type
-//! as the object's Content-Type attribute. Large uploads stream through a
-//! multipart upload to `{prefix}/blob-tmp/{did}/{random}` (the CID is only
-//! known at the end), then are copied into place. References live in
-//! SlateDB as `b/{did}\0{cid}\0{record path}`, maintained at commit time.
-//! The GC moves unreferenced blobs to `{prefix}/blob-gc/{did}/{cid}` and
-//! deletes them after a re-check ([`sweep_blobs_settle`]).
+//! Blob endpoints and the unreferenced-blob GC (DESIGN.md "6. Blobs").
+//! `{prefix}/blob/{did}/{cid}` holds the bytes, MIME type as its
+//! Content-Type attribute; large uploads go through a multipart upload to
+//! `blob-tmp/` since the CID is only known at the end.
 
 use super::sync::assert_available;
 use super::*;
@@ -27,15 +21,12 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/com.atproto.sync.listBlobs", get(list_blobs))
 }
 
-/// Multipart part size (S3's minimum is 5 MiB). Bodies smaller than this are
-/// sent as a single PUT straight to the final key.
+/// S3's minimum part is 5 MiB. Smaller bodies are one PUT to the final key.
 const PART_SIZE: usize = 8 << 20;
-/// Parts uploading concurrently per blob.
 const PART_CONCURRENCY: usize = 4;
-/// Orphaned temp objects (crashed uploads) are removed after this long.
 const TMP_GRACE: Duration = Duration::from_secs(24 * 3600);
 
-pub(super) fn blob_path(app: &App, did: &str, cid: &Cid) -> object_store::path::Path {
+pub(super) fn blob_path(app: &App, did: &str, cid: impl std::fmt::Display) -> object_store::path::Path {
     object_store::path::Path::from(format!("{}/blob/{}/{}", app.store.prefix, did, cid))
 }
 
@@ -57,10 +48,7 @@ async fn upload_blob(
     headers: HeaderMap,
     body: Body,
 ) -> XResult<Json<J>> {
-    let did = creds
-        .did()
-        .ok_or_else(|| XrpcError::auth("user credentials required"))?
-        .to_string();
+    let did = creds.user_did()?.to_string();
     let mime = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -69,21 +57,11 @@ async fn upload_blob(
         .unwrap_or("application/octet-stream")
         .to_string();
     creds.need_blob(&mime)?;
-    // Deactivated accounts may upload (migration); taken-down ones may not.
-    // (Also with a user service JWT, where the reference skips the check:
-    // getServiceAuth refuses taken-down accounts an uploadBlob token, but
-    // one issued before the takedown would otherwise still upload for up to
-    // an hour.)
-    let acct = app.account(&did).await?;
-    if matches!(
-        acct.status.as_deref(),
-        Some("takendown") | Some("suspended")
-    ) {
-        return Err(XrpcError {
-            status: StatusCode::UNAUTHORIZED,
-            error: "AccountTakedown".into(),
-            message: "Account has been taken down".into(),
-        });
+    // Deactivated accounts may upload (migration). Unlike the reference this
+    // applies to user service JWTs too: one issued before a takedown would
+    // otherwise still upload for up to an hour.
+    if super::server::is_takendown_account(&app.account(&did).await?) {
+        return Err(super::server::takedown_error());
     }
     let max = app.config.max_blob_size;
     let declared = headers
@@ -120,7 +98,7 @@ async fn upload_blob(
     if declared.is_some_and(|n| n != size) {
         tracing::debug!(%did, declared = ?declared, size, "uploadBlob: content-length mismatch");
     }
-    // (the bytes are content-addressed, so storing them again changed nothing)
+    // checked after storing: the bytes are content-addressed, so that changed nothing
     if super::admin::is_blob_takendown(&app, &did, &cid.to_string()).await? {
         return Err(XrpcError::bad(
             "InvalidRequest",
@@ -138,16 +116,14 @@ struct Upload<'a> {
     attrs: Attributes,
     /// Client-declared type until the first bytes are sniffed.
     mime: String,
-    /// First bytes of the body, for content sniffing.
     head: Vec<u8>,
-    /// Body chunks held until we know whether a multipart upload is needed.
+    /// Held until we know whether a multipart upload is needed.
     buf: Vec<Bytes>,
     buffered: usize,
     multipart: Option<(WriteMultipart, object_store::path::Path)>,
 }
 
 impl Upload<'_> {
-    /// Streams the body, hashing as it goes; returns (cid, size).
     async fn run(&mut self, body: Body, max: u64) -> XResult<(Cid, u64)> {
         let mut stream = body.into_data_stream();
         let mut hasher = Sha256::new();
@@ -185,7 +161,7 @@ impl Upload<'_> {
             codec: crate::cid::CODEC_RAW,
             digest: hasher.finalize().into(),
         };
-        let dest = blob_path(self.app, self.did, &cid);
+        let dest = blob_path(self.app, self.did, cid);
         let store = &self.app.store.raw;
         match self.multipart.take() {
             None => {
@@ -205,8 +181,7 @@ impl Upload<'_> {
                     let _ = store.delete(&tmp).await;
                     return Err(XrpcError::from_err(e));
                 }
-                // Copy also refreshes the final object's last-modified time,
-                // which restarts its GC grace period for a re-upload.
+                // the copy restarts a re-uploaded blob's GC grace period
                 let copied = store.copy(&tmp, &dest).await;
                 let _ = store.delete(&tmp).await;
                 copied.map_err(XrpcError::from_err)?;
@@ -215,8 +190,8 @@ impl Upload<'_> {
         Ok((cid, size))
     }
 
-    /// Content sniffing as the reference (file-type): a recognized
-    /// signature overrides the client's Content-Type.
+    /// As the reference (file-type), a recognized signature overrides the
+    /// client's Content-Type.
     fn sniff(&mut self) {
         if let Some(m) = sniff_mime(&self.head) {
             self.mime = m.to_string();
@@ -255,9 +230,8 @@ impl Upload<'_> {
 
 const SNIFF_BYTES: usize = 64;
 
-/// MIME type from well-known file signatures (the common subset of what the
-/// reference's `file-type` detects for media uploads).
-pub fn sniff_mime(b: &[u8]) -> Option<&'static str> {
+/// The common subset of what the reference's `file-type` detects for media.
+fn sniff_mime(b: &[u8]) -> Option<&'static str> {
     let at = |off: usize, sig: &[u8]| b.len() >= off + sig.len() && &b[off..off + sig.len()] == sig;
     if at(0, b"\x89PNG\r\n\x1a\n") {
         return Some("image/png");
@@ -292,7 +266,6 @@ pub fn sniff_mime(b: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// A stored blob's MIME type (its Content-Type attribute, set at upload).
 pub(super) fn stored_mime(attrs: &Attributes) -> String {
     attrs
         .get(&Attribute::ContentType)
@@ -317,7 +290,7 @@ async fn get_blob(
     if !is_admin && super::admin::is_blob_takendown(&app, &q.did, &cid.to_string()).await? {
         return Err(XrpcError::bad("BlobNotFound", "Blob not found"));
     }
-    let r = match app.store.raw.get(&blob_path(&app, &q.did, &cid)).await {
+    let r = match app.store.raw.get(&blob_path(&app, &q.did, cid)).await {
         Ok(r) => r,
         Err(object_store::Error::NotFound { .. }) => {
             return Err(XrpcError::bad("BlobNotFound", "Blob not found"))
@@ -334,7 +307,7 @@ async fn get_blob(
     };
     h.insert(header::CONTENT_TYPE, hv(mime));
     h.insert(header::CONTENT_LENGTH, header::HeaderValue::from(size));
-    // same hardening headers as the reference PDS
+    // the reference PDS's hardening headers
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         header::HeaderValue::from_static("nosniff"),
@@ -350,8 +323,8 @@ async fn get_blob(
     Ok(resp)
 }
 
-/// Distinct blob CIDs referenced by `did`'s records, in CID order, starting
-/// after `cursor`. Returns (cid, one referencing record path).
+/// Distinct (cid, one referencing record path) of `did`, in CID order after
+/// `cursor`; with `since`, only refs from records written after that rev.
 async fn referenced_blobs(
     app: &App,
     did: &str,
@@ -402,8 +375,6 @@ struct ListBlobsQ {
     cursor: Option<String>,
 }
 
-/// With `since`, only blobs referenced by records written after that rev
-/// (as the reference does via record.repoRev).
 async fn list_blobs(
     State(app): AppState,
     MaybeAuth(creds): MaybeAuth,
@@ -430,17 +401,12 @@ struct MissingQ {
     cursor: Option<String>,
 }
 
-/// Blobs referenced by the caller's records whose bytes aren't in the store
-/// (e.g. after importRepo, before the blobs are re-uploaded).
 async fn list_missing_blobs(
     State(app): AppState,
     Auth(creds): Auth,
     Query(q): Query<MissingQ>,
 ) -> XResult<Json<J>> {
-    let did = creds
-        .did()
-        .ok_or_else(|| XrpcError::auth("user credentials required"))?
-        .to_string();
+    let did = creds.user_did()?.to_string();
     let limit = q.limit.unwrap_or(500).clamp(1, 1000);
     let mut cursor = q.cursor.clone();
     let mut missing: Vec<J> = Vec::new();
@@ -453,9 +419,7 @@ async fn list_missing_blobs(
         let checks: Vec<_> = page
             .iter()
             .map(|(cid, _)| {
-                object_store::path::Path::from(format!("{}/blob/{}/{}", app.store.prefix, did, cid))
-            })
-            .map(|path| {
+                let path = blob_path(&app, &did, cid);
                 let store = app.store.raw.clone();
                 async move {
                     match store.head(&path).await {
@@ -487,11 +451,6 @@ async fn list_missing_blobs(
     Ok(Json(out))
 }
 
-// ---------- unreferenced-blob GC ----------
-
-/// Starts the background sweeper: every `min(grace / 4, 1h)` (at least 10 s)
-/// it deletes blobs last written more than `config.blob_gc_grace` ago that no
-/// record references (no `b/{did}\0{cid}\0` key), plus stale temp uploads.
 /// Only DIDs whose partition this node owns are swept.
 pub fn spawn_blob_gc(app: Arc<App>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -512,43 +471,19 @@ pub fn spawn_blob_gc(app: Arc<App>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-fn pct_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%'
-            && i + 2 < b.len()
-            && b[i + 1].is_ascii_hexdigit()
-            && b[i + 2].is_ascii_hexdigit()
-        {
-            out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap_or(b'%'));
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
+/// Longer than a write that checked the blob (repo.rs `check_blobs`)
+/// usually takes to apply its reference; one still in flight past it holds
+/// the blob ([`HeldBlobs`]).
+const QUARANTINE_SETTLE: Duration = Duration::from_secs(60);
 
-/// How long a collected blob stays quarantined before it is deleted for
-/// good (capped by the grace period): longer than a write that checked the
-/// blob (repo.rs `check_blobs`) usually takes to apply its reference; one
-/// still in flight past it holds the blob ([`HeldBlobs`]).
-pub const QUARANTINE_SETTLE: Duration = Duration::from_secs(60);
-
-/// Blobs that writes in flight on this node checked (`repo.rs`
-/// `check_blobs`) and may still reference: (did, cid) -> writes holding it.
-/// A quarantined blob held here isn't purged, however long its write takes
-/// to apply (a cold repo load, a store brownout): the next pass sees the
-/// reference and restores it, or purges it once the write is gone. Writes
-/// run on the repo's owner, the node whose GC sweeps its blobs.
+/// (did, cid) -> writes in flight on this node that checked the blob. A
+/// quarantined blob held here isn't purged however long its write takes to
+/// apply (a cold repo load, a store brownout). Writes run on the repo's
+/// owner, the node whose GC sweeps its blobs.
 static IN_FLIGHT: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<(String, Cid), usize>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// Holds a write's checked blobs in [`IN_FLIGHT`] until dropped (when the
-/// write has applied or failed).
+/// Holds a write's checked blobs in [`IN_FLIGHT`] until dropped.
 pub struct HeldBlobs {
     keys: Vec<(String, Cid)>,
 }
@@ -586,7 +521,6 @@ fn quarantine_path(app: &App, did: &str, cid: &str) -> object_store::path::Path 
     object_store::path::Path::from(format!("{}/blob-gc/{}/{}", app.store.prefix, did, cid))
 }
 
-/// Whether any record of `did` references blob `cid` (`b/{did}\0{cid}\0...`).
 async fn referenced(p: &Partition, did: &str, cid: &str) -> anyhow::Result<bool> {
     let prefix = [state::blob_ref_prefix(did).as_slice(), cid.as_bytes(), b"\0"].concat();
     let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await?;
@@ -595,35 +529,28 @@ async fn referenced(p: &Partition, did: &str, cid: &str) -> anyhow::Result<bool>
 
 /// (did, cid) of a `.../{did}/{cid}` object path.
 fn did_cid(path: &object_store::path::Path) -> Option<(String, String)> {
-    let parts: Vec<String> = path.parts().map(|p| pct_decode(p.as_ref())).collect();
+    let parts: Vec<String> = path.parts().map(|p| super::sync::pct_decode(p.as_ref(), false)).collect();
     let n = parts.len();
     (n >= 2).then(|| (parts[n - 2].clone(), parts[n - 1].clone()))
 }
 
-/// One GC pass with the default settle time (`min(grace, QUARANTINE_SETTLE)`).
 /// Returns (blobs scanned, objects deleted).
 pub async fn sweep_blobs(app: &App, grace: Duration) -> anyhow::Result<(usize, usize)> {
     sweep_blobs_settle(app, grace, grace.min(QUARANTINE_SETTLE)).await
 }
 
-/// One GC pass. Returns (blobs scanned, objects deleted), where a blob moved
-/// to quarantine counts as deleted (it is no longer served).
+/// A blob moved to quarantine counts as deleted (it is no longer served).
 ///
 /// The race: a write checks that its blob exists (`check_blobs`) and is
 /// applied a little later; a sweep that read "no reference" in between would
-/// delete the blob under it. So a collected blob is not deleted at once:
-/// 1. an unreferenced blob older than `grace` is moved to
-///    `{prefix}/blob-gc/{did}/{cid}` (copy, then delete the original). From
-///    then on writes referencing it fail their check (BlobNotFound), as for
-///    any missing blob;
-/// 2. once it has sat there for `settle` (any write that passed its check
-///    before the move has usually applied by then), the references are
-///    checked again: if one appeared, the blob is moved back; if a write
-///    that checked it is still in flight ([`HeldBlobs`]: a slow apply), it
-///    waits for a later pass; otherwise the quarantined copy is deleted.
+/// delete the blob under it. So an unreferenced blob older than `grace` is
+/// first moved to `blob-gc/` (writes referencing it then fail their check),
+/// and only after `settle` are its references checked again: one that
+/// appeared moves it back, a write still in flight ([`HeldBlobs`]) defers
+/// it, otherwise it is deleted.
 ///
-/// Orphaned multipart uploads can't be listed through object_store; see
-/// DESIGN.md ("6. Blobs") for the bucket lifecycle rule that aborts them.
+/// Orphaned multipart uploads can't be listed through object_store: DESIGN.md
+/// "6. Blobs" has the bucket lifecycle rule that aborts them.
 pub async fn sweep_blobs_settle(app: &App, grace: Duration, settle: Duration) -> anyhow::Result<(usize, usize)> {
     let now = chrono::Utc::now();
     let cutoff = now - chrono::Duration::from_std(grace)?;
@@ -670,7 +597,7 @@ pub async fn sweep_blobs_settle(app: &App, grace: Duration, settle: Duration) ->
         if referenced(&p, &did, &cid).await? {
             // a write that checked the blob before the move: put it back
             let Ok(c) = Cid::parse(&cid) else { continue };
-            if let Err(e) = store.copy(&meta.location, &blob_path(app, &did, &c)).await {
+            if let Err(e) = store.copy(&meta.location, &blob_path(app, &did, c)).await {
                 tracing::warn!(path = %meta.location, "blob gc restore: {e}");
                 continue;
             }
