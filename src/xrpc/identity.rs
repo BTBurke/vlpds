@@ -40,10 +40,8 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/tls-check", get(tls_check))
 }
 
-/// The DID of the active account here whose handle is `handle`: None if
-/// there is none (or it is deactivated / taken down, as the reference's
-/// getAccount(handle)); an error only when that can't be told (owner
-/// unreachable, shard moving: retry). Any node answers for any account.
+/// None for an inactive account too (reference getAccount(handle)); an error
+/// only when the owner can't tell (unreachable, shard moving: retry).
 async fn active_handle_did(app: &Arc<App>, handle: &str) -> Result<Option<String>, XrpcError> {
     let Ok(Some(did)) = app.resolve_handle(handle).await else {
         return Ok(None);
@@ -55,12 +53,10 @@ async fn active_handle_did(app: &Arc<App>, handle: &str) -> Result<Option<String
     }
 }
 
-/// Whether `host` is under one of our handle domains.
 fn under_handle_domain(app: &App, host: &str) -> bool {
     host.ends_with(&format!(".{}", app.handle_domain))
 }
 
-/// The host of `--public-url` (the PDS hostname).
 fn public_host(app: &App) -> Option<String> {
     reqwest::Url::parse(&app.public_url).ok()?.host_str().map(|h| h.to_ascii_lowercase())
 }
@@ -70,11 +66,8 @@ struct TlsCheckQ {
     domain: Option<String>,
 }
 
-/// Caddy on-demand TLS `ask` endpoint, as the reference PDS distribution's
-/// `/tls-check`: 200 for the PDS hostname and for handles of active
-/// accounts here under the handle domain; 400 for a missing domain or one
-/// outside the handle domain, 404 for an unknown handle (Caddy issues a
-/// certificate only on 2xx). Every node answers for every account.
+/// Caddy's on-demand TLS `ask` endpoint, as the reference PDS
+/// distribution's: Caddy issues a certificate only on 2xx.
 async fn tls_check(State(app): AppState, Query(q): Query<TlsCheckQ>) -> Response {
     let err = |status: StatusCode, error: &str, message: &str| (status, Json(json!({"error": error, "message": message}))).into_response();
     let domain = match q.domain.as_deref().map(|d| d.trim_end_matches('.').to_ascii_lowercase()) {
@@ -94,11 +87,10 @@ async fn tls_check(State(app): AppState, Query(q): Query<TlsCheckQ>) -> Response
     }
 }
 
-/// The DID document of the PDS's own did:web service DID (`--service-did`),
-/// so the DID it signs and accepts service auth as resolves to this server.
-/// The reference PDS serves none; this follows the reference AppView's
-/// (bsky well-known.ts) shape with a PDS service entry, and no verification
-/// method (the service DID signs nothing). 404 for a non-did:web DID.
+/// The document of our own did:web `--service-did`, so the DID we accept
+/// service auth for resolves here. The reference PDS serves none; the shape
+/// is the reference AppView's, with no verification method (the service
+/// DID signs nothing).
 async fn well_known_did_json(State(app): AppState) -> Response {
     let did = &app.jwt.service_did;
     if !did.starts_with("did:web:") {
@@ -115,9 +107,8 @@ pub(crate) fn service_did_doc(did: &str, public_url: &str) -> J {
     })
 }
 
-/// HTTPS handle verification for handles under our domain (the reference's
-/// well-known.ts): the request's Host is the handle; its DID as text/plain,
-/// or 404 unless it is an active account here.
+/// HTTPS handle verification (reference well-known.ts): the Host is the
+/// handle.
 async fn well_known_atproto_did(State(app): AppState, headers: HeaderMap) -> Response {
     let host = headers
         .get(header::HOST)
@@ -135,12 +126,10 @@ async fn well_known_atproto_did(State(app): AppState, headers: HeaderMap) -> Res
     match active_handle_did(&app, &handle).await {
         Ok(Some(did)) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], did).into_response(),
         Ok(None) => not_found(),
-        // owner unreachable / shard moving: retry, not "no such user"
         Err(e) => e.into_response(),
     }
 }
 
-/// The DID document this PDS generates for an account it hosts.
 pub(super) fn did_doc(app: &App, acct: &Account) -> J {
     json!({
         "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1", "https://w3id.org/security/suites/secp256k1-2019/v1"],
@@ -156,12 +145,10 @@ pub(super) fn did_doc(app: &App, acct: &Account) -> J {
     })
 }
 
-/// Whether the document generated here is the account's current one. While
-/// an account is active here it is (every change of a registered DID goes
-/// through this PDS). A deactivated account may have migrated away (the
-/// reference flow ends with deactivateAccount on the old PDS) or not have
-/// arrived yet (migration in): its DID resolves through the directory /
-/// did:web, as the reference resolves every DID. Unregistered local DIDs
+/// Whether the document generated here is the account's current one. It is
+/// while the account is active here (every change of a registered DID goes
+/// through this PDS). A deactivated account may have migrated away or not
+/// arrived yet, so its DID resolves like any other. Unregistered local DIDs
 /// (`--plc-mode unregistered`) have no other document.
 pub(crate) fn serves_local_doc(app: &App, acct: &Account) -> bool {
     let deactivated = acct.extra.get("deactivatedAt").is_some_and(|v| !v.is_null());
@@ -172,16 +159,13 @@ pub(crate) fn serves_local_doc(app: &App, acct: &Account) -> bool {
     !acct.signing_pubkey.is_empty() && !(deactivated && resolvable) && !external_ops
 }
 
-/// The current DID document of an account hosted here: ours
-/// ([`serves_local_doc`]), else resolved (cached; the cache is invalidated
-/// when the account is deactivated). An active account whose did:plc may
-/// change elsewhere falls back to ours when the directory can't be reached.
+/// An active account whose did:plc may change elsewhere falls back to our
+/// document when the directory can't be reached.
 pub(crate) async fn account_did_doc(app: &App, acct: &Account) -> Result<Arc<J>, crate::did_resolver::ResolveError> {
     if serves_local_doc(app, acct) {
         return Ok(Arc::new(did_doc(app, acct)));
     }
-    let r = app.did_resolver.resolve(&acct.did).await;
-    match r {
+    match app.did_resolver.resolve(&acct.did).await {
         Err(crate::did_resolver::ResolveError::Failed(..)) if acct.status.is_none() && !acct.signing_pubkey.is_empty() => {
             Ok(Arc::new(did_doc(app, acct)))
         }
@@ -205,41 +189,30 @@ struct HandleQ {
 async fn resolve_handle(State(app): AppState, Query(q): Query<HandleQ>) -> XResult<Json<J>> {
     let handle = q.handle.to_ascii_lowercase();
     if !super::syntax::valid_handle(&handle) {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            "Error: handle must be a valid handle",
-        ));
+        return Err(XrpcError::bad("InvalidRequest", "Error: handle must be a valid handle"));
     }
     match resolve_any_handle(&app, &handle).await? {
         Some(did) => Ok(Json(json!({"did": did}))),
-        // (the reference answers an unresolvable external handle with a
-        // plain InvalidRequest; the lexicon's HandleNotFound is used for
-        // both here, so a valid handle is never a parameter error)
+        // (the reference answers an unresolvable external handle with
+        // InvalidRequest; a valid handle is never a parameter error here)
         None => Err(XrpcError::bad("HandleNotFound", "Unable to resolve handle")),
     }
 }
 
-/// Whether `handle` is ours to know (the reference's
-/// `serviceHandleDomains` check: under the handle domain, or the domain
-/// itself).
+/// Reference `serviceHandleDomains` check.
 fn is_service_handle(app: &App, handle: &str) -> bool {
     under_handle_domain(app, handle) || handle == app.handle_domain
 }
 
-/// The DID of the active account here whose handle is `handle`, as the
-/// reference's getAccount(handle): deactivated and taken-down accounts
-/// don't resolve. A shard mid-move is a 503 (retry), not "no such handle".
+/// Inactive accounts don't resolve (reference getAccount(handle)).
 async fn local_handle_did(app: &App, handle: &str) -> XResult<Option<String>> {
     let Some(did) = app.resolve_handle(handle).await? else { return Ok(None) };
     let acct = super::server::account_if_exists(app, &did).await?;
     Ok(acct.is_some_and(|a| a.status.is_none() && a.handle == handle).then_some(did))
 }
 
-/// resolveHandle (reference identity/resolveHandle.ts): an active account
-/// here; else, for a handle under our handle domains, nobody (it would be
-/// here); else the handle is resolved for the caller: the Bluesky app
-/// resolves @-mention facets through its PDS, so other servers' users must
-/// resolve too ([`resolve_external_handle`]).
+/// Other servers' handles resolve too: the Bluesky app resolves @-mention
+/// facets through its PDS.
 async fn resolve_any_handle(app: &App, handle: &str) -> XResult<Option<String>> {
     if let Some(did) = local_handle_did(app, handle).await? {
         return Ok(Some(did));
@@ -250,16 +223,11 @@ async fn resolve_any_handle(app: &App, handle: &str) -> XResult<Option<String>> 
     Ok(resolve_external_handle(app, handle).await)
 }
 
-/// AppView `com.atproto.identity.resolveHandle` deadline.
 const APPVIEW_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The DID of a handle hosted elsewhere: the configured AppView's
-/// resolveHandle (as the reference: its answer, a DID or "unknown", is
-/// final); without an AppView, or when it can't be reached or fails (5xx),
-/// the handle resolver (DNS TXT `_atproto.<handle>`, then
-/// `https://<handle>/.well-known/atproto-did`, SSRF-guarded:
-/// crate::handle_resolver). In dev mode only the AppView is asked (a dev or
-/// test server looks up no arbitrary names).
+/// The configured AppView's answer is final, as in the reference; without
+/// one, or when it fails, the handle is resolved here. A dev server looks up
+/// no arbitrary names.
 pub(super) async fn resolve_external_handle(app: &App, handle: &str) -> Option<String> {
     if let Some((url, _)) = &app.config.appview {
         match appview_resolve_handle(url, handle).await {
@@ -270,14 +238,18 @@ pub(super) async fn resolve_external_handle(app: &App, handle: &str) -> Option<S
     if app.config.dev_mode {
         return None;
     }
-    let txt = crate::handle_resolver::resolver(app.config.txt_resolver.as_ref());
-    let http = async { well_known_did(handle, false).await.ok() };
-    crate::handle_resolver::resolve(txt.as_ref(), handle, http).await.filter(|d| super::syntax::valid_did(d))
+    dns_or_https_did(app, handle).await.filter(|d| super::syntax::valid_did(d))
 }
 
-/// GET resolveHandle from the AppView (unauthenticated, like the
-/// reference's `bskyAppView.client`). Ok(None): it answered that the handle
-/// doesn't resolve (4xx); Err: unreachable, 5xx, or a malformed answer.
+/// DNS TXT `_atproto.<handle>`, then `https://<handle>/.well-known/atproto-did`
+/// (reference HandleResolver).
+async fn dns_or_https_did(app: &App, handle: &str) -> Option<String> {
+    let txt = crate::handle_resolver::resolver(app.config.txt_resolver.as_ref());
+    let http = async { well_known_did(handle, false).await.ok() };
+    crate::handle_resolver::resolve(txt.as_ref(), handle, http).await
+}
+
+/// Ok(None): the AppView answered that the handle doesn't resolve (4xx).
 async fn appview_resolve_handle(base: &str, handle: &str) -> Result<Option<String>, String> {
     let url = format!("{}/xrpc/com.atproto.identity.resolveHandle", base.trim_end_matches('/'));
     let fetch = async {
@@ -302,10 +274,7 @@ async fn appview_resolve_handle(base: &str, handle: &str) -> Result<Option<Strin
     tokio::time::timeout(APPVIEW_RESOLVE_TIMEOUT, fetch).await.map_err(|_| "timed out".to_string())?
 }
 
-/// Whether `handle` resolves to `did`, verified as the reference verifies
-/// a handle (bidirectionally): the claim here for a handle under our
-/// domains, else the external resolution ([`resolve_external_handle`]). In
-/// dev mode, where nothing external is looked up, a claim here suffices.
+/// In dev mode, where nothing external is looked up, a claim here suffices.
 async fn handle_resolves_to(app: &App, handle: &str, did: &str) -> XResult<bool> {
     let service = is_service_handle(app, handle);
     if service || app.config.dev_mode {
@@ -319,18 +288,6 @@ async fn handle_resolves_to(app: &App, handle: &str, did: &str) -> XResult<bool>
     Ok(resolve_external_handle(app, handle).await.as_deref() == Some(did))
 }
 
-/// Local accounts only (documents per [`account_did_doc`]). Anything else is
-/// DidNotFound.
-async fn local_account(app: &App, did: &str) -> XResult<Account> {
-    match app.account(did).await {
-        Ok(a) => Ok(a),
-        Err(e) if e.error == "AccountNotFound" => Err(XrpcError::bad(
-            "DidNotFound",
-            format!("DID not found: {did}"),
-        )),
-        Err(e) => Err(e),
-    }
-}
 
 #[derive(Deserialize)]
 struct DidQ {
@@ -339,22 +296,19 @@ struct DidQ {
 
 async fn resolve_did(State(app): AppState, Query(q): Query<DidQ>) -> XResult<Json<J>> {
     if !super::syntax::valid_did(&q.did) {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            "Error: did must be a valid did",
-        ));
+        return Err(XrpcError::bad("InvalidRequest", "Error: did must be a valid did"));
     }
-    let acct = local_account(&app, &q.did).await?;
+    let acct = super::server::account_if_exists(&app, &q.did)
+        .await?
+        .ok_or_else(|| XrpcError::bad("DidNotFound", format!("DID not found: {}", q.did)))?;
     let doc = account_did_doc(&app, &acct).await.map_err(resolve_error)?;
     Ok(Json(json!({"didDoc": doc})))
 }
 
-/// identifier (handle or DID) -> (the account, if hosted here; {did,
-/// handle, didDoc}). The handle is "handle.invalid" unless it resolves back
-/// to the DID ([`handle_resolves_to`]). Accounts here use their documents
-/// ([`account_did_doc`]); any other identity is resolved (a handle as
-/// resolveHandle does, the DID through the DID resolver; `fresh` skips its
-/// cache), so a client can look up anyone through its PDS.
+/// (the account, if hosted here; {did, handle, didDoc}) of anyone, so a
+/// client can look up any identity through its PDS. The handle is
+/// "handle.invalid" unless it resolves back to the DID. `fresh` skips the
+/// resolver's cache.
 async fn identity_info(app: &App, identifier: &str, fresh: bool) -> XResult<(Option<Account>, J)> {
     let bad_ident = || XrpcError::bad("InvalidRequest", "Error: identifier must be a valid at-identifier");
     let not_found = |h: &str| XrpcError::bad("HandleNotFound", format!("Unable to resolve handle: {h}"));
@@ -423,16 +377,13 @@ async fn resolve_identity(State(app): AppState, Query(q): Query<IdentifierQ>) ->
     Ok(Json(identity_info(&app, &q.identifier, false).await?.1))
 }
 
-/// Returns the identity info. When called by the account itself (or an
-/// admin) it also emits a `#identity` event so downstream caches refresh;
-/// anonymous callers can't make us emit events.
+/// Emits `#identity` only for the account itself or an admin.
 async fn refresh_identity(
     State(app): AppState,
     MaybeAuth(creds): MaybeAuth,
     Json(inp): Json<IdentifierQ>,
 ) -> XResult<Json<J>> {
     let (acct, info) = identity_info(&app, &inp.identifier, true).await?;
-    // only an account hosted here has events to emit
     let Some(acct) = acct else { return Ok(Json(info)) };
     let may_emit = match &creds {
         Some(Credentials::Admin) => true,
@@ -455,12 +406,8 @@ struct UpdateHandleIn {
     handle: String,
 }
 
-/// Checks a requested handle: a single label under our handle domain
-/// (3-18 chars, like the reference), or an external domain that proves
-/// control with a DNS TXT `_atproto.{handle}` record (`did=<DID>`) or
-/// `https://{handle}/.well-known/atproto-did`, resolved as the reference's
-/// HandleResolver does (crate::handle_resolver). In dev mode the external
-/// proof is skipped.
+/// A handle under our domain follows createAccount's rules; an external one
+/// must resolve to `did` (skipped in dev mode).
 pub(super) async fn check_new_handle(app: &App, handle: &str, did: &str) -> XResult<()> {
     // syntax + disallowed TLDs, then the slur filter (reference order)
     super::server::normalize_handle(handle)?;
@@ -473,22 +420,14 @@ pub(super) async fn check_new_handle(app: &App, handle: &str, did: &str) -> XRes
     if app.config.dev_mode {
         return Ok(());
     }
-    let txt = crate::handle_resolver::resolver(app.config.txt_resolver.as_ref());
-    let http = async { well_known_did(handle, false).await.ok() };
-    let resolved = crate::handle_resolver::resolve(txt.as_ref(), handle, http).await;
-    if resolved.as_deref() != Some(did) {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            "External handle did not resolve to DID",
-        ));
+    if dns_or_https_did(app, handle).await.as_deref() != Some(did) {
+        return Err(XrpcError::bad("InvalidRequest", "External handle did not resolve to DID"));
     }
     Ok(())
 }
 
-/// The DID served at `https://{handle}/.well-known/atproto-did`, fetched with
-/// the SSRF-guarded client (outside dev mode a handle resolving to a private
-/// or loopback address is refused before connecting), the reference's 3 s
-/// deadline and a small body cap.
+/// SSRF-guarded: outside dev mode a handle resolving to a private or
+/// loopback address is refused before connecting.
 async fn well_known_did(handle: &str, dev_mode: bool) -> Result<String, String> {
     use futures::StreamExt;
     const MAX_BYTES: usize = 2048;
@@ -520,10 +459,7 @@ async fn update_handle(
     Json(inp): Json<UpdateHandleIn>,
 ) -> XResult<StatusCode> {
     creds.need_identity("handle")?;
-    let did = creds
-        .did()
-        .ok_or_else(|| XrpcError::auth("user credentials required"))?
-        .to_string();
+    let did = creds.user_did()?.to_string();
     {
         use crate::ratelimit::*;
         check(&[&UPDATE_HANDLE_5MIN, &UPDATE_HANDLE_DAY], &did, 1)?;
@@ -543,12 +479,10 @@ async fn update_handle(
     Ok(StatusCode::OK)
 }
 
-/// Moves the account to `handle` (already validated) and emits #identity.
-/// Global uniqueness is a conditional create of handle/{handle} (an object
-/// already holding our DID is a retry of an interrupted update). The worker
-/// then swaps the handle on its current state, and the handle that state held
-/// is released. `user`: the account's own request, refused while taken down
-/// or suspended (admins may rename those).
+/// Moves the account to the already-validated `handle` and emits #identity.
+/// Global uniqueness is a conditional create of handle/{handle}; one already
+/// holding our DID is a retry of an interrupted update. `user`: the
+/// account's own request, refused while taken down (admins may rename).
 pub(super) async fn set_handle(app: &App, did: &str, handle: &str, user: bool) -> XResult<()> {
     // only decides whether to claim; the op re-checks against current state
     let read = app.account(did).await?.handle;
@@ -556,11 +490,9 @@ pub(super) async fn set_handle(app: &App, did: &str, handle: &str, user: bool) -
     if claimed && !super::server::claim_handle(app, handle, did).await? {
         return Err(XrpcError::bad("HandleNotAvailable", format!("Handle already taken: {handle}")));
     }
-    // The DID document first (reference AccountManager.updateHandle): a PLC
-    // update op, acknowledged by the directory, before the local change; a
-    // failure changes nothing here. (The reverse failure, PLC updated and
-    // the local swap failing, is fixed by retrying: the PLC step is then a
-    // no-op.)
+    // The DID document first (reference AccountManager.updateHandle), so a
+    // failure changes nothing here; PLC updated and the local swap failing
+    // is fixed by retrying (the PLC step is then a no-op).
     if let Err(e) = update_did_doc_handle(app, did, handle).await {
         if claimed {
             release_unless_current(app, did, handle).await;
@@ -606,8 +538,7 @@ pub(super) async fn set_handle(app: &App, did: &str, handle: &str, user: bool) -
     }
 }
 
-/// Releases our claim of `handle` unless the account (read now) stands on
-/// it: a concurrent update of the same DID to the same handle may have
+/// A concurrent update of the same DID to the same handle may have
 /// succeeded. An unreadable account keeps the claim (stale claims are taken
 /// over after a grace period: `server::claim_handle`).
 async fn release_unless_current(app: &App, did: &str, handle: &str) {
@@ -616,13 +547,11 @@ async fn release_unless_current(app: &App, did: &str, handle: &str) {
     }
 }
 
-/// Points the DID document at the account's current handle (did:plc with PLC
-/// registration on). Two updates of one DID can finish their PLC and local
-/// steps in opposite orders (PLC says one handle, the account the other);
-/// every update ends with this, which re-reads the account after each PLC
-/// step until they agree, so the last update to finish leaves them agreeing
-/// whichever node ran it. Failures are logged (the next update or a
-/// refreshIdentity by the user fixes it): the local change is done.
+/// Two updates of one DID can finish their PLC and local steps in opposite
+/// orders. Every update ends with this, which re-reads the account after
+/// each PLC step until they agree, so the last update to finish leaves them
+/// agreeing whichever node ran it. Failures are only logged: the next
+/// update or a refreshIdentity fixes them.
 async fn reconcile_did_doc_handle(app: &App, did: &str) {
     let Some(plc) = &app.plc else { return };
     if !did.starts_with("did:plc:") {
@@ -649,9 +578,7 @@ async fn reconcile_did_doc_handle(app: &App, did: &str) {
     }
 }
 
-/// With PLC registration on: a did:plc gets a PLC update op for `handle`
-/// (signed with the server rotation key); a did:web must already name the
-/// handle in its document. Off: nothing (the document is generated here).
+/// A did:web must already name the handle in its document.
 async fn update_did_doc_handle(app: &App, did: &str, handle: &str) -> XResult<()> {
     let Some(plc) = &app.plc else { return Ok(()) };
     if did.starts_with("did:plc:") {
@@ -672,11 +599,7 @@ async fn get_recommended_did_credentials(
     State(app): AppState,
     Auth(creds): Auth,
 ) -> XResult<Json<J>> {
-    let did = creds
-        .did()
-        .ok_or_else(|| XrpcError::auth("user credentials required"))?
-        .to_string();
-    let acct = app.account(&did).await?;
+    let acct = app.account(creds.user_did()?).await?;
     Ok(Json(json!({
         "alsoKnownAs": [format!("at://{}", acct.handle)],
         "verificationMethods": {"atproto": format!("did:key:{}", acct.signing_pubkey)},
@@ -687,25 +610,15 @@ async fn get_recommended_did_credentials(
     })))
 }
 
-/// The PLC operation endpoints when PLC registration is off
-/// (`--plc-mode unregistered`, dev only): there is no rotation key and no
-/// PLC log to extend.
-fn plc_unsupported() -> XrpcError {
-    XrpcError {
+fn plc_service(app: &App) -> XResult<&Arc<crate::plc::Plc>> {
+    app.plc.as_ref().ok_or_else(|| XrpcError {
         status: StatusCode::NOT_IMPLEMENTED,
         error: "MethodNotImplemented".into(),
         message: "PLC operations are not supported: PLC registration is off on this PDS (--plc-mode unregistered, dev only)".into(),
-    }
+    })
 }
 
-fn plc_service(app: &App) -> XResult<&Arc<crate::plc::Plc>> {
-    app.plc.as_ref().ok_or_else(plc_unsupported)
-}
-
-/// requestPlcOperationSignature / signPlcOperation auth (reference
-/// ACCESS_FULL plus taken-down sessions, `identity:*`): a full session, a
-/// taken-down account's restricted session, or OAuth with `identity:*`; no
-/// app passwords.
+/// Reference ACCESS_FULL plus taken-down sessions; OAuth needs `identity:*`.
 fn plc_signer(creds: &Credentials) -> XResult<String> {
     match creds {
         Credentials::Session { did } | Credentials::Takendown { did } => Ok(did.clone()),
@@ -724,8 +637,7 @@ fn plc_signer(creds: &Credentials) -> XResult<String> {
     }
 }
 
-/// Mails a `plc_operation` token (reference requestPlcOperationSignature):
-/// deactivated and taken-down accounts too.
+/// Deactivated and taken-down accounts too.
 async fn request_plc_operation_signature(State(app): AppState, Auth(creds): Auth) -> XResult<StatusCode> {
     plc_service(&app)?;
     let did = plc_signer(&creds)?;
@@ -746,11 +658,8 @@ struct SignPlcIn {
     services: Option<J>,
 }
 
-/// Signs an update of the account's DID with the server rotation key
-/// (reference signPlcOperation): the emailed token, then the DID's last op
-/// with the requested fields replaced (`createUpdateOp`). Not submitted:
-/// the client sends it to the PDS that will host the account (migration
-/// out) or to submitPlcOperation here.
+/// Not submitted: the client sends it to the PDS that will host the account
+/// (migration out) or to submitPlcOperation here.
 async fn sign_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp): Json<SignPlcIn>) -> XResult<Json<J>> {
     let plc = plc_service(&app)?.clone();
     let did = plc_signer(&creds)?;
@@ -779,8 +688,7 @@ async fn sign_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp): 
         }
         Ok(())
     })?;
-    // the op may be submitted by anyone, anywhere: from now on this DID can
-    // change without this PDS ([`serves_local_doc`])
+    // the op may be submitted by anyone: this DID can now change without us
     mark_plc_external(&app, &did).await?;
     // consumed only once the op is made (reference: deleteEmailToken last),
     // so a directory outage doesn't burn the emailed token
@@ -789,9 +697,7 @@ async fn sign_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp): 
 }
 
 /// Account extension flag: this did:plc may change without going through
-/// this PDS (a server-signed op was handed out by signPlcOperation, a user
-/// rotation key is listed), so its document is resolved through the
-/// directory ([`serves_local_doc`]).
+/// this PDS, so its document is the directory's ([`serves_local_doc`]).
 pub(super) const PLC_EXTERNAL: &str = "plcExternalOps";
 
 fn has_plc_external(a: &Account) -> bool {
@@ -816,14 +722,10 @@ struct SubmitPlcIn {
     operation: J,
 }
 
-/// Forwards a signed operation for the caller's DID to the PLC directory
-/// after the reference's checks (submitPlcOperation): the server's rotation
-/// key stays a rotation key, the atproto_pds service is this PDS, the
-/// atproto key is the account's signing key, and the first alias is the
-/// account's handle. Then #identity.
+/// The reference's submitPlcOperation checks, then #identity.
 async fn submit_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp): Json<SubmitPlcIn>) -> XResult<StatusCode> {
     creds.need_identity("*")?;
-    let did = creds.did().ok_or_else(|| XrpcError::auth("user credentials required"))?.to_string();
+    let did = creds.user_did()?.to_string();
     let plc = plc_service(&app)?.clone();
     let op = inp.operation;
     let bad = |m: &str| XrpcError::bad("InvalidRequest", m);
@@ -858,12 +760,11 @@ async fn submit_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp)
     }
     plc.client.send(&did, &op, "submit").await?;
     app.did_resolver.invalidate(&did);
-    // rotation keys of the user's own can change the DID without us
     let foreign_keys = op["rotationKeys"].as_array().is_some_and(|a| a.iter().filter_map(J::as_str).any(|k| !plc.is_operator_key(k)));
     if foreign_keys {
         mark_plc_external(&app, &did).await?;
     }
-    // #identity (writes nothing; not for a taken-down account, as refreshIdentity)
+    // #identity only (writes nothing); not for a taken-down account
     app.mutate_account(&did, true, false, false, |a| Ok(a.status.as_deref() != Some("takendown"))).await?;
     Ok(StatusCode::OK)
 }
