@@ -1023,7 +1023,11 @@ async fn retired_state_gc_over_history() {
         let mut live_logs: Vec<String> = nodes.iter().map(|n| n.s.app.log.log_id.to_string()).collect();
         live_logs.sort();
         let (dirs, assigns, logs) = bucket(&store).await;
-        if dirs == want && assigns == want && logs == live_logs {
+        // no dead log left. A live log may be absent: retention (window 0)
+        // deletes a live log's segments once its shards checkpoint past
+        // them, so a log nothing was appended to since is empty (seen ~3%
+        // of loaded runs, always the last-restarted node's fresh log)
+        if dirs == want && assigns == want && logs.iter().all(|l| live_logs.contains(l)) {
             eprintln!("converged: {} shards, logs {logs:?}", want.len());
             break;
         }
