@@ -192,7 +192,8 @@ async fn post_op(State(s): State<Arc<Inner>>, Path(did): Path<String>, body: axu
         Ok(()) => {
             logs.insert(did, l);
             s.accepted.fetch_add(1, Ordering::SeqCst);
-            StatusCode::OK.into_response()
+            // the directory answers `res.sendStatus(200)`: text/plain "OK"
+            ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], "OK").into_response()
         }
         Err(e) => err(StatusCode::BAD_REQUEST, e.to_string()),
     }

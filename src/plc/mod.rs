@@ -606,15 +606,19 @@ impl PlcClient {
         Ok(format!("{}/{did}{suffix}", self.url))
     }
 
-    /// Runs one request with the timeout and records it.
-    async fn call(&self, op: &'static str, rb: reqwest::RequestBuilder, did: &str) -> Result<Option<J>, PlcError> {
+    /// Runs one request with the timeout and records it. `json`: a 2xx body
+    /// is parsed as JSON (the GETs); otherwise it is ignored: the directory
+    /// answers an accepted `POST /{did}` with `res.sendStatus(200)`, a
+    /// text/plain "OK" (did-method-plc server routes.ts), and any 2xx means
+    /// the op was applied.
+    async fn call(&self, op: &'static str, rb: reqwest::RequestBuilder, did: &str, json: bool) -> Result<Option<J>, PlcError> {
         let t = Instant::now();
         let r = tokio::time::timeout(REQUEST_TIMEOUT, async {
             let r = rb.send().await.map_err(|e| PlcError::Unavailable(format!("{e}")))?;
             let status = r.status();
             let body = read_capped(r).await?;
             if status.is_success() {
-                if body.is_empty() {
+                if body.is_empty() || !json {
                     return Ok(None);
                 }
                 return serde_json::from_slice(&body).map(Some).map_err(|e| PlcError::Unavailable(format!("bad response: {e}")));
@@ -650,19 +654,19 @@ impl PlcClient {
     /// The latest op in the DID's log (`GET /{did}/log/last`).
     pub async fn last_op(&self, did: &str) -> Result<J, PlcError> {
         let url = self.did_url(did, "/log/last")?;
-        self.call("get_last_op", self.http.get(url), did).await?.ok_or_else(|| PlcError::Unavailable("empty response".into()))
+        self.call("get_last_op", self.http.get(url), did, true).await?.ok_or_else(|| PlcError::Unavailable("empty response".into()))
     }
 
     /// The DID's document data (`GET /{did}/data`).
     pub async fn document_data(&self, did: &str) -> Result<J, PlcError> {
         let url = self.did_url(did, "/data")?;
-        self.call("get_data", self.http.get(url), did).await?.ok_or_else(|| PlcError::Unavailable("empty response".into()))
+        self.call("get_data", self.http.get(url), did, true).await?.ok_or_else(|| PlcError::Unavailable("empty response".into()))
     }
 
     /// Submits an op (`POST /{did}`); `op_label` names it in metrics.
     pub async fn send(&self, did: &str, op: &J, op_label: &'static str) -> Result<(), PlcError> {
         let url = self.did_url(did, "")?;
-        self.call(op_label, self.http.post(url).json(op), did).await.map(|_| ())
+        self.call(op_label, self.http.post(url).json(op), did, false).await.map(|_| ())
     }
 }
 
