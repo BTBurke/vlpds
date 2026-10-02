@@ -66,7 +66,6 @@ pub struct NodeLease {
     /// Set once this incarnation has joined: every live peer follows its
     /// log from below its first seq (see `Cluster::try_join`). Peers hand
     /// shards only to joined nodes; a node takes none before.
-    #[serde(default)]
     pub joined: bool,
     /// Every peer log this node's merged firehose follows -> the follower's
     /// floor (it delivers each of the log's events above it). A joiner
@@ -77,7 +76,6 @@ pub struct NodeLease {
     /// its send time + TTL on its own clock), so its merged firehose never
     /// settles past it unless a later renewal lands. A joiner that ignores
     /// this node as dead makes its own seqs pass it.
-    #[serde(default)]
     pub wm_cap: i64,
     /// This build's git revision (as in `vlpds_build_info`).
     pub rev: String,

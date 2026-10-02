@@ -134,9 +134,7 @@ pub struct Layout {
     /// never reused.
     pub next_id: ShardId,
     /// Ops planned so far (op ids).
-    #[serde(default)]
     pub op_seq: u64,
-    #[serde(default)]
     pub op: Option<Reshard>,
     /// Fields of a newer feature level, kept when this node CASes the
     /// object (DESIGN.md "Rolling upgrades": tolerant control objects).

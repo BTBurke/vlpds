@@ -92,11 +92,8 @@ fn session_expired(s: &Session, now: i64) -> bool {
 /// Whether the stored value is expired. Unparseable rows count as expired.
 fn expired(kind: Kind, routing: &str, name: &str, val: &[u8], now: i64) -> bool {
     match kind {
-        // past its window, or claimed for longer than any claim may be (a
-        // row from before the cap: util::MAX_CLAIM_TTL)
-        Kind::Replay => serde_json::from_slice::<i64>(val)
-            .map(|until| until <= now || until > now + super::util::MAX_CLAIM_TTL)
-            .unwrap_or(true),
+        // past its window
+        Kind::Replay => serde_json::from_slice::<i64>(val).map(|until| until <= now).unwrap_or(true),
         Kind::Revocation => {
             crate::xrpc::revocation_expired(routing, name, val, now.max(0) as u64).unwrap_or(false)
         }
