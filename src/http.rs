@@ -17,6 +17,11 @@
 //! the caller as they are, and a redirect from a user-controlled host could
 //! point anywhere. Every new outbound connection counts in
 //! `vlpds_http_client_connects_total{role}`, so reuse regressions show up.
+//!
+//! Response bodies streamed from an upstream to a client (forwards, proxied
+//! calls) go through [`stall::Watched`]: one whose client stops taking it
+//! is dropped after [`stall::WRITE_STALL`], so a client that never reads
+//! can't pin upstream flow-control windows or pooled connections.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -388,6 +393,17 @@ pub mod h1 {
         h.insert(http::header::HOST, http::HeaderValue::from_str(authority)?);
         h.entry(http::header::USER_AGENT).or_insert(http::HeaderValue::from_static(USER_AGENT));
         h.entry(http::header::ACCEPT).or_insert(http::HeaderValue::from_static("*/*"));
+        // a request body still uploading when the response ends keeps its
+        // connection busy: such a connection is not pooled (PooledBody)
+        let req_done = match hyper::body::Body::size_hint(req.body()).exact() {
+            Some(0) => None,
+            _ => {
+                let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let body = std::mem::take(req.body_mut());
+                *req.body_mut() = Body::new(TrackEnd { body, done: done.clone() });
+                Some(done)
+            }
+        };
         let (mut conn, mut reused) = host.checkout(role).await?;
         if conn.ready().await.is_err() {
             drop(conn);
@@ -406,8 +422,38 @@ pub mod h1 {
             },
         };
         let (parts, body) = resp.into_parts();
-        let body = PooledBody { body, conn: Some(conn), host };
+        let body = PooledBody { body, conn: Some(conn), host, req_done };
         Ok(http::Response::from_parts(parts, body))
+    }
+
+    /// A request body that flags when it has been sent to the end.
+    struct TrackEnd {
+        body: Body,
+        done: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl hyper::body::Body for TrackEnd {
+        type Data = Bytes;
+        type Error = axum::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, axum::Error>>> {
+            let r = std::pin::Pin::new(&mut self.body).poll_frame(cx);
+            if matches!(r, Poll::Ready(None)) || (matches!(r, Poll::Ready(Some(Ok(_)))) && self.body.is_end_stream()) {
+                self.done.store(true, Ordering::Release);
+            }
+            r
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.body.is_end_stream()
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            self.body.size_hint()
+        }
     }
 
     /// A response body that returns its connection to the pool at its end.
@@ -415,14 +461,22 @@ pub mod h1 {
         body: hyper::body::Incoming,
         conn: Option<SendRequest<Body>>,
         host: &'static Host,
+        /// set once the request body was sent to the end (None: no body)
+        req_done: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl PooledBody {
-        /// Back to the pool, if the exchange is complete.
+        /// Back to the pool, if the exchange is complete: the response read
+        /// to the end and the request body sent. One whose upload is still
+        /// going (the upstream answered early) is not pooled: the next
+        /// request on it would wait for that upload. Dropping the handle
+        /// lets the connection finish the exchange and close.
         fn release(&mut self) {
             if hyper::body::Body::is_end_stream(&self.body) {
                 if let Some(c) = self.conn.take() {
-                    self.host.put(c);
+                    if self.req_done.as_ref().is_none_or(|d| d.load(Ordering::Acquire)) {
+                        self.host.put(c);
+                    }
                 }
             }
         }
@@ -462,6 +516,246 @@ pub mod h1 {
     }
 }
 
+/// Write-progress deadlines for response bodies streamed from an upstream
+/// to a client (forwarded peer responses, proxied AppView responses).
+///
+/// The server polls a response body only when it can send more: an h2
+/// stream whose client keeps its window at zero, or an HTTP/1.1 socket
+/// whose client doesn't read, is never polled again. The upstream side then
+/// stays busy for as long as the client likes: a peer h2 stream holds its
+/// unread bytes out of the connection's flow-control window (enough of them
+/// stall every forward on that connection), and a pooled AppView
+/// connection is never returned. Each upstream call has its own deadlines
+/// (time to first byte, upstream idle), but none of them sees a client that
+/// stopped reading.
+///
+/// [`Watched`] notes when the client got the response head, and then each
+/// chunk that wasn't the last; a sweeper thread drops the upstream body of
+/// every watched body whose next poll hasn't come [`WRITE_STALL`] later (h2
+/// resets the upstream stream and frees its window; an h1 connection
+/// closes). A later poll gets an error, which resets the client's stream /
+/// closes its connection. An upstream that keeps the body waiting is not a
+/// stall (the callers' own idle deadlines cover that). Cost per body: one
+/// allocation and an uncontended shard lock at creation, an uncontended
+/// lock per chunk; bodies already buffered need none
+/// ([`Watched::unwatched`]).
+pub mod stall {
+    use super::*;
+    use bytes::Bytes;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Weak;
+    use std::time::Instant;
+
+    /// How long a client may leave a watched body unpolled after taking a
+    /// chunk. Generous: a client reading at all is polled far more often (a
+    /// socket buffer or window's worth at its pace).
+    pub const WRITE_STALL: Duration = Duration::from_secs(30);
+    const SWEEP: Duration = Duration::from_secs(1);
+    const SHARDS: usize = 16;
+
+    static LIMIT_MS: AtomicU64 = AtomicU64::new(WRITE_STALL.as_millis() as u64);
+    static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+    static STALLED: AtomicU64 = AtomicU64::new(0);
+
+    /// Changes [`WRITE_STALL`] for this process (tests).
+    pub fn set_limit(d: Duration) {
+        LIMIT_MS.store(d.as_millis().max(1) as u64, Ordering::Relaxed);
+    }
+
+    /// Bodies dropped for a stalled client so far.
+    pub fn stalled_total() -> u64 {
+        STALLED.load(Ordering::Relaxed)
+    }
+
+    /// ms since [`EPOCH`], never 0.
+    fn now_ms() -> u64 {
+        EPOCH.elapsed().as_millis() as u64 + 1
+    }
+
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+    trait Reap: Send + Sync {
+        fn stalled(&self, now: u64, limit: u64) -> bool;
+        /// Drops the upstream body if it is (still) stalled at `now`.
+        fn reap(&self, now: u64, limit: u64) -> bool;
+    }
+
+    struct Registry {
+        shards: Vec<parking_lot::Mutex<Vec<Weak<dyn Reap>>>>,
+        next: AtomicUsize,
+    }
+
+    static REG: LazyLock<Registry> = LazyLock::new(|| {
+        std::thread::Builder::new()
+            .name("vlpds-stall-sweep".into())
+            .spawn(|| loop {
+                std::thread::sleep(SWEEP);
+                sweep();
+            })
+            .expect("stall sweeper thread");
+        Registry { shards: (0..SHARDS).map(|_| Default::default()).collect(), next: AtomicUsize::new(0) }
+    });
+
+    thread_local! {
+        static SHARD: usize = REG.next.fetch_add(1, Ordering::Relaxed) % SHARDS;
+    }
+
+    fn register(w: Weak<dyn Reap>) {
+        let i = SHARD.with(|s| *s);
+        REG.shards[i].lock().push(w);
+    }
+
+    /// One pass: forgets finished bodies, drops stalled ones' upstreams.
+    /// Returns how many were dropped.
+    fn sweep() -> usize {
+        let (now, limit) = (now_ms(), LIMIT_MS.load(Ordering::Relaxed));
+        let mut stalled = Vec::new();
+        for s in &REG.shards {
+            s.lock().retain(|w| match w.upgrade() {
+                None => false,
+                Some(e) if e.stalled(now, limit) => {
+                    stalled.push(e);
+                    false
+                }
+                Some(_) => true,
+            });
+        }
+        // (dropped outside the shard locks)
+        let mut n = 0;
+        for e in stalled {
+            if e.reap(now, limit) {
+                n += 1;
+            } else {
+                // polled as we looked: back on the list
+                register(Arc::downgrade(&e));
+            }
+        }
+        if n > 0 {
+            STALLED.fetch_add(n as u64, Ordering::Relaxed);
+            tracing::info!("dropped {n} upstream response bodies whose clients stopped reading");
+        }
+        n
+    }
+
+    struct Shared<B> {
+        /// None once dropped for a stall
+        body: parking_lot::Mutex<Option<B>>,
+        /// when a chunk (not the last) was handed out and no poll has come
+        /// since ([`now_ms`]); 0 = not waiting on the client. Written under
+        /// `body`'s lock.
+        waiting: AtomicU64,
+    }
+
+    impl<B: Send> Reap for Shared<B> {
+        fn stalled(&self, now: u64, limit: u64) -> bool {
+            let w = self.waiting.load(Ordering::Relaxed);
+            w != 0 && now.saturating_sub(w) >= limit
+        }
+
+        fn reap(&self, now: u64, limit: u64) -> bool {
+            // a body being polled right now is not stalled
+            let Some(mut g) = self.body.try_lock() else { return false };
+            if !self.stalled(now, limit) {
+                return false;
+            }
+            let b = g.take();
+            drop(g);
+            drop(b);
+            true
+        }
+    }
+
+    enum State<B> {
+        /// not watched
+        Own(B),
+        Shared(Arc<Shared<B>>),
+    }
+
+    /// A response body with a write-progress deadline (module docs), and
+    /// `H` held until the body is dropped (e.g. an admission slot).
+    pub struct Watched<B, H = ()> {
+        state: State<B>,
+        _hold: H,
+    }
+
+    impl<B: hyper::body::Body + Send + 'static> Watched<B, ()> {
+        pub fn new(body: B) -> Self {
+            Self::with_hold(body, ())
+        }
+    }
+
+    impl<B: hyper::body::Body + Send + 'static, H> Watched<B, H> {
+        /// Watched from now on: the client has the response head and must
+        /// start taking the body (a client whose h2 window is zero from the
+        /// start never polls it at all).
+        pub fn with_hold(body: B, hold: H) -> Self {
+            let waiting = if body.is_end_stream() { 0 } else { now_ms() };
+            let s = Arc::new(Shared { body: parking_lot::Mutex::new(Some(body)), waiting: AtomicU64::new(waiting) });
+            register(Arc::downgrade(&s) as Weak<dyn Reap>);
+            Watched { state: State::Shared(s), _hold: hold }
+        }
+
+        /// Not watched (a body that holds no upstream), only holding `hold`.
+        pub fn unwatched(body: B, hold: H) -> Self {
+            Watched { state: State::Own(body), _hold: hold }
+        }
+    }
+
+    fn stalled_error() -> BoxError {
+        "client stopped reading the response".into()
+    }
+
+    impl<B, H> hyper::body::Body for Watched<B, H>
+    where
+        B: hyper::body::Body<Data = Bytes> + Send + Unpin + 'static,
+        B::Error: Into<BoxError>,
+        H: Unpin,
+    {
+        type Data = Bytes;
+        type Error = BoxError;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, BoxError>>> {
+            match &mut self.state {
+                State::Own(b) => std::pin::Pin::new(b).poll_frame(cx).map(|o| o.map(|r| r.map_err(Into::into))),
+                State::Shared(s) => {
+                    let mut g = s.body.lock();
+                    s.waiting.store(0, Ordering::Relaxed);
+                    let Some(b) = g.as_mut() else { return Poll::Ready(Some(Err(stalled_error()))) };
+                    let r = std::pin::Pin::new(&mut *b).poll_frame(cx);
+                    // handed a chunk with more to come: the client's turn
+                    // (pending: the upstream's, which has its own deadlines)
+                    if matches!(r, Poll::Ready(Some(Ok(_)))) && !b.is_end_stream() {
+                        s.waiting.store(now_ms(), Ordering::Relaxed);
+                    }
+                    r.map(|o| o.map(|r| r.map_err(Into::into)))
+                }
+            }
+        }
+
+        fn is_end_stream(&self) -> bool {
+            match &self.state {
+                State::Own(b) => b.is_end_stream(),
+                State::Shared(s) => s.body.lock().as_ref().is_some_and(|b| b.is_end_stream()),
+            }
+        }
+
+        fn size_hint(&self) -> hyper::body::SizeHint {
+            match &self.state {
+                State::Own(b) => b.size_hint(),
+                State::Shared(s) => s.body.lock().as_ref().map(|b| b.size_hint()).unwrap_or_default(),
+            }
+        }
+    }
+
+    /// Runs one sweep now (tests).
+    pub fn sweep_now() -> usize {
+        sweep()
+    }
+}
+
 /// Client for user-controlled URLs: [`public`]'s settings, plus (outside
 /// dev mode) a resolver that refuses non-public addresses. Pair it with
 /// [`crate::did_resolver::check_outbound_url`] for the scheme and IP literals
@@ -485,31 +779,61 @@ pub fn guarded(dev_mode: bool) -> &'static reqwest::Client {
 /// Node-to-node client: `n` independent h2c clients (one connection per
 /// peer each), picked round-robin. Derefs to the next client, so
 /// `app.http.get(..)` spreads calls over the connections.
+///
+/// Bulk downloads ([`is_bulk`]: repo exports, blobs, block fetches; large,
+/// unauthenticated, streamed to clients at their pace) go over `n` other
+/// connections ([`PeerClient::for_path`]): clients that read them slowly or
+/// not at all fill only those connections' flow-control windows, never the
+/// ones every other forward shares (and [`stall::Watched`] drops a body
+/// whose client stopped reading).
 #[derive(Clone)]
 pub struct PeerClient(Arc<PeerInner>);
 
 struct PeerInner {
     clients: Vec<reqwest::Client>,
+    /// for [`is_bulk`] paths (empty: share `clients`)
+    bulk: Vec<reqwest::Client>,
     next: AtomicUsize,
+}
+
+/// Peer calls whose responses are bulk downloads (see [`PeerClient`]).
+pub fn is_bulk(path: &str) -> bool {
+    matches!(
+        path.strip_prefix("/xrpc/"),
+        Some("com.atproto.sync.getRepo" | "com.atproto.sync.getBlob" | "com.atproto.sync.getBlocks")
+    )
 }
 
 impl PeerClient {
     pub fn new(n: usize) -> reqwest::Result<PeerClient> {
         let clients = (0..n.max(1)).map(|_| peer_builder().build()).collect::<Result<_, _>>()?;
-        Ok(PeerClient(Arc::new(PeerInner { clients, next: AtomicUsize::new(0) })))
+        let bulk = (0..n.max(1)).map(|_| peer_builder().build()).collect::<Result<_, _>>()?;
+        Ok(PeerClient(Arc::new(PeerInner { clients, bulk, next: AtomicUsize::new(0) })))
     }
 
     /// Wraps one existing client (tests).
     pub fn single(c: reqwest::Client) -> PeerClient {
-        PeerClient(Arc::new(PeerInner { clients: vec![c], next: AtomicUsize::new(0) }))
+        PeerClient(Arc::new(PeerInner { clients: vec![c], bulk: Vec::new(), next: AtomicUsize::new(0) }))
     }
 
     pub fn pick(&self) -> &reqwest::Client {
-        let c = &self.0.clients;
+        Self::pick_of(&self.0.clients, &self.0.next)
+    }
+
+    /// The client for a call to `path` (bulk downloads on their own
+    /// connections).
+    pub fn for_path(&self, path: &str) -> &reqwest::Client {
+        if !self.0.bulk.is_empty() && is_bulk(path) {
+            return Self::pick_of(&self.0.bulk, &self.0.next);
+        }
+        self.pick()
+    }
+
+    fn pick_of<'a>(c: &'a [reqwest::Client], next: &AtomicUsize) -> &'a reqwest::Client {
         if c.len() == 1 {
             return &c[0];
         }
-        &c[self.0.next.fetch_add(1, Ordering::Relaxed) % c.len()]
+        &c[next.fetch_add(1, Ordering::Relaxed) % c.len()]
     }
 }
 
@@ -520,6 +844,16 @@ impl std::ops::Deref for PeerClient {
     }
 }
 
+/// Peer h2 receive windows. A response the entry node's client doesn't
+/// read keeps its unread bytes, at most one stream window, out of the
+/// connection window until [`stall::Watched`] drops it. 1 MiB per stream /
+/// 64 MiB per connection takes 64 such responses per connection (x
+/// connections per peer) to stall it, while one stream still moves ~5 GB/s
+/// at LAN RTTs. (Was 4 MiB / 64 MiB: 16 unread exports stalled a
+/// connection.)
+pub const PEER_STREAM_WINDOW: u32 = 1 << 20;
+pub const PEER_CONNECTION_WINDOW: u32 = 64 << 20;
+
 /// Peers speak h2c (the listener is HTTP/1 + HTTP/2 auto). With HTTP/1.1,
 /// forwarding ~10k writes/s at ~100 ms each needed ~1k concurrent
 /// connections per peer: beyond the 256 pooled ones every request opened and
@@ -528,8 +862,8 @@ impl std::ops::Deref for PeerClient {
 fn peer_builder() -> reqwest::ClientBuilder {
     base("peer")
         .http2_prior_knowledge()
-        .http2_initial_stream_window_size(4 << 20)
-        .http2_initial_connection_window_size(64 << 20)
+        .http2_initial_stream_window_size(PEER_STREAM_WINDOW)
+        .http2_initial_connection_window_size(PEER_CONNECTION_WINDOW)
         // a half-open connection would otherwise black-hole every forward on
         // it until each one's TTFB deadline: PING every 10 s, idle or not,
         // and drop the connection after 5 s without an answer
@@ -739,6 +1073,47 @@ mod tests {
         assert!(h1_connects(ROLE) <= 4, "{} connects", h1_connects(ROLE));
         let waits = crate::metrics::HTTP_CLIENT_POOL_WAITS.with_label_values(&[ROLE]).get();
         assert!(waits > 0, "128 requests over 4 connections waited");
+    }
+
+    /// An upstream that answers before the request body is uploaded: the
+    /// connection is not pooled (the next request on it would wait behind
+    /// that upload), and it closes once the upload ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h1_early_answer_during_upload_is_not_pooled() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use futures::StreamExt;
+        const ROLE: &str = "test-h1-early";
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 64 << 10];
+                    let _ = s.read(&mut buf).await; // the head (and whatever came with it)
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await;
+                    while s.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+                });
+            }
+        });
+        let (go, wait) = tokio::sync::oneshot::channel::<()>();
+        let upload = futures::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"part one")) }).chain(
+            futures::stream::once(async move {
+                let _ = wait.await;
+                Ok(bytes::Bytes::from_static(b"part two"))
+            }),
+        );
+        let mut req = axum::http::Request::new(axum::body::Body::from_stream(upload));
+        *req.method_mut() = axum::http::Method::POST;
+        *req.uri_mut() = "/upload".parse().unwrap();
+        let r = h1::send(ROLE, &authority, req).await.unwrap();
+        let b = axum::body::to_bytes(axum::body::Body::new(r.into_body()), usize::MAX).await.unwrap();
+        assert_eq!(&b[..], b"ok");
+        let host = h1::host(&authority);
+        assert_eq!(host.idle_connections(), 0, "pooled while its upload is still going");
+        // a new request gets a connection of its own at once
+        let r = tokio::time::timeout(Duration::from_secs(2), h1::send(ROLE, &authority, h1_get("/next"))).await;
+        assert!(r.expect("waited behind the upload").is_ok());
+        drop(go);
     }
 
     /// A body dropped part-way (the client went away) closes its connection,

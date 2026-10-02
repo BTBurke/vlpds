@@ -1,6 +1,8 @@
 //! Proxy fast path (src/xrpc/proxy.rs caches): service JWTs are reused per
 //! (iss, aud, lxm, signing key), so a key rotation stops the reuse of tokens
-//! signed by the old key once the account cache refreshes.
+//! signed by the old key once the account cache refreshes. Also the
+//! proxy's limits: per-account requests in flight, clients that stop
+//! reading, account-load failures.
 
 use crate::common::*;
 use axum::extract::{Request, State};
@@ -220,4 +222,153 @@ async fn preflights_stay_local() {
     assert_eq!(h.get("access-control-allow-headers").unwrap(), "authorization,atproto-accept-labelers");
     assert_eq!(h.get("access-control-max-age").unwrap(), "86400");
     assert!(seen.lock().is_empty(), "a preflight reached the AppView");
+}
+
+/// An upstream for the limit tests: `/xrpc/app.bsky.test.slow` streams a
+/// chunk every 50 ms forever, `big` is 9 MiB and `small` 64 KiB (both with
+/// a Content-Length). Returns its `host:port`.
+async fn limits_upstream() -> String {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let authority = l.local_addr().unwrap().to_string();
+    let router = axum::Router::new().fallback(|req: Request| async move {
+        match req.uri().path() {
+            "/xrpc/app.bsky.test.slow" => {
+                let s = futures::stream::unfold((), |_| async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Some((Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"chunk ")), ()))
+                });
+                axum::body::Body::from_stream(s)
+            }
+            "/xrpc/app.bsky.test.big" => axum::body::Body::from(vec![b'b'; 9 << 20]),
+            _ => axum::body::Body::from(vec![b's'; 64 << 10]),
+        }
+    });
+    tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+    authority
+}
+
+/// One account can't hold more than MAX_IN_FLIGHT_PER_ACCOUNT proxied
+/// requests (bodies included): past it 429, and finished ones free their
+/// slots. (Without it one account's unread responses could hold most of
+/// the AppView pool.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxied_requests_in_flight_are_capped_per_account() {
+    let authority = limits_upstream().await;
+    let s = TestServer::spawn_with(|c| {
+        c.appview = Some((format!("http://{authority}"), APPVIEW_DID.into()));
+        c.dev_mode = true;
+    })
+    .await;
+    let a = s.create_account("capped").await;
+    let b = s.create_account("uncapped").await;
+    let http = reqwest::Client::new();
+    let get = |tok: String, nsid: &'static str| {
+        let (http, url) = (http.clone(), format!("{}/xrpc/{nsid}", s.url));
+        async move { http.get(url).bearer_auth(tok).send().await.unwrap() }
+    };
+    let max = 64; // proxy::MAX_IN_FLIGHT_PER_ACCOUNT
+    let held = futures::future::join_all((0..max).map(|_| get(a.access.clone(), "app.bsky.test.slow"))).await;
+    assert!(held.iter().all(|r| r.status() == 200));
+    let r = get(a.access.clone(), "app.bsky.test.small").await;
+    assert_eq!(r.status(), 429);
+    assert_eq!(r.json::<J>().await.unwrap()["error"], "RateLimitExceeded");
+    // other accounts are not affected
+    assert_eq!(get(b.access.clone(), "app.bsky.test.small").await.status(), 200);
+    // done (the clients went away): the slots come back
+    drop(held);
+    let t = Instant::now();
+    loop {
+        let r = get(a.access.clone(), "app.bsky.test.small").await;
+        if r.status() == 200 {
+            assert_eq!(r.bytes().await.unwrap().len(), 64 << 10);
+            break;
+        }
+        assert!(t.elapsed() < Duration::from_secs(10), "slots not freed: {}", r.status());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A client that sends a proxied request and never reads the response
+/// must not keep the upstream connection: a small response is read whole
+/// and its connection pooled at once; a large one is dropped (and its
+/// connection closed) once the client hasn't taken any of it for the
+/// write-stall deadline. Before, both held a pooled AppView connection for
+/// as long as the client kept the socket open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unread_proxied_responses_free_upstream_connections() {
+    use tokio::io::AsyncWriteExt;
+    let authority = limits_upstream().await;
+    let s = TestServer::spawn_with(|c| {
+        c.appview = Some((format!("http://{authority}"), APPVIEW_DID.into()));
+        c.dev_mode = true;
+    })
+    .await;
+    let a = s.create_account("staller").await;
+    let host = vlpds::http::h1::host(&authority);
+    let stall = |nsid: &'static str| {
+        let (addr, tok) = (s.addr, a.access.clone());
+        async move {
+            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let req = format!("GET /xrpc/{nsid} HTTP/1.1\r\nhost: pds.test\r\nauthorization: Bearer {tok}\r\n\r\n");
+            sock.write_all(req.as_bytes()).await.unwrap();
+            sock // never read
+        }
+    };
+    let wait = |what: &str, ok: &dyn Fn() -> bool| {
+        let t = Instant::now();
+        while !ok() {
+            assert!(t.elapsed() < Duration::from_secs(10), "{what}: open {} idle {}", host.open_connections(), host.idle_connections());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let _small = stall("app.bsky.test.small").await;
+    wait("small response pooled", &|| host.open_connections() == 1 && host.idle_connections() == 1);
+    let _big = stall("app.bsky.test.big").await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(host.idle_connections(), 0, "the unread response holds its connection");
+    assert_eq!(host.open_connections(), 1);
+    let limit = Duration::from_millis(1200);
+    vlpds::http::stall::set_limit(limit);
+    let dropped = vlpds::http::stall::sweep_now();
+    vlpds::http::stall::set_limit(vlpds::http::stall::WRITE_STALL);
+    assert!(dropped >= 1, "{dropped}");
+    wait("stalled response's connection closed", &|| host.open_connections() == 0);
+}
+
+/// Only a missing account is 403 AccountNotFound: an account whose signing
+/// key can't be unwrapped (here: a node without its KEK) is a server error
+/// the client may retry, not "account not found".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_load_failures_are_not_account_not_found() {
+    use vlpds::secrets::{KekBytes, KekConfig};
+    let (_seen, av_url) = spawn_appview().await;
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let node = |kek: KekBytes| {
+        let (store, av_url) = (store.clone(), av_url.clone());
+        TestServer::spawn_with(move |c| {
+            c.memory_store = Some(store);
+            c.shards = 4;
+            c.kek = KekConfig { local: Some(kek), ..Default::default() };
+            c.appview = Some((av_url, APPVIEW_DID.into()));
+            c.dev_mode = true;
+            c.cluster = Some(vlpds::cluster::ClusterConfig {
+                node_id: "kek".into(),
+                addr: c.public_url.clone(),
+                shards: 4,
+                ttl: Duration::from_millis(1500),
+                renew_every: Duration::from_millis(100),
+                skew: Duration::from_millis(300),
+                ..Default::default()
+            });
+        })
+    };
+    let a = node(KekBytes::random()).await;
+    let u = a.create_account("kekless").await;
+    a.app.log.checkpoint_all().await;
+    vlpds::server::shutdown(&a.app).await;
+    let b = node(KekBytes::random()).await;
+    let r = b.xrpc.get("app.bsky.feed.getTimeline", &[], &u.auth()).await;
+    assert!(r.status >= 500, "{r:?}");
+    assert_ne!(r.json["error"], "AccountNotFound", "{r:?}");
+    vlpds::server::shutdown(&b.app).await;
 }

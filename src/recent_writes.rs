@@ -23,6 +23,11 @@
 //! AppView rev at or above `head` (nearly every request) is answered from
 //! the entry with no store read; one at or above `base` from `recs`; below
 //! `base` (or no entry) the caller reads the store and [`fill`]s the entry.
+//! A read that finds more than [`MAX_RECS`] records above the AppView's rev
+//! (an AppView lagging behind a busy repo) keeps only the oldest of them
+//! while scanning, and its answer is kept with the entry for that rev until
+//! the repo changes ([`fill_lagging`]): an AppView that lags polls with the
+//! same rev, and each poll would otherwise scan the repo again.
 //! Entries are valid only in the partition epoch they were made in (another
 //! node may have written the repo since), and whole-repo changes (import,
 //! delete, creation) drop them ([`invalidate`]). Loads that raced a change
@@ -79,11 +84,14 @@ struct Entry {
     recs: Vec<Rec>,
     bytes: usize,
     touched: Instant,
+    /// the answer for one rev below `base` (`fill_lagging`), while `head`
+    /// is unchanged
+    lagging: Option<(u64, Vec<Rec>)>,
 }
 
 impl Entry {
     fn new(part: Part, head: u64, base: u64, old_exists: bool) -> Entry {
-        Entry { part, head, base, old_exists, recs: Vec::new(), bytes: 0, touched: Instant::now() }
+        Entry { part, head, base, old_exists, recs: Vec::new(), bytes: 0, touched: Instant::now(), lagging: None }
     }
 
     fn remove(&mut self, path: &str) {
@@ -190,7 +198,11 @@ pub fn lookup(did: &str, part: Part, since: u64) -> Since {
         return Since::Nothing;
     }
     if since < e.base {
-        return Since::Unknown;
+        return match &e.lagging {
+            Some((s, r)) if *s == since && r.is_empty() => Since::Nothing,
+            Some((s, r)) if *s == since => Since::Records(r.clone()),
+            _ => Since::Unknown,
+        };
     }
     answer(&e.recs, since, e.old_exists)
 }
@@ -231,6 +243,32 @@ pub fn fill(did: &str, part: Part, gen: u64, read: Read, since: u64) -> Since {
     }
     m.insert(did.into(), e);
     out
+}
+
+/// Keeps `answer`, the reference's answer for `since` read from the store
+/// when more than [`MAX_RECS`] records were above it (`head`: the repo's
+/// rev as read), until the repo changes. Like [`fill`], skipped if the repo
+/// changed since `gen` was taken. An entry for the same head keeps its
+/// records; otherwise the entry restarts at `head` (nothing above it).
+pub fn fill_lagging(did: &str, part: Part, gen: u64, head: u64, since: u64, answer: Vec<Rec>) {
+    let i = shard(did);
+    let mut m = LOG.shards[i].lock();
+    if LOG.gens[i].load(Ordering::SeqCst) != gen {
+        return;
+    }
+    if !m.contains_key(did) {
+        make_room(&mut m);
+    }
+    let e = m
+        .entry(did.into())
+        .and_modify(|e| {
+            if e.part != part || e.head != head {
+                *e = Entry::new(part, head, head, true);
+            }
+        })
+        .or_insert_with(|| Entry::new(part, head, head, true));
+    e.touched = Instant::now();
+    e.lagging = Some((since, answer));
 }
 
 /// Drops `did`'s entry (its records changed other than by a commit).
@@ -285,6 +323,7 @@ impl Commit {
         };
         e.head = self.rev;
         e.touched = Instant::now();
+        e.lagging = None;
         match self.ops {
             Some(ops) => {
                 for (path, new) in ops {
@@ -372,5 +411,31 @@ mod tests {
         fill(did, (crate::slots::ShardId(1), 1), g, Read { head: 60, base: 60, old_exists: true, recs: vec![] }, 60);
         assert!(matches!(lookup(did, (crate::slots::ShardId(1), 1), 70), Since::Nothing));
         assert!(matches!(lookup(did, (crate::slots::ShardId(1), 1), 69), Since::Unknown));
+    }
+
+    /// The answer for a rev with too many records above it is kept until
+    /// the next commit (a lagging AppView polls with the same rev).
+    #[test]
+    fn lagging_answer_kept_until_the_repo_changes() {
+        let did = "did:plc:rwtest3";
+        let part = (crate::slots::ShardId(1), 1);
+        invalidate(did);
+        let rec = |p: &str, rev| Rec { path: p.into(), rev, cid: cid(rev as u8), bytes: None };
+        let g = generation(did);
+        fill_lagging(did, part, g, 100, 5, vec![rec("app.bsky.feed.like/a", 6)]);
+        assert_eq!(paths(lookup(did, part, 5)), vec!["app.bsky.feed.like/a"]);
+        assert!(matches!(lookup(did, part, 4), Since::Unknown), "only that rev");
+        assert!(matches!(lookup(did, part, 100), Since::Nothing));
+        fill_lagging(did, part, generation(did), 100, 7, vec![]);
+        assert!(matches!(lookup(did, part, 7), Since::Nothing), "an empty answer (sanity check) is kept too");
+        // a commit drops it
+        commit(did, 100, 110, vec![("app.bsky.feed.post/b", true)]).apply();
+        assert!(matches!(lookup(did, part, 7), Since::Unknown));
+        assert_eq!(paths(lookup(did, part, 100)), vec!["app.bsky.feed.post/b"]);
+        // a stale generation caches nothing
+        let g = generation(did);
+        commit(did, 110, 120, vec![]).apply();
+        fill_lagging(did, part, g, 110, 9, vec![rec("x/y", 10)]);
+        assert!(matches!(lookup(did, part, 9), Since::Unknown));
     }
 }

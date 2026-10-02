@@ -10,7 +10,12 @@
 //! through untouched, compressed or not; one with them is buffered,
 //! decoded, munged as the reference does and re-serialized, with
 //! `Atproto-Upstream-Lag` (ms since the oldest merged post/profile write).
-//! DESIGN.md "Read-after-write".
+//! Like the reference, any `atproto-proxy` target's response is munged, so
+//! the upstream is untrusted here: at most [`MAX_CODINGS`] codings, zstd
+//! windows of at most 2^[`ZSTD_WINDOW_LOG_MAX`], 10 MiB decoded, decoding
+//! and parsing of larger bodies on blocking threads (at most one per core),
+//! and at most [`MUNGE_BUDGET`] decoded bytes being munged at once (a
+//! response past it is returned unmunged). DESIGN.md "Read-after-write".
 
 use super::*;
 use crate::recent_writes::{self, Rec, Since};
@@ -155,9 +160,24 @@ fn check_accept_encoding(client: Option<&header::HeaderValue>) -> XResult<()> {
     Ok(())
 }
 
+/// Codings decoded per body at most (`gzip, gzip, ...` chains multiply the
+/// work; real upstreams apply one).
+pub(super) const MAX_CODINGS: usize = 2;
+/// zstd's default limit (2^27, a 128 MiB window allocation per decoder) is
+/// far above what a JSON response needs; 2^23 (8 MiB) is the window the
+/// zstd CLI and HTTP encoders use up to level 19.
+pub(super) const ZSTD_WINDOW_LOG_MAX: u32 = 23;
+/// Decoded bytes of responses being munged at once (their parsed form is
+/// ~10x): past it a response with records to merge is returned as is.
+pub(super) const MUNGE_BUDGET: usize = 32 << 20;
+/// Bodies at most this size (identity) are parsed and re-serialized on the
+/// IO thread; larger or compressed ones on a blocking thread.
+const INLINE_BYTES: usize = 64 << 10;
+
 /// Codings applied to a body, in order (Content-Encoding lists them in the
-/// order they were applied); None if one can't be decoded.
-fn codings(h: &HeaderMap) -> Option<Vec<String>> {
+/// order they were applied); None if one can't be decoded, or there are
+/// more than [`MAX_CODINGS`].
+pub(super) fn codings(h: &HeaderMap) -> Option<Vec<String>> {
     let mut out = Vec::new();
     for v in h.get_all(header::CONTENT_ENCODING) {
         for c in v.to_str().ok()?.split(',') {
@@ -165,7 +185,7 @@ fn codings(h: &HeaderMap) -> Option<Vec<String>> {
             if c.is_empty() || c == "identity" {
                 continue;
             }
-            if !decodable(&c) {
+            if !decodable(&c) || out.len() == MAX_CODINGS {
                 return None;
             }
             out.push(c);
@@ -174,28 +194,50 @@ fn codings(h: &HeaderMap) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Decodes `body`, at most [`MAX_RESPONSE_BYTES`] out (the reference bounds
-/// the decoded size too).
-fn decode(body: Bytes, codings: &[String]) -> Result<Bytes, String> {
+/// Decodes `body`, at most `max` bytes out after every coding (the
+/// reference bounds the decoded size too).
+pub(super) fn decode(body: Bytes, codings: &[String], max: usize) -> Result<Bytes, String> {
     use std::io::Read;
+    if codings.len() > MAX_CODINGS {
+        return Err("too many content-encodings".into());
+    }
     let mut cur = body;
     for c in codings.iter().rev() {
         let mut out = Vec::new();
-        let limit = MAX_RESPONSE_BYTES as u64 + 1;
+        let limit = max as u64 + 1;
         let r = match c.as_str() {
             "gzip" | "x-gzip" => flate2::read::MultiGzDecoder::new(&cur[..]).take(limit).read_to_end(&mut out),
             "deflate" => flate2::read::ZlibDecoder::new(&cur[..]).take(limit).read_to_end(&mut out),
             "br" => brotli_decompressor::Decompressor::new(&cur[..], 4096).take(limit).read_to_end(&mut out),
-            "zstd" => zstd::stream::read::Decoder::new(&cur[..]).and_then(|d| d.take(limit).read_to_end(&mut out)),
+            "zstd" => zstd::stream::read::Decoder::new(&cur[..]).and_then(|mut d| {
+                d.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
+                d.take(limit).read_to_end(&mut out)
+            }),
             other => return Err(format!("unsupported content-encoding: \"{other}\"")),
         };
         r.map_err(|_| "unable to decode request body".to_string())?;
-        if out.len() > MAX_RESPONSE_BYTES {
+        if out.len() > max {
             return Err("upstream response too large".into());
         }
         cur = Bytes::from(out);
     }
     Ok(cur)
+}
+
+/// Blocking threads decoding/parsing munged responses at once.
+static CPU: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(4, |n| n.get())));
+/// [`MUNGE_BUDGET`] in KiB permits.
+static MEM: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| tokio::sync::Semaphore::new(MUNGE_BUDGET >> 10));
+
+/// Runs `f` here when `inline`, else on a blocking thread (one per core at
+/// most).
+async fn cpu<T: Send + 'static>(inline: bool, f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    if inline {
+        return Ok(f());
+    }
+    let _p = CPU.acquire().await.map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(f).await.map_err(|e| e.to_string())
 }
 
 // Local records
@@ -282,33 +324,65 @@ async fn records_since(app: &App, did: &str, part: recent_writes::Part, since: u
         recent_writes::fill(did, part, gen, read, since);
         return Ok(Vec::new());
     }
-    // no rev index: scan the repo's records for those written after `since`
+    // no rev index: scan the repo's records for those written after `since`,
+    // keeping only the oldest MAX_RECS of them (a max-heap on (rev, path))
     let prefix = state::record_prefix(did);
     let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await?;
-    let (mut recs, mut old, mut top) = (Vec::new(), false, head.rev.0);
+    let mut kept = std::collections::BinaryHeap::<ByRev>::with_capacity(recent_writes::MAX_RECS + 1);
+    let (mut above, mut old, mut top) = (0usize, false, head.rev.0);
     while let Some(kv) = iter.next().await? {
         let rev = state::record_value_rev(&kv.value);
         if rev <= since {
             old = true;
             continue;
         }
+        above += 1;
+        top = top.max(rev);
         let path = std::str::from_utf8(&kv.key[prefix.len()..])?;
+        if kept.len() == recent_writes::MAX_RECS && kept.peek().is_some_and(|m| (rev, path) >= (m.0.rev, &*m.0.path)) {
+            continue;
+        }
         let (cid, bytes) = state::decode_record_value(&kv.value)?;
         let bytes = recent_writes::keeps_bytes(path).then(|| Bytes::copy_from_slice(&bytes));
-        top = top.max(rev);
-        recs.push(Rec { path: path.into(), rev, cid, bytes });
+        kept.push(ByRev(Rec { path: path.into(), rev, cid, bytes }));
+        if kept.len() > recent_writes::MAX_RECS {
+            kept.pop();
+        }
     }
-    recs.sort_by(|a, b| a.rev.cmp(&b.rev).then_with(|| a.path.cmp(&b.path)));
-    if recs.len() <= recent_writes::MAX_RECS {
+    let mut recs: Vec<Rec> = kept.into_sorted_vec().into_iter().map(|r| r.0).collect();
+    if above <= recent_writes::MAX_RECS {
         let read = recent_writes::Read { head: top, base: since, old_exists: old, recs };
         return Ok(match recent_writes::fill(did, part, gen, read, since) {
             Since::Records(r) => r,
             _ => Vec::new(),
         });
     }
-    // too many to keep: answer without caching
+    // too many to keep them all: the answer for `since` is kept until the
+    // repo changes (an AppView that lags polls with the same rev)
     recs.truncate(recent_writes::LIMIT);
-    Ok(if old { recs } else { Vec::new() })
+    let answer = if old { recs } else { Vec::new() };
+    recent_writes::fill_lagging(did, part, gen, top, since, answer.clone());
+    Ok(answer)
+}
+
+/// A record ordered by (rev, path), as [`recent_writes`] orders them.
+struct ByRev(Rec);
+
+impl PartialEq for ByRev {
+    fn eq(&self, o: &Self) -> bool {
+        self.cmp(o).is_eq()
+    }
+}
+impl Eq for ByRev {}
+impl PartialOrd for ByRev {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for ByRev {
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        (self.0.rev, &*self.0.path).cmp(&(o.0.rev, &*o.0.path))
+    }
 }
 
 // Views of local records (reference LocalViewer)
@@ -788,12 +862,25 @@ pub(super) async fn proxy(app: &App, target: &Target<'_>, mut f: Forward<'_>, ac
         COUNTERS.unchanged.inc();
         return Ok(passthrough(parts, body)); // an encoding we can't read (we didn't ask for it)
     };
-    let raw = axum::body::to_bytes(body, usize::MAX)
+    let raw = axum::body::to_bytes(body, MAX_RESPONSE_BYTES)
         .await
         .map_err(|e| upstream_failure(&e.to_string()))?;
     let original = |raw: Bytes| passthrough(parts.clone(), Body::from(raw));
-    let decoded = decode(raw.clone(), &codings).map_err(|e| upstream_failure(&e))?;
-    let Ok(v) = serde_json::from_slice::<J>(&decoded) else {
+    let inline = codings.is_empty() && raw.len() <= INLINE_BYTES;
+    let r = raw.clone();
+    let decoded = cpu(inline, move || decode(r, &codings, MAX_RESPONSE_BYTES))
+        .await
+        .and_then(|r| r)
+        .map_err(|e| upstream_failure(&e))?;
+    // its parsed form stays in memory while munging (AppView calls)
+    let kib = (decoded.len() >> 10).max(1) as u32;
+    let Ok(_mem) = MEM.try_acquire_many(kib) else {
+        tracing::debug!(did, bytes = decoded.len(), "read-after-write: over the munge budget, returned as is");
+        COUNTERS.unchanged.inc();
+        return Ok(original(raw));
+    };
+    let inline = decoded.len() <= INLINE_BYTES;
+    let Ok(Ok(v)) = cpu(inline, move || serde_json::from_slice::<J>(&decoded)).await else {
         COUNTERS.unchanged.inc();
         return Ok(original(raw));
     };
@@ -802,7 +889,8 @@ pub(super) async fn proxy(app: &App, target: &Target<'_>, mut f: Forward<'_>, ac
     match munge(kind, &viewer, v, &local).await {
         Ok(v) => {
             COUNTERS.munged.inc();
-            Ok(munged_response(&v, local.lag()))
+            let lag = local.lag();
+            cpu(inline, move || munged_response(&v, lag)).await.map_err(|e| upstream_failure(&e))
         }
         Err(Abort) => {
             COUNTERS.unchanged.inc();
@@ -918,14 +1006,56 @@ mod tests {
         let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         e.write_all(b"{\"a\":1}").unwrap();
         let gz = Bytes::from(e.finish().unwrap());
-        assert_eq!(&decode(gz.clone(), &["gzip".into()]).unwrap()[..], b"{\"a\":1}");
-        assert!(decode(Bytes::from_static(b"nope"), &["gzip".into()]).is_err());
+        let m = MAX_RESPONSE_BYTES;
+        assert_eq!(&decode(gz.clone(), &["gzip".into()], m).unwrap()[..], b"{\"a\":1}");
+        assert!(decode(Bytes::from_static(b"nope"), &["gzip".into()], m).is_err());
         let zs = Bytes::from(zstd::encode_all(&b"{}"[..], 1).unwrap());
-        assert_eq!(&decode(zs, &["zstd".into()]).unwrap()[..], b"{}");
+        assert_eq!(&decode(zs, &["zstd".into()], m).unwrap()[..], b"{}");
         let mut br = Vec::new();
         brotli::BrotliCompress(&mut &b"{\"b\":2}"[..], &mut br, &Default::default()).unwrap();
-        assert_eq!(&decode(Bytes::from(br), &["br".into()]).unwrap()[..], b"{\"b\":2}");
-        assert!(decode(Bytes::from_static(b"nope"), &["br".into()]).is_err());
+        assert_eq!(&decode(Bytes::from(br), &["br".into()], m).unwrap()[..], b"{\"b\":2}");
+        assert!(decode(Bytes::from_static(b"nope"), &["br".into()], m).is_err());
+    }
+
+    /// Untrusted upstream bodies decode within bounds: a zstd frame asking
+    /// for a window above 2^23 is refused (not a 128 MiB+ allocation), a
+    /// chain of more than two codings isn't decoded at all, and a bomb
+    /// stops at the decoded limit.
+    #[test]
+    fn decoding_is_bounded() {
+        use std::io::Write;
+        // window log 27 (zstd's default maximum): refused here
+        let data = vec![b'a'; 1 << 20];
+        let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        enc.set_parameter(zstd::stream::raw::CParameter::WindowLog(27)).unwrap();
+        enc.include_contentsize(false).unwrap();
+        enc.write_all(&data).unwrap();
+        let big_window = Bytes::from(enc.finish().unwrap());
+        assert!(decode(big_window, &["zstd".into()], MAX_RESPONSE_BYTES).is_err());
+        // window log 23: fine
+        let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        enc.set_parameter(zstd::stream::raw::CParameter::WindowLog(23)).unwrap();
+        enc.write_all(&data).unwrap();
+        let ok = Bytes::from(enc.finish().unwrap());
+        assert_eq!(decode(ok, &["zstd".into()], MAX_RESPONSE_BYTES).unwrap().len(), 1 << 20);
+        // coding chains: two decode, three are refused (header and decode)
+        let gz = |b: &[u8]| {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            e.write_all(b).unwrap();
+            e.finish().unwrap()
+        };
+        let twice = Bytes::from(gz(&gz(b"{}")));
+        assert_eq!(&decode(twice, &["gzip".into(), "gzip".into()], 1024).unwrap()[..], b"{}");
+        let mut h = HeaderMap::new();
+        h.insert(header::CONTENT_ENCODING, header::HeaderValue::from_static("gzip, gzip"));
+        assert_eq!(codings(&h).map(|c| c.len()), Some(2));
+        h.insert(header::CONTENT_ENCODING, header::HeaderValue::from_static("gzip, gzip, gzip"));
+        assert_eq!(codings(&h), None);
+        assert!(decode(Bytes::new(), &["gzip".into(), "gzip".into(), "gzip".into()], 1024).is_err());
+        // a bomb: 64 MiB of zeros in ~64 KiB, stopped at the limit
+        let bomb = Bytes::from(gz(&vec![0u8; 64 << 20]));
+        assert!(bomb.len() < 1 << 20);
+        assert_eq!(decode(bomb, &["gzip".into()], MAX_RESPONSE_BYTES).unwrap_err(), "upstream response too large");
     }
 
     #[test]

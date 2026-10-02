@@ -128,7 +128,7 @@ impl Credentials {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_rpc(lxm, aud),
             Credentials::AppPassword { privileged, .. } => {
-                *privileged || !lxm.starts_with("chat.bsky.")
+                *privileged || !lxm.get(..10).is_some_and(|p| p.eq_ignore_ascii_case("chat.bsky."))
             }
             Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => false,
             _ => true,

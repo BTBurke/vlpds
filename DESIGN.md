@@ -450,9 +450,9 @@ load it should stay flat (a rising rate means pool churn).
 
 | Role | Used for | Settings |
 |---|---|---|
-| peer | forwarding, internal calls | h2c prior knowledge; 4 MiB stream / 64 MiB conn windows; PING every 10 s (also idle), dead after 5 s; TCP keepalive 30 s; nodelay; connect 1 s; 15 s total per request (client default; forwards override it with their own deadlines, 3 s to the response head); `--peer-connections` (default 4) connections per peer, round-robin |
+| peer | forwarding, internal calls | h2c prior knowledge; 1 MiB stream / 64 MiB conn windows; PING every 10 s (also idle), dead after 5 s; TCP keepalive 30 s; nodelay; connect 1 s; 15 s total per request (client default; forwards override it with their own deadlines, 3 s to the response head); `--peer-connections` (default 4) connections per peer, round-robin, and as many again for bulk downloads (forwarded getRepo, getBlob, getBlocks) |
 | public | PLC, requestCrawl, Cloud KMS (5 s per call) | h2 by ALPN on https, HTTP/1.1 on http with 1,024 idle per host; idle close 60 s; h2 PING 20 s / 10 s; TCP keepalive; connect 5 s, read 30 s |
-| proxy | configured AppView / report service | `http://`: hyper HTTP/1.1 connections, one pool per host with a slot per IO thread: a connection goes back to the slot of the thread that finished its body, a request takes from its own slot, else from another slot, else connects; at most 1,024 connections per host (idle + busy; past that a request waits for one, `vlpds_http_client_pool_waits_total`); idle close 60 s, retry once if a reused connection was closed before the request went out; `https://`: public's settings as one client per IO thread. No read timeout: the proxy arms a 10 s head deadline and a 30 s body-idle timer only while the upstream makes it wait. Responses stream through unbuffered; compressed ones as the upstream encoded them (Content-Encoding/-Length kept, never decoded or re-compressed; the client's Accept-Encoding is forwarded, for the read-after-write methods only its decodable codings: §8); a client that goes away mid-body closes the upstream connection. CORS preflights are answered locally (no auth, no upstream) |
+| proxy | configured AppView / report service | `http://`: hyper HTTP/1.1 connections, one pool per host with a slot per IO thread: a connection goes back to the slot of the thread that finished its body, a request takes from its own slot, else from another slot, else connects; at most 1,024 connections per host (idle + busy; past that a request waits for one, `vlpds_http_client_pool_waits_total`); idle close 60 s, retry once if a reused connection was closed before the request went out; `https://`: public's settings as one client per IO thread. No read timeout: the proxy arms a 10 s head deadline and a 30 s body-idle timer only while the upstream makes it wait. Responses up to 128 KiB (by Content-Length) are read whole before the client gets them (the connection goes back at once); larger ones stream through unbuffered under the write-stall deadline (below); compressed ones as the upstream encoded them (Content-Encoding/-Length kept, never decoded or re-compressed; the client's Accept-Encoding is forwarded, for the read-after-write methods only its decodable codings: §8); a client that goes away mid-body closes the upstream connection. Request bodies go upstream as the client encoded them (the server's request decompression covers local routes only), and an h1 connection whose upload is still going when its response ends is not pooled. At most 64 proxied requests per account in flight on its owner (until each body is done); more are 429 `RateLimitExceeded`. CORS preflights are answered locally (no auth, no upstream) |
 | guarded | user-derived URLs: did:web, handle `.well-known`, OAuth client metadata, lexicons, DID-doc service endpoints | public's settings, 32 idle per host, plus a resolver that drops non-public addresses (outside dev mode); pair with `check_outbound_url` |
 | S3 (object_store) | log and state stores (separate pools) | HTTP/1.1 only, 256 idle per host, idle close 15 s (S3 closes at ~20 s), connect 2 s, 30 s total |
 
@@ -485,6 +485,26 @@ only. There is no separate internal listener yet: the peer address
 splitting them needs a second advertised address. `/metrics` and
 `/debug/pprof` are on `--metrics-listen` (default `127.0.0.1:9583`; on the
 app port only with `--dev-mode` or `--metrics-listen app`).
+
+**Clients that stop reading.** The server polls a response body only when
+it can send more, so a client that keeps its h2 window at zero (or never
+reads its socket) leaves the body unpolled for as long as it likes, and
+none of the upstream deadlines see it. For a forwarded body that pinned the
+unread bytes, up to a stream window, in the peer connection's flow-control
+window: 16 unread getRepo exports (4 MiB windows; getRepo is not
+rate-limited) stalled every forward on a connection, 64 all of a node's
+forwards to that peer (PINGs still passed). For a proxied body it held an
+AppView connection (h1 pool slot or h2 window share) indefinitely. Now
+(`http::stall`): bodies streamed from an upstream (forwards, proxied
+responses not buffered) are watched from the response head on; a sweeper
+thread (1 s) drops the upstream body of one whose client hasn't taken the
+next chunk within 30 s (h2 resets the peer stream, freeing its window; an
+h1 connection closes), and a later poll fails the client's stream. A
+client reading at any pace polls far more often. Bulk downloads use their
+own peer connections, and 1 MiB stream windows take 64 unread bodies to
+fill a connection window. Cost: one allocation and an uncontended shard
+lock per watched body, an uncontended lock per chunk; small proxied
+responses (the common case) are buffered and not watched.
 
 Server (`server::serve`, HTTP/1.1 + h2c auto): h1 header read timeout 30 s
 (slowloris; also the idle keep-alive bound), h2 windows as above, 1,024
@@ -584,10 +604,24 @@ valid only in the partition epoch they were made in. A request then costs:
   entry is created empty) or, when the AppView lags behind, one scan of the
   repo's records for revs above it, which fills the entry so later requests
   hit it. Loads that raced a commit are not cached (per-shard generations).
+  The scan keeps only the oldest 32 records above the rev (a bounded heap;
+  it used to collect every one). With more than 32 above it (an AppView
+  lagging behind a busy repo) the entry can't hold them all: the answer for
+  that rev is kept with the entry until the repo's next commit, so a
+  lagging AppView polling with the same rev costs one scan, not one per
+  request.
 
 Only a response with records to merge is buffered (10 MiB bound on the
 wire and decoded), decoded (gzip, deflate, br, zstd), parsed and
-re-serialized; for these methods the client's Accept-Encoding is narrowed
+re-serialized. Like the reference this applies to any `atproto-proxy`
+target, so the body is untrusted: at most two codings (a longer chain is
+returned as received), zstd windows up to 2^23 (its default allows 2^27, a
+128 MiB allocation per decoder), decoding and parsing of compressed or
+larger-than-64 KiB bodies on blocking threads (one per core at most), and
+at most 32 MiB of decoded bodies being munged at once (their parsed form is
+~10x; past it a response is returned unmunged). Upstream error bodies are
+decoded too (within 256 KiB) for their error name and message, as in the
+reference. For these methods the client's Accept-Encoding is narrowed
 to codings vlpds can decode (the reference's gzip/deflate/br plus zstd, so
 the usual `gzip, deflate, br` passes as is; others such as `compress` are
 dropped, `*` = whichever of gzip/deflate/br aren't named; the reference

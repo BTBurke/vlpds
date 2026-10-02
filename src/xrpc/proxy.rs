@@ -9,8 +9,17 @@
 //!   user's repo key (iss = user DID, aud = bare service DID, lxm = nsid).
 //!   Scope checks use the `did#service_id` form, like TS.
 //! - Request and response bodies stream through; headers are allow-listed.
+//!   Request bodies are forwarded as the client encoded them (the server's
+//!   request decompression skips the proxy fallback). A response the client
+//!   stops reading is dropped after `http::stall::WRITE_STALL`; small ones
+//!   (<= [`BUFFER_SMALL`] by Content-Length) are read whole first, so the
+//!   upstream connection goes back at once whatever the client does.
+//! - At most [`MAX_IN_FLIGHT_PER_ACCOUNT`] proxied requests per account are
+//!   in flight on its owner (response bodies included); more are 429.
 //! - Upstream >= 400 responses are re-raised as XRPC errors (500 becomes 502
-//!   UpstreamFailure); connection failures and timeouts are 502 UpstreamFailure.
+//!   UpstreamFailure; error/message from its JSON body, decoded if
+//!   compressed, within [`MAX_ERROR_BYTES`]); connection failures and
+//!   timeouts are 502 UpstreamFailure.
 //!
 //! Also serves `app.bsky.actor.{get,put}Preferences` from private account
 //! state and proxies `com.atproto.moderation.createReport`.
@@ -43,6 +52,17 @@ const HEADERS_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 10 << 20;
 const SERVICE_JWT_TTL_SECS: u64 = 60;
+/// Upstream responses up to this size (Content-Length) are read whole before
+/// the client gets them: the upstream connection (an h1 pool slot, a share
+/// of an h2 window) is free at once, whatever pace the client reads at.
+const BUFFER_SMALL: u64 = 128 << 10;
+/// Upstream error bodies read for their error/message, on the wire and
+/// decoded.
+const MAX_ERROR_BYTES: usize = 256 << 10;
+/// Proxied requests in flight per account on its owner node (until each
+/// response body is done). One account could otherwise hold most of the
+/// AppView connection pool with responses its client never reads.
+pub const MAX_IN_FLIGHT_PER_ACCOUNT: u32 = 64;
 
 /// Account-management methods that must be called directly, never proxied.
 const PROTECTED_METHODS: &[&str] = &[
@@ -127,6 +147,12 @@ fn lxm_in(set: &[&str], lxm: &str) -> bool {
     set.iter().any(|m| m.eq_ignore_ascii_case(lxm))
 }
 
+/// `s` starts with `prefix`, ASCII case-insensitively (NSID checks, like
+/// [`lxm_in`]).
+fn has_prefix_ignore_case(s: &str, prefix: &str) -> bool {
+    s.get(..prefix.len()).is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+}
+
 fn valid_nsid(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     s.len() <= 317
@@ -188,7 +214,7 @@ fn default_target<'a>(app: &'a App, lxm: &str) -> XResult<Option<Target<'a>>> {
             .map(Some)
             .ok_or_else(no_service);
     }
-    if lxm.starts_with("chat.bsky.") {
+    if has_prefix_ignore_case(lxm, "chat.bsky.") {
         // DMs live on a separate service; clients must name it.
         return Err(no_service());
     }
@@ -389,24 +415,21 @@ impl UpstreamError {
                 headers.insert(name, v.clone());
             }
         }
+        // (the reference reads it unless it says it isn't JSON)
         let json_body = resp
             .headers
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(is_json_content_type);
-        let encoded = resp
-            .headers
-            .get(header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|e| !e.trim().is_empty() && !e.trim().eq_ignore_ascii_case("identity"));
+            .is_none_or(is_json_content_type);
         let (mut error, mut message) = (None, None);
-        if json_body && !encoded {
-            let buf = axum::body::to_bytes(body, usize::MAX).await;
-            if let Ok(buf) = buf {
-                if let Ok(v) = serde_json::from_slice::<J>(&buf) {
-                    error = v.get("error").and_then(|e| e.as_str()).map(String::from);
-                    message = v.get("message").and_then(|e| e.as_str()).map(String::from);
-                }
+        // decodable codings only (else the body is dropped unread); bounded
+        // on the wire and decoded
+        if let Some(codings) = read_after_write::codings(&resp.headers).filter(|_| json_body) {
+            let buf = axum::body::to_bytes(body, MAX_ERROR_BYTES).await;
+            let decoded = buf.ok().and_then(|b| read_after_write::decode(b, &codings, MAX_ERROR_BYTES).ok());
+            if let Some(v) = decoded.and_then(|b| serde_json::from_slice::<J>(&b).ok()) {
+                error = v.get("error").and_then(|e| e.as_str()).map(String::from);
+                message = v.get("message").and_then(|e| e.as_str()).map(String::from);
             }
         }
         UpstreamError { status, headers, error, message }
@@ -762,6 +785,52 @@ where
     }
 }
 
+/// The upstream response with its body as the proxy passes it on: read
+/// whole when small (Content-Length <= [`BUFFER_SMALL`]: the upstream
+/// connection is released before the client reads anything), else streamed
+/// under [`UpstreamBody`]'s limits and a write-progress deadline
+/// ([`crate::http::stall`]).
+async fn response_body<B>(r: axum::http::Response<B>) -> Result<(axum::http::response::Parts, Body), String>
+where
+    B: hyper::body::Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<BoxError>,
+{
+    let (parts, body) = r.into_parts();
+    let body = UpstreamBody::new(body);
+    let len = parts.headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+    if len.is_some_and(|n| n <= BUFFER_SMALL) {
+        let b = collect(body).await.map_err(|e| format!("upstream body: {e}"))?;
+        return Ok((parts, Body::from(b)));
+    }
+    Ok((parts, Body::new(crate::http::stall::Watched::new(body))))
+}
+
+/// A (small) body read to its end; one chunk is passed on as it is.
+async fn collect<B>(mut body: B) -> Result<Bytes, BoxError>
+where
+    B: hyper::body::Body<Data = Bytes, Error = BoxError> + Unpin,
+{
+    let mut first: Option<Bytes> = None;
+    let mut rest: Option<Vec<u8>> = None;
+    while let Some(f) = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await {
+        let Ok(d) = f?.into_data() else { continue };
+        match (&first, &mut rest) {
+            (None, _) => first = Some(d),
+            (Some(f), None) => {
+                let mut v = Vec::with_capacity(f.len() + d.len());
+                v.extend_from_slice(f);
+                v.extend_from_slice(&d);
+                rest = Some(v);
+            }
+            (Some(_), Some(v)) => v.extend_from_slice(&d),
+        }
+    }
+    Ok(match rest {
+        Some(v) => Bytes::from(v),
+        None => first.unwrap_or_default(),
+    })
+}
+
 /// Sends the request to `target` with a (cached) service-auth token (when
 /// there is an issuer, whose account `acct` is) and streams the response
 /// back.
@@ -832,10 +901,7 @@ async fn send(
             *req.headers_mut() = headers;
             let send = crate::http::h1::send("public", authority, req);
             match tokio::time::timeout(HEADERS_TIMEOUT, send).await {
-                Ok(Ok(r)) => {
-                    let (parts, body) = r.into_parts();
-                    Ok((parts, Body::new(UpstreamBody::new(body))))
-                }
+                Ok(Ok(r)) => response_body(r).await,
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(_) => Err("headers timeout".to_string()),
             }
@@ -849,10 +915,7 @@ async fn send(
                 rb = rb.body(reqwest::Body::wrap_stream(b.into_data_stream()));
             }
             match tokio::time::timeout(HEADERS_TIMEOUT, rb.send()).await {
-                Ok(Ok(r)) => {
-                    let (parts, body) = axum::http::Response::from(r).into_parts();
-                    Ok((parts, Body::new(UpstreamBody::new(body))))
-                }
+                Ok(Ok(r)) => response_body(axum::http::Response::from(r)).await,
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(_) => Err("headers timeout".to_string()),
             }
@@ -900,13 +963,13 @@ pub(super) async fn pipethrough_unauthed(
 
 /// Account checks shared by every proxied call: loads the account and
 /// rejects taken-down accounts unless the method allows them.
+/// Only a missing account is 403 `AccountNotFound`; anything else (the
+/// shard moving away, a store or KMS failure) keeps its own status, so
+/// clients retry a 503 instead of treating the account as gone.
 async fn check_takedown(app: &App, did: &str, allow_takendown: bool) -> XResult<CachedAcct> {
-    let acct = cached_account(app, did).await.map_err(|_| {
-        xerr(
-            StatusCode::FORBIDDEN,
-            "AccountNotFound",
-            "Account not found",
-        )
+    let acct = cached_account(app, did).await.map_err(|e| match e.error.as_str() {
+        "AccountNotFound" => xerr(StatusCode::FORBIDDEN, "AccountNotFound", "Account not found"),
+        _ => e,
     })?;
     if !allow_takendown && matches!(acct.status.as_deref(), Some("takendown") | Some("suspended")) {
         return Err(xerr(
@@ -916,6 +979,50 @@ async fn check_takedown(app: &App, did: &str, allow_takendown: bool) -> XResult<
         ));
     }
     Ok(acct)
+}
+
+/// In-flight proxied requests per account (by DID hash), sharded.
+static IN_FLIGHT: std::sync::LazyLock<Vec<parking_lot::Mutex<std::collections::HashMap<u64, u32>>>> =
+    std::sync::LazyLock::new(|| (0..CACHE_SHARDS).map(|_| Default::default()).collect());
+
+/// One admitted proxied request (see [`admit`]); dropped when its response
+/// body is done.
+struct InFlight(u64);
+
+impl InFlight {
+    fn shard(h: u64) -> &'static parking_lot::Mutex<std::collections::HashMap<u64, u32>> {
+        &IN_FLIGHT[(h % CACHE_SHARDS as u64) as usize]
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut m = Self::shard(self.0).lock();
+        if let Some(n) = m.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Admits one more proxied request for `did`: 429 at
+/// [`MAX_IN_FLIGHT_PER_ACCOUNT`]. Requests for an account are served by its
+/// owner, so this counts them across entry nodes.
+fn admit(did: &str) -> XResult<InFlight> {
+    let h = fixed_hash(did);
+    let mut m = InFlight::shard(h).lock();
+    let n = m.entry(h).or_insert(0);
+    if *n >= MAX_IN_FLIGHT_PER_ACCOUNT {
+        return Err(xerr(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RateLimitExceeded",
+            "Too many concurrent proxied requests for this account",
+        ));
+    }
+    *n += 1;
+    Ok(InFlight(h))
 }
 
 fn user_did(creds: &Credentials) -> XResult<&str> {
@@ -1000,6 +1107,16 @@ pub async fn fallback(State(app): AppState, req: Request) -> Response {
 }
 
 async fn proxy_request(app: &App, req: Request) -> XResult<Response> {
+    let mut slot = None;
+    let r = proxy_request_admitted(app, req, &mut slot).await;
+    match (r, slot) {
+        // the slot lasts until the response body is done
+        (Ok(r), Some(slot)) => Ok(r.map(|b| Body::new(crate::http::stall::Watched::unwatched(b, slot)))),
+        (r, _) => r,
+    }
+}
+
+async fn proxy_request_admitted(app: &App, req: Request, slot: &mut Option<InFlight>) -> XResult<Response> {
     let Some(nsid) = req.uri().path().strip_prefix("/xrpc/") else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
@@ -1055,6 +1172,7 @@ async fn proxy_request(app: &App, req: Request) -> XResult<Response> {
         return Err(XrpcError::bad("InvalidToken", "Bad token method"));
     }
     let acct = check_takedown(app, did, lxm == APPEAL_ACTIONED_SUBJECT).await?;
+    *slot = Some(admit(did)?);
 
     let body = (method == Method::POST).then_some(body);
     let pq = parts

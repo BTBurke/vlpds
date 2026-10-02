@@ -78,6 +78,13 @@ async fn fake_handler(State(f): State<Fake>, req: Request) -> Response {
             json_err(500, json!({"error": "Oops", "message": "upstream broke"}))
         }
         "/xrpc/app.bsky.test.err404plain" => (StatusCode::NOT_FOUND, "not here").into_response(),
+        "/xrpc/app.bsky.test.err400gzip" => {
+            use std::io::Write;
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(br#"{"error":"CustomGz","message":"zipped boom"}"#).unwrap();
+            let gz = e.finish().unwrap();
+            (StatusCode::BAD_REQUEST, [("content-type", "application/json"), ("content-encoding", "gzip")], gz).into_response()
+        }
         "/xrpc/app.bsky.test.echo" => {
             let ct = parts
                 .headers
@@ -335,6 +342,25 @@ async fn streams_post_bodies() {
     );
     assert_eq!(seen.headers.get("accept-encoding").unwrap(), "gzip");
     assert_eq!(seen.body.len(), payload.len());
+
+    // encoded request bodies go upstream as the client sent them: not
+    // decoded (that was unbounded), not refused for a coding this PDS
+    // doesn't decode
+    for coding in ["gzip", "zstd", "br"] {
+        let raw: Vec<u8> = (0..5000u32).map(|i| (i * 13) as u8).collect();
+        let r = env
+            .post(&bob, "app.bsky.test.echo")
+            .header("content-type", "application/x-test")
+            .header("content-encoding", coding)
+            .body(raw.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200, "{coding}");
+        let seen = env.appview.last();
+        assert_eq!(seen.headers.get("content-encoding").unwrap(), coding);
+        assert_eq!(seen.body.as_ref(), raw.as_slice(), "{coding}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -366,6 +392,10 @@ async fn maps_upstream_errors() {
         (s, b["error"].as_str(), b["message"].as_str()),
         (502, Some("Oops"), Some("upstream broke"))
     );
+
+    // a compressed error body is decoded for its error name
+    let (s, b) = err_of(env.get(Some(&u), "app.bsky.test.err400gzip").send().await.unwrap()).await;
+    assert_eq!((s, b["error"].as_str(), b["message"].as_str()), (400, Some("CustomGz"), Some("zipped boom")));
 
     let (s, b) = err_of(
         env.get(Some(&u), "app.bsky.test.err404plain")
@@ -529,6 +559,43 @@ async fn target_selection_and_rejections() {
         "token aud is the bare DID"
     );
     assert_eq!(claims["lxm"], "chat.bsky.convo.listConvos");
+    // NSIDs are case-insensitive here as in the method lists: a chat
+    // method in any case needs the header...
+    let (s, b) = err_of(env.get(Some(&u), "Chat.Bsky.convo.listConvos").send().await.unwrap()).await;
+    assert_eq!((s, b["error"].as_str()), (400, Some("InvalidRequest")), "{b}");
+    // ...and a non-privileged app password can't reach any of them
+    let pw = env
+        .post(&u, "com.atproto.server.createAppPassword")
+        .json(&json!({"name": "plain", "privileged": false}))
+        .send()
+        .await
+        .unwrap()
+        .json::<J>()
+        .await
+        .unwrap()["password"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let session: J = env
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.createSession", env.url))
+        .json(&json!({"identifier": u.did, "password": pw}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let app_pw = User { did: u.did.clone(), jwt: session["accessJwt"].as_str().unwrap().to_string() };
+    let before = env.reports.seen.lock().len();
+    for lxm in ["chat.bsky.convo.addReaction", "CHAT.bsky.convo.addReaction", "Chat.Bsky.Convo.AddReaction"] {
+        let (s, _) = err_of(
+            env.get(Some(&app_pw), lxm).header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap(),
+        )
+        .await;
+        assert!((400..500).contains(&s), "{lxm}: {s}");
+    }
+    assert_eq!(env.reports.seen.lock().len(), before, "an app password reached a chat method");
     // Unknown service id in a resolvable document.
     let (s, b) = err_of(
         env.get(Some(&u), "chat.bsky.convo.listConvos")

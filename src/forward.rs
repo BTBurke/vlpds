@@ -44,7 +44,10 @@
 //! Forwards fail fast: if the owner hasn't started answering within a
 //! time-to-first-byte deadline (counted once the request body is sent) the
 //! client gets 503 `PartitionUnavailable` + `Retry-After`, and the owner's
-//! lease expiry moves the shard. Response bodies then stream without limit.
+//! lease expiry moves the shard. Response bodies then stream without a size
+//! or time limit, but with a write-progress deadline: one whose client stops
+//! reading is dropped (`http::stall`), and bulk downloads (getRepo, getBlob,
+//! getBlocks) use their own peer connections (`http::PeerClient::for_path`).
 //!
 //! A slow cold repo load is not a dead owner: a forwarded repo write that its
 //! worker hasn't started within [`FORWARDED_WRITE_START`] (its repo is still
@@ -629,7 +632,8 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
     crate::metrics::FORWARDED.inc();
     let ttfb = ttfb_for(&req);
     let t = Instant::now();
-    let resp = forward(client.pick(), &owner, req, token, ttfb).await;
+    let peer = client.for_path(req.uri().path());
+    let resp = forward(peer, &owner, req, token, ttfb).await;
     crate::metrics::observe_forward(resp.status().as_u16(), t);
     resp
 }
@@ -872,7 +876,10 @@ async fn forward(
     for (k, v) in resp.headers() {
         out = out.header(k, v);
     }
-    out.body(Body::from_stream(resp.bytes_stream()))
+    // a client that stops reading must not keep the peer stream (and its
+    // share of the connection's flow-control window) forever
+    let body = axum::http::Response::from(resp).into_body();
+    out.body(Body::new(crate::http::stall::Watched::new(body)))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
@@ -1125,6 +1132,71 @@ mod tests {
             .unwrap();
         assert_eq!(r.status(), 503);
         assert!(t.elapsed() < TTFB_FAST + Duration::from_secs(2), "{:?}", t.elapsed());
+    }
+
+    /// Clients that stop reading forwarded responses (an h2 window kept at
+    /// zero, a socket never read: the server stops polling the body) must
+    /// not stall other forwards. Unread bodies keep their bytes out of the
+    /// peer connection's flow-control window; enough of them used to stall
+    /// every forward on it (4 MiB stream windows: 16 unread exports per
+    /// connection). Bulk downloads now use their own connections, and a
+    /// body nobody reads is dropped after the write-stall deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn unread_forwarded_bodies_dont_stall_other_forwards() {
+        use crate::http::{stall, PeerClient};
+        const CHUNK: usize = 64 << 10;
+        const BODY: usize = 2 << 20; // more than a stream window
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner = format!("http://{}", l.local_addr().unwrap());
+        let router = axum::Router::new().route(
+            "/xrpc/{nsid}",
+            axum::routing::get(|| async {
+                let chunks = (0..BODY / CHUNK).map(|_| Ok::<_, std::io::Error>(bytes::Bytes::from(vec![7u8; CHUNK])));
+                Body::from_stream(futures::stream::iter(chunks))
+            }),
+        );
+        tokio::spawn(crate::server::serve(l, router));
+        let peers = PeerClient::new(1).unwrap();
+        let fwd = |path: &'static str| {
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            forward(peers.for_path(req.uri().path()), &owner, req, None, TTFB_SLOW)
+        };
+        let read = |r: Response, within: Duration| async move {
+            tokio::time::timeout(within, axum::body::to_bytes(r.into_body(), usize::MAX)).await.map(|b| b.map(|b| b.len()).ok())
+        };
+        // more unread exports than one connection's window holds
+        let n = (crate::http::PEER_CONNECTION_WINDOW / crate::http::PEER_STREAM_WINDOW) as usize + 16;
+        let mut held = Vec::new();
+        for _ in 0..n {
+            let r = fwd("/xrpc/com.atproto.sync.getRepo?did=did:plc:x").await;
+            assert_eq!(r.status(), StatusCode::OK);
+            held.push(r);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // other forwards use other connections
+        let r = fwd("/xrpc/com.atproto.repo.getRecord?repo=did:plc:x").await;
+        assert_eq!(read(r, Duration::from_secs(5)).await, Ok(Some(BODY)), "a forward stalled behind unread exports");
+
+        // the same on the shared connections: unread bodies fill the window...
+        for _ in 0..n {
+            held.push(fwd("/xrpc/com.atproto.repo.listRecords?repo=did:plc:x").await);
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let r = fwd("/xrpc/com.atproto.repo.getRecord?repo=did:plc:x").await;
+        let pending = tokio::spawn(read(r, Duration::from_secs(10)));
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert!(!pending.is_finished(), "expected the shared connection to be stalled");
+        // ...until they pass the write-stall deadline and are dropped
+        let before = stall::stalled_total();
+        stall::set_limit(Duration::from_millis(500));
+        let dropped = stall::sweep_now();
+        stall::set_limit(stall::WRITE_STALL);
+        assert!(dropped >= 2 * n, "{dropped} dropped");
+        assert!(stall::stalled_total() >= before + dropped as u64);
+        assert_eq!(pending.await.unwrap(), Ok(Some(BODY)), "the window was not freed");
+        // a dropped body errors for its (late) reader
+        let late = held.pop().unwrap();
+        assert_eq!(read(late, Duration::from_secs(5)).await, Ok(None));
     }
 
     #[tokio::test]

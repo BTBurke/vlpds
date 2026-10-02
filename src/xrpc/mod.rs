@@ -267,13 +267,20 @@ pub fn router(app: Arc<App>) -> Router {
                 .merge(admin_tools::routes()),
         ))
         .merge(proxy::routes())
-        .fallback(proxy::fallback)
         .merge(oauth::routes())
         .merge(internal::routes())
         .merge(crate::profiling::routes())
         .merge(ratelimits::routes())
         .merge(feature_level::routes())
-        .merge(webui::routes());
+        .merge(webui::routes())
+        // request bodies of locally served routes: Content-Encoding
+        // gzip/deflate decoded (415 otherwise; their extractors bound the
+        // decoded size). Not the proxy fallback (added after this layer),
+        // which forwards bodies as the client encoded them, like the
+        // reference: decoding there was unbounded (~1000:1) and refused
+        // codings the upstream may take.
+        .layer(tower_http::decompression::RequestDecompressionLayer::new())
+        .fallback(proxy::fallback);
     ratelimits::start(&app);
     // DPoP-Nonce / WWW-Authenticate on DPoP-authenticated requests
     let r = oauth::with_dpop_layer(r, &app);
@@ -285,8 +292,6 @@ pub fn router(app: Arc<App>) -> Router {
     };
     r.layer(axum::middleware::from_fn(incorrect_method))
         .layer(axum::middleware::from_fn(track_http))
-        // request bodies: Content-Encoding gzip/deflate decoded (415 otherwise)
-        .layer(tower_http::decompression::RequestDecompressionLayer::new())
         // responses: gzip for JSON and CAR bodies over 1 KiB (reference
         // `compression()` with its CAR filter, packages/pds/src/util/compression.ts)
         .layer(tower_http::compression::CompressionLayer::new().compress_when(

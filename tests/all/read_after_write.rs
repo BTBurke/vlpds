@@ -506,6 +506,44 @@ async fn brotli_upstream_is_munged() {
     assert_eq!(j["cursor"], pad);
 }
 
+/// An AppView lagging more than the log keeps (32 records) behind a repo:
+/// the store read keeps only the oldest records above its rev (the
+/// reference's oldest 10), and that answer is kept until the repo changes,
+/// so polls with the same rev don't scan the repo again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lagging_appview_is_answered_from_one_bounded_scan() {
+    use vlpds::recent_writes::{lookup, Since};
+    let (stub, s) = setup().await;
+    let a = s.create_account("rawlag").await;
+    s.post(&a, "indexed").await;
+    stub.set_rev(&rev(&s, &a.did).await);
+    stub.set("app.bsky.feed.getTimeline", json!({"feed": []}));
+    let mut posts = Vec::new();
+    for i in 0..40 {
+        posts.push(s.post(&a, &format!("lagging {i}")).await.uri);
+    }
+    let since = vlpds::tid::Tid::parse(&stub.rev.lock()).unwrap().0;
+    let p = s.app.partition(&a.did).ok().unwrap();
+    let part = (p.id, p.epoch);
+    vlpds::recent_writes::invalidate(&a.did);
+    assert!(matches!(lookup(&a.did, part, since), Since::Unknown));
+    let oldest: std::collections::HashSet<String> = posts[..10].iter().cloned().collect();
+    for _ in 0..2 {
+        let j = s.xrpc.get("app.bsky.feed.getTimeline", &[], &a.auth()).await.ok();
+        let got: std::collections::HashSet<String> =
+            j["feed"].as_array().unwrap().iter().map(|i| i["post"]["uri"].as_str().unwrap().to_string()).collect();
+        assert_eq!(got, oldest, "the oldest 10 records above the AppView's rev");
+        // kept: the next poll needs no store read
+        match lookup(&a.did, part, since) {
+            Since::Records(r) => assert_eq!(r.len(), 10),
+            other => panic!("not kept: {other:?}"),
+        }
+    }
+    // a new commit drops it
+    s.post(&a, "one more").await;
+    assert!(matches!(lookup(&a.did, part, since), Since::Unknown));
+}
+
 /// A repo with no records at or below the AppView's rev (a new account's
 /// first posts) gets nothing merged: the reference's sanity check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
