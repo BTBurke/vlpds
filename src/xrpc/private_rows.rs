@@ -1,20 +1,13 @@
 //! Golden format fixtures of private (`p/`) rows (tests/all/formats.rs,
-//! DESIGN.md "Rolling upgrades and format versioning", "Tests and CI").
-//!
-//! [`private_row_fixtures`] builds every kind of private row with fixed
-//! values, from the types (or, for rows their writers spell as `json!`
-//! literals, the same shapes) the writers use; [`check_private_row`] decodes
-//! one the way its readers do. The row types are private to their XRPC
+//! DESIGN.md "Tests and CI"). The row types are private to their XRPC
 //! modules, which each contribute a `fixture_rows` / `check_row` pair.
 
 use serde_json::{json, Value as J};
 
-/// A private row: (routing key, name, value), stored at
-/// `state::private_key(routing, name)`.
+/// (routing key, name, value)
 pub type PrivateRow = (String, String, Vec<u8>);
 
-/// Every kind of private row, with fixed values. `did` routes the
-/// per-account rows.
+/// Every kind of private row, with fixed values.
 pub fn private_row_fixtures(did: &str) -> Vec<PrivateRow> {
     let mut rows = super::server::fixture_rows(did);
     rows.extend(super::admin::fixture_rows(did));
@@ -25,8 +18,8 @@ pub fn private_row_fixtures(did: &str) -> Vec<PrivateRow> {
 }
 
 /// Decodes a private row the way its readers do: Ok(the row's kind), Err if
-/// it doesn't decode, lacks a field its readers use, or (typed rows)
-/// doesn't re-encode to the same bytes (a field this build would drop).
+/// it doesn't decode, lacks a field its readers use, or doesn't re-encode to
+/// the same bytes (a field this build would drop).
 pub fn check_private_row(routing: &str, name: &str, val: &[u8]) -> anyhow::Result<&'static str> {
     type Check = fn(&str, &str, &[u8]) -> Option<anyhow::Result<&'static str>>;
     let checks: [Check; 5] = [super::server::check_row, super::admin::check_row, super::email2fa::check_row, super::proxy::check_row, check_shared_row];
@@ -38,11 +31,8 @@ pub fn check_private_row(routing: &str, name: &str, val: &[u8]) -> anyhow::Resul
     anyhow::bail!("unknown private row {routing:?} {name:?}")
 }
 
-pub(super) fn enc<T: serde::Serialize>(v: &T) -> Vec<u8> {
-    serde_json::to_vec(v).expect("serializable")
-}
+pub(super) use super::server::to_json_bytes as enc;
 
-/// A typed row: decodes as `T` and re-encodes to the same bytes.
 pub(super) fn typed_row<T: serde::Serialize + serde::de::DeserializeOwned>(kind: &'static str, val: &[u8]) -> anyhow::Result<&'static str> {
     let v: T = serde_json::from_slice(val).map_err(|e| anyhow::anyhow!("{kind}: {e}"))?;
     anyhow::ensure!(serde_json::to_vec(&v)? == val, "{kind}: re-encodes differently (a field would be dropped)");
@@ -50,8 +40,7 @@ pub(super) fn typed_row<T: serde::Serialize + serde::de::DeserializeOwned>(kind:
 }
 
 /// A row written as a `json!` object: the fields its readers use, with
-/// their JSON types ('s' string, 'u' unsigned, 'b' bool, '?' anything but
-/// null).
+/// their JSON types ('s' string, 'u' unsigned, 'b' bool, '?' not null).
 pub(super) fn json_row(kind: &'static str, val: &[u8], fields: &[(&str, char)]) -> anyhow::Result<&'static str> {
     let v: J = serde_json::from_slice(val).map_err(|e| anyhow::anyhow!("{kind}: {e}"))?;
     for (f, t) in fields {
@@ -73,7 +62,7 @@ pub(super) fn utf8_row(kind: &'static str, val: &[u8]) -> anyhow::Result<&'stati
     Ok(kind)
 }
 
-/// TOTP and OAuth rows (their types are public).
+/// TOTP and OAuth rows, whose types are public.
 fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
     use crate::oauth::client::ClientAuth;
     use crate::oauth::store as o;

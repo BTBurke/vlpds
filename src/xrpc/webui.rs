@@ -1,12 +1,6 @@
-//! The embedded web UI (React + Vite, built from `ui/` into `ui/dist`):
-//! public landing `/`, the account app `/account/*` and the operator console
-//! `/admin/*`, all client-side routed and served as one `index.html`, plus
-//! hashed assets and the bundled fonts. Also `vlpds.admin.getClusterStatus`,
-//! the admin-authenticated (Basic) view of `/internal/v1/cluster` the console
-//! polls, with peers' own status fetched server-side.
-//!
-//! When the UI hasn't been built, `build.rs` leaves a placeholder page in
-//! `ui/dist`, so the binary always builds.
+//! The embedded web UI (built from `ui/` into `ui/dist`; `build.rs` leaves a
+//! placeholder when it isn't built) and `vlpds.admin.getClusterStatus`, the
+//! view the operator console polls.
 
 use super::*;
 use rust_embed::RustEmbed;
@@ -41,14 +35,7 @@ async fn shell() -> Response {
     let Some(f) = Assets::get("index.html") else {
         return (StatusCode::NOT_FOUND, "UI not built: run `just ui`").into_response();
     };
-    let mut r = (
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        f.data,
-    )
-        .into_response();
+    let mut r = ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], f.data).into_response();
     let h = r.headers_mut();
     h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static(SPA_CSP));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
@@ -63,11 +50,7 @@ async fn asset(uri: axum::http::Uri) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     };
     // hashed bundle files never change; fonts and the icon keep stable names
-    let cache = if path.starts_with("assets/") {
-        "public, max-age=31536000, immutable"
-    } else {
-        "public, max-age=86400"
-    };
+    let cache = if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "public, max-age=86400" };
     let mime = f.metadata.mimetype().to_string();
     (
         [
@@ -80,24 +63,18 @@ async fn asset(uri: axum::http::Uri) -> Response {
         .into_response()
 }
 
-/// The cluster as this node sees it, for the operator console. Admin only.
 /// Peers' own durable ordinal and lease state come from their
-/// `/internal/v1/cluster` (shared admin token), fetched concurrently with a
-/// short timeout; an unreachable peer is reported with `"reachable": false`.
+/// `/internal/v1/cluster`.
 async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
-    if !matches!(creds, Credentials::Admin) {
-        return Err(XrpcError {
-            status: StatusCode::UNAUTHORIZED,
-            error: "AuthenticationRequired".into(),
-            message: "admin credentials required".into(),
-        });
-    }
+    super::admin::require_admin(&creds)?;
     let owned: Vec<crate::slots::ShardId> = app.partitions.owned().iter().map(|p| p.id).collect();
     let durable = app.log.durable_ordinal.load(Ordering::Acquire);
     let durable = (durable != u64::MAX).then_some(durable);
     let sources: Vec<J> = {
-        let s = app.firehose.sources.read();
-        let mut v: Vec<J> = s
+        let mut v: Vec<J> = app
+            .firehose
+            .sources
+            .read()
             .iter()
             .map(|(log, src)| {
                 let (wm, local) = match src {
@@ -135,7 +112,7 @@ async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json
     out["node"] = json!(me);
     out["leaseValid"] = json!(c.lease_valid());
     out["leaseExpiresMs"] = json!(c.lease_expiry_us() / 1000);
-    // in slot order (shard ids are stable names since splits and merges)
+    // in slot order
     let layout = c.layout();
     out["table"] = json!(layout.shards.iter().map(|r| c.owner_of(r.id).map(|(id, _)| id)).collect::<Vec<_>>());
     out["layout"] = json!({"version": layout.version, "shards": layout.shards, "op": layout.op});
@@ -168,7 +145,7 @@ async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json
             let r = app
                 .http
                 .get(format!("{}/internal/v1/cluster", l.addr.trim_end_matches('/')))
-                .header("x-vlpds-internal", &app.config.internal_token)
+                .header(super::internal::HDR, &app.config.internal_token)
                 .timeout(std::time::Duration::from_millis(1500))
                 .send()
                 .await;
@@ -190,13 +167,9 @@ async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json
     Ok(Json(out))
 }
 
-/// The feature-level part of getClusterStatus: `cluster/version` (read
-/// now), this build's window, and what the console's banner says (DESIGN.md
-/// "Rolling upgrades and format versioning"): `mixedBuilds` (live nodes on
-/// more than one rev), `finalizable` (the highest level every live node can
-/// run, when above the active one: `vlpds admin cluster finalize`) and
-/// `finalizedAt` (when the active level was raised: older builds can no
-/// longer join).
+/// `finalizable`: the highest level every live node can run, when above the
+/// active one. `finalizedAt`: when the active level was raised (older builds
+/// can no longer join).
 async fn feature_levels(c: &crate::cluster::Cluster, nodes: &[crate::cluster::NodeLease]) -> J {
     let (v, error) = match c.read_version().await {
         Ok(Some((v, _))) => (Some(v), None),

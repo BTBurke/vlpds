@@ -1,27 +1,20 @@
 //! Periodic totals for the operator dashboard: accounts by status, repos
-//! written recently, and the SST disk cache's size.
-//!
-//! Every `--account-stats-interval-secs` (default 15 min; 0 = off) each node
-//! scans the account (`a/`) and head (`h/`) rows of the shards it owns, from
-//! a snapshot, and exports its share (`vlpds_accounts{status}`,
-//! `vlpds_repos_written_within{window}`); the dashboard sums the nodes. One
-//! pass reads two small rows per account, in key order, once per interval:
-//! never per scrape. A shard moving between nodes mid-interval is counted
-//! by both or neither until the next pass.
+//! written recently, and the SST disk cache's size. Each node exports its
+//! own shards' share and the dashboard sums the nodes; a shard moving
+//! mid-interval is counted by both or neither until the next pass. Scanned
+//! once per interval, never per scrape.
 
 use super::*;
 use std::time::Duration;
 
-/// Repo-activity windows of `vlpds_repos_written_within` (label, seconds).
+/// (label, seconds)
 const WINDOWS: [(&str, u64); 3] = [("1d", 86_400), ("7d", 7 * 86_400), ("30d", 30 * 86_400)];
-/// `vlpds_accounts` statuses (anything else counts as `other`).
 const STATUSES: [&str; 5] = ["active", "deactivated", "takendown", "suspended", "other"];
 
 #[derive(Default, Debug, PartialEq)]
 pub struct Counts {
     /// By [`STATUSES`] index.
     pub accounts: [i64; 5],
-    /// Repos (heads), and those written within each of [`WINDOWS`].
     pub repos: i64,
     pub written_within: [i64; 3],
 }
@@ -33,11 +26,9 @@ fn status_index(status: Option<&str>) -> usize {
     }
 }
 
-/// Counts the accounts and repos of every shard open on this node, each
-/// within its layout range (a split child still reading its parent's SSTs
-/// sees the parent's other keys too).
+/// Each shard within its layout range: a split child still reading its
+/// parent's SSTs sees the parent's other keys too.
 pub async fn count(app: &App, now_micros: u64) -> anyhow::Result<Counts> {
-    /// Only an account's status (serde skips the rest of the JSON).
     #[derive(serde::Deserialize)]
     struct Status<'a> {
         #[serde(borrow, default)]
@@ -89,7 +80,6 @@ fn export(c: &Counts) {
     metrics::ACCOUNT_STATS_TIME.set(now);
 }
 
-/// Bytes of the files under `dir` (recursively; unreadable entries skipped).
 fn dir_bytes(dir: &std::path::Path) -> u64 {
     let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
     rd.flatten()
@@ -111,8 +101,6 @@ async fn export_disk_cache(app: &App) {
     metrics::DISK_CACHE_BYTES.with_label_values(&["capacity"]).set(capacity as i64);
 }
 
-/// The periodic count (see the module docs); a no-op task when the interval
-/// is zero.
 pub fn spawn_account_stats(app: Arc<App>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let every = app.config.account_stats_interval;

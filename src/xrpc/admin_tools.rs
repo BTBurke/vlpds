@@ -1,24 +1,5 @@
-//! Operator tools behind `vlpds admin` (src/cli/admin.rs), the reference
-//! PDS's `pdsadmin` and packages/pds/src/scripts equivalents that have no
-//! com.atproto.admin.* method (DESIGN.md "Admin CLI"):
-//!
-//! - `vlpds.admin.publishIdentity` (script publish-identity; with `syncPlc`
-//!   also script rotate-keys): emits `#identity` for a DID, first making its
-//!   PLC document's `atproto` key the signing key this PDS holds.
-//! - `vlpds.admin.checkRepo`: a repo's stored state checked against itself
-//!   from one snapshot: the head commit (hash, data root, DID, signature),
-//!   records (each hashing to its CID), the MST rebuilt from `R/` against
-//!   the head's data root, the persisted interior nodes `M/` against that
-//!   tree, and the record-CID, blob-ref, backlink and collection indexes.
-//! - `vlpds.admin.rebuildRepo` (script rebuild-repo): re-derives the repo
-//!   from its records (MST, `M/`, indexes) and signs a new commit, `#sync`
-//!   (the worker's ReplaceRepo, guarded by the head commit the records were
-//!   read at).
-//! - `vlpds.admin.requestCrawl` (pdsadmin request-crawl): asks relays to
-//!   crawl this PDS's public hostname, with per-relay results.
-//!
-//! DID-keyed methods route to the repo's owner like any other `did`
-//! parameter (crate::forward).
+//! Operator tools behind `vlpds admin`: the reference PDS's `pdsadmin` and
+//! scripts that have no com.atproto.admin.* method (DESIGN.md "Admin CLI").
 
 use super::admin::require_admin;
 use super::*;
@@ -40,34 +21,26 @@ fn not_found(did: &str) -> XrpcError {
     XrpcError::bad("RepoNotFound", format!("could not find repo: {did}"))
 }
 
-// ---------------------------------------------------------------------------
-// publishIdentity
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PublishIdentityIn {
     did: String,
-    /// First make the DID's PLC `atproto` key the signing key held here
-    /// (reference rotate-keys); a no-op when it already is.
+    /// First make the DID's PLC `atproto` key the signing key held here (the
+    /// reference's rotate-keys).
     #[serde(default)]
     sync_plc: bool,
 }
 
-/// Emits `#identity` for an account hosted here (any status but deleted),
-/// as the reference's `sequenceIdentity`; caches of its DID document are
-/// dropped. With `syncPlc` (the reference's rotate-keys), a did:plc whose
-/// directory document names another signing key is updated first (signed
-/// with the server rotation key), then the repo is re-signed (an empty
-/// commit) and `#identity` + `#sync` emitted, so relays that saw commits
-/// fail against the old document resynchronize; a PLC failure emits nothing.
+/// The reference's `sequenceIdentity`. With `syncPlc`, the repo is also
+/// re-signed (an empty commit, `#identity` + `#sync`) so relays that saw
+/// commits fail against the old document resynchronize; a PLC failure emits
+/// nothing.
 async fn publish_identity(State(app): AppState, Auth(creds): Auth, Json(inp): Json<PublishIdentityIn>) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let did = inp.did;
     let acct = app.account(&did).await.map_err(|_| not_found(&did))?;
     if !inp.sync_plc {
-        // a rewrite of the unchanged account row, ordered with the repo's
-        // commits, carrying the #identity frame
+        // rewrites the unchanged row, ordered with the commits, for #identity
         let (_, after) = app.mutate_account(&did, true, false, false, |_| Ok(true)).await?;
         app.did_resolver.invalidate(&did);
         return Ok(Json(json!({"did": did, "handle": after.handle, "plcUpdated": J::Null})));
@@ -86,29 +59,22 @@ async fn publish_identity(State(app): AppState, Auth(creds): Auth, Json(inp): Js
     Ok(Json(json!({"did": did, "handle": acct.handle, "plcUpdated": plc_updated, "rev": head.rev.to_string()})))
 }
 
-// ---------------------------------------------------------------------------
-// checkRepo / rebuildRepo
-// ---------------------------------------------------------------------------
-
-/// A record as ReplaceRepo takes it: (path, cid, bytes, blob refs).
+/// As ReplaceRepo takes it: (path, cid, bytes, blob refs).
 type StoredRecord = (String, Cid, Bytes, Vec<Cid>);
 
-/// Persisted nodes by CID.
 type NodeBlocks = HashMap<Cid, Arc<[u8]>>;
 
 /// Problems listed per check (counts are exact).
 const LIST_MAX: usize = 20;
 
-/// What `inspect` read and found.
 struct Inspection {
     head: Head,
     records: Vec<StoredRecord>,
-    /// Records whose bytes don't hash to their CID (or don't decode).
+    /// Records that don't decode or don't hash to their CID.
     bad_records: Vec<String>,
-    /// The tree rebuilt from the records has the head's data root.
     matches_head: bool,
-    /// Keys a rebuild deletes: `M/` nodes not in the tree or not hashing
-    /// to their key, stale record-CID and blob-ref index entries.
+    /// What a rebuild deletes: bad or unreferenced `M/` nodes, stale index
+    /// entries.
     stale_keys: Vec<Bytes>,
     report: J,
 }
@@ -126,8 +92,6 @@ async fn scan_keys<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, prefix: &[u8])
     Ok(out)
 }
 
-/// The commit block's checks: (hash, data root, did, signature) agree with
-/// the head and the account's public key.
 fn check_commit(did: &str, head: &Head, pubkey: &str) -> J {
     let cid_ok = Cid::dag_cbor(&head.commit_block) == head.commit;
     let (mut data_ok, mut did_ok, mut sig_ok) = (false, false, false);
@@ -150,10 +114,59 @@ fn check_commit(did: &str, head: &Head, pubkey: &str) -> J {
     json!({"cidOk": cid_ok, "dataOk": data_ok, "didOk": did_ok, "signatureOk": sig_ok})
 }
 
-/// Reads `did`'s state from one snapshot of its shard (taken under the
-/// apply lock: a commit's state batch is in it entirely or not at all) and
-/// checks it. Runs on the repo's owner; doesn't touch the repo worker, so
-/// it works on a repo that fails to load.
+/// (records, paths of records that don't decode or hash to their CID).
+async fn read_records<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str) -> XResult<(Vec<StoredRecord>, Vec<String>)> {
+    let rprefix = state::record_prefix(did);
+    let (mut records, mut bad) = (Vec::new(), Vec::new());
+    for (k, v) in scan_keys(db, &rprefix).await? {
+        let path = String::from_utf8_lossy(&k[rprefix.len()..]).into_owned();
+        let Ok((cid, bytes)) = state::decode_record_value(&v) else {
+            bad.push(path);
+            continue;
+        };
+        let mut blobs = Vec::new();
+        match Value::decode(&bytes) {
+            Ok(v) if Cid::dag_cbor(&bytes) == cid => super::blob_refs(&v, &mut blobs),
+            _ => {
+                bad.push(path);
+                continue;
+            }
+        }
+        records.push((path, cid, bytes, blobs));
+    }
+    Ok((records, bad))
+}
+
+/// The backlink index (bl/) against the records: (entries missing or wrong,
+/// stale keys, entries stored).
+async fn check_backlinks<R: slatedb::DbReadOps + Sync + ?Sized>(
+    db: &R,
+    did: &str,
+    records: &[StoredRecord],
+) -> XResult<(usize, Vec<Bytes>, usize)> {
+    let stored: HashMap<Bytes, Bytes> = scan_keys(db, &state::backlink_prefix(did)).await?.into_iter().collect();
+    let mut want: BTreeMap<Vec<u8>, crate::backlinks::Rkeys> = BTreeMap::new();
+    for (path, _, bytes, _) in records {
+        let coll = crate::worker::collection_of(path);
+        if let Some(l) = crate::backlinks::link(coll, bytes) {
+            want.entry(l).or_default().push(path[coll.len() + 1..].into());
+        }
+    }
+    let want: HashMap<Bytes, Bytes> = want
+        .into_iter()
+        .map(|(l, mut rkeys)| {
+            rkeys.sort();
+            (Bytes::from(state::backlink_key(did, &l)), crate::backlinks::encode(&rkeys))
+        })
+        .collect();
+    let missing = want.iter().filter(|(k, v)| stored.get(*k) != Some(*v)).count();
+    let stale = stored.keys().filter(|k| !want.contains_key(*k)).cloned().collect();
+    Ok((missing, stale, stored.len()))
+}
+
+/// Reads `did`'s state from one snapshot (taken under the apply lock, so a
+/// commit's batch is in it entirely or not at all) and checks it. Doesn't
+/// touch the repo worker, so it works on a repo that fails to load.
 async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
     let p = app.partition(did)?;
     let snap = {
@@ -171,29 +184,8 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
         None => return Err(XrpcError::internal(format!("{did}: head without account"))),
     };
 
-    // records (R/), each hashing to its CID
-    let rprefix = state::record_prefix(did);
-    let mut records = Vec::new();
-    let mut bad_records = Vec::new();
-    for (k, v) in scan_keys(snap.as_ref(), &rprefix).await? {
-        let path = String::from_utf8_lossy(&k[rprefix.len()..]).into_owned();
-        let Ok((cid, bytes)) = state::decode_record_value(&v) else {
-            bad_records.push(path);
-            continue;
-        };
-        let ok = Cid::dag_cbor(&bytes) == cid;
-        let mut blobs = Vec::new();
-        match Value::decode(&bytes) {
-            Ok(v) if ok => super::blob_refs(&v, &mut blobs),
-            _ => {
-                bad_records.push(path);
-                continue;
-            }
-        }
-        records.push((path, cid, bytes, blobs));
-    }
+    let (records, bad_records) = read_records(snap.as_ref(), did).await?;
 
-    // persisted nodes (M/), the record-CID (c/) and blob-ref (b/) indexes
     let mprefix = state::mst_node_prefix(did);
     let stored: Vec<(Bytes, Bytes)> = scan_keys(snap.as_ref(), &mprefix).await?;
     let cprefix = {
@@ -213,7 +205,6 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
         }
     }
 
-    // the tree from the records, its nodes against M/ (CPU: blocking pool)
     let recs: Vec<(crate::mst_lazy::Key, Cid)> = records.iter().map(|(p, c, ..)| (Arc::from(p.as_bytes()), *c)).collect();
     let (rebuilt, want) = tokio::task::spawn_blocking(move || -> XResult<(Cid, NodeBlocks)> {
         let mut tree = crate::mst_lazy::build_tree(&recs).map_err(XrpcError::from_err)?;
@@ -257,26 +248,9 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
     stale_keys.extend(blob_index.difference(&want_blobs).cloned());
     let (cid_extra, blob_extra) = (n1 - n0, stale_keys.len() - n1);
 
-    // the backlink index (bl/): each linked record's rkey under its link
-    let bl_index: HashMap<Bytes, Bytes> = scan_keys(snap.as_ref(), &state::backlink_prefix(did)).await?.into_iter().collect();
-    let mut want_bl: BTreeMap<Vec<u8>, crate::backlinks::Rkeys> = BTreeMap::new();
-    for (path, _, bytes, _) in &records {
-        let coll = crate::worker::collection_of(path);
-        if let Some(l) = crate::backlinks::link(coll, bytes) {
-            want_bl.entry(l).or_default().push(path[coll.len() + 1..].into());
-        }
-    }
-    let want_bl: HashMap<Bytes, Bytes> = want_bl
-        .into_iter()
-        .map(|(l, mut rkeys)| {
-            rkeys.sort();
-            (Bytes::from(state::backlink_key(did, &l)), crate::backlinks::encode(&rkeys))
-        })
-        .collect();
-    let bl_missing = want_bl.iter().filter(|(k, v)| bl_index.get(*k) != Some(*v)).count();
-    let n2 = stale_keys.len();
-    stale_keys.extend(bl_index.keys().filter(|k| !want_bl.contains_key(*k)).cloned());
-    let bl_extra = stale_keys.len() - n2;
+    let (bl_missing, bl_stale, bl_stored) = check_backlinks(snap.as_ref(), did, &records).await?;
+    let bl_extra = bl_stale.len();
+    stale_keys.extend(bl_stale);
 
     let commit = check_commit(did, &head, &acct.signing_pubkey);
     let mut problems: Vec<String> = Vec::new();
@@ -324,7 +298,7 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
         "indexes": {
             "recordCidMissing": cid_missing, "recordCidExtra": cid_extra,
             "blobRefMissing": blob_missing, "blobRefExtra": blob_extra,
-            "backlinkMissing": bl_missing, "backlinkExtra": bl_extra, "backlinks": bl_index.len(),
+            "backlinkMissing": bl_missing, "backlinkExtra": bl_extra, "backlinks": bl_stored,
             "collectionsMissing": colls_missing,
         },
     });
@@ -345,21 +319,15 @@ async fn check_repo(State(app): AppState, Auth(creds): Auth, Query(q): Query<Did
 #[serde(rename_all = "camelCase")]
 struct RebuildIn {
     did: String,
-    /// Check and report what would be written, change nothing.
     #[serde(default)]
     dry_run: bool,
 }
 
-/// The reference's rebuild-repo: the repo re-derived from its records (the
-/// MST, its persisted nodes, the record-CID, blob-ref and collection
-/// indexes; stale `M/` nodes and index entries the check found deleted)
-/// under a new signed commit (rev bumped), announced with `#sync`
-/// (none while deactivated: activation emits it). The records are read from
-/// a snapshot, so the replace is refused if a commit landed since
-/// (`InvalidSwap`: run it again). Refused when the records can't be the
-/// repo's (one doesn't hash to its CID, or they don't rebuild to the
-/// head's data root: records were lost, and the repo can't load to be
-/// rewritten), and for taken-down accounts (untakedown first).
+/// The reference's rebuild-repo: re-derives the repo from its records under
+/// a new signed commit. The replace is guarded by the head the records were
+/// read at (`InvalidSwap` if a commit landed since: run it again). Refused
+/// when the records can't be the repo's (records lost), and for taken-down
+/// accounts.
 async fn rebuild_repo(State(app): AppState, Auth(creds): Auth, Json(inp): Json<RebuildIn>) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let did = inp.did;
@@ -388,20 +356,14 @@ async fn rebuild_repo(State(app): AppState, Auth(creds): Auth, Json(inp): Json<R
     Ok(Json(out))
 }
 
-// ---------------------------------------------------------------------------
-// requestCrawl
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize, Default)]
 struct RequestCrawlIn {
-    /// Relay hostnames or URLs (default: the node's `--crawlers`).
+    /// Hostnames or URLs (default: `--crawlers`).
     #[serde(default)]
     relays: Vec<String>,
 }
 
-/// POSTs `com.atproto.sync.requestCrawl {"hostname": <our public host>}` to
-/// each relay (a bare hostname is https), 10 s each, concurrently; reports
-/// each result instead of only logging it as the startup crawl does.
+/// Unlike the startup crawl, reports each relay's result.
 async fn request_crawl(State(app): AppState, Auth(creds): Auth, body: Option<Json<RequestCrawlIn>>) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let given = body.map(|Json(b)| b).unwrap_or_default().relays;

@@ -1,8 +1,5 @@
-//! `vlpds.admin.setFeatureLevel {level}`: raises the cluster's feature
-//! level (`Cluster::finalize_level`, CLI `vlpds admin cluster finalize`;
-//! DESIGN.md "Rolling upgrades and format versioning"). The level and each
-//! node's window are in `vlpds.admin.getClusterStatus` (`version`, and
-//! `nodes[].{rev,minLevel,maxLevel,seenLevel}`).
+//! `vlpds.admin.setFeatureLevel` (DESIGN.md "Rolling upgrades and format
+//! versioning").
 
 use super::*;
 use crate::cluster::FinalizeError;
@@ -14,8 +11,7 @@ pub fn routes() -> Router<Arc<App>> {
 #[derive(Deserialize)]
 struct SetIn {
     level: u32,
-    /// Lower the level instead (`vlpds admin cluster lower`): only past
-    /// levels that gate wire behavior (non-persistent ones).
+    /// Only past levels that gate wire behavior (non-persistent ones).
     #[serde(default)]
     lower: bool,
 }
@@ -36,6 +32,6 @@ async fn set_feature_level(State(app): AppState, Auth(creds): Auth, Json(inp): J
         Ok(v) => Ok(Json(json!({"active": v.active, "target": v.target, "history": v.history}))),
         Err(FinalizeError::Invalid(m)) => Err(XrpcError::bad("InvalidRequest", m)),
         Err(e @ FinalizeError::Incompatible { .. }) => Err(XrpcError { status: StatusCode::CONFLICT, error: "IncompatibleNodes".into(), message: e.to_string() }),
-        Err(e @ FinalizeError::Store(_)) => Err(XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: "Unavailable".into(), message: e.to_string() }),
+        Err(e @ FinalizeError::Store(_)) => Err(XrpcError::unavailable("Unavailable", e.to_string())),
     }
 }

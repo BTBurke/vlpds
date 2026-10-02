@@ -1,32 +1,9 @@
-//! Signing-key rotation (DESIGN.md "Signing-key rotation"):
-//! `admin.updateAccountSigningKey` and its recovery.
-//!
-//! The reference's rotate-keys updates the DID document, then writes an
-//! empty commit signed with the new key and sequences `#identity` and
-//! `#sync`. Here the repo's worker orders the steps with the repo's commits
-//! (`worker::KeyStep`):
-//!
-//! 1. `Begin`: the new key, wrapped, is recorded as the account's pending
-//!    key (durably, with a `K/` marker) and repo writes are refused from
-//!    then on. The key is persisted before any directory can name it, so a
-//!    crash never leaves a DID document listing a key nobody holds, and no
-//!    commit is signed with the old key once the document may list the new
-//!    one.
-//! 2. The PLC directory's `atproto` key is set to it (did:plc with PLC
-//!    registration on; otherwise there is nothing to update here).
-//! 3. `Finish`: the account switches keys and the head is re-signed (same
-//!    data root, new rev), `#identity` then `#sync`, in one log entry. The
-//!    call is acknowledged once that entry is durable, so every read after
-//!    the acknowledgement serves the re-signed head.
-//!
-//! A rotation that stops between 1 and 3 (a crash, a directory outage, the
-//! shard moving) stays pending; [`complete`] drives a pending rotation to
-//! its end from durable state alone and is idempotent: it sets the
-//! directory's key to the pending one (a no-op if it already is) and
-//! finishes. Only a definite refusal by the directory, with the directory
-//! still not naming the key, abandons it (`Abort`). The node runs it for
-//! every marker in its shards at start and every [`RECOVERY_INTERVAL`]
-//! ([`spawn_recovery`]), and in the background after a failed attempt.
+//! Signing-key rotation (DESIGN.md "Signing-key rotation"): `Begin` records
+//! the new key as pending (before any directory can name it, and repo
+//! writes are refused from then on), the PLC directory is updated, `Finish`
+//! re-signs the head. A rotation stopped in between stays pending and
+//! [`complete`] drives it to its end from durable state alone; only a
+//! definite refusal by a directory that doesn't name the key abandons it.
 
 use super::*;
 use crate::plc::PlcError;
@@ -35,10 +12,8 @@ use crate::worker::{AccountOp, KeyStep};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-/// How often each node looks for rotations left pending in its shards.
 pub const RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Error name of a rotation stopped by a test crash hook.
 const INTERRUPTED: &str = "KeyRotationInterrupted";
 
 /// Test hook: asked at each phase of a rotation of a DID ("begun": the
@@ -49,7 +24,6 @@ pub type CrashHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 static CRASH_HOOKS: parking_lot::Mutex<Option<HashMap<String, CrashHook>>> = parking_lot::Mutex::new(None);
 
-/// Installs (Some) or removes (None) the crash hook of rotations of `did`.
 pub fn set_crash_hook(did: &str, h: Option<CrashHook>) {
     let mut g = CRASH_HOOKS.lock();
     let m = g.get_or_insert_with(HashMap::new);
@@ -67,9 +41,8 @@ fn crash_at(did: &str, phase: &str) -> Result<(), XrpcError> {
     }
 }
 
-/// DIDs whose rotation this node is driving (a handler or a resolver), so
-/// the sweep doesn't start a second driver beside it. Only an economy:
-/// every step is safe to repeat or race.
+/// DIDs whose rotation this node is driving, so the sweep doesn't start a
+/// second driver. Only an economy: every step is safe to repeat or race.
 static DRIVING: parking_lot::Mutex<Option<HashSet<String>>> = parking_lot::Mutex::new(None);
 
 struct Driving(String);
@@ -88,17 +61,13 @@ impl Drop for Driving {
     }
 }
 
-/// How a pending rotation ended.
 pub enum Done {
-    /// The repo is re-signed with the new key (its new head).
     Finished(Head),
-    /// The directory refused the new key and doesn't name it: the rotation
-    /// was dropped (why).
+    /// The directory refused the new key and doesn't name it.
     Aborted(XrpcError),
 }
 
-/// Whether the directory's document of `did` names `did_key` as its
-/// `atproto` key (a tombstoned DID names none).
+/// Whether the directory names `did_key` as the `atproto` key.
 async fn plc_names(plc: &crate::plc::Plc, did: &str, did_key: &str) -> Result<bool, PlcError> {
     match plc.last_op(did).await {
         Ok(last) => Ok(crate::plc::normalize(&last)["verificationMethods"]["atproto"] == did_key),
@@ -107,10 +76,8 @@ async fn plc_names(plc: &crate::plc::Plc, did: &str, did_key: &str) -> Result<bo
     }
 }
 
-/// Drives the pending rotation `p` of `did` to its end (steps 2 and 3).
-/// `key`: the new key, if the caller holds it (else it is unwrapped from
-/// `p`). Err: undecided (directory or key service unreachable, shard moved,
-/// crash hook); the rotation is still pending.
+/// Idempotent. `key`: the new key, if the caller holds it (else unwrapped
+/// from `p`). Err: undecided; the rotation is still pending.
 pub async fn complete(app: &App, did: &str, p: &PendingSigningKey, key: Option<Arc<Keypair>>) -> Result<Done, XrpcError> {
     let did_key = format!("did:key:{}", p.pubkey);
     if let (Some(plc), true) = (&app.plc, did.starts_with("did:plc:")) {
@@ -140,9 +107,8 @@ pub async fn complete(app: &App, did: &str, p: &PendingSigningKey, key: Option<A
     Ok(Done::Finished(head))
 }
 
-/// Rotates `did`'s signing key to `key` (all three steps). The new key's
-/// did:key once the repo is re-signed with it. On an undecided failure the
-/// rotation stays pending and is finished in the background.
+/// The new key's did:key once the repo is re-signed with it. On an
+/// undecided failure the rotation is finished in the background.
 pub(super) async fn rotate(app: &Arc<App>, did: &str, key: Keypair) -> XResult<String> {
     let key = Arc::new(key);
     let did_key = key.did_key();
@@ -169,23 +135,18 @@ pub(super) async fn rotate(app: &Arc<App>, did: &str, key: Keypair) -> XResult<S
     }
 }
 
-/// Whether an undecided rotation is worth retrying here: a server-side
-/// failure on a repo this node still owns (a moved repo is the new owner's
-/// to finish), not a crash hook.
+/// A moved repo is the new owner's to finish.
 fn retryable(app: &App, did: &str, e: &XrpcError) -> bool {
     e.status.is_server_error() && e.error != INTERRUPTED && app.partition(did).is_ok()
 }
 
-/// One attempt at `did`'s pending rotation, if it has one (None: nothing
-/// pending).
+/// None: nothing pending.
 async fn resolve_once(app: &App, did: &str) -> Result<Option<Done>, XrpcError> {
     let acct = app.account(did).await?;
     let Some(p) = acct.pending_signing_key else { return Ok(None) };
     complete(app, did, &p, None).await.map(Some)
 }
 
-/// Retries `did`'s pending rotation with backoff until it ends (or can't
-/// be finished here), unless this node is driving it already.
 fn spawn_resolver(app: Arc<App>, did: String) {
     let Some(driving) = Driving::take(&did) else { return };
     tokio::spawn(async move {
@@ -208,17 +169,15 @@ fn spawn_resolver(app: Arc<App>, did: String) {
     });
 }
 
-/// What one [`recover_pending`] pass found.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Recovered {
-    /// Rotations found pending in this node's shards.
     pub pending: usize,
     pub finished: usize,
     pub aborted: usize,
 }
 
-/// Finishes (or abandons) every rotation left pending in the shards this
-/// node owns: one attempt each, undecided ones retried in the background.
+/// One attempt at each rotation pending in this node's shards; undecided
+/// ones are retried in the background.
 pub async fn recover_pending(app: &Arc<App>) -> Recovered {
     let mut dids = Vec::new();
     for p in app.partitions.owned() {
@@ -256,8 +215,7 @@ pub async fn recover_pending(app: &Arc<App>) -> Recovered {
     out
 }
 
-/// [`recover_pending`] now and every [`RECOVERY_INTERVAL`] (a crash or a
-/// shard move leaves a rotation to the shard's next owner).
+/// A crash or a shard move leaves a rotation to the shard's next owner.
 pub fn spawn_recovery(app: Arc<App>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(RECOVERY_INTERVAL);

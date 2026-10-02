@@ -312,13 +312,15 @@ fn standard_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> X
     }
 }
 
-/// Per-App in-memory state.
+/// Per-App in-memory state (per `App`, so in-process test clusters behave
+/// like separate machines).
 pub(super) struct Ext {
     ctl: Arc<RwLock<HashMap<String, Arc<Ctl>>>>,
     /// Bumped by every change, so a load racing one is not cached.
     gen: AtomicU64,
     pub(super) dev_mail: PMutex<HashMap<String, Vec<Mail>>>,
     locks: Vec<tokio::sync::Mutex<()>>,
+    pub(super) cas_locks: super::cas::Locks,
     claim_grace_ms: AtomicU64,
 }
 
@@ -338,6 +340,7 @@ pub(super) fn ext(app: &App) -> Arc<Ext> {
         gen: AtomicU64::new(0),
         dev_mail: PMutex::new(HashMap::new()),
         locks: (0..64).map(|_| tokio::sync::Mutex::new(())).collect(),
+        cas_locks: Default::default(),
         claim_grace_ms: AtomicU64::new(STALE_CLAIM_GRACE.as_millis() as u64),
     });
     w.push((id, e.clone()));

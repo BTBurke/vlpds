@@ -1,15 +1,11 @@
-//! Node-to-node endpoints (cluster mode). Authenticated with the shared
-//! internal token (`Config::internal_token`, not the admin token) in
-//! `x-vlpds-internal`, and by the caller's node certificate: served only on
-//! the mTLS peer listener (`--peer-listen`, crate::peer_tls;
-//! `server::public_router` 404s them on `--listen`). A lone node has no
-//! peer listener, so no `/internal/*`.
+//! Node-to-node endpoints, served only on the mTLS peer listener and
+//! authenticated also by the shared internal token (DESIGN.md "Exposure").
 
 use super::*;
 use crate::segment::Mutation;
 use base64::Engine;
 
-const HDR: &str = "x-vlpds-internal";
+pub(super) const HDR: &str = "x-vlpds-internal";
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 pub fn routes() -> Router<Arc<App>> {
@@ -31,8 +27,7 @@ pub fn routes() -> Router<Arc<App>> {
         .merge(super::ratelimits::internal_routes())
 }
 
-/// Cluster view of this node (HA tests / ops): shards it owns, the routing
-/// table it forwards by, its log, peers, and where its firehose merger stands.
+/// For HA tests and ops.
 async fn cluster_status(State(app): AppState, headers: HeaderMap) -> XResult<Json<J>> {
     check(&app, &headers)?;
     let owned: Vec<crate::slots::ShardId> = app.partitions.owned().iter().map(|p| p.id).collect();
@@ -66,7 +61,6 @@ async fn cluster_status(State(app): AppState, headers: HeaderMap) -> XResult<Jso
 
 #[derive(serde::Serialize, Deserialize, Default)]
 struct NudgeIn {
-    /// Shards the sender handed us (`cluster::Handoff`).
     #[serde(default)]
     handoffs: Vec<crate::cluster::Handoff>,
 }
@@ -84,15 +78,12 @@ async fn cluster_nudge(State(app): AppState, headers: HeaderMap, axum::Json(inp)
 #[derive(serde::Serialize, Deserialize)]
 struct HelloIn {
     node_id: String,
-    /// The joiner's build and feature levels (informational: its lease is
-    /// authoritative).
+    /// Informational: the joiner's lease is authoritative.
     rev: String,
     min_level: u32,
     max_level: u32,
 }
 
-/// Logs a peer whose build or level window differs from ours (a rolling
-/// deploy in progress, or a node that missed one).
 fn note_peer_build(peer: &str, rev: &str, min: u32, max: u32, ours: crate::version::Window) {
     let window = (min, max);
     if window != (ours.min, ours.max) || rev != crate::version::build_rev() {
@@ -117,8 +108,8 @@ async fn cluster_hello(State(app): AppState, headers: HeaderMap, axum::Json(inp)
     })))
 }
 
-/// Greets each peer (see [`cluster_hello`]): per peer, the floor of its
-/// follower of our log, or None if it didn't confirm.
+/// Per peer, the floor of its follower of our log, or None if it didn't
+/// confirm.
 pub async fn hello_peers(http: &crate::http::PeerClient, token: &str, node_id: &str, levels: crate::version::Window, addrs: Vec<String>) -> Vec<Option<i64>> {
     let sends = addrs.into_iter().map(|addr| async move {
         let hello = HelloIn { node_id: node_id.to_string(), rev: crate::version::build_rev().to_string(), min_level: levels.min, max_level: levels.max };
@@ -133,7 +124,6 @@ pub async fn hello_peers(http: &crate::http::PeerClient, token: &str, node_id: &
         match r {
             Ok(r) => {
                 let v = r.json::<J>().await.ok()?;
-                // informational (logged); 0 = unparseable
                 let level = |k: &str| v[k].as_u64().unwrap_or(0) as u32;
                 note_peer_build(&addr, v["rev"].as_str().unwrap_or_default(), level("minLevel"), level("maxLevel"), levels);
                 (v["ok"] == json!(true)).then(|| v["floor"].as_i64()).flatten()
@@ -147,8 +137,7 @@ pub async fn hello_peers(http: &crate::http::PeerClient, token: &str, node_id: &
     futures::future::join_all(sends).await
 }
 
-/// Sends each `(addr, handoffs)` nudge (see [`cluster_nudge`]). Best effort
-/// and bounded: a peer that misses one finds its handoffs on its next step.
+/// Best effort: a peer that misses one finds its handoffs on its next step.
 pub async fn nudge_peers(http: &crate::http::PeerClient, token: &str, nudges: Vec<(String, Vec<crate::cluster::Handoff>)>) {
     let sends = nudges.into_iter().map(|(addr, handoffs)| async move {
         let r = http
@@ -167,7 +156,7 @@ pub async fn nudge_peers(http: &crate::http::PeerClient, token: &str, nudges: Ve
     futures::future::join_all(sends).await;
 }
 
-fn check(app: &App, headers: &HeaderMap) -> XResult<()> {
+pub(super) fn check(app: &App, headers: &HeaderMap) -> XResult<()> {
     let t = headers.get(HDR).and_then(|v| v.to_str().ok()).unwrap_or("");
     if internal_token_ok(&app.config, t) {
         Ok(())
@@ -176,8 +165,7 @@ fn check(app: &App, headers: &HeaderMap) -> XResult<()> {
     }
 }
 
-/// Whether `t` is the node-to-node token. Dev mode also accepts the admin
-/// token, for senders not yet switched to the internal token.
+/// Dev mode also accepts the admin token.
 pub fn internal_token_ok(cfg: &crate::server::Config, t: &str) -> bool {
     crate::auth::token_eq(&cfg.internal_token, t)
         || (cfg.dev_mode && crate::auth::token_eq(&cfg.admin_token, t))
@@ -185,19 +173,14 @@ pub fn internal_token_ok(cfg: &crate::server::Config, t: &str) -> bool {
 
 #[derive(Deserialize)]
 struct StreamQ {
-    /// The log the follower is following.
     log: Option<String>,
 }
 
-/// Streams this node's log (durable batches + watermark heartbeats) to a peer.
 async fn stream(State(app): AppState, headers: HeaderMap, Query(q): Query<StreamQ>, ws: WebSocketUpgrade) -> XResult<Response> {
     check(&app, &headers)?;
-    // HA fix: serve only the log the follower asked for. A restarted node keeps
-    // its address, so a peer still following its previous (dead) log reached
-    // the new incarnation and got the *new* log's batches labeled with the old
-    // log id. Past the old log's fence ordinal they were merged twice (once
-    // per label): duplicate events on the merged firehose (bench/ha
-    // s3-slow-all, every node restarted at once).
+    // A restarted node keeps its address: a peer still following its previous
+    // log must not get the new log's batches under the old id (they would be
+    // merged twice).
     if let Some(want) = &q.log {
         if **want != *app.log.log_id {
             return Err(XrpcError::bad("WrongLog", format!("this node serves log {}, not {want}", app.log.log_id)));
@@ -230,10 +213,7 @@ async fn put_private(State(app): AppState, headers: HeaderMap, axum::Json(inp): 
             if !key.starts_with(&state::private_prefix(&inp.routing)) {
                 return Err(XrpcError::bad("InvalidRequest", "key outside the routing key's private state"));
             }
-            Ok(Mutation {
-                key: key.into(),
-                val: v.map(|v| B64.decode(v).map(Bytes::from)).transpose().map_err(XrpcError::from_err)?,
-            })
+            Ok(Mutation { key: key.into(), val: b64_opt(v)? })
         })
         .collect::<XResult<Vec<_>>>()?;
     // must be local now (no forwarding loops)
@@ -255,7 +235,6 @@ struct CasIn {
     conds: Vec<(String, Option<String>)>,
     /// (name, value: None = delete), base64
     puts: Vec<(String, Option<String>)>,
-    /// name prefixes whose rows are deleted
     #[serde(default)]
     delete_prefixes: Vec<String>,
 }
@@ -264,7 +243,6 @@ fn b64_opt(v: Option<String>) -> XResult<Option<Bytes>> {
     v.map(|v| B64.decode(v).map(Bytes::from)).transpose().map_err(XrpcError::from_err)
 }
 
-/// [`App::private_cas`] at this node, which must own the routing key.
 async fn private_cas(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<CasIn>) -> XResult<Json<J>> {
     use super::cas::{Cond, Op};
     check(&app, &headers)?;
@@ -299,17 +277,7 @@ pub async fn forward_private_cas(
             Op::DeletePrefix { prefix } => body.delete_prefixes.push(prefix),
         }
     }
-    let r = app
-        .http
-        .post(format!("{owner}/internal/v1/private/cas"))
-        .header(HDR, &app.config.internal_token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(upstream)?;
-    if !r.status().is_success() {
-        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
-    }
+    let r = send(app.http.post(format!("{owner}/internal/v1/private/cas")).header(HDR, &app.config.internal_token).json(&body)).await?;
     #[derive(Deserialize)]
     struct Out {
         applied: bool,
@@ -346,8 +314,7 @@ struct ScanQ {
     prefix: String,
 }
 
-/// Private entries of a local routing key by name prefix (bounded: callers
-/// scan small per-account sets such as `sec/` or `oauth/ses/`).
+/// Unbounded: callers scan small per-account sets such as `sec/`.
 async fn scan_private(State(app): AppState, headers: HeaderMap, Query(q): Query<ScanQ>) -> XResult<Json<J>> {
     check(&app, &headers)?;
     app.partition(&q.routing)?;
@@ -373,16 +340,13 @@ struct ReplayIn {
     routing: String,
     key: String,
     until: i64,
-    /// release an earlier claim instead
     #[serde(default)]
     release: bool,
-    /// a guard released right after: memory only (see `claim_replay_owned`)
+    /// A guard released right after: memory only.
     #[serde(default)]
     transient: bool,
 }
 
-/// Single-use check-and-set of an OAuth replay key (DPoP proof / client
-/// assertion / request object jti) at the owner of its routing key.
 async fn claim_replay(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<ReplayIn>) -> XResult<Json<J>> {
     check(&app, &headers)?;
     app.partition(&inp.routing)?;
@@ -394,24 +358,19 @@ async fn claim_replay(State(app): AppState, headers: HeaderMap, axum::Json(inp):
     Ok(Json(json!({"fresh": fresh})))
 }
 
-/// [`super::server::scan_private`] of `routing` wherever its partition is
-/// owned (here, or one internal call to the owner).
+/// [`super::server::scan_private`] at the routing key's owner.
 pub async fn scan_private_anywhere(app: &App, routing: &str, prefix: &str) -> XResult<Vec<(String, Bytes)>> {
     let Some(owner) = app.remote_owner(routing) else {
         return super::server::scan_private(app, routing, prefix).await;
     };
-    let r = app
-        .http
-        .get(format!("{owner}/internal/v1/private/scan"))
-        .header(HDR, &app.config.internal_token)
-        .timeout(OWNER_CALL_TIMEOUT)
-        .query(&[("routing", routing), ("prefix", prefix)])
-        .send()
-        .await
-        .map_err(upstream)?;
-    if !r.status().is_success() {
-        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
-    }
+    let r = send(
+        app.http
+            .get(format!("{owner}/internal/v1/private/scan"))
+            .header(HDR, &app.config.internal_token)
+            .timeout(OWNER_CALL_TIMEOUT)
+            .query(&[("routing", routing), ("prefix", prefix)]),
+    )
+    .await?;
     #[derive(Deserialize)]
     struct Rows {
         rows: Vec<(String, String)>,
@@ -423,7 +382,6 @@ pub async fn scan_private_anywhere(app: &App, routing: &str, prefix: &str) -> XR
         .collect()
 }
 
-/// The account record of `did` wherever its partition is owned.
 pub async fn account_anywhere(app: &App, did: &str) -> XResult<Account> {
     let Some(owner) = app.remote_owner(did) else {
         return app.account(did).await;
@@ -453,20 +411,19 @@ pub async fn account_anywhere(app: &App, did: &str) -> XResult<Account> {
     r.json().await.map_err(upstream)
 }
 
-/// Single-use claim of an OAuth replay `key` until `until` (unix secs), made
-/// at the owner of `routing` so every node agrees, and persisted in its
-/// partition so a later owner agrees too. Ok(false) = replayed.
+/// Single-use claim of an OAuth replay `key` until `until` (unix secs), at
+/// the owner of `routing` so every node agrees, and persisted so a later
+/// owner agrees too. Ok(false) = replayed.
 pub async fn claim_replay_anywhere(app: &App, routing: &str, key: &str, until: i64) -> XResult<bool> {
     replay_call(app, routing, key, until, false, false).await
 }
 
-/// [`claim_replay_anywhere`] for a short guard that is released right after
-/// (in memory at the owner only).
+/// [`claim_replay_anywhere`] for a short guard released right after (in
+/// memory at the owner only).
 pub async fn claim_transient_anywhere(app: &App, routing: &str, key: &str, until: i64) -> XResult<bool> {
     replay_call(app, routing, key, until, false, true).await
 }
 
-/// Releases a claim made with [`claim_transient_anywhere`].
 pub async fn release_replay_anywhere(app: &App, routing: &str, key: &str) -> XResult<()> {
     replay_call(app, routing, key, 0, true, true).await.map(|_| ())
 }
@@ -481,28 +438,33 @@ async fn replay_call(app: &App, routing: &str, key: &str, until: i64, release: b
         return crate::oauth::util::claim_replay_owned(app, routing, key, until, !transient).await;
     };
     let body = ReplayIn { routing: routing.into(), key: key.into(), until, release, transient };
-    let r = app
-        .http
-        .post(format!("{owner}/internal/v1/oauth/replay"))
-        .header(HDR, &app.config.internal_token)
-        .timeout(OWNER_CALL_TIMEOUT)
-        .json(&body)
-        .send()
-        .await
-        .map_err(upstream)?;
-    if !r.status().is_success() {
-        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
-    }
+    let r = send(
+        app.http
+            .post(format!("{owner}/internal/v1/oauth/replay"))
+            .header(HDR, &app.config.internal_token)
+            .timeout(OWNER_CALL_TIMEOUT)
+            .json(&body),
+    )
+    .await?;
     let v: J = r.json().await.map_err(upstream)?;
     Ok(v["fresh"].as_bool().unwrap_or(false))
 }
 
-/// Deadline for the small owner lookups below (auth checks wait on them):
-/// a frozen owner fails the request fast instead of holding it.
+/// Auth checks wait on these owner lookups: a frozen owner fails the
+/// request fast instead of holding it.
 const OWNER_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn upstream(e: impl std::fmt::Display) -> XrpcError {
-    XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: "PartitionUnavailable".into(), message: format!("partition owner: {e}") }
+    XrpcError::unavailable("PartitionUnavailable", format!("partition owner: {e}"))
+}
+
+/// A non-2xx answer is an [`upstream`] error.
+async fn send(req: reqwest::RequestBuilder) -> XResult<reqwest::Response> {
+    let r = req.send().await.map_err(upstream)?;
+    if !r.status().is_success() {
+        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
+    }
+    Ok(r)
 }
 
 pub async fn forward_put_private(app: &App, owner: &str, routing: &str, muts: Vec<Mutation>) -> XResult<()> {
@@ -510,77 +472,41 @@ pub async fn forward_put_private(app: &App, owner: &str, routing: &str, muts: Ve
         routing: routing.to_string(),
         muts: muts.into_iter().map(|m| (B64.encode(&m.key), m.val.map(|v| B64.encode(v)))).collect(),
     };
-    let r = app
-        .http
-        .post(format!("{owner}/internal/v1/private/put"))
-        .header(HDR, &app.config.internal_token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(upstream)?;
-    if !r.status().is_success() {
-        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
-    }
+    send(app.http.post(format!("{owner}/internal/v1/private/put")).header(HDR, &app.config.internal_token).json(&body)).await?;
     Ok(())
 }
 
 pub async fn forward_get_private(app: &App, owner: &str, routing: &str, name: &str) -> XResult<Option<Bytes>> {
-    let r = app
-        .http
-        .get(format!("{owner}/internal/v1/private/get"))
-        .header(HDR, &app.config.internal_token)
-        .query(&[("routing", routing), ("name", name)])
-        .send()
-        .await
-        .map_err(upstream)?;
-    if !r.status().is_success() {
-        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
-    }
+    let r = send(
+        app.http
+            .get(format!("{owner}/internal/v1/private/get"))
+            .header(HDR, &app.config.internal_token)
+            .query(&[("routing", routing), ("name", name)]),
+    )
+    .await?;
     let v: J = r.json().await.map_err(upstream)?;
-    match v["value"].as_str() {
-        Some(s) => Ok(Some(B64.decode(s).map_err(upstream)?.into())),
-        None => Ok(None),
-    }
+    v["value"].as_str().map(|s| B64.decode(s).map(Bytes::from).map_err(upstream)).transpose()
 }
 
-// ---------------------------------------------------------------------------
-// admin scatter-gather (cluster-wide listings; see admin.rs)
-// ---------------------------------------------------------------------------
-
-/// Per-peer deadline for a scatter-gather leg: a slow or dead peer costs the
-/// admin call at most this, and is reported as unreachable.
+/// Per-peer deadline of a scatter-gather leg (a slower peer is reported as
+/// unreachable).
 const GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The local half of searchAccounts on this node's shards, for a peer's merge.
-async fn admin_search_accounts(
-    State(app): AppState,
-    headers: HeaderMap,
-    Query(q): Query<super::admin::SearchQ>,
-) -> XResult<Json<J>> {
+async fn admin_search_accounts(State(app): AppState, headers: HeaderMap, Query(q): Query<super::admin::SearchQ>) -> XResult<Json<J>> {
     check(&app, &headers)?;
     let (hits, owned) = super::admin::search_accounts_local(&app, &q).await?;
     Ok(Json(json!({"owned": owned, "accounts": hits})))
 }
 
-/// The local half of getInviteCodes on this node's shards, for a peer's merge.
-async fn admin_invite_codes(
-    State(app): AppState,
-    headers: HeaderMap,
-    Query(q): Query<super::admin::InviteCodesQ>,
-) -> XResult<Json<J>> {
+async fn admin_invite_codes(State(app): AppState, headers: HeaderMap, Query(q): Query<super::admin::InviteCodesQ>) -> XResult<Json<J>> {
     check(&app, &headers)?;
     let (codes, owned) = super::admin::invite_codes_local(&app, &q).await?;
     Ok(Json(json!({"owned": owned, "codes": codes})))
 }
 
-/// A sync.listRepos page from this node's shards only (the cursor's shard
-/// must be ours: 503 otherwise, never forwarded again), in the public
-/// response shape. Peers call it with the owner of their cursor's shard.
-async fn sync_list_repos(
-    State(app): AppState,
-    headers: HeaderMap,
-    Query(q): Query<ListPageQ>,
-) -> XResult<Response> {
+/// From this node's shards only (the cursor's shard must be ours: 503
+/// otherwise, never forwarded again), in the public response shape.
+async fn sync_list_repos(State(app): AppState, headers: HeaderMap, Query(q): Query<ListPageQ>) -> XResult<Response> {
     check(&app, &headers)?;
     let pos = super::sync::parse_list_cursor(&q.cursor)?;
     let limit = super::extract::limit_param(Some(q.limit), 500, 1, 1000)?;
@@ -595,24 +521,19 @@ struct ListPageQ {
     limit: i64,
 }
 
-/// GETs a listRepos page from the shard owner at `owner` (its raw body).
+/// The raw body of the owner's listRepos page.
 pub async fn owner_list_repos(app: &App, owner: &str, cursor: &str, limit: usize) -> XResult<Bytes> {
-    let r = app
-        .http
-        .get(format!("{}/internal/v1/sync/listRepos", owner.trim_end_matches('/')))
-        .header(HDR, &app.config.internal_token)
-        .query(&[("cursor", cursor), ("limit", &limit.to_string())])
-        .timeout(GATHER_TIMEOUT)
-        .send()
-        .await
-        .map_err(upstream)?;
-    if !r.status().is_success() {
-        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
-    }
+    let r = send(
+        app.http
+            .get(format!("{}/internal/v1/sync/listRepos", owner.trim_end_matches('/')))
+            .header(HDR, &app.config.internal_token)
+            .query(&[("cursor", cursor), ("limit", &limit.to_string())])
+            .timeout(GATHER_TIMEOUT),
+    )
+    .await?;
     r.bytes().await.map_err(upstream)
 }
 
-/// The local half of sync.listReposByCollection, for a peer's merge.
 async fn sync_list_repos_by_collection(
     State(app): AppState,
     headers: HeaderMap,
@@ -625,7 +546,7 @@ async fn sync_list_repos_by_collection(
 
 pub struct PeerReply {
     pub node: String,
-    /// Shards the peer scanned (owned at the time).
+    /// Shards the peer scanned.
     pub owned: Vec<crate::slots::ShardId>,
     pub body: J,
 }
@@ -633,10 +554,9 @@ pub struct PeerReply {
 #[derive(Default)]
 pub struct Gathered {
     pub replies: Vec<PeerReply>,
-    /// Node ids of live peers that failed or timed out.
     pub unreachable: Vec<String>,
-    /// Node ids of live peers that answered 404: their build doesn't have
-    /// the endpoint (a rolling deploy), which is not "unreachable".
+    /// Peers that answered 404: their build lacks the endpoint (a rolling
+    /// deploy), which is not "unreachable".
     pub unsupported: Vec<String>,
 }
 
@@ -645,8 +565,7 @@ enum LegError {
     Failed(String),
 }
 
-/// GETs `path?query` on every live peer (not this node) concurrently, each
-/// bounded by [`GATHER_TIMEOUT`]. No peers (a single node) = nothing to do.
+/// GETs `path?query` on every live peer concurrently.
 pub async fn gather(app: &App, path: &str, query: &[(&str, String)]) -> Gathered {
     let Some(c) = &app.cluster else {
         return Gathered::default();

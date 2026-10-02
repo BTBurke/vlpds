@@ -1,41 +1,14 @@
-//! Email second factor: the reference PDS's `emailAuthFactor` (the factor
-//! the Bluesky app offers), next to vlpds's own TOTP (src/totp.rs).
-//!
-//! - State: `Account.extra.emailAuthFactorAt` (RFC 3339; absent = off).
-//!   Toggled through `com.atproto.server.updateEmail` with the account's
-//!   current address: enabling needs a confirmed email and no token;
-//!   disabling is two-phase (the first call mails an `update_email` code and
-//!   fails `TokenRequired`, the second carries it), so a hijacked session
-//!   can't silently drop the factor. Changing the address (user or admin)
-//!   clears the factor, as in the reference: codes must not go to an
-//!   unconfirmed inbox.
-//! - Sign-in: a password login (createSession or the OAuth sign-in page;
-//!   app passwords bypass it, as in the reference) with the factor on and no
-//!   code mails a fresh `auth_factor` code (15 min, single use, keyed digest
-//!   at rest like every email token) and fails 401
-//!   `AuthFactorTokenRequired`; `authFactorToken` carries the code back.
-//! - Guessing: wrong codes count against a per-account lockout with TOTP's
-//!   schedule (every [`crate::totp::MAX_FAILURES`] wrong codes lock the
-//!   factor for 5 min, doubling up to a day; 429 `RateLimitExceeded` while
-//!   locked, and no code is mailed then), on top of createSession's
-//!   per-identifier rate limits. The reference has only the latter.
-//!
-//! Precedence: when TOTP is also enabled, TOTP alone is asked for (a TOTP
-//! or recovery code); no email code is mailed or accepted. Both can stay
-//! enabled, so disabling TOTP falls back to the email factor, but the
-//! weaker factor never stands in for the stronger one.
+//! Email second factor: the reference PDS's `emailAuthFactor`, plus a
+//! wrong-code lockout on TOTP's schedule (DESIGN.md "Email second factor").
+//! When TOTP is also enabled, TOTP alone is asked for: the weaker factor
+//! never stands in for the stronger one.
 
-use super::server::{
-    assert_email_token, create_email_token, delete_email_tokens, deliver, invalid_request,
-    to_json_bytes,
-};
+use super::server::{assert_email_token, create_email_token, delete_email_tokens, deliver, invalid_request, to_json_bytes};
 use super::*;
 
-/// Account field holding when the factor was enabled.
+/// RFC 3339; absent = off.
 pub(super) const FLAG: &str = "emailAuthFactorAt";
-/// Email-token purpose of sign-in codes.
 pub(super) const PURPOSE: &str = "auth_factor";
-/// Private-state name of the wrong-code lockout counters.
 const LOCKOUT_NAME: &str = "eotp_lock";
 
 pub(super) fn enabled(a: &Account) -> bool {
@@ -48,17 +21,16 @@ struct Lockout {
     locked_until: u64,
 }
 
-/// The lockout row with fixed values (golden fixtures, `super::private_rows`).
+/// Golden fixtures (`super::private_rows`).
 pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
     vec![(did.into(), LOCKOUT_NAME.into(), super::private_rows::enc(&Lockout { failures: 3, locked_until: 1_790_000_300 }))]
 }
 
-/// Decodes the lockout row (None: not it).
 pub(super) fn check_row(_routing: &str, name: &str, val: &[u8]) -> Option<anyhow::Result<&'static str>> {
     (name == LOCKOUT_NAME).then(|| super::private_rows::typed_row::<Lockout>("email 2fa lockout", val))
 }
 
-/// The factor a failed second-factor check asked for.
+/// What a failed second-factor check asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Factor {
     Totp,
@@ -78,7 +50,7 @@ impl From<FactorErr> for XrpcError {
     }
 }
 
-/// Reference `obfuscateEmail`: first and last character of each side.
+/// The reference's `obfuscateEmail`.
 pub(super) fn obfuscate_email(email: &str) -> String {
     fn word(w: &str) -> String {
         let first = w.chars().next().map(String::from).unwrap_or_default();
@@ -97,19 +69,11 @@ fn factor_required() -> XrpcError {
     }
 }
 
-/// Second factor of a login (createSession, OAuth sign-in): TOTP when
-/// enabled, else the email factor when enabled. App passwords
-/// (`app_password`) bypass both. A code sent anyway (no factor, or an app
-/// password) is still checked as an email sign-in code, as the reference's
-/// `login()` does (`if (authFactorToken) assertValidEmailTokenAndCleanup`):
-/// with no code mailed it fails 400 `InvalidToken`, and counts against the
-/// lockout like any wrong code.
-pub(super) async fn check_second_factor(
-    app: &App,
-    acct: &Account,
-    code: Option<&str>,
-    app_password: bool,
-) -> Result<(), FactorErr> {
+/// TOTP when enabled, else the email factor when enabled; app passwords
+/// bypass both. A code sent anyway is still checked as an email sign-in
+/// code, as the reference's `login()` does, and counts against the lockout
+/// like any wrong code.
+pub(super) async fn check_second_factor(app: &App, acct: &Account, code: Option<&str>, app_password: bool) -> Result<(), FactorErr> {
     let code = code.map(str::trim).filter(|c| !c.is_empty());
     let hint = || Factor::Email { hint: acct.email.as_deref().map(obfuscate_email).unwrap_or_default() };
     if app_password {
@@ -118,13 +82,9 @@ pub(super) async fn check_second_factor(
             None => Ok(()),
         };
     }
-    let totp = crate::totp::enabled_for(app, acct)
-        .await
-        .map_err(|err| FactorErr { err, factor: Factor::Totp })?;
+    let totp = crate::totp::enabled_for(app, acct).await.map_err(|err| FactorErr { err, factor: Factor::Totp })?;
     if totp {
-        return crate::totp::check_second_factor(app, acct, code)
-            .await
-            .map_err(|err| FactorErr { err, factor: Factor::Totp });
+        return crate::totp::check_second_factor(app, acct, code).await.map_err(|err| FactorErr { err, factor: Factor::Totp });
     }
     match (&acct.email, enabled(acct), code) {
         (Some(email), true, _) => check_email_code(app, acct, Some(email), code).await.map_err(|err| FactorErr { err, factor: hint() }),
@@ -133,15 +93,12 @@ pub(super) async fn check_second_factor(
     }
 }
 
-/// Checks `code` (under the lockout), or mails a fresh one to `email` when
-/// there's none (the factor is on: `email` is always given then).
+/// Checks `code` under the lockout, or mails a fresh one to `email`.
 async fn check_email_code(app: &App, acct: &Account, email: Option<&str>, code: Option<&str>) -> XResult<()> {
     use super::cas::{Cond, Op};
     let did = acct.did.as_str();
-    // the TOTP lock also serializes this factor's counter updates on this
-    // node; across nodes, every update below is conditional on the rows
-    // still holding what was read (src/xrpc/cas.rs), redone otherwise: no
-    // lost failure, and a code is accepted once
+    // across nodes every update is conditional on the rows read, redone
+    // otherwise: no lost failure, and a code is accepted once
     let _g = crate::totp::lock(did).await;
     let token_name = format!("etok/{PURPOSE}");
     for _ in 0..crate::totp::CAS_ROUNDS {
@@ -152,9 +109,7 @@ async fn check_email_code(app: &App, acct: &Account, email: Option<&str>, code: 
             return Err(crate::totp::locked_out());
         }
         let Some(code) = code else {
-            let Some(email) = email else {
-                return Ok(());
-            };
+            let Some(email) = email else { return Ok(()) };
             let token = create_email_token(app, did, PURPOSE).await?;
             deliver(app, email, crate::mail::Email::SignInAuthFactor { handle: Some(&acct.handle), token: &token });
             return Err(factor_required());
@@ -179,17 +134,14 @@ async fn check_email_code(app: &App, acct: &Account, email: Option<&str>, code: 
     Err(crate::totp::conflict())
 }
 
-/// updateEmail `emailAuthFactor: true` on the confirmed current address.
-/// Idempotent; no token needed (enabling only adds protection).
+/// No token needed: enabling only adds protection.
 pub(super) async fn enable(app: &App, did: &str) -> XResult<()> {
     app.mutate_account(did, false, false, false, |a| {
         if enabled(a) {
             return Ok(false);
         }
         if a.email.is_none() || !a.email_confirmed {
-            return Err(invalid_request(
-                "A confirmed email address is required to enable email-based two-factor authentication",
-            ));
+            return Err(invalid_request("A confirmed email address is required to enable email-based two-factor authentication"));
         }
         super::server::set_extra(a, FLAG, json!(crate::events::now_rfc3339()));
         Ok(true)
@@ -198,11 +150,9 @@ pub(super) async fn enable(app: &App, did: &str) -> XResult<()> {
     Ok(())
 }
 
-/// updateEmail `emailAuthFactor: false` on the current address. Without a
-/// token: mails an `update_email` code (the token requestEmailUpdate mints
-/// too, which is what the Bluesky app sends) and fails `TokenRequired`.
-/// With one: checks and spends it, then clears the factor. A no-op when the
-/// factor is already off.
+/// Two-phase, so a hijacked session can't silently drop the factor: without
+/// a token, mails an `update_email` code (what the Bluesky app sends back)
+/// and fails `TokenRequired`.
 pub(super) async fn disable(app: &App, acct: &Account, token: Option<&str>) -> XResult<()> {
     if !enabled(acct) {
         return Ok(());

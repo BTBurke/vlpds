@@ -1,31 +1,21 @@
 //! Conditional writes of private (`p/{routing}\0...`) state, correct across
-//! nodes: [`App::private_cas`].
+//! nodes: [`App::private_cas`] (DESIGN.md "Auth state under concurrency").
 //!
-//! `put_private` is a blind write. Read-modify-write sequences whose
-//! correctness depends on what they read (a refresh-token rotation, a
-//! session created from a credential check, a TOTP `last_step` or lockout
-//! counter) use this instead: the conditions are checked and the write made
-//! at the routing key's owner, under a lock there that every conditional
-//! write of that routing key takes, with the write applied before the lock
-//! is released. So two conditional writes of one key never interleave, on
-//! whichever nodes they started (requests on other nodes are forwarded to
-//! the owner, as `put_private` does).
-//!
-//! Only conditional writes serialize with each other: a blind `put_private`
-//! of the same rows can still slip between a check and its write. Rows that
-//! need the guarantee are written only through here (the OAuth store, the
-//! legacy `sess/` rows, `auth_epoch`, TOTP state, the email-factor lockout).
+//! The conditions are checked and the write made at the routing key's
+//! owner, under a lock every conditional write of that key takes, with the
+//! write applied before the lock is released. Only conditional writes
+//! serialize with each other: a blind `put_private` of the same rows can
+//! still slip between a check and its write, so rows that need the
+//! guarantee are written only through here.
 //!
 //! An ownership move between the check and the write is safe: the old
-//! owner's log refuses an entry for a shard it no longer holds (nodelog
-//! `Open::push`), so the write fails rather than landing after the new
-//! owner's writes.
+//! owner's log refuses an entry for a shard it no longer holds, so the write
+//! fails rather than landing after the new owner's writes.
 
 use super::*;
 use crate::segment::Mutation;
 use std::collections::HashMap;
 
-/// A precondition, on the current (applied) value of one private row.
 #[derive(Clone, Debug)]
 pub enum Cond {
     /// The row `name` holds exactly `val` (None = absent).
@@ -38,14 +28,12 @@ impl Cond {
     }
 }
 
-/// A write, made if every [`Cond`] holds.
 #[derive(Clone, Debug)]
 pub enum Op {
-    /// Set (Some) or delete (None) the row `name`.
+    /// None deletes.
     Put { name: String, val: Option<Bytes> },
-    /// Delete every row whose name starts with `prefix` (read at the owner
-    /// under the lock, so no row created by an earlier conditional write is
-    /// missed).
+    /// Listed at the owner under the lock, so no row created by an earlier
+    /// conditional write is missed.
     DeletePrefix { prefix: String },
 }
 
@@ -57,16 +45,15 @@ impl Op {
 
 #[derive(Clone, Debug, Default)]
 pub struct Outcome {
-    /// Whether every condition held (and so the write was made).
+    /// False: a condition failed and nothing was written.
     pub applied: bool,
-    /// Rows removed by [`Op::DeletePrefix`] (name, value).
+    /// (name, value) of the rows removed by [`Op::DeletePrefix`].
     pub deleted: Vec<(String, Bytes)>,
 }
 
-/// Per-routing-key locks of one node (per `App`, so in-process test
-/// clusters behave like separate machines). Unused entries are pruned.
+/// Per-routing-key locks of one node.
 #[derive(Default)]
-struct Locks {
+pub(super) struct Locks {
     m: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -83,22 +70,6 @@ impl Locks {
     }
 }
 
-static LOCKS: parking_lot::RwLock<Vec<(usize, Arc<Locks>)>> = parking_lot::RwLock::new(Vec::new());
-
-fn locks(app: &App) -> Arc<Locks> {
-    let id = app as *const App as usize;
-    if let Some((_, l)) = LOCKS.read().iter().find(|(k, _)| *k == id) {
-        return l.clone();
-    }
-    let mut w = LOCKS.write();
-    if let Some((_, l)) = w.iter().find(|(k, _)| *k == id) {
-        return l.clone();
-    }
-    let l = Arc::new(Locks::default());
-    w.push((id, l.clone()));
-    l
-}
-
 /// Test hook: awaited at a named point of a read-modify-write (e.g.
 /// `oauth_refresh`, right before its conditional write) for one routing key,
 /// so a test can hold a request there while it races something against it.
@@ -107,7 +78,6 @@ pub type PauseHook = Arc<dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Futu
 static PAUSE_HOOKS: parking_lot::Mutex<Option<HashMap<String, PauseHook>>> = parking_lot::Mutex::new(None);
 static ANY_PAUSE_HOOK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Installs (Some) or removes (None) the pause hook of `routing` (tests).
 pub fn set_pause_hook(routing: &str, h: Option<PauseHook>) {
     let mut g = PAUSE_HOOKS.lock();
     let m = g.get_or_insert_with(HashMap::new);
@@ -118,7 +88,6 @@ pub fn set_pause_hook(routing: &str, h: Option<PauseHook>) {
     ANY_PAUSE_HOOK.store(!m.is_empty(), std::sync::atomic::Ordering::Release);
 }
 
-/// Runs `routing`'s pause hook at `point`, if a test installed one.
 pub async fn pause_point(point: &str, routing: &str) {
     if !ANY_PAUSE_HOOK.load(std::sync::atomic::Ordering::Acquire) {
         return;
@@ -130,10 +99,7 @@ pub async fn pause_point(point: &str, routing: &str) {
 }
 
 impl App {
-    /// Checks `conds` and, if they all hold, applies `ops` in one log write,
-    /// at the owner of `routing` and serialized with every other
-    /// conditional write of `routing` (module docs). `applied: false` =
-    /// a condition failed and nothing was written.
+    /// Checks `conds` and, if they all hold, applies `ops` in one log write.
     pub async fn private_cas(&self, routing: &str, conds: Vec<Cond>, ops: Vec<Op>) -> Result<Outcome, XrpcError> {
         if let Some(owner) = self.remote_owner(routing) {
             let touches_sec = ops.iter().any(|o| matches!(o, Op::Put { name, .. } if name.starts_with(super::server::SEC)));
@@ -148,10 +114,9 @@ impl App {
     }
 }
 
-/// [`App::private_cas`] on the owner (the internal endpoint calls this: never
-/// forwarded again).
+/// Never forwarded again.
 pub(super) async fn private_cas_local(app: &App, routing: &str, conds: Vec<Cond>, ops: Vec<Op>) -> Result<Outcome, XrpcError> {
-    let lock = locks(app).get(routing);
+    let lock = super::server::ext(app).cas_locks.get(routing);
     let _g = lock.lock().await;
     let p = app.partition(routing)?;
     for c in &conds {
@@ -163,12 +128,13 @@ pub(super) async fn private_cas_local(app: &App, routing: &str, conds: Vec<Cond>
     }
     let mut muts: Vec<Mutation> = Vec::new();
     let mut deleted = Vec::new();
-    let mut put_names: Vec<&str> = Vec::new();
-    for op in &ops {
-        if let Op::Put { name, .. } = op {
-            put_names.push(name);
-        }
-    }
+    let put_names: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Put { name, .. } => Some(name.as_str()),
+            Op::DeletePrefix { .. } => None,
+        })
+        .collect();
     for op in &ops {
         match op {
             Op::Put { name, val } => muts.push(Mutation { key: state::private_key(routing, name).into(), val: val.clone() }),
@@ -194,8 +160,7 @@ pub(super) async fn private_cas_local(app: &App, routing: &str, conds: Vec<Cond>
     Ok(Outcome { applied: true, deleted })
 }
 
-/// `put_private` into a partition held here, never forwarded: if the shard
-/// moved since the checks, the log refuses the entry (module docs).
+/// Never forwarded: if the shard moved since the checks, the log refuses it.
 async fn write_local(p: &crate::partition::Partition, muts: Vec<Mutation>) -> Result<(), XrpcError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let entry = crate::partition::LogEntry {

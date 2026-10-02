@@ -1,19 +1,8 @@
-//! Rate-limit observability and runtime configuration (src/ratelimit.rs,
-//! DESIGN.md "Rate limits: observability and runtime config"):
-//!
-//! - `GET vlpds.admin.getRateLimits?top=N&local=bool` (admin): the limits in
-//!   force, the stored config with its history, and per node and cluster-wide
-//!   the heaviest keys per bucket and recent 429s by bucket and route. Peers
-//!   are asked over `/internal/v1/ratelimits` with a short deadline; a peer
-//!   that doesn't answer is listed in `unreachableNodes`.
-//! - `POST vlpds.admin.updateRateLimits` (admin) `{config, ifVersion,
-//!   actor?, note?}`: validates and stores the next config version (CAS),
-//!   installs it here, then nudges every peer to reload and reports which
-//!   version each one now runs.
-//! - `/internal/v1/ratelimits` (GET: this node's snapshot) and
-//!   `/internal/v1/ratelimits/reload` (POST: re-read the object now).
+//! Rate-limit observability and runtime configuration (DESIGN.md "Rate
+//! limits: observability and runtime config").
 
-use super::authn::Credentials;
+use super::admin::require_admin;
+use super::internal::HDR as INTERNAL_HDR;
 use super::*;
 use crate::ratelimit::config::Doc;
 use crate::ratelimit::runtime::{self, SaveError, SaveReq};
@@ -21,8 +10,6 @@ use crate::ratelimit::{Consumer, NodeSnapshot, RejectionCount};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-const INTERNAL_HDR: &str = "x-vlpds-internal";
-/// Deadline for a peer's reload after a change.
 const RELOAD_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_TOP: usize = 10;
 const MAX_TOP: usize = 50;
@@ -33,39 +20,16 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/vlpds.admin.updateRateLimits", post(update_rate_limits))
 }
 
-/// The node-to-node half (mounted with `internal::routes`).
 pub fn internal_routes() -> Router<Arc<App>> {
     Router::new()
         .route("/internal/v1/ratelimits", get(internal_snapshot))
         .route("/internal/v1/ratelimits/reload", post(internal_reload))
 }
 
-/// Starts the config refresher (called when the router is built;
-/// idempotent). It runs under `--no-rate-limits` too, so the console shows
-/// and edits the cluster's config from any node: one conditional GET per
-/// [`runtime::REFRESH_EVERY`].
+/// Idempotent. Runs under `--no-rate-limits` too, so the console shows and
+/// edits the cluster's config from any node.
 pub fn start(app: &Arc<App>) {
     runtime::spawn_refresher(&app.ratelimit, app.store.clone());
-}
-
-fn require_admin(creds: &Credentials) -> XResult<()> {
-    match creds {
-        Credentials::Admin => Ok(()),
-        _ => Err(XrpcError {
-            status: StatusCode::UNAUTHORIZED,
-            error: "AuthenticationRequired".into(),
-            message: "admin credentials required".into(),
-        }),
-    }
-}
-
-fn internal_ok(app: &App, headers: &HeaderMap) -> XResult<()> {
-    let t = headers.get(INTERNAL_HDR).and_then(|v| v.to_str().ok()).unwrap_or("");
-    if internal::internal_token_ok(&app.config, t) {
-        Ok(())
-    } else {
-        Err(XrpcError::auth("internal endpoint"))
-    }
 }
 
 fn node_id(app: &App) -> String {
@@ -79,7 +43,7 @@ struct TopQ {
     local: bool,
 }
 
-/// One bucket as in force on this node, with its default.
+/// The buckets in force on this node, with their defaults.
 fn limiter_rows(p: &crate::ratelimit::Policy) -> Vec<J> {
     p.specs()
         .map(|s| {
@@ -116,16 +80,16 @@ fn node_row(s: &NodeSnapshot, me: &str, reachable: bool) -> J {
 #[serde(rename_all = "camelCase")]
 struct ClusterConsumer {
     key: String,
-    /// Summed over nodes (per-IP counters are per node).
+    /// Summed over nodes (counters are per node).
     used: u32,
-    /// The most any one node counted (what its limit is checked against).
+    /// What a node's limit is checked against.
     max_node_used: u32,
     limit: Option<u32>,
     reset_ms: u64,
     nodes: Vec<String>,
 }
 
-/// Merges nodes' heavy hitters per bucket: summed by key, heaviest first.
+/// Heaviest first.
 fn merge_top(snaps: &[NodeSnapshot], n: usize) -> BTreeMap<String, Vec<ClusterConsumer>> {
     let mut by: BTreeMap<String, BTreeMap<String, ClusterConsumer>> = BTreeMap::new();
     for s in snaps {
@@ -157,7 +121,7 @@ fn merge_top(snaps: &[NodeSnapshot], n: usize) -> BTreeMap<String, Vec<ClusterCo
         .collect()
 }
 
-/// Sums nodes' 429 tallies by (bucket, route).
+/// By (bucket, route).
 fn merge_rejections(snaps: &[NodeSnapshot]) -> Vec<RejectionCount> {
     let mut m: BTreeMap<(String, String), RejectionCount> = BTreeMap::new();
     for s in snaps {
@@ -238,8 +202,7 @@ struct UpdateIn {
     note: Option<String>,
 }
 
-/// The caller's address for the audit entry (TCP peer, or the client behind
-/// a trusted proxy, or the client a forwarding peer vouched for).
+/// The caller's address for the audit entry.
 pub struct PeerIp(Option<std::net::IpAddr>);
 
 impl axum::extract::FromRequestParts<Arc<App>> for PeerIp {
@@ -250,21 +213,20 @@ impl axum::extract::FromRequestParts<Arc<App>> for PeerIp {
     }
 }
 
+fn upstream_failure(message: String) -> XrpcError {
+    XrpcError { status: StatusCode::BAD_GATEWAY, error: "UpstreamFailure".into(), message }
+}
+
 fn save_error(e: SaveError) -> XrpcError {
     let message = e.to_string();
     match e {
         SaveError::Invalid(_) => XrpcError::bad("InvalidConfig", message),
         SaveError::Conflict { .. } => XrpcError { status: StatusCode::CONFLICT, error: "ConfigConflict".into(), message },
-        SaveError::Store(_) => XrpcError { status: StatusCode::BAD_GATEWAY, error: "UpstreamFailure".into(), message },
+        SaveError::Store(_) => upstream_failure(message),
     }
 }
 
-async fn update_rate_limits(
-    State(app): AppState,
-    Auth(creds): Auth,
-    PeerIp(peer): PeerIp,
-    Json(inp): Json<UpdateIn>,
-) -> XResult<Json<J>> {
+async fn update_rate_limits(State(app): AppState, Auth(creds): Auth, PeerIp(peer): PeerIp, Json(inp): Json<UpdateIn>) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let doc: Doc = serde_json::from_value(inp.config).map_err(|e| XrpcError::bad("InvalidConfig", format!("invalid config: {e}")))?;
     let actor = inp.actor.map(|a| a.trim().chars().take(64).collect::<String>()).filter(|a| !a.is_empty()).unwrap_or_else(|| "admin".into());
@@ -272,7 +234,7 @@ async fn update_rate_limits(
     let me = node_id(&app);
     let req = SaveReq { doc, if_version: inp.if_version, actor, ip, node: me.clone(), note: inp.note };
     let saved = runtime::save(&app.ratelimit, &app.store, req).await.map_err(save_error)?;
-    // every peer reloads now (each also re-reads within REFRESH_EVERY anyway)
+    // peers also re-read within REFRESH_EVERY; this makes it now
     let mut applied = vec![json!({"node": me, "configVersion": app.ratelimit.policy().version, "ok": true})];
     if let Some(c) = &app.cluster {
         let peers: Vec<_> = c.peers().into_iter().filter(|l| l.node_id != me).collect();
@@ -305,17 +267,17 @@ async fn update_rate_limits(
 }
 
 async fn internal_snapshot(State(app): AppState, headers: HeaderMap, Query(q): Query<TopQ>) -> XResult<Json<J>> {
-    internal_ok(&app, &headers)?;
+    internal::check(&app, &headers)?;
     let n = q.top.unwrap_or(DEFAULT_TOP).clamp(1, MAX_TOP);
     let s = app.ratelimit.snapshot(&node_id(&app), n);
     Ok(Json(serde_json::to_value(s).map_err(XrpcError::from_err)?))
 }
 
 async fn internal_reload(State(app): AppState, headers: HeaderMap) -> XResult<Json<J>> {
-    internal_ok(&app, &headers)?;
+    internal::check(&app, &headers)?;
     let l = &app.ratelimit;
     if let Err(e) = runtime::refresh(l, &app.store).await {
-        return Err(XrpcError { status: StatusCode::BAD_GATEWAY, error: "UpstreamFailure".into(), message: format!("{e:#}") });
+        return Err(upstream_failure(format!("{e:#}")));
     }
     let st = l.runtime.status();
     Ok(Json(json!({"node": node_id(&app), "configVersion": l.policy().version, "configError": st.error})))
