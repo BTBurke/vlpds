@@ -88,6 +88,59 @@ fn segment_plain() -> Vec<u8> {
     b.seal(LOG, 5, 4)
 }
 
+/// A like record (it has a backlink: src/backlinks.rs).
+fn like_record() -> Vec<u8> {
+    let v = serde_json::json!({"$type": "app.bsky.feed.like", "subject": {"uri": "at://did:plc:subject000000000000000000/app.bsky.feed.post/3l3qo2vutsw2a", "cid": Cid::dag_cbor(b"\xa0").to_string()}, "createdAt": TIME});
+    vlpds::cbor::Value::from_json(&v).unwrap().to_cbor()
+}
+
+/// A segment of one #commit creating a like: its derived muts include the
+/// backlink put (`bl/`, `segment::derive_commit_muts`).
+fn segment_like() -> Vec<u8> {
+    let rec_block = like_record();
+    let rec = Cid::dag_cbor(&rec_block);
+    let mut commit_block = Vec::new();
+    vlpds::cbor::Value::Map(vec![("did".into(), vlpds::cbor::Value::Text(DID.into())), ("data".into(), vlpds::cbor::Value::Link(rec))]).encode(&mut commit_block);
+    let commit = Cid::dag_cbor(&commit_block);
+    let mut car = Vec::new();
+    vlpds::car::write_header(&mut car, &commit);
+    vlpds::car::write_block(&mut car, &commit, &commit_block);
+    vlpds::car::write_block(&mut car, &rec, &rec_block);
+    let ops = [vlpds::events::RepoOp { action: "create", path: "app.bsky.feed.like/3l3qo2vutsw2b", cid: Some(rec), prev: None }];
+    let frame = vlpds::events::commit_frame(&vlpds::events::CommitFrame {
+        repo: DID,
+        rev: "3l3qo2vutsw2c",
+        since: None,
+        commit,
+        prev_data: None,
+        blocks: &car,
+        ops: &ops,
+        time: TIME,
+    });
+    let mut bytes = Vec::new();
+    frame.finish(1010 << 8, &mut bytes);
+    let derived = segment::derive_commit_muts(&bytes).unwrap();
+    let mut b = SegmentBuilder::for_log(LOG);
+    b.push_derived(1010 << 8, ShardId(3), 7, |o| o.extend_from_slice(&bytes), &derived, derived.len());
+    b.seal(LOG, 6, 6)
+}
+
+/// The backlink index: a like's link, its `bl/` key, and a value of two rkeys.
+fn backlinks() -> Vec<u8> {
+    let rec = like_record();
+    let link = vlpds::backlinks::link("app.bsky.feed.like", &rec).unwrap();
+    let rkeys: vlpds::backlinks::Rkeys = vec!["3l3qo2vutsw2b".into(), "3l3qo2vutsw2d".into()];
+    let k: BTreeMap<&str, String> = [
+        ("record", hex::encode(&rec)),
+        ("link", hex::encode(&link)),
+        ("key bl/", hex::encode(vlpds::state::backlink_key(DID, &link))),
+        ("value", hex::encode(vlpds::backlinks::encode(&rkeys))),
+    ]
+    .into_iter()
+    .collect();
+    pretty(&k)
+}
+
 fn head() -> vlpds::state::Head {
     let (_, commit, commit_block, rev) = commit_frame();
     vlpds::state::Head { commit, data: Cid::dag_cbor(b"\xa1aa\x01"), rev, commit_block: Bytes::from(commit_block) }
@@ -246,6 +299,8 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("segment/plain.seg", plain),
         ("segment/zstd.seg", zstd),
         ("segment/fence.bin", segment::fence_object("node-b").to_vec()),
+        ("segment/like.seg", segment_like()),
+        ("state/backlinks.json", backlinks()),
         ("state/head.bin", h.encode().to_vec()),
         ("state/record.bin", vlpds::state::record_value(&h.data, h.rev.0, b"\xa1aa\x01").to_vec()),
         ("state/account.json", compact(&account())),
@@ -360,6 +415,31 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             // zstd's output may change with the library; only decoding is a format
             let plain = std::fs::read(dir.join("segment/plain.seg")).unwrap();
             assert!(segment::decode(Bytes::copy_from_slice(b)).unwrap() == plain, "{name}: decodes to plain.seg");
+        }
+        "segment/like.seg" => {
+            let LogObject::Segment(h, entries) = segment::parse(Bytes::copy_from_slice(b), true, None).unwrap() else { panic!("{name}") };
+            let e = &entries[0];
+            // c/ put, R/ put, the backlink put, h/
+            assert_eq!(e.derived, 4, "{name}: #commit muts derived");
+            let bl = &e.muts[2];
+            assert_eq!(vlpds::state::key_body(&bl.key)[..3], *b"bl/", "{name}: the like's backlink put");
+            assert_eq!(bl.val.as_deref(), Some(&b"3l3qo2vutsw2b"[..]));
+            let mut sb = SegmentBuilder::for_log(&h.log_id);
+            let frame = e.frame.clone();
+            sb.push_derived(e.seq, e.shard, e.epoch, |o| o.extend_from_slice(&frame), &e.muts, e.derived);
+            assert!(sb.seal(&h.log_id, h.ordinal, h.prefix_end) == b, "{name}: re-encode differs");
+        }
+        "state/backlinks.json" => {
+            let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();
+            assert!(pretty(&k) == b);
+            let hx = |n: &str| hex::decode(&k[n]).unwrap();
+            let link = vlpds::backlinks::link("app.bsky.feed.like", &hx("record")).unwrap();
+            assert_eq!(link, hx("link"));
+            assert_eq!(vlpds::state::backlink_key(DID, &link), hx("key bl/"));
+            assert_eq!(vlpds::state::key_slot(&hx("key bl/")), Some(vlpds::slots::slot_of(DID)));
+            let v = vlpds::backlinks::decode(&hx("value"));
+            assert_eq!(v.len(), 2);
+            assert!(vlpds::backlinks::encode(&v) == hx("value"));
         }
         "segment/fence.bin" => {
             let LogObject::Fence { by } = segment::parse(Bytes::copy_from_slice(b), true, None).unwrap() else { panic!("{name}") };

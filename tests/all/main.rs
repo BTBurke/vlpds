@@ -16,6 +16,7 @@ mod account;
 mod app_passwords;
 mod auth;
 mod auth_caches;
+mod backlinks;
 mod blob_deletes;
 mod blob_gc_race;
 mod blobs;

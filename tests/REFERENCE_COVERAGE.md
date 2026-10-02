@@ -18,10 +18,10 @@ Status values:
 | | Cases |
 |---|---:|
 | covered | 295 |
-| ported | 75 |
+| ported | 79 |
 | N/A | 64 |
 | divergent | 7 |
-| GAP (left) | 4 |
+| GAP (left) | 0 |
 | **total** | **445** |
 
 Some rows marked `ported` or `covered` also carry a partial divergence that the row explains, for example "ported + divergent".
@@ -65,6 +65,10 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
     `#identity` then `#sync`, so `getRepo` and the firehose verify against the new DID document right away. The new key is
     recorded before PLC is updated, writes wait out the rotation, and a rotation interrupted by an outage or a crash is finished
     from durable state (DESIGN.md "Signing-key rotation").
+14. **Duplicate likes/reposts/follows/blocks are pruned** (`src/backlinks.rs`, a `bl/` backlink index). createRecord (unless
+    `validate: false`) deletes the account's earlier record of the collection with the same subject (`subject.uri` for likes and
+    reposts, the `subject` DID for follows and blocks) in the new record's commit, as the reference's `getBacklinkConflicts`
+    (DESIGN.md "Backlinks").
 
 ## Notable divergences
 
@@ -91,9 +95,7 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
 
 ## Gaps left
 
-| Gap | Reference cases | Why not fixed here |
-|---|---|---|
-| Duplicate likes/reposts/follows/blocks are not pruned. The reference's createRecord deletes the account's earlier record with the same subject in the same commit (`getBacklinkConflicts`). | crud "prevents duplicate likes/reposts/follows/blocks" (4) | Needs a backlink index across apply, import, reshard and migration. Test `ref_repo::ref_prevents_duplicate_backlinks` is `#[ignore]`d. |
+None.
 
 ---
 
@@ -444,10 +446,10 @@ Puppeteer tests of the reference's browser account-manager UI (`@atproto/oauth-p
 | compare-and-swap > applyWrites succeeds on proper commit cas | covered | `crud::apply_writes_swap_commit` |
 | compare-and-swap > applyWrites fails on bad commit cas | covered | `crud::apply_writes_swap_commit` |
 | compare-and-swap > writes fail on values that can't reliably transform between cbor to lex | covered | `crud::rejects_values_too_deep_for_cbor` |
-| prevents duplicate likes | GAP | `ref_repo::ref_prevents_duplicate_backlinks` (`#[ignore]`): the reference's createRecord deletes the account's earlier like/repost with the same `subject.uri` in the same commit (`getBacklinkConflicts`). vlpds has no backlink index; adding one touches the worker apply path, import, reshard and migration, so not a small fix |
-| prevents duplicate reposts | GAP | same as above |
-| prevents duplicate blocks | GAP | same as above (follow/block keyed on `subject` DID) |
-| prevents duplicate follows | GAP | same as above |
+| prevents duplicate likes | ported | `ref_repo::ref_prevents_duplicate_backlinks` (**fix**: vlpds had no backlink index. createRecord now deletes the account's earlier like with the same `subject.uri` in the new record's commit, as the reference's `getBacklinkConflicts`, unless `validate: false`; applyWrites and imports don't prune. Index `bl/` in src/backlinks.rs, DESIGN.md "Backlinks"; more cases in `backlinks::*`: the firehose commit carries the deletes, applyWrites/import duplicates, concurrent creates, replay after kill -9, reshard) |
+| prevents duplicate reposts | ported | same as above (`subject.uri`) |
+| prevents duplicate blocks | ported | same as above (`subject` DID) |
+| prevents duplicate follows | ported | same as above (`subject` DID) |
 | doesn't serve taken-down record | covered | `moderation::takes_down_and_restores_records` (getRecord + listRecords) |
 | doesn't serve taken-down actor | ported | `ref_repo::ref_taken_down_actor_records_not_served` (**fix**: listRecords on an unknown/taken-down/deactivated repo was 400 RepoNotFound/RepoTakendown/RepoDeactivated; now the reference's 400 InvalidRequest "Could not find repo: {repo}". The self/admin exemption of `sync::assert_available` is kept) |
 

@@ -316,6 +316,9 @@ async fn create_record(
             cid,
             bytes,
             blobs,
+            // the reference's createRecord: unless `validate` is false, the
+            // repo's earlier like/repost/follow/block of the subject goes
+            prune_backlinks: inp.validate != Some(false),
         }],
         swap,
     )
@@ -556,12 +559,14 @@ async fn apply_writes(
                     encode_record(&mut value, &collection, &rkey, inp.validate, schema.as_deref())?;
                 statuses.push(status);
                 decls.extend(d);
+                // the reference prunes duplicate backlinks in createRecord only
                 writes.push(Write::Create {
                     collection,
                     rkey,
                     cid,
                     bytes,
                     blobs,
+                    prune_backlinks: false,
                 });
             }
             "com.atproto.repo.applyWrites#update" => {

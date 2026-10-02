@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod backfill;
+pub mod backlinks;
 pub mod car;
 pub mod cli;
 pub mod caches;

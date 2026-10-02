@@ -17,6 +17,7 @@
 //! p/{routing}\0{name}     -> private per-account state (slot of the routing key)
 //! M/{did}\0{cid digest}   -> MST node block, height >= 1 (DESIGN.md "Partial MSTs")
 //! K/{did}                 -> empty (signing-key rotation pending: `Account::pending_signing_key`)
+//! bl/{did}\0{code}{subject} -> rkeys linking `subject` (crate::backlinks, DESIGN.md "Backlinks")
 
 use crate::cid::{Cid, CID_BYTES_LEN};
 use crate::tid::Tid;
@@ -140,6 +141,18 @@ pub fn key_rotation_key(did: &str) -> Vec<u8> {
 }
 
 pub const KEY_ROTATION_FAMILY: &[u8] = b"K/";
+
+/// Backlink index entry: bl/{did}\0{link}, `link` = collection code ‖
+/// subject ([`crate::backlinks::link`]); the value is the rkeys of the
+/// repo's records in that collection with that subject.
+pub fn backlink_key(did: &str, link: &[u8]) -> Vec<u8> {
+    keyed(did, b"bl/", &[did.as_bytes(), b"\0", link])
+}
+
+/// Where `did`'s backlink index starts (one contiguous range).
+pub fn backlink_prefix(did: &str) -> Vec<u8> {
+    keyed(did, b"bl/", &[did.as_bytes(), b"\0"])
+}
 
 pub fn record_prefix(did: &str) -> Vec<u8> {
     keyed(did, b"R/", &[did.as_bytes(), b"\0"])

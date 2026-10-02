@@ -430,8 +430,8 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<ShardId>) -> anyhow::Re
 
 /// The state mutations of a #commit, rebuilt from its frame: for each op,
 /// the record CID index keys (delete the previous, put the new), the record
-/// (`R/`: cid | rev | the block from the commit's CAR) or its delete; then
-/// the head (`h/`). Exactly what the repo worker writes for a commit, in
+/// (`R/`: cid | rev | the block from the commit's CAR) or its delete, and
+/// the record's backlink put (`bl/`, crate::backlinks); then the head (`h/`). Exactly what the repo worker writes for a commit, in
 /// the same order; the worker checks the two agree (debug builds).
 pub fn derive_commit_muts(frame: &[u8]) -> anyhow::Result<Vec<Mutation>> {
     derive(frame, None)
@@ -483,6 +483,15 @@ fn derive(frame: &[u8], want: Option<usize>) -> anyhow::Result<Vec<Mutation>> {
             Some(c) => Mutation { key, val: Some(state::record_value(c, rev.0, block(c)?)) },
             None => Mutation { key, val: None },
         });
+        // the record's backlink as if its subject had no other record (the
+        // stored muts that follow correct the rest: crate::backlinks)
+        if let Some(c) = &new {
+            let coll = crate::worker::collection_of(path);
+            if let Some(l) = crate::backlinks::link(coll, block(c)?) {
+                let rkey = path.split_once('/').map_or(path, |(_, r)| r);
+                muts.push(Mutation { key: state::backlink_key(did, &l).into(), val: Some(Bytes::copy_from_slice(rkey.as_bytes())) });
+            }
+        }
     }
     let commit_block = block(&commit)?;
     let data = link(Value::decode(commit_block)?.get("data")).ok_or_else(|| anyhow::anyhow!("commit block without data"))?;

@@ -394,7 +394,6 @@ async fn ref_taken_down_actor_records_not_served() {
 /// commit (reference createRecord `getBacklinkConflicts`). Other accounts'
 /// records are unaffected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "GAP: vlpds has no backlink index, so createRecord does not prune duplicate likes/reposts/follows/blocks (REFERENCE_COVERAGE.md)"]
 async fn ref_prevents_duplicate_backlinks() {
     let s = TestServer::spawn().await;
     let alice = s.create_account("alice").await;

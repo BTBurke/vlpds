@@ -9,7 +9,7 @@
 //!   from one snapshot: the head commit (hash, data root, DID, signature),
 //!   records (each hashing to its CID), the MST rebuilt from `R/` against
 //!   the head's data root, the persisted interior nodes `M/` against that
-//!   tree, and the record-CID, blob-ref and collection indexes.
+//!   tree, and the record-CID, blob-ref, backlink and collection indexes.
 //! - `vlpds.admin.rebuildRepo` (script rebuild-repo): re-derives the repo
 //!   from its records (MST, `M/`, indexes) and signs a new commit, `#sync`
 //!   (the worker's ReplaceRepo, guarded by the head commit the records were
@@ -22,7 +22,7 @@
 
 use super::admin::require_admin;
 use super::*;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
@@ -257,6 +257,27 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
     stale_keys.extend(blob_index.difference(&want_blobs).cloned());
     let (cid_extra, blob_extra) = (n1 - n0, stale_keys.len() - n1);
 
+    // the backlink index (bl/): each linked record's rkey under its link
+    let bl_index: HashMap<Bytes, Bytes> = scan_keys(snap.as_ref(), &state::backlink_prefix(did)).await?.into_iter().collect();
+    let mut want_bl: BTreeMap<Vec<u8>, crate::backlinks::Rkeys> = BTreeMap::new();
+    for (path, _, bytes, _) in &records {
+        let coll = crate::worker::collection_of(path);
+        if let Some(l) = crate::backlinks::link(coll, bytes) {
+            want_bl.entry(l).or_default().push(path[coll.len() + 1..].into());
+        }
+    }
+    let want_bl: HashMap<Bytes, Bytes> = want_bl
+        .into_iter()
+        .map(|(l, mut rkeys)| {
+            rkeys.sort();
+            (Bytes::from(state::backlink_key(did, &l)), crate::backlinks::encode(&rkeys))
+        })
+        .collect();
+    let bl_missing = want_bl.iter().filter(|(k, v)| bl_index.get(*k) != Some(*v)).count();
+    let n2 = stale_keys.len();
+    stale_keys.extend(bl_index.keys().filter(|k| !want_bl.contains_key(*k)).cloned());
+    let bl_extra = stale_keys.len() - n2;
+
     let commit = check_commit(did, &head, &acct.signing_pubkey);
     let mut problems: Vec<String> = Vec::new();
     for k in ["cidOk", "dataOk", "didOk", "signatureOk"] {
@@ -278,6 +299,8 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
         (cid_extra, "stale record-CID index entries"),
         (blob_missing, "blob-ref index entries missing"),
         (blob_extra, "stale blob-ref index entries"),
+        (bl_missing, "backlink index entries missing or wrong"),
+        (bl_extra, "stale backlink index entries"),
         (colls_missing.len(), "collection index entries missing"),
     ] {
         if n > 0 {
@@ -301,6 +324,7 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
         "indexes": {
             "recordCidMissing": cid_missing, "recordCidExtra": cid_extra,
             "blobRefMissing": blob_missing, "blobRefExtra": blob_extra,
+            "backlinkMissing": bl_missing, "backlinkExtra": bl_extra, "backlinks": bl_index.len(),
             "collectionsMissing": colls_missing,
         },
     });

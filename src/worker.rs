@@ -56,12 +56,17 @@ pub enum WriteError {
 
 pub enum Write {
     /// `blobs`: blob CIDs referenced by the record (for blob ref tracking).
+    /// `prune_backlinks`: the repo's earlier records of the collection
+    /// with the record's subject are deleted in the same commit
+    /// (createRecord, as the reference's `getBacklinkConflicts`;
+    /// crate::backlinks).
     Create {
         collection: String,
         rkey: String,
         cid: Cid,
         bytes: Bytes,
         blobs: Vec<Cid>,
+        prune_backlinks: bool,
     },
     /// putRecord (upsert) / applyWrites#update (`must_exist`: the record has
     /// to be there, as MST update requires). `swap`: Some(None) = must not exist.
@@ -289,12 +294,16 @@ pub enum WorkerMsg {
     CacheInfo { did: Arc<str>, reply: oneshot::Sender<Option<CachedRepo>> },
     /// The paths a repo's queued requests visit, loaded on the
     /// blocking pool (see `Worker::start_fetch`): the tree to continue
-    /// with (and the blob refs, if the fetch read them), or why it failed.
-    Fetched { did: Arc<str>, res: Result<Box<(LazyTree, Option<BlobRefs>)>, crate::mst::MstError> },
+    /// with (None: unchanged), the blob refs and backlink index entries
+    /// if the fetch read them, or why it failed.
+    Fetched { did: Arc<str>, res: Result<Box<FetchedState>, crate::mst::MstError> },
 }
 
 /// A repo's blob refs by record path (`RepoState::blob_refs`).
 pub type BlobRefs = HashMap<String, Vec<Cid>>;
+
+/// What a fetch read ([`WorkerMsg::Fetched`]).
+pub type FetchedState = (Option<LazyTree>, Option<BlobRefs>, Option<crate::backlinks::Fetched>);
 
 /// A cached repo, as [`WorkerMsg::CacheInfo`] reports it.
 #[derive(Clone, Debug)]
@@ -350,6 +359,9 @@ pub struct RepoState {
     pub nodes: crate::mst::SharedNodeIndex,
     /// Approximate heap charged to the worker's cache ([`repo_bytes`]).
     pub charge: usize,
+    /// The backlink index entries of commits in flight, and those read for
+    /// the requests about to run (crate::backlinks::Cache).
+    pub backlinks: crate::backlinks::Cache,
     /// A repo whose paths are being loaded off the worker thread
     /// (its requests wait in `Worker::loading`; see `Worker::start_fetch`).
     pub fetching: bool,
@@ -375,7 +387,7 @@ const REPO_BASE_BYTES: usize = 2048;
 /// Approximate heap of a cached repo: what the cache budget counts. A repo
 /// is charged its loaded paths (`mst_lazy::heap_bytes`).
 pub fn repo_bytes(st: &RepoState) -> usize {
-    REPO_BASE_BYTES + st.mst.heap_bytes() + st.blob_refs.len() * 96
+    REPO_BASE_BYTES + st.mst.heap_bytes() + st.blob_refs.len() * 96 + st.backlinks.heap_bytes()
 }
 
 /// A repo charged more than this is unloaded (back to its root) as soon
@@ -644,7 +656,7 @@ impl Worker {
                 let reqs = match lazy_needs(st, reqs) {
                     Ok(reqs) => reqs,
                     Err((reqs, Some(need))) => {
-                        self.start_fetch(did, reqs, need);
+                        self.start_fetch(did, reqs, *need);
                         continue;
                     }
                     Err((reqs, None)) => {
@@ -774,10 +786,15 @@ impl Worker {
                             (Some(st), Ok(fetched)) if st.fetching => {
                                 metrics::LAZY_MST_FETCHES.with_label_values(&["ok"]).inc();
                                 st.fetching = false;
-                                let (mst, blobs) = *fetched;
-                                st.mst = mst;
+                                let (mst, blobs, bl) = *fetched;
+                                if let Some(mst) = mst {
+                                    st.mst = mst;
+                                }
                                 if let Some(b) = blobs {
                                     install_blob_refs(st, b);
+                                }
+                                if let Some(bl) = bl {
+                                    st.backlinks.install(bl);
                                 }
                                 order.push(did.clone());
                                 groups.insert(did, buffered);
@@ -991,17 +1008,19 @@ impl Worker {
             return;
         };
         st.fetching = true;
-        let mut mst = st.mst.clone();
+        let mut mst = (!need.tree_loaded).then(|| st.mst.clone());
         let db = st.partition.db.clone();
         let (rt, me, d) = (self.rt.clone(), self.me.clone(), did.clone());
         self.loading.insert(did, reqs);
         self.rt.spawn_blocking(move || {
-            let res = need.load(&mut mst, &*db, &d, &rt).and_then(|_| {
+            let store_err = |e: anyhow::Error| crate::mst::MstError::Store(e.to_string());
+            let res = mst.as_mut().map_or(Ok(()), |m| need.load(m, &*db, &d, &rt)).and_then(|_| {
                 let blobs = match need.blobs {
-                    true => Some(rt.block_on(load_blob_refs(&*db, &d)).map_err(|e| crate::mst::MstError::Store(e.to_string()))?),
+                    true => Some(rt.block_on(load_blob_refs(&*db, &d)).map_err(store_err)?),
                     false => None,
                 };
-                Ok(Box::new((mst, blobs)))
+                let bl = rt.block_on(need.load_backlinks(&*db, &d)).map_err(store_err)?;
+                Ok(Box::new((mst, blobs, bl)))
             });
             let _ = me.send(WorkerMsg::Fetched { did: d, res });
         });
@@ -1143,6 +1162,10 @@ impl Worker {
             }
         }
         replace_nodes_mutations(&req.did, HashMap::new(), &tree, &mut muts);
+        // a new repo's whole tree is in flight until this applies
+        let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut backlinks = crate::backlinks::Cache::default();
+        index_backlinks(&req.did, req.records.iter().map(|(p, _, b)| (p.as_str(), &b[..])), &mut backlinks, &Some(applied.clone()), &mut muts);
         muts.extend([
             Mutation {
                 key: state::account_key(&req.did).into(),
@@ -1161,8 +1184,6 @@ impl Worker {
         let reply = req.reply;
         let h2 = head.clone();
         let h2_did = req.did.clone();
-        // a new repo's whole tree is in flight until this applies
-        let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let a2 = applied.clone();
         let entry = LogEntry {
             shard: partition.id,
@@ -1198,6 +1219,7 @@ impl Worker {
             view,
             nodes,
             charge: 0,
+            backlinks,
             fetching: false,
             backfill: false,
             inflight: [(applied, None)].into(),
@@ -1221,6 +1243,17 @@ pub struct Need {
     all: bool,
     /// The repo's blob refs (an update or delete drops the old record's).
     blobs: bool,
+    /// Backlink index values (by link) a create or update in a linked
+    /// collection changes, the paths whose record's link an update or
+    /// delete removes, or the whole index (crate::backlinks).
+    bl_links: Vec<Vec<u8>>,
+    bl_paths: Vec<String>,
+    bl_all: bool,
+    /// The links of `prune_backlinks` creates: a conflict deletes, which
+    /// needs the blob refs (`lazy_needs`).
+    bl_prune: Vec<Vec<u8>>,
+    /// The tree part is loaded already (a fetch for backlinks alone).
+    tree_loaded: bool,
 }
 
 impl Need {
@@ -1231,6 +1264,7 @@ impl Need {
                 Queued::Write(r) => {
                     for w in &r.writes {
                         n.blobs |= !matches!(w, Write::Create { .. });
+                        n.backlinks(w);
                         let p = w.path();
                         let probe = format!("{}/", collection_of(&p)).into_bytes();
                         if !n.probes.contains(&probe) {
@@ -1242,6 +1276,7 @@ impl Need {
                 Queued::Account(AccountReq { op: AccountOp::ReplaceRepo { .. } | AccountOp::Delete, .. }) => {
                     n.all = true;
                     n.blobs = true;
+                    n.bl_all = true;
                 }
                 Queued::Account(_) | Queued::Snapshot(_) => {}
             }
@@ -1250,7 +1285,59 @@ impl Need {
     }
 
     fn is_empty(&self) -> bool {
-        self.keys.is_empty() && self.probes.is_empty() && !self.all && !self.blobs
+        self.keys.is_empty() && self.probes.is_empty() && !self.all && !self.blobs && !self.backlinks_needed()
+    }
+
+    /// What `w` needs of the backlink index: the value of its record's
+    /// link, and the old record's link (an update or delete).
+    fn backlinks(&mut self, w: &Write) {
+        let (coll, rkey, record) = match w {
+            Write::Create { collection, rkey, bytes, .. } => (collection, rkey, Some(bytes)),
+            Write::Update { collection, rkey, bytes, .. } => (collection, rkey, Some(bytes)),
+            Write::Delete { collection, rkey, .. } => (collection, rkey, None),
+        };
+        if !crate::backlinks::linked(coll) {
+            return;
+        }
+        if let Some(l) = record.and_then(|b| crate::backlinks::link(coll, b)) {
+            if matches!(w, Write::Create { prune_backlinks: true, .. }) {
+                self.bl_prune.push(l.clone());
+            }
+            self.bl_links.push(l);
+        }
+        if !matches!(w, Write::Create { .. }) {
+            self.bl_paths.push(format!("{coll}/{rkey}"));
+        }
+    }
+
+    fn backlinks_needed(&self) -> bool {
+        !self.bl_links.is_empty() || !self.bl_paths.is_empty() || self.bl_all
+    }
+
+    /// Drops what the repo's backlink cache holds already.
+    fn skip_cached_backlinks(&mut self, c: &crate::backlinks::Cache) {
+        self.bl_all &= !c.all;
+        self.bl_links.retain(|l| !c.vals.contains_key(&l[..]));
+        let mut more = Vec::new();
+        self.bl_paths.retain(|p| match c.paths.get(p.as_str()) {
+            Some((Some(l), _)) => {
+                if !c.vals.contains_key(l) {
+                    more.push(l.to_vec());
+                }
+                false
+            }
+            Some((None, _)) => false,
+            None => true,
+        });
+        self.bl_links.extend(more);
+    }
+
+    /// Reads the backlink state it needs (with `all`: the whole index).
+    async fn load_backlinks<R: slatedb::DbReadOps + Sync + ?Sized>(&self, db: &R, did: &str) -> anyhow::Result<Option<crate::backlinks::Fetched>> {
+        if !self.backlinks_needed() {
+            return Ok(None);
+        }
+        crate::backlinks::fetch(db, did, &self.bl_links, &self.bl_paths, self.bl_all).await.map(Some)
     }
 
     /// Loads it into `mst` from `db` (blocking: the blocking pool only).
@@ -1277,20 +1364,32 @@ impl Need {
 /// Whether a repo's `reqs` run on its loaded paths alone: `Ok` (they do),
 /// else what to load first (`Some`), or None if the walk failed (a node or
 /// leaf that doesn't match its link: the repo is reloaded).
-fn lazy_needs(st: &mut RepoState, reqs: Vec<Queued>) -> Result<Vec<Queued>, (Vec<Queued>, Option<Need>)> {
+/// Requests to run later, and what to load first (`lazy_needs`).
+type Deferred = (Vec<Queued>, Option<Box<Need>>);
+
+fn lazy_needs(st: &mut RepoState, reqs: Vec<Queued>) -> Result<Vec<Queued>, Deferred> {
     let mut need = Need::of(&reqs);
     need.blobs &= !st.blob_refs_loaded;
+    need.skip_cached_backlinks(&st.backlinks);
+    // a create's conflicts are deleted (their blob refs dropped)
+    let bl = &st.backlinks.vals;
+    need.blobs |= !st.blob_refs_loaded && need.bl_prune.iter().any(|l| bl.get(&l[..]).is_some_and(|(v, _)| !v.is_empty()));
     if need.is_empty() {
         return Ok(reqs);
     }
     if need.blobs || (need.all && !st.mst.fully_loaded()) {
-        return Err((reqs, Some(need)));
+        return Err((reqs, Some(Box::new(need))));
     }
     let keys: Vec<&[u8]> = need.keys.iter().map(|k| &k[..]).collect();
     let probes: Vec<&[u8]> = need.probes.iter().map(|k| &k[..]).collect();
     match st.mst.fetch(&keys, &probes, &crate::mst_store::CachedOnly) {
+        // backlink index entries to read first (off this thread too)
+        Ok(()) if need.backlinks_needed() => {
+            need.tree_loaded = true;
+            Err((reqs, Some(Box::new(need))))
+        }
         Ok(()) => Ok(reqs),
-        Err(crate::mst::MstError::NotLoaded) => Err((reqs, Some(need))),
+        Err(crate::mst::MstError::NotLoaded) => Err((reqs, Some(Box::new(need)))),
         Err(e) => {
             tracing::error!(did = %st.did, "lazy MST walk failed: {e}");
             Err((reqs, None))
@@ -1321,10 +1420,15 @@ fn unload_settled(st: &mut RepoState) -> bool {
 /// Marks a repo's log entry that writes MST state as in flight (see
 /// `RepoState::inflight`); the returned flag is set once it is applied.
 fn track_inflight(st: &mut RepoState, nodes: Option<HashSet<Cid>>) -> Arc<std::sync::atomic::AtomicBool> {
+    track_inflight_with(st, nodes, Default::default())
+}
+
+/// [`track_inflight`] with the flag to set (made before the entry: the
+/// backlink cache entries it writes carry it).
+fn track_inflight_with(st: &mut RepoState, nodes: Option<HashSet<Cid>>, done: Arc<std::sync::atomic::AtomicBool>) -> Arc<std::sync::atomic::AtomicBool> {
     while st.inflight.front().is_some_and(|(done, _)| done.load(Ordering::Acquire)) {
         st.inflight.pop_front();
     }
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     st.inflight.push_back((done.clone(), nodes));
     done
 }
@@ -1338,6 +1442,7 @@ fn unload_repo(st: &mut RepoState) {
     // durable too now: read again when next needed
     st.blob_refs = HashMap::new();
     st.blob_refs_loaded = false;
+    st.backlinks.prune();
     *st.view.write() = st.durable_view();
     metrics::LAZY_MST_UNLOADS.inc();
     st.charge = repo_bytes(st);
@@ -1505,9 +1610,16 @@ pub async fn load_repo_with(
         true => Some(load_blob_refs(&**db, &did).await?),
         false => None,
     };
+    let backlinks = match opts.need.as_ref() {
+        Some(n) => n.load_backlinks(&**db, &did).await?,
+        None => None,
+    };
     let mut st = finish_load(partition.clone(), did, mst, head, key, acct)?;
     if let Some(b) = blob_refs {
         install_blob_refs(&mut st, b);
+    }
+    if let Some(b) = backlinks {
+        st.backlinks.install(b);
     }
     st.backfill = backfill;
     Ok(Some(st))
@@ -1617,6 +1729,7 @@ fn finish_load(
         view,
         nodes,
         charge: 0,
+        backlinks: Default::default(),
         fetching: false,
         backfill: false,
         inflight: Default::default(),
@@ -1644,6 +1757,13 @@ struct Batch {
     /// Whether each collection the batch writes had records before it (the
     /// `C/` index changes where that differs after it).
     colls: BTreeMap<String, bool>,
+    /// Set once the batch's commit is applied (tags the backlink cache
+    /// entries it writes: `RepoState::inflight`).
+    applied: Arc<std::sync::atomic::AtomicBool>,
+    /// The backlink index values the batch changes, as they were before it.
+    bl_init: BTreeMap<Box<[u8]>, crate::backlinks::Rkeys>,
+    /// The link of each linked-collection path's latest value in the batch.
+    links: HashMap<String, Option<Box<[u8]>>>,
 }
 
 impl Batch {
@@ -1655,6 +1775,9 @@ impl Batch {
             blobs: HashMap::new(),
             waiters: Vec::new(),
             colls: BTreeMap::new(),
+            applied: Default::default(),
+            bl_init: BTreeMap::new(),
+            links: HashMap::new(),
         }
     }
     fn is_empty(&self) -> bool {
@@ -1713,7 +1836,7 @@ fn process_with(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, src: &dyn 
 fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock_id: u64, src: &dyn Source) -> anyhow::Result<()> {
     let mut batch = Batch::new();
     for q in reqs {
-        let req = match q {
+        let mut req = match q {
             // abandoned by its handler (answered "not started"): drop it
             Queued::Write(r) if r.claim.as_ref().is_some_and(|c| !c.take()) => {
                 metrics::WRITES_ABANDONED.inc();
@@ -1765,6 +1888,13 @@ fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock
                 continue;
             }
         }
+        // createRecord (as the reference's getBacklinkConflicts): the
+        // repo's earlier records of the collection with the new record's
+        // subject are deleted first, in the same commit
+        if req.writes.iter().any(|w| matches!(w, Write::Create { prune_backlinks: true, .. })) {
+            let deletes = backlink_conflicts(st, &req.writes)?;
+            req.writes.splice(0..0, deletes);
+        }
         // each write's path, formatted once for the checks and the apply
         let paths: Vec<String> = req.writes.iter().map(Write::path).collect();
         let new_paths = paths.iter().filter(|p| !batch.ops.contains_key(*p)).collect::<HashSet<_>>().len();
@@ -1804,6 +1934,10 @@ fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock
                     cid, bytes, blobs, ..
                 } => {
                     let prev = st.mst.insert(path.as_bytes(), cid, src)?;
+                    if crate::backlinks::linked(collection_of(&path)) {
+                        let link = crate::backlinks::link(collection_of(&path), &bytes);
+                        apply_backlink(st, &mut batch, &path, prev.is_some(), link)?;
+                    }
                     batch.ops.entry(path.clone()).or_insert((prev, None)).1 = Some(cid);
                     batch.blobs.insert(path.clone(), blobs);
                     batch.record_bytes += bytes.len();
@@ -1817,6 +1951,9 @@ fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock
                 Write::Delete { .. } => {
                     let prev = st.mst.remove(path.as_bytes(), src)?;
                     if prev.is_some() {
+                        if crate::backlinks::linked(collection_of(&path)) {
+                            apply_backlink(st, &mut batch, &path, true, None)?;
+                        }
                         batch.blobs.remove(&path);
                         batch.ops.entry(path).or_insert((prev, None)).1 = None;
                     }
@@ -1829,6 +1966,62 @@ fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock
     if !batch.is_empty() {
         flush(st, batch, clock_id, src)?;
     }
+    // what durable state holds again is read from it next time
+    st.backlinks.prune();
+    Ok(())
+}
+
+/// Deletes of the records a `prune_backlinks` create among `writes`
+/// conflicts with: the repo's records of its collection whose subject is
+/// the new record's (its link's index value, loaded by `Need`).
+fn backlink_conflicts(st: &mut RepoState, writes: &[Write]) -> anyhow::Result<Vec<Write>> {
+    let mut deletes = Vec::new();
+    for w in writes {
+        let Write::Create { collection, bytes, prune_backlinks: true, .. } = w else { continue };
+        let Some(link) = crate::backlinks::link(collection, bytes) else { continue };
+        let bl = &mut st.backlinks;
+        let (rkeys, tag) = bl.vals.get(&link[..]).ok_or_else(|| anyhow::anyhow!("backlink index value of {} not loaded", st.did))?;
+        for r in rkeys {
+            // the deleted record's link is this one
+            bl.paths.entry(format!("{collection}/{r}").into()).or_insert_with(|| (Some(link.clone().into()), tag.clone()));
+            deletes.push(Write::Delete { collection: collection.clone(), rkey: r.to_string(), swap: None });
+        }
+    }
+    Ok(deletes)
+}
+
+/// Moves the record at `path` (in a linked collection) from its old link
+/// (`existed`: it held a record) to `new` in the backlink cache, recording
+/// in `batch` the values it changes.
+fn apply_backlink(st: &mut RepoState, batch: &mut Batch, path: &str, existed: bool, new: Option<Vec<u8>>) -> anyhow::Result<()> {
+    let bl = &mut st.backlinks;
+    let did = &st.did;
+    let old = match existed {
+        true => bl.paths.get(path).ok_or_else(|| anyhow::anyhow!("backlink of {did} {path} not loaded"))?.0.clone(),
+        false => None,
+    };
+    let new: Option<Box<[u8]>> = new.map(Into::into);
+    let rkey = path.split_once('/').map_or(path, |(_, r)| r);
+    let tag = Some(batch.applied.clone());
+    fn value<'v>(vals: &'v mut HashMap<Box<[u8]>, (crate::backlinks::Rkeys, crate::backlinks::Tag)>, init: &mut BTreeMap<Box<[u8]>, crate::backlinks::Rkeys>, l: &[u8], tag: &crate::backlinks::Tag) -> anyhow::Result<&'v mut crate::backlinks::Rkeys> {
+        let (v, t) = vals.get_mut(l).ok_or_else(|| anyhow::anyhow!("backlink index value not loaded"))?;
+        init.entry(l.into()).or_insert_with(|| v.clone());
+        *t = tag.clone();
+        Ok(v)
+    }
+    if let Some(o) = old.as_ref().filter(|o| Some(*o) != new.as_ref()) {
+        value(&mut bl.vals, &mut batch.bl_init, o, &tag).map_err(|e| e.context(format!("{did} {path}")))?.retain(|r| &**r != rkey);
+    }
+    // the new link's value is visited even when unchanged: the commit's
+    // derived put of it may need a stored one after it (flush)
+    if let Some(n) = &new {
+        let v = value(&mut bl.vals, &mut batch.bl_init, n, &tag).map_err(|e| e.context(format!("{did} {path}")))?;
+        if let Err(i) = v.binary_search_by(|r| (**r).cmp(rkey)) {
+            v.insert(i, rkey.into());
+        }
+    }
+    batch.links.insert(path.to_string(), new.clone());
+    bl.paths.insert(path.into(), (new, tag));
     Ok(())
 }
 
@@ -1968,6 +2161,7 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
     // index keys, records, head: segment::derive_commit_muts), `extra` the
     // rest (collection index, blob refs); the segment stores only `extra`
     let mut extra = Vec::new();
+    let mut derived_bl: HashMap<&[u8], &str> = HashMap::new();
     let mut written: HashSet<Cid> = HashSet::new();
     // what read-after-write needs (crate::recent_writes), applied at the ack
     let mut recent = Some(Vec::new());
@@ -2013,6 +2207,26 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
                 });
             }
             None => muts.push(Mutation { key, val: None }),
+        }
+        // the record's backlink: put as if its subject had no other record
+        // (replay derives it from the record block); `bl_init` below
+        // stores what differs from that
+        if let (Some(_), Some(Some(l))) = (new, batch.links.get(path.as_str())) {
+            let rkey = path.split_once('/').map_or(path.as_str(), |(_, r)| r);
+            muts.push(Mutation { key: state::backlink_key(&st.did, l).into(), val: Some(Bytes::copy_from_slice(rkey.as_bytes())) });
+            derived_bl.insert(&l[..], rkey);
+        }
+    }
+    // the backlink index values the batch changed, where its derived puts
+    // (above) don't leave them as they are now
+    for (l, before) in &batch.bl_init {
+        let now = st.backlinks.vals.get(l).map(|(v, _)| v).ok_or_else(|| anyhow::anyhow!("backlink index value left the cache"))?;
+        let as_derived = match derived_bl.get(&l[..]) {
+            Some(r) => now.len() == 1 && &*now[0] == *r,
+            None => now == before,
+        };
+        if !as_derived {
+            extra.push(Mutation { key: state::backlink_key(&st.did, l).into(), val: (!now.is_empty()).then(|| crate::backlinks::encode(now)) });
         }
     }
     let head = Head {
@@ -2079,7 +2293,7 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
     }
     st.head = head;
     st.pending.fetch_add(1, Ordering::AcqRel);
-    let applied = track_inflight(st, Some(mst_blocks.iter().map(|(c, _)| *c).collect()));
+    let applied = track_inflight_with(st, Some(mst_blocks.iter().map(|(c, _)| *c).collect()), batch.applied.clone());
 
     let waiters = batch.waiters;
     let (view, snap) = (st.view.clone(), st.durable_view());
@@ -2231,6 +2445,45 @@ fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>, src: &dyn 
     Ok(crate::mst_lazy::persisted_nodes(&st.mst.tree, st.mst.persist_min()))
 }
 
+/// Mutations deleting the repo's whole backlink index (read by `Need`
+/// with the entries in flight: `Cache::all`); the cache then says so until
+/// `done` (the clearing entry) is applied.
+fn clear_backlinks(st: &mut RepoState, muts: &mut Vec<Mutation>, done: &Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
+    anyhow::ensure!(st.backlinks.all, "backlink index of {} not loaded to clear it", st.did);
+    for (l, (v, t)) in st.backlinks.vals.iter_mut() {
+        if !v.is_empty() {
+            muts.push(Mutation { key: state::backlink_key(&st.did, l).into(), val: None });
+            v.clear();
+            *t = Some(done.clone());
+        }
+    }
+    // records gone with the tree (a path written again is set anew)
+    st.backlinks.paths.clear();
+    Ok(())
+}
+
+/// The backlink index of a whole repo's `records` (path, bytes): its puts,
+/// and the cache entries (tagged `tag`: durable state may not have them).
+fn index_backlinks<'a>(did: &str, records: impl Iterator<Item = (&'a str, &'a [u8])>, cache: &mut crate::backlinks::Cache, tag: &crate::backlinks::Tag, muts: &mut Vec<Mutation>) {
+    let mut vals: BTreeMap<Vec<u8>, crate::backlinks::Rkeys> = BTreeMap::new();
+    for (path, bytes) in records {
+        let coll = collection_of(path);
+        if !crate::backlinks::linked(coll) {
+            continue;
+        }
+        let link = crate::backlinks::link(coll, bytes);
+        if let Some(l) = &link {
+            vals.entry(l.clone()).or_default().push(path[coll.len() + 1..].into());
+        }
+        cache.paths.insert(path.into(), (link.map(Into::into), tag.clone()));
+    }
+    for (l, mut rkeys) in vals {
+        rkeys.sort();
+        muts.push(Mutation { key: state::backlink_key(did, &l).into(), val: Some(crate::backlinks::encode(&rkeys)) });
+        cache.vals.insert(l.into(), (rkeys, tag.clone()));
+    }
+}
+
 /// `M/` mutations replacing a repo's persisted nodes `old` by those of
 /// the (written, fully loaded) `tree`.
 fn replace_nodes_mutations(did: &str, old: HashMap<Cid, Arc<[u8]>>, tree: &Tree, muts: &mut Vec<Mutation>) {
@@ -2260,6 +2513,8 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
     let whole_tree = matches!(req.op, AccountOp::ReplaceRepo { .. } | AccountOp::Delete);
     // a re-signed head (KeyStep::Finish): extends read-after-write's log at the ack
     let mut resigned: Option<crate::recent_writes::Commit> = None;
+    // set once applied (tags the backlink cache entries a whole-tree op writes)
+    let done: Arc<std::sync::atomic::AtomicBool> = Default::default();
     match req.op {
         AccountOp::Update {
             mutate,
@@ -2363,6 +2618,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
                 return Ok(());
             };
             let old_nodes = clear_repo_mutations(st, &mut muts, src)?;
+            clear_backlinks(st, &mut muts, &done)?;
             let rev = tid::next_rev(Some(st.head.rev), clock_id);
             let mut tree = Tree::new();
             let mut colls = HashSet::new();
@@ -2381,6 +2637,8 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
                 });
                 index_mutations(st, rev.0, path, false, true, Some(blobs), &mut muts)?;
             }
+            // after the clear's deletes: a link kept is written again
+            index_backlinks(&st.did, records.iter().map(|(p, _, b, _)| (p.as_str(), &b[..])), &mut st.backlinks, &Some(done.clone()), &mut muts);
             let data = tree.root_cid()?;
             replace_nodes_mutations(&st.did, old_nodes, &tree, &mut muts);
             let (commit, commit_block) = match sign_commit(&st.did, &rev.to_string(), &data, &key) {
@@ -2418,6 +2676,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
         }
         AccountOp::Delete => {
             let old_nodes = clear_repo_mutations(st, &mut muts, src)?;
+            clear_backlinks(st, &mut muts, &done)?;
             for c in old_nodes.keys() {
                 muts.push(Mutation { key: state::mst_node_key(&st.did, c).into(), val: None });
             }
@@ -2456,7 +2715,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             KeyOutcome::Written(c) => resigned = c,
         },
     }
-    let applied = whole_tree.then(|| track_inflight(st, None));
+    let applied = whole_tree.then(|| track_inflight_with(st, None, done));
     let entry = LogEntry {
         shard: st.partition.id,
         frames,
@@ -2595,7 +2854,7 @@ mod tests {
     fn write(did: &Arc<str>, rkey: &str) -> (WorkerMsg, oneshot::Receiver<Result<CommitAck, WriteError>>) {
         let bytes = Bytes::from(format!("record {rkey}"));
         let (reply, rx) = oneshot::channel();
-        let w = Write::Create { collection: "app.test.thing".into(), rkey: rkey.into(), cid: Cid::dag_cbor(&bytes), bytes, blobs: Vec::new() };
+        let w = Write::Create { collection: "app.test.thing".into(), rkey: rkey.into(), cid: Cid::dag_cbor(&bytes), bytes, blobs: Vec::new(), prune_backlinks: false };
         (WorkerMsg::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None }), rx)
     }
 
@@ -2751,7 +3010,7 @@ mod tests {
             let bytes = Bytes::from(format!("record {rkey} {blobs:?}"));
             let (collection, rkey, cid) = ("app.test.thing".to_string(), rkey.to_string(), Cid::dag_cbor(&bytes));
             match update {
-                false => Write::Create { collection, rkey, cid, bytes, blobs },
+                false => Write::Create { collection, rkey, cid, bytes, blobs, prune_backlinks: false },
                 true => Write::Update { collection, rkey, cid, bytes, blobs, swap: None, must_exist: true },
             }
         };
@@ -2945,8 +3204,10 @@ mod tests {
             (Arc::new(Partition { id: crate::slots::ShardId(0), epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() }), rx)
         });
         let tid = |i: u64| Tid::from_parts(1_700_000_000_000_000 + i * 1_000_003, i % 1024).to_string();
-        for records in [20u64, 5000] {
-            let did: Arc<str> = format!("did:plc:bench{records}").into();
+        // likes and follows: createRecord's backlink check (one index
+        // read per create, done inline here) and the index's `bl/` puts
+        for (kind, records) in [("post", 20u64), ("post", 5000), ("like", 5000), ("follow", 5000)] {
+            let did: Arc<str> = format!("did:plc:bench{kind}{records}").into();
             let key = Keypair::generate();
             let mut tree = Tree::new();
             for i in 0..records {
@@ -2964,11 +3225,33 @@ mod tests {
             let mut one = |st: &mut RepoState| {
                 let rkey = tid(next);
                 next += 1;
-                let bytes = Bytes::from(format!("{{\"$type\":\"app.bsky.feed.post\",\"text\":\"post {rkey} {}\",\"createdAt\":\"2026-10-01T00:00:00.000Z\"}}", "x".repeat(120)));
+                let (collection, bytes) = match kind {
+                    "post" => ("app.bsky.feed.post", Bytes::from(format!("{{\"$type\":\"app.bsky.feed.post\",\"text\":\"post {rkey} {}\",\"createdAt\":\"2026-10-01T00:00:00.000Z\"}}", "x".repeat(120)))),
+                    _ => {
+                        let coll = if kind == "like" { "app.bsky.feed.like" } else { "app.bsky.graph.follow" };
+                        let subject = match kind {
+                            "like" => serde_json::json!({"uri": format!("at://did:plc:{next:024}/app.bsky.feed.post/{rkey}"), "cid": Cid::dag_cbor(rkey.as_bytes()).to_string()}),
+                            _ => serde_json::json!(format!("did:plc:{next:024}")),
+                        };
+                        let v = serde_json::json!({"$type": coll, "subject": subject, "createdAt": "2026-10-01T00:00:00.000Z"});
+                        (coll, Bytes::from(crate::cbor::Value::from_json(&v).unwrap().to_cbor()))
+                    }
+                };
                 let (reply, _rx) = oneshot::channel();
-                let w = Write::Create { collection: "app.bsky.feed.post".into(), rkey, cid: Cid::dag_cbor(&bytes), bytes, blobs: Vec::new() };
+                let w = Write::Create { collection: collection.into(), rkey, cid: Cid::dag_cbor(&bytes), bytes, blobs: Vec::new(), prune_backlinks: kind != "post" };
                 let reqs = vec![Queued::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None })];
-                let Ok(reqs) = lazy_needs(st, reqs) else { panic!("paths not loaded") };
+                let reqs = match lazy_needs(st, reqs) {
+                    Ok(reqs) => reqs,
+                    // the backlink read a fetch does off the worker thread
+                    Err((reqs, Some(need))) => {
+                        if let Some(f) = rt.block_on(need.load_backlinks(&*st.partition.db, &st.did)).unwrap() {
+                            st.backlinks.install(f);
+                        }
+                        let Ok(reqs) = lazy_needs(st, reqs) else { panic!("paths not loaded") };
+                        reqs
+                    }
+                    Err(_) => panic!("paths not loaded"),
+                };
                 process(st, reqs, 7, rt.handle()).unwrap();
                 while let Ok(e) = rx.try_recv() {
                     commits += 1;
@@ -2993,7 +3276,7 @@ mod tests {
                 best = best.min((thread_cpu() - t) / n as f64 * 1e6);
             }
             println!(
-                "bench_commit_cpu records={records}: {best:.2} us/commit (thread CPU, best of {rounds}); {} state B/commit, {} segment B/commit",
+                "bench_commit_cpu {kind} records={records}: {best:.2} us/commit (thread CPU, best of {rounds}); {} state B/commit, {} segment B/commit",
                 state_bytes / commits.max(1),
                 seg_bytes / commits.max(1)
             );

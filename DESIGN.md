@@ -181,6 +181,9 @@ swappable.
   - `M/{did}\0{cid digest}` → MST node block (lazy MSTs): exactly the
     interior nodes of the tree at `h/{did}`'s data root, put and deleted in
     the commit's batch (puts derived from the #commit CAR at replay).
+  - `bl/{did}\0{code}{subject}` → the rkeys of the repo's likes / reposts /
+    follows / blocks of that subject: the backlink index createRecord
+    prunes duplicates with (see "Backlinks").
   - `a/{did}`, `n/{handle}` → account. The account row carries the repo
     signing key only wrapped under the KEK (`Account::wrapped_signing_key`,
     bound to the DID) next to its public key (`signing_pubkey`, which DID
@@ -1787,6 +1790,79 @@ the full-tree mode is removed).
   At the 100× planet-scale target (~200k commits/s) it would be ~0.6 GB/s
   of extra memtable writes and should be built then.
 
+## Backlinks (`src/backlinks.rs`)
+
+Reference parity: the reference's createRecord deletes the repo's earlier
+records of the same collection and subject in the new record's commit
+(`getBacklinkConflicts` over its `backlink` table): likes and reposts by
+`subject.uri` (a valid AT-URI), follows and blocks by `subject` (a valid
+DID), records whose `$type` is their collection. Only createRecord, and
+not with `validate: false`; applyWrites, putRecord and importRepo index
+without pruning, so duplicates can exist and a later createRecord deletes
+them all. The deletes are ordinary ops of the same #commit.
+
+- **Key.** `bl/{did}\0{code}{subject}` (slot-major like every per-repo
+  family, so reshards carry it) → the rkeys with that subject, sorted and
+  `\0`-separated; code `l`/`r`/`f`/`b`. One key per (collection, subject),
+  so the common no-conflict check is one point read, which the SSTs' bloom
+  filters answer without a block read when the key is absent. A key per
+  record (`...{subject}\0{rkey}`) would make every check a prefix scan
+  that no filter skips (one block read per L0 SST); a hashed subject
+  would save ~60 B per like but need the candidates' records read to rule
+  out collisions.
+- **Reads off the worker thread.** A request that creates, updates or
+  deletes a linked record needs the index values its records link to, and
+  for an update or delete the old record's link (its `R/` value). The
+  worker reads them in the same fetch that loads missing MST paths (the
+  blocking pool; a backlink-only fetch skips the tree clone), so a like is
+  one fetch hop and one or two point reads. Durable state lags the
+  worker by the commits in flight, so the repo keeps those commits'
+  entries (`backlinks::Cache`, each tagged with its commit's applied flag)
+  over what it reads, and drops every entry durable state holds again
+  after each run: between runs it holds only in-flight entries. Concurrent
+  creates of one subject thus see each other (one record left), whether
+  they share a commit or not. A conflict's delete needs the blob refs
+  (loaded once per repo load, as for any delete).
+- **Log.** A record's put (`[rkey]`, its value whenever the subject has
+  one record) is derived at replay from the #commit frame
+  (`segment::derive_commit_muts`, after the record's `R/` put; the debug
+  check compares it with the worker's). What differs from that is stored
+  after it and wins in the batch: removals (an unlike, unfollow or update
+  needs the old record, which the frame doesn't carry) and keys holding
+  several rkeys. A create costs no segment bytes; a delete stores one key
+  delete (~115 B for a like, ~80 B for a follow, with a did:plc). Imports, account deletes and creations with
+  records write the whole index as stored muts (an import or delete first
+  reads the repo's whole `bl/` range).
+- **Checks.** `vlpds.admin.checkRepo` compares `bl/` with the records
+  (`backlinkMissing`, `backlinkExtra`); rebuildRepo rewrites it.
+  `tests/all/backlinks.rs`: the reference cases, the firehose commit with
+  the deletes, applyWrites and import duplicates, concurrent writes,
+  replay after kill -9 (byte-identical `bl/`), split and merge.
+  Golden fixtures (level 1): `state/backlinks.json` (link, key, value)
+  and `segment/like.seg` (a like's #commit, its derived `bl/` put).
+
+**Cost (M4 Pro, dev-release, shared laptop).** `worker::tests::bench_commit_cpu`,
+old and new binaries interleaved, 6 runs each (best of 7 rounds per run),
+median, one createRecord per commit on a 5,000-record repo, the backlink
+read done inline on the same thread (in production it runs on the blocking
+pool), against an in-memory store whose read finds nothing:
+
+| | before | after |
+|---|---:|---:|
+| post µs/commit (20 / 5000 records) | 37.6 / 37.1 | 38.4 / 38.6 (noise) |
+| like µs/commit | 39.6 | 46.9 |
+| follow µs/commit | 38.1 | 43.8 |
+| like state B/commit | 4,756 | 4,868 (+112) |
+| follow state B/commit | 3,562 | 3,638 (+76) |
+| segment B/commit (like, follow) | 5,445 / 3,947 | unchanged |
+
+The ~6–7 µs per like or follow is the point read (a SlateDB get through
+`block_on`), two CBOR decodes of the record (needs, apply) and the cache
+bookkeeping; posts and other collections pay one string compare per
+write. The state bytes are uncompressed key + value with the bench's
+21-character DID: ~123 B per like and ~85 B per follow with a did:plc
+(zstd SST blocks shrink the repeated DID prefixes).
+
 ## Backups and restore (design, not implemented)
 
 **Today there are none.** Durability is the object store's (S3 Standard:
@@ -3079,6 +3155,4 @@ notable ones:
   no separate mod-service default for `tools.ozone.*`.
 - **Stricter sessions.** `revokeAppPassword` and `identity.updateHandle` require a full (non-app-password) session.
 
-These known gaps are tracked in that file and are not deliberate:
-
-- duplicate backlinks (likes, reposts, follows, blocks) are not pruned.
+No known (non-deliberate) gaps are left in that file.
