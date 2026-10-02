@@ -1,28 +1,11 @@
-//! Service proxying (atproto-proxy) and app-level endpoints served by the PDS.
+//! Service proxying (atproto-proxy), mirroring the reference's
+//! `pipethrough.ts`, plus `app.bsky.actor.{get,put}Preferences` and
+//! createReport. The rest of the policy is in DESIGN.md "7. HTTP".
 //!
-//! Mirrors the reference PDS's `pipethrough.ts`:
-//! - Unknown `/xrpc/{nsid}` requests (router fallback) are forwarded to the
-//!   service named by the `atproto-proxy: <did>#<service id>` header, or by
-//!   default `app.bsky.*` / `tools.ozone.*` go to the configured AppView.
-//!   `chat.bsky.*` requires the header. Anything else is 501.
-//! - The forwarded request carries an ES256K service-auth JWT signed with the
-//!   user's repo key (iss = user DID, aud = bare service DID, lxm = nsid).
-//!   Scope checks use the `did#service_id` form, like TS.
-//! - Request and response bodies stream through; headers are allow-listed.
-//!   Request bodies are forwarded as the client encoded them (the server's
-//!   request decompression skips the proxy fallback). A response the client
-//!   stops reading is dropped after `http::stall::WRITE_STALL`; small ones
-//!   (<= [`BUFFER_SMALL`] by Content-Length) are read whole first, so the
-//!   upstream connection goes back at once whatever the client does.
-//! - At most [`MAX_IN_FLIGHT_PER_ACCOUNT`] proxied requests per account are
-//!   in flight on its owner (response bodies included); more are 429.
-//! - Upstream >= 400 responses are re-raised as XRPC errors (500 becomes 502
-//!   UpstreamFailure; error/message from its JSON body, decoded if
-//!   compressed, within [`MAX_ERROR_BYTES`]); connection failures and
-//!   timeouts are 502 UpstreamFailure.
-//!
-//! Also serves `app.bsky.actor.{get,put}Preferences` from private account
-//! state and proxies `com.atproto.moderation.createReport`.
+//! A response the client stops reading is dropped after
+//! `http::stall::WRITE_STALL`; small ones (<= [`BUFFER_SMALL`]) are read
+//! whole first, so the upstream connection goes back at once whatever the
+//! client does.
 
 use super::authn::Credentials;
 use super::*;
@@ -32,7 +15,7 @@ use axum::http::{Method, Uri};
 use std::borrow::Cow;
 use std::time::Duration;
 
-/// Private-state name of the stored `app.bsky` preferences (JSON array).
+/// Private-state name of the stored preferences (JSON array).
 const PREFS_KEY: &str = "prefs:app.bsky";
 const PREFS_NAMESPACE: &str = "app.bsky";
 const PERSONAL_DETAILS_PREF: &str = "app.bsky.actor.defs#personalDetailsPref";
@@ -47,24 +30,19 @@ const GET_FEED_SKELETON: &str = "app.bsky.feed.getFeedSkeleton";
 
 mod read_after_write;
 
-/// TS proxy defaults: headersTimeout 10s, bodyTimeout 30s, maxResponseSize 10MB.
+/// The reference's proxy defaults.
 const HEADERS_TIMEOUT: Duration = Duration::from_secs(10);
 const BODY_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 10 << 20;
 const SERVICE_JWT_TTL_SECS: u64 = 60;
-/// Upstream responses up to this size (Content-Length) are read whole before
-/// the client gets them: the upstream connection (an h1 pool slot, a share
-/// of an h2 window) is free at once, whatever pace the client reads at.
+/// By Content-Length.
 const BUFFER_SMALL: u64 = 128 << 10;
-/// Upstream error bodies read for their error/message, on the wire and
-/// decoded.
+/// On the wire and decoded.
 const MAX_ERROR_BYTES: usize = 256 << 10;
-/// Proxied requests in flight per account on its owner node (until each
-/// response body is done). One account could otherwise hold most of the
-/// AppView connection pool with responses its client never reads.
+/// Until each response body is done: one account could otherwise hold most
+/// of the AppView connection pool with responses its client never reads.
 pub const MAX_IN_FLIGHT_PER_ACCOUNT: u32 = 64;
 
-/// Account-management methods that must be called directly, never proxied.
 const PROTECTED_METHODS: &[&str] = &[
     "com.atproto.admin.sendEmail",
     "com.atproto.identity.requestPlcOperationSignature",
@@ -84,7 +62,7 @@ const PROTECTED_METHODS: &[&str] = &[
     "com.atproto.server.updateEmail",
 ];
 
-/// Methods a non-privileged app password may not call (DMs + createAccount).
+/// Off limits to non-privileged app passwords.
 const PRIVILEGED_METHODS: &[&str] = &[
     "chat.bsky.actor.deleteAccount",
     "chat.bsky.actor.exportAccountData",
@@ -103,14 +81,8 @@ const PRIVILEGED_METHODS: &[&str] = &[
     "com.atproto.server.createAccount",
 ];
 
-/// Response headers forwarded from upstream (besides content-* headers).
-const RES_HEADERS_TO_FORWARD: [header::HeaderName; 3] = [
-    header::HeaderName::from_static("atproto-repo-rev"),
-    header::HeaderName::from_static("atproto-content-labelers"),
-    header::RETRY_AFTER,
-];
-
-/// Response headers of a successful upstream response that are passed on.
+/// Response headers passed on: all of them on success, all but the content
+/// headers (the first four) on errors.
 const RES_HEADERS: [header::HeaderName; 7] = [
     header::CONTENT_LENGTH,
     header::CONTENT_ENCODING,
@@ -147,8 +119,6 @@ fn lxm_in(set: &[&str], lxm: &str) -> bool {
     set.iter().any(|m| m.eq_ignore_ascii_case(lxm))
 }
 
-/// `s` starts with `prefix`, ASCII case-insensitively (NSID checks, like
-/// [`lxm_in`]).
 fn has_prefix_ignore_case(s: &str, prefix: &str) -> bool {
     s.get(..prefix.len()).is_some_and(|p| p.eq_ignore_ascii_case(prefix))
 }
@@ -164,25 +134,24 @@ fn valid_nsid(s: &str) -> bool {
         })
 }
 
-// Target selection
-// ----------------
-
-/// A resolved proxy target (configured ones borrow the config).
 struct Target<'a> {
-    /// Service endpoint (only its origin is used; the path comes from the request).
+    /// Only its origin is used.
     url: Cow<'a, str>,
     /// Bare service DID: the service-auth JWT audience.
     did: Cow<'a, str>,
     service_id: Cow<'a, str>,
-    /// Operator-configured (AppView / report service): exempt from SSRF checks.
+    /// Operator-configured: exempt from SSRF checks.
     trusted: bool,
 }
 
 impl Target<'_> {
-    /// `did#service_id`, the audience used for scope checks.
     fn scope_aud(&self) -> String {
         format!("{}#{}", self.did, self.service_id)
     }
+}
+
+fn no_service(lxm: &str) -> XrpcError {
+    XrpcError::bad("InvalidRequest", format!("No service configured for {lxm}"))
 }
 
 fn proxy_header(headers: &HeaderMap) -> XResult<Option<&str>> {
@@ -204,44 +173,22 @@ fn configured<'a>(svc: &'a Option<(String, String)>, service_id: &'static str) -
     })
 }
 
-/// Default service for a method without an atproto-proxy header:
-/// Ok(None) = not proxyable (501).
+/// For a method without an atproto-proxy header. Ok(None): not proxyable.
 fn default_target<'a>(app: &'a App, lxm: &str) -> XResult<Option<Target<'a>>> {
-    let no_service =
-        || XrpcError::bad("InvalidRequest", format!("No service configured for {lxm}"));
-    if lxm == CREATE_REPORT {
-        return configured(&app.config.report_service, "atproto_labeler")
-            .map(Some)
-            .ok_or_else(no_service);
-    }
-    if has_prefix_ignore_case(lxm, "chat.bsky.") {
-        // DMs live on a separate service; clients must name it.
-        return Err(no_service());
-    }
-    if lxm.starts_with("app.bsky.") || lxm.starts_with("tools.ozone.") {
-        return configured(&app.config.appview, "bsky_appview")
-            .map(Some)
-            .ok_or_else(no_service);
-    }
-    Ok(None)
+    let svc = if lxm == CREATE_REPORT {
+        configured(&app.config.report_service, "atproto_labeler")
+    } else if has_prefix_ignore_case(lxm, "chat.bsky.") {
+        // clients must name the DM service
+        None
+    } else if lxm.starts_with("app.bsky.") || lxm.starts_with("tools.ozone.") {
+        configured(&app.config.appview, "bsky_appview")
+    } else {
+        return Ok(None);
+    };
+    svc.map(Some).ok_or_else(|| no_service(lxm))
 }
 
-/// The `did#service_id` a request targets (header or default), without
-/// resolving anything. Used for scope checks on locally served methods.
-fn compute_proxy_to(app: &App, headers: &HeaderMap, lxm: &str) -> XResult<String> {
-    if let Some(h) = proxy_header(headers)? {
-        return Ok(h.to_string());
-    }
-    match default_target(app, lxm)? {
-        Some(t) => Ok(t.scope_aud()),
-        None => Err(XrpcError::bad(
-            "InvalidRequest",
-            format!("No service configured for {lxm}"),
-        )),
-    }
-}
-
-/// Parses and resolves `atproto-proxy: <did>#<service id>`.
+/// Resolves `<did>#<service id>`.
 async fn parse_proxy_header<'a>(app: &'a App, proxy_to: &str) -> XResult<Target<'a>> {
     let bad = |m: &str| XrpcError::bad("InvalidRequest", m);
     let hash = match proxy_to.find('#') {
@@ -259,16 +206,8 @@ async fn parse_proxy_header<'a>(app: &'a App, proxy_to: &str) -> XResult<Target<
         return Err(bad("proxy header cannot contain spaces"));
     }
     let (did, service_id) = (&proxy_to[..hash], &proxy_to[hash + 1..]);
-    // The configured AppView is used without resolution.
-    if let Some((url, av_did)) = &app.config.appview {
-        if did == av_did && service_id == "bsky_appview" {
-            return Ok(Target {
-                url: Cow::Borrowed(url),
-                did: Cow::Borrowed(av_did),
-                service_id: Cow::Borrowed("bsky_appview"),
-                trusted: true,
-            });
-        }
+    if service_id == "bsky_appview" && app.config.appview.as_ref().is_some_and(|(_, av)| av == did) {
+        return Ok(configured(&app.config.appview, "bsky_appview").expect("checked"));
     }
     let doc = resolve_did(app, did)
         .await
@@ -283,9 +222,6 @@ async fn parse_proxy_header<'a>(app: &'a App, proxy_to: &str) -> XResult<Target<
     })
 }
 
-/// DID document for `did`: for accounts hosted here per
-/// `identity::account_did_doc` (built locally while active), otherwise
-/// resolved over the network (cached).
 pub async fn resolve_did(app: &App, did: &str) -> Result<Arc<J>, did_resolver::ResolveError> {
     if !did.starts_with("did:") {
         return Err(did_resolver::ResolveError::BadDid(did.into()));
@@ -296,11 +232,7 @@ pub async fn resolve_did(app: &App, did: &str) -> Result<Arc<J>, did_resolver::R
     app.did_resolver.resolve(did).await
 }
 
-// Forwarding
-// ----------
-
-/// Configured upstreams (AppView, report service) use the shared public
-/// client; endpoints taken from DID documents use the SSRF-guarded one.
+/// Endpoints taken from DID documents use the SSRF-guarded client.
 fn proxy_http(app: &App, trusted: bool) -> &'static reqwest::Client {
     if trusted {
         crate::http::proxy()
@@ -313,7 +245,7 @@ fn upstream_failure(message: &str) -> XrpcError {
     xerr(StatusCode::BAD_GATEWAY, "UpstreamFailure", message)
 }
 
-/// Request headers passed to the upstream service (TS allow-list).
+/// The reference's allow-list.
 fn forward_headers(src: &HeaderMap, with_body: bool, authorization: Option<&str>, accept_encoding: Option<header::HeaderValue>) -> HeaderMap {
     const ACCEPT_LANGUAGE: header::HeaderName = header::ACCEPT_LANGUAGE;
     const ACCEPT_LABELERS: header::HeaderName = header::HeaderName::from_static("atproto-accept-labelers");
@@ -357,47 +289,27 @@ fn is_json_content_type(ct: &str) -> bool {
     sub == "json" || sub.ends_with("+json")
 }
 
-fn response_type_name(status: u16) -> Option<&'static str> {
+/// The reference's (error, message) defaults by status.
+fn response_type(status: u16) -> Option<(&'static str, &'static str)> {
     Some(match status {
-        400 => "InvalidRequest",
-        401 => "AuthenticationRequired",
-        403 => "Forbidden",
-        404 => "XRPCNotSupported",
-        406 => "NotAcceptable",
-        413 => "PayloadTooLarge",
-        415 => "UnsupportedMediaType",
-        429 => "RateLimitExceeded",
-        500 => "InternalServerError",
-        501 => "MethodNotImplemented",
-        502 => "UpstreamFailure",
-        503 => "NotEnoughResources",
-        504 => "UpstreamTimeout",
+        400 => ("InvalidRequest", "Invalid Request"),
+        401 => ("AuthenticationRequired", "Authentication Required"),
+        403 => ("Forbidden", "Forbidden"),
+        404 => ("XRPCNotSupported", "XRPC Not Supported"),
+        406 => ("NotAcceptable", "Not Acceptable"),
+        413 => ("PayloadTooLarge", "Payload Too Large"),
+        415 => ("UnsupportedMediaType", "Unsupported Media Type"),
+        429 => ("RateLimitExceeded", "Rate Limit Exceeded"),
+        500 => ("InternalServerError", "Internal Server Error"),
+        501 => ("MethodNotImplemented", "Method Not Implemented"),
+        502 => ("UpstreamFailure", "Upstream Failure"),
+        503 => ("NotEnoughResources", "Not Enough Resources"),
+        504 => ("UpstreamTimeout", "Upstream Timeout"),
         _ => return None,
     })
 }
 
-fn response_type_str(status: u16) -> Option<&'static str> {
-    Some(match status {
-        400 => "Invalid Request",
-        401 => "Authentication Required",
-        403 => "Forbidden",
-        404 => "XRPC Not Supported",
-        406 => "Not Acceptable",
-        413 => "Payload Too Large",
-        415 => "Unsupported Media Type",
-        429 => "Rate Limit Exceeded",
-        500 => "Internal Server Error",
-        501 => "Method Not Implemented",
-        502 => "Upstream Failure",
-        503 => "Not Enough Resources",
-        504 => "Upstream Timeout",
-        _ => return None,
-    })
-}
-
-/// An upstream error response, re-raised (TS PipethroughUpstreamError):
-/// status passes through except 500 -> 502; error/message come from the
-/// upstream JSON body when present; only the forwardable headers are kept.
+/// Reference PipethroughUpstreamError: 500 becomes 502.
 struct UpstreamError {
     status: u16,
     headers: HeaderMap,
@@ -410,9 +322,9 @@ impl UpstreamError {
         let upstream_status = resp.status.as_u16();
         let status = if upstream_status == 500 { 502 } else { upstream_status };
         let mut headers = HeaderMap::new();
-        for name in RES_HEADERS_TO_FORWARD {
-            if let Some(v) = resp.headers.get(&name) {
-                headers.insert(name, v.clone());
+        for name in &RES_HEADERS[4..] {
+            if let Some(v) = resp.headers.get(name) {
+                headers.insert(name.clone(), v.clone());
             }
         }
         // (the reference reads it unless it says it isn't JSON)
@@ -422,8 +334,7 @@ impl UpstreamError {
             .and_then(|v| v.to_str().ok())
             .is_none_or(is_json_content_type);
         let (mut error, mut message) = (None, None);
-        // decodable codings only (else the body is dropped unread); bounded
-        // on the wire and decoded
+        // decodable codings only, else the body is dropped unread
         if let Some(codings) = read_after_write::codings(&resp.headers).filter(|_| json_body) {
             let buf = axum::body::to_bytes(body, MAX_ERROR_BYTES).await;
             let decoded = buf.ok().and_then(|b| read_after_write::decode(b, &codings, MAX_ERROR_BYTES).ok());
@@ -436,11 +347,9 @@ impl UpstreamError {
     }
 
     fn into_response(self) -> Response {
-        let error = self.error.or_else(|| response_type_name(self.status).map(String::from));
-        let message = self
-            .message
-            .filter(|m| !m.is_empty())
-            .or_else(|| response_type_str(self.status).map(String::from));
+        let defaults = response_type(self.status);
+        let error = self.error.or_else(|| defaults.map(|d| d.0.to_string()));
+        let message = self.message.filter(|m| !m.is_empty()).or_else(|| defaults.map(|d| d.1.to_string()));
         let mut body = serde_json::Map::new();
         if let Some(e) = error {
             body.insert("error".into(), J::String(e));
@@ -459,43 +368,40 @@ async fn upstream_error(resp: axum::http::response::Parts, body: Body) -> Respon
 
 struct Forward<'a> {
     method: Method,
-    /// Path and query, forwarded verbatim (TS uses req.originalUrl).
+    /// Forwarded verbatim (the reference uses req.originalUrl).
     path_and_query: &'a str,
     headers: &'a HeaderMap,
     body: Option<Body>,
     /// Service-auth issuer; None forwards without credentials.
     iss: Option<&'a str>,
-    /// Method named in the service-auth token.
     lxm: &'a str,
-    /// Service-auth audience other than the target's DID (getFeed: the
-    /// feed generator's).
+    /// Instead of the target's DID (getFeed: the feed generator's).
     aud: Option<&'a str>,
-    /// Accept-Encoding sent instead of the client's (read-after-write asks
-    /// only for encodings it can decode).
+    /// Instead of the client's (read-after-write asks only for encodings it
+    /// can decode).
     accept_encoding: Option<header::HeaderValue>,
 }
 
-// ---- fast path caches ------------------------------------------------------
-//
-// Proxying is the hottest path a PDS serves (every AppView read goes through
-// it). Per request it would otherwise cost two account reads + JSON parse, a
-// key parse, and a ~25 µs ES256K signature. Instead:
-// - account signing key + status are cached, read once per request. Only
-//   the DID's owner caches (requests are routed to it), and an entry is
-//   valid only in the partition epoch it was read in, so changes another
-//   node made while it owned the DID never show through a stale entry.
-//   Every account change goes through the owner's worker, which drops the
-//   entry once the change is applied ([`account_changed`]): takedowns and
-//   key rotations apply to the next request. ACCT_TTL only bounds an
-//   entry's life (memory, and a backstop);
-// - minted service JWTs are reused per (iss, aud, lxm, signing key) until
-//   half their lifetime has passed, so an active account signs ~2×/min per
-//   method. The key is part of the cache key: after a rotation or migration
-//   the account reload brings the new key, and with it fresh tokens,
-//   instead of reusing ones signed by the old key.
-// Lookups don't allocate: the account cache is keyed by DID (borrowed
-// lookups), the JWT cache by a hash of (iss, aud, lxm, key id) with the full
-// key stored and compared on every hit.
+impl<'a> Forward<'a> {
+    fn new(method: Method, path_and_query: &'a str, headers: &'a HeaderMap, body: Option<Body>, iss: Option<&'a str>, lxm: &'a str) -> Self {
+        Forward { method, path_and_query, headers, body, iss, lxm, aud: None, accept_encoding: None }
+    }
+}
+
+fn path_and_query(uri: &Uri) -> &str {
+    uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path())
+}
+
+// Proxying is the hottest path a PDS serves, so per request it reads no
+// account and signs no JWT:
+// - an account's signing key + status are cached on its owner, valid only
+//   in the partition epoch they were read in (another node's changes while
+//   it owned the DID never show through). The owner's worker drops the
+//   entry once an account change applies ([`account_changed`]), so
+//   takedowns and key rotations apply to the next request; ACCT_TTL is a
+//   backstop;
+// - service JWTs are reused per (iss, aud, lxm, signing key) for half their
+//   lifetime; the key is in the cache key so a rotation mints fresh tokens.
 
 const ACCT_TTL: Duration = Duration::from_secs(60);
 const JWT_REUSE: Duration = Duration::from_secs(SERVICE_JWT_TTL_SECS / 2);
@@ -503,16 +409,15 @@ const CACHE_SHARDS: usize = 64;
 
 type Shard<K, V> = parking_lot::Mutex<std::collections::HashMap<K, (V, std::time::Instant)>>;
 
-/// Capped by `kind`'s [`crate::caches`] cap (sized from the memory budget).
+/// Capped by `kind`'s [`crate::caches`] cap.
 struct TtlCache<K, V> {
     shards: Vec<Shard<K, V>>,
     kind: crate::caches::Cache,
-    /// per shard, bumped (under its lock) by every [`TtlCache::invalidate`]:
-    /// a load that raced one is not cached
+    /// Per shard, bumped under its lock by every [`TtlCache::invalidate`], so
+    /// a load that raced one is not cached.
     gens: Vec<std::sync::atomic::AtomicU64>,
 }
 
-/// Fixed-key hash (the same key always picks the same shard).
 fn fixed_hash<Q: std::hash::Hash + ?Sized>(k: &Q) -> u64 {
     use std::hash::Hasher;
     let mut h = std::hash::DefaultHasher::new();
@@ -557,7 +462,6 @@ impl<K: std::hash::Hash + Eq, V: Clone> TtlCache<K, V> {
         self.gens[i].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         m.remove(k);
     }
-    /// Value if inserted less than `max_age` ago.
     fn get<Q>(&self, k: &Q, max_age: Duration) -> Option<V>
     where
         K: std::borrow::Borrow<Q>,
@@ -565,7 +469,6 @@ impl<K: std::hash::Hash + Eq, V: Clone> TtlCache<K, V> {
     {
         self.get_aged(k).filter(|(_, age)| *age < max_age).map(|(v, _)| v)
     }
-    /// Value and age, however old.
     fn get_aged<Q>(&self, k: &Q) -> Option<(V, Duration)>
     where
         K: std::borrow::Borrow<Q>,
@@ -599,14 +502,14 @@ impl<K: std::hash::Hash + Eq, V: Clone> TtlCache<K, V> {
 #[derive(Clone)]
 struct CachedAcct {
     key: Arc<Keypair>,
-    /// Identifies the signing key (a hash of it): part of the JWT cache key.
+    /// A hash of the public key: part of the JWT cache key.
     key_id: u64,
     status: Option<String>,
-    /// (partition, epoch) it was read in: valid only while still owned in it
+    /// (partition, epoch) it was read in
     part: (crate::slots::ShardId, u64),
 }
 
-/// A minted service JWT and the (iss, aud, lxm, key id) it was minted for.
+/// (iss, aud, lxm, key id, jwt)
 type CachedJwt = Arc<(String, String, String, u64, Arc<str>)>;
 
 static ACCTS: std::sync::LazyLock<Arc<TtlCache<String, CachedAcct>>> = std::sync::LazyLock::new(|| {
@@ -618,8 +521,7 @@ static JWTS: std::sync::LazyLock<Arc<TtlCache<u64, CachedJwt>>> = std::sync::Laz
     track(Cache::ProxyJwts, Arc::new(TtlCache::new(Cache::ProxyJwts)))
 });
 
-/// Drops `did`'s cached account. Its worker calls this once an account
-/// change is applied (before acking it).
+/// The worker calls this once an account change is applied, before acking.
 pub(crate) fn account_changed(did: &str) {
     ACCTS.invalidate(did);
 }
@@ -634,9 +536,8 @@ async fn cached_account(app: &App, did: &str) -> XResult<CachedAcct> {
         prev => prev.map(|(a, _)| a),
     };
     crate::metrics::PROXY_CACHE.with_label_values(&["account_miss"]).inc();
-    // the two fields used here, borrowed: a full `Account` parse (its
-    // flattened extension map buffers the whole document) cost more than
-    // the read at 1M active accounts, where ~half the lookups miss
+    // borrowed fields only: a full `Account` parse buffers the whole
+    // document (its flattened extension map) and costs more than the read
     #[derive(serde::Deserialize)]
     struct KeyAndStatus<'a> {
         #[serde(borrow)]
@@ -654,11 +555,9 @@ async fn cached_account(app: &App, did: &str) -> XResult<CachedAcct> {
         .map_err(XrpcError::from_err)?
         .ok_or_else(|| XrpcError::bad("AccountNotFound", format!("no account {did}")))?;
     let acct: KeyAndStatus = serde_json::from_slice(&raw).map_err(XrpcError::from_err)?;
-    // the public key identifies the signing key (a rewrap under a new KEK
-    // changes the wrapped form, not the key)
+    // a rewrap under a new KEK changes the wrapped form, not the key
     let key_id = fixed_hash(&*acct.signing_pubkey);
-    // an unchanged key keeps its unwrapped form; else the keyring's cache
-    // (a KMS unwrap only on its miss)
+    // an unchanged key skips the keyring (and a KMS unwrap)
     let key = match prev.filter(|p| p.key_id == key_id) {
         Some(p) => p.key,
         None => app.secrets.signing_key(did, &acct.wrapped_signing_key, &acct.signing_pubkey).await?,
@@ -681,17 +580,16 @@ fn service_jwt(acct: &CachedAcct, iss: &str, aud: &str, lxm: &str) -> XResult<Ar
     Ok(j)
 }
 
-/// A service endpoint as the proxy uses it.
 #[derive(Clone)]
 struct Endpoint {
     /// `scheme://host[:port]`
     origin: Arc<str>,
-    /// `host:port` of a plain `http://` endpoint (the HTTP/1.1 fast path).
+    /// `host:port` of a plain `http://` endpoint, for the HTTP/1.1 fast path
     h1: Option<Arc<str>>,
 }
 
-/// The parsed form of a service endpoint URL. The last one per thread is
-/// kept: proxied calls nearly always go to the one AppView.
+/// The last one per thread is kept: proxied calls nearly always go to the
+/// one AppView.
 fn endpoint(url: &str) -> XResult<Endpoint> {
     thread_local! {
         static LAST: std::cell::RefCell<Option<(String, Endpoint)>> = const { std::cell::RefCell::new(None) };
@@ -709,11 +607,10 @@ fn endpoint(url: &str) -> XResult<Endpoint> {
     Ok(e)
 }
 
-/// Upstream response body, passed through with the reference's limits: at
-/// most [`MAX_RESPONSE_BYTES`], and [`BODY_TIMEOUT`] without progress fails
+/// At most [`MAX_RESPONSE_BYTES`]; [`BODY_TIMEOUT`] without progress fails
 /// it. The idle timer is armed only while the upstream keeps us waiting, so
-/// a response that arrived with its head (the common case) costs no timer
-/// (each tokio timer operation takes the runtime's one timer-wheel lock).
+/// a response that arrived with its head costs no timer (each tokio timer
+/// operation takes the runtime's one timer-wheel lock).
 struct UpstreamBody<B> {
     inner: B,
     seen: usize,
@@ -785,10 +682,8 @@ where
     }
 }
 
-/// The upstream response with its body as the proxy passes it on: read
-/// whole when small (Content-Length <= [`BUFFER_SMALL`]: the upstream
-/// connection is released before the client reads anything), else streamed
-/// under [`UpstreamBody`]'s limits and a write-progress deadline
+/// Read whole when small, so the upstream connection is released before
+/// the client reads anything; else streamed under a write-progress deadline
 /// ([`crate::http::stall`]).
 async fn response_body<B>(r: axum::http::Response<B>) -> Result<(axum::http::response::Parts, Body), String>
 where
@@ -805,7 +700,7 @@ where
     Ok((parts, Body::new(crate::http::stall::Watched::new(body))))
 }
 
-/// A (small) body read to its end; one chunk is passed on as it is.
+/// One chunk is passed on without a copy.
 async fn collect<B>(mut body: B) -> Result<Bytes, BoxError>
 where
     B: hyper::body::Body<Data = Bytes, Error = BoxError> + Unpin,
@@ -831,9 +726,7 @@ where
     })
 }
 
-/// Sends the request to `target` with a (cached) service-auth token (when
-/// there is an issuer, whose account `acct` is) and streams the response
-/// back.
+/// `acct`: the issuer's account, if already loaded.
 async fn forward(app: &App, target: &Target<'_>, f: Forward<'_>, acct: Option<&CachedAcct>) -> XResult<Response> {
     let (parts, body) = send(app, target, f, acct).await?;
     if parts.status.as_u16() >= 400 {
@@ -842,8 +735,6 @@ async fn forward(app: &App, target: &Target<'_>, f: Forward<'_>, acct: Option<&C
     Ok(passthrough(parts, body))
 }
 
-/// A successful upstream response, streamed through with its allow-listed
-/// headers.
 fn passthrough(parts: axum::http::response::Parts, body: Body) -> Response {
     let mut out = Response::new(body);
     *out.status_mut() = parts.status;
@@ -856,8 +747,7 @@ fn passthrough(parts: axum::http::response::Parts, body: Body) -> Response {
     out
 }
 
-/// Sends the request (see [`forward`]); the upstream response head and
-/// body, whatever its status.
+/// The upstream response, whatever its status.
 async fn send(
     app: &App,
     target: &Target<'_>,
@@ -874,7 +764,7 @@ async fn send(
                     &fetched
                 }
             };
-            // Phase 1 of service-auth updates: the outbound JWT aud is the bare DID.
+            // the reference's phase 1 of service-auth updates: aud is the bare DID
             Some(service_jwt(acct, iss, f.aud.unwrap_or(&target.did), f.lxm)?)
         }
         None => None,
@@ -930,8 +820,7 @@ async fn send(
     })
 }
 
-/// Operator metrics of one proxied request: the upstream's answer (`None`:
-/// unreachable) and time to its response head, by service; reports.
+/// `status` None: unreachable.
 fn observe_upstream(service_id: &str, started: std::time::Instant, status: Option<StatusCode>, report: bool) {
     let service = crate::metrics::upstream_service(service_id);
     crate::metrics::UPSTREAM_DURATION.with_label_values(&[service]).observe(started.elapsed().as_secs_f64());
@@ -948,9 +837,8 @@ fn observe_upstream(service_id: &str, started: std::time::Instant, status: Optio
     }
 }
 
-/// Unauthenticated pipethrough of a GET to the `atproto-proxy` target or the
-/// method's default service (reference `pipethrough(ctx, req)` without an
-/// issuer), e.g. repo.getRecord for repos not hosted here.
+/// Reference `pipethrough(ctx, req)` without an issuer, e.g. repo.getRecord
+/// for repos not hosted here.
 pub(super) async fn pipethrough_unauthed(
     app: &App,
     headers: &HeaderMap,
@@ -961,53 +849,31 @@ pub(super) async fn pipethrough_unauthed(
         Some(h) => parse_proxy_header(app, h).await?,
         None => default_target(app, lxm)?
             .or_else(|| configured(&app.config.appview, "bsky_appview"))
-            .ok_or_else(|| XrpcError::bad("InvalidRequest", format!("No service configured for {lxm}")))?,
+            .ok_or_else(|| no_service(lxm))?,
     };
-    let pq = uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path());
-    forward(
-        app,
-        &target,
-        Forward {
-            method: Method::GET,
-            path_and_query: pq,
-            headers,
-            body: None,
-            iss: None,
-            lxm,
-            aud: None,
-            accept_encoding: None,
-        },
-        None,
-    )
-    .await
+    let f = Forward::new(Method::GET, path_and_query(uri), headers, None, None, lxm);
+    forward(app, &target, f, None).await
 }
 
-/// Account checks shared by every proxied call: loads the account and
-/// rejects taken-down accounts unless the method allows them.
-/// Only a missing account is 403 `AccountNotFound`; anything else (the
-/// shard moving away, a store or KMS failure) keeps its own status, so
-/// clients retry a 503 instead of treating the account as gone.
+/// Only a missing account is 403 `AccountNotFound`; anything else (shard
+/// moving, store or KMS failure) keeps its own status, so clients retry a
+/// 503 instead of treating the account as gone.
 async fn check_takedown(app: &App, did: &str, allow_takendown: bool) -> XResult<CachedAcct> {
     let acct = cached_account(app, did).await.map_err(|e| match e.error.as_str() {
         "AccountNotFound" => xerr(StatusCode::FORBIDDEN, "AccountNotFound", "Account not found"),
         _ => e,
     })?;
     if !allow_takendown && matches!(acct.status.as_deref(), Some("takendown") | Some("suspended")) {
-        return Err(xerr(
-            StatusCode::UNAUTHORIZED,
-            "AccountTakedown",
-            "Account has been taken down",
-        ));
+        return Err(super::server::takedown_error());
     }
     Ok(acct)
 }
 
-/// In-flight proxied requests per account (by DID hash), sharded.
+/// By DID hash.
 static IN_FLIGHT: std::sync::LazyLock<Vec<parking_lot::Mutex<std::collections::HashMap<u64, u32>>>> =
     std::sync::LazyLock::new(|| (0..CACHE_SHARDS).map(|_| Default::default()).collect());
 
-/// One admitted proxied request (see [`admit`]); dropped when its response
-/// body is done.
+/// Dropped when its response body is done.
 struct InFlight(u64);
 
 impl InFlight {
@@ -1028,9 +894,8 @@ impl Drop for InFlight {
     }
 }
 
-/// Admits one more proxied request for `did`: 429 at
-/// [`MAX_IN_FLIGHT_PER_ACCOUNT`]. Requests for an account are served by its
-/// owner, so this counts them across entry nodes.
+/// Requests for an account are served by its owner, so this counts them
+/// across entry nodes.
 fn admit(did: &str) -> XResult<InFlight> {
     let h = fixed_hash(did);
     let mut m = InFlight::shard(h).lock();
@@ -1048,17 +913,12 @@ fn admit(did: &str) -> XResult<InFlight> {
 }
 
 fn user_did(creds: &Credentials) -> XResult<&str> {
-    creds
-        .did()
-        .ok_or_else(|| XrpcError::auth("user credentials required"))
+    creds.user_did()
 }
 
-/// GET `lxm` with `params` from the configured AppView, as `iss` (a
-/// service-auth token) or unauthenticated; the JSON body (identity-encoded)
-/// or the upstream's error.
+/// The identity-encoded JSON body, or the upstream's error.
 async fn appview_json(app: &App, lxm: &str, params: &[(&str, &str)], iss: Option<(&str, &CachedAcct)>) -> XResult<J> {
-    let target = configured(&app.config.appview, "bsky_appview")
-        .ok_or_else(|| XrpcError::bad("InvalidRequest", format!("No service configured for {lxm}")))?;
+    let target = configured(&app.config.appview, "bsky_appview").ok_or_else(|| no_service(lxm))?;
     let url = reqwest::Url::parse_with_params(&format!("http://x/xrpc/{lxm}"), params)
         .map_err(|_| XrpcError::bad("InvalidRequest", "invalid xrpc path"))?;
     let pq = match url.query() {
@@ -1066,36 +926,27 @@ async fn appview_json(app: &App, lxm: &str, params: &[(&str, &str)], iss: Option
         None => url.path().to_string(),
     };
     let headers = HeaderMap::new();
-    let f = Forward {
-        method: Method::GET,
-        path_and_query: &pq,
-        headers: &headers,
-        body: None,
-        iss: iss.map(|(d, _)| d),
-        lxm,
-        aud: None,
-        accept_encoding: None,
-    };
+    let f = Forward::new(Method::GET, &pq, &headers, None, iss.map(|(d, _)| d), lxm);
     let (parts, body) = send(app, &target, f, iss.map(|(_, a)| a)).await?;
     if parts.status.as_u16() >= 400 {
         let e = UpstreamError::read(parts, body).await;
+        let defaults = response_type(e.status);
         return Err(XrpcError {
             status: StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY),
-            message: e.message.or_else(|| response_type_str(e.status).map(String::from)).unwrap_or_default(),
-            error: e.error.or_else(|| response_type_name(e.status).map(String::from)).unwrap_or_default(),
+            message: e.message.or_else(|| defaults.map(|d| d.1.to_string())).unwrap_or_default(),
+            error: e.error.or_else(|| defaults.map(|d| d.0.to_string())).unwrap_or_default(),
         });
     }
     let buf = axum::body::to_bytes(body, usize::MAX).await.map_err(|e| upstream_failure(&e.to_string()))?;
     serde_json::from_slice(&buf).map_err(|_| upstream_failure("invalid upstream response"))
 }
 
-/// Feed generator DIDs by feed URI (getFeed), for a minute.
+/// By feed URI.
 static FEED_DIDS: std::sync::LazyLock<TtlCache<String, Arc<str>>> =
     std::sync::LazyLock::new(|| TtlCache::new(crate::caches::Cache::DidDocs));
 const FEED_DID_TTL: Duration = Duration::from_secs(60);
 
-/// The DID of the feed generator getFeed's `feed` names, from its record
-/// on the AppView (reference api/app/bsky/feed/getFeed.ts).
+/// From the feed's record on the AppView (reference getFeed.ts).
 async fn feed_generator_did(app: &App, pq: &str) -> XResult<Arc<str>> {
     let url = reqwest::Url::parse(&format!("http://x{pq}")).map_err(|_| XrpcError::bad("InvalidRequest", "invalid xrpc path"))?;
     let feed = url
@@ -1120,7 +971,6 @@ async fn feed_generator_did(app: &App, pq: &str) -> XResult<Arc<str>> {
     Ok(did)
 }
 
-/// Router fallback: catch-all proxy for XRPC methods not served locally.
 pub async fn fallback(State(app): AppState, req: Request) -> Response {
     match proxy_request(&app, req).await {
         Ok(r) => r,
@@ -1148,77 +998,44 @@ async fn proxy_request_admitted(app: &App, req: Request, slot: &mut Option<InFli
     }
     let method = req.method().clone();
     if method != Method::GET && method != Method::HEAD && method != Method::POST {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            "XRPC requests only supports GET and POST",
-        ));
+        return Err(XrpcError::bad("InvalidRequest", "XRPC requests only supports GET and POST"));
     }
     if lxm_in(PROTECTED_METHODS, &lxm) {
         return Err(XrpcError::bad("InvalidToken", "Bad token method"));
     }
     let header = proxy_header(req.headers())?.map(String::from);
-    // Decide whether there is anything to proxy to before authenticating or
-    // touching the network.
+    // anything to proxy to? (before authenticating or touching the network)
     let default = match &header {
         Some(_) => None,
-        None => match default_target(app, &lxm)? {
-            Some(t) => Some(t),
-            None => {
-                return Err(xerr(
-                    StatusCode::NOT_IMPLEMENTED,
-                    "MethodNotImplemented",
-                    "Method Not Implemented",
-                ))
-            }
-        },
+        None => Some(default_target(app, &lxm)?.ok_or_else(|| {
+            xerr(StatusCode::NOT_IMPLEMENTED, "MethodNotImplemented", "Method Not Implemented")
+        })?),
     };
 
     let (parts, body) = req.into_parts();
     let creds = super::authn::authenticate(app, &parts).await?;
     let did = user_did(&creds)?;
 
-    let target = match (header, default) {
-        (Some(h), _) => parse_proxy_header(app, &h).await?,
-        (None, Some(t)) => t,
-        (None, None) => unreachable!(),
+    let target = match default {
+        Some(t) => t,
+        None => parse_proxy_header(app, header.as_deref().expect("no default without a header")).await?,
     };
     creds.need_rpc(&lxm, &target.scope_aud())?;
-    if matches!(
-        creds,
-        Credentials::AppPassword {
-            privileged: false,
-            ..
-        }
-    ) && lxm_in(PRIVILEGED_METHODS, &lxm)
-    {
+    if matches!(creds, Credentials::AppPassword { privileged: false, .. }) && lxm_in(PRIVILEGED_METHODS, &lxm) {
         return Err(XrpcError::bad("InvalidToken", "Bad token method"));
     }
     let acct = check_takedown(app, did, lxm == APPEAL_ACTIONED_SUBJECT).await?;
     *slot = Some(admit(did)?);
 
     let body = (method == Method::POST).then_some(body);
-    let pq = parts
-        .uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or(parts.uri.path());
-    let mut fwd = Forward {
-        method,
-        path_and_query: pq,
-        headers: &parts.headers,
-        body,
-        iss: Some(did),
-        lxm: &lxm,
-        aud: None,
-        accept_encoding: None,
-    };
-    // the AppView methods the reference serves itself (only with an
-    // AppView configured, like the reference)
+    let pq = path_and_query(&parts.uri);
+    let mut fwd = Forward::new(method, pq, &parts.headers, body, Some(did), &lxm);
+    // the AppView methods the reference serves itself, only with an AppView
+    // configured like the reference
     let feed_did;
     if fwd.method == Method::GET && app.config.appview.is_some() {
         if lxm == GET_FEED {
-            // the token is for the feed generator, which the AppView calls
-            // with it
+            // the token is for the feed generator, which the AppView calls with it
             creds.need_rpc(GET_FEED_SKELETON, &target.scope_aud())?;
             feed_did = feed_generator_did(app, pq).await?;
             fwd.aud = Some(&feed_did);
@@ -1229,9 +1046,6 @@ async fn proxy_request_admitted(app: &App, req: Request, slot: &mut Option<InFli
     }
     forward(app, &target, fwd, Some(&acct)).await
 }
-
-// app.bsky.actor.{get,put}Preferences
-// -----------------------------------
 
 /// The AppView audience whose preferences this PDS stores locally.
 fn local_prefs_aud(app: &App) -> String {
@@ -1261,8 +1075,7 @@ async fn prefs_target<'a>(
     Ok(Some(parse_proxy_header(app, &aud).await?))
 }
 
-/// Legacy full-access session (not app password / OAuth): may see and set
-/// personalDetailsPref.
+/// May see and set personalDetailsPref.
 fn has_access_full(creds: &Credentials) -> bool {
     matches!(creds, Credentials::Session { .. })
 }
@@ -1277,8 +1090,7 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
     vec![(did.into(), PREFS_KEY.into(), super::private_rows::enc(&prefs))]
 }
 
-/// Decodes the preferences row as `load_prefs` does (None: not it): an
-/// array of objects, each with a `$type`.
+/// None: not the preferences row.
 pub(super) fn check_row(_routing: &str, name: &str, val: &[u8]) -> Option<anyhow::Result<&'static str>> {
     (name == PREFS_KEY).then(|| {
         let prefs: Vec<J> = serde_json::from_slice(val)?;
@@ -1329,41 +1141,21 @@ async fn get_preferences(
     uri: Uri,
 ) -> XResult<Response> {
     // the moderation service reads any account's preferences (reference
-    // authorizationOrModService; the undocumented `did` parameter), here only
+    // authorizationOrModService, the undocumented `did` parameter)
     if let Credentials::ModService { .. } = creds {
         let did = mod_service_prefs_did(&app, &headers, &uri)?;
         return Ok(Json(json!({"preferences": visible_prefs(&app, &did, true).await?})).into_response());
     }
     let did = user_did(&creds)?.to_string();
     if let Some(target) = prefs_target(&app, &creds, &headers, GET_PREFERENCES).await? {
-        let pq = uri
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or(uri.path());
-        return forward(
-            &app,
-            &target,
-            Forward {
-                method: Method::GET,
-                path_and_query: pq,
-                headers: &headers,
-                body: None,
-                iss: Some(&did),
-                lxm: GET_PREFERENCES,
-                aud: None,
-                accept_encoding: None,
-            },
-            None,
-        )
-        .await;
+        let f = Forward::new(Method::GET, path_and_query(&uri), &headers, None, Some(&did), GET_PREFERENCES);
+        return forward(&app, &target, f, None).await;
     }
     let full = has_access_full(&creds);
     Ok(Json(json!({"preferences": visible_prefs(&app, &did, full).await?})).into_response())
 }
 
-/// getPreferences by the moderation service: the account from `?did=`, and
-/// never proxied to another AppView (reference: "Moderator requests cannot
-/// be proxied to other app views").
+/// The account from `?did=`.
 fn mod_service_prefs_did(app: &App, headers: &HeaderMap, uri: &Uri) -> XResult<String> {
     if proxy_header(headers)?.is_some_and(|h| h != local_prefs_aud(app)) {
         return Err(XrpcError::bad("InvalidRequest", "Moderator requests cannot be proxied to other app views"));
@@ -1376,8 +1168,7 @@ fn mod_service_prefs_did(app: &App, headers: &HeaderMap, uri: &Uri) -> XResult<S
     Ok(did)
 }
 
-/// `did`'s app.bsky preferences as getPreferences returns them (with the
-/// derived declared-age pref; personalDetailsPref only with `full`).
+/// With the derived declared-age pref; personalDetailsPref only with `full`.
 async fn visible_prefs(app: &App, did: &str, full: bool) -> XResult<Vec<J>> {
     let mut prefs = load_prefs(app, did).await?;
     let birth = prefs
@@ -1404,21 +1195,8 @@ async fn put_preferences(
 ) -> XResult<Response> {
     let did = user_did(&creds)?.to_string();
     if let Some(target) = prefs_target(&app, &creds, &headers, PUT_PREFERENCES).await? {
-        let pq = uri
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or(uri.path());
-        let fwd = Forward {
-            method: Method::POST,
-            path_and_query: pq,
-            headers: &headers,
-            body: Some(Body::from(body)),
-            iss: Some(&did),
-            lxm: PUT_PREFERENCES,
-            aud: None,
-            accept_encoding: None,
-        };
-        return forward(&app, &target, fwd, None).await;
+        let f = Forward::new(Method::POST, path_and_query(&uri), &headers, Some(Body::from(body)), Some(&did), PUT_PREFERENCES);
+        return forward(&app, &target, f, None).await;
     }
     check_takedown(&app, &did, false).await?;
 
@@ -1428,61 +1206,31 @@ async fn put_preferences(
         return Err(XrpcError::bad("InvalidRequest", "Input must be an object"));
     };
     let values = match input.get("preferences") {
-        None => {
-            return Err(XrpcError::bad(
-                "InvalidRequest",
-                "Input must have the property \"preferences\"",
-            ))
-        }
+        None => return Err(XrpcError::bad("InvalidRequest", "Input must have the property \"preferences\"")),
         Some(J::Array(a)) => a,
-        Some(_) => {
-            return Err(XrpcError::bad(
-                "InvalidRequest",
-                "Input/preferences must be an array",
-            ))
-        }
+        Some(_) => return Err(XrpcError::bad("InvalidRequest", "Input/preferences must be an array")),
     };
-    let mut checked = Vec::with_capacity(values.len());
-    for v in values {
-        match (v.is_object(), pref_type(v)) {
-            (true, Some(_)) => checked.push(v.clone()),
-            _ => {
-                return Err(XrpcError::bad(
-                    "InvalidRequest",
-                    "Preference is missing a $type",
-                ))
-            }
-        }
+    if !values.iter().all(|v| v.is_object() && pref_type(v).is_some()) {
+        return Err(XrpcError::bad("InvalidRequest", "Preference is missing a $type"));
     }
-    if !checked
-        .iter()
-        .all(|p| pref_in_namespace(pref_type(p).unwrap()))
-    {
+    let types: Vec<&str> = values.iter().filter_map(pref_type).collect();
+    if !types.iter().all(|t| pref_in_namespace(t)) {
         return Err(XrpcError::bad(
             "InvalidRequest",
             format!("Some preferences are not in the {PREFS_NAMESPACE} namespace"),
         ));
     }
     let full = has_access_full(&creds);
-    let forbidden: Vec<&str> = checked
-        .iter()
-        .filter_map(|p| pref_type(p))
-        .filter(|t| !pref_allowed(t, full))
-        .collect();
+    let forbidden: Vec<&str> = types.into_iter().filter(|t| !pref_allowed(t, full)).collect();
     if !forbidden.is_empty() {
         return Err(XrpcError::bad(
             "InvalidRequest",
-            format!(
-                "Do not have authorization to set preferences: {}",
-                forbidden.join(", ")
-            ),
+            format!("Do not have authorization to set preferences: {}", forbidden.join(", ")),
         ));
     }
-    // Replace every stored pref this caller may set; keep the ones it can't
-    // (personalDetailsPref for non-full-access sessions). Read-only prefs
-    // (declaredAgePref) are derived and never stored.
-    // Serialized per account so concurrent puts can't lose each other's
-    // kept prefs (requests for a DID are served by its owning node).
+    // Keep the stored prefs this caller can't set; declaredAgePref is derived,
+    // never stored. Serialized per account so concurrent puts can't lose each
+    // other's kept prefs (requests for a DID are served by its owner).
     let ext = super::server::ext(&app);
     let _g = ext.lock(&format!("prefs:{did}")).await;
     let mut stored: Vec<J> = load_prefs(&app, &did)
@@ -1490,11 +1238,7 @@ async fn put_preferences(
         .into_iter()
         .filter(|p| pref_type(p).is_some_and(|t| !(pref_in_namespace(t) && pref_allowed(t, full))))
         .collect();
-    stored.extend(
-        checked
-            .into_iter()
-            .filter(|p| pref_type(p) != Some(DECLARED_AGE_PREF)),
-    );
+    stored.extend(values.iter().filter(|p| pref_type(p) != Some(DECLARED_AGE_PREF)).cloned());
     let val = Bytes::from(serde_json::to_vec(&stored).map_err(XrpcError::from_err)?);
     let m = crate::segment::Mutation {
         key: Bytes::from(state::private_key(&did, PREFS_KEY)),
@@ -1504,9 +1248,6 @@ async fn put_preferences(
     Ok(StatusCode::OK.into_response())
 }
 
-// com.atproto.moderation.createReport
-// -----------------------------------
-
 async fn create_report(
     State(app): AppState,
     Auth(creds): Auth,
@@ -1514,7 +1255,10 @@ async fn create_report(
     body: AxBytes,
 ) -> XResult<Response> {
     let did = user_did(&creds)?.to_string();
-    let aud = compute_proxy_to(&app, &headers, CREATE_REPORT)?;
+    let aud = match proxy_header(&headers)? {
+        Some(h) => h.to_string(),
+        None => default_target(&app, CREATE_REPORT)?.ok_or_else(|| no_service(CREATE_REPORT))?.scope_aud(),
+    };
     creds.need_rpc(CREATE_REPORT, &aud)?;
 
     let input: J = serde_json::from_slice(&body)
@@ -1523,18 +1267,12 @@ async fn create_report(
         return Err(XrpcError::bad("InvalidRequest", "Input must be an object"));
     }
     if !input.get("reasonType").is_some_and(|v| v.is_string()) {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            "Input must have the property \"reasonType\"",
-        ));
+        return Err(XrpcError::bad("InvalidRequest", "Input must have the property \"reasonType\""));
     }
     if !input.get("subject").is_some_and(|v| v.is_object()) {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            "Input must have the property \"subject\"",
-        ));
+        return Err(XrpcError::bad("InvalidRequest", "Input must have the property \"subject\""));
     }
-    // Taken-down accounts may still report (appeals).
+    // taken-down accounts may still report (appeals)
     let acct = check_takedown(&app, &did, true).await?;
 
     let target = match proxy_header(&headers)? {
@@ -1547,29 +1285,12 @@ async fn create_report(
             fwd_headers.insert(name, v.clone());
         }
     }
-    fwd_headers.insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/json"),
-    );
+    fwd_headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
     let body = Bytes::from(serde_json::to_vec(&input).map_err(XrpcError::from_err)?);
     fwd_headers.insert(header::CONTENT_LENGTH, body.len().into());
     let path = format!("/xrpc/{CREATE_REPORT}");
-    forward(
-        &app,
-        &target,
-        Forward {
-            method: Method::POST,
-            path_and_query: &path,
-            headers: &fwd_headers,
-            body: Some(Body::from(body)),
-            iss: Some(&did),
-            lxm: CREATE_REPORT,
-            aud: None,
-            accept_encoding: None,
-        },
-        Some(&acct),
-    )
-    .await
+    let f = Forward::new(Method::POST, &path, &fwd_headers, Some(Body::from(body)), Some(&did), CREATE_REPORT);
+    forward(&app, &target, f, Some(&acct)).await
 }
 
 #[cfg(test)]
