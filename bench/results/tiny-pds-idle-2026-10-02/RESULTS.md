@@ -373,3 +373,92 @@ Remaining idle Class A in laidle1 (0.166 A/s):
 Run files are `lbidle1`, `laidle1`, `la10idle1`, `lbpers1` and `lapers1` (`*.jsonl.gz`, `*.log`).
 `analyze.py --matrix lbidle1 laidle1 la10idle1 lbpers1 lapers1` prints the component table. The
 scratch dirs, both builds' target dirs and the MinIO container were deleted.
+
+## Follow-up: reshard GC skips idle dir passes
+
+The reshard GC dir pass (`src/reshard_gc.rs`, on the owner of slot 0's shard, every 60 s) now stops
+after its layout GET while:
+- the layout equals the one of the last full pass,
+- that pass found no retired dir (deletable, or held by a checkpoint, the grace or anything else) and no
+  `assign/` record out of the layout,
+- and that pass ran less than an hour ago.
+
+Anything else makes the next pass full: a pending op, something left over, an error, a missing layout,
+or lost leadership. Every split, merge or abort changes the layout, so the pass right after it is full.
+A skip deletes nothing. DESIGN.md "Retired state GC" has the argument. Metric:
+`vlpds_reshard_gc_skipped_passes_total`.
+
+**Method.** The same as the previous follow-up: `--shards 1 --lease-ttl-ms 60000`, a 5-min warmup,
+then a 30-min window, counted with objstats. MinIO ran in its own tmpfs container on 127.0.0.1:9431,
+removed afterwards. Both runs ran at the same time:
+- `gbidle1`: release build of `1d577f9` (before).
+- `gaidle1`: the same build plus this change.
+
+Request rates (Class A / Class B per second):
+
+| component | laidle1 (earlier) | gbidle1 (before) | **gaidle1 (after)** |
+|---|---|---|---|
+| ctl_lease (lease CAS + `LIST nodes/`) | 0.100 / 0 | 0.100 / 0 | 0.100 / 0 |
+| ctl_assign (`LIST assign/`; layout GETs) | 0.020 / 0.0178 | 0.020 / 0.0178 | **0.0033** / 0.0178 |
+| state_other (`LIST state/`, reshard GC) | 0.0333 / 0 | 0.0333 / 0 | **0** / 0 |
+| everything else (SlateDB, rate-limit poll, version) | 0.0122 / 0.552 | 0.0122 / 0.552 | 0.0122 / 0.555 |
+| **total** | **0.166 / 0.570** | **0.166 / 0.569** | **0.116 / 0.572** |
+
+Monthly cost:
+
+| run | Class A /mo | Class B /mo | R2 $/mo | S3 $/mo |
+|---|---|---|---|---|
+| gbidle1 (before) | 0.435 M | 1.50 M | $0.00 | $2.77 |
+| **gaidle1 (after)** | **0.304 M** | 1.50 M | $0.00 | **$2.12** |
+
+- **Idle Class A fell 30%**, from 0.166 to 0.116 A/s (−0.050 A/s, −131 k A/mo), as projected.
+  - The GC's two `LIST state/` per pass are gone (state_other 0.0333 → 0).
+  - Its `LIST assign/` is gone too (ctl_assign 36 → 6 LISTs in the window). The 6 left are the
+    cluster step's every-25-steps LIST.
+  - The layout GET stays: 30 Class B per 30 min, 0.0167 B/s, ~$0.02/mo on S3. It is what notices a
+    layout change, and it doesn't depend on the node's cached view.
+- **The hourly full pass is not in this window.** The first pass (07:26:56) was full, and the next full
+  one was due at 08:26:56, after the window. Amortized it adds 3 LISTs per hour (0.0008 A/s, 2.2 k
+  A/mo). A peek at `/metrics` 5 min in showed 1 full pass and 4 skipped.
+- **Personal PDS at 200 commits/day.** Idle plus 7.56 A per commit comes to ~0.35 M A/mo. That is
+  S3 ≈ $2.4/mo, down from ≈ $3.1. R2's free tier now covers ~3,000 commits/day, up from ~2,450.
+
+Remaining idle Class A in gaidle1 (0.116 A/s):
+
+| source | A/s |
+|---|---|
+| lease CAS (every TTL/5) | 0.083 |
+| `LIST nodes/` (once per TTL) | 0.017 |
+| SlateDB GC (per shard) | 0.012 |
+| `LIST assign/` (every 25 steps) | 0.003 |
+| reshard GC hourly full pass (amortized, not in window) | 0.0008 |
+
+**Other GC passes, checked for avoidable idle requests:**
+- **Forced detach / opt-in full compactions** (`ReshardGc::compaction_pass`, every node, every 60 s)
+  makes no requests while idle. It reads each held shard's in-memory manifest. It only goes to the
+  store for a compaction it is following, or for a shard that still reads inherited SSTs
+  (`read_manifest` + `submit_compaction`). Nothing to cut.
+- **SlateDB GC** (0.0122 A/s per shard; each directory task every 10 min,
+  `garbage_collector::DEFAULT_INTERVAL`). Per 10 min:
+  - `LIST wal/` ×2;
+  - `LIST manifest/`, `LIST compacted/`, `LIST compactions/`;
+  - ~1 boundary `put_create`;
+  - ~1 bulk delete each of superseded manifests and `.compactions` files.
+
+  What can be cut:
+  - **The two `LIST wal/` (0.0033 A/s, 8.8 k A/mo per shard, ~3% of the new floor).** These are the
+    WAL task and the WAL-fence task, which defaults to `dry_run`. vlpds runs with `wal_enabled: false`
+    (`partition.rs`), so both list an empty directory. Setting `wal_options` and `wal_fence_options`
+    to `None` in `partition::gc_options` would drop them. Not changed here: it needs a check that
+    SlateDB writes no WAL object at open/fence with the WAL off.
+  - **The rest runs at SlateDB's default 10-min interval per directory.** There is no vlpds flag for
+    it, but `GarbageCollectorDirectoryOptions::interval` could be raised in `partition::gc_options`.
+    The cost is that superseded manifests, `.compactions` files and replaced SSTs linger longer. Even
+    idle, these passes still find superseded files to delete (3 + 2 bulk deletes per 30 min), so they
+    are not pure waste like the WAL LISTs.
+  - The boundary GETs (`gc/*.boundary`, 0.22 B/s) are part of manifest/compactions polling, not the
+    GC passes. They are Class B and already covered by `--slatedb-manifest-poll`.
+
+Run files are `gbidle1` and `gaidle1` (`*.jsonl.gz`, `*.log`). `analyze.py --matrix gbidle1 gaidle1`
+prints the component table. The scratch dirs, both builds' target dirs and the MinIO container were
+deleted.

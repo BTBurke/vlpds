@@ -23,6 +23,10 @@
 //!   per pass; deletes are idempotent and resumable (SlateDB's
 //!   `delete_db` marker).
 //!
+//! An idle dir pass is skipped (no requests but the layout GET) while the
+//! layout is unchanged since a full pass that found nothing out of the
+//! layout, at most [`FULL_PASS_EVERY`] apart (see `ReshardGc::dir_pass`).
+//!
 //! Optionally (`full_every`) every held shard gets a full compaction once
 //! per interval, which also drops tombstones in its bottom run.
 
@@ -61,6 +65,10 @@ pub struct Config {
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(3600);
 pub const DEFAULT_DETACH_AFTER: Duration = Duration::from_secs(300);
+/// A dir pass LISTs `state/` and `assign/` at least this often even while
+/// the skip rule says nothing can be there: a safety net for whatever it
+/// doesn't foresee (see `ReshardGc::dir_pass`).
+pub const FULL_PASS_EVERY: Duration = Duration::from_secs(3600);
 
 impl Default for Config {
     fn default() -> Self {
@@ -122,6 +130,9 @@ pub struct Pass {
     pub held: HashMap<Held, usize>,
     /// Skipped: a reshard op is pending.
     pub op_pending: bool,
+    /// Skipped: the layout is the one an earlier pass found nothing to do
+    /// under (no LISTs).
+    pub skipped: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +160,10 @@ struct State {
     last_full: HashMap<ShardId, Instant>,
     /// dir GC resumes checking after this id (round robin)
     cursor: Option<ShardId>,
+    /// The layout of the last full dir pass, if it found no dir and no
+    /// assignment out of the layout, and when that pass started. While
+    /// the layout stays this one, passes skip their LISTs.
+    idle: Option<(Layout, Instant)>,
 }
 
 pub struct ReshardGc {
@@ -180,9 +195,12 @@ impl ReshardGc {
                     tracing::warn!("forced compaction pass failed: {e:#}");
                 }
                 if !(me.hooks.leader)() {
+                    // what we learned may be stale by the time we lead again
+                    me.st.lock().idle = None;
                     continue;
                 }
                 match me.dir_pass().await {
+                    Ok(p) if p.skipped => metrics::RESHARD_GC_SKIPPED.inc(),
                     Ok(p) => {
                         metrics::RESHARD_GC_PASSES.with_label_values(&["ok"]).inc();
                         if p.deleted_dirs + p.deleted_assigns > 0 {
@@ -316,6 +334,20 @@ impl ReshardGc {
     }
 
     /// One pass: retired state dirs, then orphaned assignments.
+    ///
+    /// Skipped after the layout GET (no LISTs, nothing deleted) when the
+    /// layout equals the one of a full pass at most [`FULL_PASS_EVERY`] ago
+    /// that found no retired dir (deletable, held for any reason, or an
+    /// aborted op's clone) and no orphaned assignment. Things out of the
+    /// layout only appear through a layout change: a dir or record of a
+    /// shard id below `next_id` is made by an op (the layout carries it,
+    /// then drops it at the flip or abort) or by a shard's owner while the
+    /// shard is in the layout (leaving it is a change). A pass with
+    /// anything left, a pending op, an error or a lost leadership forgets
+    /// what it learned, so the next pass is full. A skip never deletes; it
+    /// only defers work, by at most FULL_PASS_EVERY for anything the rule
+    /// doesn't foresee (e.g. a stale former owner rewriting a deleted
+    /// shard's record).
     pub async fn dir_pass(&self) -> anyhow::Result<Pass> {
         let mut pass = Pass::default();
         let Some(grace) = self.cfg.grace else { return Ok(pass) };
@@ -323,7 +355,20 @@ impl ReshardGc {
         // every manifest poll: one that still lists a parent's SSTs must be
         // replaced before the parent goes, whatever the configured grace.
         let grace = if cfg!(test) { grace } else { grace.max(crate::partition::manifest_poll_interval() * 3) };
-        let Some(layout) = self.read_layout().await? else { return Ok(pass) };
+        let layout = self.read_layout().await;
+        let started = Instant::now();
+        {
+            let mut st = self.st.lock();
+            if let (Ok(Some(l)), Some((seen, at))) = (&layout, &st.idle) {
+                if l == seen && at.elapsed() < FULL_PASS_EVERY {
+                    pass.skipped = true;
+                    return Ok(pass);
+                }
+            }
+            // a full pass (or an error) from here: it re-learns
+            st.idle = None;
+        }
+        let Some(layout) = layout? else { return Ok(pass) };
         if layout.op.is_some() {
             // a pending op (or one resuming after a crash) may still clone
             // from its parents or write its children's assignments
@@ -385,11 +430,15 @@ impl ReshardGc {
         let dirs = self.state_dirs().await?;
         let orphans: Vec<ShardId> = self.assign_records().await?.into_iter().filter(|s| !live.contains(s) && *s < layout.next_id && !dirs.contains(s)).collect();
         metrics::RESHARD_GC_ORPHAN_ASSIGNS.set(orphans.len() as i64);
+        let idle = pass.retired == 0 && orphans.is_empty();
         for x in orphans.into_iter().take(self.cfg.max_dirs.max(1) * 4) {
             anyhow::ensure!((self.hooks.lease_ok)(), "node lease not valid: no deletes");
             if self.delete_assignment(x).await? {
                 pass.deleted_assigns += 1;
             }
+        }
+        if idle {
+            self.st.lock().idle = Some((layout, started));
         }
         Ok(pass)
     }
@@ -762,6 +811,158 @@ mod tests {
         store.raw.put(&Path::from(format!("{}/state/0000000001/stray", store.prefix)), bytes::Bytes::from_static(b"x").into()).await.unwrap();
         let p = g.dir_pass().await.unwrap();
         assert_eq!((p.deleted_dirs, p.held.get(&Held::Other)), (0, Some(&1)), "{p:?}");
+    }
+
+    /// Counts LISTs and GETs on top of another store.
+    #[derive(Debug)]
+    struct Counting {
+        inner: Arc<dyn object_store::ObjectStore>,
+        lists: std::sync::atomic::AtomicU64,
+        gets: std::sync::atomic::AtomicU64,
+    }
+
+    impl std::fmt::Display for Counting {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "Counting")
+        }
+    }
+
+    impl Counting {
+        /// (LISTs, GETs) since the last call.
+        fn take(&self) -> (u64, u64) {
+            use std::sync::atomic::Ordering::Relaxed;
+            (self.lists.swap(0, Relaxed), self.gets.swap(0, Relaxed))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for Counting {
+        async fn put_opts(&self, location: &Path, payload: object_store::PutPayload, opts: object_store::PutOptions) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(&self, location: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(&self, location: &Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(&self, locations: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(&self, from: &Path, to: &Path, options: object_store::CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn counting_store(prefix: &str) -> (Store, Arc<Counting>) {
+        let c = Arc::new(Counting { inner: Store::memory(None).raw, lists: Default::default(), gets: Default::default() });
+        (Store { prefix: prefix.into(), raw: c.clone(), ..Store::memory(None) }, c)
+    }
+
+    /// Idle passes skip their LISTs (one layout GET each); a layout change
+    /// runs a full pass at once, and FULL_PASS_EVERY after the last full
+    /// pass one runs anyway and finds what appeared without a layout
+    /// change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_dir_passes_skip() {
+        let (store, n) = counting_store("gcidle");
+        parent(&store, ShardId(0), 10).await;
+        put_json(&store, "assign/0000000000", &Assignment::default()).await;
+        // id 1 was handed out (an aborted op's child, long gone)
+        put_json(&store, "assign/layout", &layout(&[(0, 0, 65536)], 2, None)).await;
+        let g = gc(&store, Arc::new(Mutex::new(Vec::new())), Duration::ZERO, None);
+        n.take();
+        let p = g.dir_pass().await.unwrap();
+        assert!(!p.skipped && p.retired == 0, "{p:?}");
+        assert_eq!(n.take(), (3, 1), "a full pass: LIST state/ twice, LIST assign/, the layout GET");
+        for _ in 0..3 {
+            assert!(g.dir_pass().await.unwrap().skipped);
+            assert_eq!(n.take(), (0, 1), "a skipped pass: the layout GET only");
+        }
+        // any layout change (here only its version): a full pass at once
+        let mut l = layout(&[(0, 0, 65536)], 2, None);
+        l.version = 3;
+        put_json(&store, "assign/layout", &l).await;
+        assert!(!g.dir_pass().await.unwrap().skipped);
+        assert_eq!(n.take().0, 3);
+        assert!(g.dir_pass().await.unwrap().skipped);
+        // something out of the layout appears without a layout change (a
+        // stale former owner rewriting a deleted shard's record): skipped
+        // passes leave it, the hourly full pass deletes it
+        put_json(&store, "assign/0000000001", &Assignment::default()).await;
+        let p = g.dir_pass().await.unwrap();
+        assert!(p.skipped && p.deleted_assigns == 0, "{p:?}");
+        assert_eq!(assigns(&store).await, vec![0, 1]);
+        {
+            let mut st = g.st.lock();
+            let at = &mut st.idle.as_mut().expect("idle").1;
+            *at = at.checked_sub(FULL_PASS_EVERY).unwrap();
+        }
+        let p = g.dir_pass().await.unwrap();
+        assert_eq!((p.skipped, p.deleted_assigns), (false, 1), "{p:?}");
+        assert_eq!(assigns(&store).await, vec![0]);
+        // that pass found something: the next one is full too, then idle
+        assert!(!g.dir_pass().await.unwrap().skipped);
+        assert!(g.dir_pass().await.unwrap().skipped);
+        // an unreadable layout (gone here) forgets it all
+        store.raw.delete(&Path::from("gcidle/assign/layout")).await.unwrap();
+        assert!(!g.dir_pass().await.unwrap().skipped);
+        put_json(&store, "assign/layout", &l).await;
+        n.take();
+        assert!(!g.dir_pass().await.unwrap().skipped);
+        assert_eq!(n.take().0, 3);
+    }
+
+    /// A split (op pending, then flipped) runs full passes at once, and a
+    /// retired parent held by the grace keeps every pass full until it is
+    /// deleted; only then do passes skip again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reshard_and_grace_keep_passes_running() {
+        let (store, n) = counting_store("gcgrace");
+        parent(&store, ShardId(0), 10).await;
+        put_json(&store, "assign/0000000000", &Assignment::default()).await;
+        put_json(&store, "assign/layout", &layout(&[(0, 0, 65536)], 1, None)).await;
+        let g = gc(&store, Arc::new(Mutex::new(Vec::new())), Duration::from_secs(3), None);
+        assert!(!g.dir_pass().await.unwrap().skipped);
+        assert!(g.dir_pass().await.unwrap().skipped);
+        // the split is planned: nothing touched, nothing skipped
+        let op = crate::slots::Reshard { id: 1, parents: vec![ShardId(0)], children: vec![], driver: "n".into(), extra: Default::default() };
+        put_json(&store, "assign/layout", &layout(&[(0, 0, 65536)], 2, Some(op))).await;
+        let p = g.dir_pass().await.unwrap();
+        assert!(p.op_pending && !p.skipped, "{p:?}");
+        assert!(g.st.lock().idle.is_none());
+        // the parent's last writes (its manifest changes now), the child, the flip
+        put_json(&store, "assign/0000000000", &Assignment { frozen: Some(1), ..Default::default() }).await;
+        parent(&store, ShardId(0), 10).await;
+        parent(&store, ShardId(1), 10).await;
+        put_json(&store, "assign/0000000001", &Assignment::default()).await;
+        put_json(&store, "assign/layout", &layout(&[(1, 0, 65536)], 2, None)).await;
+        n.take();
+        for _ in 0..2 {
+            let p = g.dir_pass().await.unwrap();
+            assert_eq!((p.skipped, p.retired, p.deleted_dirs, p.held.get(&Held::Grace)), (false, 1, 0, Some(&1)), "{p:?}");
+            assert!(n.take().0 >= 3, "a full pass");
+        }
+        wait_for("the parent deleted", 20, async || {
+            let p = g.dir_pass().await.unwrap();
+            assert!(!p.skipped, "{p:?}");
+            p.deleted_dirs == 1
+        })
+        .await;
+        assert_eq!(dirs(&store).await, vec![1]);
+        assert_eq!(assigns(&store).await, vec![1]);
+        let p = g.dir_pass().await.unwrap();
+        assert!(!p.skipped && p.retired == 0, "the deleting pass found a retired dir: the next is full: {p:?}");
+        assert!(g.dir_pass().await.unwrap().skipped);
     }
 
     /// A forced detach whose owner dies before the compaction ran (the DB

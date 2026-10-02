@@ -1317,6 +1317,26 @@ and post-restart requests per commit up ~2x across the reshard hours, and
    a marker and no manifest is deleted). Then its `assign/` record goes.
    Records out of the layout whose dir is gone (a pass that stopped between
    the two deletes, an op aborted before its clone) go on the next pass.
+
+   *Idle passes.* A full pass makes three LISTs (`state/` twice,
+   `assign/`), 0.05 Class A/s at 60 s: 30% of an idle single node's floor
+   once the lone-node savings were in. So a pass skips everything after
+   the layout GET while the layout equals the one of the last full pass,
+   that pass found no retired dir (deletable or held for any reason,
+   grace included) and no record out of the layout, and it ran less than
+   an hour ago. Anything else (a pending op, something left, an error, a
+   missing layout, a lost leadership) forgets that, so the next pass is
+   full; after a split, merge or abort the layout differs, so the pass
+   right after it is full. Why nothing is missed: a dir or record of an id
+   below `next_id` is made either by an op, which the layout carries until
+   its flip or abort, or by a shard's owner while the shard is in the
+   layout, and leaving it is a layout change. A skip deletes nothing and
+   only defers work, by at most the hour for anything that rule doesn't
+   foresee (a stale former owner rewriting a deleted shard's record). The
+   layout GET (Class B) stays: it is what notices a change, and it doesn't
+   depend on this node's cached view. Metric:
+   `vlpds_reshard_gc_skipped_passes_total` (not counted in
+   `vlpds_reshard_gc_passes_total`).
 3. **Clone source checkpoints.** `clone_db` reads each source at a
    checkpoint named `vlpds-clone-{child}` (1 h lifetime), reused by a
    resumed clone, and deletes it once the clone is initialized; a clone
@@ -1377,6 +1397,7 @@ listRecords p99 flat at 2.7–3.8 ms), so it stays off.
 
 Metrics: `vlpds_reshard_gc_retired_dirs{state}`,
 `vlpds_reshard_gc_deleted_total{kind}`, `vlpds_reshard_gc_passes_total`,
+`vlpds_reshard_gc_skipped_passes_total`,
 `vlpds_reshard_gc_orphan_assign_records`, `vlpds_shards_with_inherited_ssts`,
 `vlpds_forced_compactions_total{kind,result}`; alerts and runbook in `ops/`.
 Retention metrics were already labelled by kind (own, dead, fence), not by
