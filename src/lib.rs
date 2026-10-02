@@ -25,6 +25,7 @@ pub mod oauth;
 pub mod objstats;
 pub mod partition;
 pub mod partitions;
+pub mod plc;
 pub mod reshard;
 pub mod profiling;
 pub mod ratelimit;

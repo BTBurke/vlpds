@@ -808,6 +808,40 @@ the kid is unknown, add the old KEK back (`--kek-old-file` / `--gcp-kms-old-key`
 on every node and rerun the rewrap ([KEK rotation](#kek-rotation)). Otherwise
 compare the node's KEK config with its peers'. Never "fix" a row by hand.
 
+### VlpdsPlcDirectoryUnavailable
+
+**Means:** writes to the PLC directory (`--plc-url`) fail as unavailable
+(`vlpds_plc_requests_total{result="unavailable"}`: 5xx, 429, timeouts,
+connection errors; the `PLC directory request failed` warn log has the DID,
+op and error). New accounts' DIDs are registered before the account exists,
+so **createAccount (and OAuth sign-up) fails with 500** and leaves nothing
+behind (the handle and email are free again). **updateHandle**, admin
+updateAccountHandle and updateAccountSigningKey fail the same way with no
+local change; signPlcOperation can't read the last op; submitPlcOperation
+can't forward. Everything else (logins, writes, reads, firehose, sync) is
+unaffected: existing DIDs resolve from the directory's own replicas.
+
+**Do:** follow [PLC directory outage](#plc-directory-outage).
+
+### VlpdsPlcOpsRejected
+
+**Means:** the directory refused (4xx) an op this server built and signed
+(`op` label). Usually: the DID no longer lists this server's rotation key
+(the account migrated away, or a user removed the key and the account
+wasn't told: `update_handle` / `update_signing_key`), a rotation key the
+directory doesn't accept, or a bug in op construction (`create`: every
+signup failing). The directory's message is in the warn log and in the 500
+the client got.
+
+**Do:** for `create`, treat as an incident: no one can sign up. Check the
+log message (`Invalid signature`, `Operation too large`, ...), the node's
+`PLC registration on` startup line (rotation key did:key), and whether a
+deploy changed op construction; roll back. For updates of single DIDs,
+fetch `$PLC/{did}/log/last`: if its `rotationKeys` lack this server's key
+(current or retired) the account is no longer ours to update; tell the
+user (they hold the remaining rotation keys). For `rotate_key`, the DID's
+last op was signed after our read (retry `rotatePlcKeys`).
+
 ### VlpdsSignatureFault
 
 Also covers **VlpdsSignatureFaultFailStop** (the previous process exited
@@ -815,7 +849,7 @@ with code 6, `signature_fault`).
 
 **Means:** a signature failed verification against the key's own public key
 right after it was made (`vlpds_signature_verify_failures_total{purpose}`:
-`commit`, `service_auth`, `oauth_token`; `key_load` = a cached signing key's
+`commit`, `service_auth`, `oauth_token`, `plc_operation`; `key_load` = a cached signing key's
 scalar no longer derives its public key). Correct code never does this: the
 CPU or memory of this host computed something wrong (bad DIMM, Rowhammer,
 overheating, failing CPU). The bad signature was **not** emitted: the node
@@ -964,6 +998,81 @@ configured for unwrap.
    each needs a new signing key installed (`admin.updateAccountSigningKey`) and a
    PLC rotation, which needs the PLC rotation keys the users or their recovery
    flow hold.
+
+### PLC rotation key provisioning
+
+Accounts' DIDs are registered with the PLC directory, and every DID lists
+this deployment's **PLC rotation key** (DESIGN "PLC identity"). Outside
+`--dev-mode` a node refuses to start without one (`--plc-mode unregistered`
+is dev-only). Every node of a cluster needs the same key. Losing it means
+the server can no longer update its accounts' DIDs (handle changes,
+migrations out); users with their own recovery key can still recover.
+
+1. Generate and wrap it under the KEK (Cloud KMS in production) on a host
+   with the node's KEK config:
+   `vlpds --gcp-kms-key projects/P/locations/us/keyRings/vlpds/cryptoKeys/secrets --wrap-plc-rotation-key </dev/null >plc-rotation.key`
+   (empty stdin = a new key; or pipe 64 hex chars to wrap an existing key,
+   e.g. a reference PDS's `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`). The
+   did:key goes to stderr: record it.
+2. Distribute `plc-rotation.key` like the other secrets (sops / Ansible
+   Vault), mode 0400, and start nodes with `--plc-rotation-key-file`
+   (`VLPDS_PLC_ROTATION_KEY_FILE`). The file is useless without KMS decrypt
+   on the KEK. Alternatively pass the hex in
+   `VLPDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` (plaintext in the
+   environment; not recommended).
+3. Optional: `--plc-recovery-did-key did:key:...` (an offline key the
+   operator holds) goes ahead of the server key in every new DID.
+4. Check after start: the `PLC registration on` log line shows `plc_url` and
+   `rotation_key` (the did:key from step 1) on every node;
+   `getRecommendedDidCredentials` returns it in `rotationKeys`.
+5. Back up the wrapped file with the KEK backup plan: it needs the KEK to
+   open, and it is not in the bucket.
+
+For local e2e runs, point `--plc-url` at a local did-method-plc server
+(`docker run` its image with Postgres) or use `--dev-mode` without a key
+(unregistered DIDs). Never point a test cluster at plc.directory.
+
+### PLC rotation key rotation
+
+1. Make a new key (step 1 above). Roll every node with the new key as
+   current and the old one retired:
+   `--plc-rotation-key-file new.key --plc-rotation-key-old-file old.key`.
+   New DIDs list the new key; any update of an old DID (handle change,
+   signPlcOperation) is signed by the old key and lists the new one instead.
+2. On **every** node (each covers the shards it owns):
+   `curl -XPOST -u admin:$ADMIN -H 'content-type: application/json' -d '{"dryRun": true}' $NODE/xrpc/vlpds.admin.rotatePlcKeys`
+   reports `current`, `rotated` (still on the old key), `foreign` (DIDs that
+   list neither: migrated away, or synthetic bulkCreate DIDs) and `failed`.
+   Run it without `dryRun` to submit the updates (4 in flight per node; the
+   directory rate-limits per DID and per IP, so expect it to take a while
+   for millions of accounts). Re-run until `failed` is 0, then dry runs
+   until `rotated` is 0 on every node (rerun where shards moved).
+3. Only then drop `--plc-rotation-key-old-file`. Keep the old key material
+   offline until you are sure: an op signed by a key a DID no longer lists
+   is refused, but a retired key that leaks can still sign for DIDs that
+   list it. For a **compromised** key, also consider the 72 h recovery
+   window: a higher-priority key (the user's or `--plc-recovery-did-key`)
+   can undo ops the attacker signed within 72 h.
+
+### PLC directory outage
+
+1. Confirm: `vlpds_plc_requests_total{result="unavailable"}` on all nodes,
+   the `PLC directory request failed` warn log (status or timeout), the
+   directory's status page. A 429 means we are rate-limited (bulk
+   `rotatePlcKeys`, a signup flood): slow down.
+2. Impact while it lasts: createAccount / sign-up, updateHandle, admin handle
+   and signing-key changes and submitPlcOperation return 500 with nothing
+   changed; clients may retry. Nothing queues on our side and nothing needs
+   replaying afterwards. Existing accounts work normally.
+3. Don't switch to `--plc-mode unregistered` to keep signups open: those
+   DIDs would never exist on the network.
+4. If one node is affected (egress or DNS), drain it with SIGTERM; its
+   shards move to nodes that can reach the directory.
+5. Afterwards: a createAccount whose local part failed after the directory
+   accepted the genesis op tombstones the DID; if the tombstone itself
+   failed (`tombstoning the DID of a failed account creation` error log),
+   that DID is registered without an account: harmless (nothing points
+   users at it).
 
 ### Rolling deploy
 

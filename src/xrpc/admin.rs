@@ -15,6 +15,7 @@ pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/xrpc/vlpds.admin.bulkCreate", post(bulk_create))
         .route("/xrpc/vlpds.admin.rewrapSecrets", post(rewrap_secrets))
+        .route("/xrpc/vlpds.admin.rotatePlcKeys", post(rotate_plc_keys))
         .route("/xrpc/vlpds.admin.getDevMail", get(get_dev_mail))
         .route(
             "/xrpc/com.atproto.admin.getAccountInfo",
@@ -751,7 +752,10 @@ struct UpdateSigningKeyIn {
 /// Rotates the account's repo signing key. The PDS signs commits, so it must
 /// hold the private key: `signingKey` must be a did:key reserved with
 /// server.reserveSigningKey, or omitted/"generate" for a fresh key. The DID
-/// document changes, so an #identity event is emitted.
+/// document changes, so an #identity event is emitted; with PLC
+/// registration on, a did:plc's `atproto` key is first updated in the PLC
+/// directory (as the reference's rotate-keys script), and a failure there
+/// changes nothing here.
 async fn update_account_signing_key(
     State(app): AppState,
     Auth(creds): Auth,
@@ -777,6 +781,9 @@ async fn update_account_signing_key(
         None => Keypair::generate(),
     };
     let did_key = key.did_key();
+    if let (Some(plc), true) = (&app.plc, inp.did.starts_with("did:plc:")) {
+        plc.update_signing_key(&inp.did, &did_key).await?;
+    }
     // wrapped for the row; cached unwrapped, so the repo's reload after the
     // rotation needs no unwrap
     let (wrapped, pubkey) = app.secrets.wrap_signing_key(&inp.did, &Arc::new(key)).await?;
@@ -1308,7 +1315,9 @@ const BULK_EXISTS_CONCURRENCY: usize = 64;
 /// Simulation-only: creates accounts `start..start+count` (or `indices`)
 /// with deterministic DIDs (`state::bulk_did`) and genesis posts (`records`:
 /// one count, or one per account). Emits the normal #identity/#account/#sync
-/// events but skips the global handle claim object.
+/// events but skips the global handle claim object, and never touches the
+/// PLC directory, even with PLC registration on: these synthetic DIDs are
+/// not registered anywhere (benchmarks must not hammer a real PLC).
 ///
 /// Idempotent, so a resumed range is safe: an account whose head is stored
 /// (or that its worker holds) is left alone and counted as `existing`.
@@ -1434,6 +1443,84 @@ async fn bulk_create(
 
 static BULK_PASSWORD_HASH: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| state::hash_password_blocking("hunter2"));
+
+// ---------------------------------------------------------------------------
+// PLC rotation key rotation (DESIGN.md "PLC identity")
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RotatePlcIn {
+    /// Count DIDs still on a retired key, change nothing.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// PLC updates in flight per rotatePlcKeys run (the directory rate-limits).
+const ROTATE_PLC_CONCURRENCY: usize = 4;
+
+/// For every did:plc account of the shards this node owns whose DID lists
+/// a retired server rotation key (`--plc-rotation-key-old-file`) and not
+/// the current one: a PLC update signed by the retired key that lists the
+/// current key instead. Run it on every node after rolling out a new
+/// rotation key, then with `dryRun` until each reports `rotated: 0` before
+/// retiring the old key. Idempotent. `foreign`: DIDs that list none of our
+/// keys (migrated away).
+async fn rotate_plc_keys(State(app): AppState, Auth(creds): Auth, body: Option<Json<RotatePlcIn>>) -> XResult<Json<J>> {
+    use futures::StreamExt;
+    require_admin(&creds)?;
+    let plc = app.plc.clone().ok_or_else(|| invalid_request("PLC registration is off on this PDS"))?;
+    let dry = body.map(|Json(b)| b).unwrap_or_default().dry_run;
+    let mut dids = Vec::new();
+    for p in app.partitions.owned() {
+        let mut it = state::FamilyScan::new(p.db.as_ref(), state::ACCOUNT_FAMILY, None, &Default::default())
+            .await
+            .map_err(XrpcError::from_err)?;
+        while let Some(kv) = it.next().await.map_err(XrpcError::from_err)? {
+            let a: Account = serde_json::from_slice(&kv.value).map_err(XrpcError::from_err)?;
+            if crate::plc::valid_plc_did(&a.did) {
+                dids.push(a.did);
+            }
+        }
+    }
+    let accounts = dids.len();
+    let results: Vec<(String, Result<crate::plc::KeyRotation, crate::plc::PlcError>)> = futures::stream::iter(dids)
+        .map(|did| {
+            let plc = plc.clone();
+            async move {
+                let r = plc.rotate_server_key(&did, dry).await;
+                (did, r)
+            }
+        })
+        .buffer_unordered(ROTATE_PLC_CONCURRENCY)
+        .collect()
+        .await;
+    let (mut current, mut rotated, mut foreign) = (0u64, 0u64, 0u64);
+    let mut errors = Vec::new();
+    for (did, r) in results {
+        match r {
+            Ok(crate::plc::KeyRotation::Current) => current += 1,
+            Ok(crate::plc::KeyRotation::Rotated) => rotated += 1,
+            Ok(crate::plc::KeyRotation::Foreign) => foreign += 1,
+            // synthetic (bulkCreate) DIDs were never registered
+            Err(crate::plc::PlcError::NotFound(_)) => foreign += 1,
+            Err(e) => errors.push(format!("{did}: {e}")),
+        }
+    }
+    tracing::info!(accounts, current, rotated, foreign, errors = errors.len(), dry_run = dry, rotation_key = plc.rotation_did_key(), "rotate PLC keys");
+    let failed = errors.len();
+    errors.truncate(20);
+    Ok(Json(json!({
+        "rotationKey": plc.rotation_did_key(),
+        "dryRun": dry,
+        "accounts": accounts,
+        "current": current,
+        "rotated": rotated,
+        "foreign": foreign,
+        "failed": failed,
+        "errors": errors,
+    })))
+}
 
 // ---------------------------------------------------------------------------
 // KEK rotation (DESIGN.md "Secrets at rest")

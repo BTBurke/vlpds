@@ -425,7 +425,7 @@ flight). `ss -ltn` shows the effective queue (Send-Q) per listener;
   event. MST code is also tested against atproto interop test vectors.
 
 ## Scope for v1
-XRPC: `server.createAccount` (locally minted did:plc-shaped DIDs, no PLC registration), `server.createSession`, `repo.{createRecord,putRecord,deleteRecord,applyWrites,getRecord,listRecords,describeRepo,uploadBlob}`,
+XRPC: `server.createAccount` (originally locally minted did:plc-shaped DIDs; now registered with PLC, see "PLC identity"), `server.createSession`, `repo.{createRecord,putRecord,deleteRecord,applyWrites,getRecord,listRecords,describeRepo,uploadBlob}`,
 `sync.{subscribeRepos,getRepo,getRecord,getLatestCommit,getRepoStatus,listRepos,getBlob}`.
 Auth: HS256 session JWTs + admin token. No OAuth, email, moderation, or app-view proxying.
 
@@ -1989,7 +1989,7 @@ are stored as hashes.
 | Email tokens (confirm, update, reset, delete, PLC) | `p/{did}\0etok/{purpose}`, `p/_reset:{digest}\0t` | HMAC-SHA256 under a key derived from `jwt_secret` (were plaintext, the reset token even in the key) |
 | OAuth codes, refresh tokens | `oauth/*` rows | hashes / MACs under keys derived from `jwt_secret` (unchanged) |
 | Sessions | `p/{did}\0sess/{id}` | ids only: tokens are JWTs under `jwt_secret` (unchanged) |
-| PLC rotation key | none | the PDS holds none (DIDs minted locally; `getRecommendedDidCredentials` recommends none) |
+| PLC rotation key | flag / env, or a KEK-wrapped file (`--plc-rotation-key-file`) | never in the bucket; unwrapped at startup ("PLC identity") |
 | `jwt_secret`, admin / internal tokens, SMTP credentials | flags / env | never in the bucket |
 | DPoP keys | clients | never on the server |
 
@@ -2109,8 +2109,9 @@ leaves the node:
   nothing applied (the repo is evicted and reloads). Three failures within a
   minute fail-stop the node (`signature_fault`, exit 6). A repo load also
   re-derives the public key from the cached scalar and checks it against
-  `signing_pubkey` (`purpose="key_load"`). Session JWTs are HMACs; nothing
-  here signs PLC operations.
+  `signing_pubkey` (`purpose="key_load"`). Session JWTs are HMACs. PLC
+  operations (server rotation key) are verified too
+  (`purpose="plc_operation"`).
 
 Alerts `VlpdsSignatureFault`, `VlpdsSignatureFaultFailStop` (RUNBOOK: suspect
 hardware; drain and replace the host). Tests: `crypto::tests`,
@@ -2211,3 +2212,120 @@ offers; vlpds's TOTP (`vlpds.server.*Totp`) stays as a second option.
   code field on `AuthFactorTokenRequired`, which takes a TOTP code too.
 - Unlike the reference, an `authFactorToken` sent for an account without a
   factor is ignored rather than checked.
+
+## PLC identity (`src/plc`)
+
+Accounts get real `did:plc` identities, as on the reference PDS: the DID is
+registered with the PLC directory (`--plc-url`, default
+`https://plc.directory`) before the account exists, and this PDS holds a
+**PLC rotation key** that can update it. Before this, DIDs were random
+`did:plc`-shaped strings that only this server resolved: accounts were not
+on the network and could not migrate out.
+
+**Operations, byte for byte with did-method-plc** (`@did-plc/lib`, used by
+the reference). An op is DAG-CBOR (canonical key order) signed with a
+rotation key: ES256K over the encoding without `sig`, compact 64-byte low-S,
+base64url without padding. Signing goes through `Keypair::sign_verified`
+(hedged nonce, verified before use, `purpose="plc_operation"`; see "Signing
+hardening"). The DID is `did:plc:` + the first 24 chars of
+base32(sha256(signed genesis op)); an update's `prev` is the CID of the op
+it follows (`createUpdateOp`). `plc::PlcLog::apply` is the directory's
+`assureValidNextOp` (genesis hash, signature by a rotation key of the
+previous op, tombstones, recovery forks by a higher-priority key within
+72 h); the mock directory and the tests use it. Vectors:
+`testdata/plc` (did-method-plc interop audit logs: DIDs, op CIDs,
+signatures incl. high-S / DER / bad base64, nullification), all replayed by
+`plc::tests`.
+
+**Genesis (createAccount).** Rotation keys `[recoveryKey from the request?,
+--plc-recovery-did-key?, server rotation key]` (reference
+`formatDidAndPlcOp` ordering), `verificationMethods.atproto` = the new
+signing key, `alsoKnownAs` = `at://{handle}`, `services.atproto_pds` =
+`--public-url`. Each signature is hedged, so re-signing gives a new DID: the
+op is re-signed until the DID lands in a partition this node owns (as
+random DIDs were; ~N tries for N nodes, ~30 µs each). Order: validate, then
+claim handle/email/invite + hash + wrap the signing key (concurrently, as
+before), then **POST the genesis op and wait for the directory's 200**, then
+create the repo and account (`CreateRepo`), then reply. A PLC refusal or
+outage releases the claims and returns 500 `InternalServerError` (the
+reference's error: its `PlcClientError` is not an XRPC error) with the
+directory's reason; nothing was written and no event emitted. If the local
+create fails after PLC accepted, the DID is tombstoned (best effort,
+logged), as the reference does. Bringing a DID (migration in) is unchanged:
+no genesis op.
+
+**Updates.** `updateHandle` and admin `updateAccountHandle` claim the new
+handle, then submit a PLC update (fetch `/{did}/log/last`, replace the
+first `at://` alias, `prev` = its CID), then swap the handle locally and
+emit `#identity`. A PLC failure releases the claim and changes nothing; an
+unchanged alias submits nothing (the reference would submit a no-op
+update). A `did:web` account's document must already name the handle
+(reference). Admin `updateAccountSigningKey` updates the `atproto` key in
+PLC before the local rotation. Failure after PLC accepted (local swap
+failing) is repaired by retrying: the PLC step is then a no-op.
+
+**Endpoints** (reference semantics): `requestPlcOperationSignature` mails a
+`plc_operation` token (full session, taken-down session, or OAuth
+`identity:*`; deactivated accounts too); `signPlcOperation` checks and
+consumes it, fetches the last op (refusing a tombstoned DID) and returns an
+update signed with the server key with the requested `rotationKeys` /
+`alsoKnownAs` / `verificationMethods` / `services` replaced (not
+submitted); `submitPlcOperation` requires the server rotation key among
+`rotationKeys`, `atproto_pds` = this PDS, `atproto` = the account's signing
+key and `alsoKnownAs[0]` = `at://{handle}`, forwards the op, and emits
+`#identity`. `getRecommendedDidCredentials.rotationKeys` = `[recovery?,
+server key]`. Activation and `checkAccountStatus.validDid` check a did:plc
+against the directory's `/data` (server rotation key present, endpoint,
+signing key; reference `assertValidDidDocumentForService`), so an account
+that migrated away can't be reactivated here. **Migration out** is the
+reference flow: getServiceAuth for the new PDS, its createAccount with the
+DID, repo/blob transfer, then here request + signPlcOperation with the new
+PDS's recommended credentials, the new PDS submits it and activates, and
+the account is deactivated here (`tests/all/plc.rs` runs it end to end
+between two servers).
+
+**The rotation key** is one secp256k1 key for the whole deployment
+(reference `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`). It comes from
+`--plc-rotation-key` / `VLPDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` (hex;
+`PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` is read too) or
+`--plc-rotation-key-file`: a `vw1.` blob wrapped under the KEK (purpose
+`plc-rotation-key`; `vlpds --wrap-plc-rotation-key` makes one, through
+Cloud KMS in production) or hex from a mounted secret. It is unwrapped once
+at startup (a KMS outage then fails the start) and never written to the
+bucket (`tests/all/secrets_at_rest.rs`). Every node of a cluster gets the
+same key. **Rotating it**: roll out the new key as current with the old one
+in `--plc-rotation-key-old-file`; an update of a DID that lists only the
+retired key is signed by it and lists the current key in its place, and
+`vlpds.admin.rotatePlcKeys` (per node, its shards' accounts, 4 PLC updates
+in flight, `dryRun` to count) does that for every account; then retire the
+old key. Activation accepts a retired key meanwhile.
+
+**Modes** (`--plc-mode`). `auto` (default): `directory` with a rotation key,
+else `unregistered`, which only `--dev-mode` accepts. `directory`:
+everything above. `unregistered` (dev/test/bench only): random local DIDs,
+never registered, PLC endpoints 501 — what the in-process suite and the
+benches use, so they never reach a directory. The binary refuses to start
+outside dev mode without a rotation key. `vlpds.admin.bulkCreate`
+(synthetic accounts, deterministic DIDs) never touches the directory in any
+mode. For e2e against a real directory, point `--plc-url` at a local
+did-method-plc server (plain http is accepted, with a warning outside dev
+mode); in-process tests use `plc::mock::MockPlc`, never plc.directory.
+
+**Not done / differences.** Resolution endpoints (`resolveDid`,
+`resolveIdentity`) still serve the locally generated document for accounts
+hosted here (identical to the directory's while the account is here); a
+migrated-away account's stale document is served here until it is deleted.
+No `PDS_PLC_ROTATION_KEY_KMS_KEY_ID` (a KMS-resident signing key): the key
+is KMS-*wrapped* instead. signPlcOperation refuses a requested field of the
+wrong shape instead of signing it (the reference casts it unchecked). The
+mock directory has no rate limits or export.
+
+Metrics `vlpds_plc_requests_total{op,result}` (op: create, update_handle,
+update_signing_key, submit, tombstone, rotate_key, get_last_op, get_data; result: ok,
+rejected, unavailable, not_found) and `vlpds_plc_request_seconds{op}`; alert
+`VlpdsPlcDirectoryUnavailable` and `VlpdsPlcOpsRejected` (RUNBOOK).
+Tests: `plc::tests` (vectors, op construction, log rules, config),
+`plc::mock::tests`, `tests/all/plc.rs` (genesis, failures, handle and key
+updates, sign/submit, migration out, unregistered mode, bulkCreate, key
+rotation), `tests/all/secrets_at_rest.rs`
+(`plc_rotation_key_never_reaches_the_bucket`).

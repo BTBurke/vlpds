@@ -84,8 +84,13 @@ pub struct Config {
     pub max_blob_size: u64,
     /// Unreferenced blobs older than this are deleted by the blob GC.
     pub blob_gc_grace: Duration,
-    /// PLC directory used to resolve did:plc documents.
+    /// PLC directory: resolves did:plc documents and, with PLC registration
+    /// on (`plc`), receives new accounts' genesis ops and their updates.
     pub plc_url: String,
+    /// PLC registration: mode and the server rotation key (src/plc;
+    /// DESIGN.md "PLC identity"). Default: registration off (no rotation
+    /// key), which only dev mode accepts (`check_secrets`).
+    pub plc: crate::plc::PlcConfig,
     /// createAccount requires an invite code (describeServer inviteCodeRequired).
     pub invite_required: bool,
     /// Membership settings (node id, advertised URL, lease timing). None =
@@ -171,6 +176,7 @@ impl Config {
             anyhow::ensure!(v.len() >= MIN_SECRET_LEN, "{name} must be at least {MIN_SECRET_LEN} bytes");
         }
         self.kek.check(self.dev_mode)?;
+        self.plc.check(self.dev_mode, &self.plc_url)?;
         if !self.dev_mode {
             for (i, (a, va, _)) in secrets.iter().enumerate() {
                 for (b, vb, _) in &secrets[i + 1..] {
@@ -222,7 +228,8 @@ impl Default for Config {
             cluster: None,
             max_blob_size: 100 << 20,
             blob_gc_grace: Duration::from_secs(6 * 3600),
-            plc_url: "https://plc.directory".into(),
+            plc_url: crate::plc::DEFAULT_PLC_URL.into(),
+            plc: Default::default(),
             invite_required: false,
             rate_limits_enabled: true,
             trusted_proxies: Vec::new(),
@@ -288,6 +295,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let secrets = Arc::new(crate::secrets::Secrets::from_config(&cfg.kek, cfg.dev_mode)?);
     tracing::info!(kek = secrets.current_kid(), unwrap_keks = ?secrets.kids(), dev = secrets.is_dev(), "secrets at rest");
     let workers = worker::spawn_with_secrets(cfg.workers, limits, lookup, tokio::runtime::Handle::current(), secrets.clone());
+    let plc = crate::plc::Plc::from_config(&cfg.plc, &cfg.plc_url, cfg.dev_mode, &secrets).await?;
 
     let mut cc = cfg.cluster.clone().unwrap_or_else(|| ClusterConfig { node_id: "single".into(), addr: cfg.public_url.clone(), ..Default::default() });
     cc.shards = n;
@@ -379,6 +387,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         http,
         ratelimit: Arc::new(crate::ratelimit::Limiter::new(&cfg)),
         secrets,
+        plc,
         config: Arc::new(cfg),
         cluster: Some(cluster),
         log,
@@ -636,10 +645,20 @@ mod tests {
             admin_token: admin.into(),
             internal_token: internal.into(),
             kek: crate::secrets::KekConfig { local: Some(crate::secrets::KekBytes::random()), ..Default::default() },
+            plc: crate::plc::PlcConfig {
+                rotation_key: Some(crate::plc::RotationKey::Key(Arc::new(crate::crypto::Keypair::generate()))),
+                ..Default::default()
+            },
             ..Config::default()
         };
         let (a, b, c) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
         prod(&a, &b, &c).check_secrets().expect("strong distinct secrets");
+        // a PLC rotation key is required (DIDs are registered), and the
+        // unregistered dev mode is refused
+        let e = Config { plc: Default::default(), ..prod(&a, &b, &c) }.check_secrets().unwrap_err();
+        assert!(e.to_string().contains("PLC rotation key"), "{e}");
+        let unreg = crate::plc::PlcConfig { mode: crate::plc::PlcMode::Unregistered, ..prod(&a, &b, &c).plc };
+        assert!(Config { plc: unreg, ..prod(&a, &b, &c) }.check_secrets().is_err());
         // a KEK is required, and not the dev one
         let e = Config { kek: Default::default(), ..prod(&a, &b, &c) }.check_secrets().unwrap_err();
         assert!(e.to_string().contains("key-encryption key"), "{e}");

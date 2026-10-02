@@ -2,7 +2,8 @@
 //! keys, reserved keys and TOTP secrets reach the bucket only wrapped under
 //! the KEK, email tokens only as keyed digests; KEK rotation rewraps them;
 //! with the key service (Cloud KMS, mocked here) down, cold writes fail with
-//! a retryable 503 while reads work; unwrapped keys are cached.
+//! a retryable 503 while reads work; unwrapped keys are cached; the PLC
+//! rotation key never reaches the bucket.
 
 use crate::common::*;
 use object_store::ObjectStoreExt;
@@ -416,5 +417,55 @@ async fn kms_unwraps_are_cached_and_outages_are_retryable() {
 async fn a_few_writes(s: &TestServer, t: &TestAccount) {
     for i in 0..3 {
         s.post(t, &format!("warm {i}")).await;
+    }
+}
+
+/// The PLC rotation key (src/plc) is held only by the node: provisioned as
+/// a KMS-wrapped file and unwrapped at startup (one KMS decrypt), it signs
+/// genesis and update ops, and appears nowhere in the bucket or state in
+/// any common encoding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plc_rotation_key_never_reaches_the_bucket() {
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let kms = mock_kms().await;
+    let plc = vlpds::plc::mock::MockPlc::start().await;
+    let rot = vlpds::crypto::Keypair::generate();
+    let raw = rot.to_bytes().to_vec();
+    // `vlpds --wrap-plc-rotation-key` with the node's KEK, into a file
+    let ring = vlpds::secrets::Secrets::from_config(&gcp(&kms), false).unwrap();
+    let wrapped = vlpds::plc::wrap_rotation_key(&ring, &rot).await.unwrap();
+    let path = std::env::temp_dir().join(format!("{}.plc-key", unique_name("rk")));
+    std::fs::write(&path, format!("{wrapped}\n")).unwrap();
+    let src = vlpds::plc::RotationKey::from_file(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(matches!(src, vlpds::plc::RotationKey::Wrapped(_)));
+    let decrypts = kms.decrypts.load(Ordering::SeqCst);
+    let (st, kek, url) = (store.clone(), gcp(&kms), plc.url.clone());
+    let s = TestServer::spawn_with(move |c| {
+        c.memory_store = Some(st);
+        c.kek = kek;
+        c.plc_url = url;
+        c.plc = vlpds::plc::PlcConfig { rotation_key: Some(src), ..Default::default() };
+    })
+    .await;
+    assert_eq!(kms.decrypts.load(Ordering::SeqCst), decrypts + 1, "unwrapped once at startup");
+    assert_eq!(s.app.plc.as_ref().unwrap().rotation_did_key(), rot.did_key());
+    let a = s.create_account("plcsec").await;
+    s.post(&a, "hello").await;
+    let h2 = format!("{}.{HANDLE_DOMAIN}", unique_name("plcsec"));
+    s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": h2}), &a.auth()).await.ok();
+    s.xrpc.post_empty("com.atproto.identity.requestPlcOperationSignature", &a.auth()).await.ok();
+    let tok = s.mail_token(&a.email).await.unwrap();
+    s.xrpc.post("com.atproto.identity.signPlcOperation", &json!({"token": tok}), &a.auth()).await.ok();
+    assert_eq!(plc.ops(&a.did).len(), 2);
+    vlpds::plc::verify_sig(&[rot.did_key()], &plc.last_op(&a.did).unwrap()).unwrap();
+
+    s.app.log.checkpoint_all().await;
+    let all = everything(&s).await;
+    assert!(all.iter().any(|(p, b)| p.contains("/log/") && has(b, h2.as_bytes())), "the scan sees account data");
+    for f in forms(&raw) {
+        for (path, b) in &all {
+            assert!(!has(b, &f), "PLC rotation key found in {path}");
+        }
     }
 }

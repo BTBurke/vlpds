@@ -84,6 +84,9 @@ pub struct App {
     pub ratelimit: Arc<crate::ratelimit::Limiter>,
     /// Key-encryption keys and the unwrapped signing-key cache (src/secrets.rs).
     pub secrets: Arc<crate::secrets::Secrets>,
+    /// PLC registration (src/plc): the server rotation key and the
+    /// directory. None = DIDs minted locally and never registered (dev only).
+    pub plc: Option<Arc<crate::plc::Plc>>,
 }
 
 type AppState = State<Arc<App>>;
@@ -455,6 +458,30 @@ impl App {
             let did = crypto::random_plc_did();
             if self.partitions.for_key(&did).is_some() {
                 return Ok(did);
+            }
+        }
+        Err(XrpcError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error: "PartitionUnavailable".into(),
+            message: "this node owns no partitions yet".into(),
+        })
+    }
+
+    /// A new account's DID with PLC registration on: the genesis op (signed
+    /// with the server rotation key; its hedged signature makes every
+    /// attempt a new DID) re-signed until its DID lands in a partition this
+    /// node owns, as [`mint_local_did`](Self::mint_local_did). (did, op).
+    pub fn mint_plc_did(
+        &self,
+        plc: &crate::plc::Plc,
+        signing_did_key: &str,
+        handle: &str,
+        recovery_key: Option<&str>,
+    ) -> Result<(String, serde_json::Value), XrpcError> {
+        for _ in 0..10_000 {
+            let (did, op) = plc.genesis(signing_did_key, handle, &self.public_url, recovery_key)?;
+            if self.cluster.is_none() || self.partitions.for_key(&did).is_some() {
+                return Ok((did, op));
             }
         }
         Err(XrpcError {

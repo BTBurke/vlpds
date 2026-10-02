@@ -64,6 +64,7 @@ mod mst_lazy;
 mod oauth;
 mod ops_metrics;
 mod oauth_replay_durable;
+mod plc;
 mod preferences;
 mod proxy;
 mod push;

@@ -360,10 +360,12 @@ pub enum Purpose {
     OAuthToken,
     /// A loaded signing key whose scalar no longer derives its public key.
     KeyLoad,
+    /// A PLC operation signed with the server's rotation key.
+    PlcOperation,
 }
 
 impl Purpose {
-    pub const ALL: [Purpose; 4] = [Purpose::Commit, Purpose::ServiceAuth, Purpose::OAuthToken, Purpose::KeyLoad];
+    pub const ALL: [Purpose; 5] = [Purpose::Commit, Purpose::ServiceAuth, Purpose::OAuthToken, Purpose::KeyLoad, Purpose::PlcOperation];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -371,6 +373,7 @@ impl Purpose {
             Purpose::ServiceAuth => "service_auth",
             Purpose::OAuthToken => "oauth_token",
             Purpose::KeyLoad => "key_load",
+            Purpose::PlcOperation => "plc_operation",
         }
     }
 }

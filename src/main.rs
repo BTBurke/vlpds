@@ -292,9 +292,47 @@ struct Args {
     /// Delete unreferenced blobs uploaded more than this many seconds ago.
     #[arg(long, env = "VLPDS_BLOB_GC_GRACE_SECS", default_value_t = 6 * 3600)]
     blob_gc_grace_secs: u64,
-    /// PLC directory for did:plc resolution.
-    #[arg(long, env = "VLPDS_PLC_URL", default_value = "https://plc.directory")]
+    /// PLC directory: did:plc resolution and, with PLC registration on,
+    /// where new accounts' genesis ops and their updates are submitted (a
+    /// local did-method-plc server works for e2e runs).
+    #[arg(long, env = "VLPDS_PLC_URL", default_value = vlpds::plc::DEFAULT_PLC_URL)]
     plc_url: String,
+    /// PLC registration of new accounts' DIDs (DESIGN.md "PLC identity"):
+    /// `auto` = `directory` when a rotation key is set, else `unregistered`
+    /// (dev mode only); `directory`; `unregistered` (dev/test/bench only:
+    /// DIDs minted locally, never registered, resolvable only here).
+    #[arg(long, env = "VLPDS_PLC_MODE", default_value = "auto")]
+    plc_mode: String,
+    /// The server's PLC rotation key: a secp256k1 private key as 64 hex
+    /// chars (falls back to the reference's
+    /// PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX). Prefer the env var or
+    /// --plc-rotation-key-file over the flag (argv is visible).
+    #[arg(long, env = "VLPDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX", hide_env_values = true)]
+    plc_rotation_key: Option<String>,
+    /// A file holding the PLC rotation key wrapped under the KEK (`vw1.`,
+    /// from --wrap-plc-rotation-key; unwrapped at startup, via Cloud KMS
+    /// with --gcp-kms-key) or as 64 hex chars (a mounted secret).
+    #[arg(long, env = "VLPDS_PLC_ROTATION_KEY_FILE", conflicts_with = "plc_rotation_key")]
+    plc_rotation_key_file: Option<std::path::PathBuf>,
+    /// Retired PLC rotation keys (files as --plc-rotation-key-file): they
+    /// sign updates of DIDs that still list them, replacing them with the
+    /// current key (`vlpds.admin.rotatePlcKeys`; RUNBOOK "PLC rotation key
+    /// rotation").
+    #[arg(long, env = "VLPDS_PLC_ROTATION_KEY_OLD_FILE", value_delimiter = ',')]
+    plc_rotation_key_old_file: Vec<std::path::PathBuf>,
+    /// Retired PLC rotation keys as hex (comma-separated).
+    #[arg(long, env = "VLPDS_PLC_ROTATION_KEY_OLD", value_delimiter = ',', hide_env_values = true)]
+    plc_rotation_key_old: Vec<String>,
+    /// A did:key put ahead of the server rotation key in new accounts'
+    /// rotation keys and in getRecommendedDidCredentials (falls back to the
+    /// reference's PDS_RECOVERY_DID_KEY).
+    #[arg(long, env = "VLPDS_PLC_RECOVERY_DID_KEY")]
+    plc_recovery_did_key: Option<String>,
+    /// Print the PLC rotation key read from stdin (64 hex chars; empty
+    /// stdin = a new random key) wrapped under the configured KEK, in the
+    /// --plc-rotation-key-file form, and exit. Its did:key goes to stderr.
+    #[arg(long)]
+    wrap_plc_rotation_key: bool,
     /// Require an invite code for createAccount.
     #[arg(long, env = "VLPDS_INVITE_REQUIRED")]
     invite_required: bool,
@@ -545,6 +583,45 @@ fn secret(v: &Option<String>, dev_mode: bool, dev_default: &str) -> String {
     }
 }
 
+/// The PLC flags as a [`vlpds::plc::PlcConfig`].
+fn plc_config(args: &Args) -> anyhow::Result<vlpds::plc::PlcConfig> {
+    use vlpds::plc::RotationKey;
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let hex = |h: &str| RotationKey::Hex(zeroize::Zeroizing::new(h.trim().to_string()));
+    let rotation_key = match (args.plc_rotation_key.as_deref().filter(|h| !h.trim().is_empty()), &args.plc_rotation_key_file) {
+        (Some(h), _) => Some(hex(h)),
+        (None, Some(p)) => Some(RotationKey::from_file(p)?),
+        (None, None) => env("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX").map(|h| hex(&zeroize::Zeroizing::new(h))),
+    };
+    let mut old_rotation_keys = args.plc_rotation_key_old_file.iter().map(|p| RotationKey::from_file(p)).collect::<anyhow::Result<Vec<_>>>()?;
+    old_rotation_keys.extend(args.plc_rotation_key_old.iter().filter(|h| !h.trim().is_empty()).map(|h| hex(h)));
+    Ok(vlpds::plc::PlcConfig {
+        mode: args.plc_mode.parse()?,
+        rotation_key,
+        old_rotation_keys,
+        recovery_did_key: args.plc_recovery_did_key.clone().filter(|k| !k.is_empty()).or_else(|| env("PDS_RECOVERY_DID_KEY")),
+    })
+}
+
+/// `--wrap-plc-rotation-key`: stdin (hex, or empty for a new key) -> the
+/// key wrapped under the configured KEK on stdout.
+async fn wrap_plc_rotation_key(args: &Args) -> anyhow::Result<()> {
+    let kek = kek_config(args)?;
+    kek.check(args.dev_mode)?;
+    let secrets = vlpds::secrets::Secrets::from_config(&kek, args.dev_mode)?;
+    let mut input = zeroize::Zeroizing::new(String::new());
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let key = if input.trim().is_empty() {
+        std::sync::Arc::new(vlpds::crypto::Keypair::generate())
+    } else {
+        vlpds::plc::RotationKey::Hex(zeroize::Zeroizing::new(input.trim().to_string())).load(&secrets).await?
+    };
+    let wrapped = vlpds::plc::wrap_rotation_key(&secrets, &key).await?;
+    println!("{wrapped}");
+    eprintln!("PLC rotation key {} wrapped under KEK {}", key.did_key(), secrets.current_kid());
+    Ok(())
+}
+
 /// The KEK flags as a [`vlpds::secrets::KekConfig`].
 fn kek_config(args: &Args) -> anyhow::Result<vlpds::secrets::KekConfig> {
     use vlpds::secrets::KekBytes;
@@ -569,6 +646,9 @@ fn kek_config(args: &Args) -> anyhow::Result<vlpds::secrets::KekConfig> {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
+    if args.wrap_plc_rotation_key {
+        return wrap_plc_rotation_key(&args).await;
+    }
     vlpds::partition::set_block_cache_bytes(args.block_cache_mb << 20);
     vlpds::partition::set_sst_compression(args.sst_compression.parse()?);
     vlpds::partition::set_compaction_polling(args.compaction_polling.parse()?);
@@ -626,6 +706,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         max_blob_size: args.max_blob_mb << 20,
         blob_gc_grace: Duration::from_secs(args.blob_gc_grace_secs),
         plc_url: args.plc_url.clone(),
+        plc: plc_config(&args)?,
         invite_required: args.invite_required,
         rate_limits_enabled: !args.no_rate_limits,
         resolve_lexicons: args

@@ -109,6 +109,9 @@ pub enum Purpose {
     ReservedKey,
     /// A TOTP shared secret (subject: the account DID).
     Totp,
+    /// The server's PLC rotation key (subject: `plc::ROTATION_KEY_SUBJECT`;
+    /// in `--plc-rotation-key-file`, never in the bucket).
+    PlcRotationKey,
 }
 
 impl Purpose {
@@ -117,6 +120,7 @@ impl Purpose {
             Purpose::SigningKey => "repo-signing-key",
             Purpose::ReservedKey => "reserved-signing-key",
             Purpose::Totp => "totp-secret",
+            Purpose::PlcRotationKey => "plc-rotation-key",
         }
     }
 }

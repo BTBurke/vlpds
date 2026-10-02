@@ -717,6 +717,32 @@ groups:
           summary: "{{ $labels.instance }}: wrapped secrets rejected by the KEK"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssecretunwraprejected"
 
+      # PLC directory writes (genesis ops at createAccount, handle and
+      # signing-key updates, submitPlcOperation, key rotation) failing as
+      # unavailable (5xx, 429, timeouts, connection errors): account
+      # creation and handle changes fail with 500 and change nothing.
+      # Existing accounts keep working. (guess)
+      - alert: VlpdsPlcDirectoryUnavailable
+        expr: sum by (instance) (rate(vlpds_plc_requests_total{job="vlpds",op=~"create|update_handle|update_signing_key|submit|tombstone|rotate_key",result="unavailable"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}: PLC directory writes failing ({{ $value | humanize }}/s); createAccount and handle changes return 500"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsplcdirectoryunavailable"
+
+      # The directory refused an op this server built and signed (genesis,
+      # handle/key update, tombstone, key rotation): a bug, a rotation key
+      # the DID doesn't list, or a directory rule change. Client-built ops
+      # (submitPlcOperation) are excluded.
+      - alert: VlpdsPlcOpsRejected
+        expr: sum by (instance, op) (increase(vlpds_plc_requests_total{job="vlpds",op=~"create|update_handle|update_signing_key|tombstone|rotate_key",result="rejected"}[1h])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: PLC directory rejected {{ $value | humanize }} {{ $labels.op }} ops in the last hour"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsplcopsrejected"
+
       # A signature failed verification right after signing (crypto.rs):
       # it was not emitted, but this host is flipping bits (memory/CPU).
       # Three within a minute fail-stop the node (next alert).

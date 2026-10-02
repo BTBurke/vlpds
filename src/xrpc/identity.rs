@@ -25,15 +25,15 @@ pub fn routes() -> Router<Arc<App>> {
         )
         .route(
             "/xrpc/com.atproto.identity.requestPlcOperationSignature",
-            post(plc_unsupported),
+            post(request_plc_operation_signature),
         )
         .route(
             "/xrpc/com.atproto.identity.signPlcOperation",
-            post(plc_unsupported),
+            post(sign_plc_operation),
         )
         .route(
             "/xrpc/com.atproto.identity.submitPlcOperation",
-            post(plc_unsupported),
+            post(submit_plc_operation),
         )
         .route("/.well-known/atproto-did", get(well_known_atproto_did))
 }
@@ -113,9 +113,9 @@ async fn resolve_handle(State(app): AppState, Query(q): Query<HandleQ>) -> XResu
     }
 }
 
-/// Local accounts only: these DIDs are minted here and not registered with
-/// PLC, so this server is the only place they resolve. Anything else is
-/// DidNotFound.
+/// Local accounts only (their documents are generated here; with PLC
+/// registration on, the same document the directory serves for an account
+/// hosted here). Anything else is DidNotFound.
 async fn local_account(app: &App, did: &str) -> XResult<Account> {
     match app.account(did).await {
         Ok(a) => Ok(a),
@@ -315,6 +315,17 @@ pub(super) async fn set_handle(app: &App, did: &str, handle: &str, user: bool) -
     if claimed && !super::server::claim_handle(app, handle, did).await? {
         return Err(XrpcError::bad("HandleNotAvailable", format!("Handle already taken: {handle}")));
     }
+    // The DID document first (reference AccountManager.updateHandle): a PLC
+    // update op, acknowledged by the directory, before the local change; a
+    // failure changes nothing here. (The reverse failure, PLC updated and
+    // the local swap failing, is fixed by retrying: the PLC step is then a
+    // no-op.)
+    if let Err(e) = update_did_doc_handle(app, did, handle).await {
+        if claimed {
+            super::server::release_handle(app, handle, did).await;
+        }
+        return Err(e);
+    }
     let h = handle.to_string();
     let res = app
         .mutate_account(did, true, false, false, move |a| {
@@ -346,6 +357,25 @@ pub(super) async fn set_handle(app: &App, did: &str, handle: &str, user: bool) -
     }
 }
 
+/// With PLC registration on: a did:plc gets a PLC update op for `handle`
+/// (signed with the server rotation key); a did:web must already name the
+/// handle in its document. Off: nothing (the document is generated here).
+async fn update_did_doc_handle(app: &App, did: &str, handle: &str) -> XResult<()> {
+    let Some(plc) = &app.plc else { return Ok(()) };
+    if did.starts_with("did:plc:") {
+        plc.update_handle(did, handle).await?;
+    } else {
+        app.did_resolver.invalidate(did);
+        let doc = app.did_resolver.resolve(did).await.map_err(|e| XrpcError::bad("InvalidRequest", e.to_string()))?;
+        let at = doc["alsoKnownAs"].as_array().and_then(|a| a.iter().filter_map(J::as_str).find(|h| h.starts_with("at://")));
+        if at != Some(format!("at://{handle}").as_str()) {
+            return Err(XrpcError::bad("InvalidRequest", "DID is not properly configured for handle"));
+        }
+    }
+    app.did_resolver.invalidate(did);
+    Ok(())
+}
+
 async fn get_recommended_did_credentials(
     State(app): AppState,
     Auth(creds): Auth,
@@ -358,23 +388,158 @@ async fn get_recommended_did_credentials(
     Ok(Json(json!({
         "alsoKnownAs": [format!("at://{}", acct.handle)],
         "verificationMethods": {"atproto": format!("did:key:{}", acct.signing_pubkey)},
-        // This PDS holds no PLC rotation key (DIDs are minted locally and
-        // never registered), so it recommends none.
-        "rotationKeys": [],
+        // [server recovery key?, server rotation key]; none when PLC
+        // registration is off (no rotation key here)
+        "rotationKeys": app.plc.as_ref().map(|p| p.recommended_rotation_keys()).unwrap_or_default(),
         "services": {"atproto_pds": {"type": "AtprotoPersonalDataServer", "endpoint": app.public_url}},
     })))
 }
 
-/// requestPlcOperationSignature / signPlcOperation / submitPlcOperation.
-/// Accounts here use locally minted did:plc identifiers that were never
-/// registered with a PLC directory and this server has no rotation key, so
-/// there is no PLC log to extend.
-async fn plc_unsupported() -> XrpcError {
+/// The PLC operation endpoints when PLC registration is off
+/// (`--plc-mode unregistered`, dev only): there is no rotation key and no
+/// PLC log to extend.
+fn plc_unsupported() -> XrpcError {
     XrpcError {
         status: StatusCode::NOT_IMPLEMENTED,
         error: "MethodNotImplemented".into(),
-        message: "PLC operations are not supported: this PDS mints did:plc identifiers locally without registering them with a PLC directory".into(),
+        message: "PLC operations are not supported: PLC registration is off on this PDS (--plc-mode unregistered, dev only)".into(),
     }
+}
+
+fn plc_service(app: &App) -> XResult<&Arc<crate::plc::Plc>> {
+    app.plc.as_ref().ok_or_else(plc_unsupported)
+}
+
+/// requestPlcOperationSignature / signPlcOperation auth (reference
+/// ACCESS_FULL plus taken-down sessions, `identity:*`): a full session, a
+/// taken-down account's restricted session, or OAuth with `identity:*`; no
+/// app passwords.
+fn plc_signer(creds: &Credentials) -> XResult<String> {
+    match creds {
+        Credentials::Session { did } | Credentials::Takendown { did } => Ok(did.clone()),
+        Credentials::OAuth { did, .. } => {
+            creds.require(creds.allows_identity("*"))?;
+            Ok(did.clone())
+        }
+        Credentials::AppPassword { .. } => Err(XrpcError {
+            status: StatusCode::BAD_REQUEST,
+            error: "InvalidToken".into(),
+            message: "Bad token scope".into(),
+        }),
+        Credentials::Admin => Err(XrpcError::auth("user credentials required")),
+    }
+}
+
+/// Mails a `plc_operation` token (reference requestPlcOperationSignature):
+/// deactivated and taken-down accounts too.
+async fn request_plc_operation_signature(State(app): AppState, Auth(creds): Auth) -> XResult<StatusCode> {
+    plc_service(&app)?;
+    let did = plc_signer(&creds)?;
+    let acct = app.account(&did).await.map_err(|_| XrpcError::bad("InvalidRequest", "account not found"))?;
+    let email = acct.email.clone().ok_or_else(|| XrpcError::bad("InvalidRequest", "account does not have an email address"))?;
+    let token = super::server::create_email_token(&app, &did, "plc_operation").await?;
+    super::server::deliver(
+        &app,
+        &email,
+        "PLC Update Operation Requested",
+        &format!("We received a request to update your PLC. Your confirmation code is {token}"),
+        "plc_operation",
+        Some(&token),
+    );
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SignPlcIn {
+    token: Option<String>,
+    rotation_keys: Option<J>,
+    also_known_as: Option<J>,
+    verification_methods: Option<J>,
+    services: Option<J>,
+}
+
+/// Signs an update of the account's DID with the server rotation key
+/// (reference signPlcOperation): the emailed token, then the DID's last op
+/// with the requested fields replaced (`createUpdateOp`). Not submitted:
+/// the client sends it to the PDS that will host the account (migration
+/// out) or to submitPlcOperation here.
+async fn sign_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp): Json<SignPlcIn>) -> XResult<Json<J>> {
+    let plc = plc_service(&app)?.clone();
+    let did = plc_signer(&creds)?;
+    let token = inp
+        .token
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| XrpcError::bad("InvalidRequest", "email confirmation token required to sign PLC operations"))?;
+    super::server::assert_email_token(&app, &did, "plc_operation", token).await?;
+    super::server::delete_email_tokens(&app, &did, &["plc_operation"]).await?;
+    if !did.starts_with("did:plc:") {
+        return Err(XrpcError::bad("InvalidRequest", format!("not a did:plc: {did}")));
+    }
+    let last = plc.last_op(&did).await?;
+    // (the reference casts the requested fields without checking them; an
+    // op of the wrong shape is refused here rather than signed)
+    let operation = plc.update_op(&last, |m| {
+        for (k, v) in [
+            ("rotationKeys", inp.rotation_keys),
+            ("alsoKnownAs", inp.also_known_as),
+            ("verificationMethods", inp.verification_methods),
+            ("services", inp.services),
+        ] {
+            if let Some(v) = v {
+                m.insert(k.into(), v);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(Json(json!({"operation": operation})))
+}
+
+#[derive(Deserialize)]
+struct SubmitPlcIn {
+    operation: J,
+}
+
+/// Forwards a signed operation for the caller's DID to the PLC directory
+/// after the reference's checks (submitPlcOperation): the server's rotation
+/// key stays a rotation key, the atproto_pds service is this PDS, the
+/// atproto key is the account's signing key, and the first alias is the
+/// account's handle. Then #identity.
+async fn submit_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp): Json<SubmitPlcIn>) -> XResult<StatusCode> {
+    creds.require(creds.allows_identity("*"))?;
+    let did = creds.did().ok_or_else(|| XrpcError::auth("user credentials required"))?.to_string();
+    let plc = plc_service(&app)?.clone();
+    let op = inp.operation;
+    let bad = |m: &str| XrpcError::bad("InvalidRequest", m);
+    if crate::plc::op_type(&op, true).ok() != Some(crate::plc::OpType::Operation) {
+        return Err(bad("Invalid operation"));
+    }
+    if !op["rotationKeys"].as_array().is_some_and(|a| a.iter().any(|k| k == plc.rotation_did_key())) {
+        return Err(bad("Rotation keys do not include server's rotation key"));
+    }
+    let pds = &op["services"]["atproto_pds"];
+    if pds["type"] != "AtprotoPersonalDataServer" {
+        return Err(bad("Incorrect type on atproto_pds service"));
+    }
+    if pds["endpoint"] != app.public_url.as_str() {
+        return Err(bad("Incorrect endpoint on atproto_pds service"));
+    }
+    let acct = app.account(&did).await?;
+    if op["verificationMethods"]["atproto"] != format!("did:key:{}", acct.signing_pubkey).as_str() {
+        return Err(bad("Incorrect signing key"));
+    }
+    if !acct.handle.is_empty() && op["alsoKnownAs"].get(0) != Some(&J::String(format!("at://{}", acct.handle))) {
+        return Err(bad("Incorrect handle in alsoKnownAs"));
+    }
+    if !did.starts_with("did:plc:") {
+        return Err(bad(&format!("not a did:plc: {did}")));
+    }
+    plc.client.send(&did, &op, "submit").await?;
+    app.did_resolver.invalidate(&did);
+    // #identity (writes nothing; not for a taken-down account, as refreshIdentity)
+    app.mutate_account(&did, true, false, false, |a| Ok(a.status.as_deref() != Some("takendown"))).await?;
+    Ok(StatusCode::OK)
 }
 
 #[cfg(test)]

@@ -1248,6 +1248,9 @@ pub(super) struct CreateAccountIn {
     pub invite_code: Option<String>,
     pub did: Option<String>,
     pub plc_op: Option<J>,
+    /// A did:key put first in the new DID's rotation keys (PLC
+    /// registration on; reference `recoveryKey`).
+    pub recovery_key: Option<String>,
 }
 
 /// Account extension flag: the DID was brought from elsewhere (migration
@@ -1297,8 +1300,13 @@ async fn account_did_doc(app: &App, a: &Account) -> Option<J> {
 /// Account creation (createAccount, which then starts a session, and the
 /// OAuth sign-up page), as the reference's local-PDS path
 /// (validateInputsForLocalPds + createAccount):
-/// - `plcOp` is refused; there is no PLC registration here.
+/// - `plcOp` is refused (no entryway mode).
 /// - Without `did`, a DID is minted and the handle must be under our domain.
+///   With PLC registration on (src/plc), the DID is the hash of a genesis op
+///   signed with the server rotation key, and the account is created only
+///   after the PLC directory accepted that op (its failure leaves nothing
+///   behind here; a local failure after it tombstones the DID, as the
+///   reference does). Off (dev only), the DID is random and unregistered.
 /// - With `did` (migration in), `requester` (the verified service-auth
 ///   issuer) must be that DID. The account starts deactivated with an empty
 ///   repo, a fresh signing key and no firehose events; the user then imports
@@ -1355,6 +1363,16 @@ pub(super) async fn create_account_inner(
     };
     let handle = normalize_handle(&inp.handle)?;
     ensure_no_slur(&handle)?;
+
+    let recovery_key = inp.recovery_key.as_deref().filter(|k| !k.is_empty());
+    if let (Some(k), Some(_)) = (recovery_key, &app.plc) {
+        if !crate::plc::valid_did_key(k) {
+            return Err(invalid_request("recoveryKey must be a secp256k1 or P-256 did:key"));
+        }
+    }
+    let key = Arc::new(Keypair::generate());
+    // the genesis op this request registers (PLC registration on, new DID)
+    let mut genesis: Option<(Arc<crate::plc::Plc>, J)> = None;
     let (did, external) = match inp.did.as_deref() {
         Some(d) => {
             // (checked before the handle, whose proof may be fetched)
@@ -1375,7 +1393,14 @@ pub(super) async fn create_account_inner(
         }
         None => {
             ensure_service_handle(app, &handle, false)?;
-            (app.mint_local_did()?, false)
+            match &app.plc {
+                Some(plc) => {
+                    let (did, op) = app.mint_plc_did(plc, &key.did_key(), &handle, recovery_key)?;
+                    genesis = Some((plc.clone(), op));
+                    (did, false)
+                }
+                None => (app.mint_local_did()?, false),
+            }
         }
     };
     // Atomic use of the invite code (a conditional-create claim per use).
@@ -1394,7 +1419,6 @@ pub(super) async fn create_account_inner(
     // one after the other they were most of createAccount's latency, and at
     // a fixed concurrency its rate.
     // The signing key is wrapped (a KMS call in production) alongside.
-    let key = Arc::new(Keypair::generate());
     let (h, e, password_hash, wrapped) = tokio::join!(
         claim_handle(app, &handle, &did),
         claim_email(app, &email, &did),
@@ -1428,6 +1452,16 @@ pub(super) async fn create_account_inner(
         }
         e?;
         return Err(invalid_request(format!("Email already taken: {email}")));
+    }
+    // Register the DID before anything about the account is written (the
+    // reference sends the genesis op before creating the account row).
+    if let Some((plc, op)) = &genesis {
+        if let Err(err) = plc.create(&did, op).await {
+            release_handle(app, &handle, &did).await;
+            release_email(app, &email, &did).await;
+            release(claim).await;
+            return Err(err.into());
+        }
     }
     let mut acct = Account {
         did: did.clone(),
@@ -1474,6 +1508,12 @@ pub(super) async fn create_account_inner(
         release_handle(app, &handle, &did).await;
         release_email(app, &email, &did).await;
         release(claim).await;
+        if let Some((plc, _)) = &genesis {
+            // the DID was registered for an account that doesn't exist
+            if let Err(t) = plc.tombstone(&did).await {
+                tracing::error!(%did, "tombstoning the DID of a failed account creation: {t}");
+            }
+        }
         return Err(e);
     }
     if let Some(c) = &claim {
@@ -1885,11 +1925,32 @@ async fn activate_account(State(app): AppState, Auth(creds): Auth) -> XResult<St
 }
 
 /// Reference assertValidDidDocumentForService: the account's DID document
-/// names this PDS and the account's signing key. A DID minted here is
-/// documented by this server (it is never registered elsewhere), so only a
-/// DID brought here (migration in) is resolved and checked. There is no
-/// rotation-key check: this PDS holds no PLC rotation key.
+/// names this PDS and the account's signing key. With PLC registration on,
+/// a did:plc (minted here or brought here) is checked against the
+/// directory's data, which must also keep the server rotation key; a DID
+/// minted here without registration is documented by this server only, so
+/// then only a DID brought here (migration in) is resolved and checked.
 async fn assert_valid_did_doc(app: &App, a: &Account) -> XResult<()> {
+    if let (Some(plc), true) = (&app.plc, a.did.starts_with("did:plc:")) {
+        let data = plc.client.document_data(&a.did).await?;
+        // (a retired server key counts: `vlpds.admin.rotatePlcKeys` moves it)
+        let has_key = data["rotationKeys"].as_array().is_some_and(|k| k.iter().any(|k| k.as_str().is_some_and(|k| plc.is_server_key(k))));
+        if !has_key {
+            return Err(invalid_request("Server rotation key not included in PLC DID data"));
+        }
+        let pds = data["services"]["atproto_pds"]["endpoint"].as_str();
+        if pds != Some(app.public_url.as_str()) {
+            return Err(invalid_request(
+                "DID document atproto_pds service endpoint does not match PDS public url",
+            ));
+        }
+        if data["verificationMethods"]["atproto"] != format!("did:key:{}", a.signing_pubkey).as_str() {
+            return Err(invalid_request(
+                "DID document verification method does not match expected signing key",
+            ));
+        }
+        return Ok(());
+    }
     if !has_external_did(a) {
         return Ok(());
     }
