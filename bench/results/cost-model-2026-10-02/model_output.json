@@ -1,0 +1,2703 @@
+{
+ "coef": {
+  "poll_get_per_shard": 3.2614218781800637,
+  "poll_analytic_per_shard": 3.1999999999999997,
+  "gc_ops_per_shard_meas": 0.013329406002196698,
+  "ctl_put_per_node": 0.4998527250823762,
+  "ctl_list_per_node": 1.0163672076674983,
+  "ctl_get_per_shard": 0.020007126001344067,
+  "seg_put_latency_mean_s": 0.033994453592004786,
+  "seg_overhead_s": 0.00280706769399858,
+  "hedge_frac": 0.009461654465577106,
+  "t_flush_s": 0.07228513791559617,
+  "flush_classA": 4.415136614663872,
+  "flush_classA_noingest": 3.0558008761051365,
+  "flush_classB": 9.069555038566412,
+  "load_classB": 1.2815314589544637,
+  "retention_classA_per_node": 0.04978379570051154,
+  "retention_classB_per_node": 0.009047061736684563
+ },
+ "validate": [
+  {
+   "run": "costmodel one/idle",
+   "nodes": 1,
+   "shards": 256,
+   "commits_s": 0.0,
+   "meas_A": 5.024075278994639,
+   "model_A": 4.126003728450386,
+   "meas_B": 840.0869240722806,
+   "model_B": 840.054872132177,
+   "secs": 900
+  },
+  {
+   "run": "costmodel one/avg",
+   "nodes": 1,
+   "shards": 256,
+   "commits_s": 344.9790329800651,
+   "meas_A": 67.18516191566113,
+   "model_A": 71.21027775450337,
+   "meas_B": 974.9488484976985,
+   "model_B": 1010.5715345928786,
+   "secs": 810
+  },
+  {
+   "run": "costmodel one2/idle",
+   "nodes": 1,
+   "shards": 256,
+   "commits_s": 0.0,
+   "meas_A": 30.572028120883896,
+   "model_A": 30.558977603370113,
+   "meas_B": 917.240596743354,
+   "model_B": 918.092926458137,
+   "secs": 301
+  },
+  {
+   "run": "costmodel one2/avg",
+   "nodes": 1,
+   "shards": 256,
+   "commits_s": 343.056565105492,
+   "meas_A": 69.96807135265891,
+   "model_A": 70.19944961734018,
+   "meas_B": 1007.9377532500275,
+   "model_B": 999.4691915781032,
+   "secs": 905
+  },
+  {
+   "run": "costmodel one2/peak",
+   "nodes": 1,
+   "shards": 256,
+   "commits_s": 436.828794415255,
+   "meas_A": 73.28685873925582,
+   "model_A": 70.20015524226646,
+   "meas_B": 1039.1706254738526,
+   "model_B": 1033.797291880414,
+   "secs": 604
+  },
+  {
+   "run": "costmodel one2/burst",
+   "nodes": 1,
+   "shards": 256,
+   "commits_s": 894.4998880464213,
+   "meas_A": 72.90156942647897,
+   "model_A": 70.20356533560549,
+   "meas_B": 1067.0159880793972,
+   "model_B": 1037.517110151207,
+   "secs": 604
+  },
+  {
+   "run": "costmodel one2/avg2",
+   "nodes": 1,
+   "shards": 256,
+   "commits_s": 342.1835041299166,
+   "meas_A": 67.39361970952933,
+   "model_A": 70.1994428603952,
+   "meas_B": 1017.151210918819,
+   "model_B": 1030.796617638922,
+   "secs": 605
+  },
+  {
+   "run": "cost1024 s1024/idle",
+   "nodes": 1,
+   "shards": 1024,
+   "commits_s": 0.0,
+   "meas_A": 2.0929804865911636,
+   "model_A": 11.133979509172969,
+   "meas_B": 3294.8911948735167,
+   "model_B": 3346.5341493265805,
+   "secs": 150
+  },
+  {
+   "run": "cost1024 s1024b/idle",
+   "nodes": 1,
+   "shards": 1024,
+   "commits_s": 0.0,
+   "meas_A": 0.6988804537774822,
+   "model_A": 11.133979509172969,
+   "meas_B": 3274.2782219626297,
+   "model_B": 3346.5341493265805,
+   "secs": 300
+  },
+  {
+   "run": "cost1024 s1024b/avg",
+   "nodes": 1,
+   "shards": 1024,
+   "commits_s": 343.3582832679335,
+   "meas_A": 85.23717137347401,
+   "model_A": 92.37623789854447,
+   "meas_B": 3471.5204512355067,
+   "model_B": 3499.0858785049077,
+   "secs": 904
+  },
+  {
+   "run": "costmodel three/avg",
+   "nodes": 3,
+   "shards": 256,
+   "commits_s": 340.03539855458183,
+   "meas_A": 158.57098992443102,
+   "model_A": 156.12116084905702,
+   "meas_B": 1163.8461138854827,
+   "model_B": 1045.719694477361,
+   "secs": 1218
+  }
+ ],
+ "projections": [
+  {
+   "scenario": "bluesky-today",
+   "nodes": 3,
+   "shards": 256,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     81.95724615651085,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.14935138710153462,
+     0.027141185210053688,
+     0.08195724615651084,
+     81.95724615651085
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     834.9240008140963,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     2.56,
+     0.0,
+     0.8533333333333334,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     69.90671576490116,
+     143.60208109742896,
+     0.0,
+     15.833420767258232
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     44.85360106340623,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.0024884939193725586,
+     0.3185272216796875,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     4.5486597982496235,
+     8.12182425634408,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3703.4679999999994,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 925.8669999999998,
+    "log, 72 h retention (zstd segments)": 233.74656
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 418.46550911747494,
+     "class_b_M": 2713.551702493247,
+     "class_a_$": 2092.3275455873745,
+     "class_b_$": 1085.4206809972989,
+     "storage_$": 111.85087587999999,
+     "total_$": 3289.5991024646733
+    },
+    "gcs": {
+     "class_a_M": 418.46550911747494,
+     "class_b_M": 2713.551702493247,
+     "class_a_$": 2092.3275455873745,
+     "class_b_$": 1085.4206809972989,
+     "storage_$": 90.58109225193373,
+     "total_$": 3268.329318836607
+    },
+    "r2": {
+     "class_a_M": 419.9251362834173,
+     "class_b_M": 2703.551702493247,
+     "class_a_$": 1889.663113275378,
+     "class_b_$": 973.2786128975689,
+     "storage_$": 72.79622339999999,
+     "total_$": 2935.737949572947
+    }
+   }
+  },
+  {
+   "scenario": "bluesky-today",
+   "nodes": 3,
+   "shards": 1024,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     81.95724615651085,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.14935138710153462,
+     0.027141185210053688,
+     0.08195724615651084,
+     81.95724615651085
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     3339.696003256385,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     10.24,
+     0.0,
+     3.4133333333333336,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     130.3912913696359,
+     267.84924156116824,
+     0.0,
+     29.53278748761043
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     44.85360106340623,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.0024884939193725586,
+     0.3185272216796875,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     7.597761421252118,
+     23.487297025376325,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3703.4679999999994,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 925.8669999999998,
+    "log, 72 h retention (zstd segments)": 233.74656
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 605.7432374909783,
+     "class_b_M": 9667.754417391521,
+     "class_a_$": 3028.7161874548915,
+     "class_b_$": 3867.101766956609,
+     "storage_$": 111.85087587999999,
+     "total_$": 7007.668830291501
+    },
+    "gcs": {
+     "class_a_M": 605.7432374909783,
+     "class_b_M": 9667.754417391521,
+     "class_a_$": 3028.7161874548915,
+     "class_b_$": 3867.101766956609,
+     "storage_$": 90.58109225193373,
+     "total_$": 6986.399046663435
+    },
+    "r2": {
+     "class_a_M": 613.9351526569206,
+     "class_b_M": 9657.754417391521,
+     "class_a_$": 2762.708186956143,
+     "class_b_$": 3476.7915902609475,
+     "storage_$": 72.79622339999999,
+     "total_$": 6312.29600061709
+    }
+   }
+  },
+  {
+   "scenario": "bluesky-today",
+   "nodes": 8,
+   "shards": 256,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     192.48652710021665,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.39827036560409235,
+     0.0723764938934765,
+     0.19248652710021666,
+     192.48652710021665
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     834.9240008140963,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     2.56,
+     0.0,
+     0.8533333333333334,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     91.79432737097754,
+     188.56352067435301,
+     0.0,
+     20.790823791522907
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     44.85360106340623,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.0024884939193725586,
+     0.3185272216796875,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     12.129759461998997,
+     33.121824256344084,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3703.4679999999994,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 925.8669999999998,
+    "log, 72 h retention (zstd segments)": 233.74656
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 787.2868361702863,
+     "class_b_M": 2897.6552561074177,
+     "class_a_$": 3936.4341808514314,
+     "class_b_$": 1159.062102442967,
+     "storage_$": 111.85087587999999,
+     "total_$": 5207.347159174398
+    },
+    "gcs": {
+     "class_a_M": 787.2868361702863,
+     "class_b_M": 2897.6552561074177,
+     "class_a_$": 3936.4341808514314,
+     "class_b_$": 1159.062102442967,
+     "storage_$": 90.58109225193373,
+     "total_$": 5186.077375546332
+    },
+    "r2": {
+     "class_a_M": 789.0371332392544,
+     "class_b_M": 2887.6552561074177,
+     "class_a_$": 3550.667099576645,
+     "class_b_$": 1039.55589219867,
+     "storage_$": 72.79622339999999,
+     "total_$": 4663.0192151753145
+    }
+   }
+  },
+  {
+   "scenario": "bluesky-today",
+   "nodes": 8,
+   "shards": 1024,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     192.48652710021665,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.39827036560409235,
+     0.0723764938934765,
+     0.19248652710021666,
+     192.48652710021665
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     3339.696003256385,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     10.24,
+     0.0,
+     3.4133333333333336,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     234.83186310973062,
+     482.3906241562448,
+     0.0,
+     53.18790415902194
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     44.85360106340623,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.0024884939193725586,
+     0.3185272216796875,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     20.260697123338982,
+     48.48729702537632,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3703.4679999999994,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 925.8669999999998,
+    "log, 72 h retention (zstd segments)": 233.74656
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1205.026551517851,
+     "class_b_M": 10297.81930515483,
+     "class_a_$": 6025.132757589255,
+     "class_b_$": 4119.127722061931,
+     "storage_$": 111.85087587999999,
+     "total_$": 10256.111355531186
+    },
+    "gcs": {
+     "class_a_M": 1205.026551517851,
+     "class_b_M": 10297.81930515483,
+     "class_a_$": 6025.132757589255,
+     "class_b_$": 4119.127722061931,
+     "storage_$": 90.58109225193373,
+     "total_$": 10234.84157190312
+    },
+    "r2": {
+     "class_a_M": 1213.509136586819,
+     "class_b_M": 10287.81930515483,
+     "class_a_$": 5460.791114640685,
+     "class_b_$": 3703.614949855738,
+     "storage_$": 72.79622339999999,
+     "total_$": 9237.202287896424
+    }
+   }
+  },
+  {
+   "scenario": "bluesky-today",
+   "nodes": 16,
+   "shards": 256,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     273.6547118864201,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.7965407312081847,
+     0.144752987786953,
+     0.2736547118864201,
+     273.6547118864201
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     834.9240008140963,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     2.56,
+     0.0,
+     0.8533333333333334,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     101.31032771728592,
+     208.1112485071035,
+     0.0,
+     22.946136565923396
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     44.85360106340623,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.0024884939193725586,
+     0.3185272216796875,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     24.259518923997994,
+     125.12182425634408,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3703.4679999999994,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 925.8669999999998,
+    "log, 72 h retention (zstd segments)": 233.74656
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1058.7143190723966,
+     "class_b_M": 3191.1938064656256,
+     "class_a_$": 5293.571595361983,
+     "class_b_$": 1276.4775225862504,
+     "storage_$": 111.85087587999999,
+     "total_$": 6681.899993828233
+    },
+    "gcs": {
+     "class_a_M": 1058.7143190723966,
+     "class_b_M": 3191.1938064656256,
+     "class_a_$": 5293.571595361983,
+     "class_b_$": 1276.4775225862504,
+     "storage_$": 90.58109225193373,
+     "total_$": 6660.630210200167
+    },
+    "r2": {
+     "class_a_M": 1060.6780722337153,
+     "class_b_M": 3181.1938064656256,
+     "class_a_$": 4773.051325051719,
+     "class_b_$": 1145.2297703276251,
+     "storage_$": 72.79622339999999,
+     "total_$": 5991.077318779344
+    }
+   }
+  },
+  {
+   "scenario": "bluesky-today",
+   "nodes": 16,
+   "shards": 1024,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     273.6547118864201,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.7965407312081847,
+     0.144752987786953,
+     0.2736547118864201,
+     273.6547118864201
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     3339.696003256385,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     10.24,
+     0.0,
+     3.4133333333333336,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     309.10864070588525,
+     634.9696678620005,
+     0.0,
+     70.01111577821878
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     44.85360106340623,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.0024884939193725586,
+     0.3185272216796875,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     40.521394246677964,
+     140.48729702537634,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3703.4679999999994,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 925.8669999999998,
+    "log, 72 h retention (zstd segments)": 233.74656
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1668.1446662933988,
+     "class_b_M": 10941.203609995866,
+     "class_a_$": 8340.723331466996,
+     "class_b_$": 4376.481443998347,
+     "storage_$": 111.85087587999999,
+     "total_$": 12829.055651345343
+    },
+    "gcs": {
+     "class_a_M": 1668.1446662933988,
+     "class_b_M": 10941.203609995866,
+     "class_a_$": 8340.723331466996,
+     "class_b_$": 4376.481443998347,
+     "storage_$": 90.58109225193373,
+     "total_$": 12807.785867717277
+    },
+    "r2": {
+     "class_a_M": 1676.8407074547176,
+     "class_b_M": 10931.203609995866,
+     "class_a_$": 7545.783183546229,
+     "class_b_$": 3935.2332995985116,
+     "storage_$": 72.79622339999999,
+     "total_$": 11553.81270654474
+    }
+   }
+  },
+  {
+   "scenario": "bluesky-today-90M",
+   "nodes": 3,
+   "shards": 256,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     81.95724615651085,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.14935138710153462,
+     0.027141185210053688,
+     0.08195724615651084,
+     81.95724615651085
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     834.9240008140963,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     2.56,
+     0.0,
+     0.8533333333333334,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     69.90671576490116,
+     143.60208109742896,
+     0.0,
+     15.833420767258232
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     44.85360106340623,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.0024884939193725586,
+     0.3185272216796875,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     4.5486597982496235,
+     8.12182425634408,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3714.4176999999995,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 928.6044249999999,
+    "log, 72 h retention (zstd segments)": 233.74656
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 418.46550911747494,
+     "class_b_M": 2713.551702493247,
+     "class_a_$": 2092.3275455873745,
+     "class_b_$": 1085.4206809972989,
+     "storage_$": 112.16567975499997,
+     "total_$": 3289.9139063396733
+    },
+    "gcs": {
+     "class_a_M": 418.46550911747494,
+     "class_b_M": 2713.551702493247,
+     "class_a_$": 2092.3275455873745,
+     "class_b_$": 1085.4206809972989,
+     "storage_$": 90.83603239986098,
+     "total_$": 3268.5842589845342
+    },
+    "r2": {
+     "class_a_M": 419.9251362834173,
+     "class_b_M": 2703.551702493247,
+     "class_a_$": 1889.663113275378,
+     "class_b_$": 973.2786128975689,
+     "storage_$": 73.00153027499998,
+     "total_$": 2935.9432564479466
+    }
+   }
+  },
+  {
+   "scenario": "bluesky-today-90M",
+   "nodes": 3,
+   "shards": 1024,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     81.95724615651085,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.14935138710153462,
+     0.027141185210053688,
+     0.08195724615651084,
+     81.95724615651085
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     3339.696003256385,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     10.24,
+     0.0,
+     3.4133333333333336,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     130.3912913696359,
+     267.84924156116824,
+     0.0,
+     29.53278748761043
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     44.85360106340623,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.0024884939193725586,
+     0.3185272216796875,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     7.597761421252118,
+     23.487297025376325,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3714.4176999999995,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 928.6044249999999,
+    "log, 72 h retention (zstd segments)": 233.74656
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 605.7432374909783,
+     "class_b_M": 9667.754417391521,
+     "class_a_$": 3028.7161874548915,
+     "class_b_$": 3867.101766956609,
+     "storage_$": 112.16567975499997,
+     "total_$": 7007.983634166501
+    },
+    "gcs": {
+     "class_a_M": 605.7432374909783,
+     "class_b_M": 9667.754417391521,
+     "class_a_$": 3028.7161874548915,
+     "class_b_$": 3867.101766956609,
+     "storage_$": 90.83603239986098,
+     "total_$": 6986.653986811362
+    },
+    "r2": {
+     "class_a_M": 613.9351526569206,
+     "class_b_M": 9657.754417391521,
+     "class_a_$": 2762.708186956143,
+     "class_b_$": 3476.7915902609475,
+     "storage_$": 73.00153027499998,
+     "total_$": 6312.50130749209
+    }
+   }
+  },
+  {
+   "scenario": "bluesky-today-90M",
+   "nodes": 8,
+   "shards": 256,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     192.48652710021665,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.39827036560409235,
+     0.0723764938934765,
+     0.19248652710021666,
+     192.48652710021665
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     834.9240008140963,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     2.56,
+     0.0,
+     0.8533333333333334,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     91.79432737097754,
+     188.56352067435301,
+     0.0,
+     20.790823791522907
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     44.85360106340623,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.0024884939193725586,
+     0.3185272216796875,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     12.129759461998997,
+     33.121824256344084,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3714.4176999999995,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 928.6044249999999,
+    "log, 72 h retention (zstd segments)": 233.74656
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 787.2868361702863,
+     "class_b_M": 2897.6552561074177,
+     "class_a_$": 3936.4341808514314,
+     "class_b_$": 1159.062102442967,
+     "storage_$": 112.16567975499997,
+     "total_$": 5207.661963049399
+    },
+    "gcs": {
+     "class_a_M": 787.2868361702863,
+     "class_b_M": 2897.6552561074177,
+     "class_a_$": 3936.4341808514314,
+     "class_b_$": 1159.062102442967,
+     "storage_$": 90.83603239986098,
+     "total_$": 5186.33231569426
+    },
+    "r2": {
+     "class_a_M": 789.0371332392544,
+     "class_b_M": 2887.6552561074177,
+     "class_a_$": 3550.667099576645,
+     "class_b_$": 1039.55589219867,
+     "storage_$": 73.00153027499998,
+     "total_$": 4663.224522050315
+    }
+   }
+  },
+  {
+   "scenario": "bluesky-today-90M",
+   "nodes": 8,
+   "shards": 1024,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     192.48652710021665,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.39827036560409235,
+     0.0723764938934765,
+     0.19248652710021666,
+     192.48652710021665
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     3339.696003256385,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     10.24,
+     0.0,
+     3.4133333333333336,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     234.83186310973062,
+     482.3906241562448,
+     0.0,
+     53.18790415902194
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     44.85360106340623,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.0024884939193725586,
+     0.3185272216796875,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     20.260697123338982,
+     48.48729702537632,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3714.4176999999995,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 928.6044249999999,
+    "log, 72 h retention (zstd segments)": 233.74656
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1205.026551517851,
+     "class_b_M": 10297.81930515483,
+     "class_a_$": 6025.132757589255,
+     "class_b_$": 4119.127722061931,
+     "storage_$": 112.16567975499997,
+     "total_$": 10256.426159406186
+    },
+    "gcs": {
+     "class_a_M": 1205.026551517851,
+     "class_b_M": 10297.81930515483,
+     "class_a_$": 6025.132757589255,
+     "class_b_$": 4119.127722061931,
+     "storage_$": 90.83603239986098,
+     "total_$": 10235.096512051046
+    },
+    "r2": {
+     "class_a_M": 1213.509136586819,
+     "class_b_M": 10287.81930515483,
+     "class_a_$": 5460.791114640685,
+     "class_b_$": 3703.614949855738,
+     "storage_$": 73.00153027499998,
+     "total_$": 9237.407594771423
+    }
+   }
+  },
+  {
+   "scenario": "bluesky-today-90M",
+   "nodes": 16,
+   "shards": 256,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     273.6547118864201,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.7965407312081847,
+     0.144752987786953,
+     0.2736547118864201,
+     273.6547118864201
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     834.9240008140963,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     2.56,
+     0.0,
+     0.8533333333333334,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     101.31032771728592,
+     208.1112485071035,
+     0.0,
+     22.946136565923396
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     44.85360106340623,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.0024884939193725586,
+     0.3185272216796875,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     24.259518923997994,
+     125.12182425634408,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3714.4176999999995,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 928.6044249999999,
+    "log, 72 h retention (zstd segments)": 233.74656
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1058.7143190723966,
+     "class_b_M": 3191.1938064656256,
+     "class_a_$": 5293.571595361983,
+     "class_b_$": 1276.4775225862504,
+     "storage_$": 112.16567975499997,
+     "total_$": 6682.214797703234
+    },
+    "gcs": {
+     "class_a_M": 1058.7143190723966,
+     "class_b_M": 3191.1938064656256,
+     "class_a_$": 5293.571595361983,
+     "class_b_$": 1276.4775225862504,
+     "storage_$": 90.83603239986098,
+     "total_$": 6660.885150348095
+    },
+    "r2": {
+     "class_a_M": 1060.6780722337153,
+     "class_b_M": 3181.1938064656256,
+     "class_a_$": 4773.051325051719,
+     "class_b_$": 1145.2297703276251,
+     "storage_$": 73.00153027499998,
+     "total_$": 5991.282625654344
+    }
+   }
+  },
+  {
+   "scenario": "bluesky-today-90M",
+   "nodes": 16,
+   "shards": 1024,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     273.6547118864201,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.7965407312081847,
+     0.144752987786953,
+     0.2736547118864201,
+     273.6547118864201
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     3339.696003256385,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     10.24,
+     0.0,
+     3.4133333333333336,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     309.10864070588525,
+     634.9696678620005,
+     0.0,
+     70.01111577821878
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     44.85360106340623,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.0024884939193725586,
+     0.3185272216796875,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     40.521394246677964,
+     140.48729702537634,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3714.4176999999995,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 928.6044249999999,
+    "log, 72 h retention (zstd segments)": 233.74656
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1668.1446662933988,
+     "class_b_M": 10941.203609995866,
+     "class_a_$": 8340.723331466996,
+     "class_b_$": 4376.481443998347,
+     "storage_$": 112.16567975499997,
+     "total_$": 12829.370455220344
+    },
+    "gcs": {
+     "class_a_M": 1668.1446662933988,
+     "class_b_M": 10941.203609995866,
+     "class_a_$": 8340.723331466996,
+     "class_b_$": 4376.481443998347,
+     "storage_$": 90.83603239986098,
+     "total_$": 12808.040807865204
+    },
+    "r2": {
+     "class_a_M": 1676.8407074547176,
+     "class_b_M": 10931.203609995866,
+     "class_a_$": 7545.783183546229,
+     "class_b_$": 3935.2332995985116,
+     "storage_$": 73.00153027499998,
+     "total_$": 11554.01801341974
+    }
+   }
+  },
+  {
+   "scenario": "sizing-today",
+   "nodes": 3,
+   "shards": 256,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     82.28966784824016,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.14935138710153462,
+     0.027141185210053688,
+     0.08228966784824016,
+     82.28966784824016
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     834.9240008140963,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     2.56,
+     0.0,
+     0.8533333333333334,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     69.90671576490116,
+     143.60208109742896,
+     0.0,
+     15.833420767258232
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     76.89188753726782,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.011920928955078125,
+     1.52587890625,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     4.5486597982496235,
+     8.12182425634408,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3871.1499999999996,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 967.7874999999999,
+    "log, 72 h retention (zstd segments)": 1119.744
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 419.36451710004155,
+     "class_b_M": 2800.9810817222915,
+     "class_a_$": 2096.822585500208,
+     "class_b_$": 1120.3924326889166,
+     "storage_$": 137.04967449999998,
+     "total_$": 3354.264692689125
+    },
+    "gcs": {
+     "class_a_M": 419.36451710004155,
+     "class_b_M": 2800.9810817222915,
+     "class_a_$": 2096.822585500208,
+     "class_b_$": 1120.3924326889166,
+     "storage_$": 110.98803752149921,
+     "total_$": 3328.203055710624
+    },
+    "r2": {
+     "class_a_M": 420.8250184685488,
+     "class_b_M": 2790.9810817222915,
+     "class_a_$": 1893.7125831084695,
+     "class_b_$": 1004.7531894200249,
+     "storage_$": 89.2302225,
+     "total_$": 2987.695995028494
+    }
+   }
+  },
+  {
+   "scenario": "sizing-today",
+   "nodes": 3,
+   "shards": 1024,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     82.28966784824016,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.14935138710153462,
+     0.027141185210053688,
+     0.08228966784824016,
+     82.28966784824016
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     3339.696003256385,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     10.24,
+     0.0,
+     3.4133333333333336,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     130.3912913696359,
+     267.84924156116824,
+     0.0,
+     29.53278748761043
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     76.89188753726782,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.011920928955078125,
+     1.52587890625,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     7.597761421252118,
+     23.487297025376325,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3871.1499999999996,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 967.7874999999999,
+    "log, 72 h retention (zstd segments)": 1119.744
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 606.6422454735449,
+     "class_b_M": 9755.183796620566,
+     "class_a_$": 3033.211227367725,
+     "class_b_$": 3902.073518648226,
+     "storage_$": 137.04967449999998,
+     "total_$": 7072.334420515951
+    },
+    "gcs": {
+     "class_a_M": 606.6422454735449,
+     "class_b_M": 9755.183796620566,
+     "class_a_$": 3033.211227367725,
+     "class_b_$": 3902.073518648226,
+     "storage_$": 110.98803752149921,
+     "total_$": 7046.27278353745
+    },
+    "r2": {
+     "class_a_M": 614.8350348420522,
+     "class_b_M": 9745.183796620566,
+     "class_a_$": 2766.757656789235,
+     "class_b_$": 3508.266166783403,
+     "storage_$": 89.2302225,
+     "total_$": 6364.254046072639
+    }
+   }
+  },
+  {
+   "scenario": "sizing-today",
+   "nodes": 8,
+   "shards": 256,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     219.42015416918775,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.39827036560409235,
+     0.0723764938934765,
+     0.21942015416918775,
+     219.42015416918775
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     834.9240008140963,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     2.56,
+     0.0,
+     0.8533333333333334,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     91.79432737097754,
+     188.56352067435301,
+     0.0,
+     20.790823791522907
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     76.89188753726782,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.011920928955078125,
+     1.52587890625,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     12.129759461998997,
+     33.121824256344084,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3871.1499999999996,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 967.7874999999999,
+    "log, 72 h retention (zstd segments)": 1119.744
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 858.1416940539234,
+     "class_b_M": 2985.084635336462,
+     "class_a_$": 4290.708470269617,
+     "class_b_$": 1194.0338541345848,
+     "storage_$": 137.04967449999998,
+     "total_$": 5621.791998904201
+    },
+    "gcs": {
+     "class_a_M": 858.1416940539234,
+     "class_b_M": 2985.084635336462,
+     "class_a_$": 4290.708470269617,
+     "class_b_$": 1194.0338541345848,
+     "storage_$": 110.98803752149921,
+     "total_$": 5595.7303619257
+    },
+    "r2": {
+     "class_a_M": 859.9628211753576,
+     "class_b_M": 2975.084635336462,
+     "class_a_$": 3869.832695289109,
+     "class_b_$": 1071.0304687211262,
+     "storage_$": 89.2302225,
+     "total_$": 5030.093386510235
+    }
+   }
+  },
+  {
+   "scenario": "sizing-today",
+   "nodes": 8,
+   "shards": 1024,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     219.42015416918775,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.39827036560409235,
+     0.0723764938934765,
+     0.21942015416918775,
+     219.42015416918775
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     3339.696003256385,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     10.24,
+     0.0,
+     3.4133333333333336,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     234.83186310973062,
+     482.3906241562448,
+     0.0,
+     53.18790415902194
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     76.89188753726782,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.011920928955078125,
+     1.52587890625,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     20.260697123338982,
+     48.48729702537632,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3871.1499999999996,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 967.7874999999999,
+    "log, 72 h retention (zstd segments)": 1119.744
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1275.881409401488,
+     "class_b_M": 10385.248684383872,
+     "class_a_$": 6379.40704700744,
+     "class_b_$": 4154.099473753549,
+     "storage_$": 137.04967449999998,
+     "total_$": 10670.55619526099
+    },
+    "gcs": {
+     "class_a_M": 1275.881409401488,
+     "class_b_M": 10385.248684383872,
+     "class_a_$": 6379.40704700744,
+     "class_b_$": 4154.099473753549,
+     "storage_$": 110.98803752149921,
+     "total_$": 10644.49455828249
+    },
+    "r2": {
+     "class_a_M": 1284.4348245229223,
+     "class_b_M": 10375.248684383872,
+     "class_a_$": 5779.95671035315,
+     "class_b_$": 3735.089526378194,
+     "storage_$": 89.2302225,
+     "total_$": 9604.276459231345
+    }
+   }
+  },
+  {
+   "scenario": "sizing-today",
+   "nodes": 16,
+   "shards": 256,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     435.8911782221036,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.7965407312081847,
+     0.144752987786953,
+     0.4358911782221036,
+     435.8911782221036
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     834.9240008140963,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     2.56,
+     0.0,
+     0.8533333333333334,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     101.31032771728592,
+     208.1112485071035,
+     0.0,
+     22.946136565923396
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     76.89188753726782,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.011920928955078125,
+     1.52587890625,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     24.259518923997994,
+     125.12182425634408,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3871.1499999999996,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 967.7874999999999,
+    "log, 72 h retention (zstd segments)": 1119.744
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1485.3885836596337,
+     "class_b_M": 3278.62318569467,
+     "class_a_$": 7426.942918298168,
+     "class_b_$": 1311.4492742778682,
+     "storage_$": 137.04967449999998,
+     "total_$": 8875.441867076035
+    },
+    "gcs": {
+     "class_a_M": 1485.3885836596337,
+     "class_b_M": 3278.62318569467,
+     "class_a_$": 7426.942918298168,
+     "class_b_$": 1311.4492742778682,
+     "storage_$": 110.98803752149921,
+     "total_$": 8849.380230097535
+    },
+    "r2": {
+     "class_a_M": 1487.7789862801224,
+     "class_b_M": 3268.62318569467,
+     "class_a_$": 6695.005438260549,
+     "class_b_$": 1176.7043468500813,
+     "storage_$": 89.2302225,
+     "total_$": 7960.940007610631
+    }
+   }
+  },
+  {
+   "scenario": "sizing-today",
+   "nodes": 16,
+   "shards": 1024,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     435.8911782221036,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.7965407312081847,
+     0.144752987786953,
+     0.4358911782221036,
+     435.8911782221036
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     3339.696003256385,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     10.24,
+     0.0,
+     3.4133333333333336,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     309.10864070588525,
+     634.9696678620005,
+     0.0,
+     70.01111577821878
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     76.89188753726782,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     0.011920928955078125,
+     1.52587890625,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     40.521394246677964,
+     140.48729702537634,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 3871.1499999999996,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 967.7874999999999,
+    "log, 72 h retention (zstd segments)": 1119.744
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 2094.818930880636,
+     "class_b_M": 11028.63298922491,
+     "class_a_$": 10474.09465440318,
+     "class_b_$": 4411.453195689965,
+     "storage_$": 137.04967449999998,
+     "total_$": 15022.597524593144
+    },
+    "gcs": {
+     "class_a_M": 2094.818930880636,
+     "class_b_M": 11028.63298922491,
+     "class_a_$": 10474.09465440318,
+     "class_b_$": 4411.453195689965,
+     "storage_$": 110.98803752149921,
+     "total_$": 14996.535887614644
+    },
+    "r2": {
+     "class_a_M": 2103.9416215011247,
+     "class_b_M": 11018.63298922491,
+     "class_a_$": 9467.73729675506,
+     "class_b_$": 3966.7078761209677,
+     "storage_$": 89.2302225,
+     "total_$": 13523.675395376029
+    }
+   }
+  },
+  {
+   "scenario": "sizing-100x",
+   "nodes": 3,
+   "shards": 256,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     413.57491184083165,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.14935138710153462,
+     0.027141185210053688,
+     0.41357491184083167,
+     413.57491184083165
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     834.9240008140963,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     2.56,
+     0.0,
+     0.8533333333333334,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     69.90671576490116,
+     143.60208109742896,
+     0.0,
+     15.833420767258232
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     1537.8377507453565,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     1.1920928955078125,
+     152.587890625,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     4.5486597982496235,
+     8.12182425634408,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 77423.0,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 19355.75,
+    "log, 72 h retention (zstd segments)": 111974.4
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1293.682067989399,
+     "class_b_M": 7040.239391204891,
+     "class_a_$": 6468.410339946995,
+     "class_b_$": 2816.0957564819564,
+     "storage_$": 4801.32245,
+     "total_$": 14085.828546428951
+    },
+    "gcs": {
+     "class_a_M": 1293.682067989399,
+     "class_b_M": 7040.239391204891,
+     "class_a_$": 6468.410339946995,
+     "class_b_$": 2816.0957564819564,
+     "storage_$": 3888.2934832028113,
+     "total_$": 13172.799579631763
+    },
+    "r2": {
+     "class_a_M": 1296.0137832925582,
+     "class_b_M": 7030.239391204891,
+     "class_a_$": 5832.062024816511,
+     "class_b_$": 2530.8861808337606,
+     "storage_$": 3131.14725,
+     "total_$": 11494.095455650271
+    }
+   }
+  },
+  {
+   "scenario": "sizing-100x",
+   "nodes": 3,
+   "shards": 1024,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     413.57491184083165,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.14935138710153462,
+     0.027141185210053688,
+     0.41357491184083167,
+     413.57491184083165
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     3339.696003256385,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     10.24,
+     0.0,
+     3.4133333333333336,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     130.3912913696359,
+     267.84924156116824,
+     0.0,
+     29.53278748761043
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     1537.8377507453565,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     1.1920928955078125,
+     152.587890625,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     7.597761421252118,
+     23.487297025376325,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 77423.0,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 19355.75,
+    "log, 72 h retention (zstd segments)": 111974.4
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1480.9597963629024,
+     "class_b_M": 13994.442106103164,
+     "class_a_$": 7404.798981814512,
+     "class_b_$": 5597.776842441266,
+     "storage_$": 4801.32245,
+     "total_$": 17803.89827425578
+    },
+    "gcs": {
+     "class_a_M": 1480.9597963629024,
+     "class_b_M": 13994.442106103164,
+     "class_a_$": 7404.798981814512,
+     "class_b_$": 5597.776842441266,
+     "storage_$": 3888.2934832028113,
+     "total_$": 16890.86930745859
+    },
+    "r2": {
+     "class_a_M": 1490.0237996660614,
+     "class_b_M": 13984.442106103164,
+     "class_a_$": 6705.107098497276,
+     "class_b_$": 5034.399158197139,
+     "storage_$": 3131.14725,
+     "total_$": 14870.653506694414
+    }
+   }
+  },
+  {
+   "scenario": "sizing-100x",
+   "nodes": 8,
+   "shards": 256,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     413.57491184083165,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.39827036560409235,
+     0.0723764938934765,
+     0.41357491184083167,
+     413.57491184083165
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     834.9240008140963,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     2.56,
+     0.0,
+     0.8533333333333334,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     91.79432737097754,
+     188.56352067435301,
+     0.0,
+     20.790823791522907
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     1537.8377507453565,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     1.1920928955078125,
+     152.587890625,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     12.129759461998997,
+     33.121824256344084,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 77423.0,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 19355.75,
+    "log, 72 h retention (zstd segments)": 111974.4
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1371.8334920164527,
+     "class_b_M": 7224.342944819062,
+     "class_a_$": 6859.167460082264,
+     "class_b_$": 2889.737177927625,
+     "storage_$": 4801.32245,
+     "total_$": 14550.22708800989
+    },
+    "gcs": {
+     "class_a_M": 1371.8334920164527,
+     "class_b_M": 7224.342944819062,
+     "class_a_$": 6859.167460082264,
+     "class_b_$": 2889.737177927625,
+     "storage_$": 3888.2934832028113,
+     "total_$": 13637.198121212701
+    },
+    "r2": {
+     "class_a_M": 1374.1652073196117,
+     "class_b_M": 7214.342944819062,
+     "class_a_$": 6183.743432938252,
+     "class_b_$": 2597.163460134862,
+     "storage_$": 3131.14725,
+     "total_$": 11912.054143073114
+    }
+   }
+  },
+  {
+   "scenario": "sizing-100x",
+   "nodes": 8,
+   "shards": 1024,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     413.57491184083165,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.39827036560409235,
+     0.0723764938934765,
+     0.41357491184083167,
+     413.57491184083165
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     3339.696003256385,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     10.24,
+     0.0,
+     3.4133333333333336,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     234.83186310973062,
+     482.3906241562448,
+     0.0,
+     53.18790415902194
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     1537.8377507453565,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     1.1920928955078125,
+     152.587890625,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     20.260697123338982,
+     48.48729702537632,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 77423.0,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 19355.75,
+    "log, 72 h retention (zstd segments)": 111974.4
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1789.5732073640177,
+     "class_b_M": 14624.506993866475,
+     "class_a_$": 8947.866036820089,
+     "class_b_$": 5849.802797546589,
+     "storage_$": 4801.32245,
+     "total_$": 19598.99128436668
+    },
+    "gcs": {
+     "class_a_M": 1789.5732073640177,
+     "class_b_M": 14624.506993866475,
+     "class_a_$": 8947.866036820089,
+     "class_b_$": 5849.802797546589,
+     "storage_$": 3888.2934832028113,
+     "total_$": 18685.96231756949
+    },
+    "r2": {
+     "class_a_M": 1798.6372106671768,
+     "class_b_M": 14614.506993866475,
+     "class_a_$": 8093.867448002295,
+     "class_b_$": 5261.22251779193,
+     "storage_$": 3131.14725,
+     "total_$": 16486.237215794223
+    }
+   }
+  },
+  {
+   "scenario": "sizing-100x",
+   "nodes": 16,
+   "shards": 256,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     438.87822859083957,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.7965407312081847,
+     0.144752987786953,
+     0.4388782285908396,
+     438.87822859083957
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     834.9240008140963,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     2.56,
+     0.0,
+     0.8533333333333334,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     101.31032771728592,
+     208.1112485071035,
+     0.0,
+     22.946136565923396
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     1537.8377507453565,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     1.1920928955078125,
+     152.587890625,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     24.259518923997994,
+     125.12182425634408,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 77423.0,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 19355.75,
+    "log, 72 h retention (zstd segments)": 111974.4
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 1496.3475449569762,
+     "class_b_M": 7517.881495177271,
+     "class_a_$": 7481.737724784881,
+     "class_b_$": 3007.1525980709084,
+     "storage_$": 4801.32245,
+     "total_$": 15290.21277285579
+    },
+    "gcs": {
+     "class_a_M": 1496.3475449569762,
+     "class_b_M": 7517.881495177271,
+     "class_a_$": 7481.737724784881,
+     "class_b_$": 3007.1525980709084,
+     "storage_$": 3888.2934832028113,
+     "total_$": 14377.183806058601
+    },
+    "r2": {
+     "class_a_M": 1498.7458029225245,
+     "class_b_M": 7507.881495177271,
+     "class_a_$": 6744.35611315136,
+     "class_b_$": 2702.8373382638174,
+     "storage_$": 3131.14725,
+     "total_$": 12578.340701415176
+    }
+   }
+  },
+  {
+   "scenario": "sizing-100x",
+   "nodes": 16,
+   "shards": 1024,
+   "req": {
+    "log segment PUTs (If-None-Match; incl. ~1% hedges)": [
+     438.87822859083957,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "log retention (LIST/report; DELETEs)": [
+     0.7965407312081847,
+     0.144752987786953,
+     0.4388782285908396,
+     438.87822859083957
+    ],
+    "SlateDB polling, per shard (manifest/compactions probe GET + GC boundary GET)": [
+     0.0,
+     3339.696003256385,
+     0.0,
+     0.0
+    ],
+    "SlateDB GC passes, per shard (LIST x5, boundary CAS)": [
+     10.24,
+     0.0,
+     3.4133333333333336,
+     0.0
+    ],
+    "checkpoint flush + compaction (SST/manifest/compactions PUTs, SST GETs)": [
+     309.10864070588525,
+     634.9696678620005,
+     0.0,
+     70.01111577821878
+    ],
+    "cold repo loads (SST range GETs past the disk cache)": [
+     0.0,
+     1537.8377507453565,
+     0.0,
+     0.0
+    ],
+    "compaction bytes (2 MiB input GETs, <=256 MiB output PUTs)": [
+     1.1920928955078125,
+     152.587890625,
+     0.0,
+     0.0
+    ],
+    "control plane (lease CAS, LIST nodes/ + assign/, assignment + peer lease GETs)": [
+     40.521394246677964,
+     140.48729702537634,
+     0.0,
+     0.0
+    ]
+   },
+   "storage_gb": {
+    "state (zstd SSTs, live)": 77423.0,
+    "SlateDB transient (replaced SSTs until checkpoint expiry + GC)": 19355.75,
+    "log, 72 h retention (zstd segments)": 111974.4
+   },
+   "cost": {
+    "s3": {
+     "class_a_M": 2105.7778921779786,
+     "class_b_M": 15267.89129870751,
+     "class_a_$": 10528.889460889894,
+     "class_b_$": 6107.156519483004,
+     "storage_$": 4801.32245,
+     "total_$": 21437.368430372895
+    },
+    "gcs": {
+     "class_a_M": 2105.7778921779786,
+     "class_b_M": 15267.89129870751,
+     "class_a_$": 10528.889460889894,
+     "class_b_$": 6107.156519483004,
+     "storage_$": 3888.2934832028113,
+     "total_$": 20524.339463575707
+    },
+    "r2": {
+     "class_a_M": 2114.9084381435264,
+     "class_b_M": 15257.89129870751,
+     "class_a_$": 9517.08797164587,
+     "class_b_$": 5492.840867534703,
+     "storage_$": 3131.14725,
+     "total_$": 18141.07608918057
+    }
+   }
+  }
+ ],
+ "sensitivity": {
+  "bluesky-today 3n/256s": [
+   {
+    "knobs": "baseline (defaults)",
+    "class_a_M": 418.46550911747494,
+    "class_b_M": 2713.551702493247,
+    "s3": 3289.5991024646733,
+    "gcs": 3268.329318836607,
+    "r2": 2935.737949572947,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "DB manifest poll 5 s",
+    "class_a_M": 418.46550911747494,
+    "class_b_M": 1615.7101338227924,
+    "s3": 2850.4624749964914,
+    "gcs": 2829.192691368425,
+    "r2": 2540.5149848515834,
+    "delta_s3": -439.1366274681818
+   },
+   {
+    "knobs": "DB manifest poll 10 s",
+    "class_a_M": 418.46550911747494,
+    "class_b_M": 1478.4799377389852,
+    "s3": 2795.5703965629687,
+    "gcs": 2774.3006129349023,
+    "r2": 2491.112114261413,
+    "delta_s3": -494.0287059017046
+   },
+   {
+    "knobs": "DB manifest poll 30 s",
+    "class_a_M": 418.46550911747494,
+    "class_b_M": 1386.9931403497806,
+    "s3": 2758.975677607287,
+    "gcs": 2737.7058939792205,
+    "r2": 2458.176867201299,
+    "delta_s3": -530.6234248573865
+   },
+   {
+    "knobs": "compactor + worker polls 30 s",
+    "class_a_M": 418.46550911747494,
+    "class_b_M": 2027.4007220742128,
+    "s3": 3015.1387102970593,
+    "gcs": 2993.868926668993,
+    "r2": 2688.7235966220946,
+    "delta_s3": -274.4603921676139
+   },
+   {
+    "knobs": "manifest 10 s + compactor/worker 30 s",
+    "class_a_M": 418.46550911747494,
+    "class_b_M": 792.3289573199506,
+    "s3": 2521.1100043953547,
+    "gcs": 2499.8402207672884,
+    "r2": 2244.09776131056,
+    "delta_s3": -768.4890980693185
+   },
+   {
+    "knobs": "checkpoint every 30 s",
+    "class_a_M": 316.80713997083006,
+    "class_b_M": 2504.7255087478043,
+    "s3": 2697.776779233272,
+    "gcs": 2676.5069956052057,
+    "r2": 2403.0978586646856,
+    "delta_s3": -591.8223232314012
+   },
+   {
+    "knobs": "checkpoint every 60 s",
+    "class_a_M": 279.5465759933144,
+    "class_b_M": 2428.1850151558906,
+    "s3": 2480.8577619089283,
+    "gcs": 2459.587978280862,
+    "r2": 2207.870743072776,
+    "delta_s3": -808.741340555745
+   },
+   {
+    "knobs": "segment linger 50 ms",
+    "class_a_M": 294.68382289449266,
+    "class_b_M": 2713.551702493247,
+    "s3": 2670.6906713497624,
+    "gcs": 2649.420887721696,
+    "r2": 2378.1633439815237,
+    "delta_s3": -618.9084311149109
+   },
+   {
+    "knobs": "segment linger 100 ms",
+    "class_a_M": 261.1504110583681,
+    "class_b_M": 2713.551702493247,
+    "s3": 2503.023612169139,
+    "gcs": 2481.753828541073,
+    "r2": 2227.1120903657,
+    "delta_s3": -786.5754902955341
+   },
+   {
+    "knobs": "segment linger 250 ms",
+    "class_a_M": 230.70283875708085,
+    "class_b_M": 2713.551702493247,
+    "s3": 2350.785750662703,
+    "gcs": 2329.5159670346366,
+    "r2": 2089.961000934552,
+    "delta_s3": -938.8133518019704
+   },
+   {
+    "knobs": "K = 1",
+    "class_a_M": 418.46550911747494,
+    "class_b_M": 2713.551702493247,
+    "s3": 3289.5991024646733,
+    "gcs": 3268.329318836607,
+    "r2": 2935.737949572947,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "K = 8",
+    "class_a_M": 418.46550911747494,
+    "class_b_M": 2713.551702493247,
+    "s3": 3289.5991024646733,
+    "gcs": 3268.329318836607,
+    "r2": 2935.737949572947,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "segment cap 2 MiB",
+    "class_a_M": 418.46550911747494,
+    "class_b_M": 2713.551702493247,
+    "s3": 3289.5991024646733,
+    "gcs": 3268.329318836607,
+    "r2": 2935.737949572947,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "segment cap 32 MiB",
+    "class_a_M": 418.46550911747494,
+    "class_b_M": 2713.551702493247,
+    "s3": 3289.5991024646733,
+    "gcs": 3268.329318836607,
+    "r2": 2935.737949572947,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "S3 Express-like latency (6 ms PUTs, t_flush 15 ms)",
+    "class_a_M": 936.6614763542027,
+    "class_b_M": 2877.2088694058543,
+    "s3": 5946.041805413355,
+    "gcs": 5924.772021785289,
+    "r2": 5328.509750418989,
+    "delta_s3": 2656.442702948682
+   },
+   {
+    "knobs": "GC interval 30 min",
+    "class_a_M": 413.97731711747497,
+    "class_b_M": 2713.551702493247,
+    "s3": 3267.158142464674,
+    "gcs": 3245.8883588366075,
+    "r2": 2908.808797572947,
+    "delta_s3": -22.44095999999945
+   },
+   {
+    "knobs": "all tuned: manifest 10 s, polls 30 s, checkpoint 30 s, linger 100 ms",
+    "class_a_M": 159.49204191172322,
+    "class_b_M": 583.5027635745076,
+    "s3": 1142.7121908684194,
+    "gcs": 1121.442407240353,
+    "r2": 1002.831811195052,
+    "delta_s3": -2146.886911596254
+   }
+  ],
+  "bluesky-today 8n/1024s": [
+   {
+    "knobs": "baseline (defaults)",
+    "class_a_M": 1205.026551517851,
+    "class_b_M": 10297.81930515483,
+    "s3": 10256.111355531186,
+    "gcs": 10234.84157190312,
+    "r2": 9237.202287896424,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "DB manifest poll 5 s",
+    "class_a_M": 1205.026551517851,
+    "class_b_M": 5906.453030473009,
+    "s3": 8499.564845658459,
+    "gcs": 8478.295062030393,
+    "r2": 7656.310429010968,
+    "delta_s3": -1756.5465098727273
+   },
+   {
+    "knobs": "DB manifest poll 10 s",
+    "class_a_M": 1205.026551517851,
+    "class_b_M": 5357.532246137781,
+    "s3": 8279.996531924367,
+    "gcs": 8258.726748296302,
+    "r2": 7458.6989466502855,
+    "delta_s3": -1976.1148236068184
+   },
+   {
+    "knobs": "DB manifest poll 30 s",
+    "class_a_M": 1205.026551517851,
+    "class_b_M": 4991.585056580962,
+    "s3": 8133.61765610164,
+    "gcs": 8112.347872473574,
+    "r2": 7326.957958409831,
+    "delta_s3": -2122.493699429546
+   },
+   {
+    "knobs": "compactor + worker polls 30 s",
+    "class_a_M": 1205.026551517851,
+    "class_b_M": 7553.215383478692,
+    "s3": 9158.269786860732,
+    "gcs": 9137.000003232666,
+    "r2": 8249.144876093014,
+    "delta_s3": -1097.8415686704539
+   },
+   {
+    "knobs": "manifest 10 s + compactor/worker 30 s",
+    "class_a_M": 1205.026551517851,
+    "class_b_M": 2612.9283244616427,
+    "s3": 7182.154963253912,
+    "gcs": 7160.885179625846,
+    "r2": 6470.641534846876,
+    "delta_s3": -3073.956392277274
+   },
+   {
+    "knobs": "checkpoint every 30 s",
+    "class_a_M": 890.3658952394946,
+    "class_b_M": 9651.44471028734,
+    "s3": 8424.258236192409,
+    "gcs": 8402.988452564343,
+    "r2": 7588.534480491525,
+    "delta_s3": -1831.853119338777
+   },
+   {
+    "knobs": "checkpoint every 60 s",
+    "class_a_M": 759.150334389481,
+    "class_b_M": 9381.902257831163,
+    "s3": 7660.3634509598705,
+    "gcs": 7639.093667331805,
+    "r2": 6901.02917378224,
+    "delta_s3": -2595.7479045713153
+   },
+   {
+    "knobs": "segment linger 50 ms",
+    "class_a_M": 941.7044885710053,
+    "class_b_M": 10297.81930515483,
+    "s3": 8939.501040796958,
+    "gcs": 8918.231257168893,
+    "r2": 8051.068055352357,
+    "delta_s3": -1316.6103147342274
+   },
+   {
+    "knobs": "segment linger 100 ms",
+    "class_a_M": 853.9784749391932,
+    "class_b_M": 10297.81930515483,
+    "s3": 8500.870972637897,
+    "gcs": 8479.60118900983,
+    "r2": 7655.906226947859,
+    "delta_s3": -1755.2403828932893
+   },
+   {
+    "knobs": "segment linger 250 ms",
+    "class_a_M": 772.8747651024114,
+    "class_b_M": 10297.81930515483,
+    "s3": 8095.352423453988,
+    "gcs": 8074.082639825922,
+    "r2": 7290.574565988076,
+    "delta_s3": -2160.7589320771976
+   },
+   {
+    "knobs": "K = 1",
+    "class_a_M": 1205.026551517851,
+    "class_b_M": 10297.81930515483,
+    "s3": 10256.111355531186,
+    "gcs": 10234.84157190312,
+    "r2": 9237.202287896424,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "K = 8",
+    "class_a_M": 1205.026551517851,
+    "class_b_M": 10297.81930515483,
+    "s3": 10256.111355531186,
+    "gcs": 10234.84157190312,
+    "r2": 9237.202287896424,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "segment cap 2 MiB",
+    "class_a_M": 1205.026551517851,
+    "class_b_M": 10297.81930515483,
+    "s3": 10256.111355531186,
+    "gcs": 10234.84157190312,
+    "r2": 9237.202287896424,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "segment cap 32 MiB",
+    "class_a_M": 1205.026551517851,
+    "class_b_M": 10297.81930515483,
+    "s3": 10256.111355531186,
+    "gcs": 10234.84157190312,
+    "r2": 9237.202287896424,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "S3 Express-like latency (6 ms PUTs, t_flush 15 ms)",
+    "class_a_M": 1915.1702894921198,
+    "class_b_M": 11078.183359583642,
+    "s3": 14118.975667174056,
+    "gcs": 14097.70588354599,
+    "r2": 12715.266319798739,
+    "delta_s3": 3862.8643116428702
+   },
+   {
+    "knobs": "GC interval 30 min",
+    "class_a_M": 1187.073783517851,
+    "class_b_M": 10297.81930515483,
+    "s3": 10166.347515531186,
+    "gcs": 10145.07773190312,
+    "r2": 9129.485679896425,
+    "delta_s3": -89.76383999999962
+   },
+   {
+    "knobs": "all tuned: manifest 10 s, polls 30 s, checkpoint 30 s, linger 100 ms",
+    "class_a_M": 539.3178186608368,
+    "class_b_M": 1966.553729594153,
+    "s3": 3595.0614610218454,
+    "gcs": 3573.791677393779,
+    "r2": 3240.677666493413,
+    "delta_s3": -6661.04989450934
+   }
+  ],
+  "sizing-100x 8n/1024s": [
+   {
+    "knobs": "baseline (defaults)",
+    "class_a_M": 1789.5732073640177,
+    "class_b_M": 14624.506993866475,
+    "s3": 19598.99128436668,
+    "gcs": 18685.96231756949,
+    "r2": 16486.237215794223,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "DB manifest poll 5 s",
+    "class_a_M": 1789.5732073640177,
+    "class_b_M": 10233.140719184654,
+    "s3": 17842.44477449395,
+    "gcs": 16929.41580769676,
+    "r2": 14905.34535690877,
+    "delta_s3": -1756.546509872729
+   },
+   {
+    "knobs": "DB manifest poll 10 s",
+    "class_a_M": 1789.5732073640177,
+    "class_b_M": 9684.219934849427,
+    "s3": 17622.876460759857,
+    "gcs": 16709.84749396267,
+    "r2": 14707.733874548088,
+    "delta_s3": -1976.114823606822
+   },
+   {
+    "knobs": "DB manifest poll 30 s",
+    "class_a_M": 1789.5732073640177,
+    "class_b_M": 9318.272745292606,
+    "s3": 17476.497584937133,
+    "gcs": 16563.468618139945,
+    "r2": 14575.992886307633,
+    "delta_s3": -2122.493699429546
+   },
+   {
+    "knobs": "compactor + worker polls 30 s",
+    "class_a_M": 1789.5732073640177,
+    "class_b_M": 11879.903072190336,
+    "s3": 18501.14971569622,
+    "gcs": 17588.120748899033,
+    "r2": 15498.179803990815,
+    "delta_s3": -1097.8415686704575
+   },
+   {
+    "knobs": "manifest 10 s + compactor/worker 30 s",
+    "class_a_M": 1789.5732073640177,
+    "class_b_M": 6939.616013173288,
+    "s3": 16525.034892089403,
+    "gcs": 15612.005925292215,
+    "r2": 13719.676462744677,
+    "delta_s3": -3073.956392277276
+   },
+   {
+    "knobs": "checkpoint every 30 s",
+    "class_a_M": 1474.9125510856613,
+    "class_b_M": 13978.132398998985,
+    "s3": 17767.1381650279,
+    "gcs": 16854.10919823071,
+    "r2": 14837.569408389323,
+    "delta_s3": -1831.853119338779
+   },
+   {
+    "knobs": "checkpoint every 60 s",
+    "class_a_M": 1343.6969902356477,
+    "class_b_M": 13708.589946542808,
+    "s3": 17003.243379795364,
+    "gcs": 16090.214412998173,
+    "r2": 14150.06410168004,
+    "delta_s3": -2595.7479045713153
+   },
+   {
+    "knobs": "segment linger 50 ms",
+    "class_a_M": 1789.5732073640177,
+    "class_b_M": 14624.506993866475,
+    "s3": 19598.99128436668,
+    "gcs": 18685.96231756949,
+    "r2": 16486.237215794223,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "segment linger 100 ms",
+    "class_a_M": 1789.5732073640177,
+    "class_b_M": 14624.506993866475,
+    "s3": 19598.99128436668,
+    "gcs": 18685.96231756949,
+    "r2": 16486.237215794223,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "segment linger 250 ms",
+    "class_a_M": 1789.5732073640177,
+    "class_b_M": 14624.506993866475,
+    "s3": 19598.99128436668,
+    "gcs": 18685.96231756949,
+    "r2": 16486.237215794223,
+    "delta_s3": 0.0
+   },
+   {
+    "knobs": "K = 1",
+    "class_a_M": 1279.0348869790935,
+    "class_b_M": 14624.506993866475,
+    "s3": 17046.299682442055,
+    "gcs": 16133.270715644869,
+    "r2": 14186.517351620334,
+    "delta_s3": -2552.6916019246237
+   },
+   {
+    "knobs": "K = 8",
+    "class_a_M": 2877.192510523037,
+    "class_b_M": 14624.506993866475,
+    "s3": 25037.087800161775,
+    "gcs": 24124.058833364586,
+    "r2": 21385.418366874022,
+    "delta_s3": 5438.096515795096
+   },
+   {
+    "knobs": "segment cap 2 MiB",
+    "class_a_M": 5052.431116841075,
+    "class_b_M": 14624.506993866475,
+    "s3": 35913.28083175197,
+    "gcs": 35000.25186495477,
+    "r2": 31183.78066903363,
+    "delta_s3": 16314.289547385288
+   },
+   {
+    "knobs": "segment cap 32 MiB",
+    "class_a_M": 1279.0348869790935,
+    "class_b_M": 14624.506993866475,
+    "s3": 17046.299682442055,
+    "gcs": 16133.270715644869,
+    "r2": 14186.517351620334,
+    "delta_s3": -2552.6916019246237
+   },
+   {
+    "knobs": "S3 Express-like latency (6 ms PUTs, t_flush 15 ms)",
+    "class_a_M": 3493.25256089045,
+    "class_b_M": 15404.871048295288,
+    "s3": 28429.533673770366,
+    "gcs": 27516.504706973177,
+    "r2": 24439.682427951266,
+    "delta_s3": 8830.542389403687
+   },
+   {
+    "knobs": "GC interval 30 min",
+    "class_a_M": 1771.6204393640176,
+    "class_b_M": 14624.506993866475,
+    "s3": 19509.227444366676,
+    "gcs": 18596.198477569487,
+    "r2": 16378.520607794222,
+    "delta_s3": -89.76384000000326
+   },
+   {
+    "knobs": "all tuned: manifest 10 s, polls 30 s, checkpoint 30 s, linger 100 ms",
+    "class_a_M": 1474.9125510856613,
+    "class_b_M": 6293.241418305797,
+    "s3": 14693.181772750626,
+    "gcs": 13780.152805953438,
+    "r2": 12071.008655339778,
+    "delta_s3": -4905.809511616053
+   }
+  ]
+ }
+}
