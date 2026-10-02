@@ -961,6 +961,29 @@ fn kek_config(args: &Args) -> anyhow::Result<vlpds::secrets::KekConfig> {
     })
 }
 
+fn peer_tls(args: &Args, node_id: &str, advertise_url: &str) -> anyhow::Result<Option<std::sync::Arc<vlpds::peer_tls::PeerTls>>> {
+    let Some(dir) = &args.peer_tls_dir else {
+        tracing::info!("lone node (no --peer-listen): no peer listener, no /internal/*, no peer calls");
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        advertise_url.starts_with("https://"),
+        "--advertise-url must be https://<host>:<--peer-listen port> (peers talk mTLS only), got {advertise_url:?}"
+    );
+    vlpds::peer_tls::check_node_id(node_id)?;
+    let files = if args.dev_mode {
+        vlpds::peer_tls::dev_files(dir, node_id, &[vlpds::peer_tls::url_host(advertise_url)?])?
+    } else {
+        vlpds::peer_tls::Files::in_dir(dir, node_id)
+    };
+    let t = vlpds::peer_tls::PeerTls::load(files).map_err(|e| e.context(format!("peer TLS (--peer-tls-dir {})", dir.display())))?;
+    anyhow::ensure!(t.node_id() == node_id, "{node_id}.crt names node {:?} but --node-id is {node_id:?}", t.node_id());
+    let (cert_exp, ca_exp) = t.not_after();
+    tracing::info!(node = %t.node_id(), cert_not_after = cert_exp, ca_not_after = ca_exp, "peer mTLS on");
+    t.spawn_reloader();
+    Ok(Some(t))
+}
+
 async fn run(args: Args) -> anyhow::Result<()> {
     if args.wrap_plc_rotation_key {
         return wrap_plc_rotation_key(&args).await;
@@ -998,30 +1021,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     };
     let node_id = args.node_id.clone().unwrap_or_else(|| "single".into());
     let advertise_url = args.advertise_url.clone().unwrap_or_else(|| args.public_url.clone());
-    let peer_tls = match &args.peer_tls_dir {
-        Some(dir) => {
-            anyhow::ensure!(
-                advertise_url.starts_with("https://"),
-                "--advertise-url must be https://<host>:<--peer-listen port> (peers talk mTLS only), got {advertise_url:?}"
-            );
-            vlpds::peer_tls::check_node_id(&node_id)?;
-            let files = if args.dev_mode {
-                vlpds::peer_tls::dev_files(dir, &node_id, &[vlpds::peer_tls::url_host(&advertise_url)?])?
-            } else {
-                vlpds::peer_tls::Files::in_dir(dir, &node_id)
-            };
-            let t = vlpds::peer_tls::PeerTls::load(files).map_err(|e| e.context(format!("peer TLS (--peer-tls-dir {})", dir.display())))?;
-            anyhow::ensure!(t.node_id() == node_id, "{node_id}.crt names node {:?} but --node-id is {node_id:?}", t.node_id());
-            let (cert_exp, ca_exp) = t.not_after();
-            tracing::info!(node = %t.node_id(), cert_not_after = cert_exp, ca_not_after = ca_exp, "peer mTLS on");
-            t.spawn_reloader();
-            Some(t)
-        }
-        None => {
-            tracing::info!("lone node (no --peer-listen): no peer listener, no /internal/*, no peer calls");
-            None
-        }
-    };
+    let peer_tls = peer_tls(&args, &node_id, &advertise_url)?;
+    let metrics_addr = metrics_listen(&args);
     let reshard_gc = Some(vlpds::reshard_gc::Config {
         grace: opt_duration(&args.reshard_gc_grace)?,
         detach_after: opt_duration(&args.forced_detach_after)?,
@@ -1133,7 +1134,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             levels: vlpds::version::Window::BUILD,
         }),
         memory_store: None,
-        metrics_listen: metrics_listen(&args),
+        metrics_listen: metrics_addr.clone(),
         log_retention,
         reshard_gc,
         cache_budget_bytes: args.cache_budget_mb.map(|m| m << 20),
@@ -1160,8 +1161,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         );
     }
     let listener = bind(&args.listen, args.listen_backlog).await?;
-    let metrics_listener = match metrics_listen(&args) {
-        Some(a) => Some(bind(&a, args.listen_backlog).await?),
+    let metrics_listener = match &metrics_addr {
+        Some(a) => Some(bind(a, args.listen_backlog).await?),
         None => None,
     };
     let peer_listener = match &args.peer_listen {
@@ -1173,7 +1174,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         tracing::info!(dir = %c.dir.display(), shard_mb = c.shard_bytes >> 20, "SST disk cache (per shard)");
     }
     server::spawn_reporters(&app);
-    tracing::info!(listen = %args.listen, metrics_listen = metrics_listen(&args).as_deref().unwrap_or("(app port)"), "vlpds serving");
+    tracing::info!(listen = %args.listen, metrics_listen = metrics_addr.as_deref().unwrap_or("(app port)"), "vlpds serving");
     if let Some(l) = metrics_listener {
         server::spawn_metrics_listener(&app, l);
     }
