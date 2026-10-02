@@ -446,8 +446,17 @@ commit hot path.
   a write that checked just before the move can apply its reference just
   after it. After a settle time (60 s, or the grace period if shorter) the
   references are checked again: if one appeared, the blob is moved back;
-  otherwise it is deleted. A write that checks after the move fails with
-  `BlobNotFound`, as it would for any missing blob.
+  otherwise it is deleted, unless a write that checked it is still in
+  flight on this node (`blobs::HeldBlobs`, taken by `check_blobs` before
+  its HEADs and dropped when the write is acked or fails): a write slower
+  than the settle time (a cold-load queue, a store brownout) then keeps it
+  for a later pass. A write that checks after the move fails with
+  `BlobNotFound`, as it would for any missing blob. `check_blobs` makes one
+  HEAD per distinct blob, not per declared ref.
+- **Legacy refs.** Writes refuse `{cid, mimeType}` refs, but importRepo
+  indexes them (as the reference's `enumBlobRefs(allowLegacy)`), so a
+  migrated old repo's images show in listBlobs/listMissingBlobs and the GC
+  keeps them.
 - **Aborted multipart uploads.** Large uploads go through a multipart upload
   to `blob-tmp/{did}/{random}`. A failed upload is aborted. A completed temp
   object left behind by a crash is deleted by the GC after 24 h. But the
@@ -2140,7 +2149,14 @@ root through the store).
   muts than the base set derives the node puts too). The deletes (the
   replaced nodes, from `LazyTree::write_diff_blocks`) are stored muts.
   Repo creation with genesis records, `importRepo` (`ReplaceRepo`) and
-  account deletion write or clear the whole set. A repo whose `M/` is
+  account deletion write or clear the whole set. importRepo parses the
+  CAR, checks it and builds the new tree on the blocking pool (record
+  bytes are slices of the body, no copies; a record block over 2 MiB is
+  refused; the CAR is capped by `--max-import-mb`, 1 GiB default) and
+  hands the worker the built tree, which only writes it: still one log
+  entry for the whole repo (a segment of its own when over the segment
+  size), so the cap also bounds that entry. No rate limit of its own yet
+  (the rate-limit layer, `ratelimit.rs`, is where one belongs). A repo whose `M/` is
   missing or wrong (a bug, a lost key range) is rebuilt from
   `R/` on open and backfilled through the log
   (`vlpds_lazy_mst_fallbacks_total{reason}`).
@@ -2412,7 +2428,20 @@ records of the same collection and subject in the new record's commit
 DID), records whose `$type` is their collection. Only createRecord, and
 not with `validate: false`; applyWrites, putRecord and importRepo index
 without pruning, so duplicates can exist and a later createRecord deletes
-them all. The deletes are ordinary ops of the same #commit.
+them (the oldest first, at most as many as keep the commit within 200
+ops: the rest go with later creates of the subject). The deletes are
+ordinary ops of the same #commit.
+
+- **Replay derives with the replaying binary.** A commit's `bl/` put is a
+  derived mut (`segment::derive` -> `backlinks::link` ->
+  `lexicon::valid_at_uri`, `syntax::valid_did`), so those validators'
+  verdicts are part of the segment format at its level: a changed verdict
+  would make a replayed index differ from the one the writer built.
+  `segment::tests::derivation_validator_verdicts_are_frozen` pins them on
+  the edge cases; changing one needs a feature level that gates the new
+  verdicts (derivation at the segment's level). The same holds for the
+  derived `M/` puts (`mst_lazy::persisted_blocks`): the node decoder may
+  not get stricter than what a writer at the segment's level emitted.
 
 - **Key.** `bl/{did}\0{code}{subject}` (slot-major like every per-repo
   family, so reshards carry it) → the rkeys with that subject, sorted and

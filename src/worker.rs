@@ -202,10 +202,14 @@ pub enum AccountOp {
     /// `stale_keys`: state keys that snapshot found stale (garbage `M/`
     /// nodes, index entries), deleted in the same batch (only meaningful
     /// with `swap_commit`: the state they were read from is still current).
+    /// `tree`: the MST of `records`, built (and its root computed) off the
+    /// worker thread by the caller (importRepo: hashing a big repo's tree
+    /// would stall every repo of the worker); None = the worker builds it.
     ReplaceRepo {
         records: Vec<(String, Cid, Bytes, Vec<Cid>)>,
         swap_commit: Option<Cid>,
         stale_keys: Vec<Bytes>,
+        tree: Option<Tree>,
     },
     /// Delete the account and repo: #account(active=false, status=deleted).
     Delete,
@@ -1119,6 +1123,23 @@ impl Worker {
             )));
             return;
         };
+        // Not cached is not "doesn't exist": a repo created (or loaded) and
+        // then evicted is only in durable state, and two createAccounts for
+        // one DID can both pass the handler's check. A head there means the
+        // repo exists (an account delete removes it). The repo isn't cached,
+        // so nothing of it is in flight: durable state is current. One point
+        // read on the worker thread, for a rare op.
+        match self.rt.block_on(partition.db.get(state::head_key(&req.did))) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                let _ = req.reply.send(Err(WriteError::Invalid(REPO_EXISTS.into())));
+                return;
+            }
+            Err(e) => {
+                let _ = req.reply.send(Err(WriteError::Unavailable(format!("repo existence check failed: {e}"))));
+                return;
+            }
+        }
         let mut tree = Tree::new();
         for (path, cid, _) in &req.records {
             if let Err(e) = tree.insert_no_proof(path.as_bytes(), *cid) {
@@ -1874,7 +1895,10 @@ fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock
             }
             Queued::Write(r) => r,
             Queued::Snapshot(r) => {
-                let _ = r.reply.send(Ok(st.view.clone()));
+                // a deleted repo's view keeps its old head over an empty
+                // tree: there is no repo to read
+                let deleted = st.account.status.as_deref() == Some("deleted");
+                let _ = r.reply.send(if deleted { Err(WriteError::RepoNotFound) } else { Ok(st.view.clone()) });
                 continue;
             }
             Queued::Account(a) => {
@@ -2004,14 +2028,19 @@ fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock
 /// Deletes of the records a `prune_backlinks` create among `writes`
 /// conflicts with: the repo's records of its collection whose subject is
 /// the new record's (its link's index value, loaded by `Need`).
+///
+/// At most `MAX_COMMIT_OPS - writes.len()` of them (the oldest rkeys
+/// first), so the commit stays within its op limit: the rest stay indexed
+/// and a later create for the same subject prunes them.
 fn backlink_conflicts(st: &mut RepoState, writes: &[Write]) -> anyhow::Result<Vec<Write>> {
     let mut deletes = Vec::new();
+    let room = MAX_COMMIT_OPS.saturating_sub(writes.len());
     for w in writes {
         let Write::Create { collection, bytes, prune_backlinks: true, .. } = w else { continue };
         let Some(link) = crate::backlinks::link(collection, bytes) else { continue };
         let bl = &mut st.backlinks;
         let (rkeys, tag) = bl.vals.get(&link[..]).ok_or_else(|| anyhow::anyhow!("backlink index value of {} not loaded", st.did))?;
-        for r in rkeys {
+        for r in rkeys.iter().take(room - deletes.len()) {
             // the deleted record's link is this one
             bl.paths.entry(format!("{collection}/{r}").into()).or_insert_with(|| (Some(link.clone().into()), tag.clone()));
             deletes.push(Write::Delete { collection: collection.clone(), rkey: r.to_string(), swap: None });
@@ -2426,6 +2455,27 @@ fn send_entry(st: &RepoState, entry: LogEntry) -> anyhow::Result<()> {
     enqueue(st, entry)
 }
 
+/// Acks an account op that wrote nothing (a no-op). With nothing in flight,
+/// at once; otherwise through an empty log entry (no frames, no muts: a
+/// private-state entry, skipped by the firehose), so the ack follows the
+/// repo's earlier entries in log order and a caller that sees it can rely
+/// on what it was ordered after being durable.
+fn ack_noop(st: &RepoState, reply: oneshot::Sender<Result<Head, WriteError>>) -> anyhow::Result<()> {
+    if st.pending.load(Ordering::Acquire) == 0 {
+        let _ = reply.send(Ok(st.head.clone()));
+        return Ok(());
+    }
+    let entry = LogEntry {
+        shard: st.partition.id,
+        frames: Vec::new(),
+        muts: Vec::new(),
+        ack: Some(head_ack(reply, st.head.clone())),
+        pending: Some(st.pending.clone()),
+        enqueued: Instant::now(),
+    };
+    send_entry(st, entry)
+}
+
 fn head_ack(
     reply: oneshot::Sender<Result<Head, WriteError>>,
     head: Head,
@@ -2560,9 +2610,10 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
         } => {
             let account = match mutate_account(st, mutate) {
                 Ok(Some(a)) => a,
-                // rejected, or nothing to write: ack now (a no-op logs nothing)
-                r => {
-                    let _ = req.reply.send(r.map(|_| st.head.clone()));
+                // nothing to write: acked in log order (`ack_noop`)
+                Ok(None) => return ack_noop(st, req.reply),
+                Err(e) => {
+                    let _ = req.reply.send(Err(e));
                     return Ok(());
                 }
             };
@@ -2604,9 +2655,10 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
         AccountOp::Activate { mutate } => {
             let account = match mutate_account(st, mutate) {
                 Ok(Some(a)) => a,
-                // rejected, or nothing to write: ack now (a no-op logs nothing)
-                r => {
-                    let _ = req.reply.send(r.map(|_| st.head.clone()));
+                // nothing to write: acked in log order (`ack_noop`)
+                Ok(None) => return ack_noop(st, req.reply),
+                Err(e) => {
+                    let _ = req.reply.send(Err(e));
                     return Ok(());
                 }
             };
@@ -2632,7 +2684,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             ));
             st.account = account;
         }
-        AccountOp::ReplaceRepo { records, swap_commit, stale_keys } => {
+        AccountOp::ReplaceRepo { records, swap_commit, stale_keys, tree: prebuilt } => {
             if let Some(swap) = swap_commit.filter(|c| *c != st.head.commit) {
                 let _ = req.reply.send(Err(WriteError::InvalidSwap(format!("head commit is {}, not {swap}", st.head.commit))));
                 return Ok(());
@@ -2657,13 +2709,16 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             let old_nodes = clear_repo_mutations(st, &mut muts, src)?;
             clear_backlinks(st, &mut muts, &done)?;
             let rev = tid::next_rev(Some(st.head.rev), clock_id);
-            let mut tree = Tree::new();
+            let build = prebuilt.is_none();
+            let mut tree = prebuilt.unwrap_or_default();
             let mut colls = HashSet::new();
             for (path, cid, bytes, blobs) in &records {
                 if colls.insert(collection_of(path)) {
                     muts.push(Mutation { key: state::collection_key(collection_of(path), &st.did).into(), val: Some(Bytes::new()) });
                 }
-                tree.insert_no_proof(path.as_bytes(), *cid)?;
+                if build {
+                    tree.insert_no_proof(path.as_bytes(), *cid)?;
+                }
                 muts.push(Mutation {
                     key: state::record_key(&st.did, path).into(),
                     val: Some(state::record_value(cid, rev.0, bytes)),
@@ -2740,11 +2795,8 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             st.account.status = Some("deleted".into());
         }
         AccountOp::SigningKey(step) => match key_step(st, step, clock_id, &time, &mut frames, &mut muts)? {
-            // nothing to write: ack now (a no-op logs nothing)
-            KeyOutcome::Noop => {
-                let _ = req.reply.send(Ok(st.head.clone()));
-                return Ok(());
-            }
+            // nothing to write: acked in log order (`ack_noop`)
+            KeyOutcome::Noop => return ack_noop(st, req.reply),
             KeyOutcome::Refused(e) => {
                 let _ = req.reply.send(Err(e));
                 return Ok(());
@@ -3212,6 +3264,116 @@ mod tests {
         let mut t = Ts(0, 0);
         unsafe { clock_gettime(clk, &mut t) };
         t.0 as f64 + t.1 as f64 * 1e-9
+    }
+
+    /// A partition whose "sequencer" is the test (`rx`), and `apply`, which
+    /// writes an entry's muts to its db and acks it.
+    async fn test_partition() -> (Arc<Partition>, tokio::sync::mpsc::Receiver<LogEntry>) {
+        let store = crate::store::Store::memory(None);
+        let db = Arc::new(crate::partition::open_db(&store, crate::slots::ShardId(0), None).await.unwrap());
+        let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
+        let log = NodeLog::start(
+            store.clone(),
+            NodeLogConfig { log_id: "t".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(1), lease_ok: None },
+            merger_tx,
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel::<LogEntry>(16);
+        (Arc::new(Partition { id: crate::slots::ShardId(0), epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() }), rx)
+    }
+
+    async fn apply(db: &Arc<slatedb::Db>, e: LogEntry) {
+        let mut wb = slatedb::WriteBatch::new();
+        for m in &e.muts {
+            match &m.val {
+                Some(v) => wb.put(&m.key, v),
+                None => wb.delete(&m.key),
+            }
+        }
+        if !e.muts.is_empty() {
+            db.write(wb).await.unwrap();
+        }
+        settle(e);
+    }
+
+    async fn create_req(did: &Arc<str>) -> (WorkerMsg, oneshot::Receiver<Result<Head, WriteError>>) {
+        let key = Arc::new(Keypair::generate());
+        let account = serde_json::json!({
+            "did": &**did, "handle": "t.test", "wrapped_signing_key": Secrets::dev().wrap_signing_key(did, &key).await.unwrap().0, "signing_pubkey": key.public_multibase(),
+            "password_hash": "", "created_at": "2026-01-01T00:00:00Z",
+        });
+        let (reply, rx) = oneshot::channel();
+        let req = CreateRepoReq { did: did.clone(), handle: "t.test".into(), key, account_json: Bytes::from(serde_json::to_vec(&account).unwrap()), records: Vec::new(), reply };
+        (WorkerMsg::CreateRepo(req), rx)
+    }
+
+    /// A repo that is only in durable state (created, then evicted: here a
+    /// fresh worker) can't be created again over (a concurrent createAccount
+    /// for an existing DID used to overwrite it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_repo_refuses_a_durable_repo() {
+        let (part, mut rx) = test_partition().await;
+        let db = part.db.clone();
+        let p2 = part.clone();
+        let route: PartitionLookup = Arc::new(move |_: &str| Some(p2.clone()));
+        let did: Arc<str> = "did:plc:createtwice".into();
+        {
+            let workers = spawn(1, 100, route.clone(), tokio::runtime::Handle::current());
+            let (m, created) = create_req(&did).await;
+            workers.senders[0].send(m).unwrap();
+            apply(&db, rx.recv().await.unwrap()).await;
+            created.await.unwrap().unwrap();
+        }
+        let workers = spawn(1, 100, route, tokio::runtime::Handle::current());
+        let (m, again) = create_req(&did).await;
+        workers.senders[0].send(m).unwrap();
+        let r = tokio::time::timeout(Duration::from_secs(5), again).await.unwrap().unwrap();
+        assert!(matches!(&r, Err(WriteError::Invalid(m)) if m == REPO_EXISTS), "{:?}", r.map(|h| h.rev));
+        assert!(rx.try_recv().is_err(), "nothing logged");
+    }
+
+    /// A no-op account op is acked after the repo's earlier entries, not
+    /// before them; and a deleted repo has no snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn noop_account_ops_ack_in_log_order() {
+        let (part, mut rx) = test_partition().await;
+        let db = part.db.clone();
+        let p2 = part.clone();
+        let workers = spawn(1, 100, Arc::new(move |_: &str| Some(p2.clone())), tokio::runtime::Handle::current());
+        let w = workers.senders[0].clone();
+        let did: Arc<str> = "did:plc:noopack".into();
+        let (m, created) = create_req(&did).await;
+        w.send(m).unwrap();
+        apply(&db, rx.recv().await.unwrap()).await;
+        created.await.unwrap().unwrap();
+        let account = |mutate: AccountMutation| {
+            let (reply, r) = oneshot::channel();
+            (WorkerMsg::Account(AccountReq { did: did.clone(), op: AccountOp::Update { mutate, identity_event: false, account_event: false }, reply }), r)
+        };
+        // nothing in flight: acked at once, nothing logged
+        let (m, mut r) = account(Box::new(|_| Ok(false)));
+        w.send(m).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut r).await.unwrap().unwrap().unwrap();
+        // behind an in-flight commit: waits for it
+        let (m, first) = write(&did, "a");
+        w.send(m).unwrap();
+        let inflight = rx.recv().await.unwrap();
+        let (m, mut noop) = account(Box::new(|_| Ok(false)));
+        w.send(m).unwrap();
+        let empty = rx.recv().await.unwrap();
+        assert!(empty.muts.is_empty() && empty.frames.is_empty(), "an empty entry carries the ack");
+        assert!(noop.try_recv().is_err(), "acked before the earlier commit");
+        apply(&db, inflight).await;
+        first.await.unwrap().unwrap();
+        apply(&db, empty).await;
+        noop.await.unwrap().unwrap();
+        // deleted: no snapshot of the old head over an empty tree
+        let (reply, deleted) = oneshot::channel();
+        w.send(WorkerMsg::Account(AccountReq { did: did.clone(), op: AccountOp::Delete, reply })).unwrap();
+        apply(&db, rx.recv().await.unwrap()).await;
+        deleted.await.unwrap().unwrap();
+        let (reply, snap) = oneshot::channel();
+        w.send(WorkerMsg::Snapshot(SnapshotReq { did: did.clone(), reply, permit: None })).unwrap();
+        assert!(matches!(snap.await.unwrap(), Err(WriteError::RepoNotFound)));
     }
 
     /// CPU per commit of the worker's commit path (validate, MST insert,

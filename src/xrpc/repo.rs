@@ -2,7 +2,8 @@ use super::extract::RecordBody;
 use super::*;
 use crate::cbor::{JsonValue, RecordRefs};
 
-pub fn routes() -> Router<Arc<App>> {
+/// `max_import_bytes`: the importRepo body limit (`Config::max_import_bytes`).
+pub fn routes(max_import_bytes: usize) -> Router<Arc<App>> {
     let r = Router::new()
         .route("/xrpc/com.atproto.repo.createRecord", post(create_record))
         .route("/xrpc/com.atproto.repo.putRecord", post(put_record))
@@ -13,13 +14,21 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/com.atproto.repo.describeRepo", get(describe_repo))
         .route(
             "/xrpc/com.atproto.repo.importRepo",
-            post(import_repo).layer(axum::extract::DefaultBodyLimit::max(MAX_IMPORT_BYTES)),
+            post(import_repo).layer(axum::extract::DefaultBodyLimit::max(max_import_bytes)),
         );
     r
 }
 
-/// Largest CAR importRepo accepts (it is parsed in memory).
-const MAX_IMPORT_BYTES: usize = 1 << 30;
+/// Default largest CAR importRepo accepts (`Config::max_import_bytes`).
+/// It is parsed in memory (the body plus the parsed tree: record bytes
+/// aren't copied), and the import is written as one log entry, about the
+/// CAR's size (a segment of its own when larger than a segment).
+pub const DEFAULT_MAX_IMPORT_BYTES: usize = 1 << 30;
+
+/// Largest record block an import takes. The reference sets none; vlpds's
+/// own writes refuse a record over 1 MB, so this leaves room for records
+/// made elsewhere while bounding what one record costs every later read.
+const MAX_IMPORT_RECORD_BYTES: usize = 2 << 20;
 
 /// Collection must be an NSID and rkey a valid record key.
 fn check_path(collection: &str, rkey: Option<&str>) -> XResult<()> {
@@ -155,8 +164,21 @@ fn take<'a>(v: &mut JsonValue<'a>, k: &str) -> XResult<JsonValue<'a>> {
 /// be taken down (reference: processWriteBlobs -> "Could not find blob"),
 /// and its declared mimeType and size must match the stored blob (reference
 /// verifyBlob), so lexicon `accept`/`maxSize` checks hold for the real bytes.
-async fn check_blobs(app: &App, did: &str, decls: &[BlobDecl]) -> XResult<()> {
-    for (cid, mime, size) in decls {
+///
+/// One takedown check and HEAD per distinct blob (a 1 MB record can declare
+/// ~9k refs), one comparison per distinct declaration. The returned guard
+/// holds the blobs against the GC's purge ([`super::blobs::HeldBlobs`]):
+/// keep it until the write has applied (or failed). It is taken before the
+/// checks, so a quarantine that races them is covered too.
+async fn check_blobs(app: &App, did: &str, decls: &[BlobDecl]) -> XResult<super::blobs::HeldBlobs> {
+    let mut seen = std::collections::HashSet::with_capacity(decls.len());
+    let decls: Vec<&BlobDecl> = decls.iter().filter(|d| seen.insert(*d)).collect();
+    let mut cids: Vec<Cid> = Vec::with_capacity(decls.len());
+    let mut distinct = std::collections::HashSet::with_capacity(decls.len());
+    cids.extend(decls.iter().map(|d| d.0).filter(|c| distinct.insert(*c)));
+    let held = super::blobs::HeldBlobs::hold(did, cids.iter().copied());
+    let mut stored: std::collections::HashMap<Cid, (String, u64)> = std::collections::HashMap::with_capacity(cids.len());
+    for cid in &cids {
         let missing = || XrpcError::bad("BlobNotFound", format!("Could not find blob: {cid}"));
         if super::admin::is_blob_takendown(app, did, &cid.to_string()).await? {
             return Err(missing());
@@ -167,7 +189,10 @@ async fn check_blobs(app: &App, did: &str, decls: &[BlobDecl]) -> XResult<()> {
             Err(object_store::Error::NotFound { .. }) => return Err(missing()),
             Err(e) => return Err(XrpcError::from_err(e)),
         };
-        let stored_mime = super::blobs::stored_mime(&found.attributes);
+        stored.insert(*cid, (super::blobs::stored_mime(&found.attributes), found.meta.size));
+    }
+    for (cid, mime, size) in decls {
+        let (stored_mime, stored_size) = &stored[cid];
         if mime.as_deref() != Some(stored_mime.as_str()) {
             return Err(XrpcError::bad(
                 "InvalidMimeType",
@@ -177,8 +202,7 @@ async fn check_blobs(app: &App, did: &str, decls: &[BlobDecl]) -> XResult<()> {
                 ),
             ));
         }
-        let stored_size = found.meta.size;
-        if *size != i64::try_from(stored_size).ok() {
+        if *size != i64::try_from(*stored_size).ok() {
             return Err(XrpcError::bad(
                 "InvalidSize",
                 format!(
@@ -188,7 +212,7 @@ async fn check_blobs(app: &App, did: &str, decls: &[BlobDecl]) -> XResult<()> {
             ));
         }
     }
-    Ok(())
+    Ok(held)
 }
 
 async fn submit(
@@ -307,7 +331,7 @@ async fn create_record(
     let schema = crate::lexicon::resolve_record_schema(&app, &inp.collection, inp.validate).await;
     let (cid, bytes, blobs, status, decls) =
         encode_record(&mut inp.record, &inp.collection, &rkey, inp.validate, schema.as_deref())?;
-    check_blobs(&app, &did, &decls).await?;
+    let _held = check_blobs(&app, &did, &decls).await?;
     let swap = parse_cid_opt(&inp.swap_commit)?;
     let path = format!("{}/{}", inp.collection, rkey);
     let ack = submit(
@@ -413,7 +437,7 @@ async fn put_record(
             )));
         }
     }
-    check_blobs(&app, &did, &decls).await?;
+    let _held = check_blobs(&app, &did, &decls).await?;
     let w = Write::Update {
         collection: inp.collection,
         rkey: inp.rkey,
@@ -607,7 +631,7 @@ async fn apply_writes(
             }
         }
     }
-    check_blobs(&app, &did, &decls).await?;
+    let _held = check_blobs(&app, &did, &decls).await?;
     let ack = submit(&app, did.clone(), writes, swap).await?;
     let results: Vec<J> = ack
         .results
@@ -888,24 +912,31 @@ async fn import_repo(
             message: "Account has been taken down".into(),
         });
     }
-    let records = tokio::task::spawn_blocking(move || parse_import(&body).map(|r| (did, r)))
+    // parsing, checking and building the new tree all run on the blocking
+    // pool: the repo's worker only writes the result
+    let parsed = tokio::task::spawn_blocking(move || parse_import(&body).map(|r| (did, r)))
         .await
         .map_err(XrpcError::from_err)?;
-    let (did, records) = records?;
-    app.account_op(&did, crate::worker::AccountOp::ReplaceRepo { records, swap_commit: None, stale_keys: Vec::new() })
-        .await?;
+    let (did, (records, tree)) = parsed?;
+    app.account_op(
+        &did,
+        crate::worker::AccountOp::ReplaceRepo { records, swap_commit: None, stale_keys: Vec::new(), tree: Some(tree) },
+    )
+    .await?;
     Ok(StatusCode::OK)
 }
 
 type ImportedRecord = (String, Cid, Bytes, Vec<Cid>);
 
-fn parse_import(body: &[u8]) -> XResult<Vec<ImportedRecord>> {
+/// The records of an import CAR, their bytes sliced from `body` (no
+/// copies), and their MST (checked to rebuild to the commit's data root).
+fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate::mst::Tree)> {
     let bad = |m: String| XrpcError::bad("InvalidRequest", m);
     let (roots, blocks) = car::read_car(body).map_err(|e| bad(format!("invalid CAR: {e}")))?;
     if roots.len() != 1 {
         return Err(bad("expected one root".into()));
     }
-    let mut map: std::collections::HashMap<Cid, Vec<u8>> =
+    let mut map: std::collections::HashMap<Cid, &[u8]> =
         std::collections::HashMap::with_capacity(blocks.len());
     for (c, b) in blocks {
         let actual = if c.codec == crate::cid::CODEC_RAW {
@@ -916,7 +947,7 @@ fn parse_import(body: &[u8]) -> XResult<Vec<ImportedRecord>> {
         if actual != c {
             return Err(bad(format!("block does not match its cid: {c}")));
         }
-        map.insert(c, b.to_vec());
+        map.insert(c, b);
     }
     let commit_bytes = map
         .get(&roots[0])
@@ -940,8 +971,10 @@ fn parse_import(body: &[u8]) -> XResult<Vec<ImportedRecord>> {
     if let Some(k) = key_err {
         return Err(bad(format!("invalid record path {k}")));
     }
+    drop(tree);
     // walk() skips subtrees missing from the CAR: rebuilding from the walked
-    // entries reproduces `data` only if the tree was complete.
+    // entries reproduces `data` only if the tree was complete. The rebuilt
+    // tree is the one the worker writes.
     let mut check = crate::mst::Tree::new();
     for (path, cid) in &entries {
         check
@@ -956,16 +989,19 @@ fn parse_import(body: &[u8]) -> XResult<Vec<ImportedRecord>> {
         if !super::syntax::valid_record_path(&path) {
             return Err(bad(format!("invalid record path {path}")));
         }
-        let bytes = map
+        let bytes = *map
             .get(&cid)
             .ok_or_else(|| bad(format!("missing record block {cid} at {path}")))?;
+        if bytes.len() > MAX_IMPORT_RECORD_BYTES {
+            return Err(bad(format!("record at '{path}' too large ({} bytes)", bytes.len())));
+        }
         let v =
             Value::decode(bytes).map_err(|_| bad(format!("Could not parse record at '{path}'")))?;
         let mut blobs = Vec::new();
         blob_refs(&v, &mut blobs);
-        out.push((path, cid, Bytes::from(bytes.clone()), blobs));
+        out.push((path, cid, body.slice_ref(bytes), blobs));
     }
-    Ok(out)
+    Ok((out, check))
 }
 
 #[cfg(test)]

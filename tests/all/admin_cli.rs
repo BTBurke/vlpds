@@ -328,7 +328,7 @@ async fn check_and_rebuild_repo() {
 
     // the replace is guarded by the head the records were read at
     let stale = Some(Cid::from_bytes(&head0.to_bytes()).unwrap());
-    let r = s.app.account_op(&a.did, vlpds::worker::AccountOp::ReplaceRepo { records: Vec::new(), swap_commit: stale, stale_keys: Vec::new() }).await;
+    let r = s.app.account_op(&a.did, vlpds::worker::AccountOp::ReplaceRepo { records: Vec::new(), swap_commit: stale, stale_keys: Vec::new(), tree: None }).await;
     assert_eq!(r.err().map(|e| e.error), Some("InvalidSwap".to_string()));
     assert_eq!(s.list_records(&a.did, "app.bsky.feed.post", &[("limit", "5")]).await.ok()["records"].as_array().unwrap().len(), 5);
 

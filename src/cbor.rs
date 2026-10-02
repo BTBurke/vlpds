@@ -204,15 +204,18 @@ impl Value {
     /// lex-json: `$link` / `$bytes` objects must have exactly that one
     /// string field holding a valid CID / base64; `$type` must be a non-empty
     /// string; `{"$type": "blob"}` needs a `$link` ref, a string mimeType
-    /// and an integer size; numbers must be integers (JSON `123.0` parses
-    /// as the integer 123, as in JavaScript).
+    /// and an integer size; numbers must be safe integers, |n| <= 2^53 - 1
+    /// (JSON `123.0` parses as the integer 123, as in JavaScript; the
+    /// reference's lex-cbor encoder refuses any number that isn't
+    /// `Number.isSafeInteger`, whether written `2^60` or `2^60.0`).
     pub fn from_json(j: &serde_json::Value) -> Result<Value, CborError> {
         let dm = |m: &str| CborError::DataModel(m.to_string());
         Ok(match j {
             serde_json::Value::Null => Value::Null,
             serde_json::Value::Bool(b) => Value::Bool(*b),
             serde_json::Value::Number(n) => match n.as_i64() {
-                Some(i) => Value::Int(i),
+                Some(i) if safe_int(i) => Value::Int(i),
+                Some(_) => return Err(dm("integers beyond 2^53 - 1 are not allowed")),
                 None => match n.as_f64() {
                     // integer-valued floats within JS's safe integer range
                     Some(f) if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_991.0 => {
@@ -460,18 +463,19 @@ pub struct RecordRefs {
 impl RecordRefs {
     /// Distinct blob CIDs, in order of first reference.
     pub fn cids(&self) -> Vec<Cid> {
-        let mut out: Vec<Cid> = Vec::with_capacity(self.blobs.len());
-        for (c, ..) in &self.blobs {
-            if !out.contains(c) {
-                out.push(*c);
-            }
-        }
-        out
+        // a set, not `Vec::contains`: a 1 MB record holds ~9k refs
+        let mut seen = std::collections::HashSet::with_capacity(self.blobs.len());
+        self.blobs.iter().map(|(c, ..)| *c).filter(|c| seen.insert(*c)).collect()
     }
 }
 
-/// Largest integer a JSON float may carry into a record (JS's safe range).
+/// Largest integer a JSON number may carry into a record (JS's safe range).
 const MAX_SAFE_INT: f64 = 9_007_199_254_740_991.0;
+
+/// Within JS's safe integer range (`Number.isSafeInteger`).
+fn safe_int(n: i64) -> bool {
+    n.unsigned_abs() <= MAX_SAFE_INT as u64
+}
 
 // A typed blob ref, as @atproto/lex-data's strict `isTypedBlobRef` checks
 // it: exactly `$type`, `ref`, `mimeType` and `size`; `ref` a raw-codec CID,
@@ -578,7 +582,8 @@ impl<'a> JsonValue<'a> {
         match self {
             JsonValue::Null => write_null(out),
             JsonValue::Bool(b) => write_bool(out, *b),
-            JsonValue::Int(n) => write_int(out, *n),
+            JsonValue::Int(n) if safe_int(*n) => write_int(out, *n),
+            JsonValue::Int(_) => return Err(()),
             JsonValue::Float(f) => {
                 if f.fract() != 0.0 || f.abs() > MAX_SAFE_INT {
                     return Err(());
@@ -1289,6 +1294,31 @@ mod tests {
         }
     }
 
+    /// Numbers are safe integers however they are written (lex-cbor's
+    /// encoder: `Number.isSafeInteger`), integer or integral float.
+    #[test]
+    fn json_numbers_must_be_safe_integers() {
+        for (text, ok) in [
+            ("9007199254740991", true),
+            ("-9007199254740991", true),
+            ("9007199254740991.0", true),
+            ("9007199254740992", false),
+            ("-9007199254740992", false),
+            ("9007199254740992.0", false),
+            ("9223372036854775807", false),
+            ("-9223372036854775808", false),
+            ("18446744073709551615", false),
+            ("1.5", false),
+        ] {
+            let rec = format!(r#"{{"n": {text}}}"#);
+            let j: serde_json::Value = serde_json::from_str(&rec).unwrap();
+            let mut out = Vec::new();
+            let one_pass = JsonValue::parse(rec.as_bytes()).unwrap().encode_record(&mut out, &mut RecordRefs::default());
+            assert_eq!(Value::from_json(&j).is_ok(), ok, "{text}");
+            assert_eq!(one_pass.is_ok(), ok, "{text}");
+        }
+    }
+
     #[test]
     fn huge_lengths_are_errors_not_panics() {
         // byte/text strings and arrays of length u64::MAX
@@ -1333,7 +1363,7 @@ mod tests {
         let j = serde_json::json!({
             "$type": "app.bsky.feed.post",
             "text": "quote \" backslash \\ nl \n tab \t ctl \u{1} emoji \u{1F600}",
-            "n": [0, -1, 23, 24, -25, 255, 256, 65536, i64::MAX, i64::MIN + 1, i64::MIN],
+            "n": [0, -1, 23, 24, -25, 255, 256, 65536, 9_007_199_254_740_991i64, -9_007_199_254_740_991i64],
             "b": {"$bytes": "AQIDBA"},
             "e": {"$bytes": ""},
             "l": {"$link": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"},
@@ -1350,5 +1380,10 @@ mod tests {
         bad.push(0);
         assert!(write_json(&bad, &mut out).is_err());
         assert_eq!(out, before);
+        // stored records may hold any 64-bit integer (CBOR from a CAR)
+        let big = Value::Array([i64::MAX, i64::MIN + 1, i64::MIN].map(Value::Int).to_vec()).to_cbor();
+        let mut out = Vec::new();
+        write_json(&big, &mut out).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&out).unwrap(), serde_json::json!([i64::MAX, i64::MIN + 1, i64::MIN]));
     }
 }

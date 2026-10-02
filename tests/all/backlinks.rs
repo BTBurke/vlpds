@@ -422,3 +422,48 @@ async fn reshard_carries_the_index() {
         check_backlinks(&s, &x.did).await;
     }
 }
+
+/// More duplicates than one commit may hold: a create prunes as many as
+/// fit (the commit stays within 200 ops, oldest first) and later creates
+/// prune the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_pruning_is_capped_per_commit() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("blcap").await;
+    let w = |rkey: usize| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": LIKE, "rkey": rk(rkey), "value": rec(LIKE, 9)});
+    for range in [0..200, 200..250] {
+        let writes: Vec<J> = range.map(w).collect();
+        s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok();
+    }
+    let all = || async {
+        let (mut out, mut cursor) = (Vec::new(), None::<String>);
+        loop {
+            let mut q = vec![("limit", "100")];
+            if let Some(c) = &cursor {
+                q.push(("cursor", c.as_str()));
+            }
+            let l = s.list_records(&a.did, LIKE, &q).await.ok();
+            let page: Vec<String> = l["records"].as_array().unwrap().iter().map(|r| r["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_string()).collect();
+            let done = page.is_empty();
+            out.extend(page);
+            match l["cursor"].as_str() {
+                Some(c) if !done => cursor = Some(c.to_string()),
+                _ => return out,
+            }
+        }
+    };
+    assert_eq!(all().await.len(), 250);
+    let mut sub = s.subscribe_from_now().await;
+    let kept = create(&s, &a, LIKE, rec(LIKE, 9), None).await;
+    let frames = sub.wait_for(Duration::from_secs(10), &a.did, "#commit").await;
+    let ops = frames.iter().rev().find_map(|f| f.commit()).map(|c| c.ops.len()).unwrap();
+    assert_eq!(ops, 200, "the 199 oldest duplicates deleted with the create");
+    let left = all().await;
+    assert_eq!(left.len(), 52);
+    assert!(left.contains(&rk(249)) && !left.contains(&rk(198)), "oldest first");
+    create(&s, &a, LIKE, rec(LIKE, 9), None).await;
+    let left = all().await;
+    assert_eq!(left.len(), 1);
+    assert!(!left.contains(&kept.rkey().to_string()));
+    assert_eq!(check_backlinks(&s, &a.did).await, 1);
+}

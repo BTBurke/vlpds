@@ -707,4 +707,73 @@ mod tests {
         let e = decode(Bytes::from(big)).unwrap_err();
         assert!(e.to_string().contains("zstd frame"), "{e}");
     }
+
+    /// Replay derives a commit's `bl/` put with the *replaying* binary's
+    /// validators (`backlinks::link` -> `lexicon::valid_at_uri`,
+    /// `syntax::valid_did`), so their verdicts are part of the segment
+    /// format at its level (DESIGN.md "Rolling upgrades", derived muts): a
+    /// verdict that changes would make a replayed index differ from the one
+    /// the writer built. This table freezes them on the edge cases; a change
+    /// here needs a new feature level that gates the new verdicts.
+    #[test]
+    fn derivation_validator_verdicts_are_frozen() {
+        use crate::cbor::Value;
+        let rec = |coll: &str, subject: Value| {
+            let mut m = vec![("$type".to_string(), Value::Text(coll.into())), ("subject".to_string(), subject)];
+            m.sort_by(|a, b| crate::cbor::key_cmp(&a.0, &b.0));
+            Value::Map(m).to_cbor()
+        };
+        let uri = |u: &str| Value::Map(vec![("cid".into(), Value::Text("bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454".into())), ("uri".into(), Value::Text(u.into()))]);
+        let long_did = format!("did:plc:{}", "a".repeat(2040));
+        let longer_did = format!("did:plc:{}", "a".repeat(2041));
+        let dids: Vec<(&str, bool)> = vec![
+            ("did:plc:abc", true),
+            ("did:web:example.com", true),
+            ("did:web:localhost%3A8080", true),
+            ("did:PLC:abc", false),
+            ("did:plc:", false),
+            ("did:plc:abc:", false),
+            ("did:plc:abc#frag", false),
+            ("did:plc:abc%", false),
+            ("did:plc:abc%zz", true),
+            (" did:plc:abc", false),
+            ("did:plc:abc\n", false),
+            ("did:plc:a.b-c_d:e", true),
+            ("did:plc:é", false),
+            (&long_did, true),
+            (&longer_did, false),
+            ("DID:plc:abc", false),
+        ];
+        for (d, want) in &dids {
+            let got = crate::backlinks::link("app.bsky.graph.follow", &rec("app.bsky.graph.follow", Value::Text(d.to_string())));
+            assert_eq!(got.is_some(), *want, "follow {d:?}");
+        }
+        let uris: Vec<(&str, bool)> = vec![
+            ("at://did:plc:abc/app.bsky.feed.post/3k", true),
+            ("at://did:plc:abc", true),
+            ("at://did:plc:abc/app.bsky.feed.post", true),
+            ("at://alice.test/app.bsky.feed.post/3k", true),
+            ("at://did:plc:abc/app.bsky.feed.post/", false),
+            ("at://did:plc:abc/app.bsky.feed.post/3k#frag", false),
+            ("at://did:plc:abc/app.bsky.feed.post/3k?q=1", false),
+            ("at://did:plc:abc/notnsid/3k", false),
+            ("at://did:plc:abc/app.bsky.feed.post/3k/extra", false),
+            ("AT://did:plc:abc/app.bsky.feed.post/3k", false),
+            ("https://example.com", false),
+            ("at://", false),
+            ("at://did:plc:abc//3k", false),
+        ];
+        for (u, want) in &uris {
+            let got = crate::backlinks::link("app.bsky.feed.like", &rec("app.bsky.feed.like", uri(u)));
+            assert_eq!(got.is_some(), *want, "like {u:?}");
+        }
+        // shape: wrong $type, non-string subject, a like's bare-string subject
+        assert!(crate::backlinks::link("app.bsky.graph.follow", &rec("app.bsky.graph.block", Value::Text("did:plc:abc".into()))).is_none());
+        assert!(crate::backlinks::link("app.bsky.graph.follow", &rec("app.bsky.graph.follow", Value::Int(1))).is_none());
+        assert!(crate::backlinks::link("app.bsky.feed.like", &rec("app.bsky.feed.like", Value::Text("at://did:plc:abc".into()))).is_none());
+        assert_eq!(
+            crate::backlinks::link("app.bsky.feed.repost", &rec("app.bsky.feed.repost", uri("at://did:plc:abc/app.bsky.feed.post/3k"))).as_deref(),
+            Some(&b"rat://did:plc:abc/app.bsky.feed.post/3k"[..])
+        );
+    }
 }

@@ -26,6 +26,7 @@ pub use blobs::spawn_blob_gc;
 pub use server::{drop_revocation, reset_token_did, revocation_expired, set_stale_claim_grace, spawn_reserved_key_gc, sweep_reserved_keys};
 pub use server::{auth_epoch, auth_epoch_cond, epoch_for_login, new_auth_epoch_op, AUTH_EPOCH};
 pub use sync::{request_crawl, set_export_buffer_max_mb, DEFAULT_EXPORT_STALL, DEFAULT_MAX_EXPORTS};
+pub use repo::DEFAULT_MAX_IMPORT_BYTES;
 pub use server::{set_mailer, LogMailer, Mail, Mailer};
 
 /// Imports shared by every XRPC module (they `use super::*`).
@@ -267,7 +268,7 @@ pub fn router(app: Arc<App>) -> Router {
             Router::new()
                 .merge(server::routes())
                 .merge(identity::routes())
-                .merge(repo::routes())
+                .merge(repo::routes(app.config.max_import_bytes))
                 .merge(sync::routes())
                 .merge(blobs::routes())
                 .merge(admin::routes())
@@ -661,22 +662,36 @@ impl App {
     }
 }
 
-/// Blob CIDs referenced by a record ({"$type": "blob", "ref": {"$link": ...}}).
+/// Blob CIDs referenced by a stored record, distinct, in walk order:
+/// typed refs (`{"$type": "blob", "ref": {"$link": ...}}`) and legacy ones
+/// (exactly `{"cid": "<cid string>", "mimeType": "<non-empty>"}`), as the
+/// reference indexes an imported record's blobs (`enumBlobRefs` with
+/// `allowLegacy: true, strict: false`). Writes never get here with a
+/// legacy ref (they are refused: "Legacy blobs are not allowed"), but old
+/// repos migrating in hold them, and an unindexed ref is missing from
+/// listMissingBlobs/listBlobs and collected by the blob GC.
 pub fn blob_refs(v: &Value, out: &mut Vec<Cid>) {
-    match v {
-        Value::Map(m) => {
-            if v.get("$type").and_then(|t| t.as_str()) == Some("blob") {
-                if let Some(Value::Link(c)) = v.get("ref") {
-                    if !out.contains(c) {
-                        out.push(*c);
+    fn walk(v: &Value, out: &mut Vec<Cid>, seen: &mut std::collections::HashSet<Cid>) {
+        match v {
+            Value::Map(m) => {
+                let found = match (v.get("$type"), v.get("ref"), v.get("cid"), v.get("mimeType")) {
+                    (Some(Value::Text(t)), Some(Value::Link(c)), ..) if t == "blob" => Some(*c),
+                    (None, _, Some(Value::Text(c)), Some(Value::Text(mime))) if m.len() == 2 && !mime.is_empty() => {
+                        Cid::parse(c).ok()
                     }
+                    _ => None,
+                };
+                if let Some(c) = found.filter(|c| seen.insert(*c)) {
+                    out.push(c);
+                }
+                for (_, child) in m {
+                    walk(child, out, seen);
                 }
             }
-            for (_, child) in m {
-                blob_refs(child, out);
-            }
+            Value::Array(a) => a.iter().for_each(|c| walk(c, out, seen)),
+            _ => {}
         }
-        Value::Array(a) => a.iter().for_each(|c| blob_refs(c, out)),
-        _ => {}
     }
+    let mut seen = out.iter().copied().collect();
+    walk(v, out, &mut seen);
 }

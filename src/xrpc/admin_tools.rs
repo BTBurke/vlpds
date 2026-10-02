@@ -380,7 +380,7 @@ async fn rebuild_repo(State(app): AppState, Auth(creds): Auth, Json(inp): Json<R
     }
     let (records, stale_keys) = (ins.records, ins.stale_keys);
     let swap = Some(ins.head.commit);
-    let head = app.account_op(&did, crate::worker::AccountOp::ReplaceRepo { records, swap_commit: swap, stale_keys }).await?;
+    let head = app.account_op(&did, crate::worker::AccountOp::ReplaceRepo { records, swap_commit: swap, stale_keys, tree: None }).await?;
     tracing::warn!(%did, commit = %head.commit, rev = %head.rev, "repo rebuilt from its records (admin rebuildRepo)");
     out["commit"] = json!(head.commit.to_string());
     out["rev"] = json!(head.rev.to_string());

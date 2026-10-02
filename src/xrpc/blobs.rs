@@ -531,9 +531,54 @@ fn pct_decode(s: &str) -> String {
 }
 
 /// How long a collected blob stays quarantined before it is deleted for
-/// good (capped by the grace period): longer than any write that checked
-/// the blob (repo.rs `check_blobs`) takes to apply its reference.
+/// good (capped by the grace period): longer than a write that checked the
+/// blob (repo.rs `check_blobs`) usually takes to apply its reference; one
+/// still in flight past it holds the blob ([`HeldBlobs`]).
 pub const QUARANTINE_SETTLE: Duration = Duration::from_secs(60);
+
+/// Blobs that writes in flight on this node checked (`repo.rs`
+/// `check_blobs`) and may still reference: (did, cid) -> writes holding it.
+/// A quarantined blob held here isn't purged, however long its write takes
+/// to apply (a cold repo load, a store brownout): the next pass sees the
+/// reference and restores it, or purges it once the write is gone. Writes
+/// run on the repo's owner, the node whose GC sweeps its blobs.
+static IN_FLIGHT: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<(String, Cid), usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Holds a write's checked blobs in [`IN_FLIGHT`] until dropped (when the
+/// write has applied or failed).
+pub struct HeldBlobs {
+    keys: Vec<(String, Cid)>,
+}
+
+impl HeldBlobs {
+    pub fn hold(did: &str, cids: impl IntoIterator<Item = Cid>) -> HeldBlobs {
+        let keys: Vec<(String, Cid)> = cids.into_iter().map(|c| (did.to_string(), c)).collect();
+        let mut m = IN_FLIGHT.lock();
+        for k in &keys {
+            *m.entry(k.clone()).or_default() += 1;
+        }
+        HeldBlobs { keys }
+    }
+}
+
+impl Drop for HeldBlobs {
+    fn drop(&mut self) {
+        let mut m = IN_FLIGHT.lock();
+        for k in &self.keys {
+            if let Some(n) = m.get_mut(k) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(k);
+                }
+            }
+        }
+    }
+}
+
+fn held(did: &str, cid: &Cid) -> bool {
+    IN_FLIGHT.lock().contains_key(&(did.to_string(), *cid))
+}
 
 fn quarantine_path(app: &App, did: &str, cid: &str) -> object_store::path::Path {
     object_store::path::Path::from(format!("{}/blob-gc/{}/{}", app.store.prefix, did, cid))
@@ -570,9 +615,10 @@ pub async fn sweep_blobs(app: &App, grace: Duration) -> anyhow::Result<(usize, u
 ///    then on writes referencing it fail their check (BlobNotFound), as for
 ///    any missing blob;
 /// 2. once it has sat there for `settle` (any write that passed its check
-///    before the move has applied by then), the references are checked
-///    again: if one appeared, the blob is moved back; otherwise the
-///    quarantined copy is deleted.
+///    before the move has usually applied by then), the references are
+///    checked again: if one appeared, the blob is moved back; if a write
+///    that checked it is still in flight ([`HeldBlobs`]: a slow apply), it
+///    waits for a later pass; otherwise the quarantined copy is deleted.
 ///
 /// Orphaned multipart uploads can't be listed through object_store; see
 /// DESIGN.md ("6. Blobs") for the bucket lifecycle rule that aborts them.
@@ -628,6 +674,9 @@ pub async fn sweep_blobs_settle(app: &App, grace: Duration, settle: Duration) ->
             }
             restored += 1;
             tracing::warn!(%did, %cid, "blob gc: a reference appeared during quarantine; restored");
+        } else if Cid::parse(&cid).is_ok_and(|c| held(&did, &c)) {
+            // a write that checked it hasn't applied yet: decide next pass
+            continue;
         } else {
             purged += 1;
         }

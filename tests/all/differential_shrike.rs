@@ -451,7 +451,7 @@ fn json_compare(text: &str) -> JsonOutcome {
     if tree.as_ref().ok() != one_pass.as_ref().ok() {
         return JsonOutcome::Disagree(format!("vlpds encoders differ: {tree:?} {one_pass:?}"));
     }
-    let s = json_to_drisl(&j, Integers::Any);
+    let s = json_to_drisl(&j, Integers::Safe);
     match (tree, s) {
         (Ok(v), Ok(s)) if v == s => JsonOutcome::Agree,
         (Ok(_), Ok(_)) if partial_padding(&j) => JsonOutcome::PartialPaddingShrikeMap,
@@ -2055,9 +2055,9 @@ fn json_reference_oracle() {
         let s = json_to_drisl(&j, Integers::Any).map(hex::encode).unwrap_or_else(|_| "ERR".into());
         *tally.entry(format!("shrike {}", if s == want { "agrees" } else if want == "ERR" { "accepts (reference rejects)" } else if s == "ERR" { "rejects (reference accepts)" } else { "encodes differently" })).or_default() += 1;
         if v != want {
-            // policy splits (SHRIKE_ISSUES.md, "policy differences"): vlpds takes any i64 where strict
-            // lex-json wants JS-safe integers; vlpds's links are base32
-            // dag-cbor/raw CIDs and its $bytes the standard alphabet only
+            // policy split (SHRIKE_ISSUES.md, "policy differences"): vlpds's
+            // links are base32 dag-cbor/raw CIDs and its $bytes the standard
+            // alphabet only (integers: JS-safe, as the reference)
             fn any(j: &J, f: &dyn Fn(&J) -> bool) -> bool {
                 f(j) || match j {
                     J::Object(o) => o.values().any(|v| any(v, f)),
@@ -2065,14 +2065,11 @@ fn json_reference_oracle() {
                     _ => false,
                 }
             }
-            let unsafe_int = |x: &J| x.as_i64().is_some_and(|n| n.unsigned_abs() > (1 << 53) - 1) || x.is_u64() && x.as_i64().is_none();
             let foreign = |x: &J| {
                 x.get("$link").and_then(|l| l.as_str()).is_some_and(|l| !l.starts_with('b') || Cid::parse(l).is_err())
                     || x.get("$bytes").and_then(|b| b.as_str()).is_some_and(|b| b.contains(['-', '_']))
             };
-            let why = if want == "ERR" && any(&j, &unsafe_int) {
-                "integer outside the JS-safe range"
-            } else if v == "ERR" && any(&j, &foreign) {
+            let why = if v == "ERR" && any(&j, &foreign) {
                 "non-base32 / non-dag-cbor-or-raw link, or URL-safe $bytes"
             } else {
                 d.push(format!("{}: reference {want}, vlpds {v}", short(text)));

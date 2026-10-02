@@ -1,0 +1,135 @@
+//! importRepo of CARs built here: legacy blob refs are indexed (as the
+//! reference's `enumBlobRefs(allowLegacy)`), record blocks and whole CARs
+//! are capped, and integers outside JS's safe range are refused on write.
+use crate::common::*;
+use std::time::Duration;
+use vlpds::cbor::key_cmp;
+
+/// A CAR of an (unsigned: importRepo doesn't check) commit over `records`.
+fn import_car(did: &str, records: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut tree = vlpds::mst::Tree::new();
+    let mut blocks: Vec<(Cid, Vec<u8>)> = Vec::new();
+    for (path, rec) in records {
+        let c = Cid::dag_cbor(rec);
+        tree.insert_no_proof(path.as_bytes(), c).unwrap();
+        blocks.push((c, rec.clone()));
+    }
+    let data = tree.write_diff_blocks(&mut blocks).unwrap();
+    let mut fields = vec![
+        ("did".to_string(), Value::Text(did.to_string())),
+        ("rev".to_string(), Value::Text("3l3qo2vuowo2b".to_string())),
+        ("data".to_string(), Value::Link(data)),
+        ("prev".to_string(), Value::Null),
+        ("version".to_string(), Value::Int(3)),
+        ("sig".to_string(), Value::Bytes(vec![0; 64])),
+    ];
+    fields.sort_by(|a, b| key_cmp(&a.0, &b.0));
+    let commit = Value::Map(fields).to_cbor();
+    let root = Cid::dag_cbor(&commit);
+    let mut car = Vec::new();
+    vlpds::car::write_header(&mut car, &root);
+    vlpds::car::write_block(&mut car, &root, &commit);
+    for (c, b) in &blocks {
+        vlpds::car::write_block(&mut car, c, b);
+    }
+    car
+}
+
+fn cbor(j: J) -> Vec<u8> {
+    Value::from_json(&j).unwrap().to_cbor()
+}
+
+fn png(tag: u8) -> Vec<u8> {
+    let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+    v.extend((0..2000).map(|_| rand::random::<u8>()));
+    v.push(tag);
+    v
+}
+
+async fn import(s: &TestServer, a: &TestAccount, car: Vec<u8>) -> Resp {
+    s.xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &a.auth()).await
+}
+
+/// An old repo's legacy blob refs (`{cid, mimeType}`) are indexed on
+/// import: listBlobs lists them, listMissingBlobs reports the missing ones,
+/// and the blob GC keeps the uploaded one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_blob_refs_are_indexed_on_import() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("legacy").await;
+    let up = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", png(1), "image/png", &a.auth()).await.ok();
+    let have = up["blob"]["ref"]["$link"].as_str().unwrap().to_string();
+    let missing = Cid::raw(b"never uploaded").to_string();
+    let post = |cid: &str| {
+        cbor(json!({"$type": "app.bsky.feed.post", "text": "old", "createdAt": "2023-01-01T00:00:00Z",
+            "embed": {"$type": "app.bsky.embed.images", "images": [{"alt": "", "image": {"cid": cid, "mimeType": "image/png"}}]}}))
+    };
+    // not a legacy ref: an extra field
+    let other = cbor(json!({"$type": "app.bsky.feed.post", "text": "x", "createdAt": "2023-01-01T00:00:00Z",
+        "x": {"cid": Cid::raw(b"other").to_string(), "mimeType": "image/png", "size": 1}}));
+    let car = import_car(
+        &a.did,
+        &[
+            ("app.bsky.feed.post/3jzfcijpj2z2a", post(&have)),
+            ("app.bsky.feed.post/3jzfcijpj2z2b", post(&missing)),
+            ("app.bsky.feed.post/3jzfcijpj2z2c", other),
+        ],
+    );
+    import(&s, &a, car).await.ok();
+    let listed = s.xrpc.get("com.atproto.sync.listBlobs", &[("did", &a.did)], &Auth::None).await.ok();
+    let mut cids: Vec<&str> = listed["cids"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+    cids.sort();
+    let mut want = vec![have.as_str(), missing.as_str()];
+    want.sort();
+    assert_eq!(cids, want);
+    let m = s.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &a.auth()).await.ok();
+    assert_eq!(m["blobs"].as_array().unwrap().iter().map(|b| b["cid"].as_str().unwrap()).collect::<Vec<_>>(), vec![missing.as_str()]);
+    // the GC sees the reference
+    vlpds::xrpc::blobs::sweep_blobs_settle(&s.app, Duration::ZERO, Duration::ZERO).await.unwrap();
+    let g = s.xrpc.get("com.atproto.sync.getBlob", &[("did", &a.did), ("cid", &have)], &Auth::None).await;
+    assert_eq!(g.status, 200);
+}
+
+/// A record block over 2 MiB is refused; one under it imports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_import_records_are_refused() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("bigrec").await;
+    let rec = |n: usize| {
+        let mut m = vec![
+            ("$type".to_string(), Value::Text("com.example.big".into())),
+            ("b".to_string(), Value::Bytes(vec![7; n])),
+        ];
+        m.sort_by(|a, b| key_cmp(&a.0, &b.0));
+        Value::Map(m).to_cbor()
+    };
+    let r = import(&s, &a, import_car(&a.did, &[("com.example.big/a", rec((2 << 20) + 1))])).await;
+    r.err(400, "InvalidRequest");
+    assert!(r.text().contains("too large"), "{}", r.text());
+    import(&s, &a, import_car(&a.did, &[("com.example.big/a", rec(1 << 20))])).await.ok();
+}
+
+/// `Config::max_import_bytes` bounds the CAR.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn import_size_is_configurable() {
+    let s = TestServer::spawn_with(|c| c.max_import_bytes = 4096).await;
+    let a = s.create_account("capped").await;
+    let small = import_car(&a.did, &[("com.example.x/a", cbor(json!({"$type": "com.example.x", "v": 1})))]);
+    import(&s, &a, small).await.ok();
+    let big = import_car(&a.did, &[("com.example.x/a", cbor(json!({"$type": "com.example.x", "v": "y".repeat(5000)})))]);
+    assert_eq!(import(&s, &a, big).await.status, 413);
+}
+
+/// Integers past 2^53 - 1 are refused like integral floats there (the
+/// reference encoder: `Number.isSafeInteger`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unsafe_integers_are_refused_on_write() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("bigint").await;
+    for (n, ok) in [("9007199254740991", true), ("9007199254740992", false), ("-9223372036854775808", false)] {
+        let body = format!(r#"{{"repo": "{}", "collection": "com.example.n", "record": {{"$type": "com.example.n", "n": {n}}}}}"#, a.did);
+        let j: J = serde_json::from_str(&body).unwrap();
+        let r = s.xrpc.post("com.atproto.repo.createRecord", &j, &a.auth()).await;
+        assert_eq!(r.is_ok(), ok, "{n}: {}", r.text());
+    }
+}

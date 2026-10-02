@@ -172,8 +172,10 @@ For the record; these were vlpds's side of the disagreements.
   `mimeType`: the data model only asks for a non-empty string, and real
   records carry `"mimeType": "jpeg"`).
 - CAR reader: accepted headers without `version: 1` (or with non-CID roots).
+- Record JSON integers: any i64 was accepted while integral floats past
+  2^53 - 1 were refused; now every number must be JS-safe, as the
+  reference's lex-cbor encoder (`Number.isSafeInteger`).
 
-Left as vlpds policy (reference strict lex-json differs): integers outside the
-JS-safe range are accepted (the data model says 64-bit); `$link` must be a
+Left as vlpds policy (reference strict lex-json differs): `$link` must be a
 base32 dag-cbor/raw sha-256 CIDv1 (the reference takes base58btc, CIDv0 and
 other codecs; vlpds's `Cid` can't represent them).

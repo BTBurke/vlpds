@@ -167,6 +167,10 @@ pub struct Config {
     /// over the network and validated; a write waits at most this long for a
     /// resolution (else `validationStatus: "unknown"`). None = off.
     pub resolve_lexicons: Option<Duration>,
+    /// Largest CAR importRepo accepts (reference PDS_MAX_REPO_IMPORT_SIZE).
+    /// The CAR is parsed in memory and the import is one log entry, so this
+    /// bounds both (DESIGN.md "Partial MSTs", untrusted block sets).
+    pub max_import_bytes: usize,
     /// With `s3: None`: share this in-memory object store instead of a fresh
     /// one, so several in-process nodes form one cluster (tests; may be
     /// wrapped, e.g. in a `ThrottledStore` for object-store latency).
@@ -323,6 +327,7 @@ impl Default for Config {
             peer_connections: crate::http::DEFAULT_PEER_CONNECTIONS,
             rate_limit_bypass_key: None,
             resolve_lexicons: None,
+            max_import_bytes: crate::xrpc::DEFAULT_MAX_IMPORT_BYTES,
             memory_store: None,
             metrics_listen: None,
             log_retention: Some(crate::retention::Config::default()),

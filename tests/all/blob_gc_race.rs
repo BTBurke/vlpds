@@ -98,3 +98,27 @@ async fn unreferenced_blob_is_purged_after_settling() {
     assert_eq!(quarantined().await, 0);
     assert_eq!(blob_status(&s, &a.did, &cid).await, 400);
 }
+
+async fn exists(s: &TestServer, path: &object_store::path::Path) -> bool {
+    let mut l = object_store::ObjectStore::list(&*s.app.store.raw, Some(path));
+    futures::StreamExt::next(&mut l).await.is_some()
+}
+
+/// A write that checked a blob and hasn't applied yet (a slow apply: cold
+/// repo load, store brownout) holds it: past the settle time the
+/// quarantined copy is kept while the write is in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_flight_write_holds_a_quarantined_blob() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("gch").await;
+    let blob = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", png(3), "image/png", &a.auth()).await.ok()["blob"].clone();
+    let cid = Cid::parse(blob["ref"]["$link"].as_str().unwrap()).unwrap();
+    assert_eq!(sweep(&s, HOUR).await, 1);
+    let held = vlpds::xrpc::blobs::HeldBlobs::hold(&a.did, [cid]);
+    let path = object_store::path::Path::from(format!("{}/blob-gc/{}", s.app.store.prefix, a.did));
+    sweep(&s, Duration::ZERO).await;
+    assert!(exists(&s, &path).await, "purged under an in-flight write");
+    drop(held);
+    sweep(&s, Duration::ZERO).await;
+    assert!(!exists(&s, &path).await, "purged once the write is gone");
+}

@@ -1122,14 +1122,14 @@ pub fn decode_node_reference(data: &[u8], c: Cid) -> std::result::Result<Node, M
 /// strictly between the separators its parent puts around it (else lookups
 /// by key order would miss them). Each block is decoded at most once, so
 /// load work and memory are linear in the input.
-struct Loader<'a> {
-    blocks: &'a HashMap<Cid, Vec<u8>>,
+struct Loader<'a, B> {
+    blocks: &'a HashMap<Cid, B>,
     seen: std::collections::HashSet<Cid>,
     /// Load only the nodes on the key-order path to this key (proofs).
     path: Option<&'a [u8]>,
 }
 
-impl Loader<'_> {
+impl<B: AsRef<[u8]>> Loader<'_, B> {
     /// Loads the subtree at `c` (`depth` nodes below the root), whose keys
     /// must lie strictly between `lo` and `hi`. Children missing from
     /// `blocks` stay unloaded (partial tree), as do children off `path`. A
@@ -1151,7 +1151,7 @@ impl Loader<'_> {
         if !self.seen.insert(c) {
             return Err(MstError::Invalid("node appears more than once"));
         }
-        let mut n = decode_node(data, c)?;
+        let mut n = decode_node(data.as_ref(), c)?;
         if depth > 0 && n.entries.is_empty() {
             return Err(MstError::Invalid("empty child node"));
         }
@@ -1407,7 +1407,7 @@ impl Tree {
     /// Rejects a block set that isn't a tree (a node linked twice) or whose
     /// nodes hold keys outside their parent's separators (see [`Loader`]),
     /// so loading is linear in the input.
-    pub fn load_from_blocks(blocks: &HashMap<Cid, Vec<u8>>, root: Cid) -> Result<Tree> {
+    pub fn load_from_blocks<B: AsRef<[u8]>>(blocks: &HashMap<Cid, B>, root: Cid) -> Result<Tree> {
         Self::load_with(blocks, root, None)
     }
 
@@ -1415,11 +1415,11 @@ impl Tree {
     /// (the rest stay unloaded, like missing blocks): enough for
     /// [`Tree::get`] of `key`, e.g. to check an inclusion proof, without
     /// decoding the rest of an untrusted block set.
-    pub fn load_path_from_blocks(blocks: &HashMap<Cid, Vec<u8>>, root: Cid, key: &[u8]) -> Result<Tree> {
+    pub fn load_path_from_blocks<B: AsRef<[u8]>>(blocks: &HashMap<Cid, B>, root: Cid, key: &[u8]) -> Result<Tree> {
         Self::load_with(blocks, root, Some(key))
     }
 
-    fn load_with(blocks: &HashMap<Cid, Vec<u8>>, root: Cid, path: Option<&[u8]>) -> Result<Tree> {
+    fn load_with<B: AsRef<[u8]>>(blocks: &HashMap<Cid, B>, root: Cid, path: Option<&[u8]>) -> Result<Tree> {
         let mut l = Loader { blocks, seen: Default::default(), path };
         let mut r = l.load(root, 0, None, None)?.ok_or(MstError::Partial)?;
         ensure_heights(&mut r, 0)?;

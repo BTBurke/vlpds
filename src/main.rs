@@ -488,6 +488,10 @@ struct Args {
     /// validate those records too, instead of reporting them "unknown".
     #[arg(long, env = "VLPDS_RESOLVE_LEXICONS")]
     resolve_lexicons: bool,
+    /// Largest CAR importRepo accepts, in MiB (parsed in memory; the import
+    /// is written as one log entry).
+    #[arg(long, env = "VLPDS_MAX_IMPORT_MB", default_value_t = 1024)]
+    max_import_mb: usize,
     /// Accepted for script compatibility; every node runs the cluster protocol
     /// (a lone node is a one-node cluster).
     #[arg(long, env = "VLPDS_CLUSTER")]
@@ -982,6 +986,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         resolve_lexicons: args
             .resolve_lexicons
             .then_some(vlpds::lexicon::RESOLVE_TIMEOUT),
+        max_import_bytes: args.max_import_mb << 20,
         trusted_proxies: args.trusted_proxies.clone(),
         peer_connections: args.peer_connections,
         rate_limit_bypass_key: args.rate_limit_bypass_key.clone(),
