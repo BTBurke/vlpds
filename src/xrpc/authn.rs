@@ -1,15 +1,7 @@
-//! Request authentication. Every authenticated handler takes `Auth`, which
-//! dispatches on the Authorization scheme:
-//!   Bearer <jwt>  -> legacy session / app-password tokens   (server.rs)
-//!   DPoP <token>  -> OAuth access tokens bound to a DPoP key (oauth.rs)
-//!   Basic admin:<token> -> admin
-//!   Bearer <service jwt> on a moderator method -> the moderation service
-//!     (`--mod-service-did`; [`MODERATOR_METHODS`])
-//!   Bearer <service jwt with `lxm`> on uploadBlob -> a user's own service
-//!     JWT ([`USER_SERVICE_AUTH_METHODS`]; e.g. the video service uploading
-//!     a processed video for the user)
-//! and yields `Credentials`, whose `allows_*` methods are the single place
-//! permission checks happen (OAuth scopes, app-password restrictions).
+//! Request authentication: `Auth` dispatches on the Authorization scheme
+//! (Bearer session or service JWT, DPoP OAuth, Basic admin) and yields
+//! `Credentials`, whose `allows_*` methods are the one place permission
+//! checks (OAuth scopes, app-password limits) happen.
 
 use super::*;
 use axum::extract::FromRequestParts;
@@ -17,60 +9,46 @@ use axum::http::request::Parts;
 
 #[derive(Clone, Debug)]
 pub enum Credentials {
-    /// Full-access session from createSession with the account password.
     Session {
         did: String,
     },
-    /// App-password session. Privileged app passwords may use DMs.
+    /// Privileged app passwords may use DMs.
     AppPassword {
         did: String,
         privileged: bool,
     },
-    /// OAuth access token (DPoP-bound) with its granted scopes.
     OAuth {
         did: String,
         client_id: String,
         scopes: super::oauth::ScopeSet,
     },
     Admin,
-    /// Restricted session of a taken-down account (createSession with
-    /// `allowTakendown`; scope `com.atproto.takendown`). Accepted only by
-    /// the methods in [`TAKENDOWN_METHODS`]; grants no repo, blob, account
-    /// or identity actions.
+    /// A taken-down account's session (`allowTakendown`), accepted only by
+    /// [`TAKENDOWN_METHODS`].
     Takendown {
         did: String,
     },
-    /// A service JWT from the configured moderation service
-    /// (`--mod-service-did`), on one of [`MODERATOR_METHODS`] (or
-    /// getPreferences, for any account's preferences). `iss` is the token's
-    /// issuer (the DID, or `DID#atproto_labeler`). Grants nothing else.
+    /// The `--mod-service-did` service on [`MODERATOR_METHODS`] or
+    /// getPreferences. `iss` is the DID or `DID#atproto_labeler`.
     ModService {
         iss: String,
     },
-    /// A service JWT issued by a user hosted here, with its own `#atproto`
-    /// key, addressed to this PDS for the method being called (the
-    /// reference's `userServiceAuth`; from getServiceAuth). Accepted only on
-    /// [`USER_SERVICE_AUTH_METHODS`]; grants blob uploads and nothing else.
+    /// A local user's own service JWT (reference `userServiceAuth`), only on
+    /// [`USER_SERVICE_AUTH_METHODS`].
     UserServiceAuth {
         did: String,
     },
 }
 
-/// Methods that also take a user's service JWT (the reference's
-/// `authorizationOrUserServiceAuth`): a Bearer token carrying an `lxm`
-/// claim is verified as one ([`verify_user_service_auth`]), anything else
-/// as a session. The Bluesky app's video upload depends on it: the app gets
-/// a token (`aud` = this PDS, `lxm` = uploadBlob) from getServiceAuth and
-/// hands it to the video service, which uploads the processed video here.
-/// (createAccount takes service auth too, `userServiceAuthOptional`; it is
-/// verified in its handler: `super::server::create_account`.)
+/// Methods that also take a user's service JWT (reference
+/// `authorizationOrUserServiceAuth`): the Bluesky app hands an uploadBlob
+/// token from getServiceAuth to the video service, which uploads the
+/// processed video here. createAccount verifies its own service auth.
 pub const USER_SERVICE_AUTH_METHODS: &[&str] = &["com.atproto.repo.uploadBlob"];
 
-/// Admin methods the moderation service may call with service auth (the
-/// reference's `authVerifier.moderator`): a Bearer token on these is only
-/// ever a moderation-service JWT. The other admin methods (deleteAccount,
-/// updateAccountEmail/Handle/Password, createInviteCode(s), ...) take admin
-/// Basic auth only (`adminToken`).
+/// Admin methods the moderation service may call (reference
+/// `authVerifier.moderator`): a Bearer token on these is only ever a
+/// moderation-service JWT. Other admin methods take Basic auth only.
 pub const MODERATOR_METHODS: &[&str] = &[
     "com.atproto.admin.disableAccountInvites",
     "com.atproto.admin.disableInviteCodes",
@@ -83,12 +61,10 @@ pub const MODERATOR_METHODS: &[&str] = &[
     "com.atproto.admin.updateSubjectStatus",
 ];
 
-/// The reference's `authorizationOrModService`: user auth, or the
-/// moderation service reading an account's preferences (`?did=`).
+/// Reference `authorizationOrModService`.
 const MOD_SERVICE_OR_USER_METHODS: &[&str] = &["app.bsky.actor.getPreferences"];
 
-/// Methods that accept the `com.atproto.takendown` scope (the reference's
-/// `additional: [AuthScope.Takendown]`).
+/// Reference `additional: [AuthScope.Takendown]`.
 pub const TAKENDOWN_METHODS: &[&str] = &[
     "app.bsky.actor.getPreferences",
     "com.atproto.identity.requestPlcOperationSignature",
@@ -114,6 +90,10 @@ impl Credentials {
         }
     }
 
+    pub fn user_did(&self) -> XResult<&str> {
+        self.did().ok_or_else(|| XrpcError::auth("user credentials required"))
+    }
+
     /// action: "create" | "update" | "delete"
     pub fn allows_repo(&self, collection: &str, action: &str) -> bool {
         match self {
@@ -123,7 +103,6 @@ impl Credentials {
         }
     }
 
-    /// Proxied / service-auth calls to method `lxm` at service `aud`.
     pub fn allows_rpc(&self, lxm: &str, aud: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_rpc(lxm, aud),
@@ -143,18 +122,16 @@ impl Credentials {
         }
     }
 
-    /// Account management (attr e.g. "email", "repo", "status"; action "read" | "manage").
+    /// action: "read" | "manage"
     pub fn allows_account(&self, attr: &str, action: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_account(attr, action),
-            // app passwords can't manage the account (see server.rs for specifics)
             Credentials::AppPassword { .. } => action == "read",
             Credentials::Takendown { .. } | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => false,
             _ => true,
         }
     }
 
-    /// Identity changes (attr "handle" | "*").
     pub fn allows_identity(&self, attr: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_identity(attr),
@@ -166,9 +143,8 @@ impl Credentials {
         }
     }
 
-    /// `ok`, else the refusal: for OAuth the reference's
-    /// `ScopeMissingError` (403, `Missing required scope "<scope>"`, naming
-    /// the scope that would grant it), else [`Self::require`]'s.
+    /// OAuth refusals name the scope that would grant it (reference
+    /// `ScopeMissingError`).
     fn require_scope(&self, ok: bool, scope: impl FnOnce() -> String) -> XResult<()> {
         if ok {
             return Ok(());
@@ -190,8 +166,7 @@ impl Credentials {
     }
 
     pub fn need_rpc(&self, lxm: &str, aud: &str) -> XResult<()> {
-        // a non-privileged app password calling a privileged (chat) method:
-        // the reference's pipethrough "Bad token method"
+        // the reference pipethrough's answer to a non-privileged app password
         if matches!(self, Credentials::AppPassword { .. }) && !self.allows_rpc(lxm, aud) {
             return Err(XrpcError::bad("InvalidToken", "Bad token method"));
         }
@@ -215,7 +190,7 @@ impl Credentials {
         self.require_scope(self.allows_identity(attr), || format!("identity:{attr}"))
     }
 
-    pub fn require(&self, ok: bool) -> XResult<()> {
+    fn require(&self, ok: bool) -> XResult<()> {
         if ok {
             Ok(())
         } else {
@@ -262,91 +237,61 @@ pub async fn authenticate(app: &App, parts: &Parts) -> XResult<Credentials> {
     Err(XrpcError::auth("unsupported authorization scheme"))
 }
 
-/// The reference's `authVerifier.modService`: a service JWT for `nsid`
-/// issued by the configured moderation service (its DID, or
-/// `DID#atproto_labeler` signed with the `#atproto_label` key). No
-/// moderation service configured, or another issuer: 401 UntrustedIss
-/// "Untrusted issuer".
+/// Reference `authVerifier.modService`.
 async fn verify_mod_service(app: &App, tok: &str, nsid: &str) -> XResult<Credentials> {
     let Some(m) = app.config.mod_service_did.as_deref() else {
         return Err(service_auth_err("UntrustedIss", "Untrusted issuer"));
     };
     let trusted = [m.to_string(), format!("{m}#atproto_labeler")];
-    let sa = verify_service_jwt_from(app, tok, Some(nsid), Some(&trusted)).await?;
+    let sa = verify_jwt(app, tok, Some(nsid), Some(&trusted), false).await?;
     Ok(Credentials::ModService { iss: sa.iss })
 }
 
-/// The reference's `userServiceAuth`: a service JWT for `nsid` (`lxm` must
-/// match), `aud` exactly our service DID (no `#fragment`; there is no
-/// entryway), signed with the issuer's current `#atproto` key (an older,
-/// rotated key is refused), not expired. No `jti` replay check and no
-/// `iat` bound, as in the reference (the token lives at most an hour:
-/// getServiceAuth). The issuer must be an account hosted here: anything else
-/// (including a `did#service` issuer) is the reference's actor-store miss,
-/// 400 NotFound "Repo not found". Account status is the handler's business.
+/// Reference `userServiceAuth`: no `jti` replay check and no `iat` bound,
+/// as there (getServiceAuth tokens live at most an hour). Account status is
+/// the handler's business.
 async fn verify_user_service_auth(app: &App, tok: &str, nsid: &str) -> XResult<Credentials> {
-    let sa = verify_service_jwt_impl(app, tok, Some(nsid), None, true).await?;
+    let sa = verify_jwt(app, tok, Some(nsid), None, true).await?;
     Ok(Credentials::UserServiceAuth { did: sa.iss })
 }
 
-/// `iss` must be an account hosted here: 400 NotFound "Repo not found" for
-/// anything else (the reference's actor-store miss).
+/// Anything but an account hosted here is the reference's actor-store miss.
 async fn local_account_iss(app: &App, iss: &str) -> XResult<()> {
-    let repo_not_found = || XrpcError::bad("NotFound", "Repo not found");
-    if iss.contains('#') {
-        return Err(repo_not_found());
+    if iss.contains('#') || super::server::account_if_exists(app, iss).await?.is_none() {
+        return Err(XrpcError::bad("NotFound", "Repo not found"));
     }
-    match app.account(iss).await {
-        Ok(_) => Ok(()),
-        Err(e) if e.error == "AccountNotFound" => Err(repo_not_found()),
-        Err(e) => Err(e),
-    }
+    Ok(())
 }
 
-/// Does `tok` (unverified) carry an `lxm` claim? The reference's
-/// `isDefinitelyServiceAuth`: session and OAuth tokens never do, so such a
-/// token is a service JWT. Undecodable tokens are not (they fail as
-/// sessions).
+/// A JWT's payload, unverified: only for routing a token to its verifier.
+fn unverified_claims(tok: &str) -> Option<J> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use base64::Engine;
+    let b = B64.decode(tok.split('.').nth(1)?).ok()?;
+    serde_json::from_slice(&b).ok()
+}
+
+/// Reference `isDefinitelyServiceAuth`: session and OAuth tokens never carry
+/// `lxm`.
 fn has_lxm(tok: &str) -> bool {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-    use base64::Engine;
-    tok.split('.')
-        .nth(1)
-        .and_then(|p| B64.decode(p).ok())
-        .and_then(|b| serde_json::from_slice::<J>(&b).ok())
-        .is_some_and(|c| c.get("lxm").is_some_and(|l| !l.is_null()))
+    unverified_claims(tok).is_some_and(|c| c.get("lxm").is_some_and(|l| !l.is_null()))
 }
 
-/// Is `tok` (unverified) a JWT issued by the configured moderation service?
-/// Only routes getPreferences between user and moderation-service auth; the
-/// token is then verified as such.
 fn is_mod_service_token(app: &App, tok: &str) -> bool {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-    use base64::Engine;
     let Some(m) = app.config.mod_service_did.as_deref() else {
         return false;
     };
-    let iss = tok
-        .split('.')
-        .nth(1)
-        .and_then(|p| B64.decode(p).ok())
-        .and_then(|b| serde_json::from_slice::<J>(&b).ok())
-        .and_then(|c| c["iss"].as_str().map(String::from));
-    iss.is_some_and(|i| i.split('#').next() == Some(m))
+    unverified_claims(tok).is_some_and(|c| c["iss"].as_str().is_some_and(|i| i.split('#').next() == Some(m)))
 }
 
-/// OAuth access tokens verified by the server's ES256 key: signature and
-/// `typ` checked and the token decoded once per token (until its `exp`), as
-/// [`crate::auth::Jwt::verify_signature_cached`] does for legacy tokens.
-/// Entries remember the key that verified them (one process can run several
-/// servers, each with its own key). Claims, the DPoP proof and the session
-/// are still checked per request by `oauth::verify_dpop`.
+/// Signature and `typ` checked once per token until its `exp`; claims, the
+/// DPoP proof and the session are still checked per request. Entries
+/// remember the verifying key: one process can run several servers.
 pub fn verify_access_token(
     server: &crate::oauth::jose::ServerKey,
     token: &str,
 ) -> Result<Arc<crate::oauth::jose::DecodedJwt>, String> {
     type Verified = (Arc<str>, Arc<crate::oauth::jose::DecodedJwt>);
-    // capped by the memory budget (crate::caches; ~1.5 KB each)
     static CACHE: std::sync::LazyLock<Arc<crate::auth::TokenCache<Verified>>> =
         std::sync::LazyLock::new(|| crate::auth::TokenCache::tracked(crate::caches::Cache::OAuthTokens));
     let now = crate::tid::now_micros() / 1_000_000;
@@ -362,7 +307,6 @@ pub fn verify_access_token(
     Ok(jwt)
 }
 
-/// Extractor: authenticated request.
 pub struct Auth(pub Credentials);
 
 impl FromRequestParts<Arc<App>> for Auth {
@@ -375,7 +319,6 @@ impl FromRequestParts<Arc<App>> for Auth {
     }
 }
 
-/// Extractor: authentication if present (for endpoints with optional auth).
 pub struct MaybeAuth(pub Option<Credentials>);
 
 impl FromRequestParts<Arc<App>> for MaybeAuth {
@@ -391,11 +334,9 @@ impl FromRequestParts<Arc<App>> for MaybeAuth {
     }
 }
 
-/// The authenticated user's DID must be `repo` (handle or DID); returns the DID.
+/// The caller's DID, which `repo` (handle or DID) must name.
 pub async fn authed_repo(app: &App, creds: &Credentials, repo: &str) -> XResult<Arc<str>> {
-    let did = creds
-        .did()
-        .ok_or_else(|| XrpcError::auth("user credentials required"))?;
+    let did = creds.user_did()?;
     let target = app.resolve_repo(repo).await?;
     if *target != *did {
         // reference createRecord/putRecord/deleteRecord/applyWrites:
@@ -405,22 +346,10 @@ pub async fn authed_repo(app: &App, creds: &Credentials, repo: &str) -> XResult<
     Ok(target)
 }
 
-// ---------------------------------------------------------------------------
-// inbound service auth (reference xrpc-server verifyJwt + AuthVerifier
-// verifyServiceJwt)
-// ---------------------------------------------------------------------------
-
-/// A verified inter-service JWT: `iss` is a DID (optionally `#service`).
+/// A verified inter-service JWT: `iss` is a DID, optionally `#service`.
 #[derive(Clone, Debug)]
 pub struct ServiceAuth {
     pub iss: String,
-}
-
-impl ServiceAuth {
-    /// The issuing DID, without a `#service` fragment.
-    pub fn did(&self) -> &str {
-        self.iss.split('#').next().unwrap_or("")
-    }
 }
 
 fn service_auth_err(error: &str, message: &str) -> XrpcError {
@@ -431,9 +360,8 @@ fn service_auth_err(error: &str, message: &str) -> XrpcError {
     }
 }
 
-/// The `#atproto` (or `#atproto_label` for a `#atproto_labeler` issuer)
-/// signing key of `iss`, as multibase. Accounts hosted here use their local
-/// document; others resolve through the DID resolver (`fresh` skips its cache).
+/// The `#atproto` (`#atproto_label` for a `#atproto_labeler` issuer) key of
+/// `iss`, as multibase. `fresh` skips the resolver's cache.
 async fn issuer_key(app: &App, iss: &str, fresh: bool) -> XResult<String> {
     let (did, service) = iss.split_once('#').unwrap_or((iss, ""));
     let key_id = if service == "atproto_labeler" { "atproto_label" } else { "atproto" };
@@ -467,34 +395,17 @@ async fn issuer_key(app: &App, iss: &str, fresh: bool) -> XResult<String> {
         .ok_or_else(|| service_auth_err("AuthenticationRequired", "missing or bad key in did doc"))
 }
 
-/// Verifies an inter-service JWT addressed to this PDS (`aud` = our service
-/// DID) for method `lxm` (required to match when given), signed by its
-/// issuer's current key (retried once with a fresh DID document, for a
-/// recent key rotation). High-S signatures are accepted, as the reference
-/// does for service JWTs (`allowMalleableSig`). Errors are the reference's
-/// (BadJwt, JwtExpired, BadJwtAudience, BadJwtLexiconMethod, BadJwtIss,
-/// BadJwtSignature).
+/// An inter-service JWT addressed to this PDS, with the reference's errors
+/// (xrpc-server verifyJwt). High-S signatures are accepted, as the
+/// reference does for service JWTs (`allowMalleableSig`).
 pub async fn verify_service_jwt(app: &App, token: &str, lxm: Option<&str>) -> XResult<ServiceAuth> {
-    verify_service_jwt_from(app, token, lxm, None).await
+    verify_jwt(app, token, lxm, None, false).await
 }
 
-/// [`verify_service_jwt`], accepting only the issuers in `trusted` (when
-/// given; exact `iss`, fragment included): any other is 401 UntrustedIss
-/// "Untrusted issuer", checked before the issuer's key is resolved.
-pub async fn verify_service_jwt_from(
-    app: &App,
-    token: &str,
-    lxm: Option<&str>,
-    trusted: Option<&[String]>,
-) -> XResult<ServiceAuth> {
-    verify_service_jwt_impl(app, token, lxm, trusted, false).await
-}
-
-/// [`verify_service_jwt_from`]; `local_iss`: the issuer must be an account
-/// hosted here (no `#fragment`), else 400 NotFound "Repo not found",
-/// checked before any key resolution, so a forged token naming a foreign
-/// DID costs no outbound DID fetch.
-async fn verify_service_jwt_impl(
+/// `trusted` (exact `iss`) and `local_iss` are checked before the issuer's
+/// key is resolved, so a forged token naming a foreign DID costs no
+/// outbound DID fetch.
+async fn verify_jwt(
     app: &App,
     token: &str,
     lxm: Option<&str>,
@@ -524,28 +435,17 @@ async fn verify_service_jwt_impl(
         return Err(service_auth_err("BadJwtAudience", "jwt audience does not match service did"));
     }
     if let Some(lxm) = lxm {
-        match payload["lxm"].as_str() {
-            Some(l) if l == lxm => {}
-            Some(_) => {
-                return Err(service_auth_err(
-                    "BadJwtLexiconMethod",
-                    &format!("bad jwt lexicon method (\"lxm\"). must match: {lxm}"),
-                ))
-            }
-            None => {
-                return Err(service_auth_err(
-                    "BadJwtLexiconMethod",
-                    &format!("missing jwt lexicon method (\"lxm\"). must match: {lxm}"),
-                ))
-            }
+        let got = payload["lxm"].as_str();
+        if got != Some(lxm) {
+            let what = if got.is_some() { "bad" } else { "missing" };
+            return Err(service_auth_err(
+                "BadJwtLexiconMethod",
+                &format!("{what} jwt lexicon method (\"lxm\"). must match: {lxm}"),
+            ));
         }
     }
     let iss = payload["iss"].as_str().unwrap_or("");
-    let did_ok = {
-        let did = iss.split('#').next().unwrap_or("");
-        super::syntax::valid_did(did)
-    };
-    if !did_ok {
+    if !super::syntax::valid_did(iss.split('#').next().unwrap_or("")) {
         return Err(service_auth_err("BadJwtIss", "jwt iss is not a valid did"));
     }
     if trusted.is_some_and(|t| !t.iter().any(|x| x == iss)) {
@@ -562,7 +462,7 @@ async fn verify_service_jwt_impl(
     };
     let key = issuer_key(app, iss, false).await?;
     if !check(&key)? {
-        // a fresh document, in case the key was just rotated
+        // the key may have just been rotated
         let fresh = issuer_key(app, iss, true).await?;
         if fresh == key || !check(&fresh)? {
             return Err(service_auth_err("BadJwtSignature", "jwt signature does not match jwt issuer"));
@@ -571,16 +471,15 @@ async fn verify_service_jwt_impl(
     Ok(ServiceAuth { iss: iss.to_string() })
 }
 
-/// Optional service auth (reference `userServiceAuthOptional`): a Bearer
-/// token must be a valid service JWT for `lxm`; anything else (no
-/// Authorization header, another scheme) is unauthenticated.
+/// Reference `userServiceAuthOptional`: a Bearer token must be a valid
+/// service JWT for `lxm`; no header or another scheme is unauthenticated.
 pub async fn optional_service_auth(app: &App, headers: &HeaderMap, lxm: &str) -> XResult<Option<ServiceAuth>> {
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     match bearer {
-        Some(tok) => verify_service_jwt(app, tok.trim(), Some(lxm)).await.map(Some),
+        Some(tok) => verify_jwt(app, tok.trim(), Some(lxm), None, false).await.map(Some),
         None => Ok(None),
     }
 }

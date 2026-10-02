@@ -3350,7 +3350,7 @@ messages (tests: `ref_moderator_auth`, `invite_codes::ref_*`,
   sendEmail, getInviteCodes, disableInviteCodes, enable/disableAccountInvites)
   a Bearer token is only ever a service JWT from that DID (or
   `<did>#atproto_labeler`, keyed by `#atproto_label`): checked by the
-  existing inbound verifier (`verify_service_jwt_from`: exp, aud = our
+  existing inbound verifier (`authn::verify_jwt`: exp, aud = our
   service DID, lxm = the method, issuer allow-list before key resolution,
   signature with one fresh-document retry). Another issuer, or no flag, is
   401 `UntrustedIss` "Untrusted issuer". The result is
