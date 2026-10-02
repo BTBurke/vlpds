@@ -112,6 +112,11 @@ pub(super) const SCOPE_APP_PASS_PRIVILEGED: &str = "com.atproto.appPassPrivilege
 pub(super) const SCOPE_REFRESH: &str = "com.atproto.refresh";
 pub(super) const SCOPE_TAKENDOWN: &str = "com.atproto.takendown";
 
+/// The host of `--public-url`.
+pub(super) fn public_host(app: &App) -> &str {
+    app.public_url.split("://").nth(1).unwrap_or(&app.public_url).split(['/', ':']).next().unwrap_or("vlpds")
+}
+
 pub(super) fn now_secs() -> u64 {
     crate::tid::now_micros() / 1_000_000
 }
@@ -134,10 +139,6 @@ fn invalid_token(message: &str) -> XrpcError {
 
 fn expired_token(message: &str) -> XrpcError {
     XrpcError::bad("ExpiredToken", message)
-}
-
-fn auth_required(message: &str) -> XrpcError {
-    err(StatusCode::UNAUTHORIZED, "AuthenticationRequired", message)
 }
 
 pub(super) fn takedown_error() -> XrpcError {
@@ -266,7 +267,7 @@ pub(super) fn email_supported(e: &str) -> bool {
 }
 
 fn user_did(creds: &Credentials) -> XResult<String> {
-    creds.did().map(str::to_string).ok_or_else(|| auth_required("user credentials required"))
+    creds.did().map(str::to_string).ok_or_else(|| XrpcError::auth("user credentials required"))
 }
 
 /// The reference's ACCESS_FULL (OAuth refused).
@@ -277,7 +278,7 @@ fn full_access(creds: &Credentials) -> XResult<String> {
         Credentials::AppPassword { .. } => Err(bad_scope()),
         Credentials::OAuth { .. } => Err(oauth_forbidden()),
         Credentials::Admin | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => {
-            Err(auth_required("user credentials required"))
+            Err(XrpcError::auth("user credentials required"))
         }
     }
 }
@@ -290,7 +291,7 @@ fn standard_no_oauth(creds: &Credentials) -> XResult<String> {
         | Credentials::Takendown { did } => Ok(did.clone()),
         Credentials::OAuth { .. } => Err(oauth_forbidden()),
         Credentials::Admin | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => {
-            Err(auth_required("user credentials required"))
+            Err(XrpcError::auth("user credentials required"))
         }
     }
 }
@@ -492,7 +493,7 @@ pub(super) async fn ctl(app: &App, did: &str) -> XResult<Arc<Ctl>> {
 fn stale_or_unavailable(cached: Option<Arc<Ctl>>, now: u64) -> XResult<Arc<Ctl>> {
     match cached {
         Some(c) if now.saturating_sub(c.at) <= STALE_MAX_SECS => Ok(c),
-        _ => Err(err(StatusCode::SERVICE_UNAVAILABLE, "Unavailable", "account security state is unavailable; try again")),
+        _ => Err(XrpcError::unavailable("Unavailable", "account security state is unavailable; try again")),
     }
 }
 
@@ -859,7 +860,7 @@ pub async fn epoch_for_login(app: &App, checked: &Account) -> XResult<Option<Str
 }
 
 pub(super) fn cas_conflict() -> XrpcError {
-    err(StatusCode::SERVICE_UNAVAILABLE, "TemporarilyUnavailable", "concurrent update; retry")
+    XrpcError::unavailable("TemporarilyUnavailable", "concurrent update; retry")
 }
 
 /// Starts a new session family: (accessJwt, refreshJwt). `takendown` gives
@@ -889,7 +890,7 @@ async fn create_session_tokens(
     conds.extend(epoch.map(auth_epoch_cond));
     let out = app.private_cas(did, conds, vec![Op::put(&name, Some(Bytes::from(to_json_bytes(&st))))]).await?;
     if !out.applied {
-        return Err(auth_required("Credentials were revoked during sign-in"));
+        return Err(XrpcError::auth("Credentials were revoked during sign-in"));
     }
     Ok(issue_pair(app, did, scope, &family, &rid))
 }
@@ -1191,7 +1192,7 @@ async fn create_account_checked(app: &App, inp: CreateAccountIn, requester: Opti
         Some(d) => {
             // checked before the handle, whose proof may be fetched
             if requester != Some(d) {
-                return Err(auth_required(&format!("Missing auth to create account with did: {d}")));
+                return Err(XrpcError::auth(&format!("Missing auth to create account with did: {d}")));
             }
             if !is_atproto_did(d) {
                 return Err(invalid_request("Invalid DID"));
@@ -1473,7 +1474,7 @@ async fn create_session(State(app): AppState, Json(inp): Json<CreateSessionIn>) 
 
 async fn create_session_inner(app: &App, inp: CreateSessionIn, step: &mut LoginStep) -> XResult<Json<J>> {
     if inp.password.len() > OLD_PASSWORD_MAX_LENGTH {
-        return Err(auth_required("Password too long. Consider resetting your password."));
+        return Err(XrpcError::auth("Password too long. Consider resetting your password."));
     }
     // reference: 300/day and 30/5min per `${identifier}-${ip}`, normalized
     // like the OAuth sign-in's key (whose buckets these are too), so case
@@ -1483,7 +1484,7 @@ async fn create_session_inner(app: &App, inp: CreateSessionIn, step: &mut LoginS
         let key = inp.identifier.trim().trim_start_matches('@').to_lowercase();
         check_with_ip(&[&CREATE_SESSION_DAY, &CREATE_SESSION_5MIN], &key, 1)?;
     }
-    let invalid = || auth_required("Invalid identifier or password");
+    let invalid = || XrpcError::auth("Invalid identifier or password");
     let acct = login_account(app, &inp.identifier).await?.ok_or_else(invalid)?;
     // vlpds: a per-account cap from any IP (shared with the OAuth sign-in),
     // before the password hash
@@ -1935,11 +1936,11 @@ struct DeleteAccountIn {
 
 async fn delete_account(State(app): AppState, Json(inp): Json<DeleteAccountIn>) -> XResult<StatusCode> {
     if inp.password.len() > OLD_PASSWORD_MAX_LENGTH {
-        return Err(auth_required("Password too long. Consider resetting your password."));
+        return Err(XrpcError::auth("Password too long. Consider resetting your password."));
     }
     let acct = app.account(&inp.did).await.map_err(|_| invalid_request("account not found"))?;
     if !verify_password(&acct, &inp.password).await? {
-        return Err(auth_required("Invalid did or password"));
+        return Err(XrpcError::auth("Invalid did or password"));
     }
     assert_email_token(&app, &acct.did, "delete_account", &inp.token).await?;
     delete_account_fully(&app, &acct.did).await?;
@@ -2273,7 +2274,7 @@ async fn create_invite_code(State(app): AppState, Auth(creds): Auth, Json(inp): 
     super::admin::require_admin(&creds)?;
     let account = inp.for_account.unwrap_or_else(|| "admin".into());
     let code = super::admin::gen_invite_code(&app);
-    super::admin::create_invites(&app, &account, std::slice::from_ref(&code), inp.use_count, false).await?;
+    super::admin::create_invites(&app, &account, std::slice::from_ref(&code), inp.use_count, false, "admin").await?;
     Ok(Json(json!({"code": code})))
 }
 
@@ -2296,7 +2297,7 @@ async fn create_invite_codes(State(app): AppState, Auth(creds): Auth, Json(inp):
     let mut out = Vec::new();
     for account in accounts {
         let codes: Vec<String> = (0..inp.code_count.min(1000)).map(|_| super::admin::gen_invite_code(&app)).collect();
-        super::admin::create_invites(&app, &account, &codes, inp.use_count, false).await?;
+        super::admin::create_invites(&app, &account, &codes, inp.use_count, false, "admin").await?;
         out.push(json!({"account": account, "codes": codes}));
     }
     Ok(Json(json!({"codes": out})))
@@ -2357,7 +2358,7 @@ async fn create_earned_invites(app: &App, acct: &Account, codes: Vec<super::admi
     }
     let new: Vec<String> = (0..n).map(|_| super::admin::gen_invite_code(app)).collect();
     let disabled = acct.extra.get("invitesDisabled").and_then(|v| v.as_bool()).unwrap_or(false);
-    super::admin::create_invites_by(app, did, &new, 1, disabled, did).await?;
+    super::admin::create_invites(app, did, &new, 1, disabled, did).await?;
     let after = super::admin::account_invites(app, did).await?;
     if after.iter().filter(|c| c.created_by != "admin").count() as i64 > total {
         return Err(XrpcError::bad("DuplicateCreate", "attempted to create additional codes in another request"));
@@ -2557,8 +2558,7 @@ async fn setup_totp(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>>
         }
         return Err(crate::totp::conflict());
     }
-    let issuer = app.public_url.split("://").nth(1).unwrap_or(&app.public_url).split(['/', ':']).next().unwrap_or("vlpds").to_string();
-    let uri = crate::totp::otpauth_uri(&secret, &issuer, &acct.handle);
+    let uri = crate::totp::otpauth_uri(&secret, public_host(&app), &acct.handle);
     Ok(Json(json!({"secret": secret, "uri": uri})))
 }
 
@@ -2611,7 +2611,7 @@ async fn disable_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<D
     let did = full_access(&creds)?;
     let acct = app.account(&did).await?;
     if !verify_password(&acct, &inp.password).await? {
-        return Err(auth_required("Invalid password"));
+        return Err(XrpcError::auth("Invalid password"));
     }
     'cas: {
         let _g = crate::totp::lock(&did).await;

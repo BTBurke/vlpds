@@ -1,13 +1,11 @@
-//! com.atproto.admin.* (Basic `admin:<token>` auth), invite-code storage,
-//! subject takedowns (`is_record_takendown` / `is_blob_takendown`, kept in
-//! the account's partition under `sec/td/`), the dev-mode
-//! mailbox (vlpds.admin.getDevMail) and the vlpds.admin.bulkCreate simulator.
+//! com.atproto.admin.*, vlpds.admin.* operator methods, invite-code storage
+//! and subject takedowns (kept in the account's partition under `sec/td/`).
 
 use super::authn::Credentials;
 use super::server::{
-    ctl, delete_account_fully, ext, get_json, invalid_request, normalize_handle, pmut, put_sec,
-    recompute_status, scan_private_routing, set_deactivated,
-    set_email, set_extra, to_json_bytes, update_account, NEW_PASSWORD_MAX_LENGTH, TAKEDOWN,
+    ctl, delete_account_fully, ext, get_json, invalid_request, normalize_handle, pmut, put_sec, recompute_status,
+    scan_private_routing, set_deactivated, set_email, set_extra, to_json_bytes, update_account, NEW_PASSWORD_MAX_LENGTH,
+    TAKEDOWN,
 };
 use super::*;
 
@@ -17,72 +15,26 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/vlpds.admin.rewrapSecrets", post(rewrap_secrets))
         .route("/xrpc/vlpds.admin.rotatePlcKeys", post(rotate_plc_keys))
         .route("/xrpc/vlpds.admin.getDevMail", get(get_dev_mail))
-        .route(
-            "/xrpc/com.atproto.admin.getAccountInfo",
-            get(get_account_info),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.getAccountInfos",
-            get(get_account_infos),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.searchAccounts",
-            get(search_accounts),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.updateAccountHandle",
-            post(update_account_handle),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.updateAccountEmail",
-            post(update_account_email),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.updateAccountPassword",
-            post(update_account_password),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.updateAccountSigningKey",
-            post(update_account_signing_key),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.updateSubjectStatus",
-            post(update_subject_status),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.getSubjectStatus",
-            get(get_subject_status),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.deleteAccount",
-            post(delete_account),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.disableAccountInvites",
-            post(disable_account_invites),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.enableAccountInvites",
-            post(enable_account_invites),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.disableInviteCodes",
-            post(disable_invite_codes),
-        )
-        .route(
-            "/xrpc/com.atproto.admin.getInviteCodes",
-            get(get_invite_codes),
-        )
+        .route("/xrpc/com.atproto.admin.getAccountInfo", get(get_account_info))
+        .route("/xrpc/com.atproto.admin.getAccountInfos", get(get_account_infos))
+        .route("/xrpc/com.atproto.admin.searchAccounts", get(search_accounts))
+        .route("/xrpc/com.atproto.admin.updateAccountHandle", post(update_account_handle))
+        .route("/xrpc/com.atproto.admin.updateAccountEmail", post(update_account_email))
+        .route("/xrpc/com.atproto.admin.updateAccountPassword", post(update_account_password))
+        .route("/xrpc/com.atproto.admin.updateAccountSigningKey", post(update_account_signing_key))
+        .route("/xrpc/com.atproto.admin.updateSubjectStatus", post(update_subject_status))
+        .route("/xrpc/com.atproto.admin.getSubjectStatus", get(get_subject_status))
+        .route("/xrpc/com.atproto.admin.deleteAccount", post(delete_account))
+        .route("/xrpc/com.atproto.admin.disableAccountInvites", post(disable_account_invites))
+        .route("/xrpc/com.atproto.admin.enableAccountInvites", post(enable_account_invites))
+        .route("/xrpc/com.atproto.admin.disableInviteCodes", post(disable_invite_codes))
+        .route("/xrpc/com.atproto.admin.getInviteCodes", get(get_invite_codes))
         .route("/xrpc/com.atproto.admin.sendEmail", post(send_email))
         .route("/xrpc/vlpds.admin.getShardLayout", get(get_shard_layout))
         .route("/xrpc/vlpds.admin.splitShard", post(split_shard))
         .route("/xrpc/vlpds.admin.mergeShards", post(merge_shards))
         .route("/xrpc/vlpds.admin.abortReshard", post(abort_reshard))
 }
-
-// ---------------------------------------------------------------------------
-// shard layout: online split/merge (src/reshard.rs)
-// ---------------------------------------------------------------------------
 
 fn cluster_of(app: &App) -> XResult<&Arc<crate::cluster::Cluster>> {
     app.cluster.as_ref().ok_or_else(|| invalid_request("no cluster"))
@@ -99,7 +51,6 @@ fn layout_json(app: &App) -> XResult<J> {
     Ok(json!({"version": l.version, "shards": shards, "nextId": l.next_id, "op": l.op}))
 }
 
-/// The shard layout this node routes by, with owners and any op in flight.
 async fn get_shard_layout(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     require_admin(&creds)?;
     Ok(Json(layout_json(&app)?))
@@ -121,7 +72,7 @@ struct MergeIn {
     wait: bool,
 }
 
-/// Plans `plan`; with `wait`, returns once it flipped (or was aborted).
+/// With `wait`, returns once the op flipped or was aborted.
 async fn reshard(app: &Arc<App>, plan: crate::reshard::Plan, wait: bool) -> XResult<Json<J>> {
     let c = cluster_of(app)?;
     let host: Arc<dyn crate::cluster::ShardHost> = app.node.clone();
@@ -150,19 +101,17 @@ async fn reshard(app: &Arc<App>, plan: crate::reshard::Plan, wait: bool) -> XRes
     Ok(Json(out))
 }
 
-/// Splits a shard online (DESIGN.md "Online shard split/merge").
 async fn split_shard(State(app): AppState, Auth(creds): Auth, Json(inp): Json<SplitIn>) -> XResult<Json<J>> {
     require_admin(&creds)?;
     reshard(&app, crate::reshard::Plan::Split { shard: inp.shard, at: inp.at }, inp.wait).await
 }
 
-/// Merges two adjacent shards online.
 async fn merge_shards(State(app): AppState, Auth(creds): Auth, Json(inp): Json<MergeIn>) -> XResult<Json<J>> {
     require_admin(&creds)?;
     reshard(&app, crate::reshard::Plan::Merge { left: inp.left, right: inp.right }, inp.wait).await
 }
 
-/// Aborts the split/merge in progress (only before it flips).
+/// Only before it flips.
 async fn abort_reshard(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let c = cluster_of(&app)?;
@@ -181,56 +130,25 @@ pub(super) fn require_moderator(creds: &Credentials) -> XResult<()> {
     }
 }
 
-/// Admin Basic auth only (the reference's `authVerifier.adminToken`).
+/// The reference's `authVerifier.adminToken`.
 pub(super) fn require_admin(creds: &Credentials) -> XResult<()> {
     match creds {
         Credentials::Admin => Ok(()),
-        _ => Err(XrpcError {
-            status: StatusCode::UNAUTHORIZED,
-            error: "AuthenticationRequired".into(),
-            message: "admin credentials required".into(),
-        }),
+        _ => Err(XrpcError::auth("admin credentials required")),
     }
-}
-
-/// application/x-www-form-urlencoded pairs (repeated keys kept).
-fn query_pairs(raw: &str) -> Vec<(String, String)> {
-    fn decode(s: &str) -> String {
-        let b = s.as_bytes();
-        let mut out = Vec::with_capacity(b.len());
-        let mut i = 0;
-        while i < b.len() {
-            match b[i] {
-                b'+' => out.push(b' '),
-                b'%' if i + 2 < b.len()
-                    && b[i + 1].is_ascii_hexdigit()
-                    && b[i + 2].is_ascii_hexdigit() =>
-                {
-                    out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap_or(b'%'));
-                    i += 2;
-                }
-                c => out.push(c),
-            }
-            i += 1;
-        }
-        String::from_utf8_lossy(&out).to_string()
-    }
-    raw.split('&')
-        .filter(|p| !p.is_empty())
-        .map(|p| match p.split_once('=') {
-            Some((k, v)) => (decode(k), decode(v)),
-            None => (decode(p), String::new()),
-        })
-        .collect()
 }
 
 fn not_found(message: &str) -> XrpcError {
     XrpcError::bad("NotFound", message)
 }
 
-// ---------------------------------------------------------------------------
-// invite codes
-// ---------------------------------------------------------------------------
+fn not_implemented(message: &str) -> XrpcError {
+    XrpcError { status: StatusCode::NOT_FOUND, error: "MethodNotImplemented".into(), message: message.into() }
+}
+
+async fn ensure_account(app: &App, did: &str) -> XResult<()> {
+    app.account(did).await.map(|_| ()).map_err(|_| invalid_request(format!("Account not found: {did}")))
+}
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -257,7 +175,7 @@ fn invite_routing(code: &str) -> String {
     format!("_invite:{code}")
 }
 
-/// Invite rows with fixed values (golden fixtures, `super::private_rows`).
+/// Golden fixtures (`super::private_rows`).
 pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
     let code = "pds-test-abcde-fghij";
     let inv = InviteCode {
@@ -275,7 +193,6 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
     ]
 }
 
-/// Decodes an invite row (None: not one).
 pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow::Result<&'static str>> {
     if routing.starts_with("_invite:") && name == "c" {
         return Some(super::private_rows::typed_row::<InviteCode>("invite code", val));
@@ -288,16 +205,7 @@ pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow:
 
 /// `{hostname with . -> -}-xxxxx-xxxxx`
 pub(super) fn gen_invite_code(app: &App) -> String {
-    let host = app
-        .public_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(&app.public_url)
-        .split(['/', ':'])
-        .next()
-        .unwrap_or("vlpds")
-        .replace('.', "-");
-    format!("{host}-{}", super::server::random_token())
+    format!("{}-{}", super::server::public_host(app).replace('.', "-"), super::server::random_token())
 }
 
 async fn get_invite(app: &App, code: &str) -> XResult<Option<InviteCode>> {
@@ -306,24 +214,12 @@ async fn get_invite(app: &App, code: &str) -> XResult<Option<InviteCode>> {
 
 async fn put_invite(app: &App, inv: &InviteCode) -> XResult<()> {
     let r = invite_routing(&inv.code);
-    app.put_private(&r, vec![pmut(&r, "c", Some(to_json_bytes(inv)))])
-        .await
+    app.put_private(&r, vec![pmut(&r, "c", Some(to_json_bytes(inv)))]).await
 }
 
-/// Admin-created codes for `account` (a DID or "admin").
+/// `account`: a DID or "admin". `created_by`: "admin", or the account itself
+/// for codes earned with `--invite-interval`.
 pub(super) async fn create_invites(
-    app: &App,
-    account: &str,
-    codes: &[String],
-    use_count: i64,
-    disabled: bool,
-) -> XResult<()> {
-    create_invites_by(app, account, codes, use_count, disabled, "admin").await
-}
-
-/// Codes for `account` created by `created_by` ("admin", or the account
-/// itself for codes earned with `--invite-interval`).
-pub(super) async fn create_invites_by(
     app: &App,
     account: &str,
     codes: &[String],
@@ -344,16 +240,13 @@ pub(super) async fn create_invites_by(
         };
         put_invite(app, &inv).await?;
     }
-    let muts = codes
-        .iter()
-        .map(|c| pmut(account, &format!("invite/{c}"), Some(Vec::new())))
-        .collect();
+    let muts = codes.iter().map(|c| pmut(account, &format!("invite/{c}"), Some(Vec::new()))).collect();
     app.put_private(account, muts).await?;
     crate::metrics::INVITE_CODES.with_label_values(&["created"]).inc_by(codes.len() as u64);
     Ok(())
 }
 
-/// Invite codes created for `account` (a DID or "admin").
+/// `account`: a DID or "admin".
 pub(super) async fn account_invites(app: &App, account: &str) -> XResult<Vec<InviteCode>> {
     let mut out = Vec::new();
     // `account` may be owned elsewhere (getAccountInfos, disableInviteCodes)
@@ -367,25 +260,18 @@ pub(super) async fn account_invites(app: &App, account: &str) -> XResult<Vec<Inv
 }
 
 fn invite_slot_path(app: &App, code: &str, slot: i64) -> object_store::path::Path {
-    object_store::path::Path::from(format!(
-        "{}/invite-use/{}/{slot}",
-        app.store.prefix,
-        hex::encode(code.as_bytes())
-    ))
+    object_store::path::Path::from(format!("{}/invite-use/{}/{slot}", app.store.prefix, hex::encode(code.as_bytes())))
 }
 
-/// A claimed use of an invite code (see [`claim_invite_use`]).
 pub(super) struct InviteClaim {
     code: String,
     slot: i64,
 }
 
-/// Atomically claims one use of `code` for `did`: the code's uses are slots
-/// `0..available`, each claimed by a conditional create of
-/// `invite-use/{code}/{slot}` (`If-None-Match: *`), so concurrent signups
-/// (on any node) can't over-use it. The claim is released with
-/// [`release_invite_use`] if account creation then fails, or recorded on the
-/// code with [`record_invite_use`] once it succeeds.
+/// The code's uses are slots `0..available`, each claimed by a conditional
+/// create of `invite-use/{code}/{slot}`, so concurrent signups on any node
+/// can't over-use it. Released ([`release_invite_use`]) if account creation
+/// then fails, else recorded ([`record_invite_use`]).
 pub(super) async fn claim_invite_use(app: &App, code: &str, did: &str) -> XResult<InviteClaim> {
     let unavailable = || XrpcError::bad("InvalidInviteCode", "Provided invite code not available");
     let inv = get_invite(app, code).await?.ok_or_else(unavailable)?;
@@ -402,26 +288,10 @@ pub(super) async fn claim_invite_use(app: &App, code: &str, did: &str) -> XResul
     // recorded uses fill the low slots; a released claim can leave a gap
     let used = (inv.uses.len() as i64).min(inv.available);
     for slot in (used..inv.available).chain(0..used) {
-        let opts = PutOptions {
-            mode: PutMode::Create,
-            ..Default::default()
-        };
-        match app
-            .store
-            .raw
-            .put_opts(
-                &invite_slot_path(app, code, slot),
-                PutPayload::from(did.as_bytes().to_vec()),
-                opts,
-            )
-            .await
-        {
-            Ok(_) => {
-                return Ok(InviteClaim {
-                    code: code.to_string(),
-                    slot,
-                })
-            }
+        let opts = PutOptions { mode: PutMode::Create, ..Default::default() };
+        let payload = PutPayload::from(did.as_bytes().to_vec());
+        match app.store.raw.put_opts(&invite_slot_path(app, code, slot), payload, opts).await {
+            Ok(_) => return Ok(InviteClaim { code: code.to_string(), slot }),
             Err(object_store::Error::AlreadyExists { .. }) => continue,
             Err(e) => return Err(XrpcError::from_err(e)),
         }
@@ -429,14 +299,8 @@ pub(super) async fn claim_invite_use(app: &App, code: &str, did: &str) -> XResul
     Err(unavailable())
 }
 
-/// Gives back a claimed use (the signup failed after claiming).
 pub(super) async fn release_invite_use(app: &App, claim: InviteClaim) {
-    if let Err(e) = app
-        .store
-        .raw
-        .delete(&invite_slot_path(app, &claim.code, claim.slot))
-        .await
-    {
+    if let Err(e) = app.store.raw.delete(&invite_slot_path(app, &claim.code, claim.slot)).await {
         tracing::warn!(code = %claim.code, "failed to release invite claim: {e}");
     }
 }
@@ -445,13 +309,9 @@ pub(super) async fn record_invite_use(app: &App, claim: &InviteClaim, did: &str)
     let code = claim.code.as_str();
     let e = ext(app);
     let _g = e.lock(&invite_routing(code)).await;
-    let mut inv = get_invite(app, code)
-        .await?
-        .ok_or_else(|| XrpcError::bad("InvalidInviteCode", "Provided invite code not available"))?;
-    inv.uses.push(InviteUse {
-        used_by: did.to_string(),
-        used_at: crate::events::now_rfc3339(),
-    });
+    let mut inv =
+        get_invite(app, code).await?.ok_or_else(|| XrpcError::bad("InvalidInviteCode", "Provided invite code not available"))?;
+    inv.uses.push(InviteUse { used_by: did.to_string(), used_at: crate::events::now_rfc3339() });
     put_invite(app, &inv).await?;
     crate::metrics::INVITE_CODES.with_label_values(&["used"]).inc();
     Ok(())
@@ -471,31 +331,18 @@ async fn set_invites_disabled(app: &App, codes: &[String], disabled: bool) -> XR
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// takedowns
-// ---------------------------------------------------------------------------
-
-/// Is record `{collection}/{rkey}` of `did` taken down? Takedowns live in
-/// the account's own partition (`sec/td/`), so the owner checks them from
-/// its cached per-DID view (`server::ctl`).
+/// `path`: `{collection}/{rkey}`.
 pub async fn is_record_takendown(app: &App, did: &str, path: &str) -> XResult<bool> {
     Ok(ctl(app, did).await?.has_takedown(&format!("rec/{path}")))
 }
 
-/// Is blob `cid` of repo `did` taken down?
 pub async fn is_blob_takendown(app: &App, did: &str, cid: &str) -> XResult<bool> {
     Ok(ctl(app, did).await?.has_takedown(&format!("blob/{cid}")))
 }
 
-/// Applies (`val` = Some) or lifts a record/blob takedown of `did`; `name` is
-/// relative to `sec/td/` (`rec/{collection}/{rkey}` or `blob/{cid}`).
+/// `val` None lifts it; `name` is relative to [`TAKEDOWN`].
 async fn set_subject_takedown(app: &App, did: &str, name: &str, val: Option<J>) -> XResult<()> {
-    put_sec(
-        app,
-        did,
-        vec![pmut(did, &format!("{TAKEDOWN}{name}"), val.map(|v| to_json_bytes(&v)))],
-    )
-    .await
+    put_sec(app, did, vec![pmut(did, &format!("{TAKEDOWN}{name}"), val.map(|v| to_json_bytes(&v)))]).await
 }
 
 /// `{collection}/{rkey}` of an at:// URI naming a record of `did`.
@@ -507,16 +354,8 @@ fn record_path<'a>(uri: &'a str, did: &str) -> XResult<&'a str> {
         .ok_or_else(|| invalid_request("invalid at-uri"))
 }
 
-// ---------------------------------------------------------------------------
-// account views
-// ---------------------------------------------------------------------------
-
 async fn account_view(app: &App, a: &Account) -> XResult<J> {
-    let invites: Vec<J> = account_invites(app, &a.did)
-        .await?
-        .into_iter()
-        .map(|c| serde_json::to_value(c).unwrap())
-        .collect();
+    let invites: Vec<J> = account_invites(app, &a.did).await?.into_iter().map(|c| serde_json::to_value(c).unwrap()).collect();
     let mut v = json!({
         "did": a.did,
         "handle": a.handle,
@@ -548,16 +387,9 @@ struct DidQ {
     did: String,
 }
 
-async fn get_account_info(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Query(q): Query<DidQ>,
-) -> XResult<Json<J>> {
+async fn get_account_info(State(app): AppState, Auth(creds): Auth, Query(q): Query<DidQ>) -> XResult<Json<J>> {
     require_moderator(&creds)?;
-    let a = app
-        .account(&q.did)
-        .await
-        .map_err(|_| not_found("Account not found"))?;
+    let a = app.account(&q.did).await.map_err(|_| not_found("Account not found"))?;
     Ok(Json(account_view(&app, &a).await?))
 }
 
@@ -569,7 +401,7 @@ async fn get_account_infos(
     require_moderator(&creds)?;
     let mut infos = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for (k, did) in query_pairs(raw.as_deref().unwrap_or("")) {
+    for (k, did) in super::sync::query_pairs(raw.as_deref().unwrap_or("")) {
         if (k == "dids" || k == "dids[]") && seen.insert(did.clone()) {
             // the DIDs live on any node's shards (the request routes by none)
             if let Ok(a) = super::internal::account_anywhere(&app, &did).await {
@@ -601,11 +433,7 @@ type SearchParams = (usize, Option<String>, Option<String>);
 impl SearchQ {
     fn parsed(&self) -> XResult<SearchParams> {
         let limit = self.limit.unwrap_or(50).clamp(1, 100);
-        let email = self
-            .email
-            .as_deref()
-            .map(|e| e.trim().to_ascii_lowercase())
-            .filter(|e| !e.is_empty());
+        let email = self.email.as_deref().map(|e| e.trim().to_ascii_lowercase()).filter(|e| !e.is_empty());
         let after = match self.cursor.as_deref().filter(|c| !c.is_empty()) {
             Some(c) => {
                 let (p, d) = c.split_once(':').ok_or_else(|| invalid_request("Malformed cursor"))?;
@@ -621,9 +449,8 @@ impl SearchQ {
     }
 }
 
-/// Accounts on the shards this node owns, in (slot, did) order after the
-/// cursor, at most `limit`; plus the shards scanned. The local half of
-/// searchAccounts (also served to peers by /internal/v1/admin/searchAccounts).
+/// The local half of searchAccounts: (hits in (slot, did) order after the
+/// cursor, the shards scanned).
 pub(super) async fn search_accounts_local(app: &App, q: &SearchQ) -> XResult<(Vec<AccountHit>, Vec<crate::slots::ShardId>)> {
     let (limit, email, after) = q.parsed()?;
     let layout = app.partitions.layout();
@@ -640,20 +467,10 @@ pub(super) async fn search_accounts_local(app: &App, q: &SearchQ) -> XResult<(Ve
             .await
             .map_err(XrpcError::from_err)?;
         while out.len() < limit {
-            let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? else {
-                break;
-            };
-            let Ok(a) = serde_json::from_slice::<Account>(&kv.value) else {
+            let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? else { break };
+            let Ok(a) = serde_json::from_slice::<Account>(&kv.value) else { continue };
+            if email.as_ref().is_some_and(|e| !a.email.as_deref().is_some_and(|ae| ae.starts_with(e.as_str()))) {
                 continue;
-            };
-            if let Some(e) = &email {
-                if !a
-                    .email
-                    .as_deref()
-                    .is_some_and(|ae| ae.starts_with(e.as_str()))
-                {
-                    continue;
-                }
             }
             let (slot, did) = state::slot_did(&kv.key, state::ACCOUNT_FAMILY.len());
             let slot = u16::from_be_bytes([slot[0], slot[1]]) as u32;
@@ -664,17 +481,10 @@ pub(super) async fn search_accounts_local(app: &App, q: &SearchQ) -> XResult<(Ve
     Ok((out, ids))
 }
 
-/// Scans the accounts of every shard in the cluster (this node's, plus each
-/// live peer's via /internal/v1/admin/searchAccounts), merged in (slot, did)
-/// order, an order independent of the shard layout; `email` filters by
-/// case-insensitive prefix. Cursor: `{slot}:{did}`, the last returned key,
-/// so a page resumes on every node. Unreachable peers / unowned shards are
-/// reported (`unreachableNodes`, `missingShards`) instead of silently dropped.
-async fn search_accounts(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Query(q): Query<SearchQ>,
-) -> XResult<Json<J>> {
+/// Cluster-wide, merged in (slot, did) order, which is independent of the
+/// shard layout, so a `{slot}:{did}` cursor resumes on every node. Gaps are
+/// reported ([`partial_fields`]) instead of silently dropped.
+async fn search_accounts(State(app): AppState, Auth(creds): Auth, Query(q): Query<SearchQ>) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let (limit, _, after) = q.parsed()?;
     let (mut hits, owned) = search_accounts_local(&app, &q).await?;
@@ -705,11 +515,9 @@ async fn search_accounts(
     Ok(Json(res))
 }
 
-/// Marks a scatter-gather result incomplete: `unreachableNodes` (peers that
-/// timed out or failed), `unsupportedNodes` (peers whose build lacks the
-/// endpoint: 404 during a rolling deploy) and `missingShards` (shards
-/// holding slots >= `from` that no answering node owned, e.g. mid-move).
-/// Absent when complete.
+/// Marks a scatter-gather result incomplete: `unsupportedNodes` lack the
+/// endpoint (a rolling deploy), `missingShards` hold slots >= `from` but no
+/// answering node owned them (e.g. mid-move).
 fn partial_fields(
     app: &App,
     res: &mut J,
@@ -731,21 +539,13 @@ fn partial_fields(
     }
 }
 
-// ---------------------------------------------------------------------------
-// account updates
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize)]
 struct UpdateHandleIn {
     did: String,
     handle: String,
 }
 
-async fn update_account_handle(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<UpdateHandleIn>,
-) -> XResult<StatusCode> {
+async fn update_account_handle(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdateHandleIn>) -> XResult<StatusCode> {
     require_admin(&creds)?;
     let handle = normalize_handle(&inp.handle)?;
     // reference allowAnyValid: no slur or reserved-name checks, but a
@@ -753,11 +553,8 @@ async fn update_account_handle(
     if handle.ends_with(&format!(".{}", app.handle_domain)) {
         super::server::ensure_service_handle(&app, &handle, true)?;
     }
-    let did = inp.did.clone();
-    app.account(&did)
-        .await
-        .map_err(|_| invalid_request(format!("Account not found: {did}")))?;
-    super::identity::set_handle(&app, &did, &handle, false).await?;
+    ensure_account(&app, &inp.did).await?;
+    super::identity::set_handle(&app, &inp.did, &handle, false).await?;
     Ok(StatusCode::OK)
 }
 
@@ -767,19 +564,11 @@ struct UpdateEmailIn {
     email: String,
 }
 
-async fn update_account_email(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<UpdateEmailIn>,
-) -> XResult<StatusCode> {
+async fn update_account_email(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdateEmailIn>) -> XResult<StatusCode> {
     require_admin(&creds)?;
-    let did = app
-        .resolve_repo(&inp.account)
-        .await
-        .map_err(|_| invalid_request(format!("Account does not exist: {}", inp.account)))?;
-    app.account(&did)
-        .await
-        .map_err(|_| invalid_request(format!("Account does not exist: {}", inp.account)))?;
+    let missing = || invalid_request(format!("Account does not exist: {}", inp.account));
+    let did = app.resolve_repo(&inp.account).await.map_err(|_| missing())?;
+    app.account(&did).await.map_err(|_| missing())?;
     set_email(&app, &did, &inp.email).await?;
     Ok(StatusCode::OK)
 }
@@ -790,18 +579,12 @@ struct UpdatePasswordIn {
     password: String,
 }
 
-async fn update_account_password(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<UpdatePasswordIn>,
-) -> XResult<StatusCode> {
+async fn update_account_password(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdatePasswordIn>) -> XResult<StatusCode> {
     require_admin(&creds)?;
     if inp.password.len() > NEW_PASSWORD_MAX_LENGTH {
         return Err(invalid_request("Invalid password length."));
     }
-    app.account(&inp.did)
-        .await
-        .map_err(|_| invalid_request(format!("Account not found: {}", inp.did)))?;
+    ensure_account(&app, &inp.did).await?;
     super::server::change_password(&app, &inp.did, &inp.password).await?;
     Ok(StatusCode::OK)
 }
@@ -813,29 +596,13 @@ struct UpdateSigningKeyIn {
     signing_key: Option<String>,
 }
 
-/// Rotates the account's repo signing key. The PDS signs commits, so it must
-/// hold the private key: `signingKey` must be a did:key reserved with
-/// server.reserveSigningKey, or omitted/"generate" for a fresh key. As the
-/// reference's rotate-keys script: with PLC registration on, a did:plc's
-/// `atproto` key is updated in the PLC directory, then the repo is re-signed
-/// with the new key (an empty commit) and `#identity` + `#sync` emitted
-/// (src/xrpc/key_rotation.rs: writes wait out the rotation; one the
-/// directory refused changes nothing; one interrupted after the new key was
-/// recorded is finished in the background).
-async fn update_account_signing_key(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<UpdateSigningKeyIn>,
-) -> XResult<Json<J>> {
+/// The PDS signs commits, so it must hold the private key: `signingKey` is
+/// a did:key reserved with server.reserveSigningKey, or omitted/"generate"
+/// for a fresh key (src/xrpc/key_rotation.rs).
+async fn update_account_signing_key(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdateSigningKeyIn>) -> XResult<Json<J>> {
     require_admin(&creds)?;
-    app.account(&inp.did)
-        .await
-        .map_err(|_| invalid_request(format!("Account not found: {}", inp.did)))?;
-    let key = match inp
-        .signing_key
-        .as_deref()
-        .filter(|k| !k.is_empty() && *k != "generate")
-    {
+    ensure_account(&app, &inp.did).await?;
+    let key = match inp.signing_key.as_deref().filter(|k| !k.is_empty() && *k != "generate") {
         Some(dk) => {
             if !dk.starts_with("did:key:") {
                 return Err(invalid_request("signingKey must be a did:key"));
@@ -849,10 +616,6 @@ async fn update_account_signing_key(
     let did_key = super::key_rotation::rotate(&app, &inp.did, key).await?;
     Ok(Json(json!({"signingKey": did_key})))
 }
-
-// ---------------------------------------------------------------------------
-// subject status
-// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct StatusAttr {
@@ -870,61 +633,33 @@ struct UpdateSubjectStatusIn {
 
 enum Subject {
     Repo(String),
-    Record {
-        uri: String,
-        did: String,
-        cid: Option<String>,
-    },
-    Blob {
-        did: String,
-        cid: String,
-    },
+    Record { uri: String, did: String, cid: Option<String> },
+    Blob { did: String, cid: String },
 }
 
 fn parse_subject(s: &J) -> XResult<Subject> {
+    let field = |k: &str| s[k].as_str().map(str::to_string).ok_or_else(|| invalid_request(format!("subject.{k} required")));
     let t = s["$type"].as_str().unwrap_or("");
     match t {
-        "com.atproto.admin.defs#repoRef" => Ok(Subject::Repo(
-            s["did"]
-                .as_str()
-                .ok_or_else(|| invalid_request("subject.did required"))?
-                .to_string(),
-        )),
+        "com.atproto.admin.defs#repoRef" => Ok(Subject::Repo(field("did")?)),
         "com.atproto.repo.strongRef" => {
-            let uri = s["uri"]
-                .as_str()
-                .ok_or_else(|| invalid_request("subject.uri required"))?
-                .to_string();
+            let uri = field("uri")?;
             let did = uri
                 .strip_prefix("at://")
                 .and_then(|r| r.split('/').next())
                 .filter(|d| d.starts_with("did:"))
                 .ok_or_else(|| invalid_request("invalid at-uri"))?
                 .to_string();
-            Ok(Subject::Record {
-                uri,
-                did,
-                cid: s["cid"].as_str().map(str::to_string),
-            })
+            Ok(Subject::Record { uri, did, cid: s["cid"].as_str().map(str::to_string) })
         }
-        "com.atproto.admin.defs#repoBlobRef" => Ok(Subject::Blob {
-            did: s["did"]
-                .as_str()
-                .ok_or_else(|| invalid_request("subject.did required"))?
-                .to_string(),
-            cid: s["cid"]
-                .as_str()
-                .ok_or_else(|| invalid_request("subject.cid required"))?
-                .to_string(),
-        }),
+        "com.atproto.admin.defs#repoBlobRef" => Ok(Subject::Blob { did: field("did")?, cid: field("cid")? }),
         _ => Err(invalid_request(format!("Invalid subject ({t})"))),
     }
 }
 
-/// Deletes every OAuth session of `did`, so its DPoP access tokens stop
-/// verifying (verify_dpop requires the live session) and can't be refreshed.
-/// A failure fails the takedown request (the status is already applied, so a
-/// retry is idempotent); verify_dpop also rejects taken-down accounts.
+/// So the account's DPoP access tokens stop verifying and can't be
+/// refreshed. A failure fails the takedown request (already applied, so a
+/// retry is idempotent).
 async fn revoke_oauth_sessions(app: &App, did: &str) -> XResult<()> {
     crate::oauth::store::revoke_all_sessions(app, did).await.map(|_| ()).map_err(|e| {
         tracing::warn!(%did, "takedown: revoking OAuth sessions failed: {}", e.description);
@@ -932,18 +667,10 @@ async fn revoke_oauth_sessions(app: &App, did: &str) -> XResult<()> {
     })
 }
 
-async fn update_subject_status(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<UpdateSubjectStatusIn>,
-) -> XResult<Json<J>> {
+async fn update_subject_status(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdateSubjectStatusIn>) -> XResult<Json<J>> {
     require_moderator(&creds)?;
-    if inp.takedown.as_ref().is_some_and(|t| t.applied)
-        && inp.deactivated.as_ref().is_some_and(|d| !d.applied)
-    {
-        return Err(invalid_request(
-            "Cannot activate and takedown an account at the same time",
-        ));
+    if inp.takedown.as_ref().is_some_and(|t| t.applied) && inp.deactivated.as_ref().is_some_and(|d| !d.applied) {
+        return Err(invalid_request("Cannot activate and takedown an account at the same time"));
     }
     let subject = parse_subject(&inp.subject)?;
     if let Some(td) = &inp.takedown {
@@ -953,10 +680,7 @@ async fn update_subject_status(
         };
         match &subject {
             Subject::Repo(did) => {
-                let r = td
-                    .r#ref
-                    .clone()
-                    .unwrap_or_else(crate::events::now_rfc3339);
+                let r = td.r#ref.clone().unwrap_or_else(crate::events::now_rfc3339);
                 let applied = td.applied;
                 update_account(&app, did, false, true, move |a| {
                     set_extra(a, "takedownRef", if applied { json!(r) } else { J::Null });
@@ -975,16 +699,12 @@ async fn update_subject_status(
                 counted("account");
             }
             Subject::Record { uri, did, cid } => {
-                let v = td
-                    .applied
-                    .then(|| json!({"uri": uri, "did": did, "cid": cid, "ref": td.r#ref}));
+                let v = td.applied.then(|| json!({"uri": uri, "did": did, "cid": cid, "ref": td.r#ref}));
                 set_subject_takedown(&app, did, &format!("rec/{}", record_path(uri, did)?), v).await?;
                 counted("record");
             }
             Subject::Blob { did, cid } => {
-                let v = td
-                    .applied
-                    .then(|| json!({"did": did, "cid": cid, "ref": td.r#ref}));
+                let v = td.applied.then(|| json!({"did": did, "cid": cid, "ref": td.r#ref}));
                 set_subject_takedown(&app, did, &format!("blob/{cid}"), v).await?;
                 counted("blob");
             }
@@ -1016,17 +736,10 @@ struct SubjectStatusQ {
     blob: Option<String>,
 }
 
-async fn get_subject_status(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Query(q): Query<SubjectStatusQ>,
-) -> XResult<Json<J>> {
+async fn get_subject_status(State(app): AppState, Auth(creds): Auth, Query(q): Query<SubjectStatusQ>) -> XResult<Json<J>> {
     require_moderator(&creds)?;
     let body = if let Some(blob) = &q.blob {
-        let did = q
-            .did
-            .as_deref()
-            .ok_or_else(|| invalid_request("Must provide a did to request blob state"))?;
+        let did = q.did.as_deref().ok_or_else(|| invalid_request("Must provide a did to request blob state"))?;
         get_json::<J>(&app, did, &format!("{TAKEDOWN}blob/{blob}")).await?.map(|t| {
             json!({
                 "subject": {"$type": "com.atproto.admin.defs#repoBlobRef", "did": did, "cid": blob},
@@ -1084,22 +797,12 @@ struct DeleteAccountIn {
     did: String,
 }
 
-async fn delete_account(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<DeleteAccountIn>,
-) -> XResult<StatusCode> {
+async fn delete_account(State(app): AppState, Auth(creds): Auth, Json(inp): Json<DeleteAccountIn>) -> XResult<StatusCode> {
     require_admin(&creds)?;
-    app.account(&inp.did)
-        .await
-        .map_err(|_| invalid_request(format!("Account not found: {}", inp.did)))?;
+    ensure_account(&app, &inp.did).await?;
     delete_account_fully(&app, &inp.did).await?;
     Ok(StatusCode::OK)
 }
-
-// ---------------------------------------------------------------------------
-// invites (admin)
-// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct AccountIn {
@@ -1115,29 +818,17 @@ async fn set_account_invites_disabled(app: &App, account: &str, disabled: bool) 
         Ok(())
     })
     .await?;
-    let codes: Vec<String> = account_invites(app, &did)
-        .await?
-        .into_iter()
-        .map(|c| c.code)
-        .collect();
+    let codes: Vec<String> = account_invites(app, &did).await?.into_iter().map(|c| c.code).collect();
     set_invites_disabled(app, &codes, disabled).await
 }
 
-async fn disable_account_invites(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<AccountIn>,
-) -> XResult<StatusCode> {
+async fn disable_account_invites(State(app): AppState, Auth(creds): Auth, Json(inp): Json<AccountIn>) -> XResult<StatusCode> {
     require_moderator(&creds)?;
     set_account_invites_disabled(&app, &inp.account, true).await?;
     Ok(StatusCode::OK)
 }
 
-async fn enable_account_invites(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<AccountIn>,
-) -> XResult<StatusCode> {
+async fn enable_account_invites(State(app): AppState, Auth(creds): Auth, Json(inp): Json<AccountIn>) -> XResult<StatusCode> {
     require_moderator(&creds)?;
     set_account_invites_disabled(&app, &inp.account, false).await?;
     Ok(StatusCode::OK)
@@ -1151,11 +842,7 @@ struct DisableCodesIn {
     accounts: Vec<String>,
 }
 
-async fn disable_invite_codes(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<DisableCodesIn>,
-) -> XResult<StatusCode> {
+async fn disable_invite_codes(State(app): AppState, Auth(creds): Auth, Json(inp): Json<DisableCodesIn>) -> XResult<StatusCode> {
     require_moderator(&creds)?;
     if inp.accounts.iter().any(|a| a == "admin") {
         return Err(invalid_request("cannot disable admin invite codes"));
@@ -1175,7 +862,7 @@ pub(super) struct InviteCodesQ {
     cursor: Option<String>,
 }
 
-/// Global sort key of an invite code (listed descending).
+/// Listed descending.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum InviteKey {
     Recent(String, String),
@@ -1224,9 +911,8 @@ impl InviteCodesQ {
     }
 }
 
-/// Invite codes on the shards this node owns that sort after the cursor, in
-/// order, at most `limit + 1` (so the merger knows whether more exist); plus
-/// the shards scanned. Also served to peers by /internal/v1/admin/inviteCodes.
+/// The local half of getInviteCodes: (at most `limit + 1` codes after the
+/// cursor, so the merger knows whether more exist; the shards scanned).
 pub(super) async fn invite_codes_local(app: &App, q: &InviteCodesQ) -> XResult<(Vec<InviteCode>, Vec<crate::slots::ShardId>)> {
     let (usage, limit, after) = q.parsed()?;
     let owned: Vec<crate::slots::ShardId> = app.partitions.owned().iter().map(|p| p.id).collect();
@@ -1243,16 +929,8 @@ pub(super) async fn invite_codes_local(app: &App, q: &InviteCodesQ) -> XResult<(
     Ok((all.into_iter().map(|(_, c)| c).collect(), owned))
 }
 
-/// All invite codes in the cluster (this node's shards plus each live
-/// peer's), sorted "recent" (createdAt desc) or "usage" (uses desc), code
-/// desc as the tiebreak. Cursor: the last returned code's sort key, so the
-/// next page resumes on every node. Partial results are flagged as in
-/// searchAccounts.
-async fn get_invite_codes(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Query(q): Query<InviteCodesQ>,
-) -> XResult<Json<J>> {
+/// Cluster-wide, like searchAccounts: the cursor is the last code's sort key.
+async fn get_invite_codes(State(app): AppState, Auth(creds): Auth, Query(q): Query<InviteCodesQ>) -> XResult<Json<J>> {
     require_moderator(&creds)?;
     let (usage, limit, _) = q.parsed()?;
     let (codes, owned) = invite_codes_local(&app, &q).await?;
@@ -1280,10 +958,6 @@ async fn get_invite_codes(
     Ok(Json(out))
 }
 
-// ---------------------------------------------------------------------------
-// email
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SendEmailIn {
@@ -1296,19 +970,10 @@ struct SendEmailIn {
     comment: Option<String>,
 }
 
-async fn send_email(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<SendEmailIn>,
-) -> XResult<Json<J>> {
+async fn send_email(State(app): AppState, Auth(creds): Auth, Json(inp): Json<SendEmailIn>) -> XResult<Json<J>> {
     require_moderator(&creds)?;
-    let a = app
-        .account(&inp.recipient_did)
-        .await
-        .map_err(|_| invalid_request("Recipient not found"))?;
-    let to = a
-        .email
-        .ok_or_else(|| invalid_request("account does not have an email address"))?;
+    let a = app.account(&inp.recipient_did).await.map_err(|_| invalid_request("Recipient not found"))?;
+    let to = a.email.ok_or_else(|| invalid_request("account does not have an email address"))?;
     let subject = inp.subject.unwrap_or_else(|| "Message via your PDS".into());
     super::server::deliver_moderation(&app, &to, &subject, &inp.content);
     Ok(Json(json!({"sent": true})))
@@ -1319,33 +984,18 @@ struct DevMailQ {
     email: String,
 }
 
-/// Dev mode only: mail "sent" to an address (newest last) and the latest token.
-async fn get_dev_mail(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Query(q): Query<DevMailQ>,
-) -> XResult<Json<J>> {
+async fn get_dev_mail(State(app): AppState, Auth(creds): Auth, Query(q): Query<DevMailQ>) -> XResult<Json<J>> {
     require_admin(&creds)?;
     if !app.config.dev_mode {
-        return Err(XrpcError {
-            status: StatusCode::NOT_FOUND,
-            error: "MethodNotImplemented".into(),
-            message: "dev mail is only available in dev mode".into(),
-        });
+        return Err(not_implemented("dev mail is only available in dev mode"));
     }
     let email = q.email.trim().to_ascii_lowercase();
     let e = ext(&app);
     let msgs = e.dev_mail.lock().get(&email).cloned().unwrap_or_default();
     let token = msgs.iter().rev().find_map(|m| m.token.clone());
     let latest = msgs.last().cloned();
-    Ok(Json(
-        json!({"email": email, "token": token, "latest": latest, "messages": msgs}),
-    ))
+    Ok(Json(json!({"email": email, "token": token, "latest": latest, "messages": msgs})))
 }
-
-// ---------------------------------------------------------------------------
-// simulation
-// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct BulkCreateIn {
@@ -1353,19 +1003,17 @@ struct BulkCreateIn {
     start: u64,
     #[serde(default)]
     count: u64,
-    /// Explicit account indexes, instead of `start..start+count` (a load
-    /// generator sends each node only the DIDs it owns).
+    /// Instead of `start..start+count`, so a load generator can send each
+    /// node only the DIDs it owns.
     #[serde(default)]
     indices: Option<Vec<u64>>,
     records: BulkRecords,
-    /// Password of the created accounts (a load generator logging into
-    /// them). Unset: a random one nobody knows (no login).
+    /// Unset: a random one nobody knows.
     #[serde(default)]
     password: Option<String>,
 }
 
-/// Genesis records: one count for every account, or one per account
-/// (aligned with the account list).
+/// Genesis records: one count for every account, or one per account.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum BulkRecords {
@@ -1373,28 +1021,15 @@ enum BulkRecords {
     Each(Vec<u32>),
 }
 
-/// Accounts and genesis records one bulkCreate request may carry.
 const BULK_MAX_ACCOUNTS: usize = 100_000;
 const BULK_MAX_RECORDS: u64 = 1_000_000;
-/// Head lookups in flight per request (the existence check).
 const BULK_EXISTS_CONCURRENCY: usize = 64;
 
-/// Simulation-only: creates accounts `start..start+count` (or `indices`)
-/// with deterministic DIDs (`state::bulk_did`) and genesis posts (`records`:
-/// one count, or one per account). Emits the normal #identity/#account/#sync
-/// events but skips the global handle claim object, and never touches the
-/// PLC directory, even with PLC registration on: these synthetic DIDs are
-/// not registered anywhere (benchmarks must not hammer a real PLC).
-///
-/// Idempotent, so a resumed range is safe: an account whose head is stored
-/// (or that its worker holds) is left alone and counted as `existing`.
-/// Accounts in shards this node doesn't serve are counted as `notOwned`
-/// (send each node its own DIDs, or the same range to every node).
-async fn bulk_create(
-    State(app): AppState,
-    headers: HeaderMap,
-    Json(inp): Json<BulkCreateIn>,
-) -> XResult<Json<J>> {
+/// Simulation only: accounts with deterministic DIDs (`state::bulk_did`)
+/// and genesis posts. Emits the normal events but skips the handle claims
+/// and never touches the PLC directory (benchmarks must not hammer a real
+/// one). Idempotent, so a resumed range is safe.
+async fn bulk_create(State(app): AppState, headers: HeaderMap, Json(inp): Json<BulkCreateIn>) -> XResult<Json<J>> {
     use futures::StreamExt;
     let tok = headers
         .get(header::AUTHORIZATION)
@@ -1404,11 +1039,7 @@ async fn bulk_create(
         return Err(XrpcError::auth("admin token required"));
     }
     if !(app.config.dev_mode || app.config.allow_bulk_create) {
-        return Err(XrpcError {
-            status: StatusCode::NOT_FOUND,
-            error: "MethodNotImplemented".into(),
-            message: "bulkCreate needs --dev-mode or --allow-bulk-create".into(),
-        });
+        return Err(not_implemented("bulkCreate needs --dev-mode or --allow-bulk-create"));
     }
     let password_hash = bulk_password_hash(inp.password).await?;
     let idx: Vec<u64> = match inp.indices {
@@ -1433,7 +1064,6 @@ async fn bulk_create(
     if records.iter().map(|&n| n as u64).sum::<u64>() > BULK_MAX_RECORDS {
         return Err(invalid_request(format!("at most {BULK_MAX_RECORDS} genesis records per request")));
     }
-    // owned accounts whose head isn't stored yet
     let mut not_owned = 0u64;
     let mut owned = Vec::with_capacity(idx.len());
     for (&i, &n) in idx.iter().zip(&records) {
@@ -1516,9 +1146,8 @@ async fn bulk_create(
     })))
 }
 
-/// The password hash of a bulkCreate request's accounts: of `password`
-/// (the last one's hash is reused: a load generator sends the same one on
-/// every request), else of a random per-process password (no login).
+/// The last password's hash is reused: a load generator sends the same one
+/// on every request.
 async fn bulk_password_hash(password: Option<String>) -> XResult<String> {
     static LAST: parking_lot::Mutex<Option<(String, String)>> = parking_lot::Mutex::new(None);
     let pw = match password {
@@ -1542,45 +1171,40 @@ async fn bulk_password_hash(password: Option<String>) -> XResult<String> {
 static BULK_RANDOM_PASSWORD_HASH: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| state::hash_password_blocking(&hex::encode(rand::random::<[u8; 32]>())));
 
-// ---------------------------------------------------------------------------
-// PLC rotation key rotation (DESIGN.md "PLC identity")
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct RotatePlcIn {
-    /// Count DIDs still on a retired key, change nothing.
-    #[serde(default)]
-    dry_run: bool,
-}
-
-/// PLC updates in flight per rotatePlcKeys run (the directory rate-limits).
-const ROTATE_PLC_CONCURRENCY: usize = 4;
-
-/// For every did:plc account of the shards this node owns whose DID lists
-/// a retired server rotation key (`--plc-rotation-key-old-file`) and not
-/// the current one: a PLC update signed by the retired key that lists the
-/// current key instead. Run it on every node after rolling out a new
-/// rotation key, then with `dryRun` until each reports `rotated: 0` before
-/// retiring the old key. Idempotent. `foreign`: DIDs that list none of our
-/// keys (migrated away).
-async fn rotate_plc_keys(State(app): AppState, Auth(creds): Auth, body: Option<Json<RotatePlcIn>>) -> XResult<Json<J>> {
-    use futures::StreamExt;
-    require_admin(&creds)?;
-    let plc = app.plc.clone().ok_or_else(|| invalid_request("PLC registration is off on this PDS"))?;
-    let dry = body.map(|Json(b)| b).unwrap_or_default().dry_run;
-    let mut dids = Vec::new();
+/// Every account of the shards this node owns.
+async fn owned_accounts(app: &App) -> XResult<Vec<Account>> {
+    let mut out = Vec::new();
     for p in app.partitions.owned() {
         let mut it = state::FamilyScan::new(p.db.as_ref(), state::ACCOUNT_FAMILY, None, &Default::default())
             .await
             .map_err(XrpcError::from_err)?;
         while let Some(kv) = it.next().await.map_err(XrpcError::from_err)? {
-            let a: Account = serde_json::from_slice(&kv.value).map_err(XrpcError::from_err)?;
-            if crate::plc::valid_plc_did(&a.did) {
-                dids.push(a.did);
-            }
+            out.push(serde_json::from_slice(&kv.value).map_err(XrpcError::from_err)?);
         }
     }
+    Ok(out)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RotatePlcIn {
+    #[serde(default)]
+    dry_run: bool,
+}
+
+/// The directory rate-limits.
+const ROTATE_PLC_CONCURRENCY: usize = 4;
+
+/// Moves this node's did:plc accounts off a retired server rotation key
+/// (DESIGN.md "PLC identity"). Idempotent. `foreign`: DIDs that list none of
+/// our keys (migrated away).
+async fn rotate_plc_keys(State(app): AppState, Auth(creds): Auth, body: Option<Json<RotatePlcIn>>) -> XResult<Json<J>> {
+    use futures::StreamExt;
+    require_admin(&creds)?;
+    let plc = app.plc.clone().ok_or_else(|| invalid_request("PLC registration is off on this PDS"))?;
+    let dry = body.map(|Json(b)| b).unwrap_or_default().dry_run;
+    let dids: Vec<String> =
+        owned_accounts(&app).await?.into_iter().map(|a| a.did).filter(|d| crate::plc::valid_plc_did(d)).collect();
     let accounts = dids.len();
     let results: Vec<(String, Result<crate::plc::KeyRotation, crate::plc::PlcError>)> = futures::stream::iter(dids)
         .map(|did| {
@@ -1620,49 +1244,29 @@ async fn rotate_plc_keys(State(app): AppState, Auth(creds): Auth, body: Option<J
     })))
 }
 
-// ---------------------------------------------------------------------------
-// KEK rotation (DESIGN.md "Secrets at rest")
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct RewrapIn {
-    /// Count what is stale, change nothing.
     #[serde(default)]
     dry_run: bool,
-    /// Also unwrap blobs already under the current KEK's id, to find (and
-    /// rewrap) ones under an older version of a Cloud KMS key. One KMS
-    /// decrypt per secret.
+    /// Also unwrap blobs already under the current KEK's id, to find ones
+    /// under an older version of a Cloud KMS key (one KMS decrypt each).
     #[serde(default)]
     check_versions: bool,
 }
 
-/// Rewraps every secret at rest in the shards this node owns under the
-/// current KEK: account signing keys, reserved signing keys and TOTP
-/// secrets. Run it on every node after adding a new KEK (the old one
-/// still configured for unwrap), and again with `dryRun` until each
-/// reports `stale: 0` before retiring the old KEK. Shards that move during
-/// a run are covered by running it again. Idempotent.
+/// Rewraps this node's secrets at rest (signing keys, reserved keys, TOTP)
+/// under the current KEK (DESIGN.md "Secrets at rest"). Idempotent.
 async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Json<RewrapIn>>) -> XResult<Json<J>> {
     use crate::secrets::Purpose;
     use futures::StreamExt;
     require_admin(&creds)?;
     let inp = body.map(|Json(b)| b).unwrap_or_default();
     let started = std::time::Instant::now();
-    // the accounts of the owned shards
-    let mut dids = Vec::new();
-    for p in app.partitions.owned() {
-        let mut it = state::FamilyScan::new(p.db.as_ref(), state::ACCOUNT_FAMILY, None, &Default::default())
-            .await
-            .map_err(XrpcError::from_err)?;
-        while let Some(kv) = it.next().await.map_err(XrpcError::from_err)? {
-            let a: Account = serde_json::from_slice(&kv.value).map_err(XrpcError::from_err)?;
-            dids.push((a.did, a.wrapped_signing_key));
-        }
-    }
+    let dids: Vec<(String, String)> = owned_accounts(&app).await?.into_iter().map(|a| (a.did, a.wrapped_signing_key)).collect();
     let (accounts, check, dry) = (dids.len(), inp.check_versions, inp.dry_run);
     let app2 = app.clone();
-    // (stale signing key, stale TOTP, errors)
+    // (stale signing key, stale TOTP, error)
     let results: Vec<(bool, bool, Option<String>)> = futures::stream::iter(dids)
         .map(|(did, blob)| {
             let app = app2.clone();
@@ -1708,7 +1312,7 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
         totp += t as u64;
         errors.extend(e);
     }
-    // reserved signing keys (did:key-indexed rows carry the wrapped key)
+    // the did:key-indexed rows carry the wrapped key
     let mut reserved = 0u64;
     for (routing, name, val) in super::server::scan_private_routing(&app, "_reserved:").await? {
         let Some(did_key) = routing.strip_prefix("_reserved:").filter(|r| r.starts_with("did:key:") && name == "k") else {
