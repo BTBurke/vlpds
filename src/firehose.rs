@@ -763,11 +763,13 @@ impl Firehose {
     }
 
     /// Sends the events in (`last`, ring floor] from S3, once every log is
-    /// durable up to the floor. Ok(false) = the backfill failed (or there's
-    /// no store): the caller skips to the ring.
+    /// durable up to the floor. Ok(false) = there's no store (nothing older
+    /// than the ring exists): the caller skips to the ring. A backfill that
+    /// keeps failing disconnects the subscriber.
     async fn backfill_to_ring<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>, last: &mut i64, shard: Option<SlotRange>) -> Result<bool, &'static str> {
         let Some(store) = self.store.read().clone() else { return Ok(false) };
         let reader = Reader { store, cache: self.backfill_cache.clone(), readahead_bytes: self.readahead_bytes, shard };
+        let (mut overtaken, mut failures) = (0u32, 0u32);
         loop {
             let floor = self.ring_floor.load(Ordering::Acquire);
             if *last >= floor {
@@ -809,29 +811,48 @@ impl Firehose {
                     out.control(Some(c)).await?;
                 }
             }
-            match (&mut job.0).await {
-                Ok(Ok(_)) => *last = (*last).max(floor), // everything <= floor that exists was sent
-                // retention deleted segments ahead of us mid-read: the floor
-                // check above moves us past them
-                Ok(Err(e)) if e.downcast_ref::<crate::backfill::Pruned>().is_some() => {
-                    if crate::retention::retained_floor(&reader.store).await.is_ok_and(|p| *last < p) {
-                        continue;
-                    }
-                    tracing::warn!(from, floor, "firehose backfill failed: {e:#}");
-                    return Ok(false);
+            let err = match (&mut job.0).await {
+                Ok(Ok(_)) => {
+                    *last = (*last).max(floor); // everything <= floor that exists was sent
+                    (overtaken, failures) = (0, 0);
+                    continue;
                 }
-                Ok(Err(e)) => {
-                    tracing::warn!(from, floor, "firehose backfill failed: {e:#}");
-                    return Ok(false);
-                }
-                Err(e) => {
-                    tracing::warn!(from, floor, "firehose backfill task failed: {e}");
-                    return Ok(false);
-                }
+                Ok(Err(e)) => e,
+                Err(e) => anyhow::anyhow!("backfill task: {e}"),
+            };
+            if err.downcast_ref::<crate::backfill::Pruned>().is_some() && overtaken < MAX_PRUNED_RETRIES {
+                // Retention deleted segments the reader was walking. All of
+                // them are <= the retained floor (raised before deleting):
+                // past `last`, the check above sends OutdatedCursor; at or
+                // below it, nothing we owe was deleted (a log's head below
+                // the cursor pruned under the seek, e.g. a dead log wholly
+                // below it): read again from `last`. Each retry needs a new
+                // delete, so this ends.
+                overtaken += 1;
+                metrics::FIREHOSE_BACKFILL_RETRIES.with_label_values(&["pruned"]).inc();
+                tracing::debug!(from, floor, "firehose backfill overtaken by retention, retrying: {err:#}");
+                continue;
             }
+            // Anything else (an S3 error) is retried a few times, then the
+            // subscriber is disconnected to resume from its cursor: skipping
+            // to the ring would drop stored events behind an OutdatedCursor.
+            failures += 1;
+            if failures >= BACKFILL_ATTEMPTS {
+                tracing::warn!(from, floor, "firehose backfill failed, disconnecting: {err:#}");
+                out.close(1011).await;
+                return Err("backfill_failed");
+            }
+            metrics::FIREHOSE_BACKFILL_RETRIES.with_label_values(&["error"]).inc();
+            tracing::warn!(from, floor, "firehose backfill failed, retrying: {err:#}");
+            tokio::time::sleep(Duration::from_millis(100) * failures).await;
         }
     }
 }
+
+/// Tries per backfill before a subscriber is disconnected (S3 errors).
+const BACKFILL_ATTEMPTS: u32 = 3;
+/// Re-reads after retention overtook a backfill, before it's an error.
+const MAX_PRUNED_RETRIES: u32 = 64;
 
 /// Default byte budget of the merger's queues (see `Firehose::spawn_merger`).
 pub const DEFAULT_MERGE_QUEUE_BYTES: usize = 256 << 20;
@@ -1073,6 +1094,18 @@ impl<W: AsyncWrite + Unpin> Out<W> {
             return Err("too_slow");
         }
         Ok(())
+    }
+
+    /// Best effort: a close frame with `code`, then the caller drops the
+    /// connection.
+    async fn close(&mut self, code: u16) {
+        let mut m = Vec::with_capacity(4);
+        push_message(&mut m, OP_CLOSE, &code.to_be_bytes());
+        let _ = tokio::time::timeout(FINAL_GRACE, async {
+            self.w.write_all(&m).await?;
+            self.w.shutdown().await
+        })
+        .await;
     }
 
     /// Best effort: a last message and a close frame, then the caller drops

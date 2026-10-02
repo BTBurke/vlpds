@@ -950,8 +950,35 @@ the last seq it deletes: the *retained floor* (max over reports) bounds every
 deleted event. A cursor below it gets `#info OutdatedCursor` and continues
 from the floor (the protocol's "oldest available"). A reader that finds a
 segment missing below the log's lowest object was overtaken by retention
-(`backfill::Pruned`): it re-reads the floor and jumps with OutdatedCursor. A
-peer follower draining a dead log skips to the lowest object it finds.
+(`backfill::Pruned`): it re-reads the floor. Above its position, it jumps
+there with OutdatedCursor; at or below it, nothing it owed was deleted, and
+it reads again (a seek re-seeks that one log from its new lowest object; a
+read mid-stream re-runs the backfill from its position). A peer follower
+draining a dead log skips to the lowest object it finds.
+
+That second case is the common one, not a corner: every backfill seeks
+*every* log, including dead logs and live logs' heads lying wholly below
+the cursor, which are exactly what retention is deleting, oldest first.
+The seek LISTs a log's lowest ordinal and then reads headers; a delete
+landing in between makes a read miss. The 7 h benchbox soak (Oct 2026, 90 s
+window) hit it once in 210 probes: a 44.7 s-old cursor seeked a dead
+incarnation's log (dead 108 s, being pruned to its fence), got `Pruned`
+with the floor below the cursor, and the firehose took that for a failed
+backfill: OutdatedCursor and a jump to the ring floor, skipping 31.8 s of
+stored, acked events (the node log: `firehose backfill failed: log
+n2.… was pruned past ordinal 14108 while being read`, floor − from ≈ the
+probe's 8.15e9 first-seq gap: 8.13e9). Nothing was lost from S3, and retention deletes
+nothing inside the window (the floor is exact, not conservative): the
+subscriber was told its history was gone and skipped it.
+`tests/all/log_retention.rs` `pruning_below_the_cursor_under_a_seek_is_not_outdated`
+deletes a dead log and a live log's head under the seek deterministically;
+`cursors_inside_the_window_through_restarts_and_reshards` (3 s window,
+SIGTERM/kill -9 restarts, splits and merges, 2 ms log GETs) got
+OutdatedCursor in every run before the fix. A backfill that fails for any
+other reason (an S3 error) is retried a few times and then disconnects the
+subscriber, which resumes from its cursor: skipping to the ring would drop
+stored events behind an OutdatedCursor. OutdatedCursor now means only "past
+the retained floor" (or no store at all).
 
 ### Online shard split/merge (`src/reshard.rs`, `src/slots.rs`)
 

@@ -135,15 +135,16 @@ async fn prune_while_subscribers_backfill() {
 }
 
 async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>) -> TestServer {
-    node_with(id, store, fast()).await
+    node_with(id, store, fast(), 64 << 20).await
 }
 
-async fn node_with(id: &str, store: &Arc<dyn object_store::ObjectStore>, retention: Option<vlpds::retention::Config>) -> TestServer {
+async fn node_with(id: &str, store: &Arc<dyn object_store::ObjectStore>, retention: Option<vlpds::retention::Config>, ring_bytes: usize) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());
     TestServer::spawn_with(move |c| {
         c.memory_store = Some(store);
         c.shards = 8;
         c.log_retention = retention;
+        c.firehose_ring_bytes = ring_bytes;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
             addr: c.public_url.clone(),
@@ -252,13 +253,13 @@ async fn restart_after_pruning() {
 async fn fence_deleted_then_takeover_replays() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let no_fences = || fast().map(|c| vlpds::retention::Config { fence_retention: Some(Duration::ZERO), ..c });
-    let a = node_with("retf-a", &store, no_fences()).await;
+    let a = node_with("retf-a", &store, no_fences(), 64 << 20).await;
     let accounts: Vec<TestAccount> = futures::future::join_all((0..6).map(|_| a.create_account("rf"))).await;
     let mut posts = Vec::new();
     for (i, acct) in accounts.iter().enumerate() {
         posts.push((acct.did.clone(), a.post(acct, &format!("on a {i}")).await));
     }
-    let b = node_with("retf-b", &store, no_fences()).await;
+    let b = node_with("retf-b", &store, no_fences(), 64 << 20).await;
     let a_log = a.app.log.log_id.to_string();
     let vs = b.app.store.clone();
     vlpds::server::shutdown(&a.app).await;
@@ -272,7 +273,7 @@ async fn fence_deleted_then_takeover_replays() {
     for (i, acct) in accounts.iter().enumerate() {
         posts.push((acct.did.clone(), b.post(acct, &format!("on b {i}")).await));
     }
-    let c = node_with("retf-c", &store, no_fences()).await;
+    let c = node_with("retf-c", &store, no_fences(), 64 << 20).await;
     vlpds::server::shutdown(&b.app).await;
     let deadline = Instant::now() + Duration::from_secs(15);
     while c.app.partitions.owned().len() < 8 {
@@ -283,4 +284,340 @@ async fn fence_deleted_then_takeover_replays() {
         c.get_record(did, p.collection(), p.rkey()).await.ok();
     }
     c.post(&accounts[0], "on c").await;
+}
+
+/// Deletes a log's head the moment a reader GETs a given ordinal of it: a
+/// retention pass landing between a backfill seek's LIST (which found that
+/// ordinal lowest) and its header read. It raises the retained floor to the
+/// last seq it deletes first, as retention does. Log reads can also be
+/// slowed down (object-store latency widens every LIST-then-GET window).
+#[derive(Debug, Default)]
+struct PruneRace {
+    inner: Option<Arc<dyn object_store::ObjectStore>>,
+    armed: parking_lot::Mutex<Vec<Prune>>,
+    fired: std::sync::atomic::AtomicUsize,
+    log_get_delay: Duration,
+}
+
+#[derive(Debug)]
+struct Prune {
+    /// the GET that triggers it
+    trigger: Path,
+    /// the log's prefix, and the ordinals below which it deletes
+    log: Path,
+    below: u64,
+    /// a retention report raised to `floor` before deleting
+    report: Path,
+    floor: i64,
+}
+
+impl std::fmt::Display for PruneRace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PruneRace")
+    }
+}
+
+impl PruneRace {
+    fn new(log_get_delay: Duration) -> Arc<PruneRace> {
+        Arc::new(PruneRace { inner: Some(Arc::new(object_store::memory::InMemory::new())), log_get_delay, ..Default::default() })
+    }
+
+    fn inner(&self) -> &Arc<dyn object_store::ObjectStore> {
+        self.inner.as_ref().unwrap()
+    }
+
+    async fn prune(&self, p: Prune) -> object_store::Result<()> {
+        use futures::StreamExt;
+        use object_store::ObjectStoreExt;
+        let rep = vlpds::retention::Report { pruned_seq: p.floor, ..Default::default() };
+        self.inner().put(&p.report, serde_json::to_vec(&rep).unwrap().into()).await?;
+        let doomed: Vec<Path> = self
+            .inner()
+            .list(Some(&p.log))
+            .filter_map(|m| async move {
+                let m = m.ok()?;
+                let ord: u64 = m.location.filename()?.strip_suffix(".seg")?.parse().ok()?;
+                (ord < p.below).then_some(m.location)
+            })
+            .collect()
+            .await;
+        for d in doomed {
+            self.inner().delete(&d).await?;
+        }
+        self.fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for PruneRace {
+    async fn put_opts(&self, location: &Path, payload: object_store::PutPayload, opts: object_store::PutOptions) -> object_store::Result<object_store::PutResult> {
+        self.inner().put_opts(location, payload, opts).await
+    }
+    async fn put_multipart_opts(&self, location: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner().put_multipart_opts(location, opts).await
+    }
+    async fn get_opts(&self, location: &Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+        let hit = {
+            let mut armed = self.armed.lock();
+            armed.iter().position(|a| a.trigger == *location).map(|i| armed.remove(i))
+        };
+        if let Some(p) = hit {
+            self.prune(p).await?;
+        }
+        if !self.log_get_delay.is_zero() && location.as_ref().contains("/log/") {
+            tokio::time::sleep(self.log_get_delay).await;
+        }
+        self.inner().get_opts(location, options).await
+    }
+    fn delete_stream(&self, locations: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        self.inner().delete_stream(locations)
+    }
+    fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner().list(prefix)
+    }
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
+        self.inner().list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(&self, from: &Path, to: &Path, options: object_store::CopyOptions) -> object_store::Result<()> {
+        self.inner().copy_opts(from, to, options).await
+    }
+}
+
+/// Firehose frames from `cursor` up to `did`'s commit `head`.
+async fn frames_to(s: &TestServer, cursor: i64, did: &str, head: &Cid) -> Vec<Frame> {
+    let mut sub = s.subscribe(Some(cursor)).await;
+    sub.until(Duration::from_secs(20), |fs| fs.last().and_then(|f| f.commit()).is_some_and(|c| c.repo == did && c.commit == *head)).await
+}
+
+/// Soak 2026-10-02 (benchbox, 1 of 210 probes): a cursor 44.7 s old, inside the
+/// 90 s window, got OutdatedCursor and skipped 31.8 s of stored events. A dead
+/// log lying wholly below the cursor was being pruned while the backfill
+/// seeked it: the seek LISTed the log's lowest ordinal, retention deleted it
+/// before the header read, and the reader returned `Pruned`. The retained
+/// floor was below the cursor (nothing past it had been deleted), so the
+/// firehose took it for a failed backfill: OutdatedCursor and a jump to the
+/// ring floor.
+///
+/// Here a dead log (the node's previous incarnation, all of it below the
+/// cursor) and the live log's head below the cursor are each deleted under
+/// the seek, deterministically: the subscriber must get every event past its
+/// cursor, in order, with no OutdatedCursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn pruning_below_the_cursor_under_a_seek_is_not_outdated() {
+    let race = PruneRace::new(Duration::ZERO);
+    let store: Arc<dyn object_store::ObjectStore> = race.clone();
+    let spawn = |store: Arc<dyn object_store::ObjectStore>| {
+        TestServer::spawn_with(move |c| {
+            c.memory_store = Some(store);
+            c.shards = 4;
+            c.firehose_ring_bytes = 2048;
+            c.log_retention = None; // PruneRace is the only deleter
+            c.cluster = Some(vlpds::cluster::ClusterConfig {
+                node_id: "race".into(),
+                addr: c.public_url.clone(),
+                shards: 4,
+                ttl: Duration::from_millis(1500),
+                renew_every: Duration::from_millis(100),
+                skew: Duration::from_millis(300),
+                ..Default::default()
+            });
+        })
+    };
+    // the previous incarnation: its log is dead (fenced) once it leaves
+    let first = spawn(store.clone()).await;
+    let acct = first.create_account("pr").await;
+    for i in 0..20 {
+        first.post(&acct, &format!("dead log {i} {}", "x".repeat(64))).await;
+    }
+    let dead = first.app.log.log_id.to_string();
+    vlpds::server::shutdown(&first.app).await;
+    let s = spawn(store.clone()).await;
+    let live = s.app.log.log_id.to_string();
+    assert_ne!(dead, live);
+    let mut last = None;
+    for i in 0..40 {
+        last = Some(s.post(&acct, &format!("live log {i} {}", "y".repeat(64))).await);
+    }
+    let head = Cid::parse(last.unwrap().commit_cid.as_deref().unwrap()).unwrap();
+    let all = frames_to(&s, 0, &acct.did, &head).await;
+    assert!(all.iter().all(|f| f.kind() != "#info"), "nothing pruned yet");
+    let seqs: Vec<i64> = all.iter().filter_map(|f| f.seq()).collect();
+    let vs = s.app.store.clone();
+    let (fence, fenced) = vlpds::nodelog::first_free(&vs, &dead).await.unwrap();
+    assert!(fenced);
+    let vlpds::nodelog::Head::Segment(h) = vlpds::nodelog::read_head(&vs, &dead, fence - 1).await.unwrap() else { panic!("no segment before the fence") };
+    let dead_last = h.last_seq;
+    // a cursor past the whole dead log, 10 live events in (behind the ring)
+    let cursor = *seqs.iter().filter(|&&q| q > dead_last).nth(10).unwrap();
+    // the live log's segments wholly at or below the cursor
+    let (mut below, mut live_floor) = (0, 0);
+    while let vlpds::nodelog::Head::Segment(h) = vlpds::nodelog::read_head(&vs, &live, below).await.unwrap() {
+        if h.last_seq > cursor {
+            break;
+        }
+        live_floor = h.last_seq;
+        below += 1;
+    }
+    assert!(below > 1, "the live log has segments below the cursor");
+    let prune = |log: &str, below: u64, floor: i64| Prune {
+        trigger: vlpds::nodelog::segment_path(&vs, log, 0),
+        log: Path::from(format!("{}/log/{log}", vs.prefix)),
+        below,
+        report: Path::from(format!("{}/retain/{log}-pruner", vs.prefix)),
+        floor,
+    };
+    race.armed.lock().extend([prune(&dead, fence, dead_last), prune(&live, below, live_floor)]);
+
+    let frames = frames_to(&s, cursor, &acct.did, &head).await;
+    assert!(vlpds::retention::retained_floor(&vs).await.unwrap() <= cursor);
+    let kinds: Vec<&str> = frames.iter().map(|f| f.kind()).collect();
+    assert!(!kinds.contains(&"#info"), "OutdatedCursor inside the window: {kinds:?}");
+    assert_eq!(race.fired.load(std::sync::atomic::Ordering::SeqCst), 2, "both logs were pruned under the seek");
+    let got: Vec<i64> = frames.iter().filter_map(|f| f.seq()).collect();
+    let want: Vec<i64> = seqs.iter().copied().filter(|&q| q > cursor).collect();
+    assert_eq!(got, want, "every event past the cursor, in order");
+}
+
+/// A node in its own runtime, so it can die like a process: every task,
+/// socket and in-flight PUT of it goes at once (an in-process shutdown
+/// leaves its HTTP server, and so its log streams to peers, running).
+struct Proc {
+    rt: Option<tokio::runtime::Runtime>,
+    s: TestServer,
+}
+
+impl Proc {
+    async fn spawn(id: &str, store: &Arc<dyn object_store::ObjectStore>, retention: Option<vlpds::retention::Config>) -> Proc {
+        let (id, store) = (id.to_string(), store.clone());
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+            let s = rt.block_on(node_with(&id, &store, retention, 2048));
+            Proc { rt: Some(rt), s }
+        })
+        .await
+        .unwrap()
+    }
+
+    /// SIGTERM (a graceful shutdown first) or kill -9.
+    async fn kill(mut self, graceful: bool) {
+        let rt = self.rt.take().unwrap();
+        if graceful {
+            let app = self.s.app.clone();
+            rt.spawn(async move { vlpds::server::shutdown(&app).await }).await.unwrap();
+        }
+        rt.shutdown_background();
+    }
+}
+
+/// The soak's shape, shrunk: a 3 s window with passes every 20 ms deleting a
+/// few objects each (so some log is nearly always being pruned), a ring too
+/// small to serve any cursor, continuous writes, a node restarted over and
+/// over (SIGTERM and kill -9 in turn; each incarnation's log goes dead and is
+/// pruned to its fence) and shards split and merged, while probes subscribe
+/// with cursors a quarter window old. Log GETs take 2 ms (object-store
+/// latency is what opens the LIST-then-GET window the soak hit). None may get
+/// OutdatedCursor, and each sees its events in seq order with every repo's
+/// commits chained. Before the fix every run got OutdatedCursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn cursors_inside_the_window_through_restarts_and_reshards() {
+    const WINDOW: Duration = Duration::from_secs(3);
+    // a probe's cursor age (the margin covers the probe's own backfill)
+    const AGE: Duration = Duration::from_millis(750);
+    let ret = Some(vlpds::retention::Config { window: WINDOW, interval: Duration::from_millis(20), max_deletes: 4, fence_retention: None });
+    let store: Arc<dyn object_store::ObjectStore> = PruneRace::new(Duration::from_millis(2));
+    let a = node_with("win-a", &store, ret.clone(), 2048).await;
+    let accts: Vec<TestAccount> = futures::future::join_all((0..6).map(|_| a.create_account("win"))).await;
+    // each incarnation of b under a new node id: a restart under the same id
+    // can lose a race with a peer deleting the dead incarnation's lease (a
+    // startup error, retried by a process supervisor; not what this tests)
+    let mut b = Some(Proc::spawn("win-b0", &store, ret.clone()).await);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let (url, accts, stop) = (a.url.clone(), accts.clone(), stop.clone());
+        tokio::spawn(async move {
+            let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+            let (mut n, mut ok) = (0usize, 0usize);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let acct = &accts[n % accts.len()];
+                let body = json!({"repo": acct.did, "collection": "app.bsky.feed.post", "record": post_record(&format!("w{n}"))});
+                // moving shards and a dead peer's answer 503 for a moment: go on
+                let r = http.post(format!("{url}/xrpc/com.atproto.repo.createRecord")).bearer_auth(&acct.access).json(&body).send().await;
+                ok += usize::from(r.is_ok_and(|r| r.status().is_success()));
+                n += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            (n, ok)
+        })
+    };
+    // probes against a, which stays up throughout
+    let prober = {
+        let (addr, stop, app) = (a.addr, stop.clone(), a.app.clone());
+        tokio::spawn(async move {
+            let (mut probes, mut events) = (0usize, 0usize);
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = vlpds::tid::now_micros();
+                let cursor = vlpds::nodelog::seq_floor(now - AGE.as_micros() as u64);
+                let target = vlpds::nodelog::seq_floor(now);
+                let mut sub = Sub::connect(&format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor={cursor}")).await;
+                let (frames, done) = sub.try_until(Duration::from_secs(20), |fs| fs.last().is_some_and(|f| f.kind() == "#info" || f.seq().is_some_and(|q| q > target))).await;
+                assert!(done, "probe stuck at {:?} (target {target}, firehose at {}, closed {})", frames.last().and_then(|f| f.seq()), app.firehose.position(), sub.closed);
+                let mut last = cursor;
+                let mut prev: std::collections::HashMap<String, String> = Default::default();
+                for f in &frames {
+                    if f.kind() == "#info" {
+                        let floor = vlpds::retention::retained_floor(&app.store).await.unwrap();
+                        let age = Duration::from_micros(vlpds::tid::now_micros() - (cursor >> 8) as u64);
+                        panic!("OutdatedCursor for a cursor {AGE:?} old at connect, {age:?} now (window {WINDOW:?}); floor - cursor = {:?}", Duration::from_micros(((floor - cursor).max(0) >> 8) as u64));
+                    }
+                    let Some(seq) = f.seq() else { continue };
+                    assert!(seq > last, "seq {seq} after {last}");
+                    last = seq;
+                    if let Some(c) = f.commit() {
+                        if let (Some(p), Some(since)) = (prev.get(&c.repo), &c.since) {
+                            assert_eq!(p, since, "chain break for {} at seq {seq}", c.repo);
+                        }
+                        prev.insert(c.repo.clone(), c.rev.clone());
+                    }
+                }
+                probes += 1;
+                events += frames.len();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            (probes, events)
+        })
+    };
+    // let the first segments age past the window
+    tokio::time::sleep(WINDOW + Duration::from_millis(500)).await;
+    let mut kids: Option<Vec<J>> = None;
+    for round in 0..6 {
+        // a reshard: split one of a's shards, or merge the last split's children back
+        let r = match kids.take() {
+            None => {
+                let target = a.app.partitions.owned().first().expect("a owns a shard").id;
+                a.xrpc.post("vlpds.admin.splitShard", &json!({"shard": target, "wait": true}), &Auth::Admin).await
+            }
+            Some(k) => a.xrpc.post("vlpds.admin.mergeShards", &json!({"left": k[0]["id"], "right": k[1]["id"], "wait": true}), &Auth::Admin).await,
+        };
+        if r.is_ok() {
+            kids = r.ok()["op"]["children"].as_array().filter(|c| c.len() == 2).cloned();
+        } else {
+            eprintln!("round {round}: reshard refused: {}", r.text());
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        // restart b (SIGTERM, then kill -9): its log goes dead, a drains
+        // and fences it, and retention prunes it once past the window
+        b.take().unwrap().kill(round % 2 == 0).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        b = Some(Proc::spawn(&format!("win-b{}", round + 1), &store, ret.clone()).await);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (writes, acked) = writer.await.unwrap();
+    let (probes, events) = prober.await.unwrap();
+    b.take().unwrap().kill(true).await;
+    let floor = vlpds::retention::retained_floor(&a.app.store).await.unwrap();
+    let retried = ["seek", "pruned"].map(|r| vlpds::metrics::FIREHOSE_BACKFILL_RETRIES.with_label_values(&[r]).get());
+    eprintln!("{writes} writes ({acked} acked), {probes} probes ({events} frames), {retried:?} seeks/backfills overtaken by retention, retained floor {floor}");
+    assert!(probes > 20 && floor > 0, "retention ran under the probes");
 }

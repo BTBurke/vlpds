@@ -58,7 +58,35 @@ async fn pruned_at(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result<
 
 /// First ordinal of `log_id` whose segment has events with seq > `after`
 /// (None if the log has nothing past it).
+///
+/// Retention deletes logs oldest first, and the logs a cursor seeks are
+/// mostly ones it is deleting: dead logs and live logs' heads, wholly below
+/// the cursor. A delete landing between the seek's LIST and its header reads
+/// makes them miss (`Pruned`). If the retained floor (raised before every
+/// delete) is still at or below `after`, nothing past `after` went: seek
+/// again from the new lowest object. Otherwise the reader really is behind
+/// the floor and the caller sends OutdatedCursor.
 async fn first_ordinal_after(store: &Store, log_id: &str, after: i64) -> anyhow::Result<Option<u64>> {
+    let mut tries = 0;
+    loop {
+        match seek_once(store, log_id, after).await {
+            Err(e) if e.downcast_ref::<Pruned>().is_some() && tries < MAX_SEEK_RETRIES => {
+                if crate::retention::retained_floor(store).await? > after {
+                    return Err(e);
+                }
+                tries += 1;
+                metrics::FIREHOSE_BACKFILL_RETRIES.with_label_values(&["seek"]).inc();
+            }
+            r => return r,
+        }
+    }
+}
+
+/// Seeks retried after retention pruned a log's head under them (each needs
+/// a new delete, so this is a bound, not a budget).
+const MAX_SEEK_RETRIES: u32 = 16;
+
+async fn seek_once(store: &Store, log_id: &str, after: i64) -> anyhow::Result<Option<u64>> {
     let o = seek(store, log_id, after).await?;
     if seg_header(store, log_id, o).await?.is_some() {
         return Ok(Some(o));
