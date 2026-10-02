@@ -216,13 +216,122 @@ async fn get_checkout(
 /// (~28 B/record: a 1M-record repo's), point reads beyond.
 const EXPORT_PREFETCH_BYTES: usize = 64 << 20;
 
-/// Streams the repo CAR: commit, MST nodes (streamed on a blocking thread
-/// from the snapshot: interior nodes from `M/`, leaves rebuilt from one
-/// forward `R/` scan, one path in memory), then records from the same
-/// SlateDB snapshot. Memory stays bounded (~1 MiB chunks) regardless of
-/// repo size.
+/// Record blocks exports may hold while they stream the MST nodes (the CAR
+/// puts every node before any record), in MiB, process-wide; and per export.
+/// An export takes it 1 MiB at a time as its buffer grows; one that can't
+/// get more (or reaches its cap) reads the records it couldn't buffer with a
+/// second scan afterwards. A 100k-record repo holds ~15 MB of records.
+static EXPORT_BUFFER_MB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
+static EXPORT_BUFFER_MAX_MB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(64);
+
+/// The per-export record buffer cap in MiB (tests: 0 makes every export
+/// read its records twice, 1 splits a ~1 MB repo's between the buffer and
+/// the second scan; the bytes are the same).
+pub fn set_export_buffer_max_mb(mb: u32) {
+    EXPORT_BUFFER_MAX_MB.store(mb, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Records per batch handed from an export's `R/` scan to its MST walk.
+const EXPORT_BATCH: usize = 512;
+
+/// The body chunks an export sends (~1 MiB each).
+const EXPORT_CHUNK: usize = 1 << 20;
+
+/// What an export's `R/` scan kept for the CAR's tail: the record blocks
+/// (CAR-encoded, `since`-filtered) up to the buffer budget, in body chunks,
+/// and the first record it didn't keep, if any (the rest is read again from
+/// there).
+struct Buffered {
+    chunks: Vec<Vec<u8>>,
+    bytes: usize,
+    resume_at: Option<Vec<u8>>,
+    _permit: Option<tokio::sync::SemaphorePermit<'static>>,
+}
+
+/// One forward `R/` scan for an export: every record's (key, CID), in
+/// batches, to the MST walk (`tx`: it rebuilds the leaves from them), and
+/// the record blocks kept for after the nodes, up to the buffer budget.
+async fn scan_records(
+    snap: &slatedb::DbSnapshot,
+    did: &str,
+    since: Option<u64>,
+    tx: tokio::sync::mpsc::Sender<crate::mst_store::RecordBatch>,
+) -> anyhow::Result<Buffered> {
+    let prefix = state::record_prefix(did);
+    let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, cache_blocks: true, ..Default::default() };
+    let mut iter = match snap.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await {
+        Ok(it) => it,
+        Err(e) => {
+            let _ = tx.send(Err(e.to_string())).await;
+            return Err(e.into());
+        }
+    };
+    let mut out = Buffered { chunks: Vec::new(), bytes: 0, resume_at: None, _permit: None };
+    let (mut held_mb, cap) = (0u32, EXPORT_BUFFER_MAX_MB.load(std::sync::atomic::Ordering::Relaxed));
+    let mut batch = Vec::with_capacity(EXPORT_BATCH);
+    loop {
+        let kv = match iter.next().await {
+            Ok(Some(kv)) => kv,
+            Ok(None) => break,
+            Err(e) => {
+                let _ = tx.send(Err(e.to_string())).await;
+                return Err(e.into());
+            }
+        };
+        let (cid, bytes) = match state::decode_record_value(&kv.value) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tx.send(Err(e.to_string())).await;
+                return Err(e);
+            }
+        };
+        let key = &kv.key[prefix.len()..];
+        batch.push((Arc::from(key), cid));
+        if batch.len() == EXPORT_BATCH && tx.send(Ok(std::mem::replace(&mut batch, Vec::with_capacity(EXPORT_BATCH)))).await.is_err() {
+            // the walk is gone (it failed: a finished one has read every
+            // record): stop, leaving the rest to a second scan
+            out.resume_at.get_or_insert_with(|| key.to_vec());
+            return Ok(out);
+        }
+        if out.resume_at.is_some() || since.is_some_and(|s| state::record_value_rev(&kv.value) <= s) {
+            continue;
+        }
+        let need = (out.bytes + bytes.len() + 64).div_ceil(1 << 20) as u32;
+        while held_mb < need {
+            let Some(p) = (held_mb < cap).then(|| EXPORT_BUFFER_MB.try_acquire().ok()).flatten() else { break };
+            match &mut out._permit {
+                Some(h) => h.merge(p),
+                None => out._permit = Some(p),
+            }
+            held_mb += 1;
+        }
+        if held_mb < need {
+            out.resume_at = Some(key.to_vec());
+            continue;
+        }
+        if out.chunks.last().is_none_or(|c| c.len() >= EXPORT_CHUNK) {
+            out.chunks.push(Vec::with_capacity(EXPORT_CHUNK + 4096));
+        }
+        let Some(chunk) = out.chunks.last_mut() else { unreachable!() };
+        let was = chunk.len();
+        car::write_block(chunk, &cid, &bytes);
+        out.bytes += chunk.len() - was;
+    }
+    if !batch.is_empty() {
+        let _ = tx.send(Ok(batch)).await;
+    }
+    Ok(out)
+}
+
+/// Streams the repo CAR: commit, MST nodes, then records, from one SlateDB
+/// snapshot. One forward `R/` scan feeds both: the MST walk (on a blocking
+/// thread: interior nodes from `M/`, read ahead with one range scan, leaves
+/// rebuilt from the scanned keys and CIDs, one path in memory) runs
+/// alongside it, and the record blocks wait in a bounded buffer
+/// ([`EXPORT_BUFFER_MB`]) for the nodes to be written; records past the
+/// buffer are read again afterwards. Bytes are the same either way.
 async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Response> {
-    const CHUNK: usize = 1 << 20;
+    const CHUNK: usize = EXPORT_CHUNK;
     let (view, snap) = app.repo_view(did).await?;
     let head = view.head.clone();
     drop(view);
@@ -234,32 +343,58 @@ async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Respon
         car::write_header(&mut buf, &head.commit);
         car::write_block(&mut buf, &head.commit, &head.commit_block);
         let tx2 = tx.clone();
-        let pre = crate::mst_store::prefetch(&*snap, &did, EXPORT_PREFETCH_BYTES).await.map(|p| p.0).unwrap_or_default();
-        let (snap2, root) = (snap.clone(), head.data);
-        let walked = tokio::task::spawn_blocking(move || {
-            let mut emit = |c: Cid, b: &[u8]| {
-                car::write_block(&mut buf, &c, b);
-                if buf.len() >= CHUNK {
-                    let _ = tx2.blocking_send(Ok(Bytes::from(std::mem::replace(&mut buf, Vec::with_capacity(CHUNK + 4096)))));
-                }
-            };
-            let rt = tokio::runtime::Handle::current();
-            let nodes = crate::mst_store::DbSource::new(&*snap2, &did, &rt).with_prefetched(Some(&pre));
-            let r = crate::mst_store::ScanSource::open(&*snap2, &did, nodes, &rt)
-                .and_then(|scan| crate::mst_lazy::export_blocks(root, 1, &scan, &mut emit))
-                .map(|_| ());
-            (r, buf)
-        })
-        .await;
-        let mut buf = match walked {
-            Ok((Ok(()), buf)) => buf,
+        let (ktx, krx) = tokio::sync::mpsc::channel(64);
+        let walk = async {
+            let pre = crate::mst_store::prefetch(&*snap, &did, EXPORT_PREFETCH_BYTES).await.map(|p| p.0).unwrap_or_default();
+            let (snap2, did2, root) = (snap.clone(), did.clone(), head.data);
+            tokio::task::spawn_blocking(move || {
+                let mut emit = |c: Cid, b: &[u8]| {
+                    car::write_block(&mut buf, &c, b);
+                    if buf.len() >= CHUNK {
+                        let _ = tx2.blocking_send(Ok(Bytes::from(std::mem::replace(&mut buf, Vec::with_capacity(CHUNK + 4096)))));
+                    }
+                };
+                let rt = tokio::runtime::Handle::current();
+                let nodes = crate::mst_store::DbSource::new(&*snap2, &did2, &rt).with_prefetched(Some(&pre));
+                let src = crate::mst_store::FedSource::new(nodes, krx);
+                let r = crate::mst_lazy::export_blocks(root, 1, &src, &mut emit).map(|_| ());
+                (r, buf)
+            })
+            .await
+        };
+        let (walked, scanned) = tokio::join!(walk, scan_records(&snap, &did, since, ktx));
+        let (mut buf, scanned) = match (walked, scanned) {
+            (Ok((Ok(()), buf)), Ok(s)) => (buf, s),
+            (_, Err(e)) => {
+                let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+                return;
+            }
             _ => {
                 let _ = tx.send(Err(std::io::Error::other("mst walk failed"))).await;
                 return;
             }
         };
+        // the buffered records (no copies)
+        let Buffered { chunks, resume_at, _permit: permit, .. } = scanned;
+        if !chunks.is_empty() {
+            if !buf.is_empty() && tx.send(Ok(Bytes::from(std::mem::take(&mut buf)))).await.is_err() {
+                return; // client went away
+            }
+            for c in chunks {
+                if tx.send(Ok(Bytes::from(c))).await.is_err() {
+                    return;
+                }
+            }
+        }
+        drop(permit);
+        let Some(start) = resume_at else {
+            if !buf.is_empty() {
+                let _ = tx.send(Ok(Bytes::from(buf))).await;
+            }
+            return;
+        };
         let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, ..Default::default() };
-        let mut iter = match snap.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await {
+        let mut iter = match snap.scan_with_options([&prefix[..], &start[..]].concat()..state::prefix_end(&prefix), &opts).await {
             Ok(it) => it,
             Err(e) => {
                 let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
@@ -454,13 +589,16 @@ async fn lazy_proof(
     Ok(crate::mst_store::proof_blocks(&view.tree.root, &**snap, did, path.as_bytes()).await)
 }
 
-/// MST node blocks of a view by CID: its loaded nodes, then `M/` point
-/// reads on its snapshot (which holds exactly the interior nodes of the
-/// view's tree); with `walk`, the rest (leaves) by the repo's node index
-/// (built by one streamed walk of the whole tree from the snapshot, then
-/// advanced by the worker per commit), each found by a proof walk to its
-/// key. A miss in an index covering the view
-/// is final, so unknown CIDs don't walk the tree again.
+/// MST node blocks of a view by CID. First pass (`walk` false): its loaded
+/// nodes; leaves the repo's node index places, if it covers the view (no
+/// `M/` or record probe first: getBlocks of leaves); then `M/` point reads
+/// on its snapshot (which holds exactly the interior nodes of the view's
+/// tree). Second pass (`walk`, for what neither found nor the records
+/// matched): by the node index, built if needed (one streamed walk of the
+/// whole tree from the snapshot, then advanced by the worker per commit). A
+/// node found in the index is the end of its first key's path, read by a
+/// walk to that key. A miss in an index covering the view is final, so
+/// unknown CIDs don't walk the tree again.
 async fn lazy_nodes(
     view: &Arc<crate::worker::DurableView>,
     snap: &Arc<slatedb::DbSnapshot>,
@@ -468,33 +606,45 @@ async fn lazy_nodes(
     cids: Vec<Cid>,
     walk: bool,
 ) -> XResult<Vec<(Cid, Vec<u8>)>> {
+    use crate::mst::{NodeIndex, NodeRef};
     let mut want: std::collections::HashSet<Cid> = cids.into_iter().collect();
     let mut out = Vec::new();
-    crate::mst_lazy::loaded_blocks(&view.tree.root, &want, &mut out).map_err(XrpcError::from_err)?;
-    for (c, _) in &out {
-        want.remove(c);
-    }
-    for c in want.clone() {
-        if c.codec != crate::cid::CODEC_DAG_CBOR {
-            continue;
+    let rev = view.head.rev.0;
+    let lookup = |ix: &NodeIndex, want: &HashSet<Cid>| -> Vec<(Cid, NodeRef)> { want.iter().filter_map(|c| ix.get(c).map(|r| (*c, r.clone()))).collect() };
+    if !walk {
+        crate::mst_lazy::loaded_blocks(&view.tree.root, &want, &mut out).map_err(XrpcError::from_err)?;
+        for (c, _) in &out {
+            want.remove(c);
         }
-        if let Some(b) = snap.get(state::mst_node_key(did, &c)).await.map_err(XrpcError::from_err)? {
-            if Cid::dag_cbor(&b) == c {
+        let leaves: Vec<(Cid, NodeRef)> = {
+            let cell = view.nodes.lock();
+            match cell.index.as_ref().filter(|ix| ix.covers(rev)) {
+                Some(ix) => lookup(ix, &want).into_iter().filter(|(_, (_, h))| *h == 0).collect(),
+                None => Vec::new(),
+            }
+        };
+        for (c, (key, _)) in leaves {
+            if let Some(b) = path_end_block(view, snap, did, &key, &c).await? {
                 want.remove(&c);
-                out.push((c, b.to_vec()));
+                out.push((c, b));
             }
         }
-    }
-    if !walk || want.is_empty() {
+        for c in want {
+            if c.codec != crate::cid::CODEC_DAG_CBOR {
+                continue;
+            }
+            if let Some(b) = snap.get(state::mst_node_key(did, &c)).await.map_err(XrpcError::from_err)? {
+                if Cid::dag_cbor(&b) == c {
+                    out.push((c, b.to_vec()));
+                }
+            }
+        }
         return Ok(out);
     }
-    use crate::mst::{NodeIndex, NodeRef};
-    let rev = view.head.rev.0;
-    let lookup = |ix: &NodeIndex| -> Vec<(Cid, NodeRef)> { want.iter().filter_map(|c| ix.get(c).map(|r| (*c, r.clone()))).collect() };
     let refs = {
         let mut cell = view.nodes.lock();
         match cell.index.as_ref().filter(|ix| ix.covers(rev)) {
-            Some(ix) => Some(lookup(ix)),
+            Some(ix) => Some(lookup(ix, &want)),
             None => {
                 // from now on the worker reports written nodes, so the index
                 // built below can catch up with commits made meanwhile
@@ -524,19 +674,27 @@ async fn lazy_nodes(
             .await
             .map_err(XrpcError::from_err)?
             .map_err(XrpcError::from_err)?;
-            let r = lookup(&ix);
+            let r = lookup(&ix, &want);
             view.nodes.lock().install(ix);
             r
         }
     };
     for (c, (key, _)) in refs {
-        // the node holding its own first key is the end of that key's path
-        let path = crate::mst_store::proof_blocks(&view.tree.root, &**snap, did, &key).await.map_err(XrpcError::from_err)?;
-        if let Some((pc, b)) = path.into_iter().last().filter(|(pc, _)| *pc == c) {
-            out.push((pc, b));
+        if let Some(b) = path_end_block(view, snap, did, &key, &c).await? {
+            out.push((c, b));
         }
     }
     Ok(out)
+}
+
+/// The block of node `c` if it ends `key`'s path in the view's tree (the
+/// node holding its own first key does).
+async fn path_end_block(view: &crate::worker::DurableView, snap: &slatedb::DbSnapshot, did: &str, key: &[u8], c: &Cid) -> XResult<Option<Vec<u8>>> {
+    let n = crate::mst_store::path_end(&view.tree.root, snap, did, key).await.map_err(XrpcError::from_err)?;
+    match n.cid == Some(*c) {
+        true => Ok(Some(crate::mst_lazy::node_block(&n).map_err(XrpcError::from_err)?)),
+        false => Ok(None),
+    }
 }
 
 #[derive(Deserialize)]

@@ -86,13 +86,14 @@ impl Persist {
 // ---------- building subtrees from records ----------
 
 /// Finishes a node: encodes it and computes its CID (internal nodes keep
-/// their block, as `mst::Tree` does after a write).
-fn finish(height: i32, entries: Vec<Entry>) -> Result<Arc<Node>> {
+/// their block, as `mst::Tree` does after a write; leaves too with
+/// `keep_leaves`, for an export that emits them next).
+fn finish(height: i32, entries: Vec<Entry>, keep_leaves: bool) -> Result<Arc<Node>> {
     let mut n = Node { height, entries, cid: None, dirty: false, stub: false, bytes: None };
     let mut buf = Vec::with_capacity(64 + n.entries.len() * 80);
     encode_node(&n, &mut buf)?;
     n.cid = Some(Cid::dag_cbor(&buf));
-    if height >= 1 {
+    if height >= 1 || keep_leaves {
         n.bytes = Some(Arc::from(buf));
     }
     Ok(Arc::new(n))
@@ -103,6 +104,10 @@ fn finish(height: i32, entries: Vec<Entry>) -> Result<Arc<Node>> {
 /// A key range of an MST is a pure function of its keys: every key of
 /// height `height` is an entry, every non-empty gap between them a child.
 pub fn build(recs: &[(Key, Cid)], heights: &[i32], height: i32) -> Result<Arc<Node>> {
+    build_with(recs, heights, height, false)
+}
+
+fn build_with(recs: &[(Key, Cid)], heights: &[i32], height: i32, keep_leaves: bool) -> Result<Arc<Node>> {
     if height < 0 || height as usize > 4 * MAX_DEPTH {
         return Err(MstError::Invalid("bad subtree height"));
     }
@@ -115,17 +120,17 @@ pub fn build(recs: &[(Key, Cid)], heights: &[i32], height: i32) -> Result<Arc<No
             std::cmp::Ordering::Equal => {}
         }
         if start < i {
-            let c = build(&recs[start..i], &heights[start..i], height - 1)?;
+            let c = build_with(&recs[start..i], &heights[start..i], height - 1, keep_leaves)?;
             entries.push(Entry::Child { cid: c.cid, node: Some(c) });
         }
         entries.push(Entry::Value { key: recs[i].0.clone(), val: recs[i].1 });
         start = i + 1;
     }
     if start < recs.len() {
-        let c = build(&recs[start..], &heights[start..], height - 1)?;
+        let c = build_with(&recs[start..], &heights[start..], height - 1, keep_leaves)?;
         entries.push(Entry::Child { cid: c.cid, node: Some(c) });
     }
-    finish(height, entries)
+    finish(height, entries, keep_leaves)
 }
 
 /// A whole tree built from all of a repo's records (sorted): the cold-load
@@ -216,8 +221,12 @@ fn load_subtree_uncached(
 /// The subtree at `height` holding exactly `recs` (a record range scan
 /// bounded by the separators above it), checked against its link `cid`.
 pub fn rebuilt_subtree(recs: &[(Key, Cid)], height: i32, cid: &Cid) -> Result<Arc<Node>> {
+    rebuilt_subtree_with(recs, height, cid, false)
+}
+
+fn rebuilt_subtree_with(recs: &[(Key, Cid)], height: i32, cid: &Cid, keep_leaves: bool) -> Result<Arc<Node>> {
     let heights: Vec<i32> = recs.iter().map(|(k, _)| height_for_key(k)).collect();
-    let n = build(recs, &heights, height)?;
+    let n = build_with(recs, &heights, height, keep_leaves)?;
     if n.cid != Some(*cid) {
         return Err(MstError::Invalid("subtree rebuilt from records doesn't match its link"));
     }
@@ -857,6 +866,9 @@ pub fn export_blocks(
         }
         Ok(())
     }
+    /// Reused buffers: a leaf's records, its block.
+    type Scratch = (Vec<(Key, Cid)>, Vec<u8>);
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         n: &Node,
         lo: Option<Key>,
@@ -865,6 +877,7 @@ pub fn export_blocks(
         src: &dyn Source,
         f: &mut dyn FnMut(Cid, &[u8]),
         stats: &mut LoadStats,
+        scratch: &mut Scratch,
         depth: usize,
     ) -> Result<()> {
         if depth > MAX_DEPTH {
@@ -875,11 +888,30 @@ pub fn export_blocks(
             let Entry::Child { cid: Some(c), .. } = e else { continue };
             let clo = if i > 0 { value_key(n.entries.get(i - 1)) } else { lo.clone() };
             let chi = value_key(n.entries.get(i + 1)).or_else(|| hi.clone());
-            let child = load_subtree(src, persist_min, *c, n.height - 1, clo.as_deref(), chi.as_deref(), stats)?;
+            if n.height == 1 && persist_min >= 1 {
+                // a leaf: encoded straight from its records. Its link
+                // checks it (a leaf holds every key between its parent's
+                // separators, all of height 0 in the tree the link was
+                // computed from), so no key heights or node to build
+                let (recs, buf) = scratch;
+                recs.clear();
+                buf.clear();
+                src.records(clo.as_deref(), chi.as_deref(), recs)?;
+                stats.scans += 1;
+                stats.scanned_records += recs.len() as u64;
+                crate::mst::encode_leaf(recs, buf);
+                if Cid::dag_cbor(buf) != *c {
+                    return Err(MstError::Invalid("subtree rebuilt from records doesn't match its link"));
+                }
+                f(*c, buf);
+                continue;
+            }
+            let child = export_subtree(src, persist_min, *c, n.height - 1, clo.as_deref(), chi.as_deref(), stats)?;
             if child.height >= persist_min && !child.entries.iter().any(|e| matches!(e, Entry::Child { node: Some(_), .. })) {
-                visit(&child, clo, chi, persist_min, src, f, stats, depth + 1)?;
+                visit(&child, clo, chi, persist_min, src, f, stats, scratch, depth + 1)?;
             } else {
-                // rebuilt from records: fully loaded, walk it in place
+                // rebuilt from records: fully loaded (blocks kept), walk it
+                // in place
                 let mut t = Tree::new();
                 t.root = child;
                 t.walk_blocks(f)?;
@@ -887,8 +919,32 @@ pub fn export_blocks(
         }
         Ok(())
     }
-    visit(&r, None, None, persist_min, src, f, &mut stats, 0)?;
+    visit(&r, None, None, persist_min, src, f, &mut stats, &mut (Vec::new(), Vec::new()), 0)?;
     Ok(stats)
+}
+
+/// [`load_subtree`] for an export: nothing cached (every node is visited
+/// once), and rebuilt leaves keep their blocks (emitted right after).
+fn export_subtree(
+    src: &dyn Source,
+    persist_min: i32,
+    cid: Cid,
+    height: i32,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    stats: &mut LoadStats,
+) -> Result<Arc<Node>> {
+    if height >= persist_min {
+        if let Some(n) = read_node(src, &cid, Some(height), stats)? {
+            return Ok(n);
+        }
+        stats.fallbacks += 1;
+    }
+    let mut recs = Vec::new();
+    src.records(lo, hi, &mut recs)?;
+    stats.scans += 1;
+    stats.scanned_records += recs.len() as u64;
+    rebuilt_subtree_with(&recs, height, &cid, true)
 }
 
 // ---------- in-memory store (tests, benches) ----------

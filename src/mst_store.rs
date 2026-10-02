@@ -260,17 +260,78 @@ impl<N: Source> Source for ScanSource<'_, N> {
     }
 
     fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()> {
-        while let Some((k, c)) = self.next()? {
-            if lo.is_some_and(|lo| &k[..] <= lo) {
-                continue; // in a range the caller already had loaded
-            }
-            if hi.is_some_and(|hi| &k[..] >= hi) {
-                *self.peeked.borrow_mut() = Some((k, c));
-                break;
-            }
-            out.push((k, c));
+        forward_range(|| self.next(), &self.peeked, lo, hi, out)
+    }
+}
+
+/// The records of a forward stream in (`lo`, `hi`): those below `lo` are
+/// skipped (a range the caller had loaded), the first at or above `hi` is
+/// kept in `peeked` for the next range.
+fn forward_range(
+    mut next: impl FnMut() -> Result<Option<(Key, Cid)>>,
+    peeked: &RefCell<Option<(Key, Cid)>>,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    out: &mut Vec<(Key, Cid)>,
+) -> Result<()> {
+    while let Some((k, c)) = next()? {
+        if lo.is_some_and(|lo| &k[..] <= lo) {
+            continue;
         }
-        Ok(())
+        if hi.is_some_and(|hi| &k[..] >= hi) {
+            *peeked.borrow_mut() = Some((k, c));
+            break;
+        }
+        out.push((k, c));
+    }
+    Ok(())
+}
+
+/// A batch of a repo's records (key order) for a [`FedSource`], or the
+/// scan's error.
+pub type RecordBatch = std::result::Result<Vec<(Key, Cid)>, String>;
+
+/// [`ScanSource`] fed by a producer on the runtime (one forward `R/` scan
+/// in batches, `export_repo`): the scan runs ahead of the walk instead of
+/// one `block_on` per record on the walking thread.
+pub struct FedSource<N: Source> {
+    pub nodes: N,
+    rx: RefCell<tokio::sync::mpsc::Receiver<RecordBatch>>,
+    cur: RefCell<std::vec::IntoIter<(Key, Cid)>>,
+    peeked: RefCell<Option<(Key, Cid)>>,
+}
+
+impl<N: Source> FedSource<N> {
+    pub fn new(nodes: N, rx: tokio::sync::mpsc::Receiver<RecordBatch>) -> Self {
+        FedSource { nodes, rx: RefCell::new(rx), cur: RefCell::new(Vec::new().into_iter()), peeked: RefCell::new(None) }
+    }
+
+    /// The next record (blocking: the blocking pool only).
+    fn next(&self) -> Result<Option<(Key, Cid)>> {
+        if let Some(r) = self.peeked.borrow_mut().take() {
+            return Ok(Some(r));
+        }
+        let mut cur = self.cur.borrow_mut();
+        loop {
+            if let Some(r) = cur.next() {
+                return Ok(Some(r));
+            }
+            match self.rx.borrow_mut().blocking_recv() {
+                Some(Ok(b)) => *cur = b.into_iter(),
+                Some(Err(e)) => return Err(MstError::Store(e)),
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
+impl<N: Source> Source for FedSource<N> {
+    fn node(&self, cid: &Cid) -> Result<Option<Arc<[u8]>>> {
+        self.nodes.node(cid)
+    }
+
+    fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()> {
+        forward_range(|| self.next(), &self.peeked, lo, hi, out)
     }
 }
 
@@ -307,22 +368,94 @@ pub async fn prefetch<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, max_bytes
 /// of the path holds `key`, if any node does.
 pub async fn proof_blocks<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R, did: &str, key: &[u8]) -> Result<Vec<(Cid, Vec<u8>)>> {
     let mut out = Vec::new();
+    walk_path(root, db, did, key, &mut |n| {
+        out.push((n.cid.ok_or(MstError::Invalid("unwritten node"))?, crate::mst_lazy::node_block(n)?));
+        Ok(())
+    })
+    .await?;
+    Ok(out)
+}
+
+/// The node at the end of `key`'s path (see [`proof_blocks`]): the leaf, or
+/// the node holding `key`.
+pub async fn path_end<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R, did: &str, key: &[u8]) -> Result<Arc<Node>> {
+    walk_path(root, db, did, key, &mut |_| Ok(())).await
+}
+
+/// Walks `key`'s path from `root` (see [`proof_blocks`]), visiting each
+/// node; returns the last.
+async fn walk_path<R: DbReadOps + Sync + ?Sized>(
+    root: &Arc<Node>,
+    db: &R,
+    did: &str,
+    key: &[u8],
+    visit: &mut (dyn FnMut(&Node) -> Result<()> + Send),
+) -> Result<Arc<Node>> {
     let mut n = root.clone();
     let (mut lo, mut hi): (Option<Key>, Option<Key>) = (None, None);
     for _ in 0..=MAX_DEPTH {
         if n.stub {
             return Err(MstError::Partial);
         }
-        out.push((n.cid.ok_or(MstError::Invalid("unwritten node"))?, crate::mst_lazy::node_block(&n)?));
-        let Some((i, clo, chi)) = crate::mst_lazy::proof_child(&n, key, &lo, &hi) else { return Ok(out) };
+        visit(&n)?;
+        let Some((i, clo, chi)) = crate::mst_lazy::proof_child(&n, key, &lo, &hi) else { return Ok(n) };
         let child = match &n.entries[i] {
             Entry::Child { node: Some(c), .. } => c.clone(),
+            Entry::Child { node: None, cid: Some(c) } if n.height == 1 && NODE_CACHE.get(c).is_none() => {
+                load_leaves(db, did, &n, lo.as_deref(), hi.as_deref(), i).await?
+            }
             Entry::Child { node: None, cid: Some(c) } => load_child(db, did, c, n.height - 1, clo.as_deref(), chi.as_deref()).await?,
             _ => return Err(MstError::Partial),
         };
         (n, lo, hi) = (child, clo, chi);
     }
     Err(MstError::Invalid("tree too deep"))
+}
+
+/// The leaf at entry `want` of the height-1 node `n` (keys in (`lo`,
+/// `hi`)), with its unloaded siblings: one scan of `n`'s record range
+/// rebuilds them all (a range scan costs mostly its setup), and each that
+/// matches its link is cached. Proofs and getBlocks of nearby keys then
+/// find their leaves cached.
+async fn load_leaves<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, n: &Node, lo: Option<&[u8]>, hi: Option<&[u8]>, want: usize) -> Result<Arc<Node>> {
+    metrics::LAZY_MST_READS.with_label_values(&["leaf"]).inc();
+    let plen = state::record_prefix(did).len();
+    let mut recs = Vec::new();
+    let mut it = db.scan(record_range(did, lo, hi)).await.map_err(store_err)?;
+    while let Some(kv) = it.next().await.map_err(store_err)? {
+        push_record(plen, &kv, &mut recs)?;
+    }
+    let mut pos = 0;
+    let mut found = None;
+    for (i, e) in n.entries.iter().enumerate() {
+        match e {
+            // the node's own keys are records too: skip them
+            Entry::Value { key, .. } => {
+                while pos < recs.len() && recs[pos].0[..] <= key[..] {
+                    pos += 1;
+                }
+            }
+            Entry::Child { node, cid: Some(c) } => {
+                let end = match n.entries.get(i + 1) {
+                    Some(Entry::Value { key, .. }) => recs[pos..].iter().position(|(k, _)| k[..] >= key[..]).map_or(recs.len(), |p| pos + p),
+                    _ => recs.len(),
+                };
+                let group = &recs[pos..end];
+                pos = end;
+                if i == want {
+                    let leaf = crate::mst_lazy::rebuilt_subtree(group, 0, c)?;
+                    NODE_CACHE.put(&leaf);
+                    found = Some(leaf);
+                } else if node.is_none() && NODE_CACHE.get(c).is_none() {
+                    if let Ok(leaf) = crate::mst_lazy::rebuilt_subtree(group, 0, c) {
+                        NODE_CACHE.put(&leaf);
+                    }
+                }
+            }
+            Entry::Child { cid: None, .. } => {}
+        }
+    }
+    found.ok_or(MstError::Partial)
 }
 
 /// An unloaded child (async [`DbSource`] + `load_subtree`): interior from

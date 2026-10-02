@@ -18,7 +18,7 @@
 //! writes) on every commit, proof, export, getBlocks answer and collection
 //! index; `M/` is exactly the interior node set after writes, kill -9 +
 //! replay, reshards and fallbacks; a hot repo's loaded paths stay bounded.
-//! Server benchmarks: `bench_cold_write`, `bench_readers`, `bench_rss`
+//! Server benchmarks: `bench_cold_write`, `bench_readers`, `bench_rss`, `bench_cold_open_blobs`
 //! (ignored; DESIGN.md "Partial MSTs").
 
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
@@ -1129,6 +1129,77 @@ async fn lazy_open_rebuilds_missing_or_bad_nodes() {
 // measurements through the server (ignored; DESIGN.md "Partial MSTs")
 // ---------------------------------------------------------------------------
 
+/// The whole-repo operations leave no `M/` garbage: an import replacing a
+/// repo (a different tree, cold or loaded) keeps exactly the new tree's
+/// interior nodes, and deleting the account removes them all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn import_and_delete_leave_no_stale_nodes() {
+    let s = lazy_node(1 << 20).await;
+    let accts = vec![s.create_account("orpha").await, s.create_account("orphb").await];
+    let mut refs = vec![RefRepo::new(), RefRepo::new()];
+    let mut rng = StdRng::seed_from_u64(23);
+    for st in random_steps(&mut rng, 2, 400) {
+        ref_step(&s, &accts, &mut refs, &st).await;
+    }
+    let (a, b) = (&accts[0], &accts[1]);
+    check_stored_nodes(&s, &a.did).await;
+    assert!(stored_nodes(&s, &a.did).await.len() > 3, "an interior tree");
+    // a's repo replaced by b's records (a different, smaller tree), twice:
+    // the second import finds the first's tree
+    for _ in 0..2 {
+        let car = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &b.did)], &Auth::None).await.body.to_vec();
+        s.xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &a.auth()).await.ok();
+        check_stored_nodes(&s, &a.did).await;
+        s.create_record(a, "com.example.thing", json!({"$type": "com.example.thing", "n": 1})).await;
+        check_stored_nodes(&s, &a.did).await;
+    }
+    s.xrpc.post("com.atproto.admin.deleteAccount", &json!({"did": a.did}), &Auth::Admin).await.ok();
+    let left = stored_nodes(&s, &a.did).await;
+    assert!(left.is_empty(), "{} M/ nodes left after the account delete", left.len());
+    check_stored_nodes(&s, &b.did).await;
+}
+
+/// getRepo buffers record blocks from its one `R/` scan while it writes the
+/// nodes, up to a cap; past it (or with no budget) the rest is read again.
+/// Every split gives the same bytes, with and without `since`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn export_buffer_caps_give_same_bytes() {
+    let s = lazy_node(1 << 20).await;
+    let a = s.create_account("exbuf").await;
+    let mut since = String::new();
+    for batch in 0..12 {
+        let writes: Vec<J> = (0..200)
+            .map(|i| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "com.example.thing", "value": {"$type": "com.example.thing", "n": batch * 1000 + i, "pad": "x".repeat(400)}}))
+            .collect();
+        let r = s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok();
+        if batch == 5 {
+            since = r["commit"]["rev"].as_str().unwrap().to_string();
+        }
+    }
+    let get = |q: Vec<(&'static str, String)>| {
+        let x = s.xrpc.clone();
+        async move {
+            let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let r = x.get("com.atproto.sync.getRepo", &q, &Auth::None).await;
+            assert_eq!(r.status, 200, "{}", r.text());
+            r.body.to_vec()
+        }
+    };
+    let full = get(vec![("did", a.did.clone())]).await;
+    let diff = get(vec![("did", a.did.clone()), ("since", since.clone())]).await;
+    assert!(full.len() > 1_200_000 && diff.len() < full.len(), "{} / {}", full.len(), diff.len());
+    let repo = Repo::from_car(&full).unwrap();
+    assert_eq!(repo.blocks.len(), car_tail(&full).len() + 1, "no duplicate blocks");
+    for cap in [0, 1] {
+        vlpds::xrpc::set_export_buffer_max_mb(cap);
+        let f = get(vec![("did", a.did.clone())]).await;
+        let d = get(vec![("did", a.did.clone()), ("since", since.clone())]).await;
+        vlpds::xrpc::set_export_buffer_max_mb(64);
+        assert!(f == full, "cap {cap} MiB: full export differs");
+        assert!(d == diff, "cap {cap} MiB: since export differs");
+    }
+}
+
 fn env_or<T: std::str::FromStr>(k: &str, d: T) -> T {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
@@ -1268,6 +1339,7 @@ where
     Fut: std::future::Future<Output = ()> + Send,
 {
     let t = Instant::now();
+    let cpu0 = process_cpu();
     let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let tasks: Vec<_> = (0..conc)
         .map(|w| {
@@ -1285,7 +1357,27 @@ where
     for x in tasks {
         x.await.unwrap();
     }
-    n.load(std::sync::atomic::Ordering::Relaxed) as f64 / t.elapsed().as_secs_f64()
+    let ops = n.load(std::sync::atomic::Ordering::Relaxed);
+    CPU_PER_OP.lock().unwrap().push((process_cpu() - cpu0) / ops.max(1) as f64 * 1e6);
+    ops as f64 / t.elapsed().as_secs_f64()
+}
+
+/// Process CPU (user + system, every thread: server and client) per
+/// operation of each `throughput` call, in µs: what a run costs, which a
+/// shared machine disturbs less than the rate.
+static CPU_PER_OP: std::sync::Mutex<Vec<f64>> = std::sync::Mutex::new(Vec::new());
+
+/// Process CPU seconds (CLOCK_PROCESS_CPUTIME_ID).
+fn process_cpu() -> f64 {
+    #[repr(C)]
+    struct Ts(i64, i64);
+    unsafe extern "C" {
+        fn clock_gettime(clk: i32, ts: *mut Ts) -> i32;
+    }
+    let clk = if cfg!(target_os = "macos") { 12 } else { 2 };
+    let mut t = Ts(0, 0);
+    unsafe { clock_gettime(clk, &mut t) };
+    t.0 as f64 + t.1 as f64 * 1e-9
 }
 
 /// Read paths on one repo (`VLPDS_READ_RECORDS`, default 100k) after a
@@ -1337,7 +1429,10 @@ async fn bench_readers() {
         let (keys, interior, leaves, recs) = (Arc::new(keys), Arc::new(interior), Arc::new(leaves), Arc::new(recs));
         let x = s.xrpc.clone();
         let d = did.clone();
-        let get_record = throughput(secs, 32, move |i| {
+        // VLPDS_READ_ONLY=getRepo (comma-separated phases) skips the others
+        let only: String = env_or("VLPDS_READ_ONLY", String::new());
+        let on = |p: &str| only.is_empty() || only.split(',').any(|o| o == p);
+        let get_record = if !on("getRecord") { 0.0 } else { throughput(secs, 32, move |i| {
             let (x, d, keys) = (x.clone(), d.clone(), keys.clone());
             async move {
                 let (c, r) = keys[i % keys.len()].split_once('/').unwrap();
@@ -1345,7 +1440,7 @@ async fn bench_readers() {
                 assert_eq!(resp.status, 200);
             }
         })
-        .await;
+        .await };
         let blocks = |cids: Arc<Vec<Cid>>, secs: f64, conc: usize| {
             let (x, d) = (s.xrpc.clone(), did.clone());
             throughput(secs, conc, move |i| {
@@ -1357,20 +1452,21 @@ async fn bench_readers() {
                 }
             })
         };
-        let gb_interior = blocks(interior.clone(), secs, 32).await;
-        let gb_records = blocks(recs.clone(), secs, 32).await;
-        let gb_leaves = blocks(leaves.clone(), secs, 4).await;
+        let gb_interior = if on("interior") { blocks(interior.clone(), secs, 32).await } else { 0.0 };
+        let gb_records = if on("record") { blocks(recs.clone(), secs, 32).await } else { 0.0 };
+        let gb_leaves = if on("leaf") { blocks(leaves.clone(), secs, 4).await } else { 0.0 };
         let (x, d) = (s.xrpc.clone(), did.clone());
-        let get_repo = throughput(secs.max(4.0), 4, move |_| {
+        let get_repo = if !on("getRepo") { 0.0 } else { throughput(secs.max(4.0), 4, move |_| {
             let (x, d) = (x.clone(), d.clone());
             async move {
                 assert_eq!(x.get("com.atproto.sync.getRepo", &[("did", &d)], &Auth::None).await.status, 200);
             }
         })
-        .await;
+        .await };
         let line = format!(
-            "{n} records: sync.getRecord {get_record:.0}/s; getBlocks interior {gb_interior:.0}/s, record {gb_records:.0}/s, leaf {gb_leaves:.1}/s; getRepo {get_repo:.2}/s ({:.1} MB)",
-            r.body.len() as f64 / 1e6
+            "{n} records: sync.getRecord {get_record:.0}/s; getBlocks interior {gb_interior:.0}/s, record {gb_records:.0}/s, leaf {gb_leaves:.1}/s; getRepo {get_repo:.2}/s ({:.1} MB); CPU us/op {:?}",
+            r.body.len() as f64 / 1e6,
+            std::mem::take(&mut *CPU_PER_OP.lock().unwrap()).iter().map(|c| c.round() as u64).collect::<Vec<_>>()
         );
         eprintln!("{line}");
         report.push(line);
@@ -1569,4 +1665,87 @@ async fn hot_repo_paths_stay_bounded() {
     let listed = s.list_records(&a.did, "com.example.thing", &[("limit", "1")]).await;
     assert!(listed.status == 200 && n > 10_000, "{n} records");
     let _ = live;
+}
+
+/// Cold open of a blob-heavy repo: the real repo CAR (`~/repo.car` or
+/// `VLPDS_REPO_CAR`) imported into `VLPDS_BLOB_COPIES` accounts (default
+/// 3), then per round (`VLPDS_BLOB_ROUNDS`, default 5) a restart on a fresh
+/// copy of the store, every GET +`VLPDS_COLD_GET_MS` (default 20): the
+/// first write to each copy (a cold open) and its GETs; then, unthrottled
+/// and warm, `worker::load_repo` itself (median of 20).
+/// `cargo test --profile dev-release --test all mst_lazy::bench_cold_open_blobs -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn bench_cold_open_blobs() {
+    use object_store::throttle::{ThrottleConfig, ThrottledStore};
+    let path = std::env::var("VLPDS_REPO_CAR").unwrap_or_else(|_| format!("{}/repo.car", std::env::var("HOME").unwrap_or_default()));
+    let Ok(car) = std::fs::read(&path) else {
+        eprintln!("skipping: no repo CAR at {path}");
+        return;
+    };
+    let copies: usize = env_or("VLPDS_BLOB_COPIES", 3);
+    let rounds: usize = env_or("VLPDS_BLOB_ROUNDS", 5);
+    let delay = Duration::from_millis(env_or("VLPDS_COLD_GET_MS", 20));
+    let base = Arc::new(object_store::memory::InMemory::new());
+    let mut dids = Vec::new();
+    {
+        let s = bench_node("bo", base.clone(), 4 << 20, 4).await;
+        for _ in 0..copies {
+            let a = s.create_account("blobby").await;
+            let r = s.xrpc.post_bytes("com.atproto.repo.importRepo", car.clone(), "application/vnd.ipld.car", &a.auth()).await;
+            assert_eq!(r.status, 200, "{}", r.text());
+            dids.push(a.did);
+        }
+        let Ok(p) = s.app.partition(&dids[0]) else { panic!("shard not owned") };
+        let prefix = vlpds::state::blob_ref_prefix(&dids[0]);
+        let mut it = p.db.scan(prefix.clone()..vlpds::state::prefix_end(&prefix)).await.unwrap();
+        let mut n = 0;
+        while it.next().await.unwrap().is_some() {
+            n += 1;
+        }
+        eprintln!("{copies} copies of {path}: {n} blob refs each");
+        s.app.log.checkpoint_all().await;
+        vlpds::server::shutdown(&s.app).await;
+    }
+    {
+        // let post-import compactions finish
+        let s = bench_node("bo", base.clone(), 0, 4).await;
+        tokio::time::sleep(Duration::from_secs(env_or("VLPDS_COLD_SETTLE_SECS", 10))).await;
+        vlpds::server::shutdown(&s.app).await;
+    }
+    let (mut lat, mut gets, mut open_us) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..rounds {
+        vlpds::partition::bump_cache_epoch();
+        vlpds::mst_store::NODE_CACHE.clear();
+        let throttled = Arc::new(ThrottledStore::new(base.fork(), ThrottleConfig::default()));
+        let s = bench_node("bo", throttled.clone(), 1 << 20, 4).await;
+        throttled.config_mut(|c| c.wait_get_per_call = delay);
+        for did in &dids {
+            let g = state_gets();
+            lat.push(create_post(&s, did).await.as_secs_f64() * 1e3);
+            gets.push((state_gets() - g) as f64);
+        }
+        throttled.config_mut(|c| c.wait_get_per_call = Duration::ZERO);
+        let Ok(p) = s.app.partition(&dids[0]) else { panic!("shard not owned") };
+        let did: Arc<str> = dids[0].as_str().into();
+        let mut v = Vec::new();
+        for _ in 0..20 {
+            let t = Instant::now();
+            vlpds::worker::load_repo(p.clone(), did.clone()).await.unwrap().unwrap();
+            v.push(t.elapsed().as_secs_f64() * 1e6);
+        }
+        open_us.push(pct(&mut v, 0.5));
+        vlpds::server::shutdown(&s.app).await;
+    }
+    let line = format!(
+        "blob-heavy cold write: median {:.1} ms (min {:.1}, max {:.1}), median {} GETs (GET +{delay:?}, {} writes); warm load_repo median {:.0} us (rounds: {:?})",
+        pct(&mut lat.clone(), 0.5),
+        pct(&mut lat.clone(), 0.0),
+        pct(&mut lat, 1.0),
+        pct(&mut gets, 0.5),
+        gets.len(),
+        pct(&mut open_us.clone(), 0.5),
+        open_us.iter().map(|u| u.round() as u64).collect::<Vec<_>>()
+    );
+    println!("{line}");
 }

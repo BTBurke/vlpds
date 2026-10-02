@@ -166,3 +166,81 @@ async fn gc_grace_protects_recent_uploads() {
     post_with_image(&s, &a, &img).await;
     assert!(stored(&s, &a.did, &link(&img)).await);
 }
+
+/// Blob refs found in a record (JSON form).
+fn refs_in(v: &J, out: &mut Vec<String>) {
+    match v {
+        J::Object(m) => {
+            if m.get("$type").and_then(|t| t.as_str()) == Some("blob") {
+                if let Some(l) = m.get("ref").and_then(|r| r["$link"].as_str()) {
+                    out.push(l.to_string());
+                }
+            }
+            m.values().for_each(|c| refs_in(c, out));
+        }
+        J::Array(a) => a.iter().for_each(|c| refs_in(c, out)),
+        _ => {}
+    }
+}
+
+/// The worker loads a repo's blob refs only when a write needs the old ones
+/// (an update or delete; creates run without them, and the refs of what
+/// they create stay in memory until the load). With every idle repo's state
+/// dropped after each pass, a one-repo cache, and creates, updates and
+/// deletes racing in the same passes (a load while creates are in flight),
+/// the b/ index (listBlobs) always matches the records' refs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blob_refs_load_lazily() {
+    let s = TestServer::spawn_with(|c| {
+        c.lazy_mst_unload_idle = true;
+        c.cache_per_worker = 1;
+        c.workers = 1;
+    })
+    .await;
+    let a = s.create_account("lazyblobs").await;
+    let other = s.create_account("evictor").await;
+    let mut imgs = Vec::new();
+    for i in 0..3 {
+        imgs.push(upload(&s, &a, &file(i)).await);
+    }
+    let post = |img: &J| json!({"$type": "app.bsky.feed.post", "text": "img", "createdAt": now_iso(), "embed": {"$type": "app.bsky.embed.images", "images": [{"image": img, "alt": ""}]}});
+    for round in 0..24usize {
+        let auth = a.auth();
+        let cbody = json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": format!("p{round}"), "record": post(&imgs[round % 3])});
+        let dbody = json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": format!("p{}", round.saturating_sub(1))});
+        let mut profile = json!({"$type": "app.bsky.actor.profile"});
+        if round % 4 != 3 {
+            profile["avatar"] = imgs[(round + 1) % 3].clone();
+        }
+        let pbody = json!({"repo": a.did, "collection": "app.bsky.actor.profile", "rkey": "self", "record": profile});
+        let create = s.xrpc.post("com.atproto.repo.createRecord", &cbody, &auth);
+        let delete = s.xrpc.post("com.atproto.repo.deleteRecord", &dbody, &auth);
+        let put = s.xrpc.post("com.atproto.repo.putRecord", &pbody, &auth);
+        match round % 3 {
+            0 => {
+                tokio::join!(create, put);
+            }
+            1 => {
+                tokio::join!(create, delete);
+            }
+            _ => {
+                tokio::join!(create, delete, put);
+            }
+        }
+        if round % 5 == 4 {
+            // another repo takes the worker's one cache slot: the next
+            // write to `a` opens it cold
+            s.create_record(&other, "app.bsky.feed.post", post_record("evict")).await;
+        }
+        let mut want = Vec::new();
+        for coll in ["app.bsky.feed.post", "app.bsky.actor.profile"] {
+            let recs = s.list_records(&a.did, coll, &[("limit", "100")]).await.ok();
+            for r in recs["records"].as_array().unwrap() {
+                refs_in(&r["value"], &mut want);
+            }
+        }
+        want.sort();
+        want.dedup();
+        assert_eq!(listed(&s, &a.did).await, want, "round {round}");
+    }
+}

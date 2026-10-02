@@ -331,7 +331,15 @@ swappable.
 commit hot path.
 
 - **References.** `b/{did}\0{cid}\0{record path}` rows, written with the
-  commit that adds or removes the reference.
+  commit that adds or removes the reference. The repo worker keeps a repo's
+  refs by path to drop the old ones on an update or delete, loaded with
+  one scan of `b/{did}` on the first such write (or account delete /
+  import), not on open: a cold open for a create skips it, and the refs of
+  records created meanwhile (maybe not applied yet) stay over what the scan
+  reads. Dropped again with the repo's paths when it is idle. A cold first
+  write to the real-repo fixture (`~/repo.car`, 812 blob refs;
+  `mst_lazy::bench_cold_open_blobs`), every GET +20 ms: median ~150 ms
+  instead of ~270 ms.
 - **GC** (`blobs::sweep_blobs`, owned partitions only). A blob unreferenced
   for longer than `--blob-gc-grace-secs` is moved to `blob-gc/{did}/{cid}`,
   not deleted. A write checks that its blob exists before it is sequenced, so
@@ -1597,13 +1605,24 @@ root through the store).
   pair it with the SlateDB snapshot `App::repo_view` takes under the apply
   lock, so `M/` and `R/` there are exactly the view's version. getRecord
   proofs walk asynchronously (`mst_store::proof_blocks`), never touching the
-  shared tree. getRepo streams from the snapshot (`mst_lazy::export_blocks`:
-  the `M/` range read ahead, leaves rebuilt from one forward `R/` scan, one
-  path in memory). getBlocks: loaded nodes, `M/` point reads (interior),
-  record CIDs as before, then leaves via the repo's `NodeIndex` (built once
-  by a streamed walk, advanced by the worker per commit; a miss in an
-  index covering the view is final), each found by a
-  proof walk to its key. Loaded nodes are kept process-wide by CID
+  shared tree. getRepo streams from the snapshot with one forward `R/`
+  scan (`xrpc::sync::export_repo`): the scan hands each record's key and
+  CID, in batches, to the MST walk on a blocking thread
+  (`mst_lazy::export_blocks` over `mst_store::FedSource`: the `M/` range
+  read ahead, leaves encoded straight from their records and checked
+  against their links, one path in memory), and keeps the record blocks in
+  a bounded buffer until the nodes are out (the CAR puts every node first:
+  same bytes as before). The buffer is 1 MiB grants from a process-wide
+  256 MiB, at most 64 MiB per export; records past it are read again by a
+  second scan (`tests/all/mst_lazy.rs` `export_buffer_caps_give_same_bytes`).
+  getBlocks: loaded nodes, leaves the repo's `NodeIndex` places (once built,
+  without probing `M/` and the record index first), `M/` point reads
+  (interior), record CIDs as before, then the rest via the `NodeIndex`
+  (built once by a streamed walk, advanced by the worker per commit; a miss
+  in an index covering the view is final), each read by a walk to its key.
+  A walk that has to rebuild a leaf rebuilds its unloaded siblings from the
+  same scan of the parent's range (`mst_store::load_leaves`: a small range
+  scan costs mostly its setup). Loaded nodes are kept process-wide by CID
   (`mst_store::NODE_CACHE`, `--lazy-mst-node-cache-mb`, 256 MiB): nodes are
   content-addressed, so an entry is valid in any version that links it.
 - **Stage 4: path cache.** A repo is charged `REPO_BASE + heap of its
@@ -1640,14 +1659,16 @@ the full-tree mode is removed).
 | Segment bytes / commit (stored) | 3.36–3.51 KB | 3.74–3.95 KB (+~12%: `M/` deletes) |
 | sync.getRecord, 100k-record repo, 32 clients | 80.5k/s | 77.7k/s |
 | getBlocks: interior node / record / leaf | 95.8k / 62.3k / 43.9k/s | 82.6k / 57.6k / 21.5k/s |
-| getRepo, 100k records (22.5 MB), 4 clients | 47 /s | 16 /s |
+| getRepo, 100k records (22.5 MB), 4 clients | 47 /s | 16 /s (two `R/` scans; one since Oct 2: below) |
+| Process CPU per getRepo export / leaf getBlocks (Oct 2, below) | 112 ms / 98 µs | 148 ms / 196 µs (269 ms / 253 µs before) |
 
 - The RSS rows include the writes' own state, which in these runs lives
   in the in-memory object store and memtables (5x more state bytes per
   commit for lazy), and freed buffers the allocator keeps; the charged
   tree and path bytes are the MST memory proper (the full run's RSS grew
   ~160 B/record, under the 240 B/record charge measured with jemalloc).
-- A cold write's fixed reads (head, account, blob refs) set a ~100 ms
+- A cold write's fixed reads (head, account; blob refs only for an update
+  or delete since Oct 2) set a ~100 ms
   floor in both modes; past it the full mode grows with the repo (a 1M
   repo is 44+ GETs of `R/` and ~1 s of rebuild) and lazy doesn't, up to
   the repos whose `M/` range outgrows the prefetch. The prefetch matters:
@@ -1657,12 +1678,28 @@ the full-tree mode is removed).
   1 MiB is the default. Production reads hit the NVMe disk cache first.
   (GET counts per write were too noisy here to quote: background
   compaction and polls share the state client.)
-- getRepo is ~3x slower than walking a resident full tree: leaves are
-  rebuilt (key hashes, encode, CID) from a forward `R/` scan, and the
-  records need a second scan (the CAR puts every node before any record,
-  as the full mode does: the bytes are identical). The full mode only gets
-  its speed for repos it already holds in memory.
-- Leaf getBlocks is an index lookup plus a proof walk to the leaf's key.
+- getRepo was ~3x slower than walking a resident full tree: leaves were
+  rebuilt (key hashes, nodes, encode, CID) from a forward `R/` scan on the
+  walking thread (one `block_on` per record), and the records needed a
+  second scan. Profiled (macOS `sample`), ~95% of an export's CPU was the
+  SlateDB scans (merge iterators per row), the MST work ~5-15%. Now (Oct 2)
+  one scan feeds both, on its own task, so it overlaps the walk; leaves are
+  encoded from the records without key heights or nodes (their links check
+  them); `M/` is still read ahead with one range scan, nodes hash-checked.
+  Re-measured on a shared, loaded laptop (load 25-50 on 14 cores) against a
+  build of the last full-tree commit, 4 interleaved rounds of
+  `bench_readers` (which now also reports process CPU per operation, server
+  and client): an export costs 148 ms of CPU (spread 137-163) against 112 ms
+  (110-124) for the full tree and 269 ms (261-278) before; rates were too
+  noisy to rank precisely (medians 16.5 / 12.2 / 7.2 exports/s, each
+  spanning 4-24/s). The remaining gap is the walk itself (`M/` reads and
+  hash checks, leaf encode and hash) and the scan feeding it.
+- Leaf getBlocks is an index lookup plus a walk to the leaf's key; cold
+  leaves (the bench's random leaves are mostly cold) cost a small `R/`
+  range scan each, now shared with their siblings: 196 µs of CPU (median of
+  8 rounds) against 253 µs before and 98 µs from a resident tree.
+  sync.getRecord, interior and record getBlocks are unchanged (CPU within
+  noise of the full tree's).
 - **Stage 5 decision.** At 10× today's load (3.3k commits/s average, ~9k
   bursts) the extra state writes are ~10 MB/s cluster-wide (~30 MB/s in
   bursts) into memtables, and the extra stored segment bytes ~1.3 MB/s:

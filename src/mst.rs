@@ -725,6 +725,26 @@ pub fn encode_node(n: &Node, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+/// [`encode_node`] of a node with these values and no children (a leaf),
+/// without building it: an export streaming leaves rebuilt from records.
+pub fn encode_leaf(entries: &[(Arc<[u8]>, Cid)], out: &mut Vec<u8>) {
+    out.reserve(48 + entries.len() * 64);
+    out.extend_from_slice(&[0xa2, 0x61, b'e']);
+    cbor::write_array_head(out, entries.len());
+    let mut prev_key: &[u8] = &[];
+    for (key, val) in entries {
+        let p = count_prefix_len(prev_key, key);
+        out.extend_from_slice(&[0xa4, 0x61, b'k']);
+        cbor::write_bytes(out, &key[p..]);
+        out.extend_from_slice(&[0x61, b'p']);
+        cbor::write_uint(out, p as u64);
+        out.extend_from_slice(&[0x61, b't', 0xf6, 0x61, b'v']);
+        out.extend_from_slice(&cbor::link_bytes(val));
+        prev_key = key;
+    }
+    out.extend_from_slice(&[0x61, b'l', 0xf6]);
+}
+
 #[inline]
 fn write_opt_link(out: &mut Vec<u8>, c: Option<&Cid>) {
     match c {

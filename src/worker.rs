@@ -254,9 +254,12 @@ pub enum WorkerMsg {
     CacheInfo { did: Arc<str>, reply: oneshot::Sender<Option<CachedRepo>> },
     /// The paths a repo's queued requests visit, loaded on the
     /// blocking pool (see `Worker::start_fetch`): the tree to continue
-    /// with, or why it failed.
-    Fetched { did: Arc<str>, res: Result<Box<LazyTree>, crate::mst::MstError> },
+    /// with (and the blob refs, if the fetch read them), or why it failed.
+    Fetched { did: Arc<str>, res: Result<Box<(LazyTree, Option<BlobRefs>)>, crate::mst::MstError> },
 }
+
+/// A repo's blob refs by record path (`RepoState::blob_refs`).
+pub type BlobRefs = HashMap<String, Vec<Cid>>;
 
 /// A cached repo, as [`WorkerMsg::CacheInfo`] reports it.
 #[derive(Clone, Debug)]
@@ -265,6 +268,8 @@ pub struct CachedRepo {
     pub loaded_nodes: usize,
     /// Bytes charged to the cache budget.
     pub charge: usize,
+    /// Whether its blob refs are loaded (`RepoState::blob_refs_loaded`).
+    pub blob_refs_loaded: bool,
 }
 
 /// The repo as of its latest *durable* commit: what exports and proofs serve.
@@ -300,7 +305,12 @@ pub struct RepoState {
     pub pending: Arc<AtomicU32>,
     pub account: state::Account,
     /// Blob refs per record path (drives the b/{did}\0{blob}\0{path} index).
-    pub blob_refs: HashMap<String, Vec<Cid>>,
+    /// Loaded on first need (`blob_refs_loaded`: an update or delete, which
+    /// must drop the old record's refs, or an account delete / import);
+    /// until then it holds only the paths created since the open, whose
+    /// refs may not be durable yet (the load keeps them over what it reads).
+    pub blob_refs: BlobRefs,
+    pub blob_refs_loaded: bool,
     pub view: ViewCell,
     pub nodes: crate::mst::SharedNodeIndex,
     /// Approximate heap charged to the worker's cache ([`repo_bytes`]).
@@ -717,15 +727,20 @@ impl Worker {
                         let _ = reply.send(self.cache.peek(&did).map(|st| CachedRepo {
                             loaded_nodes: st.mst.loaded_nodes(),
                             charge: st.charge,
+                            blob_refs_loaded: st.blob_refs_loaded,
                         }));
                     }
                     WorkerMsg::Fetched { did, res } => {
                         let buffered = self.loading.remove(&did).unwrap_or_default();
                         match (self.cache.peek_mut(&did), res) {
-                            (Some(st), Ok(mst)) if st.fetching => {
+                            (Some(st), Ok(fetched)) if st.fetching => {
                                 metrics::LAZY_MST_FETCHES.with_label_values(&["ok"]).inc();
                                 st.fetching = false;
-                                st.mst = *mst;
+                                let (mst, blobs) = *fetched;
+                                st.mst = mst;
+                                if let Some(b) = blobs {
+                                    install_blob_refs(st, b);
+                                }
                                 order.push(did.clone());
                                 groups.insert(did, buffered);
                             }
@@ -943,7 +958,13 @@ impl Worker {
         let (rt, me, d) = (self.rt.clone(), self.me.clone(), did.clone());
         self.loading.insert(did, reqs);
         self.rt.spawn_blocking(move || {
-            let res = need.load(&mut mst, &*db, &d, &rt).map(|_| Box::new(mst));
+            let res = need.load(&mut mst, &*db, &d, &rt).and_then(|_| {
+                let blobs = match need.blobs {
+                    true => Some(rt.block_on(load_blob_refs(&*db, &d)).map_err(|e| crate::mst::MstError::Store(e.to_string()))?),
+                    false => None,
+                };
+                Ok(Box::new((mst, blobs)))
+            });
             let _ = me.send(WorkerMsg::Fetched { did: d, res });
         });
     }
@@ -1134,6 +1155,8 @@ impl Worker {
             pending,
             account,
             blob_refs: HashMap::new(),
+            // a new repo: no refs anywhere yet
+            blob_refs_loaded: true,
             view,
             nodes,
             charge: 0,
@@ -1158,6 +1181,8 @@ pub struct Need {
     keys: Vec<Vec<u8>>,
     probes: Vec<Vec<u8>>,
     all: bool,
+    /// The repo's blob refs (an update or delete drops the old record's).
+    blobs: bool,
 }
 
 impl Need {
@@ -1167,6 +1192,7 @@ impl Need {
             match q {
                 Queued::Write(r) => {
                     for w in &r.writes {
+                        n.blobs |= !matches!(w, Write::Create { .. });
                         let p = w.path();
                         let probe = format!("{}/", collection_of(&p)).into_bytes();
                         if !n.probes.contains(&probe) {
@@ -1175,7 +1201,10 @@ impl Need {
                         n.keys.push(p.into_bytes());
                     }
                 }
-                Queued::Account(AccountReq { op: AccountOp::ReplaceRepo { .. } | AccountOp::Delete, .. }) => n.all = true,
+                Queued::Account(AccountReq { op: AccountOp::ReplaceRepo { .. } | AccountOp::Delete, .. }) => {
+                    n.all = true;
+                    n.blobs = true;
+                }
                 Queued::Account(_) | Queued::Snapshot(_) => {}
             }
         }
@@ -1183,7 +1212,7 @@ impl Need {
     }
 
     fn is_empty(&self) -> bool {
-        self.keys.is_empty() && self.probes.is_empty() && !self.all
+        self.keys.is_empty() && self.probes.is_empty() && !self.all && !self.blobs
     }
 
     /// Loads it into `mst` from `db` (blocking: the blocking pool only).
@@ -1211,11 +1240,12 @@ impl Need {
 /// else what to load first (`Some`), or None if the walk failed (a node or
 /// leaf that doesn't match its link: the repo is reloaded).
 fn lazy_needs(st: &mut RepoState, reqs: Vec<Queued>) -> Result<Vec<Queued>, (Vec<Queued>, Option<Need>)> {
-    let need = Need::of(&reqs);
+    let mut need = Need::of(&reqs);
+    need.blobs &= !st.blob_refs_loaded;
     if need.is_empty() {
         return Ok(reqs);
     }
-    if need.all && !st.mst.fully_loaded() {
+    if need.blobs || (need.all && !st.mst.fully_loaded()) {
         return Err((reqs, Some(need)));
     }
     let keys: Vec<&[u8]> = need.keys.iter().map(|k| &k[..]).collect();
@@ -1267,6 +1297,9 @@ fn track_inflight(st: &mut RepoState, nodes: Option<HashSet<Cid>>) -> Arc<std::s
 fn unload_repo(st: &mut RepoState) {
     st.inflight.clear();
     st.mst.unload(0);
+    // durable too now: read again when next needed
+    st.blob_refs = HashMap::new();
+    st.blob_refs_loaded = false;
     *st.view.write() = st.durable_view();
     metrics::LAZY_MST_UNLOADS.inc();
     st.charge = repo_bytes(st);
@@ -1428,9 +1461,16 @@ pub async fn load_repo_with(
         Err(e) => return Err(anyhow::anyhow!("signing key of {did}: {e}")),
     };
     let (mst, backfill) = open_lazy(&partition, &did, &head, &opts).await?;
-    let blob_refs = load_blob_refs(db, &did).await?;
+    // blob refs only if the first request needs them (most cold writes are
+    // creates: no old refs to drop)
+    let blob_refs = match opts.need.as_ref().is_some_and(|n| n.blobs) {
+        true => Some(load_blob_refs(&**db, &did).await?),
+        false => None,
+    };
     let mut st = finish_load(partition.clone(), did, mst, head, key, acct)?;
-    st.blob_refs = blob_refs;
+    if let Some(b) = blob_refs {
+        install_blob_refs(&mut st, b);
+    }
     st.backfill = backfill;
     Ok(Some(st))
 }
@@ -1474,10 +1514,11 @@ async fn open_lazy(partition: &Arc<Partition>, did: &Arc<str>, head: &Head, opts
     .await?
 }
 
-async fn load_blob_refs(db: &slatedb::Db, did: &str) -> anyhow::Result<HashMap<String, Vec<Cid>>> {
+/// A repo's blob refs, by record path (one scan of its `b/` range).
+async fn load_blob_refs<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str) -> anyhow::Result<BlobRefs> {
     let prefix = state::blob_ref_prefix(did);
     let mut iter = db.scan(prefix.clone()..state::prefix_end(&prefix)).await?;
-    let mut out: HashMap<String, Vec<Cid>> = HashMap::new();
+    let mut out = BlobRefs::new();
     while let Some(kv) = iter.next().await? {
         let rest = std::str::from_utf8(&kv.key[prefix.len()..])?;
         let (cid, path) = rest
@@ -1488,6 +1529,17 @@ async fn load_blob_refs(db: &slatedb::Db, did: &str) -> anyhow::Result<HashMap<S
             .push(Cid::parse(cid)?);
     }
     Ok(out)
+}
+
+/// Installs a repo's blob refs read from durable state: the paths written
+/// since the open (already in the map) keep theirs, which may not be
+/// durable yet; every other path's refs are durable (only creates ran
+/// without the map, and an unwritten path's refs haven't changed).
+fn install_blob_refs(st: &mut RepoState, loaded: BlobRefs) {
+    for (path, blobs) in loaded {
+        st.blob_refs.entry(path).or_insert(blobs);
+    }
+    st.blob_refs_loaded = true;
 }
 
 pub fn collection_of(path: &str) -> &str {
@@ -1523,6 +1575,7 @@ fn finish_load(
         pending: Arc::new(AtomicU32::new(0)),
         account,
         blob_refs: HashMap::new(),
+        blob_refs_loaded: false,
         view,
         nodes,
         charge: 0,
@@ -1892,11 +1945,7 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
             cid: *new,
             prev: *prev,
         });
-        index_mutations(st, rev.0, path,
-            new.is_some(),
-            batch.blobs.get(path.as_str()),
-            &mut extra,
-        );
+        index_mutations(st, rev.0, path, prev.is_some(), new.is_some(), batch.blobs.get(path.as_str()), &mut extra)?;
         let key = Bytes::from(state::record_key(&st.did, path));
         if let Some(p) = prev {
             muts.push(Mutation { key: state::record_cid_key(&st.did, p, path).into(), val: None });
@@ -2035,14 +2084,18 @@ fn enqueue(st: &RepoState, entry: LogEntry) -> anyhow::Result<()> {
 
 /// Maintains the blob-ref index for one net op (the collection index
 /// changes at flush: `Batch::colls`).
+/// `existed`: the path held a record before (its refs are dropped: only
+/// known once the repo's blob refs are loaded).
 fn index_mutations(
     st: &mut RepoState,
     rev: u64,
     path: &str,
+    existed: bool,
     exists: bool,
     new_blobs: Option<&Vec<Cid>>,
     muts: &mut Vec<Mutation>,
-) {
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!existed || st.blob_refs_loaded, "blob refs of {} not loaded for a write to {path}", st.did);
     let old = st.blob_refs.remove(path).unwrap_or_default();
     let new: Vec<Cid> = if exists {
         new_blobs.cloned().unwrap_or_default()
@@ -2066,6 +2119,7 @@ fn index_mutations(
     if !new.is_empty() {
         st.blob_refs.insert(path.to_string(), new);
     }
+    Ok(())
 }
 
 fn send_entry(st: &RepoState, entry: LogEntry) -> anyhow::Result<()> {
@@ -2093,6 +2147,7 @@ fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>, src: &dyn 
     if !st.mst.fully_loaded() {
         st.mst.load_all(src)?;
     }
+    anyhow::ensure!(st.blob_refs_loaded, "blob refs of {} not loaded to clear them", st.did);
     let did = st.did.clone();
     let mut colls = std::collections::BTreeSet::new();
     st.mst.tree.walk(&mut |k, cid| {
@@ -2270,7 +2325,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
                     key: state::record_cid_key(&st.did, cid, path).into(),
                     val: Some(Bytes::new()),
                 });
-                index_mutations(st, rev.0, path, true, Some(blobs), &mut muts);
+                index_mutations(st, rev.0, path, false, true, Some(blobs), &mut muts)?;
             }
             let data = tree.root_cid()?;
             replace_nodes_mutations(&st.did, old_nodes, &tree, &mut muts);
@@ -2495,6 +2550,109 @@ mod tests {
         w.send(WorkerMsg::CacheInfo { did: did.clone(), reply }).unwrap();
         assert!(info.await.unwrap().unwrap().loaded_nodes >= 1);
         assert!(part.recent.take_dirty().is_some_and(|b| b.as_ref() == b"did:plc:claims\n"), "written repo tracked as recent");
+    }
+
+    /// Blob refs are loaded on a repo's first update or delete, not on open:
+    /// a cold open for a create skips them; the refs a create wrote while
+    /// they weren't loaded (still in flight, so not in the scanned `b/`)
+    /// survive the load, so a delete right after drops them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blob_refs_load_on_first_need() {
+        let store = crate::store::Store::memory(None);
+        let db = Arc::new(crate::partition::open_db(&store, 0, None).await.unwrap());
+        let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
+        let log = NodeLog::start(
+            store.clone(),
+            NodeLogConfig { log_id: "t".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(1), lease_ok: None },
+            merger_tx,
+        );
+        // the sequencer is this test: it applies entries when it chooses
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(16);
+        let part = Arc::new(Partition { id: 0, epoch: 1, db: db.clone(), apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() });
+        let apply = |e: LogEntry| {
+            let db = db.clone();
+            async move {
+                let mut wb = slatedb::WriteBatch::new();
+                for m in &e.muts {
+                    match &m.val {
+                        Some(v) => wb.put(&m.key, v),
+                        None => wb.delete(&m.key),
+                    }
+                }
+                db.write(wb).await.unwrap();
+                settle(e);
+            }
+        };
+        let did: Arc<str> = "did:plc:blobrefs".into();
+        let op = |w: Write| {
+            let (reply, rx) = oneshot::channel();
+            (WorkerMsg::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None }), rx)
+        };
+        let blob = |i: u8| Cid::dag_cbor(&[i]);
+        let rec = |rkey: &str, blobs: Vec<Cid>, update: bool| {
+            let bytes = Bytes::from(format!("record {rkey} {blobs:?}"));
+            let (collection, rkey, cid) = ("app.test.thing".to_string(), rkey.to_string(), Cid::dag_cbor(&bytes));
+            match update {
+                false => Write::Create { collection, rkey, cid, bytes, blobs },
+                true => Write::Update { collection, rkey, cid, bytes, blobs, swap: None, must_exist: true },
+            }
+        };
+        let route: PartitionLookup = {
+            let p = part.clone();
+            Arc::new(move |_: &str| Some(p.clone()))
+        };
+        {
+            let workers = spawn(1, 100, route.clone(), tokio::runtime::Handle::current());
+            let w = workers.senders[0].clone();
+            let key = Arc::new(Keypair::generate());
+            let account = serde_json::json!({
+                "did": &*did, "handle": "t.test", "wrapped_signing_key": Secrets::dev().wrap_signing_key(&did, &key).await.unwrap().0, "signing_pubkey": key.public_multibase(),
+                "password_hash": "", "created_at": "2026-01-01T00:00:00Z",
+            });
+            let (reply, created) = oneshot::channel();
+            w.send(WorkerMsg::CreateRepo(CreateRepoReq { did: did.clone(), handle: "t.test".into(), key, account_json: Bytes::from(serde_json::to_vec(&account).unwrap()), records: Vec::new(), reply })).unwrap();
+            apply(rx.recv().await.unwrap()).await;
+            created.await.unwrap().unwrap();
+            let (m, r) = op(rec("p1", vec![blob(1)], false));
+            w.send(m).unwrap();
+            apply(rx.recv().await.unwrap()).await;
+            r.await.unwrap().unwrap();
+        }
+        // a fresh worker: the repo opens cold
+        let workers = spawn(1, 100, route, tokio::runtime::Handle::current());
+        let w = workers.senders[0].clone();
+        let cached = || {
+            let (reply, info) = oneshot::channel();
+            w.send(WorkerMsg::CacheInfo { did: did.clone(), reply }).unwrap();
+            info
+        };
+        let (m, created) = op(rec("p2", vec![blob(2)], false));
+        w.send(m).unwrap();
+        let e_create = rx.recv().await.unwrap(); // in flight: its b/ row isn't applied
+        assert!(!cached().await.unwrap().unwrap().blob_refs_loaded, "a create opened the repo with its blob refs");
+        let has = |e: &LogEntry, b: u8, path: &str, put: bool| e.muts.iter().any(|m| m.key[..] == state::blob_ref_key(&did, &blob(b), path)[..] && m.val.is_some() == put);
+        let (m, deleted) = op(Write::Delete { collection: "app.test.thing".into(), rkey: "p2".into(), swap: None });
+        w.send(m).unwrap();
+        let e_delete = rx.recv().await.unwrap();
+        assert!(has(&e_delete, 2, "app.test.thing/p2", false), "the in-flight create's ref isn't dropped");
+        assert!(cached().await.unwrap().unwrap().blob_refs_loaded);
+        let (m, updated) = op(rec("p1", vec![blob(3)], true));
+        w.send(m).unwrap();
+        let e_update = rx.recv().await.unwrap();
+        assert!(has(&e_update, 1, "app.test.thing/p1", false) && has(&e_update, 3, "app.test.thing/p1", true), "the durable ref isn't replaced");
+        for e in [e_create, e_delete, e_update] {
+            apply(e).await;
+        }
+        for r in [created, deleted, updated] {
+            r.await.unwrap().unwrap();
+        }
+        let prefix = state::blob_ref_prefix(&did);
+        let mut it = db.scan(prefix.clone()..state::prefix_end(&prefix)).await.unwrap();
+        let mut left = Vec::new();
+        while let Some(kv) = it.next().await.unwrap() {
+            left.push(kv.key.to_vec());
+        }
+        assert_eq!(left, vec![state::blob_ref_key(&did, &blob(3), "app.test.thing/p1")]);
     }
 
     /// The path cache: over the byte budget, idle repos drop back to their
