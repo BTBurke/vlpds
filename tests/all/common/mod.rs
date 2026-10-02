@@ -27,10 +27,15 @@ pub const PASSWORD: &str = "hunter2-password";
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Unique, valid handle label (lowercase alnum), e.g. "alice3k9x".
+/// A unique name that still fits one 18-character handle label: the
+/// counter and random suffix are base-36, and a long prefix is cut so the
+/// whole name never exceeds 18 characters however many names a run makes.
 pub fn unique_name(prefix: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let r: u32 = rand::random::<u32>() % 46656;
-    format!("{prefix}{n}x{}", radix36(r as u64))
+    let suffix = format!("{}x{}", radix36(n), radix36(r as u64));
+    let keep = 18usize.saturating_sub(suffix.len()).min(prefix.len());
+    format!("{}{suffix}", &prefix[..keep])
 }
 
 fn radix36(mut n: u64) -> String {
