@@ -3782,7 +3782,6 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "slatedb"
 version = "0.17.0"
-source = "git+https://github.com/jazware/slatedb?rev=f2461431ecbafe834f697e5ce06382dbdd9974d2#f2461431ecbafe834f697e5ce06382dbdd9974d2"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -3828,7 +3827,6 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.17.0"
-source = "git+https://github.com/jazware/slatedb?rev=f2461431ecbafe834f697e5ce06382dbdd9974d2#f2461431ecbafe834f697e5ce06382dbdd9974d2"
 dependencies = [
  "chrono",
  "log",
@@ -3843,7 +3841,6 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.17.0"
-source = "git+https://github.com/jazware/slatedb?rev=f2461431ecbafe834f697e5ce06382dbdd9974d2#f2461431ecbafe834f697e5ce06382dbdd9974d2"
 dependencies = [
  "async-trait",
  "bytes",

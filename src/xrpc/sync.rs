@@ -260,7 +260,7 @@ async fn scan_records(
     let prefix = state::record_prefix(did);
     let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, cache_blocks: true, ..Default::default() };
     let mut iter = match snap.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await {
-        Ok(it) => it,
+        Ok(it) => state::BatchedScan::new(it),
         Err(e) => {
             let _ = tx.send(Err(e.to_string())).await;
             return Err(e.into());
@@ -396,7 +396,7 @@ async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Respon
         };
         let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, ..Default::default() };
         let mut iter = match snap.scan_with_options([&prefix[..], &start[..]].concat()..state::prefix_end(&prefix), &opts).await {
-            Ok(it) => it,
+            Ok(it) => state::BatchedScan::new(it),
             Err(e) => {
                 let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
                 return;

@@ -195,6 +195,39 @@ pub fn record_cid_prefix(did: &str, cid: &Cid) -> Vec<u8> {
     keyed(did, b"c/", &[did.as_bytes(), b"\0", &cid.digest[..RECORD_CID_KEY_BYTES]])
 }
 
+/// Rows a [`BatchedScan`] reads per `next_batch`.
+pub const SCAN_BATCH: usize = 256;
+
+/// A scan read [`SCAN_BATCH`] rows at a time with SlateDB's
+/// `DbIterator::next_batch`: rows in loaded blocks come without an await
+/// (or a tracing span) per row down SlateDB's iterator stack, ~half the
+/// instructions per row of `next`. For scans read to (near) their end:
+/// it reads up to a batch ahead of what the caller takes.
+pub struct BatchedScan {
+    iter: slatedb::DbIterator,
+    rows: std::vec::IntoIter<slatedb::KeyValue>,
+}
+
+impl BatchedScan {
+    pub fn new(iter: slatedb::DbIterator) -> BatchedScan {
+        BatchedScan { iter, rows: Vec::new().into_iter() }
+    }
+
+    /// The next row, as `DbIterator::next`.
+    pub async fn next(&mut self) -> Result<Option<slatedb::KeyValue>, slatedb::Error> {
+        if let Some(kv) = self.rows.next() {
+            return Ok(Some(kv));
+        }
+        self.rows = self.iter.next_batch(SCAN_BATCH).await?.into_iter();
+        Ok(self.rows.next())
+    }
+
+    /// The next row if it has already been read (no await).
+    pub fn next_buffered(&mut self) -> Option<slatedb::KeyValue> {
+        self.rows.next()
+    }
+}
+
 /// The keys of one family (`b"h/"`, or a narrower prefix such as
 /// [`collection_family`]) across slots, in (slot, key) order. Slot-major
 /// keys interleave families, so one iterator over the whole slot space

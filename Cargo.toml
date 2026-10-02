@@ -122,9 +122,10 @@ required-features = ["test-level"]
 # (Manifest::cloned_from_union now gives repeats fresh ids). DESIGN.md
 # "Online shard split/merge", "Patched SlateDB".
 [patch.crates-io]
-slatedb = { git = "https://github.com/jazware/slatedb", rev = "f2461431ecbafe834f697e5ce06382dbdd9974d2" }
+# LOCAL (iterfast): repoint to the fork rev of branch vlpds-0.17-batch-next once pushed
+slatedb = { path = "/tmp/scratch/slatedb-iterfast/slatedb" }
 # the same rev, so the metrics recorder (src/metrics.rs) and slatedb share one slatedb-common
-slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "f2461431ecbafe834f697e5ce06382dbdd9974d2" }
+slatedb-common = { path = "/tmp/scratch/slatedb-iterfast/slatedb-common" }
 
 [profile.release]
 opt-level = 3

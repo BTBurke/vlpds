@@ -200,7 +200,7 @@ impl<R: DbReadOps + Sync + ?Sized> Source for DbSource<'_, R> {
         let range = record_range(self.did, lo, hi);
         let plen = state::record_prefix(self.did).len();
         self.rt.block_on(async {
-            let mut it = self.db.scan(range).await.map_err(store_err)?;
+            let mut it = state::BatchedScan::new(self.db.scan(range).await.map_err(store_err)?);
             while let Some(kv) = it.next().await.map_err(store_err)? {
                 push_record(plen, &kv, out)?;
             }
@@ -216,7 +216,7 @@ pub struct ScanSource<'a, N: Source> {
     pub nodes: N,
     rt: &'a tokio::runtime::Handle,
     prefix_len: usize,
-    iter: RefCell<slatedb::DbIterator>,
+    iter: RefCell<state::BatchedScan>,
     /// The record read past the last range's end.
     peeked: RefCell<Option<(Key, Cid)>>,
     done: Cell<bool>,
@@ -228,7 +228,7 @@ impl<'a, N: Source> ScanSource<'a, N> {
         let prefix = state::record_prefix(did);
         let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, cache_blocks: true, ..Default::default() };
         let iter = rt.block_on(db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts)).map_err(store_err)?;
-        Ok(ScanSource { nodes, rt, prefix_len: prefix.len(), iter: RefCell::new(iter), peeked: RefCell::new(None), done: Cell::new(false) })
+        Ok(ScanSource { nodes, rt, prefix_len: prefix.len(), iter: RefCell::new(state::BatchedScan::new(iter)), peeked: RefCell::new(None), done: Cell::new(false) })
     }
 
     fn next(&self) -> Result<Option<(Key, Cid)>> {
@@ -239,7 +239,11 @@ impl<'a, N: Source> ScanSource<'a, N> {
             return Ok(None);
         }
         let mut it = self.iter.borrow_mut();
-        match self.rt.block_on(it.next()).map_err(store_err)? {
+        let next = match it.next_buffered() {
+            Some(kv) => Some(kv),
+            None => self.rt.block_on(it.next()).map_err(store_err)?,
+        };
+        match next {
             Some(kv) => {
                 let mut v = Vec::with_capacity(1);
                 push_record(self.prefix_len, &kv, &mut v)?;
@@ -395,7 +399,7 @@ pub async fn prefetch<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, max_bytes
     }
     let prefix = state::mst_node_prefix(did);
     let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, cache_blocks: true, ..Default::default() };
-    let mut it = db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await?;
+    let mut it = state::BatchedScan::new(db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await?);
     let mut bytes = 0;
     while let Some(kv) = it.next().await? {
         let Ok(digest) = <[u8; 32]>::try_from(&kv.key[prefix.len()..]) else { continue };
@@ -470,7 +474,7 @@ async fn load_leaves<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, n: &Node, 
     metrics::LAZY_MST_READS.with_label_values(&["leaf"]).inc();
     let plen = state::record_prefix(did).len();
     let mut recs = Vec::new();
-    let mut it = db.scan(record_range(did, lo, hi)).await.map_err(store_err)?;
+    let mut it = state::BatchedScan::new(db.scan(record_range(did, lo, hi)).await.map_err(store_err)?);
     while let Some(kv) = it.next().await.map_err(store_err)? {
         push_record(plen, &kv, &mut recs)?;
     }
@@ -530,7 +534,7 @@ async fn load_child_uncached<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, ci
     metrics::LAZY_MST_READS.with_label_values(&["leaf"]).inc();
     let plen = state::record_prefix(did).len();
     let mut recs = Vec::new();
-    let mut it = db.scan(record_range(did, lo, hi)).await.map_err(store_err)?;
+    let mut it = state::BatchedScan::new(db.scan(record_range(did, lo, hi)).await.map_err(store_err)?);
     while let Some(kv) = it.next().await.map_err(store_err)? {
         push_record(plen, &kv, &mut recs)?;
     }

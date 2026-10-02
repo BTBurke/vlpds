@@ -781,22 +781,26 @@ async fn list_records(
     let mut n = 0;
     let mut last_rkey = None;
     while n < limit {
-        let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? else {
+        // at most the rows the page still needs (a taken-down one asks again)
+        let rows = iter.next_batch(limit - n).await.map_err(XrpcError::from_err)?;
+        if rows.is_empty() {
             break;
-        };
-        let rkey = String::from_utf8_lossy(&kv.key[prefix.len()..]).to_string();
-        let rec_uri = uri(&did, &format!("{}/{}", q.collection, rkey));
-        if takedowns.has_takedown(&format!("rec/{}/{rkey}", q.collection)) {
+        }
+        for kv in rows {
+            let rkey = String::from_utf8_lossy(&kv.key[prefix.len()..]).to_string();
+            let rec_uri = uri(&did, &format!("{}/{}", q.collection, rkey));
+            if takedowns.has_takedown(&format!("rec/{}/{rkey}", q.collection)) {
+                last_rkey = Some(rkey);
+                continue;
+            }
+            let (cid, bytes) = state::decode_record_value(&kv.value).map_err(XrpcError::from_err)?;
+            if n > 0 {
+                out.push(b',');
+            }
+            write_record_json(&mut out, &rec_uri, &cid, &bytes)?;
+            n += 1;
             last_rkey = Some(rkey);
-            continue;
         }
-        let (cid, bytes) = state::decode_record_value(&kv.value).map_err(XrpcError::from_err)?;
-        if n > 0 {
-            out.push(b',');
-        }
-        write_record_json(&mut out, &rec_uri, &cid, &bytes)?;
-        n += 1;
-        last_rkey = Some(rkey);
     }
     out.push(b']');
     if let (true, Some(c)) = (n == limit, &last_rkey) {
