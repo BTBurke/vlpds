@@ -102,6 +102,7 @@ lazy!(RETENTION_DELETED_OBJECTS: IntCounterVec = register_int_counter_vec!("vlpd
 lazy!(RETENTION_DELETED_BYTES: IntCounterVec = register_int_counter_vec!("vlpds_retention_deleted_bytes_total", "Log bytes deleted by retention, by log (own, dead)", &["log"]));
 lazy!(RETENTION_PRUNED_SEQ: IntGauge = register_int_gauge!("vlpds_retention_pruned_seq", "Highest seq this node has deleted from any log (older cursors get OutdatedCursor)"));
 lazy!(RETENTION_REPLAY_HOLD: IntGauge = register_int_gauge!("vlpds_retention_replay_hold_segments", "Segments of our log kept only because a crash replay could still need them (durable ordinal - replay floor)"));
+lazy!(RETENTION_LISTS_SKIPPED: IntCounterVec = register_int_counter_vec!("vlpds_retention_lists_skipped_total", "Retention LISTs a pass skipped because nothing could be due yet (own: our log's first segment is inside the window or held by the replay floor; dead: no dead logs but retired ones whose fences aren't due, live set unchanged); each still runs at least hourly", &["list"]));
 lazy!(RETENTION_TICKS: IntCounterVec = register_int_counter_vec!("vlpds_retention_ticks_total", "Retention passes by result", &["result"]));
 
 // ---- proxy ----
@@ -122,6 +123,7 @@ lazy!(OBJ_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_object_stor
 lazy!(OBJ_BYTES: IntCounterVec = register_int_counter_vec!("vlpds_object_store_bytes_total", "Object-store payload bytes by direction (up, down), key component and client pool", &["dir", "component", "client"]));
 lazy!(CLUSTER_STORE_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_cluster_store_requests_total", "Control-plane object-store requests (leases, assignments, writer claims, fences) by op", &["op"]));
 lazy!(CLUSTER_NUDGES: IntCounterVec = register_int_counter_vec!("vlpds_cluster_nudges_total", "Early control-plane steps asked of peers after a release (sent, failed) or by peers (received)", &["dir"]));
+lazy!(CLUSTER_LONE_SKIPS: IntCounterVec = register_int_counter_vec!("vlpds_cluster_lone_skips_total", "Control-plane LISTs a lone node skipped (nodes: membership reused, listed at least once per TTL; assign: assignments unchanged but by our own writes, listed every 25 steps)", &["list"]));
 lazy!(CLUSTER_STORE_TIMEOUTS: IntCounterVec = register_int_counter_vec!("vlpds_cluster_store_timeouts_total", "Control-plane object-store calls a step gave up on at their deadline (min(TTL, 5 s)); the step retries next tick", &["op"]));
 lazy!(COMPACTION_POLL_MODE: IntCounterVec = register_int_counter_vec!("vlpds_compaction_poll_switches_total", "Shard compactors switched to fast polls (deep L0) or back to slow (--compaction-polling adaptive)", &["mode"]));
 lazy!(LAYOUT_VERSION: IntGauge = register_int_gauge!("vlpds_shard_layout_version", "Version of the shard layout this node routes by (grows with each split/merge)"));

@@ -690,9 +690,17 @@ pub async fn shutdown(app: &Arc<xrpc::App>) {
     if let Some(c) = &app.cluster {
         let host: Arc<dyn ShardHost> = app.node.clone();
         tracing::info!(shards = c.owned().len(), "graceful shutdown: releasing shards");
-        c.shutdown(&host).await;
+        if let Err(e) = c.shutdown(&host).await {
+            // Our lease stays (renewals stopped): peers presume us dead and
+            // fence our log, as does our own restart (it reads our lease).
+            tracing::error!("{e:#}: exiting nonzero without dropping our lease (peers or our restart fence the log)");
+            crate::lifecycle::fail_stop(SHUTDOWN_FENCE_EXIT_CODE, "shutdown_fence");
+        }
     }
 }
+
+/// Exit code of a graceful shutdown that could not fence its own log.
+pub const SHUTDOWN_FENCE_EXIT_CODE: i32 = 8;
 
 #[cfg(test)]
 mod tests {

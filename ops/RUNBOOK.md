@@ -42,6 +42,16 @@ it is marked **(unverified)**.
   The new owner **fences** the dead log (conditional create at the end of its
   durable prefix), CASes the assignment, replays the shard's spans, waits out the
   previous owner's `seq_floor` (commit-wait, max 30 s), then serves.
+- **A lone node lists less** (no flag). While `nodes/` holds only its own lease,
+  a node LISTs `nodes/` once per TTL and `assign/` every 25 steps
+  (`vlpds_cluster_lone_skips_total`). A joiner is seen at once through its hello,
+  or within a TTL if the hello is lost. An `assign/` object edited by hand in the
+  bucket (never do this) is noticed within 25 steps instead of the next one.
+- **Retention passes** run every `--log-retention-interval` (default 60 s,
+  1 s..=10 m; `VlpdsRetentionNotRunning` expects a pass every 15 min). Passes LIST
+  only what can be due, so idle passes make no requests
+  (`vlpds_retention_lists_skipped_total`). A longer interval saves little more and
+  delays deletes and dead-log retirement by up to one interval.
 - **Fail-stop is the safety mechanism.** A node that might be wrong exits; the
   supervisor restarts it and it rejoins. A wrong "dead" presumption costs
   availability, never an acked write (DESIGN "Why safety needs no clocks").
@@ -96,6 +106,7 @@ curl -s -u "admin:$VLPDS_ADMIN_TOKEN" http://NODE:2583/xrpc/vlpds.admin.getClust
 | 5 | `lease_lost` / `lease_lapsed` | Lease lost or lapsed (any reason) | `node lease lost unexpectedly: fail-stop` (`lease_lost`), preceded by one of: `node lease lost (CAS conflict)`, `node lease lapsed before renewal`, `node lease lapsed past takeover` (watchdog), `a shard we hold was reassigned`, `a shard failed to close cleanly`, `our log did not quiesce`; or `node lease lapsed before segment PUT` / `before ack` (`lease_lapsed`) |
 | 6 | `signature_fault` | 3 signatures failed verification right after signing within a minute (suspected memory/CPU fault; see [VlpdsSignatureFault](#vlpdssignaturefault)) | `repeated signature faults: fail-stop (suspect this host's memory or CPU)`, preceded by `signature failed verification against the signing key's public key` (purpose, recent) |
 | 7 | `incompatible_level` | This build can't run the cluster's feature level (`cluster/version`): checked before the node reads or writes anything, again right after its lease write (lease deleted), and once per TTL while running. An old image after a finalize, or a new image whose `MIN_LEVEL` is past the cluster's (see [VlpdsIncompatibleNode](#vlpdsincompatiblenode)) | `incompatible feature level: cluster level N is outside this build's levels A..=B` / `cluster is raising its level to N, past this build's max level B; fail-stop (exit 7)` |
+| 8 | `shutdown_fence` | A graceful stop could not fence its own log within min(TTL, 30 s) of retries. It keeps its lease, so peers presume it dead and fence the log, or the restart (same `--node-id`) does. Its shards were already handed out | `fencing our log on shutdown failed: giving up`, then `...: exiting nonzero without dropping our lease` |
 
 **How the previous process ended** is a metric on the next one
 (`src/lifecycle.rs`): each fail-stop writes its `reason` and code to the
@@ -1299,10 +1310,17 @@ For local e2e runs, point `--plc-url` at a local did-method-plc server
    closes its shards with one barrier segment + checkpoint and hands them straight
    to settled peers (their nudges skip the control-plane read), waits for its log
    to quiesce (up to 10 s), **fences its own log**, deletes its lease, nudges peers,
-   keeps answering 500 ms more, and exits 0.
+   keeps answering 500 ms more, and exits 0. If the fence keeps failing (store
+   errors for min(TTL, 30 s) of retries), it keeps its lease and exits 8
+   (`shutdown_fence`). The supervisor's restart fences the old log at startup, and
+   so do peers once the lease goes quiet. Without that, followers would wait on the
+   log forever.
 2. Give the supervisor a stop timeout well above the worst case: the close barrier
    may wait 30 s and the quiesce 10 s, so **at least 60 s (derived estimate)**. A
    stop that times out into SIGKILL becomes a crash (fence + replay by peers).
+   Failing fence retries (up to min(TTL, 30 s) more) can run past 60 s. A SIGKILL
+   there ends the same way as their exit 8: the shards are already handed out, and
+   the kept lease gets the log fenced.
 3. Start the new binary with the **same `--node-id`** and the same bucket, prefix,
    tokens and `--advertise-url`. It greets peers; peers hand back its fair share
    at their next step.

@@ -219,6 +219,12 @@ struct Args {
     /// deleted; older cursors get OutdatedCursor.
     #[arg(long, env = "VLPDS_LOG_RETENTION", default_value = "72h")]
     log_retention: String,
+    /// Time between log retention passes (1s..=10m). A pass LISTs only what
+    /// can be due (DESIGN.md "Log retention"), so on an idle node most
+    /// cost nothing; a longer interval delays deletes (and a dead log's
+    /// retirement) by up to this much.
+    #[arg(long, env = "VLPDS_LOG_RETENTION_INTERVAL", default_value = "60s")]
+    log_retention_interval: String,
     /// A dead log, once pruned to its fence, keeps the fence this long
     /// ("off" = forever). The fence is what stops a zombie of that
     /// incarnation; one paused longer than this (a suspended VM whose
@@ -813,9 +819,21 @@ async fn run(args: Args) -> anyhow::Result<()> {
             v => vlpds::retention::parse_duration(v).map(Some),
         }
     };
+    let retention_interval = vlpds::retention::parse_duration(&args.log_retention_interval)?;
+    // VlpdsRetentionNotRunning expects a pass at least every 15 min
+    anyhow::ensure!(
+        (Duration::from_secs(1)..=Duration::from_secs(600)).contains(&retention_interval),
+        "--log-retention-interval must be within 1s..=10m (got {})",
+        args.log_retention_interval
+    );
     let log_retention = match args.log_retention.as_str() {
         "off" | "none" => None,
-        v => Some(vlpds::retention::Config { window: vlpds::retention::parse_duration(v)?, fence_retention: opt_duration(&args.fence_retention)?, ..Default::default() }),
+        v => Some(vlpds::retention::Config {
+            window: vlpds::retention::parse_duration(v)?,
+            interval: retention_interval,
+            fence_retention: opt_duration(&args.fence_retention)?,
+            ..Default::default()
+        }),
     };
     let reshard_gc = Some(vlpds::reshard_gc::Config {
         grace: opt_duration(&args.reshard_gc_grace)?,

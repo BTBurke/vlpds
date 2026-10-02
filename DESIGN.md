@@ -716,6 +716,83 @@ the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
 
 Single-node mode is the same code with one node owning all shards.
 
+- **Graceful shutdown can't fence its log.** The fence is retried with
+  backoff (200 ms doubling to 5 s) for min(TTL, 30 s), renewals going on
+  meanwhile. If it still fails, the node keeps its lease, stops renewing it
+  and exits 8 (`shutdown_fence`). Deleting the lease over an unfenced log
+  would leave nobody to fence it: no peer presumes a lease it can no longer
+  see dead, and followers drain a log only up to a fence, so every peer's
+  merged firehose would wait forever. A kept lease goes quiet, so peers
+  presume the incarnation dead and fence its log (`fence_dead`), and a
+  restart with the same `--node-id` fences it at startup (`read_own_lease`).
+  Its shards were already handed out, so nothing is replayed.
+
+### Lone-node control plane
+
+A cluster step costs a lease CAS, a `LIST nodes/` and a `LIST assign/`
+every TTL/5, which is 84% of an idle single node's Class A requests
+(`bench/results/tiny-pds-idle-2026-10-02`). A node that is alone lists
+less (`Cluster::step_body`):
+
+- **`LIST nodes/` at least once per TTL.** The last listing showed only our
+  own lease, and no peer has contacted us since (a hello, which runs
+  `learn_peer`, or a nudge). Steps then reuse that view for up to
+  TTL/renew − 1 steps, never longer than TTL − renew/2 since the listing
+  started. The renewal CAS keeps its own TTL/5 loop.
+- **`LIST assign/` every 25 steps** (~5 TTLs; the every-150-steps full
+  re-read stays). This applies while the step before was also lone and
+  *settled*: it held every shard of a layout with no split/merge in
+  flight, and nothing was handed to it or left unreleased. Anything else,
+  including a failed or conflicting CAS, an early return, contact or a
+  non-lone listing, lists on the next step.
+
+*Why skipping `LIST assign/` is safe.* While `nodes/` holds only our lease,
+these are the only writers of `assign/`:
+1. Our own acquires, releases, freezes, child writes and layout CASes.
+   Each one updates our cache with the ETag it wrote, so a LIST would
+   only confirm the cache.
+2. Admin split/merge/abort through our own API. These write through
+   `plan_reshard`/`abort_reshard` (`install_layout`) and nudge us, which
+   counts as contact.
+3. Reshard GC deleting retired shards' records. A stale cache entry for a
+   shard outside the layout is never routed or acquired, and the next
+   listing drops it.
+4. A peer, which must have a lease first. A joiner writes its lease, then
+   greets every live node (hello → `learn_peer` → contact) and takes
+   nothing before every live peer follows its log (`try_join`). With us
+   live, it can't join without us: either we answered its hello (contact),
+   or our lease's `follows` names its log, which happens only after a
+   `LIST nodes/` showed it. A joiner can bypass us only by presuming us
+   dead: our lease unchanged for TTL + skew of its time, which can't
+   happen while we renew, or a refused connect, which can't happen while
+   we serve. Then it fences our log first, and we fail-stop at our next
+   PUT or renewal as in any takeover. A peer leaving (graceful handoff or
+   death) changes `nodes/` from non-lone to lone. That step lists
+   `assign/` because the previous view wasn't lone, and a leaving peer
+   writes nothing after its lease is gone: `forget_dead` deletes a lease
+   only once every shard it owned has moved, and its CASes then fail on
+   the new ETags.
+5. Out-of-band edits (a tool writing the bucket) are the only thing
+   missed. They are seen at the next 25-step listing, as before at the
+   150-step full resync for edits that kept an ETag.
+
+*A joiner's lease appears between steps.* In the window before our next
+`LIST nodes/`, the joiner greets us. `learn_peer` adds it to `peers` and
+sets contact, so the next step lists both prefixes. A step already running
+in reduced mode leaves `peers` alone, so the greeting isn't undone, and
+counts only itself as live, so it hands nothing out. If the greeting is
+lost, the joiner waits unjoined, holding nothing. Our next `LIST nodes/`
+(≤ 1 TTL) shows it, our follower confirms it through our lease, and the
+shares settle a few steps later. Unit test
+`joiner_with_a_lost_hello_is_adopted_within_a_ttl`: worst case ~0.7 s at
+TTL 0.6 s, with one owner per shard throughout. A joiner that greets is
+handed its share as before (`tests/all/join_follow.rs`,
+`fast_failover.rs`, `rebalance.rs`).
+
+Saved at TTL 60 s: 0.067 + 0.080 Class A/s of the step's 0.25. See the
+RESULTS follow-up for measured numbers. Metric:
+`vlpds_cluster_lone_skips_total{list=nodes|assign}`.
+
 ### Forwarding deadlines and not-applied writes (`src/forward.rs`)
 
 A forward fails at a time-to-first-byte deadline (3 s for quick calls, 30 s
@@ -884,6 +961,27 @@ incarnation.
 *Who deletes.* A live log only by its owner. Dead logs (not a live lease's
 log) only by the owner of the lowest-numbered shard, and only once fenced.
 Deletes are idempotent: two nodes briefly both leading is harmless.
+
+*Passes and their LISTs.* A pass runs every `--log-retention-interval`
+(default 60 s, 1 s..=10 m). It LISTs only what can be due
+(`Retention::pass`), and each LIST still runs at least hourly as a safety
+net:
+- Our log: the LIST stops at the first segment it may not delete, and
+  nothing behind that segment goes before it does. Only we delete from our
+  log, and only a prefix. So if that segment was inside the window, the
+  next LIST waits until it turns older than the window. If the replay
+  floor held it, the next LIST waits for the floor to move. If the log ran
+  out, it waits one window, since later segments are younger.
+- Dead logs (`LIST log/`): skipped while the live log set is the one the
+  last full scan saw, and that scan found no dead logs, or only retired
+  ones whose fences aren't due (until the earliest fence turns older than
+  `--fence-retention`). A log dies as a live one, which changes the set.
+  A log never seen live (a joiner that died before anyone listed it) waits
+  up to an hour; nobody can prune it before someone fences it anyway.
+
+So an idle node's passes make no requests. A longer interval only delays
+deletes and retirements, by up to one interval. Metric:
+`vlpds_retention_lists_skipped_total{list=own|dead}`.
 
 *(a) for a live log L: the replay floor.* For each shard the log applies
 into, `nodelog::ShardSinks` keeps the lowest ordinal of L a crash replay

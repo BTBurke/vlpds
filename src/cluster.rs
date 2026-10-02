@@ -251,6 +251,12 @@ struct Seen {
 /// LIST) every this many steps: a safety net, ~5 min at the default TTL.
 const FULL_RESYNC_STEPS: u64 = 150;
 
+/// A lone, settled node (see `Cluster::step_body`) LISTs `assign/` only every
+/// this many steps (~5 TTLs): nothing but its own writes, which update its
+/// cache, can change `assign/` while no other lease exists. A divisor of
+/// FULL_RESYNC_STEPS, so full resyncs still happen on schedule.
+const LONE_ASSIGN_EVERY: u64 = 25;
+
 /// The shard map, under `assign/` so the per-step LIST covers it.
 pub(crate) const LAYOUT: &str = "assign/layout";
 
@@ -294,6 +300,8 @@ pub struct Cluster {
     /// Control-plane object-store requests this node made (also exported
     /// as vlpds_cluster_store_requests_total).
     requests: AtomicU64,
+    /// Of which LISTs.
+    lists: AtomicU64,
     /// Dead logs we know are fenced: log_id -> (fence ordinal, last seq in it).
     fenced: RwLock<HashMap<String, (u64, i64)>>,
     joined_at: Instant,
@@ -345,6 +353,22 @@ pub struct Cluster {
     ignore_hellos: AtomicBool,
     /// `cluster/version` as last read, and when (re-read once per TTL by steps).
     version: RwLock<Option<(ClusterVersion, Instant)>>,
+    /// Our membership view as of the last step is just us: `nodes/` listed
+    /// only our lease (or the step reused such a view, see `step_body`).
+    lone: AtomicBool,
+    /// The last step finished with nothing in motion: alone, holding every
+    /// shard of a layout with no split/merge in flight, nothing handed or
+    /// left unreleased. Cleared at the start of every step.
+    settled: AtomicBool,
+    /// A peer contacted us (hello, nudge) since the last step began: the
+    /// next step lists `nodes/` and `assign/` whatever `lone` says.
+    contact: AtomicBool,
+    /// When the last `LIST nodes/` started, and steps that reused a lone
+    /// view since (a lone node lists `nodes/` at least once per TTL).
+    nodes_listed: parking_lot::Mutex<(Option<Instant>, u32)>,
+    /// Tests: list `nodes/` and `assign/` every step even when alone (a
+    /// unit-test host's greetings never reach its peers' `learn_peer`).
+    pub(crate) list_every_step: AtomicBool,
 }
 
 /// Why `Cluster::finalize_level` didn't raise the level.
@@ -460,6 +484,7 @@ impl Cluster {
             policy_state: parking_lot::Mutex::new((None, HashMap::new())),
             steps: AtomicU64::new(0),
             requests: AtomicU64::new(0),
+            lists: AtomicU64::new(0),
             fenced: RwLock::new(HashMap::new()),
             joined_at: Instant::now(),
             stopping: AtomicBool::new(false),
@@ -479,6 +504,11 @@ impl Cluster {
             hold_steps: AtomicBool::new(false),
             ignore_hellos: AtomicBool::new(false),
             version: RwLock::new(None),
+            lone: AtomicBool::new(false),
+            settled: AtomicBool::new(false),
+            contact: AtomicBool::new(false),
+            nodes_listed: parking_lot::Mutex::new((None, 0)),
+            list_every_step: AtomicBool::new(false),
             cfg,
         };
         // the startup gate: before anything else is read or written (our
@@ -864,12 +894,20 @@ impl Cluster {
     /// Counts a control-plane object-store request.
     fn count(&self, op: &str) {
         self.requests.fetch_add(1, Ordering::Relaxed);
+        if op == "list" {
+            self.lists.fetch_add(1, Ordering::Relaxed);
+        }
         crate::metrics::CLUSTER_STORE_REQUESTS.with_label_values(&[op]).inc();
     }
 
     /// Control-plane object-store requests made so far.
     pub fn store_requests(&self) -> u64 {
         self.requests.load(Ordering::Relaxed)
+    }
+
+    /// Control-plane LISTs made so far.
+    pub fn store_lists(&self) -> u64 {
+        self.lists.load(Ordering::Relaxed)
     }
 
     /// Our wall clock as published to peers (offset in tests only).
@@ -1246,6 +1284,7 @@ impl Cluster {
     /// A peer handed us shards or released some: adopt / step now
     /// (coalesced; one queued while a step runs starts right after it).
     pub fn nudge(&self, handoffs: Vec<Handoff>) {
+        self.contact.store(true, Ordering::Release);
         self.handed.lock().extend(handoffs);
         self.nudged.notify_one();
     }
@@ -1440,6 +1479,8 @@ impl Cluster {
         if node_id == self.cfg.node_id || self.ignore_hellos.load(Ordering::Acquire) {
             return Ok(None);
         }
+        // a joiner exists: our next step lists everything again (`step_body`)
+        self.contact.store(true, Ordering::Release);
         let Some((lease, etag)) = self.get_json::<NodeLease>(&self.path(&format!("nodes/{node_id}"))).await? else {
             return Ok(None);
         };
@@ -1633,9 +1674,8 @@ impl Cluster {
     /// Refreshes the assignment cache and the layout: one LIST of `assign/`,
     /// then a GET for each object whose ETag changed (every one every
     /// FULL_RESYNC_STEPS steps).
-    async fn read_assignments(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
+    async fn read_assignments(&self, host: &Arc<dyn ShardHost>, full: bool) -> anyhow::Result<()> {
         use futures::StreamExt;
-        let full = self.steps.fetch_add(1, Ordering::Relaxed).is_multiple_of(FULL_RESYNC_STEPS);
         let mut listed: BTreeMap<ShardId, Option<String>> = BTreeMap::new();
         let mut layout_etag = None;
         for (name, etag) in self.list("assign").await? {
@@ -1770,17 +1810,52 @@ impl Cluster {
     async fn step_body(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
         // 1b. the cluster's feature level (once per TTL)
         self.observe_version().await?;
-        // 2. membership
-        let (live, dead) = self.read_nodes(host).await?;
-        {
+        // A lone node lists less (DESIGN.md "Lone-node control plane"): while
+        // `nodes/` holds only our lease, `assign/` changes only by our own
+        // writes (which update our cache), and a joiner greets us (hello ->
+        // `learn_peer`) before it may write anything there.
+        let step = self.steps.fetch_add(1, Ordering::Relaxed);
+        let contact = self.contact.swap(false, Ordering::AcqRel);
+        let was_lone = self.lone.load(Ordering::Acquire) && !contact && !self.list_every_step.load(Ordering::Acquire);
+        let was_settled = self.settled.swap(false, Ordering::AcqRel);
+        // 2. membership: a lone node still lists `nodes/` at least once per
+        //    TTL, so a joiner whose greeting never arrives is seen anyway
+        let skip_nodes = was_lone && self.joined() && {
+            let (at, reused) = *self.nodes_listed.lock();
+            let per_ttl = (self.cfg.ttl.as_nanos() / self.cfg.renew_every.as_nanos().max(1)).max(1) as u32;
+            at.is_some_and(|t| reused + 1 < per_ttl && t.elapsed() + self.cfg.renew_every / 2 < self.cfg.ttl)
+        };
+        let (live, dead) = if skip_nodes {
+            self.nodes_listed.lock().1 += 1;
+            crate::metrics::CLUSTER_LONE_SKIPS.with_label_values(&["nodes"]).inc();
+            // `peers` is left alone: a greeting racing this step may have
+            // added a joiner, which the next step (contact) lists
+            (vec![self.lease.read().clone()], Vec::new())
+        } else {
+            // a failed LIST leaves us not lone: the next step lists again
+            self.lone.store(false, Ordering::Release);
+            let started = Instant::now();
+            let (live, dead) = self.read_nodes(host).await?;
+            *self.nodes_listed.lock() = (Some(started), 0);
             let mut peers = self.peers.write();
             *peers = live.iter().filter(|l| l.node_id != self.cfg.node_id).map(|l| (l.node_id.clone(), l.clone())).collect();
             self.alone.store(peers.is_empty(), Ordering::Release);
-        }
+            (live, dead)
+        };
+        let lone = live.len() == 1 && dead.is_empty();
+        self.lone.store(lone, Ordering::Release);
         let live_ids: HashSet<String> = live.iter().map(|l| l.node_id.clone()).collect();
         let dead_logs: HashMap<String, String> = dead.iter().map(|l| (l.node_id.clone(), l.log_id.clone())).collect();
-        // 3. layout + assignments -> routing table
-        self.read_assignments(host).await?;
+        // 3. layout + assignments -> routing table. Skipped while we were
+        //    and still are alone and the last step left nothing in motion
+        //    (every shard ours, no split/merge): only our own writes changed
+        //    `assign/` since. Listed every LONE_ASSIGN_EVERY steps anyway
+        //    (an out-of-band edit of the bucket).
+        if lone && was_lone && was_settled && !step.is_multiple_of(LONE_ASSIGN_EVERY) {
+            crate::metrics::CLUSTER_LONE_SKIPS.with_label_values(&["assign"]).inc();
+        } else {
+            self.read_assignments(host, step.is_multiple_of(FULL_RESYNC_STEPS)).await?;
+        }
         let layout = self.layout();
         self.route(&live_ids);
         host.on_membership();
@@ -1872,6 +1947,11 @@ impl Cluster {
                 self.forget_dead(d).await?;
             }
         }
+        // nothing in motion: the next step may skip `LIST assign/` if we
+        // are still alone (an early return above leaves this false)
+        let layout = self.layout();
+        let settled = lone && layout.op.is_none() && self.handed.lock().is_empty() && layout.ids().iter().all(|s| self.is_owner(*s));
+        self.settled.store(settled, Ordering::Release);
         Ok(())
     }
 
@@ -2208,8 +2288,14 @@ impl Cluster {
         unreachable!("second attempt returns")
     }
 
-    /// Graceful shutdown: close and release every shard, drop our lease.
-    pub async fn shutdown(&self, host: &Arc<dyn ShardHost>) {
+    /// Graceful shutdown: close and release every shard, fence our log, drop
+    /// our lease. Err if our log could not be fenced within
+    /// `shutdown_fence_budget`: our lease is then left in place (renewals
+    /// stopped) and the caller must exit nonzero, so that peers presume this
+    /// incarnation dead and fence its log, and so does our restart
+    /// (`read_own_lease`). Deleting the lease over an unfenced log would
+    /// leave nobody to fence it, and peers following it would wait forever.
+    pub async fn shutdown(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
         // HA fix: stop the step loop first (it would re-acquire the shards we
         // are releasing), and wait out a step already in flight.
         self.stopping.store(true, Ordering::Release);
@@ -2235,21 +2321,28 @@ impl Cluster {
         let assigns = self.assigns.read().clone();
         shards.extend(assigns.iter().filter(|(s, (a, _))| layout.contains(**s) && self.handed_to_us(**s, a)).map(|(s, _)| *s));
         if !self.close_and_release(host, shards, to, None).await {
-            return;
+            return Ok(()); // fail-stopped (host.lost)
         }
         // Nothing may still be in flight on our log when we fence it: a
         // fence below an in-flight segment would cut entries out of a span.
         if !host.quiesce().await {
             tracing::error!("our log did not quiesce: fail-stop without fencing it (peers will)");
             host.lost();
-            return;
+            return Ok(());
         }
         // HA fix: fence our own (now idle) log before dropping the lease.
         // Peers following it drain it from S3 up to a fence and only then drop
         // its firehose source; without a fence they wait forever and every
         // peer's merged firehose stalls at our watermark (bench/ha sigterm).
-        if let Err(e) = self.fence(&self.log_id).await {
-            tracing::warn!("fencing our log on shutdown failed: {e:#}");
+        // Retried (renewals go on meanwhile); if it still fails, keep the
+        // lease so the log gets fenced by whoever presumes us dead.
+        if let Err(e) = self.fence_own_log().await {
+            {
+                let _r = self.renew_lock.lock().await;
+                self.gone.store(true, Ordering::Release);
+            }
+            crate::metrics::LEASE_EVENTS.with_label_values(&["shutdown_fence_failed"]).inc();
+            return Err(e.context("fencing our log on shutdown"));
         }
         {
             // stop renewing (waiting out a renewal in flight) before the delete
@@ -2263,6 +2356,37 @@ impl Cluster {
         let nudges: Vec<(String, Vec<Handoff>)> = self.peers().into_iter().map(|l| (l.addr, Vec::new())).collect();
         crate::metrics::CLUSTER_NUDGES.with_label_values(&["sent"]).inc_by(nudges.len() as u64);
         host.nudge(nudges).await;
+        Ok(())
+    }
+
+    /// How long a graceful shutdown keeps retrying the fence of our own log:
+    /// a TTL, at most 30 s (inside a supervisor's stop timeout).
+    fn shutdown_fence_budget(&self) -> Duration {
+        self.cfg.ttl.min(Duration::from_secs(30))
+    }
+
+    /// Fences our own log, retrying with backoff (200 ms doubling to 5 s)
+    /// for `shutdown_fence_budget`. A fence PUT that timed out but landed is
+    /// found by the next attempt's scan.
+    async fn fence_own_log(&self) -> anyhow::Result<()> {
+        let deadline = Instant::now() + self.shutdown_fence_budget();
+        let mut backoff = Duration::from_millis(200);
+        let mut attempt = 1u32;
+        loop {
+            let e = match self.fence(&self.log_id).await {
+                Ok(_) => return Ok(()),
+                Err(e) => e,
+            };
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                tracing::error!(attempts = attempt, "fencing our log on shutdown failed: giving up: {e:#}");
+                return Err(e);
+            }
+            tracing::warn!(attempt, retry_in_ms = backoff.min(left).as_millis() as u64, "fencing our log on shutdown failed (retrying): {e:#}");
+            tokio::time::sleep(backoff.min(left)).await;
+            backoff = (backoff * 2).min(Duration::from_secs(5));
+            attempt += 1;
+        }
     }
 }
 
@@ -2331,8 +2455,17 @@ mod tests {
     }
 
     /// Joins as a node whose step loop runs (`spawn`): it greets peers, so
-    /// its steps can join with live peers around (`try_join`).
+    /// its steps can join with live peers around (`try_join`). The mock
+    /// host's greetings never reach a peer's `learn_peer`, so these nodes
+    /// list everything every step (`lone_join` doesn't).
     async fn join(cfg: ClusterConfig, store: Store) -> anyhow::Result<Arc<Cluster>> {
+        let c = lone_join(cfg, store).await?;
+        c.list_every_step.store(true, Ordering::Release);
+        Ok(c)
+    }
+
+    /// [`join`] with the lone-node listing savings on, as in production.
+    async fn lone_join(cfg: ClusterConfig, store: Store) -> anyhow::Result<Arc<Cluster>> {
         let c = Cluster::join(cfg, store).await?;
         c.spawned.store(true, Ordering::Release);
         Ok(c)
@@ -2686,7 +2819,7 @@ mod tests {
     /// ret3): the next call of `op` ("get", "put", "list") on a path
     /// containing a substring waits 30 s first. "vanish": the next GET is
     /// answered, then the object deleted. "conflict": the next PUT fails
-    /// its precondition.
+    /// its precondition. "fail": the next PUT fails (a store error).
     #[derive(Debug, Default)]
     struct Stalls {
         inner: object_store::memory::InMemory,
@@ -2723,6 +2856,9 @@ mod tests {
             }
             if self.take("conflict", location.as_ref()) {
                 return Err(object_store::Error::Precondition { path: location.to_string(), source: "armed conflict".into() });
+            }
+            if self.take("fail", location.as_ref()) {
+                return Err(object_store::Error::Generic { store: "Stalls", source: "armed failure".into() });
             }
             self.inner.put_opts(location, payload, opts).await
         }
@@ -2914,6 +3050,235 @@ mod tests {
         assert!(per_step <= 4.1, "{per_step} requests per step at 256 shards");
     }
 
+    // ---- lone-node control plane (DESIGN.md "Lone-node control plane") ----
+
+    /// Whether every shard has exactly one owner among `nodes`, and its
+    /// stored assignment names that node's current incarnation.
+    async fn one_owner_each(store: &Store, nodes: &[&Arc<Cluster>]) {
+        let layout = nodes[0].layout();
+        for s in layout.ids() {
+            let holders: Vec<&str> = nodes.iter().filter(|n| n.is_owner(s)).map(|n| n.cfg.node_id.as_str()).collect();
+            assert!(holders.len() <= 1, "shard {} held by {holders:?}", s.0);
+            if let [h] = holders.as_slice() {
+                let r = store.raw.get(&Path::from(format!("{}/assign/{}", store.prefix, s.key()))).await.unwrap();
+                let a: Assignment = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+                let n = nodes.iter().find(|n| n.cfg.node_id == *h).unwrap();
+                assert_eq!((a.owner.as_deref(), a.log_id.as_deref()), (Some(*h), Some(n.log_id.as_str())), "shard {}", s.0);
+            }
+        }
+    }
+
+    /// A lone, settled node lists `nodes/` once per TTL (every TTL/renew
+    /// steps) and `assign/` every LONE_ASSIGN_EVERY steps, instead of both
+    /// every step.
+    #[tokio::test]
+    async fn lone_node_lists_less() {
+        let store = Store::memory(None);
+        let a = lone_join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        assert_eq!(a.owned().len(), 8);
+        let before = a.store_lists();
+        for _ in 0..50 {
+            a.step(&ha_dyn).await.unwrap();
+        }
+        let lists = a.store_lists() - before;
+        // nodes/: every 6th step (TTL 600 ms / renew 100 ms) = 8-9; assign/:
+        // the 25th and 50th step = 2 (was 100)
+        assert!((9..=12).contains(&lists), "{lists} LISTs in 50 lone steps");
+        assert_eq!(a.owned().len(), 8);
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0);
+        // listing everything every step costs 2 per step
+        a.list_every_step.store(true, Ordering::Release);
+        let before = a.store_lists();
+        for _ in 0..10 {
+            a.step(&ha_dyn).await.unwrap();
+        }
+        assert_eq!(a.store_lists() - before, 20);
+    }
+
+    /// Time, not just steps, bounds the gap between `LIST nodes/`: steps
+    /// further apart than TTL/renew intervals list every time.
+    #[tokio::test]
+    async fn lone_node_lists_nodes_at_least_once_per_ttl() {
+        let store = Store::memory(None);
+        let a = lone_join(cfg("a"), store.clone()).await.unwrap();
+        let (_ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        a.step(&ha_dyn).await.unwrap(); // reuses the lone view
+        let before = a.store_lists();
+        tokio::time::sleep(Duration::from_millis(560)).await; // > TTL - renew/2 since the listing
+        a.step(&ha_dyn).await.unwrap();
+        assert_eq!(a.store_lists() - before, 1, "nodes/ listed (assign/ skipped)");
+    }
+
+    /// A hello (`learn_peer`) or a nudge ends the reduced listing at once:
+    /// the next step lists both, the joiner joins, and the lone node hands
+    /// it its share.
+    #[tokio::test]
+    async fn lone_node_resumes_listing_on_contact() {
+        let store = Store::memory(None);
+        let a = lone_join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        a.step(&ha_dyn).await.unwrap();
+        let b = lone_join(cfg("b"), store.clone()).await.unwrap();
+        let (hb, hb_dyn) = host();
+        // b greets a (its hello reaches a's learn_peer)
+        a.learn_peer(&ha_dyn, "b").await.unwrap();
+        let before = a.store_lists();
+        a.step(&ha_dyn).await.unwrap();
+        assert_eq!(a.store_lists() - before, 2, "nodes/ and assign/ listed right after the hello");
+        assert_eq!(a.peers().len(), 1);
+        b.step(&hb_dyn).await.unwrap(); // b joins (the mock peers confirm)
+        assert!(b.joined());
+        a.step(&ha_dyn).await.unwrap(); // a hands b its share
+        b.step(&hb_dyn).await.unwrap(); // b adopts what a handed it
+        assert_eq!((a.owned().len(), b.owned().len()), (4, 4));
+        one_owner_each(&store, &[&a, &b]).await;
+        assert_eq!(ha.lost.load(Ordering::SeqCst) + hb.lost.load(Ordering::SeqCst), 0);
+        // a nudge (a peer released shards, or a split was planned) also
+        // counts as contact
+        let store = Store::memory(None);
+        let c = lone_join(cfg("c"), store.clone()).await.unwrap();
+        let (_hc, hc_dyn) = host();
+        c.step(&hc_dyn).await.unwrap();
+        c.step(&hc_dyn).await.unwrap();
+        let before = c.store_lists();
+        c.step(&hc_dyn).await.unwrap();
+        assert_eq!(c.store_lists() - before, 0, "lone and settled: nothing listed");
+        c.nudge(Vec::new());
+        c.step(&hc_dyn).await.unwrap();
+        assert_eq!(c.store_lists() - before, 2, "nudged: both listed");
+    }
+
+    /// A joiner whose greeting never reaches the lone node (lost hello) is
+    /// still seen within the listing bound, followed, and handed its share;
+    /// meanwhile no shard ever has two holders and the joiner takes nothing
+    /// before it is followed (HA invariants).
+    #[tokio::test]
+    async fn joiner_with_a_lost_hello_is_adopted_within_a_ttl() {
+        let store = Store::memory(None);
+        let a = lone_join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.test_ignore_hellos(true);
+        a.step(&ha_dyn).await.unwrap();
+        a.step(&ha_dyn).await.unwrap(); // settled: reduced listing from here
+        // b's lease appears right after a's last `LIST nodes/` (the worst
+        // case); its greeting is lost, and its peers confirm only through
+        // their leases (`follows`)
+        let b = lone_join(cfg("b"), store.clone()).await.unwrap();
+        let (hb, hb_dyn) = host();
+        hb.unheard.store(true, Ordering::SeqCst);
+        let t0 = Instant::now();
+        let (mut seen, mut joined) = (None, None);
+        while a.owned().len() != 4 || b.owned().len() != 4 {
+            assert!(t0.elapsed() < Duration::from_secs(3), "b never got its share: a {:?} b {:?}", a.owned(), b.owned());
+            a.step(&ha_dyn).await.unwrap();
+            if seen.is_none() && !a.peers().is_empty() {
+                seen = Some(t0.elapsed());
+                // a's merged firehose now follows b's log (as on_membership
+                // would): published in a's next renewal
+                ha.follows.lock().insert(b.log_id.clone(), 0);
+            }
+            b.step(&hb_dyn).await.unwrap();
+            if joined.is_none() && b.joined() {
+                joined = Some(t0.elapsed());
+                assert!(seen.is_some(), "b joined before a followed its log");
+            }
+            if !b.joined() {
+                assert!(b.owned().is_empty(), "b took shards before joining");
+            }
+            one_owner_each(&store, &[&a, &b]).await;
+            tokio::time::sleep(a.cfg.renew_every).await;
+        }
+        let seen = seen.unwrap();
+        eprintln!("lost hello: a saw b after {seen:?}, b joined after {joined:?}, shares settled after {:?}", t0.elapsed());
+        // a step lists nodes/ at most TTL/renew steps apart (+ the steps' own time)
+        assert!(seen <= a.cfg.ttl + a.cfg.renew_every * 2, "a saw b after {seen:?}");
+        assert!(t0.elapsed() <= a.cfg.ttl + a.cfg.renew_every * 8, "b got its share after {:?}", t0.elapsed());
+        assert_eq!(ha.lost.load(Ordering::SeqCst) + hb.lost.load(Ordering::SeqCst), 0);
+        assert!(a.fenced_logs().is_empty() && b.fenced_logs().is_empty(), "nobody was presumed dead");
+    }
+
+    /// An out-of-band edit of `assign/` (an admin tool writing the bucket)
+    /// is seen within LONE_ASSIGN_EVERY steps: here a shard reassigned
+    /// under the lone node, which fail-stops.
+    #[tokio::test]
+    async fn lone_node_sees_out_of_band_assign_edits_within_its_resync() {
+        let store = Store::memory(None);
+        let a = lone_join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        let path = a.path(&format!("assign/{}", ShardId(3).key()));
+        let (mut s3, _) = a.get_json::<Assignment>(&path).await.unwrap().unwrap();
+        s3.owner = Some("elsewhere".into());
+        a.put_json(&path, &s3, PutMode::Overwrite).await.unwrap();
+        let mut steps = 0;
+        while ha.lost.load(Ordering::SeqCst) == 0 {
+            a.step(&ha_dyn).await.unwrap();
+            steps += 1;
+            assert!(steps <= LONE_ASSIGN_EVERY, "not seen within {LONE_ASSIGN_EVERY} steps");
+        }
+        assert!(steps > 1, "seen at once: the lone listing savings were off");
+    }
+
+    /// Graceful shutdown retries a failing fence of our own log; one that
+    /// lands in time completes the shutdown normally.
+    #[tokio::test]
+    async fn shutdown_retries_the_fence_of_our_log() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let a = lone_join(cfg("a"), store.clone()).await.unwrap();
+        let (_ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        for _ in 0..2 {
+            stalls.arm("fail", &format!("log/{}/", a.log_id));
+        }
+        a.shutdown(&ha_dyn).await.unwrap();
+        assert_eq!(stalls.stalled.load(Ordering::SeqCst), 2, "two failed fence PUTs, then one that landed");
+        assert!(crate::nodelog::first_free(&store, &a.log_id).await.unwrap().1, "our log is fenced");
+        assert!(a.get_json::<NodeLease>(&a.path("nodes/a")).await.unwrap().is_none(), "lease dropped");
+    }
+
+    /// A fence that keeps failing: shutdown gives up after its budget and
+    /// returns Err (the caller exits nonzero), keeping our lease so the log
+    /// still gets fenced: by our restart (same node id) or by a peer once
+    /// the lease goes quiet.
+    #[tokio::test]
+    async fn shutdown_that_cannot_fence_keeps_the_lease_and_fails() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let a = lone_join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        for _ in 0..100 {
+            stalls.arm("fail", &format!("log/{}/", a.log_id));
+        }
+        let t0 = Instant::now();
+        let e = a.shutdown(&ha_dyn).await.unwrap_err();
+        assert!(format!("{e:#}").contains("fencing our log on shutdown"), "{e:#}");
+        let took = t0.elapsed();
+        assert!(took >= a.shutdown_fence_budget() && took < a.shutdown_fence_budget() + Duration::from_secs(2), "{took:?}");
+        assert!(stalls.stalled.load(Ordering::SeqCst) >= 3, "retried with backoff");
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "no fail-stop from the cluster: the caller exits");
+        assert!(!crate::nodelog::first_free(&store, &a.log_id).await.unwrap().1, "not fenced");
+        let (lease, _) = a.get_json::<NodeLease>(&a.path("nodes/a")).await.unwrap().expect("lease kept");
+        assert_eq!(lease.log_id, a.log_id);
+        // renewals stopped: the lease goes quiet, so peers presume us dead
+        let renewals = lease.renewals;
+        tokio::time::sleep(a.cfg.renew_every * 3).await;
+        a.renew(&ha_dyn).await;
+        assert_eq!(a.get_json::<NodeLease>(&a.path("nodes/a")).await.unwrap().unwrap().0.renewals, renewals);
+        // the supervisor restarts us: the new incarnation fences the old log
+        stalls.armed.lock().clear();
+        let a2 = lone_join(cfg("a"), store.clone()).await.unwrap();
+        assert!(a2.fenced_logs().contains_key(&a.log_id));
+        assert!(crate::nodelog::first_free(&store, &a.log_id).await.unwrap().1);
+        // or, without a restart, a peer takes over once the lease is quiet
+        // (covered by dead_peer_with_future_clock_is_taken_over)
+    }
+
     // ---- feature levels (version.rs, DESIGN.md "Rolling upgrades") ----
 
     /// Exit-7 refusals as (node id, why), recorded instead of exiting.
@@ -3031,7 +3396,7 @@ mod tests {
         assert!(matches!(new.finalize_level(3, "op").await, Err(FinalizeError::Invalid(_))), "past this node's build");
         // the old node stops (its lease goes)
         let (_, ho) = host();
-        old.shutdown(&ho).await;
+        old.shutdown(&ho).await.unwrap();
         let v = new.finalize_level(2, "op").await.unwrap();
         assert_eq!((v.active, v.target, v.history.last().unwrap().level, v.history.last().unwrap().by.as_str()), (2, None, 2, "op"));
         assert_eq!(new.finalize_level(2, "op").await.unwrap().active, 2, "idempotent");

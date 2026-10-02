@@ -43,6 +43,10 @@ pub const DEFAULT_WINDOW: Duration = Duration::from_secs(72 * 3600);
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_MAX_DELETES: usize = 10_000;
 pub const DEFAULT_FENCE_RETENTION: Duration = Duration::from_secs(7 * 86400);
+/// A pass LISTs a log (or `log/`) at least this often even when what it
+/// learned says nothing can be due yet: a safety net for anything the
+/// skip rules don't foresee (see `Retention::pass`).
+pub const RELIST_EVERY: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -184,6 +188,31 @@ struct State {
     retired: HashSet<String>,
     /// dead logs left after the last full pass over them (leader only)
     dead: Option<DeadLogs>,
+    /// What the last LIST of our own log says about the next one, and when
+    /// it ran.
+    own_next: Option<(Due, std::time::Instant)>,
+    /// What the last full dead-log scan says about the next one: the live
+    /// logs it saw, when (if ever) a retired log's fence comes due, and
+    /// when it ran. None: nothing is known (the next pass scans).
+    dead_next: Option<DeadNext>,
+}
+
+/// See `State::dead_next`.
+type DeadNext = (HashSet<String>, Option<chrono::DateTime<chrono::Utc>>, std::time::Instant);
+
+/// When a log's next LIST can find something to delete (`Retention::prune`
+/// stops at the first segment it may not delete; nothing behind it goes
+/// before it does).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Due {
+    /// Not before this (the first segment left, or any segment written
+    /// after the LIST, turns older than the window then).
+    At(chrono::DateTime<chrono::Utc>),
+    /// The first segment left is old enough but at or past the replay
+    /// floor, which was this: nothing is due until the floor moves.
+    Floor(u64),
+    /// The pass stopped at its delete budget: due now.
+    Now,
 }
 
 /// A log object's ordinal, from its path.
@@ -225,8 +254,22 @@ impl Retention {
     }
 
     /// One pass: our own log, our report, then (as leader) dead logs.
+    ///
+    /// Each LIST is skipped when the previous one showed nothing can be due
+    /// yet (at most RELIST_EVERY apart), so an idle node's passes cost no
+    /// requests:
+    /// - Our log: only we delete from it, and only a prefix, so the segment
+    ///   the last LIST stopped at is still the first. Nothing is due before
+    ///   it turns older than the window or, if the replay floor held it,
+    ///   before the floor moves.
+    /// - Dead logs: the last full scan found none, or only retired ones
+    ///   whose fences aren't due yet, and the live log set hasn't changed.
+    ///   A log dies as a live one (the set changes). One never seen live (a
+    ///   joiner that died before we listed it) waits for RELIST_EVERY; it
+    ///   has nothing to prune before someone fences it anyway.
     pub async fn pass(&self) -> anyhow::Result<Pass> {
-        let cutoff = chrono::Utc::now() - chrono::Duration::from_std(self.cfg.window)?;
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::from_std(self.cfg.window)?;
         let mut budget = self.cfg.max_deletes;
         let mut pass = Pass::default();
         let floor = self.log.sinks.replay_floor();
@@ -234,17 +277,42 @@ impl Retention {
         if durable != u64::MAX {
             metrics::RETENTION_REPLAY_HOLD.set(durable.saturating_sub(floor) as i64);
         }
-        let n = self.prune(&self.log.log_id, floor, cutoff, &mut budget, "own").await?;
-        pass.objects += n.objects;
-        pass.bytes += n.bytes;
+        let own_next = self.state.lock().own_next;
+        let own_due = match own_next {
+            Some((_, at)) if at.elapsed() >= RELIST_EVERY => true,
+            Some((Due::At(t), _)) => now >= t,
+            Some((Due::Floor(f), _)) => floor != f,
+            Some((Due::Now, _)) | None => true,
+        };
+        if own_due {
+            let listed = std::time::Instant::now();
+            let (n, due) = self.prune(&self.log.log_id, floor, cutoff, &mut budget, "own").await?;
+            self.state.lock().own_next = Some((due, listed));
+            pass.objects += n.objects;
+            pass.bytes += n.bytes;
+        } else {
+            metrics::RETENTION_LISTS_SKIPPED.with_label_values(&["own"]).inc();
+        }
         self.publish().await?;
         if !(self.members.leader)() {
             // another node prunes (and reports) dead logs
+            self.state.lock().dead_next = None;
             DeadLogs::default().export();
         } else if budget > 0 {
-            let n = self.prune_dead(cutoff, &mut budget).await?;
-            pass.objects += n.objects;
-            pass.bytes += n.bytes;
+            let live = (self.members.live_logs)();
+            let skip = self
+                .state
+                .lock()
+                .dead_next
+                .as_ref()
+                .is_some_and(|(seen, until, at)| *seen == live && at.elapsed() < RELIST_EVERY && until.is_none_or(|t| now < t));
+            if skip {
+                metrics::RETENTION_LISTS_SKIPPED.with_label_values(&["dead"]).inc();
+            } else {
+                let n = self.prune_dead(live, cutoff, &mut budget).await?;
+                pass.objects += n.objects;
+                pass.bytes += n.bytes;
+            }
         }
         Ok(pass)
     }
@@ -278,29 +346,44 @@ impl Retention {
 
     /// Deletes `log_id`'s oldest segments: ordinals below `limit` last
     /// modified before `cutoff`, at most `budget` of them.
-    async fn prune(&self, log_id: &str, limit: u64, cutoff: chrono::DateTime<chrono::Utc>, budget: &mut usize, kind: &str) -> anyhow::Result<Pass> {
+    /// Also returns when the next LIST of the log can find something (see
+    /// `Due`; this assumes nobody else deletes from the log meanwhile).
+    async fn prune(&self, log_id: &str, limit: u64, cutoff: chrono::DateTime<chrono::Utc>, budget: &mut usize, kind: &str) -> anyhow::Result<(Pass, Due)> {
         let prefix = Path::from(format!("{}/log/{}", self.store.prefix, log_id));
+        let window = chrono::Duration::from_std(self.cfg.window)?;
         let mut doomed: Vec<(u64, Path, u64)> = Vec::new();
+        // the log ran out: a segment written from now on is younger
+        let mut due = Due::At(chrono::Utc::now() + window);
         {
             // listings are in key order and ordinals zero-padded: oldest first
             let mut list = self.store.raw.list(Some(&prefix));
             while let Some(m) = list.next().await {
                 let m = m?;
                 let Some(ord) = ordinal_of(&m.location) else { continue };
-                if ord >= limit || m.last_modified >= cutoff || doomed.len() >= *budget {
+                if m.last_modified >= cutoff {
+                    due = Due::At(m.last_modified + window);
+                    break;
+                }
+                if ord >= limit {
+                    due = Due::Floor(limit);
+                    break;
+                }
+                if doomed.len() >= *budget {
+                    due = Due::Now;
                     break;
                 }
                 doomed.push((ord, m.location, m.size));
             }
         }
-        let Some((last, ..)) = doomed.last() else { return Ok(Pass::default()) };
+        let Some((last, ..)) = doomed.last() else { return Ok((Pass::default(), due)) };
         // Below a replay floor (or a fence) every object is a segment. One
         // already gone was deleted by another node, which raised its own
         // floor first.
         if let nodelog::Head::Segment(h) = nodelog::read_head(&self.store, log_id, *last).await? {
             self.raise_floor(h.last_seq).await?;
         }
-        self.delete(doomed.into_iter().map(|(_, p, n)| (p, n)).collect(), budget, kind).await
+        let pass = self.delete(doomed.into_iter().map(|(_, p, n)| (p, n)).collect(), budget, kind).await?;
+        Ok((pass, due))
     }
 
     async fn delete(&self, objs: Vec<(Path, u64)>, budget: &mut usize, kind: &str) -> anyhow::Result<Pass> {
@@ -327,13 +410,17 @@ impl Retention {
     /// Dead logs (no live node writes them): once fenced and fully applied by
     /// their shards' successors, deletes their segments past the window,
     /// then the garbage past the fence and their report. The fence stays.
-    async fn prune_dead(&self, cutoff: chrono::DateTime<chrono::Utc>, budget: &mut usize) -> anyhow::Result<Pass> {
-        let live = (self.members.live_logs)();
+    async fn prune_dead(&self, live: HashSet<String>, cutoff: chrono::DateTime<chrono::Utc>, budget: &mut usize) -> anyhow::Result<Pass> {
+        let scanned = std::time::Instant::now();
+        self.state.lock().dead_next = None;
         let logs = crate::backfill::list_logs(&self.store).await?;
         let dead: Vec<String> = logs.into_iter().filter(|l| !live.contains(l) && *l != *self.log.log_id).collect();
         let mut pass = Pass::default();
         let mut known: Option<Known> = None;
         let mut stats = DeadLogs::default();
+        // the next scan may be skipped if only retired logs whose fences
+        // aren't due are left (`quiet`), until the earliest fence comes due
+        let (mut quiet, mut until) = (true, None::<chrono::DateTime<chrono::Utc>>);
         // objects left below `end` in log `x` (one LIST page)
         let held = |x: String, end: u64| async move {
             anyhow::Ok(end.saturating_sub(crate::backfill::first_ordinal(&self.store, &x).await?.unwrap_or(end)))
@@ -344,13 +431,23 @@ impl Retention {
                 return Ok(pass);
             }
             if self.state.lock().retired.contains(&x) {
-                if self.delete_fence(&x, &mut known, budget).await? {
-                    pass.objects += 1;
-                } else {
-                    stats.fenced += 1;
+                match self.delete_fence(&x, &mut known, budget).await? {
+                    FenceDue::Deleted => pass.objects += 1,
+                    FenceDue::At(t) => {
+                        stats.fenced += 1;
+                        until = Some(until.map_or(t, |u| u.min(t)));
+                    }
+                    FenceDue::Never => stats.fenced += 1,
+                    FenceDue::Held => {
+                        stats.fenced += 1;
+                        quiet = false;
+                    }
                 }
                 continue;
             }
+            // anything else may change by the next pass (fenced, opened by
+            // a successor, pruned, retired)
+            quiet = false;
             let cached = self.state.lock().fenced.get(&x).copied();
             let fence = match cached {
                 Some(f) => f,
@@ -378,7 +475,7 @@ impl Retention {
                 stats.segments += held(x.clone(), fence).await?;
                 continue;
             }
-            let n = self.prune(&x, fence, cutoff, budget, "dead").await?;
+            let (n, _) = self.prune(&x, fence, cutoff, budget, "dead").await?;
             pass.objects += n.objects;
             pass.bytes += n.bytes;
             // everything below the fence gone: retire it
@@ -396,7 +493,11 @@ impl Retention {
             }
         }
         stats.export();
-        self.state.lock().dead = Some(stats);
+        let mut st = self.state.lock();
+        st.dead = Some(stats);
+        if quiet {
+            st.dead_next = Some((live, until, scanned));
+        }
         Ok(pass)
     }
 
@@ -437,23 +538,27 @@ impl Retention {
     /// is left, no shard's replay can still read the log (`needed_by`,
     /// re-checked on fresh assignments), and no assignment names the log as
     /// its owner's (an orphan whose successor has yet to fence it: it must
-    /// find this fence, not an empty log). True if it deleted it.
-    async fn delete_fence(&self, x: &str, known: &mut Option<Known>, budget: &mut usize) -> anyhow::Result<bool> {
-        let Some(keep) = self.cfg.fence_retention else { return Ok(false) };
-        let Some(fence) = self.state.lock().fenced.get(x).copied() else { return Ok(false) };
+    /// find this fence, not an empty log).
+    async fn delete_fence(&self, x: &str, known: &mut Option<Known>, budget: &mut usize) -> anyhow::Result<FenceDue> {
+        let Some(keep) = self.cfg.fence_retention else { return Ok(FenceDue::Never) };
+        let Some(fence) = self.state.lock().fenced.get(x).copied() else { return Ok(FenceDue::Held) };
         let prefix = Path::from(format!("{}/log/{}", self.store.prefix, x));
         let objs: Vec<object_store::ObjectMeta> = self.store.raw.list(Some(&prefix)).collect::<Vec<_>>().await.into_iter().collect::<Result<_, _>>()?;
-        let cutoff = chrono::Utc::now() - chrono::Duration::from_std(keep)?;
-        let [only] = objs.as_slice() else { return Ok(false) };
-        if ordinal_of(&only.location) != Some(fence) || only.last_modified >= cutoff {
-            return Ok(false);
+        let keep = chrono::Duration::from_std(keep)?;
+        let cutoff = chrono::Utc::now() - keep;
+        let [only] = objs.as_slice() else { return Ok(FenceDue::Held) };
+        if ordinal_of(&only.location) != Some(fence) {
+            return Ok(FenceDue::Held);
+        }
+        if only.last_modified >= cutoff {
+            return Ok(FenceDue::At(only.last_modified + keep));
         }
         if known.is_none() {
             *known = Some((read_assignments(&self.store).await?, read_reports(&self.store).await?));
         }
         let (assigns, reports) = known.as_ref().unwrap();
         if needed_by(x, assigns, reports).is_some() || assigns.values().any(|a| a.log_id.as_deref() == Some(x)) {
-            return Ok(false);
+            return Ok(FenceDue::Held);
         }
         match self.store.raw.delete(&only.location).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
@@ -465,8 +570,20 @@ impl Retention {
         let mut st = self.state.lock();
         st.retired.remove(x);
         st.fenced.remove(x);
-        Ok(true)
+        Ok(FenceDue::Deleted)
     }
+}
+
+/// What `Retention::delete_fence` did with a retired log's fence.
+enum FenceDue {
+    Deleted,
+    /// Kept: it turns older than `--fence-retention` then.
+    At(chrono::DateTime<chrono::Utc>),
+    /// Kept forever (`--fence-retention off`).
+    Never,
+    /// Kept for a reason that may change any time (an assignment names
+    /// the log, objects besides the fence).
+    Held,
 }
 
 /// Assignments (by shard id) and every log's report.
@@ -620,6 +737,10 @@ mod tests {
         let r = Retention::new(store.clone(), log.clone(), cfg(Duration::ZERO), members(&["L"], true));
         // no checkpoint yet: the shard's insert floor (0) holds everything
         assert_eq!(r.pass().await.unwrap(), Pass::default());
+        let held = r.state.lock().own_next.unwrap();
+        assert_eq!(held.0, Due::Floor(0), "the first segment is old but held by the floor");
+        assert_eq!(r.pass().await.unwrap(), Pass::default());
+        assert_eq!(r.state.lock().own_next.unwrap().1, held.1, "floor unmoved: the LIST was skipped");
         log.checkpoint_all().await; // marker (L, 5) durable: replay starts at 6
         let p = r.pass().await.unwrap();
         assert_eq!(p.objects, 5, "everything but the last durable segment");
@@ -722,6 +843,74 @@ mod tests {
         assert_eq!(dead(&gc), DeadLogs::default());
         // a replay of a span in the vanished log reads nothing and doesn't fail
         assert_eq!(nodelog::replay_shard(&store, ShardId(0), &db, &history).await.unwrap(), 0);
+    }
+
+    /// Live logs as a test changes them.
+    fn dyn_members(live: Arc<Mutex<HashSet<String>>>) -> Membership {
+        Membership { live_logs: Box::new(move || live.lock().clone()), leader: Box::new(|| true) }
+    }
+
+    /// An idle node's passes skip both LISTs: its log's first segment is
+    /// inside the window (nothing is due before it turns old), and the
+    /// last dead-log scan found no dead log with the live set unchanged.
+    /// A change of the live set (a node died) rescans at once.
+    #[tokio::test]
+    async fn idle_passes_skip_lists_until_something_can_be_due() {
+        let store = Store::memory(None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ncfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(10), lease_ok: None };
+        let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
+        put_seg(&store, "L", 0, 0, ShardId(0), 1, 10).await;
+        // a live peer's log: not dead, nothing to scan
+        put_seg(&store, "P", 0, 0, ShardId(1), 1, 20).await;
+        let live = Arc::new(Mutex::new(HashSet::from(["L".to_string(), "P".to_string()])));
+        let r = Retention::new(store.clone(), log.clone(), cfg(Duration::from_secs(3600)), dyn_members(live.clone()));
+        assert_eq!(r.pass().await.unwrap(), Pass::default());
+        let (own, dead) = {
+            let st = r.state.lock();
+            (st.own_next.unwrap(), st.dead_next.clone().unwrap())
+        };
+        assert!(matches!(own.0, Due::At(t) if t > chrono::Utc::now() + chrono::Duration::minutes(59)), "{own:?}");
+        assert_eq!((dead.1, &dead.0), (None, &*live.lock()), "no dead log: nothing due until the live set changes");
+        for _ in 0..3 {
+            assert_eq!(r.pass().await.unwrap(), Pass::default());
+            let st = r.state.lock();
+            assert_eq!((st.own_next.unwrap().1, st.dead_next.as_ref().unwrap().2), (own.1, dead.2), "both LISTs skipped");
+        }
+        // P dies: the next pass scans and finds it (unfenced)
+        live.lock().remove("P");
+        r.pass().await.unwrap();
+        assert_eq!(r.state.lock().dead.unwrap().unfenced, 1);
+        assert!(r.state.lock().dead_next.is_none(), "an unfenced dead log may change any time: scanned every pass");
+        r.pass().await.unwrap();
+        assert!(r.state.lock().dead_next.is_none());
+        assert_eq!(r.state.lock().own_next.unwrap().1, own.1, "our own log still skipped");
+    }
+
+    /// Retired dead logs whose fences aren't due don't make passes rescan:
+    /// the next scan is due when the earliest fence turns older than
+    /// --fence-retention.
+    #[tokio::test]
+    async fn retired_logs_wait_for_their_fences() {
+        let store = Store::memory(None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ncfg = NodeLogConfig { log_id: "B".into(), writer: 2, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(10), lease_ok: None };
+        let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
+        // dead log D: one segment, fenced at 1, no shard needs it
+        put_seg(&store, "D", 0, 0, ShardId(0), 1, 100).await;
+        store.raw.put(&segment_path(&store, "D", 1), PutPayload::from_bytes(fence_object("B"))).await.unwrap();
+        let keep = Duration::from_secs(3600);
+        let r = Retention::new(store.clone(), log.clone(), Config { fence_retention: Some(keep), ..cfg(Duration::ZERO) }, members(&["B"], true));
+        assert_eq!(r.pass().await.unwrap().objects, 1, "D pruned to its fence");
+        assert!(r.state.lock().retired.contains("D"));
+        // the pass that retired it doesn't know the fence's age yet
+        r.pass().await.unwrap();
+        let (_, until, at) = r.state.lock().dead_next.clone().expect("only a retired log left");
+        let until = until.expect("its fence comes due");
+        assert!(until > chrono::Utc::now() + chrono::Duration::minutes(59) && until <= chrono::Utc::now() + chrono::Duration::minutes(61), "{until}");
+        r.pass().await.unwrap();
+        assert_eq!(r.state.lock().dead_next.as_ref().unwrap().2, at, "skipped");
+        assert_eq!(ordinals(&store, "D").await, vec![1]);
     }
 
     #[test]

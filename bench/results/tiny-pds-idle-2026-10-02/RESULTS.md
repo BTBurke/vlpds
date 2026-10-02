@@ -296,3 +296,80 @@ compaction cadence stay as they are.
 
 The MinIO container, its data, the node scratch dirs and the build's target dir were deleted after the
 runs.
+
+## Follow-up: lone-node control plane and retention skips (code changes 1–3)
+
+Code changes 1–3 above are now implemented:
+- Retention passes skip LISTs that can't find anything, and the interval is a
+  flag (`--log-retention-interval`).
+- A lone node skips `LIST assign/`.
+- A lone node runs `LIST nodes/` once per TTL instead of every step.
+
+Change 4 (`wm_cap` / TTL) is not implemented. DESIGN.md "Lone-node control
+plane" has the safety argument, and "Log retention" the skip rules.
+
+**Method.** Same runner, flags and windows as above: `--shards 1
+--lease-ttl-ms 60000`, a 5-min warmup, then a 30-min window, counted with
+objstats. MinIO ran in its own tmpfs container on 127.0.0.1:9417, removed
+afterwards. All five runs ran at the same time:
+- `lbidle1` / `lbpers1`: release build of `b597b61` (before), idle / personal.
+- `laidle1` / `lapers1`: the same build plus this change, idle / personal.
+- `la10idle1`: `laidle1` plus `--log-retention-interval 10m`.
+
+Request rates (Class A / Class B per second):
+
+| component | lbidle1 | laidle1 | la10idle1 | lbpers1 | lapers1 |
+|---|---|---|---|---|---|
+| ctl_lease (lease CAS + `LIST nodes/`) | 0.167 / 0 | **0.100** / 0 | 0.100 / 0 | 0.167 / 0 | **0.100** / 0 |
+| ctl_assign (`LIST assign/`) | 0.100 / 0.0178 | **0.020** / 0.0178 | 0.020 / 0.0178 | 0.100 / 0.0178 | **0.020** / 0.0178 |
+| log_segment (retention LISTs; segment PUTs) | 0.0333 / 0 | **0** / 0 | 0.0011 / 0 | 0.0711 / 0 | **0.0383** / 0 |
+| state_other (`LIST state/`, reshard GC) | 0.0333 / 0 | 0.0333 / 0 | 0.0333 / 0 | 0.0333 / 0 | 0.0333 / 0 |
+| everything else (SlateDB, rate-limit poll, version, blobs) | 0.0122 / 0.557 | 0.0122 / 0.552 | 0.0122 / 0.558 | 0.265 / 1.598 | 0.267 / 1.622 |
+| **total** | **0.346 / 0.575** | **0.166 / 0.570** | **0.167 / 0.576** | **0.637 / 1.616** | **0.459 / 1.640** |
+
+Monthly cost:
+
+| run | Class A /mo | Class B /mo | R2 $/mo | S3 $/mo |
+|---|---|---|---|---|
+| lbidle1 (before) | 0.908 M | 1.51 M | $0.00 | $5.14 |
+| **laidle1 (after)** | **0.435 M** | 1.50 M | $0.00 | **$2.77** |
+| la10idle1 (after, 10-min passes) | 0.439 M | 1.51 M | $0.00 | $2.80 |
+| lbpers1 (before, 120 commits/h) | 1.67 M | 4.25 M | $3.03 | $10.06 |
+| lapers1 (after, 120 commits/h) | 1.21 M | 4.31 M | $0.93 | $7.75 |
+
+- **Idle Class A fell 52%**, from 0.346 to 0.166 A/s (−0.18 A/s, −473 k A/mo). That matches the
+  projection for changes 1–3.
+  - `LIST nodes/`: 0.0833 → 0.0167 A/s (once per TTL). The renewal CAS stays at 0.0833.
+  - The step's `LIST assign/`: 0.0833 → 0.0033 A/s (every 25 steps).
+  - Retention: 0.0333 → 0. Our log's oldest segment is inside the 72 h window, and there are no dead
+    logs. Both LISTs still run at least hourly, but no hourly LIST fell in the 30-min window.
+  - Class B is unchanged (0.575 → 0.570 B/s).
+- **`--log-retention-interval 10m` adds nothing on top.** The skips already make idle passes free.
+  `la10idle1`'s 2 LISTs come from its first pass, which falls inside the window at a 10-min interval.
+  The flag is for operators who want fewer passes anyway, e.g. while dead logs are being scanned.
+- **Under personal use** the same 0.18 A/s goes (0.637 → 0.459 A/s). Per-commit costs (segment PUT,
+  flush, compaction, GC deletes) are untouched. R2 at the measured 120 commits/h drops from $3.03 to
+  $0.93/mo.
+- **Personal PDS at 200 commits/day.** Idle plus 7.56 A per commit comes to ~0.48 M A/mo. That is
+  S3 ≈ $3.1/mo, down from ≈ $5.4 at this build. R2's free tier now covers ~2,450 commits/day, up
+  from ~400 at `b597b61` (~950 at `37f79d9`). This holds at TTL 60 s, with crash-restart behavior
+  unchanged.
+- **The before-run is higher than `idle1` (0.346 vs 0.296 A/s).** `b597b61` has a reshard GC dir
+  pass every 60 s that `37f79d9` didn't. Each pass makes two `LIST state/` (`state_other`) plus a
+  `LIST assign/` and a layout GET (both counted in ctl_assign). That is 0.05 A/s (131 k A/mo), now
+  30% of the idle floor. It is the next thing to cut, and was not changed here: skip the pass when
+  the layout is unchanged and the last pass found no retired dirs and no orphaned records.
+
+Remaining idle Class A in laidle1 (0.166 A/s):
+
+| source | A/s |
+|---|---|
+| lease CAS (every TTL/5) | 0.083 |
+| reshard GC dir pass | 0.050 |
+| `LIST nodes/` (once per TTL) | 0.017 |
+| SlateDB GC | 0.012 |
+| `LIST assign/` (every 25 steps) | 0.003 |
+
+Run files are `lbidle1`, `laidle1`, `la10idle1`, `lbpers1` and `lapers1` (`*.jsonl.gz`, `*.log`).
+`analyze.py --matrix lbidle1 laidle1 la10idle1 lbpers1 lapers1` prints the component table. The
+scratch dirs, both builds' target dirs and the MinIO container were deleted.

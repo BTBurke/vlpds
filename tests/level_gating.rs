@@ -51,11 +51,10 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
 }
 
 /// A graceful stop (SIGTERM): hand shards off, fence our log, drop the
-/// lease; then the process exits, which an in-process node only simulates
-/// (`halt`: its log streams end, so peers drain its log to the fence).
+/// lease. Its log streams end once the log is fenced, so peers drain it to
+/// the fence while the in-process node lingers.
 async fn stop(n: TestServer) {
     vlpds::server::shutdown(&n.app).await;
-    n.app.node.halt();
 }
 
 fn cluster(n: &TestServer) -> &vlpds::cluster::Cluster {
