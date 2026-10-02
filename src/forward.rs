@@ -3,9 +3,14 @@
 //!
 //! XRPC: methods outside `com.atproto.*` / `vlpds.*` (proxied to the
 //! AppView and other services, or the app.bsky preferences) route by the
-//! bearer token's `sub` alone. Otherwise the routing DID comes from (in
+//! bearer token's `sub` alone. The unauthenticated calls that name their
+//! account in the body (createSession, requestPasswordReset,
+//! resetPassword) route by the body alone, so per-account state (the
+//! sign-in-account rate limit) lives on the account's owner whatever query
+//! or token a client adds. Otherwise the routing DID comes from (in
 //! order) the `repo` / `did` /
-//! `handle` / `identifier` query parameter (handles resolved), the bearer
+//! `handle` / `identifier` query parameter (GET only: procedures take their
+//! input in the body; handles resolved), the bearer
 //! token's `sub` (uploadBlob: or, for a user service JWT, which has none,
 //! its `iss`; when that is ours the body is never parsed), then the
 //! `repo` / `did` / `identifier` field of a JSON body (handles and emails
@@ -17,7 +22,10 @@
 //! locally.
 //! Bodies are only buffered for JSON requests (bounded), so blob uploads
 //! stream straight through; routing reads them with a borrowed struct that
-//! skips every other field.
+//! skips every other field. A `Content-Encoding: gzip` / `deflate` body
+//! (decoded by the server's decompression layer, which runs after this one)
+//! is decoded for routing only, bounded like a plain one, and forwarded as
+//! sent; any other encoding routes as if it had no body.
 //!
 //! OAuth (`/oauth/*`): routed by `xrpc::oauth::route_key` (the account, the
 //! pushed request or the grant's owner; see the HA notes in `crate::oauth`).
@@ -27,6 +35,11 @@
 //! marker is honored only with a valid internal token, and stripped either
 //! way (a client's copy just routes normally). It is not `x-vlpds-internal`,
 //! which would exempt forwarded requests from the owner's rate limits.
+//! Next to it the entry node sends the client address it resolved
+//! (`crate::ratelimit::CLIENT_IP_HEADER`: its TCP peer, or the client behind
+//! its `trusted_proxies`), which the owner's per-IP limits then key on; the
+//! owner trusts it only with the marker's valid token and drops a client's
+//! copy otherwise.
 //!
 //! Forwards fail fast: if the owner hasn't started answering within a
 //! time-to-first-byte deadline (counted once the request body is sent) the
@@ -392,6 +405,37 @@ fn body_target(body: &[u8], admin: bool) -> Option<BodyTarget> {
         .map(|s| BodyTarget::Ident(s.to_string()))
 }
 
+/// Unauthenticated XRPC calls that name their account in the body: routed
+/// by the body only (see the module notes).
+const BODY_ROUTED: [&str; 3] = [
+    "com.atproto.server.createSession",
+    "com.atproto.server.requestPasswordReset",
+    "com.atproto.server.resetPassword",
+];
+
+/// The body as routing reads it: decoded when `Content-Encoding` is gzip or
+/// deflate (bounded by [`MAX_JSON_BODY`]; past it, or undecodable: empty),
+/// empty for any other encoding.
+fn routing_body<'a>(headers: &axum::http::HeaderMap, raw: &'a [u8]) -> Cow<'a, [u8]> {
+    use std::io::Read;
+    let enc = headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase());
+    let mut out = Vec::new();
+    let limit = MAX_JSON_BODY as u64 + 1;
+    let read = match enc.as_deref() {
+        None | Some("") | Some("identity") => return Cow::Borrowed(raw),
+        Some("gzip") | Some("x-gzip") => flate2::read::MultiGzDecoder::new(raw).take(limit).read_to_end(&mut out),
+        Some("deflate") => flate2::read::ZlibDecoder::new(raw).take(limit).read_to_end(&mut out),
+        Some(_) => return Cow::Borrowed(&[]),
+    };
+    match read {
+        Ok(n) if n <= MAX_JSON_BODY => Cow::Owned(out),
+        _ => Cow::Borrowed(&[]),
+    }
+}
+
 // ---------- the layer ----------
 
 /// Strips the forwarded marker from a request; true when it carried a valid
@@ -465,7 +509,13 @@ async fn xrpc_target(
         return Ok((req, sub));
     }
     let admin = nsid.starts_with("com.atproto.admin.");
-    match query_target(req.uri().query(), admin) {
+    // the body names the account: neither the query nor an (unverified,
+    // possibly absent) token can send it elsewhere
+    let body_only = BODY_ROUTED.contains(&nsid);
+    // procedures (POST) take their input in the body; query routing is
+    // for queries, so a POST can't name a different account up there
+    let query = if req.method() == Method::POST { None } else { req.uri().query() };
+    match query_target(query, admin) {
         (Some(d), _) => return Ok((req, Some(d))),
         (None, Some(h)) => {
             let did = router.resolve_handle(&h.to_ascii_lowercase()).await;
@@ -474,6 +524,7 @@ async fn xrpc_target(
         (None, None) => {}
     }
     let sub = match nsid {
+        _ if body_only => None,
         // a user service JWT (the video service uploading for a user) has
         // no `sub`: it is the issuer's
         "com.atproto.repo.uploadBlob" => token_sub(&req).or_else(|| token_iss(&req)),
@@ -492,7 +543,8 @@ async fn xrpc_target(
     if !is_json {
         return Ok((req, sub));
     }
-    let (req, b) = buffer(req).await?;
+    let (req, raw) = buffer(req).await?;
+    let b = routing_body(req.headers(), &raw);
     let did = match body_target(&b, admin) {
         Some(BodyTarget::Did(d)) => Some(d),
         Some(BodyTarget::Ident(i)) => resolve_ident(router, app, &i).await,
@@ -520,7 +572,7 @@ async fn oauth_target(
         req.uri().path(),
         req.uri().query(),
         req.headers(),
-        &body,
+        &routing_body(req.headers(), &body),
     )
     .await;
     Ok((req, key))
@@ -533,8 +585,19 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
         return next.run(req).await;
     }
     let app = router.app();
+    // a client's copy never counts; a peer's only with its valid token
+    let client_ip = req.headers_mut().remove(crate::ratelimit::CLIENT_IP_HEADER);
     if take_forwarded(&mut req, app) {
+        if let Some(ip) = client_ip.and_then(|v| v.to_str().ok()?.trim().parse::<std::net::IpAddr>().ok()) {
+            req.extensions_mut().insert(crate::ratelimit::ClientIp(ip.to_canonical()));
+        }
         return FORWARDED.scope((), next.run(req)).await;
+    }
+    // the client address as this node sees it, sent along if forwarded
+    if let Some(a) = app {
+        if let Some(ip) = crate::ratelimit::request_client_ip(req.headers(), req.extensions(), &a.ratelimit.trusted) {
+            req.extensions_mut().insert(crate::ratelimit::ClientIp(ip));
+        }
     }
     let token = app.map(|a| a.config.internal_token.as_str());
     let retry = app.is_some_and(|a| a.config.retry_unapplied_writes);
@@ -768,13 +831,13 @@ async fn forward(
     }
     // the marker (dropped by the receiver unless the token is valid)
     rb = rb.header(FORWARDED_HEADER, internal_token.unwrap_or("-"));
-    // client address for the owner's per-IP rate limits (used there when
-    // this node is one of its trusted_proxies)
-    if let Some(peer) = parts
-        .extensions
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-    {
-        rb = rb.header("x-forwarded-for", peer.0.ip().to_string());
+    // the client address for the owner's per-IP rate limits (trusted there
+    // only next to the marker's valid token)
+    let client = parts.extensions.get::<crate::ratelimit::ClientIp>().map(|c| c.0).or_else(|| {
+        parts.extensions.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip())
+    });
+    if let Some(ip) = client {
+        rb = rb.header(crate::ratelimit::CLIENT_IP_HEADER, ip.to_string());
     }
     let progress = Arc::new(Progress {
         start: Instant::now(),
@@ -899,6 +962,92 @@ mod tests {
         // com.atproto.* still routes by the repo it names
         let subject = Some("did:plc:subject".to_string());
         assert_eq!(target("/xrpc/com.atproto.repo.getRecord?repo=did:plc:subject", true).await, subject);
+    }
+
+    /// POST bodies route over query parameters (procedures take their input
+    /// in the body), and the account-naming unauthenticated calls route by
+    /// the body alone, whatever unverified token comes along.
+    #[tokio::test]
+    async fn procedures_route_by_their_body() {
+        let b64 = |j: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(j);
+        let tok = format!("Bearer h.{}.s", b64(r#"{"sub":"did:plc:local"}"#));
+        let target = |method: &str, uri: &str, body: &str, auth: bool, router: Fixed| {
+            let mut b = Request::builder().method(method).uri(uri).header("content-type", "application/json");
+            if auth {
+                b = b.header("authorization", tok.clone());
+            }
+            let req = b.body(Body::from(body.to_string())).unwrap();
+            async move { xrpc_target(&router, None, req).await.ok().unwrap().1 }
+        };
+        let remote = || Fixed(Some("http://owner".into()));
+        let victim = Some("did:plc:victim".to_string());
+        let body = r#"{"identifier":"did:plc:victim","password":"x"}"#;
+        // ?did= on a POST no longer reroutes
+        let uri = "/xrpc/com.atproto.server.createSession?did=did:plc:elsewhere";
+        assert_eq!(target("POST", uri, body, false, remote()).await, victim);
+        // nor does a forged token whose sub is an account of the entry node
+        // (Fixed(None): every DID is local, so the sub shortcut would apply)
+        assert_eq!(target("POST", uri, body, true, Fixed(None)).await, victim);
+        // no identifier in the body: no routing key, not the token's
+        let none = target("POST", "/xrpc/com.atproto.server.createSession", r#"{"password":"x"}"#, true, remote()).await;
+        assert_eq!(none, None);
+        // other procedures: the body over the query, the token still routes
+        let w = r#"{"repo":"did:plc:victim","collection":"a.b.c","record":{}}"#;
+        assert_eq!(target("POST", "/xrpc/com.atproto.repo.createRecord?repo=did:plc:x", w, false, remote()).await, victim);
+        assert_eq!(
+            target("POST", "/xrpc/com.atproto.repo.createRecord", w, true, Fixed(None)).await.as_deref(),
+            Some("did:plc:local")
+        );
+        // GET queries still route by their parameters
+        let q = target("GET", "/xrpc/com.atproto.repo.getRecord?repo=did:plc:victim", "", false, remote()).await;
+        assert_eq!(q, victim);
+    }
+
+    /// A compressed JSON body routes as its decoded form (the decompression
+    /// layer runs after routing); the forwarded body is the one sent.
+    #[tokio::test]
+    async fn compressed_bodies_route() {
+        use std::io::Write;
+        let json = br#"{"subject":{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:s"},"takedown":{"applied":true}}"#;
+        let gz = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(json).unwrap();
+            e.finish().unwrap()
+        };
+        let zl = {
+            let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(json).unwrap();
+            e.finish().unwrap()
+        };
+        let target = |enc: &'static str, body: Vec<u8>| async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.admin.updateSubjectStatus")
+                .header("content-type", "application/json")
+                .header("content-encoding", enc)
+                .body(Body::from(body.clone()))
+                .unwrap();
+            let (req, k) = xrpc_target(&Fixed(Some("http://owner".into())), None, req).await.ok().unwrap();
+            let sent = axum::body::to_bytes(req.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(&sent[..], &body[..], "forwarded as sent");
+            k
+        };
+        let s = Some("did:plc:s".to_string());
+        assert_eq!(target("gzip", gz.clone()).await, s);
+        assert_eq!(target("deflate", zl).await, s);
+        // an encoding routing can't read, or a body that doesn't decode,
+        // routes as if there were none
+        assert_eq!(target("br", gz.clone()).await, None);
+        assert_eq!(target("gzip", json.to_vec()).await, None);
+        // a decoded body past the bound is not routed on
+        let big = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            e.write_all(br#"{"pad":""#).unwrap();
+            e.write_all(&vec![b'a'; MAX_JSON_BODY + 10]).unwrap();
+            e.write_all(br#"","subject":{"did":"did:plc:s"}}"#).unwrap();
+            e.finish().unwrap()
+        };
+        assert_eq!(target("gzip", big).await, None);
     }
 
     struct Fixed(Option<String>);

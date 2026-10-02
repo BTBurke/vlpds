@@ -1230,8 +1230,12 @@ refuses to start without one. Every node of a cluster needs the same KEK set.
   every node. `vlpds_kms_requests_total` shows wraps (account creation) and
   unwraps (cold loads).
 - The node caches unwrapped signing keys (`signing_keys` cache, sized from
-  `--cache-budget-mb`; `--cache-entries signing_keys=N`). Cloud KMS calls are
-  limited to `--kms-concurrency` (64) in flight per node, 5 s each.
+  `--cache-budget-mb`; `--cache-entries signing_keys=N`). Cloud KMS unwraps are
+  limited to `--kms-concurrency` (64) in flight per node, 5 s each; wraps have
+  their own pool of a quarter of that (16), and their failures don't trigger the
+  1 s fail-fast, so a burst of reserveSigningKey or createAccount calls can't
+  starve cold signing-key loads. reserveSigningKey is rate limited (100/h per
+  IP, 5000 new reservations/day per node).
 
 ### KEK rotation
 
@@ -1466,7 +1470,9 @@ deploy such a build (it logs `TEST BUILD` at startup).
 
 1. Pick a **unique** `--node-id`. Same bucket, prefix, KEK flags, `--jwt-secret`,
    `--admin-token`, `--internal-token`; set `--advertise-url` to an address all
-   peers can reach; add it to `--trusted-proxies` lists if used.
+   peers can reach. Nodes don't go in `--trusted-proxies`: a forwarding node
+   passes the client address over the internal token (DESIGN "Rate limits");
+   list only real proxies (load balancers) there.
 2. Start it. After it greets every peer, each peer above the new fair share
    `ceil(shards / live)` hands extras to it at its next step.
 3. Add the target to Prometheus (job `vlpds`).
@@ -1583,6 +1589,15 @@ only TOTP is asked for.
 - **Too many wrong codes** (429 `RateLimitExceeded` on createSession or the
   sign-in page): the factor is locked for 5 min, doubling per further
   lockout up to a day. It clears by itself; there is nothing to reset.
+- **Too many wrong passwords from anywhere** (429 on createSession or the
+  sign-in page for one account, from every address): the `sign-in-account`
+  bucket (100 attempts per hour per account) is spent, e.g. by someone
+  guessing. It clears within the hour. App passwords and live sessions keep
+  working. To lift it early, add a DID override for `sign-in-account` in the
+  console's Rate limits tab.
+- **An OAuth client app gets 429 `rate_limit_exceeded`** from `/oauth/token`
+  or `/oauth/par`: its backend shares one address for all its users
+  (`oauth-ip`, 3000 per 5 min per IP). Add an IP override for that address.
 - **Lost the inbox** (email factor): after verifying the user out of band,
   `com.atproto.admin.updateAccountEmail` to a new address drops the factor
   (any address change does, as in the reference); the user re-confirms and

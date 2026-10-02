@@ -234,19 +234,14 @@ struct UpdateIn {
 }
 
 /// The caller's address for the audit entry (TCP peer, or the client behind
-/// a trusted proxy).
+/// a trusted proxy, or the client a forwarding peer vouched for).
 pub struct PeerIp(Option<std::net::IpAddr>);
 
-impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerIp {
+impl axum::extract::FromRequestParts<Arc<App>> for PeerIp {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(parts: &mut axum::http::request::Parts, _: &S) -> Result<Self, Self::Rejection> {
-        Ok(PeerIp(
-            parts
-                .extensions
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|c| c.0.ip()),
-        ))
+    async fn from_request_parts(parts: &mut axum::http::request::Parts, app: &Arc<App>) -> Result<Self, Self::Rejection> {
+        Ok(PeerIp(crate::ratelimit::request_client_ip(&parts.headers, &parts.extensions, &app.ratelimit.trusted)))
     }
 }
 
@@ -263,13 +258,12 @@ async fn update_rate_limits(
     State(app): AppState,
     Auth(creds): Auth,
     PeerIp(peer): PeerIp,
-    headers: HeaderMap,
     Json(inp): Json<UpdateIn>,
 ) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let doc: Doc = serde_json::from_value(inp.config).map_err(|e| XrpcError::bad("InvalidConfig", format!("invalid config: {e}")))?;
     let actor = inp.actor.map(|a| a.trim().chars().take(64).collect::<String>()).filter(|a| !a.is_empty()).unwrap_or_else(|| "admin".into());
-    let ip = crate::ratelimit::client_ip(&headers, peer, &app.ratelimit.trusted).map(|ip| ip.to_string());
+    let ip = peer.map(|ip| ip.to_string());
     let me = node_id(&app);
     let req = SaveReq { doc, if_version: inp.if_version, actor, ip, node: me.clone(), note: inp.note };
     let saved = runtime::save(&app.ratelimit, &app.store, req).await.map_err(save_error)?;

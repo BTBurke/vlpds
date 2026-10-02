@@ -31,6 +31,10 @@
 //! (`--kms-concurrency`), coalesced per DID, time out after
 //! [`KMS_TIMEOUT`], and fail fast for [`KMS_BACKOFF`] after an outage is
 //! seen: the caller gets [`SecretError::Unavailable`] (a retryable 503).
+//! Wraps (new accounts, reserved keys, TOTP secrets: some reachable
+//! without an account) have their own, smaller permit pool and never start
+//! the fail-fast window, so a flood of them can't starve or fail-fast the
+//! cold-signing-key unwraps.
 
 use crate::crypto::Keypair;
 use async_trait::async_trait;
@@ -52,8 +56,13 @@ pub const KMS_TIMEOUT: Duration = Duration::from_secs(5);
 /// this long (one probe per interval goes through), so an outage doesn't
 /// queue every cold write behind a timeout.
 pub const KMS_BACKOFF: Duration = Duration::from_secs(1);
-/// Default remote (KMS) calls in flight per node (`--kms-concurrency`).
+/// Default remote (KMS) unwraps in flight per node (`--kms-concurrency`).
 pub const DEFAULT_KMS_CONCURRENCY: usize = 64;
+
+/// Remote wraps in flight per node, for `n` unwraps: a quarter, at least 1.
+pub fn wrap_concurrency(n: usize) -> usize {
+    (n / 4).max(1)
+}
 
 static KMS_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
@@ -724,7 +733,10 @@ pub struct Secrets {
     wrappers: Vec<Arc<dyn KeyWrapper>>,
     dev_kek: bool,
     keys: Arc<KeyCache>,
+    /// Remote unwraps in flight.
     permits: tokio::sync::Semaphore,
+    /// Remote wraps in flight (a separate pool: see the module notes).
+    wrap_permits: tokio::sync::Semaphore,
     /// Coalesces concurrent cold unwraps of one DID (striped).
     stripes: Vec<tokio::sync::Mutex<()>>,
     /// Remote unwraps fail fast until this (micros since `epoch`).
@@ -749,6 +761,7 @@ impl Secrets {
             dev_kek: false,
             keys,
             permits: tokio::sync::Semaphore::new(n),
+            wrap_permits: tokio::sync::Semaphore::new(wrap_concurrency(n)),
             stripes: (0..256).map(|_| tokio::sync::Mutex::new(())).collect(),
             down_until: AtomicU64::new(0),
             epoch: Instant::now(),
@@ -823,8 +836,9 @@ impl Secrets {
         self.epoch.elapsed().as_micros() as u64
     }
 
-    /// Runs one KEK operation with metrics; remote ones under the permit
-    /// limit and the outage backoff.
+    /// Runs one KEK operation with metrics; remote ones under their permit
+    /// pool (wraps and unwraps apart) and the outage backoff, which only an
+    /// unwrap's failure starts.
     async fn run<T>(
         &self,
         w: &Arc<dyn KeyWrapper>,
@@ -841,11 +855,15 @@ impl Secrets {
             if now < until {
                 Err(SecretError::Unavailable("key service recently unavailable; backing off".into()))
             } else {
-                match tokio::time::timeout(KMS_TIMEOUT, self.permits.acquire()).await {
+                let wrap = op == "wrap";
+                let permits = if wrap { &self.wrap_permits } else { &self.permits };
+                match tokio::time::timeout(KMS_TIMEOUT, permits.acquire()).await {
                     Err(_) => Err(SecretError::Unavailable("too many key service calls queued".into())),
                     Ok(p) => {
                         let _p = p.expect("permits never closed");
-                        called = true;
+                        // a wrap's failure (e.g. a 429 from a flood of
+                        // reservations) must not fail the unwraps fast
+                        called = !wrap;
                         match tokio::time::timeout(KMS_TIMEOUT, f).await {
                             Ok(r) => r,
                             Err(_) => Err(SecretError::Unavailable(format!("{} {op} timed out", w.backend()))),
@@ -1284,5 +1302,94 @@ mod tests {
         let bad = ServiceAccount::from_json(&sa_json(&format!("{}/nope", m.url))).unwrap();
         let k = GcpKms::new("projects/p/locations/global/keyRings/r/cryptoKeys/c", &m.url, GcpToken::ServiceAccount(bad)).unwrap();
         assert!(matches!(k.wrap(b"aad", &secret).await, Err(SecretError::Unavailable(_))));
+    }
+
+    /// A remote key service whose wraps can be held and then refused with
+    /// a 429 (a flood of reservations), unwraps answering at once.
+    struct Throttling {
+        inner: LocalKek,
+        hold: std::sync::atomic::AtomicBool,
+        release: tokio::sync::Notify,
+        wraps_in: AtomicU64,
+    }
+
+    #[async_trait]
+    impl KeyWrapper for Throttling {
+        fn kid(&self) -> &str {
+            self.inner.kid()
+        }
+        fn backend(&self) -> &'static str {
+            "mock"
+        }
+        fn remote(&self) -> bool {
+            true
+        }
+        async fn wrap(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SecretError> {
+            if !self.hold.load(Ordering::SeqCst) {
+                return self.inner.wrap(aad, plaintext).await;
+            }
+            self.wraps_in.fetch_add(1, Ordering::SeqCst);
+            self.release.notified().await;
+            Err(SecretError::Unavailable("cloud kms encrypt: HTTP 429 Too Many Requests: quota".into()))
+        }
+        async fn unwrap(&self, aad: &[u8], ct: &[u8]) -> Result<Unwrapped, SecretError> {
+            self.inner.unwrap(aad, ct).await
+        }
+    }
+
+    /// A flood of wraps (reserveSigningKey) neither takes the unwraps'
+    /// permits nor, when the key service refuses them (429), starts the
+    /// fail-fast window that would fail cold signing-key unwraps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrap_flood_does_not_stall_unwraps() {
+        let m = Arc::new(Throttling {
+            inner: LocalKek::new(&KekBytes::random()),
+            hold: std::sync::atomic::AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+            wraps_in: AtomicU64::new(0),
+        });
+        let s = Arc::new(Secrets::new(vec![m.clone() as Arc<dyn KeyWrapper>], 8).unwrap());
+        let secret = [5u8; 32];
+        let blob = s.wrap(Purpose::SigningKey, "did:plc:cold", &secret).await.unwrap();
+        // 40 wraps pile up: 2 hold the wrap pool (8 / 4), the rest queue
+        m.hold.store(true, Ordering::SeqCst);
+        let flood: Vec<_> = (0..40)
+            .map(|i| {
+                let s = s.clone();
+                tokio::spawn(async move { s.wrap(Purpose::ReservedKey, &format!("did:key:z{i}"), &[1u8; 32]).await })
+            })
+            .collect();
+        for _ in 0..100 {
+            if m.wraps_in.load(Ordering::SeqCst) >= wrap_concurrency(8) as u64 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(m.wraps_in.load(Ordering::SeqCst), wrap_concurrency(8) as u64, "wraps limited to their own pool");
+        // cold unwraps still go straight through
+        let t = Instant::now();
+        for _ in 0..20 {
+            let u = s.unwrap(Purpose::SigningKey, "did:plc:cold", &blob).await.unwrap();
+            assert_eq!(&u.plaintext[..], &secret);
+        }
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+        // the key service refuses the held wraps (429): no fail-fast window
+        m.release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        m.release.notify_waiters();
+        let u = s.unwrap(Purpose::SigningKey, "did:plc:cold", &blob).await;
+        assert!(u.is_ok(), "unwrap right after refused wraps: {:?}", u.err());
+        m.hold.store(false, Ordering::SeqCst);
+        loop {
+            m.release.notify_waiters();
+            if flood.iter().all(|h| h.is_finished()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for h in flood {
+            let _ = h.await.unwrap();
+        }
+        assert_eq!(s.down_until.load(Ordering::Relaxed), 0, "wraps never start the backoff");
     }
 }

@@ -1671,6 +1671,10 @@ async fn create_session(
     let acct = login_account(&app, &inp.identifier)
         .await?
         .ok_or_else(invalid)?;
+    // vlpds: a per-account cap from any IP (shared with the OAuth sign-in),
+    // before the password hash; counted on the account's owner, where
+    // routing sends createSession by its identifier
+    crate::ratelimit::check(&[&crate::ratelimit::SIGN_IN_ACCOUNT], &acct.did, 1)?;
     let soft_deleted = is_takendown_account(&acct);
     let mut app_pass = None;
     if !verify_password(&acct, &inp.password).await {
@@ -2268,6 +2272,9 @@ async fn reserve_signing_key(
             }
         }
     }
+    // a new reservation costs a key-service wrap and a stored row (24 h):
+    // capped per node on top of the layer's per-IP bucket
+    crate::ratelimit::check(&[&crate::ratelimit::RESERVE_SIGNING_KEY_NODE], crate::ratelimit::NODE_KEY, 1)?;
     let key = Keypair::generate();
     let did_key = key.did_key();
     let routing = reserved_routing(&did_key);

@@ -327,7 +327,8 @@ struct Args {
     /// Cloud KMS API base URL.
     #[arg(long, env = "VLPDS_GCP_KMS_ENDPOINT", default_value = vlpds::secrets::GCP_KMS_ENDPOINT)]
     gcp_kms_endpoint: String,
-    /// Remote KMS calls in flight per node (cold signing-key unwraps).
+    /// Remote KMS unwraps in flight per node (cold signing-key loads); wraps
+    /// get a separate pool of a quarter of this.
     #[arg(long, env = "VLPDS_KMS_CONCURRENCY", default_value_t = vlpds::secrets::DEFAULT_KMS_CONCURRENCY)]
     kms_concurrency: usize,
     /// Send email over SMTP: smtp://[user:pass@]host[:port] (STARTTLS when
@@ -471,7 +472,8 @@ struct Args {
     #[arg(long, env = "VLPDS_NO_RATE_LIMITS")]
     no_rate_limits: bool,
     /// Proxies (IPs or CIDRs, comma-separated) whose X-Forwarded-For is
-    /// trusted for the rate-limit client IP. In cluster mode list the nodes.
+    /// trusted for the rate-limit client IP (load balancers; not the nodes:
+    /// a forwarding node passes the client address over the internal token).
     #[arg(long, env = "VLPDS_TRUSTED_PROXIES", value_delimiter = ',')]
     trusted_proxies: Vec<String>,
     /// HTTP/2 (h2c) connections to each peer node; requests round-robin.

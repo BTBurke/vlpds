@@ -2691,8 +2691,72 @@ removes the layer from that node; its refresher keeps running, so its
 console can show and edit the cluster's config. Unknown fields are
 rejected, so a typo never silently does nothing.
 
+**The client address across forwards.** Any node takes any request and
+forwards it to the owner of its account (`src/forward.rs`), which runs the
+rate limits. Keying the owner's per-IP buckets on its TCP peer (the
+forwarding node) let one client spend another's buckets: 31 wrong
+passwords for a victim's handle through node A locked every client
+entering through A out of that handle's createSession bucket, and one
+client could spend global-ip for all of A's traffic. Trusting
+`X-Forwarded-For` from the nodes (the old advice: list them in
+`--trusted-proxies`) also trusted whatever a client wrote there. Now:
+- The entry node resolves the client address as for its own limits (TCP
+  peer, or the client behind its `--trusted-proxies`) and sends it as
+  `x-vlpds-client-ip` next to the forwarding marker (`x-vlpds-forwarded:
+  <internal token>`).
+- The owner strips that header from every request and honours it only
+  when the marker carries a valid internal token; it then wins over the TCP
+  peer and `X-Forwarded-For` (`ratelimit::ClientIp`). A client can't set
+  it, directly or through a node.
+- Nodes don't need to be in `--trusted-proxies`; list only real proxies
+  (load balancers).
+- `X-Forwarded-For` entries may carry ports (`1.2.3.4:5678`,
+  `[2001:db8::1]:443`). The right-to-left walk stops at an entry that
+  doesn't parse and keeps the last trusted hop, so a garbled entry never
+  makes it read the client-written entries to its left.
+- IPv6 clients are keyed by their /64 (an IPv4 or IPv4-mapped one by its
+  address): one subscriber can mint addresses in its /64 at will. IP
+  overrides still match the full address.
+
+Per-IP counters remain per node, so a client spreading requests across N
+nodes still gets up to N× a per-IP budget; per-account buckets don't
+multiply, because the account's owner serves (and counts) every request
+for it.
+
+**Sign-in, key reservation and OAuth buckets (vlpds additions).**
+- `sign-in-account` (100 per hour per DID, any IP), already applied to the
+  OAuth sign-in, now also caps createSession, after the identifier + IP
+  buckets and before the password hash. Requests for a DID are counted on
+  its owner. createSession, requestPasswordReset and resetPassword route by
+  their body alone: an added `?did=` or an unverified bearer token used to
+  send them to another node, where the account's counters were fresh. More
+  generally, POST requests never route by query parameters, since
+  procedures take their input in the body. The cost is that anyone can hold
+  an account's password sign-ins off for up to an hour; app passwords and
+  live sessions keep working.
+- `com.atproto.server.reserveSigningKey-0` caps reservations at 100 per
+  hour per IP. `reserve-signing-key-node` caps new reservations (each one a
+  KMS wrap plus a row kept 24 h) at 5000 per day per node, which bounds
+  outstanding reservations. A live reservation for a DID is answered
+  without spending the node cap. The reference has no limit here; the
+  endpoint is unauthenticated in both.
+- `oauth-ip` (3000 per 5 min per IP) covers `/oauth/par`, `/oauth/token` and
+  `/oauth/revoke` (OAuth error shape: 429 `rate_limit_exceeded`). They used
+  to be unlimited; the reference oauth-provider has no limits of its own. A
+  confidential client's backend refreshes for all of its users from one
+  address, so raise or exempt it with an IP override if it hits this.
+- Key kinds now include `node`: one counter for the whole node.
+
+Request bodies are decompressed after routing (the decompression layer
+sits inside the forwarding one). Routing therefore decodes a `gzip` or
+`deflate` JSON body itself, bounded at 4 MiB decoded, and forwards the
+bytes as sent. Before this, a compressed body routed by the token alone,
+so for example an admin call with a gzip body was served on the wrong
+node. Any other encoding routes as if there were no body.
+
 **Override semantics.** An IP override matches the request's client IP (as
-`trusted_proxies` resolves it) and covers every bucket that request consumes.
+`trusted_proxies` resolves it, or the forwarding peer vouched for) and covers
+every bucket that request consumes.
 A DID override matches DID-keyed buckets (repo writes, updateHandle, email
 flows, sign-in-account) by key. It does not touch global-ip: the layer runs
 before authentication, and trusting an unverified token's `sub` would let
@@ -2848,8 +2912,14 @@ one step), so new accounts never unwrap. Otherwise a key is unwrapped once
 per account per cache lifetime: at a repo's cold load (shard preloads warm
 recently written repos after a takeover), on a proxy service-JWT miss, and
 for getServiceAuth. Cold unwraps of one DID are coalesced (256 striped
-locks). Remote calls are limited to `--kms-concurrency` (64) in flight,
-time out after 5 s, and fail fast for 1 s after the key service fails. A
+locks). Remote unwraps are limited to `--kms-concurrency` (64) in flight,
+time out after 5 s, and fail fast for 1 s after the key service fails.
+Remote wraps (new accounts, reserved keys, TOTP secrets; reserveSigningKey
+needs no account) have a separate pool, a quarter of that (16). A wrap's
+failure, such as a 429 from a flood of reservations, never starts the
+fail-fast window. So a wrap flood can neither take the unwraps' permits
+nor make cold signing-key unwraps fail fast (it can still spend the KMS
+quota, hence reserveSigningKey's rate limits). A
 loaded repo holds its `Arc<Keypair>`, so the commit path never touches the
 keyring. Readers that only need the public key (DID documents,
 describeRepo, service-auth issuer checks, `checkAccountStatus`,

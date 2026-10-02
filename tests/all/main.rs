@@ -87,6 +87,7 @@ mod ref_proxy;
 mod rebalance_handback;
 mod rate_limit_config;
 mod rate_limits;
+mod rate_limits_cluster;
 mod record_encode;
 mod reshard;
 mod revocation_gc;

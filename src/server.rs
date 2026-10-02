@@ -134,7 +134,8 @@ pub struct Config {
     /// Reference rate limits (src/ratelimit.rs). Benchmarks turn this off.
     pub rate_limits_enabled: bool,
     /// Proxies (IPs / CIDRs) whose X-Forwarded-For is trusted for the
-    /// rate-limit client IP. Empty = always the TCP peer.
+    /// rate-limit client IP. Empty = always the TCP peer (or, on a request a
+    /// peer forwarded, the client address it vouched for).
     pub trusted_proxies: Vec<String>,
     /// h2c connections to each peer node (crate::http::PeerClient).
     pub peer_connections: usize,

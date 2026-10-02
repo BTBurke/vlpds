@@ -8,7 +8,7 @@ import { useLive } from './Cluster'
 
 // ---------------------------------------------------------------- server shapes (src/xrpc/ratelimits.rs)
 
-type KeyKind = 'ip' | 'identifier-ip' | 'did'
+type KeyKind = 'ip' | 'identifier-ip' | 'did' | 'node'
 
 type Limiter = {
   name: string
@@ -87,8 +87,8 @@ function fmtWindow(s: number): string {
   return `${s} s`
 }
 
-const KEY_LABEL: Record<KeyKind, string> = { ip: 'client IP', 'identifier-ip': 'identifier + IP', did: 'DID' }
-const KEY_SHORT: Record<KeyKind, string> = { ip: 'IP', 'identifier-ip': 'ID+IP', did: 'DID' }
+const KEY_LABEL: Record<KeyKind, string> = { ip: 'client IP (IPv6: /64)', 'identifier-ip': 'identifier + IP', did: 'DID', node: 'whole node' }
+const KEY_SHORT: Record<KeyKind, string> = { ip: 'IP', 'identifier-ip': 'ID+IP', did: 'DID', node: 'node' }
 
 /** Bucket names without the com.atproto. prefix every method bucket carries. */
 const shortName = (n: string) => n.replace(/^(route:)?com\.atproto\./, '$1')

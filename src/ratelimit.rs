@@ -8,6 +8,7 @@
 //! | global-ip (every XRPC call except sync.getRepo) | 5 min | 3000 | client IP |
 //! | sync.getRepo | 5 min | 6000 | IP |
 //! | server.createSession | 1 day / 5 min | 300 / 30 | identifier + IP |
+//! | ↳ sign-in-account (vlpds; any IP, shared with the OAuth sign-in) | 1 h | 100 | DID |
 //! | server.createAccount | 5 min | 100 | IP |
 //! | server.deleteAccount | 5 min | 50 | IP |
 //! | server.requestPasswordReset | 1 day / 1 h | 50 / 15 | IP |
@@ -20,12 +21,23 @@
 //! | ↳ global-ip + oauth-sign-in-ip | 5 min | 3000 / 100 | client IP |
 //! | ↳ the createSession buckets (shared with it) | 1 day / 5 min | 300 / 30 | identifier (or pending DID) + IP |
 //! | ↳ sign-in-account (vlpds; any IP) | 1 h | 100 | DID |
+//! | oauth-ip (vlpds): `/oauth/par`, `/oauth/token`, `/oauth/revoke` | 5 min | 3000 | client IP |
+//! | server.reserveSigningKey (vlpds) | 1 h | 100 | IP |
+//! | ↳ reserve-signing-key-node (vlpds; calls that reserve a new key) | 1 day | 5000 | the node |
 //!
 //! The reference's oauth-provider has no sign-in limits of its own; the PDS
 //! applies createSession's to its account-manager login. vlpds adds a per-IP
-//! cap and a per-account cap across IPs (password guessing is Argon2 CPU);
-//! TOTP guessing is bounded separately by the persisted per-account lockout
-//! in `crate::totp`.
+//! cap and a per-account cap across IPs to both createSession and the OAuth
+//! sign-in (password guessing is Argon2 CPU); TOTP guessing is bounded
+//! separately by the persisted per-account lockout in `crate::totp`. The
+//! per-account cap lets anyone hold an account's password sign-ins off for
+//! up to an hour (100 guesses); app passwords and live sessions keep
+//! working. reserveSigningKey (unauthenticated in the reference too) costs a
+//! key-service wrap and a stored row per new key, hence its per-IP and
+//! per-node caps (the node cap bounds outstanding reservations: 24 h TTL).
+//! The OAuth endpoints' bucket bounds DPoP and client-auth work per address.
+//!
+//! IPv6 clients are keyed by their /64 ([`ip_key`]).
 //!
 //! Responses carry `RateLimit-Limit` / `-Remaining` / `-Reset` / `-Policy`
 //! for the tightest bucket the request consumed (plus `Retry-After` on a
@@ -47,12 +59,14 @@
 //! `x-ratelimit-bypass: <key>` when a bypass key is configured.
 //!
 //! **Cluster mode.** Counters are per node. Per-DID buckets (repo writes,
-//! updateHandle, email flows) are effectively exact because requests for a
-//! DID are forwarded to and served by the node owning its partition.
-//! Per-IP buckets count what one node serves: requests a node forwards are
-//! counted on the owner, keyed by the client IP only if the forwarding nodes
-//! are listed in `trusted_proxies` (forwarding appends `X-Forwarded-For`);
-//! otherwise they count against the forwarding node's address. A client
+//! updateHandle, email flows, sign-in-account) are effectively exact
+//! because requests for a DID are forwarded to and served by the node
+//! owning its partition (createSession routes by its body's identifier,
+//! never by query parameters or an unverified token). Per-IP buckets count
+//! what one node serves: requests a node forwards are counted on the owner,
+//! keyed by the client address the entry node resolved ([`ClientIp`], sent
+//! as [`CLIENT_IP_HEADER`] and trusted only next to the forwarding marker's
+//! valid internal token), never by the forwarding node's address. A client
 //! spreading requests across N nodes can get up to N× the per-IP budget.
 //!
 //! **Runtime configuration and observability** (DESIGN.md "Rate limits:
@@ -99,7 +113,12 @@ pub enum KeyKind {
     IdentifierIp,
     /// The authenticated account's DID.
     Did,
+    /// One counter for the whole node ([`NODE_KEY`]).
+    Node,
 }
+
+/// The key of [`KeyKind::Node`] buckets.
+pub const NODE_KEY: &str = "node";
 
 /// One built-in bucket: its default `points` per fixed `window_ms` window.
 /// `idx` is its position in [`BUILTIN`].
@@ -148,10 +167,13 @@ limit!(REQUEST_EMAIL_UPDATE_HOUR, 17, "com.atproto.server.requestEmailUpdate-1",
 limit!(REPO_WRITE_HOUR, 18, "repo-write-hour", Did, "every repo write (create 3, update 2, delete 1 points)", HOUR, 5000);
 limit!(REPO_WRITE_DAY, 19, "repo-write-day", Did, "every repo write (create 3, update 2, delete 1 points)", DAY, 35000);
 limit!(OAUTH_SIGN_IN_IP, 20, "oauth-sign-in-ip", Ip, "OAuth sign-in form posts", 5 * MINUTE, 100);
-limit!(SIGN_IN_ACCOUNT, 21, "sign-in-account", Did, "OAuth sign-in second step, from any IP", HOUR, 100);
+limit!(SIGN_IN_ACCOUNT, 21, "sign-in-account", Did, "server.createSession; OAuth sign-in (both steps), from any IP", HOUR, 100);
+limit!(OAUTH_IP, 22, "oauth-ip", Ip, "OAuth /oauth/par, /oauth/token, /oauth/revoke", 5 * MINUTE, 3000);
+limit!(RESERVE_SIGNING_KEY_IP, 23, "com.atproto.server.reserveSigningKey-0", Ip, "server.reserveSigningKey", HOUR, 100);
+limit!(RESERVE_SIGNING_KEY_NODE, 24, "reserve-signing-key-node", Node, "server.reserveSigningKey calls that reserve a new key (one KMS wrap each)", DAY, 5000);
 
 /// Every built-in bucket, indexed by [`Limit::idx`].
-pub const BUILTIN: [&Limit; 22] = [
+pub const BUILTIN: [&Limit; 25] = [
     &GLOBAL_IP,
     &GET_REPO,
     &CREATE_SESSION_DAY,
@@ -174,7 +196,15 @@ pub const BUILTIN: [&Limit; 22] = [
     &REPO_WRITE_DAY,
     &OAUTH_SIGN_IN_IP,
     &SIGN_IN_ACCOUNT,
+    &OAUTH_IP,
+    &RESERVE_SIGNING_KEY_IP,
+    &RESERVE_SIGNING_KEY_NODE,
 ];
+
+/// OAuth endpoints the layer limits per IP ([`OAUTH_IP`]; not global-ip,
+/// which is XRPC's). A confidential client's backend calls these for all of
+/// its users from one address: raise or exempt it with an IP override.
+const OAUTH_IP_PATHS: [&str; 3] = ["/oauth/par", "/oauth/token", "/oauth/revoke"];
 
 /// Browser form posts that run the rate-limit context (checked by the
 /// handler, which renders its own page on a 429).
@@ -196,6 +226,7 @@ fn ip_route_limits(path: &str) -> &'static [&'static Limit] {
         }
         "/xrpc/com.atproto.server.resetPassword" => &[&RESET_PASSWORD],
         "/xrpc/com.atproto.repo.uploadBlob" => &[&UPLOAD_BLOB],
+        "/xrpc/com.atproto.server.reserveSigningKey" => &[&RESERVE_SIGNING_KEY_IP],
         _ => &[],
     }
 }
@@ -349,10 +380,12 @@ impl Policy {
     /// The limit `key` is held to in `spec` (None: exempt), for display:
     /// the client IP is recovered from the key (an IP, or `{id}-{ip}`).
     pub fn limit_for_key(&self, spec: &Spec, key: &str) -> Option<u32> {
+        // an IPv6 key is its /64 ([`ip_key`]): its network address stands in
+        let parse = |k: &str| k.trim_end_matches("/64").parse::<IpAddr>().ok();
         let ip = match spec.key {
-            KeyKind::Ip => key.parse::<IpAddr>().ok(),
-            KeyKind::IdentifierIp => key.rsplit_once('-').and_then(|(_, ip)| ip.parse().ok()),
-            KeyKind::Did => None,
+            KeyKind::Ip => parse(key),
+            KeyKind::IdentifierIp => key.rsplit_once('-').and_then(|(_, ip)| parse(ip)),
+            KeyKind::Did | KeyKind::Node => None,
         };
         match self.override_for(&spec.name, key, &self.ip_matches(ip)) {
             Some(Action::Exempt) => None,
@@ -732,7 +765,10 @@ impl Cidr {
 
 /// The client address: the TCP peer, or, when the peer is a trusted proxy,
 /// the right-most `X-Forwarded-For` entry that isn't itself trusted
-/// (Express `trust proxy` semantics).
+/// (Express `trust proxy` semantics). Entries may carry a port
+/// (`1.2.3.4:5678`, `[2001:db8::1]:443`); walking stops at an entry that
+/// doesn't parse, keeping the last trusted hop, so a garbled entry never
+/// lets the walk reach further-left (client-written) ones.
 pub fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trusted: &[Cidr]) -> Option<IpAddr> {
     let peer = peer?.to_canonical();
     let is_trusted = |ip: &IpAddr| trusted.iter().any(|c| c.contains(ip));
@@ -740,20 +776,75 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trusted: &[Cidr]) ->
         return Some(peer);
     }
     let mut ip = peer;
-    let hops: Vec<IpAddr> = headers
+    let hops: Vec<&str> = headers
         .get_all("x-forwarded-for")
         .iter()
-        .filter_map(|v| v.to_str().ok())
+        .map(|v| v.to_str().unwrap_or(""))
         .flat_map(|v| v.split(','))
-        .filter_map(|s| s.trim().parse::<IpAddr>().ok())
         .collect();
     for hop in hops.into_iter().rev() {
-        ip = hop.to_canonical();
+        let Some(h) = parse_hop(hop) else { break };
+        ip = h.to_canonical();
         if !is_trusted(&ip) {
             break;
         }
     }
     Some(ip)
+}
+
+/// One `X-Forwarded-For` entry: an IP, `v4:port`, `[v6]` or `[v6]:port`.
+fn parse_hop(s: &str) -> Option<IpAddr> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        let (v6, tail) = rest.split_once(']')?;
+        if !(tail.is_empty() || tail.strip_prefix(':').is_some_and(|p| p.parse::<u16>().is_ok())) {
+            return None;
+        }
+        return v6.parse::<std::net::Ipv6Addr>().ok().map(IpAddr::V6);
+    }
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    let (v4, port) = s.split_once(':')?;
+    port.parse::<u16>().ok()?;
+    v4.parse::<std::net::Ipv4Addr>().ok().map(IpAddr::V4)
+}
+
+/// The rate-limit key of a client address: an IPv4 address as is, an IPv6
+/// one as its /64 (`2001:db8:1:2::/64`; one subscriber's allocation, which
+/// it can fill with fresh addresses at will).
+pub fn ip_key(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let net = std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0);
+            format!("{net}/64")
+        }
+    }
+}
+
+/// Request extension: the client address as the node the client called
+/// resolved it. Set by `crate::forward::route` on a request it forwards
+/// (sent along as [`CLIENT_IP_HEADER`]) and on a request a peer forwarded
+/// (from that header, trusted only with the peer's valid internal token);
+/// it then wins over the TCP peer, which is the forwarding node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientIp(pub IpAddr);
+
+/// Node-to-node header carrying [`ClientIp`] on a forwarded request.
+/// Only honored next to a valid `x-vlpds-forwarded` token; a client's copy
+/// is dropped.
+pub const CLIENT_IP_HEADER: &str = "x-vlpds-client-ip";
+
+/// The client address of a request: [`ClientIp`] if set, else [`client_ip`]
+/// of its TCP peer and headers.
+pub fn request_client_ip(headers: &HeaderMap, ext: &axum::http::Extensions, trusted: &[Cidr]) -> Option<IpAddr> {
+    if let Some(ClientIp(ip)) = ext.get::<ClientIp>() {
+        return Some(*ip);
+    }
+    let peer = ext.get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+    client_ip(headers, peer, trusted)
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,19 +1100,17 @@ pub async fn layer(
 ) -> Response {
     let path = req.uri().path();
     // OAuth sign-in forms: context only; the handler consumes its buckets
-    let sign_in_form = req.method() == axum::http::Method::POST && OAUTH_SIGN_IN_PATHS.contains(&path);
-    if !sign_in_form && (!path.starts_with("/xrpc/") || unlimited_path(path)) {
+    let post = req.method() == axum::http::Method::POST;
+    let sign_in_form = post && OAUTH_SIGN_IN_PATHS.contains(&path);
+    let oauth_endpoint = post && OAUTH_IP_PATHS.contains(&path);
+    if !sign_in_form && !oauth_endpoint && (!path.starts_with("/xrpc/") || unlimited_path(path)) {
         return next.run(req).await;
     }
     let bypass = limiter.bypassed(req.headers());
-    let peer = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0.ip());
-    let ip_addr = client_ip(req.headers(), peer, &limiter.trusted);
-    let ip = ip_addr.map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".into());
-    let route = ip_route_limits(path);
-    let global = !sign_in_form && path != "/xrpc/com.atproto.sync.getRepo";
+    let ip_addr = request_client_ip(req.headers(), req.extensions(), &limiter.trusted);
+    let ip = ip_addr.map(ip_key).unwrap_or_else(|| "unknown".into());
+    let route: &[&Limit] = if oauth_endpoint { &[&OAUTH_IP] } else { ip_route_limits(path) };
+    let global = !sign_in_form && !oauth_endpoint && path != "/xrpc/com.atproto.sync.getRepo";
     let policy = limiter.policy();
     let custom = policy.routes.get(path).cloned();
     let ctx = Ctx {
@@ -1051,6 +1140,12 @@ pub async fn layer(
         });
         let mut resp = match pre {
             Ok(()) => next.run(req).await,
+            // OAuth endpoints answer in OAuth's error shape
+            Err(_) if oauth_endpoint => (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(serde_json::json!({"error": "rate_limit_exceeded", "error_description": "Rate Limit Exceeded"})),
+            )
+                .into_response(),
             Err(e) => e.into_response(),
         };
         if let Some(s) = CTX.with(|c| c.borrow().tightest) {
@@ -1195,5 +1290,61 @@ mod tests {
             client_ip(&h, Some(peer), &[c]),
             Some("1.2.3.4".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn forwarded_for_ports_and_garbage() {
+        let trusted = [Cidr::parse("10.0.0.0/8").unwrap()];
+        let peer: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip = |xff: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-forwarded-for", xff.parse().unwrap());
+            client_ip(&h, Some(peer), &trusted).unwrap().to_string()
+        };
+        // ports are stripped (v4 and bracketed v6)
+        assert_eq!(ip("9.9.9.9, 1.2.3.4:5678"), "1.2.3.4");
+        assert_eq!(ip("9.9.9.9, [2001:db8::7]:443"), "2001:db8::7");
+        assert_eq!(ip("[2001:db8::8]"), "2001:db8::8");
+        assert_eq!(ip("1.2.3.4:5678, 10.0.0.9:80"), "1.2.3.4");
+        // an unparseable entry stops the walk at the last trusted hop: the
+        // client-written entries left of it are never reached
+        assert_eq!(ip("6.6.6.6, unknown, 10.0.0.2"), "10.0.0.2");
+        assert_eq!(ip("6.6.6.6, 1.2.3.4:http"), "10.0.0.1");
+        assert_eq!(ip("6.6.6.6, [::1]x"), "10.0.0.1");
+        // several headers read as one list
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", "6.6.6.6".parse().unwrap());
+        h.append("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        assert_eq!(client_ip(&h, Some(peer), &trusted), Some("1.2.3.4".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv6_keys_are_the_64() {
+        let k = |s: &str| ip_key(s.parse().unwrap());
+        assert_eq!(k("1.2.3.4"), "1.2.3.4");
+        assert_eq!(k("::ffff:1.2.3.4"), "1.2.3.4");
+        assert_eq!(k("2001:db8:1:2::1"), "2001:db8:1:2::/64");
+        assert_eq!(k("2001:db8:1:2:ffff:ffff:ffff:ffff"), "2001:db8:1:2::/64");
+        assert_ne!(k("2001:db8:1:3::1"), k("2001:db8:1:2::1"));
+        // the console's limit lookup finds IP overrides for a /64 key
+        let mut p = Policy::default();
+        p.ip_ov.push((Cidr::parse("2001:db8:1::/48").unwrap(), Ov { limiters: vec![], action: Action::Exempt }));
+        let spec = p.builtin(&GLOBAL_IP).clone();
+        assert_eq!(p.limit_for_key(&spec, "2001:db8:1:2::/64"), None);
+        assert_eq!(p.limit_for_key(&spec, "2001:db8:2:2::/64"), Some(3000));
+    }
+
+    /// A forwarding peer's [`ClientIp`] wins over the TCP peer (the
+    /// forwarding node) and over X-Forwarded-For.
+    #[test]
+    fn client_ip_extension_wins() {
+        let mut ext = axum::http::Extensions::new();
+        ext.insert(ConnectInfo(SocketAddr::from(([10, 0, 0, 1], 9))));
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "7.7.7.7".parse().unwrap());
+        let trusted = [Cidr::parse("10.0.0.0/8").unwrap()];
+        assert_eq!(request_client_ip(&h, &ext, &trusted), Some("7.7.7.7".parse().unwrap()));
+        ext.insert(ClientIp("203.0.113.5".parse().unwrap()));
+        assert_eq!(request_client_ip(&h, &ext, &trusted), Some("203.0.113.5".parse().unwrap()));
     }
 }
