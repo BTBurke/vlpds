@@ -957,7 +957,7 @@ Single-node mode is the same code with one node owning all shards.
   would leave nobody to fence it: no peer presumes a lease it can no longer
   see dead, and followers drain a log only up to a fence, so every peer's
   merged firehose would wait forever. A kept lease goes quiet, so peers
-  presume the incarnation dead and fence its log (`fence_dead`), and a
+  presume the incarnation dead and fence its log (`fence_as`), and a
   restart with the same `--node-id` fences it at startup (`read_own_lease`).
   Its shards were already handed out, so nothing is replayed.
 
