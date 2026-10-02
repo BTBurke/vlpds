@@ -1,17 +1,13 @@
 //! Merkle Search Tree, ported from indigo's `atproto/repo/mst` so that tree
 //! shapes and sync 1.1 proof block sets match the reference implementation.
 //!
-//! Nodes are `Arc`-shared and mutated copy-on-write (`Arc::make_mut`), so a
-//! snapshot of the root (for exports, or inverting a commit) costs one refcount.
-//! Keys are `Arc<[u8]>`, so copying a node on write bumps refcounts instead of
-//! copying every key.
+//! Nodes are `Arc`-shared and mutated copy-on-write, so a snapshot of the
+//! root costs one refcount.
 //!
-//! `dirty` means "this node's block must be emitted in the next diff".
-//! Mutations mark the nodes they rewrite (and drop their cached encoding);
-//! `prove_mutation` also marks neighbouring nodes that a verifier needs to
-//! invert the operation, whose cached encoding stays valid. Written internal
-//! nodes keep their encoded block (`bytes`), so exports, proofs and getBlocks
-//! copy those blocks instead of re-encoding them (leaves re-encode).
+//! `dirty` means "emit this node's block in the next diff". Mutations mark
+//! the nodes they rewrite and drop their cached encoding (`bytes`);
+//! `prove_mutation` also marks the neighbours a verifier needs to invert the
+//! operation, whose cached encoding stays valid.
 
 use crate::cbor;
 use crate::cid::Cid;
@@ -28,24 +24,21 @@ pub enum MstError {
     Invalid(&'static str),
     #[error("invalid MST key")]
     InvalidKey,
-    /// A partial tree needs a node it may not read now (a lazy tree's
-    /// no-I/O pass: the caller loads it asynchronously and retries).
+    /// A lazy tree's no-I/O pass met an unloaded node: the caller loads it
+    /// asynchronously and retries.
     #[error("MST node not loaded")]
     NotLoaded,
-    /// Reading persisted nodes or records failed (lazy trees).
     #[error("MST store read failed: {0}")]
     Store(String),
 }
 
 type Result<T> = std::result::Result<T, MstError>;
 
-pub const MAX_KEY_BYTES: usize = 1024;
+const MAX_KEY_BYTES: usize = 1024;
 
-/// Deepest tree accepted from a block set (nodes on a root-to-leaf path). A
-/// key's height counts its hash's leading zero 2-bit pairs, so 2^32 keys
-/// give a tree ~16 levels deep, and a key of height 64 would take a 128-bit
-/// zero hash prefix. The bound keeps every recursive walk off the end of the
-/// stack: a chain of `{e: [], l: child}` nodes is otherwise unbounded.
+/// Deepest tree accepted from a block set. 2^32 keys give a tree ~16 levels
+/// deep; the bound keeps recursive walks off the end of the stack, since a
+/// chain of `{e: [], l: child}` nodes is otherwise unbounded.
 pub const MAX_DEPTH: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -54,12 +47,11 @@ pub struct Node {
     pub entries: Vec<Entry>,
     pub cid: Option<Cid>,
     pub dirty: bool,
-    /// Placeholder for a node known only by CID (partial trees).
+    /// Known only by CID.
     pub stub: bool,
-    /// The node's encoded block (hashing to `cid`), kept from its last write
-    /// while its content is unchanged. Only internal nodes (height >= 1)
-    /// keep one: leaves are ~3/4 of the nodes and bytes, and every proof
-    /// path has just one.
+    /// The encoded block, kept from its last write while the content is
+    /// unchanged. Only internal nodes keep one: leaves are ~3/4 of the nodes
+    /// and bytes, and every proof path has just one.
     pub bytes: Option<Arc<[u8]>>,
 }
 
@@ -95,9 +87,7 @@ impl Entry {
     }
 }
 
-/// Leading zero 2-bit pairs of the key's SHA-256: counted a 64-bit word at
-/// a time with `leading_zeros` (approach from shrike (MIT/Apache-2.0),
-/// `mst::height::height_from_hash`) rather than byte by byte.
+/// Leading zero 2-bit pairs of the key's SHA-256.
 pub fn height_for_key(key: &[u8]) -> i32 {
     let hv: [u8; 32] = Sha256::digest(key).into();
     for (i, w) in hv.as_chunks::<8>().0.iter().enumerate() {
@@ -115,24 +105,25 @@ fn valid_key(key: &[u8]) -> bool {
 
 impl Node {
     fn empty(height: i32) -> Node {
-        Node {
-            height,
-            entries: Vec::new(),
-            cid: None,
-            dirty: true,
-            stub: false,
-            bytes: None,
-        }
+        Node { height, entries: Vec::new(), cid: None, dirty: true, stub: false, bytes: None }
     }
 
-    /// Marks a content change: re-encode and emit in the next diff.
+    /// A node as decoded or built: not dirty, no cached block.
+    pub(crate) fn clean(height: i32, entries: Vec<Entry>, cid: Option<Cid>) -> Node {
+        Node { height, entries, cid, dirty: false, stub: false, bytes: None }
+    }
+
+    fn stub(height: i32, cid: Option<Cid>) -> Node {
+        Node { stub: true, ..Node::clean(height, Vec::new(), cid) }
+    }
+
     fn touch(&mut self) {
         self.dirty = true;
         self.bytes = None;
     }
 
-    /// The node's block: the cached encoding, or a fresh one.
-    fn block(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
+    /// The cached encoding, or a fresh one.
+    pub fn block(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
         if let Some(b) = &self.bytes {
             return Ok(std::borrow::Cow::Borrowed(b));
         }
@@ -141,7 +132,7 @@ impl Node {
         Ok(std::borrow::Cow::Owned(buf))
     }
 
-    /// The smallest key in this subtree (None for an empty or partial one).
+    /// None for an empty or partial subtree.
     fn first_key(&self) -> Option<&Arc<[u8]>> {
         let mut n = self;
         loop {
@@ -152,9 +143,8 @@ impl Node {
         }
     }
 
-    /// A key in this subtree for a [`NodeRef`]: the node's own first value
-    /// if it has one (no walk down to the leftmost leaf, a chain of cold
-    /// nodes in a big repo), else the subtree's first key.
+    /// For a [`NodeRef`]: the node's own first value if it has one, sparing a
+    /// walk down a chain of cold nodes to the leftmost leaf.
     fn subtree_key(&self) -> Option<&Arc<[u8]>> {
         self.entries
             .iter()
@@ -222,6 +212,31 @@ impl Node {
     /// Where `key` falls relative to the key range of this subtree:
     /// Less = before all keys, Greater = after all, Equal = within.
     fn compare_key(&self, key: &[u8]) -> Result<Ordering> {
+        match self.compare_step(key)? {
+            Compare::Done(o) => Ok(o),
+            Compare::Child(i) => match &self.entries[i] {
+                Entry::Child { node: Some(c), .. } => Ok(self.child_order(i, c.compare_key(key)?)),
+                _ => Err(MstError::Partial),
+            },
+        }
+    }
+
+    /// [`compare_key`](Self::compare_key), marking every node it inspects
+    /// dirty (proof).
+    fn compare_key_mark(&mut self, key: &[u8]) -> Result<Ordering> {
+        let step = self.compare_step(key)?;
+        self.dirty = true;
+        let i = match step {
+            Compare::Done(o) => return Ok(o),
+            Compare::Child(i) => i,
+        };
+        let Entry::Child { node, .. } = &mut self.entries[i] else { unreachable!() };
+        let order = Arc::make_mut(node.as_mut().ok_or(MstError::Partial)?).compare_key_mark(key)?;
+        Ok(self.child_order(i, order))
+    }
+
+    /// One node's part of `compare_key`: an answer, or the child to ask.
+    fn compare_step(&self, key: &[u8]) -> Result<Compare> {
         if self.stub {
             return Err(MstError::Partial);
         }
@@ -230,89 +245,38 @@ impl Node {
         }
         if let Some(Entry::Value { key: k, .. }) = self.entries.first() {
             if key < &k[..] {
-                return Ok(Ordering::Less);
+                return Ok(Compare::Done(Ordering::Less));
             }
         }
         if let Some(Entry::Value { key: k, .. }) = self.entries.last() {
             if key > &k[..] {
-                return Ok(Ordering::Greater);
+                return Ok(Compare::Done(Ordering::Greater));
             }
         }
-        let n = self.entries.len();
         for (i, e) in self.entries.iter().enumerate() {
             match e {
-                Entry::Value { key: k, .. } => {
-                    if key < &k[..] {
-                        return Ok(Ordering::Equal);
-                    }
-                }
-                Entry::Child { node, .. } => {
+                Entry::Value { key: k, .. } if key < &k[..] => return Ok(Compare::Done(Ordering::Equal)),
+                Entry::Value { .. } => {}
+                Entry::Child { .. } => {
                     if let Some(Entry::Value { key: nk, .. }) = self.entries.get(i + 1) {
                         if key > &nk[..] {
                             continue;
                         }
                     }
-                    let child = node.as_ref().ok_or(MstError::Partial)?;
-                    let order = child.compare_key(key)?;
-                    if i == 0 && order == Ordering::Less {
-                        return Ok(Ordering::Less);
-                    }
-                    if i == n - 1 && order == Ordering::Greater {
-                        return Ok(Ordering::Greater);
-                    }
-                    return Ok(Ordering::Equal);
+                    return Ok(Compare::Child(i));
                 }
             }
         }
-        Ok(Ordering::Equal)
+        Ok(Compare::Done(Ordering::Equal))
     }
 
-    /// Same as `compare_key`, but marks every node it inspects dirty (proof).
-    fn compare_key_mark(&mut self, key: &[u8]) -> Result<Ordering> {
-        if self.stub {
-            return Err(MstError::Partial);
+    /// This subtree's order for `key` given child `i`'s.
+    fn child_order(&self, i: usize, order: Ordering) -> Ordering {
+        match order {
+            Ordering::Less if i == 0 => Ordering::Less,
+            Ordering::Greater if i == self.entries.len() - 1 => Ordering::Greater,
+            _ => Ordering::Equal,
         }
-        if self.is_empty() {
-            return Err(MstError::Invalid("can't determine key range of empty node"));
-        }
-        self.dirty = true;
-        if let Some(Entry::Value { key: k, .. }) = self.entries.first() {
-            if key < &k[..] {
-                return Ok(Ordering::Less);
-            }
-        }
-        if let Some(Entry::Value { key: k, .. }) = self.entries.last() {
-            if key > &k[..] {
-                return Ok(Ordering::Greater);
-            }
-        }
-        let n = self.entries.len();
-        for i in 0..n {
-            if let Entry::Value { key: k, .. } = &self.entries[i] {
-                if key < &k[..] {
-                    return Ok(Ordering::Equal);
-                }
-                continue;
-            }
-            if let Some(Entry::Value { key: nk, .. }) = self.entries.get(i + 1) {
-                if key > &nk[..] {
-                    continue;
-                }
-            }
-            let Entry::Child { node, .. } = &mut self.entries[i] else {
-                unreachable!()
-            };
-            let child = Arc::make_mut(node.as_mut().ok_or(MstError::Partial)?);
-            let order = child.compare_key_mark(key)?;
-            if i == 0 && order == Ordering::Less {
-                return Ok(Ordering::Less);
-            }
-            if i == n - 1 && order == Ordering::Greater {
-                return Ok(Ordering::Greater);
-            }
-            return Ok(Ordering::Equal);
-        }
-        Ok(Ordering::Equal)
     }
 
     fn get(&self, key: &[u8], height: i32) -> Result<Option<Cid>> {
@@ -338,6 +302,11 @@ impl Node {
                 _ => unreachable!(),
             }))
     }
+}
+
+enum Compare {
+    Done(Ordering),
+    Child(usize),
 }
 
 /// Marks the nodes adjacent to `key` dirty so they are included as a
@@ -591,14 +560,7 @@ fn remove(
             };
             n = match (node, cid) {
                 (Some(c), _) => c.clone(),
-                (None, Some(c)) => Arc::new(Node {
-                    height: n.height - 1,
-                    entries: Vec::new(),
-                    cid: Some(*c),
-                    dirty: false,
-                    stub: true,
-                    bytes: None,
-                }),
+                (None, Some(c)) => Arc::new(Node::stub(n.height - 1, Some(*c))),
                 (None, None) => return Err(MstError::Partial),
             };
         }
@@ -633,8 +595,8 @@ fn remove_child(
     height: i32,
     prove: bool,
 ) -> Result<(Arc<Node>, Option<Cid>)> {
-    // the key exists below (checked once by Tree::remove_inner, so a no-op
-    // delete doesn't copy-on-write the path)
+    // Tree::remove checked the key exists, so a no-op delete doesn't
+    // copy-on-write the path
     let Some(idx) = n.find_existing_child(key) else {
         return Ok((n, None));
     };
@@ -653,11 +615,8 @@ fn remove_child(
     Ok((n, prev))
 }
 
-// ---------- encoding ----------
-
-/// Length of the common prefix, 8 bytes at a time (MST keys in one node
-/// share most of their bytes: `collection/` and the TID's leading
-/// characters).
+/// 8 bytes at a time: keys in one node share most of their bytes
+/// (`collection/` and the TID's leading characters).
 fn count_prefix_len(a: &[u8], b: &[u8]) -> usize {
     let n = a.len().min(b.len());
     let mut i = 0;
@@ -682,7 +641,7 @@ fn child_cid(e: &Entry) -> Option<Cid> {
 
 /// Encodes a node whose children all have CIDs computed. The map keys and
 /// link heads are fixed byte strings in a node's one canonical encoding, so
-/// they go out as literals and each link as one 41-byte copy.
+/// they go out as literals.
 pub fn encode_node(n: &Node, out: &mut Vec<u8>) -> Result<()> {
     let nvals = n.entries.iter().filter(|e| !e.is_child()).count();
     let mut left = None;
@@ -708,15 +667,7 @@ pub fn encode_node(n: &Node, out: &mut Vec<u8>) -> Result<()> {
             }
             _ => None,
         };
-        let p = count_prefix_len(prev_key, key);
-        out.extend_from_slice(&[0xa4, 0x61, b'k']);
-        cbor::write_bytes(out, &key[p..]);
-        out.extend_from_slice(&[0x61, b'p']);
-        cbor::write_uint(out, p as u64);
-        out.extend_from_slice(&[0x61, b't']);
-        write_opt_link(out, right.as_ref());
-        out.extend_from_slice(&[0x61, b'v']);
-        out.extend_from_slice(&cbor::link_bytes(val));
+        encode_entry(out, prev_key, key, right.as_ref(), val);
         prev_key = key;
         i += 1;
     }
@@ -725,38 +676,25 @@ pub fn encode_node(n: &Node, out: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// [`encode_node`] of a node with these values and no children (a leaf),
-/// without building it: an export streaming leaves rebuilt from records.
-pub fn encode_leaf(entries: &[(Arc<[u8]>, Cid)], out: &mut Vec<u8>) {
-    out.reserve(48 + entries.len() * 64);
-    out.extend_from_slice(&[0xa2, 0x61, b'e']);
-    cbor::write_array_head(out, entries.len());
-    let mut prev_key: &[u8] = &[];
-    for (key, val) in entries {
-        encode_leaf_entry(out, prev_key, key, val);
-        prev_key = key;
-    }
-    out.extend_from_slice(&[0x61, b'l', 0xf6]);
-}
-
-/// One entry of a leaf (`encode_leaf`): `key` prefix-compressed against
-/// the entry before it.
+/// `key` prefix-compressed against the entry before it; `right` is the
+/// subtree after it.
 #[inline]
-fn encode_leaf_entry(out: &mut Vec<u8>, prev_key: &[u8], key: &[u8], val: &Cid) {
+fn encode_entry(out: &mut Vec<u8>, prev_key: &[u8], key: &[u8], right: Option<&Cid>, val: &Cid) {
     let p = count_prefix_len(prev_key, key);
     out.extend_from_slice(&[0xa4, 0x61, b'k']);
     cbor::write_bytes(out, &key[p..]);
     out.extend_from_slice(&[0x61, b'p']);
     cbor::write_uint(out, p as u64);
-    out.extend_from_slice(&[0x61, b't', 0xf6, 0x61, b'v']);
+    out.extend_from_slice(&[0x61, b't']);
+    write_opt_link(out, right);
+    out.extend_from_slice(&[0x61, b'v']);
     out.extend_from_slice(&cbor::link_bytes(val));
 }
 
-/// [`encode_leaf`] one entry at a time, from keys the caller doesn't keep
-/// (an export's record stream): the entries are written after room for
-/// the head, which [`finish`](LeafEncoder::finish) fills in once their
-/// count is known. Same bytes, no copy; the buffers are reused from leaf to
-/// leaf.
+/// [`encode_node`] of a leaf one entry at a time, from keys the caller
+/// doesn't keep (an export's record stream): the entries are written after
+/// room for the head, which [`finish`](LeafEncoder::finish) fills in once
+/// their count is known. The buffers are reused from leaf to leaf.
 #[derive(Default)]
 pub struct LeafEncoder {
     /// `LEAF_HEAD_ROOM` bytes of room, then the entries.
@@ -782,7 +720,7 @@ impl LeafEncoder {
         if self.buf.len() < LEAF_HEAD_ROOM {
             self.clear();
         }
-        encode_leaf_entry(&mut self.buf, &self.prev, key, val);
+        encode_entry(&mut self.buf, &self.prev, key, None, val);
         self.prev.clear();
         self.prev.extend_from_slice(key);
         self.n += 1;
@@ -867,7 +805,6 @@ fn write_blocks(
             encode_node(nm, &mut buf)?;
             let c = Cid::dag_cbor(&buf);
             nm.cid = Some(c);
-            // leaves (most nodes, most bytes) re-encode on demand
             if nm.height >= 1 {
                 nm.bytes = Some(Arc::from(&buf[..]));
             }
@@ -884,51 +821,30 @@ fn write_blocks(
     Ok(c)
 }
 
-// ---------- decoding (partial trees from a block set) ----------
-
 /// Decodes one node block, checking that it is the canonical encoding of a
 /// valid node: exactly the `e` and `l` fields (both required, `l` and each
 /// `t` a link or null, as the reference's NodeData schema), entries with
 /// exactly `k`/`p`/`t`/`v`, keys strictly ascending and all of one height,
 /// maximal prefix lengths (the first entry's is 0), and no child pointers
 /// in a height-0 node. Heights across nodes are checked by `load_from_blocks`.
-pub fn decode_node(data: &[u8], c: Cid) -> std::result::Result<Node, MstError> {
-    match decode_node_fast(data, c, None) {
-        Some(n) => Ok(n),
-        // anything the fast path doesn't take (every invalid node, and
-        // valid ones it doesn't recognize, if there were any): the generic
-        // decoder decides, with its error
-        None => decode_node_reference(data, c),
-    }
+pub fn decode_node(data: &[u8], c: Cid) -> Result<Node> {
+    // the generic decoder names the error of anything the fast path refuses
+    decode_node_fast(data, c, None).map_or_else(|| decode_node_reference(data, c), Ok)
 }
 
-/// [`decode_node`] of a node whose height is known (`height` >= 1: its
-/// parent's minus one) and whose bytes are trusted to hash to `c` (a
-/// node this PDS encoded, read back from its own store): the keys aren't
-/// hashed for their heights; every other check is made. A node with keys
-/// gets `height`; one without (only a root can be) gets -1 as from
-/// [`decode_node`].
-pub fn decode_trusted_node(data: &[u8], c: Cid, height: i32) -> std::result::Result<Node, MstError> {
-    match decode_node_fast(data, c, Some(height)) {
-        Some(n) => Ok(n),
-        None => decode_node_reference(data, c),
-    }
+/// [`decode_node`] of a node whose height is known (its parent's minus one)
+/// and whose bytes are trusted to hash to `c` (read back from this PDS's own
+/// store): the keys aren't hashed for their heights. A node without keys
+/// (only a root can be) gets -1 as from [`decode_node`].
+pub fn decode_trusted_node(data: &[u8], c: Cid, height: i32) -> Result<Node> {
+    decode_node_fast(data, c, Some(height)).map_or_else(|| decode_node_reference(data, c), Ok)
 }
 
 /// [`decode_node`] specialized to the one encoding a valid node can have,
-/// read straight off the bytes: `{"e": [{"k", "p", "t", "v"}...], "l"}`
-/// with canonical heads, so every map key and the 37-byte link heads are
-/// fixed byte strings. No intermediate `Value` tree, no `String` per map
-/// key, one buffer for key reconstruction and one allocation per key.
-/// Approach from shrike (MIT/Apache-2.0), whose MST node decoder ran 2.7x
-/// faster than the generic-`Value` path by borrowing keys and byte strings
-/// from the block; this goes one step further and skips the tree.
-///
-/// Returns a node only when [`decode_node_reference`] would return the
-/// same node (tests/all/shrike_adopt.rs checks this on real, random and
-/// mutated blocks); every check that one makes is made here: exact fields,
-/// links or null, keys ascending, valid and of one height, canonical
-/// prefix lengths, no children under height 0, no trailing bytes.
+/// `{"e": [{"k", "p", "t", "v"}...], "l"}` with canonical heads, read
+/// straight off the bytes. Returns a node only when
+/// [`decode_node_reference`] would return the same node
+/// (tests/all/shrike_adopt.rs).
 fn decode_node_fast(data: &[u8], c: Cid, known_height: Option<i32>) -> Option<Node> {
     let mut r = cbor::Cursor::new(data);
     // {"e": [...
@@ -943,7 +859,6 @@ fn decode_node_fast(data: &[u8], c: Cid, known_height: Option<i32>) -> Option<No
     let mut height = -1;
     let mut has_child = false;
     for i in 0..n {
-        // {"k": suffix, "p": prefix len, "t": link/null, "v": link}
         if !r.lit(&[0xa4, 0x61, b'k']) {
             return None;
         }
@@ -998,7 +913,6 @@ fn decode_node_fast(data: &[u8], c: Cid, known_height: Option<i32>) -> Option<No
             entries.push(Entry::Child { node: None, cid: Some(t) });
         }
     }
-    // ..., "l": link/null}
     if !r.lit(&[0x61, b'l']) {
         return None;
     }
@@ -1013,21 +927,13 @@ fn decode_node_fast(data: &[u8], c: Cid, known_height: Option<i32>) -> Option<No
     if height == 0 && has_child {
         return None;
     }
-    Some(Node {
-        height,
-        entries,
-        cid: Some(c),
-        dirty: false,
-        stub: false,
-        bytes: None,
-    })
+    Some(Node::clean(height, entries, Some(c)))
 }
 
-/// The generic node decoder (DAG-CBOR `Value` tree, then structure
-/// checks): the oracle for [`decode_node_fast`] and the source of
-/// [`decode_node`]'s errors.
+/// The generic decoder: the oracle for [`decode_node_fast`] and the source
+/// of [`decode_node`]'s errors.
 #[doc(hidden)]
-pub fn decode_node_reference(data: &[u8], c: Cid) -> std::result::Result<Node, MstError> {
+pub fn decode_node_reference(data: &[u8], c: Cid) -> Result<Node> {
     use cbor::Value;
     let v = Value::decode(data).map_err(|_| MstError::Invalid("bad node cbor"))?;
     let link = |v: Option<&Value>| match v {
@@ -1102,39 +1008,28 @@ pub fn decode_node_reference(data: &[u8], c: Cid) -> std::result::Result<Node, M
     if height == 0 && entries.iter().any(Entry::is_child) {
         return Err(MstError::Invalid("child of a height-0 node"));
     }
-    Ok(Node {
-        height,
-        entries,
-        cid: Some(c),
-        dirty: false,
-        stub: false,
-        bytes: None,
-    })
+    Ok(Node::clean(height, entries, Some(c)))
 }
 
 /// One load of a (possibly partial) tree from an untrusted block set.
 ///
-/// A block set is a DAG, not a tree: nodes may link the same child many
-/// times, and expanding every link materializes an exponential tree from a
-/// few KB (fan 40, 4 levels: ~116M entries from 17.7 KB). A valid MST never
-/// repeats a node (a repeat would repeat its keys, and no child is empty),
-/// so a node reached twice is rejected, and every node's keys must fall
-/// strictly between the separators its parent puts around it (else lookups
-/// by key order would miss them). Each block is decoded at most once, so
-/// load work and memory are linear in the input.
+/// A block set is a DAG, not a tree: expanding every link of a node that
+/// links one child many times materializes an exponential tree from a few
+/// KB. A valid MST never repeats a node (it would repeat its keys), so a
+/// node reached twice is rejected, and every node's keys must fall strictly
+/// between its parent's separators (else lookups by key order would miss
+/// them). Load work and memory are linear in the input.
 struct Loader<'a, B> {
     blocks: &'a HashMap<Cid, B>,
     seen: std::collections::HashSet<Cid>,
-    /// Load only the nodes on the key-order path to this key (proofs).
+    /// Only the nodes on the key-order path to this key (proofs).
     path: Option<&'a [u8]>,
 }
 
 impl<B: AsRef<[u8]>> Loader<'_, B> {
-    /// Loads the subtree at `c` (`depth` nodes below the root), whose keys
-    /// must lie strictly between `lo` and `hi`. Children missing from
-    /// `blocks` stay unloaded (partial tree), as do children off `path`. A
-    /// node without keys takes its height from its child; every loaded
-    /// child must be exactly one level below its parent.
+    /// The subtree at `c`, whose keys must lie strictly between `lo` and
+    /// `hi`. Children missing from `blocks` or off `path` stay unloaded. A
+    /// node without keys takes its height from its child.
     fn load(
         &mut self,
         c: Cid,
@@ -1155,7 +1050,6 @@ impl<B: AsRef<[u8]>> Loader<'_, B> {
         if depth > 0 && n.entries.is_empty() {
             return Err(MstError::Invalid("empty child node"));
         }
-        // keys ascend within a node (decode_node): its first and last bound it
         let first = n.entries.iter().find_map(Entry::key);
         let last = n.entries.iter().rev().find_map(Entry::key);
         if first.zip(lo).is_some_and(|(k, lo)| k <= &lo[..])
@@ -1171,8 +1065,7 @@ impl<B: AsRef<[u8]>> Loader<'_, B> {
             let Entry::Child { cid: Some(cc), .. } = n.entries[i] else {
                 continue;
             };
-            // a child sits between its neighbouring values (decode_node never
-            // puts two children side by side); at an end, the parent's bound
+            // decode_node never puts two children side by side
             let clo = i
                 .checked_sub(1)
                 .and_then(|j| value_key(n.entries.get(j)))
@@ -1227,16 +1120,13 @@ fn ensure_heights(n: &mut Arc<Node>, depth: usize) -> Result<()> {
     Ok(())
 }
 
-// ---------- tree ----------
-
 #[derive(Clone, Debug)]
 pub struct Tree {
     pub root: Arc<Node>,
-    /// Grown from [`Tree::new`] by inserts and removes alone: every node is
-    /// loaded and was built by this code, so a mutation can only fail on a
-    /// broken invariant (a bug). Such trees mutate in place; other trees
-    /// (loaded from blocks, possibly partial, where `Partial` and
-    /// structure errors are expected) keep the old root to restore on error.
+    /// Grown from [`Tree::new`] by inserts and removes alone, so a mutation
+    /// can only fail on a bug: such trees mutate in place. Trees loaded from
+    /// blocks expect `Partial` and structure errors and keep the old root to
+    /// restore on error.
     built: bool,
 }
 
@@ -1261,14 +1151,11 @@ impl Tree {
     }
 
     /// Runs a mutation that consumes the root. A built tree hands over its
-    /// only reference, so copy-on-write copies nothing; the old code kept a
-    /// second reference to restore on error, which made `Arc::make_mut`
-    /// copy every node on the path, every insert (approach from shrike
-    /// (MIT/Apache-2.0), whose `DetachedTree` mutates its owned nodes in
-    /// place and refuses further use after a failure only a bug can cause).
-    /// If a built tree's mutation fails anyway, the tree is poisoned: its
-    /// root becomes a stub, so every later read or write fails (`Partial`
-    /// / `Invalid`) rather than report a half-applied tree's root.
+    /// only reference, so copy-on-write copies nothing (a second reference
+    /// kept to restore on error would copy every node on the path). If a
+    /// built tree's mutation fails anyway, the tree is poisoned: its root
+    /// becomes a stub, so every later read or write fails rather than report
+    /// a half-applied tree's root.
     fn mutate<T>(
         &mut self,
         root: Arc<Node>,
@@ -1281,11 +1168,7 @@ impl Tree {
                     Ok(x)
                 }
                 Err(e) => {
-                    self.root = Arc::new(Node {
-                        stub: true,
-                        dirty: false,
-                        ..Node::empty(0)
-                    });
+                    self.root = Arc::new(Node::stub(0, None));
                     self.built = false;
                     Err(e)
                 }
@@ -1303,12 +1186,12 @@ impl Tree {
         }
     }
 
-    /// Inserts or updates; returns the previous value. Marks proof nodes.
+    /// Returns the previous value. Marks proof nodes.
     pub fn insert(&mut self, key: &[u8], val: Cid) -> Result<Option<Cid>> {
         self.insert_inner(key, val, true)
     }
 
-    /// Insert without proof marking (bulk loads).
+    /// Without proof marking (bulk loads).
     pub fn insert_no_proof(&mut self, key: &[u8], val: Cid) -> Result<Option<Cid>> {
         self.insert_inner(key, val, false)
     }
@@ -1319,8 +1202,8 @@ impl Tree {
         }
         let height = height_for_key(key);
         let root = std::mem::replace(&mut self.root, placeholder());
-        // An emptied tree can be left with a non-zero height; an empty node has no
-        // fixed height, so restart it at the key's height to keep the shape canonical.
+        // an emptied tree can be left with a non-zero height: restart it at
+        // the key's to keep the shape canonical
         let root = if root.is_empty() && !root.stub && root.height != height {
             Arc::new(Node::empty(height))
         } else {
@@ -1330,10 +1213,6 @@ impl Tree {
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Result<Option<Cid>> {
-        self.remove_inner(key, true)
-    }
-
-    fn remove_inner(&mut self, key: &[u8], prove: bool) -> Result<Option<Cid>> {
         if !valid_key(key) {
             return Err(MstError::InvalidKey);
         }
@@ -1341,7 +1220,7 @@ impl Tree {
             return Ok(None);
         }
         let root = std::mem::replace(&mut self.root, placeholder());
-        self.mutate(root, |r| remove(r, key, None, prove))
+        self.mutate(root, |r| remove(r, key, None, true))
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Cid>> {
@@ -1355,7 +1234,7 @@ impl Tree {
         self.root.is_empty()
     }
 
-    /// Computes the root CID, clearing dirty flags without collecting blocks.
+    /// Clears dirty flags without collecting blocks.
     pub fn root_cid(&mut self) -> Result<Cid> {
         if self.root.stub && !self.root.dirty {
             if let Some(c) = self.root.cid {
@@ -1365,7 +1244,7 @@ impl Tree {
         write_blocks(&mut self.root, &mut None, &mut None, 0)
     }
 
-    /// Computes the root CID and returns every dirty block (new nodes + proof nodes).
+    /// Emits every dirty block (new nodes + proof nodes).
     pub fn write_diff_blocks(&mut self, out: &mut Vec<(Cid, Vec<u8>)>) -> Result<Cid> {
         write_blocks(&mut self.root, &mut Some(out), &mut None, 0)
     }
@@ -1380,9 +1259,7 @@ impl Tree {
         write_blocks(&mut self.root, &mut Some(out), &mut Some(refs), 0)
     }
 
-    /// Where every node of a fully written tree sits (cid -> first key,
-    /// height); an empty root has no key and is left out. Tests: the
-    /// oracle for [`NodeIndex`] (the server builds it by a streamed walk).
+    /// The oracle for [`NodeIndex`]; an empty root has no key and is left out.
     #[cfg(test)]
     pub fn node_refs(&self, out: &mut HashMap<Cid, NodeRef>) -> Result<()> {
         fn rec(n: &Node, out: &mut HashMap<Cid, NodeRef>, depth: usize) -> Result<()> {
@@ -1403,18 +1280,14 @@ impl Tree {
         rec(&self.root, out, 0)
     }
 
-    /// Loads a (possibly partial) tree from a block set.
-    /// Rejects a block set that isn't a tree (a node linked twice) or whose
-    /// nodes hold keys outside their parent's separators (see [`Loader`]),
-    /// so loading is linear in the input.
+    /// A (possibly partial) tree. Linear in the input (see [`Loader`]).
     pub fn load_from_blocks<B: AsRef<[u8]>>(blocks: &HashMap<Cid, B>, root: Cid) -> Result<Tree> {
         Self::load_with(blocks, root, None)
     }
 
-    /// Loads only the nodes on the key-order path from the root to `key`
-    /// (the rest stay unloaded, like missing blocks): enough for
-    /// [`Tree::get`] of `key`, e.g. to check an inclusion proof, without
-    /// decoding the rest of an untrusted block set.
+    /// Only the nodes on the key-order path to `key`: enough for
+    /// [`Tree::get`] of `key` without decoding the rest of an untrusted
+    /// block set.
     pub fn load_path_from_blocks<B: AsRef<[u8]>>(blocks: &HashMap<Cid, B>, root: Cid, key: &[u8]) -> Result<Tree> {
         Self::load_with(blocks, root, Some(key))
     }
@@ -1426,7 +1299,6 @@ impl Tree {
         Ok(Tree { root: r, built: false })
     }
 
-    /// Visits every (key, value) in key order.
     pub fn walk(&self, f: &mut dyn FnMut(&[u8], Cid)) {
         fn rec(n: &Node, f: &mut dyn FnMut(&[u8], Cid), depth: usize) {
             // loaded trees are bounded by load_from_blocks, built ones by key heights
@@ -1442,8 +1314,7 @@ impl Tree {
         rec(&self.root, f, 0)
     }
 
-    /// Visits every node block (cid, encoded bytes). The tree must be fully
-    /// written (no dirty nodes), e.g. right after `root_cid`.
+    /// The tree must be fully written (no dirty nodes).
     pub fn walk_blocks(&self, f: &mut dyn FnMut(Cid, &[u8])) -> Result<()> {
         fn rec(
             n: &Node,
@@ -1474,8 +1345,7 @@ impl Tree {
         rec(&self.root, &mut buf, f, 0)
     }
 
-    /// The block of node `cid` of a fully loaded tree, looked up in `index`
-    /// (which must cover this tree's version for a None to be final). Tests.
+    /// `index` must cover this tree's version for a None to be final.
     #[cfg(test)]
     pub fn find_node(&self, cid: &Cid, index: &NodeIndex) -> Result<Option<Vec<u8>>> {
         if self.root.cid == Some(*cid) {
@@ -1487,8 +1357,7 @@ impl Tree {
         }
     }
 
-    /// The block of the node at `height` on the path to `key`, if that
-    /// node's CID is `cid` (the tree must be fully written). Tests.
+    /// The node at `height` on the path to `key`, if its CID is `cid`.
     #[cfg(test)]
     pub fn node_block(&self, cid: &Cid, key: &[u8], height: i32) -> Result<Option<Vec<u8>>> {
         let mut n: &Node = &self.root;
@@ -1506,16 +1375,15 @@ impl Tree {
         }
     }
 
-    /// The root node's block (the tree must be written).
+    /// The tree must be written.
     pub fn root_block(&self) -> Result<(Cid, Vec<u8>)> {
         Ok((self.root.cid.ok_or(MstError::Invalid("unwritten node"))?, self.root.block()?.into_owned()))
     }
 
-    /// Node blocks on the path from the root to `key` (inclusion or exclusion
-    /// proof). The path follows key order down to the node holding `key` or
-    /// to the bottom, like the reference's `cidsForPath`: verifiers search by
-    /// key order alone, so an absent key's proof must reach the lowest node
-    /// it would sort into, even below the key's own height.
+    /// Inclusion or exclusion proof. Like the reference's `cidsForPath`, the
+    /// path follows key order to the node holding `key` or to the bottom:
+    /// verifiers search by key order alone, so an absent key's proof must
+    /// reach the lowest node it would sort into, even below its own height.
     pub fn proof_blocks(&self, key: &[u8]) -> Result<Vec<(Cid, Vec<u8>)>> {
         let mut out = Vec::new();
         let mut n: &Node = &self.root;
@@ -1535,19 +1403,15 @@ impl Tree {
     }
 }
 
-// ---------- node index (getBlocks) ----------
-
-/// Where a node sits: a key in its subtree (its own first value, see
-/// `Node::subtree_key`) and its height. The node is the one at that height
-/// on the path from the root to the key.
+/// Where a node sits: a key in its subtree and its height. The node is the
+/// one at that height on the path from the root to the key.
 pub type NodeRef = (Arc<[u8]>, i32);
 
-/// Node CID -> [`NodeRef`] for one repo, so getBlocks finds MST nodes by
-/// CID in O(depth) instead of walking the tree. Built from a tree version
-/// (one walk), then advanced by each commit's written nodes; it only grows,
-/// so it covers every version in `from..=to` (revs) and a miss for one of
-/// those is final. Entries of replaced nodes linger until a rebuild;
-/// lookups check the CID against the tree they read.
+/// Node CID -> [`NodeRef`] for one repo, so getBlocks finds nodes in
+/// O(depth). Advanced by each commit's written nodes, it only grows, so it
+/// covers every version in `from..=to` (revs) and a miss for one of those is
+/// final. Entries of replaced nodes linger until a rebuild; lookups check
+/// the CID against the tree they read.
 pub struct NodeIndex {
     map: HashMap<Cid, NodeRef>,
     pub from: u64,
@@ -1557,7 +1421,6 @@ pub struct NodeIndex {
 }
 
 impl NodeIndex {
-    /// The index of a fully loaded tree at `rev` (tests).
     #[cfg(test)]
     pub fn build(tree: &Tree, rev: u64) -> Result<NodeIndex> {
         let mut map = HashMap::new();
@@ -1566,8 +1429,6 @@ impl NodeIndex {
         Ok(NodeIndex { map, from: rev, to: rev, live })
     }
 
-    /// An index of the given nodes at `rev` (built from a streamed walk of
-    /// the whole tree from a snapshot).
     pub fn from_refs(map: HashMap<Cid, NodeRef>, rev: u64) -> NodeIndex {
         let live = map.len();
         NodeIndex { map, from: rev, to: rev, live }
@@ -1581,8 +1442,7 @@ impl NodeIndex {
         self.map.get(cid)
     }
 
-    /// Adds the nodes written by commit `prev -> rev`. False (unchanged) if
-    /// the index doesn't end at `prev`.
+    /// False (unchanged) if the index doesn't end at `prev`.
     pub fn advance(&mut self, prev: u64, rev: u64, written: &[(Cid, NodeRef)]) -> bool {
         if self.to != prev || rev < prev {
             return false;
@@ -1593,29 +1453,26 @@ impl NodeIndex {
     }
 
     /// Mostly stale entries: drop and rebuild on the next miss.
-    pub fn bloated(&self) -> bool {
+    fn bloated(&self) -> bool {
         self.map.len() > 2 * self.live + 4096
     }
 }
 
-/// A repo's node index, shared by the repo worker (which advances it per
-/// commit once anyone has asked for it) and getBlocks (which builds it).
+/// Shared by the repo worker (which advances it per commit once anyone has
+/// asked for it) and getBlocks (which builds it).
 #[derive(Default)]
 pub struct NodeIndexCell {
     pub index: Option<NodeIndex>,
-    /// Set by the first getBlocks that needed node blocks: from then on the
-    /// worker reports each commit's written nodes.
+    /// Set by the first getBlocks that needed node blocks.
     pub wanted: bool,
     /// The latest commits' written nodes (prev rev, rev, refs) while there
     /// is no index to advance, so a build from an older view can catch up.
     pub recent: std::collections::VecDeque<(u64, u64, Vec<(Cid, NodeRef)>)>,
 }
 
-/// Commits kept in [`NodeIndexCell::recent`].
 const RECENT_COMMITS: usize = 64;
 
 impl NodeIndexCell {
-    /// Worker side: records a commit's written nodes.
     pub fn commit(&mut self, prev: u64, rev: u64, written: Vec<(Cid, NodeRef)>) {
         if let Some(ix) = &mut self.index {
             if ix.advance(prev, rev, &written) && !ix.bloated() {
@@ -1629,8 +1486,8 @@ impl NodeIndexCell {
         self.recent.push_back((prev, rev, written));
     }
 
-    /// getBlocks side: installs an index built from a view, caught up with
-    /// the commits recorded since, unless the current one reaches further.
+    /// Catches `ix` up with the commits recorded since; keeps the current
+    /// index if it reaches further.
     pub fn install(&mut self, mut ix: NodeIndex) {
         for (prev, rev, written) in &self.recent {
             ix.advance(*prev, *rev, written);
@@ -2393,10 +2250,8 @@ mod tests {
         }
     }
 
-    /// An export's streamed leaf encoding and trusted interior decode give
-    /// what `encode_leaf` / `decode_node` give, on every node of a tree
-    /// with leaves of 1 to dozens of entries (one- and two-byte array
-    /// heads), the encoder reused from leaf to leaf.
+    /// Leaves of 1 to dozens of entries (one- and two-byte array heads), the
+    /// encoder reused from leaf to leaf.
     #[test]
     fn leaf_encoder_and_trusted_decode_match() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
@@ -2416,15 +2271,10 @@ mod tests {
             let n = decode_node(b, c).unwrap();
             if n.height == 0 {
                 enc.clear();
-                let mut recs: Vec<(Arc<[u8]>, Cid)> = Vec::new();
                 for e in &n.entries {
                     let Entry::Value { key, val } = e else { panic!() };
                     enc.push(key, val);
-                    recs.push((key.clone(), *val));
                 }
-                let mut want = Vec::new();
-                encode_leaf(&recs, &mut want);
-                assert_eq!(want, b);
                 assert_eq!(enc.finish(), b);
                 leaves += 1;
             } else {
@@ -2437,12 +2287,13 @@ mod tests {
         .unwrap();
         assert!(leaves > 500 && interior > 100, "{leaves} leaves, {interior} interior");
         let mut big = LeafEncoder::default();
-        let recs: Vec<(Arc<[u8]>, Cid)> = (0..30u32).map(|i| (Arc::from(format!("a/{i:03}").as_bytes()), leaf())).collect();
-        for (k, v) in &recs {
-            big.push(k, v);
+        let entries: Vec<Entry> = (0..30u32).map(|i| Entry::Value { key: Arc::from(format!("a/{i:03}").as_bytes()), val: leaf() }).collect();
+        for e in &entries {
+            let Entry::Value { key, val } = e else { unreachable!() };
+            big.push(key, val);
         }
         let mut want = Vec::new();
-        encode_leaf(&recs, &mut want);
+        encode_node(&Node::clean(0, entries, None), &mut want).unwrap();
         assert_eq!(big.finish(), &want[..]);
     }
 }

@@ -1,18 +1,11 @@
-//! Lazy MSTs over SlateDB (DESIGN.md "Partial MSTs"): the [`Source`]s a
-//! [`LazyTree`](crate::mst_lazy::LazyTree) loads from.
+//! The SlateDB [`Source`]s a [`LazyTree`](crate::mst_lazy::LazyTree) loads
+//! from (DESIGN.md "Partial MSTs"): interior nodes from `M/` by CID, leaves
+//! rebuilt from `R/` range scans bounded by the separator keys above them.
 //!
-//! - `M/{did}\0{cid}` holds the interior nodes (height >= 1) of the repo's
-//!   current tree, read by the CID a parent links to (hash-checked by the
-//!   tree);
-//! - leaves are rebuilt from `R/` range scans bounded by the separator keys
-//!   above them.
-//!
-//! The sources are synchronous (the tree code is): they block on the tokio
-//! runtime with `Handle::block_on`, so they run on a repo worker thread or
-//! the blocking pool, never on a runtime thread. The worker avoids blocking
-//! itself: a [`DbSource`] without `io` fails with `MstError::NotLoaded`
-//! instead of reading, and the worker then loads the paths on the blocking
-//! pool ([`fetch`]) before it applies the writes.
+//! The sources are synchronous (the tree code is) and block on the runtime
+//! with `Handle::block_on`, so they run on the blocking pool, never on a
+//! runtime thread. The worker's own pass uses [`CachedOnly`], which fails
+//! with `MstError::NotLoaded` instead of reading.
 
 use crate::cid::{Cid, CODEC_DAG_CBOR};
 use crate::metrics;
@@ -26,20 +19,15 @@ use std::sync::Arc;
 
 type Result<T> = std::result::Result<T, MstError>;
 
-// ---------- node cache ----------
-
-/// Nodes loaded from the store (interior nodes from `M/`, leaves rebuilt
-/// from `R/`), shared by every lazy walk in the process: readers' proof
-/// walks, getBlocks and the workers' fetches. Nodes are content-addressed,
-/// so an entry is right for any repo version that links to it (no
-/// invalidation); each is shallow (children unloaded). LRU per shard,
-/// bounded by approximate bytes (`--lazy-mst-node-cache-mb`).
+/// Loaded nodes shared by every lazy walk in the process. Nodes are
+/// content-addressed, so an entry is right for any repo version that links
+/// to it (no invalidation); each is shallow (children unloaded).
 pub struct NodeCache {
     shards: Vec<parking_lot::Mutex<CacheShard>>,
     shard_bytes: std::sync::atomic::AtomicUsize,
 }
 
-/// An LRU of nodes by CID and its approximate bytes.
+/// The LRU and its approximate bytes.
 type CacheShard = (lru::LruCache<Cid, Arc<Node>>, usize);
 
 const NODE_CACHE_SHARDS: usize = 32;
@@ -51,7 +39,7 @@ pub static NODE_CACHE: std::sync::LazyLock<NodeCache> = std::sync::LazyLock::new
 });
 
 impl NodeCache {
-    /// The budget (0 = off).
+    /// 0 turns the cache off.
     pub fn set_bytes(&self, n: usize) {
         self.shard_bytes.store(n / NODE_CACHE_SHARDS, std::sync::atomic::Ordering::Relaxed);
     }
@@ -60,12 +48,10 @@ impl NodeCache {
         &self.shards[c.digest[0] as usize % NODE_CACHE_SHARDS]
     }
 
-    /// Approximate bytes held.
     pub fn bytes(&self) -> usize {
         self.shards.iter().map(|s| s.lock().1).sum()
     }
 
-    /// Drops every entry (tests).
     pub fn clear(&self) {
         for s in &self.shards {
             *s.lock() = (lru::LruCache::unbounded(), 0);
@@ -96,44 +82,37 @@ impl NodeCache {
     }
 }
 
-/// Persisted nodes read ahead of a walk (one scan of the repo's `M/` range).
+/// Persisted nodes read ahead of a walk by one scan of the repo's `M/` range.
 pub type Prefetched = HashMap<Cid, Arc<[u8]>>;
 
 fn store_err(e: impl std::fmt::Display) -> MstError {
     MstError::Store(e.to_string())
 }
 
-/// Nodes and records of one repo in a SlateDB (the live DB or a snapshot).
+/// One repo in the live DB or a snapshot.
 pub struct DbSource<'a, R: DbReadOps + Sync + ?Sized> {
     pub db: &'a R,
     pub did: &'a str,
     pub rt: &'a tokio::runtime::Handle,
-    /// Nodes already read (a prefetch of the `M/` range); misses read `db`.
+    /// Misses read `db`.
     pub prefetched: Option<&'a Prefetched>,
-    /// false: never read (`NotLoaded` instead).
-    pub io: bool,
-    /// Reads made (node point reads + record scans).
+    /// Node point reads + record scans.
     pub reads: Cell<u64>,
 }
 
 impl<'a, R: DbReadOps + Sync + ?Sized> DbSource<'a, R> {
     pub fn new(db: &'a R, did: &'a str, rt: &'a tokio::runtime::Handle) -> Self {
-        DbSource { db, did, rt, prefetched: None, io: true, reads: Cell::new(0) }
+        DbSource { db, did, rt, prefetched: None, reads: Cell::new(0) }
     }
 
     pub fn with_prefetched(mut self, p: Option<&'a Prefetched>) -> Self {
         self.prefetched = p;
         self
     }
-
-    pub fn no_io(mut self) -> Self {
-        self.io = false;
-        self
-    }
 }
 
-/// The node cache alone: a walk that needs anything else fails with
-/// `NotLoaded` (the repo worker's no-I/O pass).
+/// The node cache alone: anything else fails with `NotLoaded` (the repo
+/// worker's no-I/O pass).
 pub struct CachedOnly;
 
 impl Source for CachedOnly {
@@ -148,7 +127,7 @@ impl Source for CachedOnly {
     }
 }
 
-/// `R/` keys of `did` strictly between `lo` and `hi` (None = open).
+/// Strictly between `lo` and `hi` (None = open).
 fn record_range(did: &str, lo: Option<&[u8]>, hi: Option<&[u8]>) -> std::ops::Range<Vec<u8>> {
     let prefix = state::record_prefix(did);
     let start = match lo {
@@ -163,10 +142,24 @@ fn record_range(did: &str, lo: Option<&[u8]>, hi: Option<&[u8]>) -> std::ops::Ra
     start..end
 }
 
-fn push_record(prefix_len: usize, kv: &slatedb::KeyValue, out: &mut Vec<(Key, Cid)>) -> Result<()> {
+fn record_entry(prefix_len: usize, kv: &slatedb::KeyValue) -> Result<(Key, Cid)> {
     let (cid, _) = state::decode_record_value(&kv.value).map_err(store_err)?;
-    out.push((Arc::from(&kv.key[prefix_len..]), cid));
+    Ok((Arc::from(&kv.key[prefix_len..]), cid))
+}
+
+/// Scans `did`'s records strictly between `lo` and `hi`.
+async fn scan_records<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()> {
+    let plen = state::record_prefix(did).len();
+    let mut it = state::BatchedScan::new(db.scan(record_range(did, lo, hi)).await.map_err(store_err)?);
+    while let Some(kv) = it.next().await.map_err(store_err)? {
+        out.push(record_entry(plen, &kv)?);
+    }
     Ok(())
+}
+
+/// For scans read to their end.
+fn read_ahead_opts() -> slatedb::config::ScanOptions {
+    slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, cache_blocks: true, ..Default::default() }
 }
 
 impl<R: DbReadOps + Sync + ?Sized> Source for DbSource<'_, R> {
@@ -182,9 +175,6 @@ impl<R: DbReadOps + Sync + ?Sized> Source for DbSource<'_, R> {
         if let Some(b) = self.prefetched.and_then(|p| p.get(cid)) {
             return Ok(Some(b.clone()));
         }
-        if !self.io {
-            return Err(MstError::NotLoaded);
-        }
         self.reads.set(self.reads.get() + 1);
         metrics::LAZY_MST_READS.with_label_values(&["node"]).inc();
         let v = self.rt.block_on(self.db.get(state::mst_node_key(self.did, cid))).map_err(store_err)?;
@@ -192,26 +182,15 @@ impl<R: DbReadOps + Sync + ?Sized> Source for DbSource<'_, R> {
     }
 
     fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()> {
-        if !self.io {
-            return Err(MstError::NotLoaded);
-        }
         self.reads.set(self.reads.get() + 1);
         metrics::LAZY_MST_READS.with_label_values(&["leaf"]).inc();
-        let range = record_range(self.did, lo, hi);
-        let plen = state::record_prefix(self.did).len();
-        self.rt.block_on(async {
-            let mut it = state::BatchedScan::new(self.db.scan(range).await.map_err(store_err)?);
-            while let Some(kv) = it.next().await.map_err(store_err)? {
-                push_record(plen, &kv, out)?;
-            }
-            Ok(())
-        })
+        self.rt.block_on(scan_records(self.db, self.did, lo, hi, out))
     }
 }
 
-/// A source whose record ranges come from one forward scan of the repo's
-/// `R/` range (asked for in key order: an export's or a full load's
-/// pre-order walk), nodes from `nodes`.
+/// Record ranges from one forward scan of the repo's `R/` range, for walks
+/// that ask for them in key order (an export's or a full load's pre-order
+/// walk).
 pub struct ScanSource<'a, N: Source> {
     pub nodes: N,
     rt: &'a tokio::runtime::Handle,
@@ -223,11 +202,10 @@ pub struct ScanSource<'a, N: Source> {
 }
 
 impl<'a, N: Source> ScanSource<'a, N> {
-    /// Opens the scan of `did`'s records on `db` (blocking).
+    /// Blocking.
     pub fn open<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, nodes: N, rt: &'a tokio::runtime::Handle) -> Result<Self> {
         let prefix = state::record_prefix(did);
-        let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, cache_blocks: true, ..Default::default() };
-        let iter = rt.block_on(db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts)).map_err(store_err)?;
+        let iter = rt.block_on(db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &read_ahead_opts())).map_err(store_err)?;
         Ok(ScanSource { nodes, rt, prefix_len: prefix.len(), iter: RefCell::new(state::BatchedScan::new(iter)), peeked: RefCell::new(None), done: Cell::new(false) })
     }
 
@@ -244,11 +222,7 @@ impl<'a, N: Source> ScanSource<'a, N> {
             None => self.rt.block_on(it.next()).map_err(store_err)?,
         };
         match next {
-            Some(kv) => {
-                let mut v = Vec::with_capacity(1);
-                push_record(self.prefix_len, &kv, &mut v)?;
-                Ok(v.pop())
-            }
+            Some(kv) => record_entry(self.prefix_len, &kv).map(Some),
             None => {
                 self.done.set(true);
                 Ok(None)
@@ -263,37 +237,25 @@ impl<N: Source> Source for ScanSource<'_, N> {
         self.nodes.node(cid)
     }
 
+    /// Records at or below `lo` are skipped (a range the caller had
+    /// loaded); the first at or above `hi` stays for the next range.
     fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()> {
-        forward_range(|| self.next(), &self.peeked, lo, hi, out)
+        while let Some((k, c)) = self.next()? {
+            if lo.is_some_and(|lo| &k[..] <= lo) {
+                continue;
+            }
+            if hi.is_some_and(|hi| &k[..] >= hi) {
+                *self.peeked.borrow_mut() = Some((k, c));
+                break;
+            }
+            out.push((k, c));
+        }
+        Ok(())
     }
 }
 
-/// The records of a forward stream in (`lo`, `hi`): those below `lo` are
-/// skipped (a range the caller had loaded), the first at or above `hi` is
-/// kept in `peeked` for the next range.
-fn forward_range(
-    mut next: impl FnMut() -> Result<Option<(Key, Cid)>>,
-    peeked: &RefCell<Option<(Key, Cid)>>,
-    lo: Option<&[u8]>,
-    hi: Option<&[u8]>,
-    out: &mut Vec<(Key, Cid)>,
-) -> Result<()> {
-    while let Some((k, c)) = next()? {
-        if lo.is_some_and(|lo| &k[..] <= lo) {
-            continue;
-        }
-        if hi.is_some_and(|hi| &k[..] >= hi) {
-            *peeked.borrow_mut() = Some((k, c));
-            break;
-        }
-        out.push((k, c));
-    }
-    Ok(())
-}
-
-/// A batch of a repo's records in key order for a [`FedSource`]: the keys
-/// back to back in one buffer (no allocation per record), each record's
-/// key end and CID.
+/// Records in key order, the keys back to back in one buffer (no allocation
+/// per record).
 #[derive(Default)]
 pub struct Records {
     keys: Vec<u8>,
@@ -328,16 +290,15 @@ impl Records {
     }
 }
 
-/// A batch of records for a [`FedSource`], or the scan's error.
 pub type RecordBatch = std::result::Result<Records, String>;
 
-/// [`ScanSource`] fed by a producer on the runtime (one forward `R/` scan
-/// in batches, `export_repo`): the scan runs ahead of the walk instead of
-/// one `block_on` per record on the walking thread.
+/// [`ScanSource`] fed by a producer on the runtime (`export_repo`), so the
+/// scan runs ahead of the walk instead of one `block_on` per record on the
+/// walking thread.
 pub struct FedSource<N: Source> {
     pub nodes: N,
     rx: RefCell<tokio::sync::mpsc::Receiver<RecordBatch>>,
-    /// The batch being read, and its next record.
+    /// The batch being read and its next record.
     cur: RefCell<(Records, usize)>,
 }
 
@@ -346,10 +307,9 @@ impl<N: Source> FedSource<N> {
         FedSource { nodes, rx: RefCell::new(rx), cur: RefCell::new((Records::default(), 0)) }
     }
 
-    /// Hands `f` the records in (`lo`, `hi`) in key order: those at or
-    /// below `lo` are skipped (a range the caller had, or the parent's own
-    /// keys), the first at or above `hi` stays for the next range. Blocking
-    /// (the blocking pool only).
+    /// Records at or below `lo` are skipped (a range the caller had, or the
+    /// parent's own keys); the first at or above `hi` stays for the next
+    /// range. Blocking.
     fn range(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, mut f: impl FnMut(&[u8], &Cid)) -> Result<()> {
         let mut cur = self.cur.borrow_mut();
         let (batch, pos) = &mut *cur;
@@ -388,18 +348,16 @@ impl<N: Source> Source for FedSource<N> {
     }
 }
 
-/// Reads `did`'s persisted nodes with one scan of its contiguous `M/`
-/// range, up to `max_bytes` (0 = none). The whole range of an average
-/// active repo is ~0.5 MB: one read instead of 7-11 dependent ones. Returns
-/// the nodes and whether the range was read to its end.
+/// One scan of `did`'s `M/` range, up to `max_bytes` (0 = none), instead of
+/// 7-11 dependent node reads. Also returns whether the range was read to its
+/// end.
 pub async fn prefetch<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, max_bytes: usize) -> anyhow::Result<(Prefetched, bool)> {
     let mut out = Prefetched::new();
     if max_bytes == 0 {
         return Ok((out, false));
     }
     let prefix = state::mst_node_prefix(did);
-    let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, cache_blocks: true, ..Default::default() };
-    let mut it = state::BatchedScan::new(db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await?);
+    let mut it = state::BatchedScan::new(db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &read_ahead_opts()).await?);
     let mut bytes = 0;
     while let Some(kv) = it.next().await? {
         let Ok(digest) = <[u8; 32]>::try_from(&kv.key[prefix.len()..]) else { continue };
@@ -414,11 +372,9 @@ pub async fn prefetch<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, max_bytes
     Ok((out, true))
 }
 
-/// `Tree::proof_blocks` of `key` on a lazy tree at `root`, without blocking:
-/// unloaded children are read from `db` (a snapshot at the tree's version:
-/// `M/` nodes, leaves rebuilt from an `R/` range), each checked against its
-/// link, into nothing shared (the tree isn't touched). The node at the end
-/// of the path holds `key`, if any node does.
+/// `Tree::proof_blocks` of `key` on a lazy tree at `root`, without blocking
+/// and without touching the tree: unloaded children are read from `db` (a
+/// snapshot at the tree's version), each checked against its link.
 pub async fn proof_blocks<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R, did: &str, key: &[u8]) -> Result<Vec<(Cid, Vec<u8>)>> {
     let mut out = Vec::new();
     walk_path(root, db, did, key, &mut |n| {
@@ -429,14 +385,11 @@ pub async fn proof_blocks<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R
     Ok(out)
 }
 
-/// The node at the end of `key`'s path (see [`proof_blocks`]): the leaf, or
-/// the node holding `key`.
+/// The leaf, or the node holding `key`.
 pub async fn path_end<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R, did: &str, key: &[u8]) -> Result<Arc<Node>> {
     walk_path(root, db, did, key, &mut |_| Ok(())).await
 }
 
-/// Walks `key`'s path from `root` (see [`proof_blocks`]), visiting each
-/// node; returns the last.
 async fn walk_path<R: DbReadOps + Sync + ?Sized>(
     root: &Arc<Node>,
     db: &R,
@@ -465,19 +418,14 @@ async fn walk_path<R: DbReadOps + Sync + ?Sized>(
     Err(MstError::Invalid("tree too deep"))
 }
 
-/// The leaf at entry `want` of the height-1 node `n` (keys in (`lo`,
-/// `hi`)), with its unloaded siblings: one scan of `n`'s record range
-/// rebuilds them all (a range scan costs mostly its setup), and each that
-/// matches its link is cached. Proofs and getBlocks of nearby keys then
-/// find their leaves cached.
+/// The leaf at entry `want` of the height-1 node `n`. One scan of `n`'s
+/// record range rebuilds its unloaded siblings too (a range scan costs
+/// mostly its setup), and those that match their links are cached for
+/// nearby proofs and getBlocks.
 async fn load_leaves<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, n: &Node, lo: Option<&[u8]>, hi: Option<&[u8]>, want: usize) -> Result<Arc<Node>> {
     metrics::LAZY_MST_READS.with_label_values(&["leaf"]).inc();
-    let plen = state::record_prefix(did).len();
     let mut recs = Vec::new();
-    let mut it = state::BatchedScan::new(db.scan(record_range(did, lo, hi)).await.map_err(store_err)?);
-    while let Some(kv) = it.next().await.map_err(store_err)? {
-        push_record(plen, &kv, &mut recs)?;
-    }
+    scan_records(db, did, lo, hi, &mut recs).await?;
     let mut pos = 0;
     let mut found = None;
     for (i, e) in n.entries.iter().enumerate() {
@@ -511,8 +459,8 @@ async fn load_leaves<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, n: &Node, 
     found.ok_or(MstError::Partial)
 }
 
-/// An unloaded child (async [`DbSource`] + `load_subtree`): interior from
-/// `M/`, a leaf (or a missing interior node) rebuilt from its record range.
+/// Interior nodes from `M/`; a leaf (or a missing interior node) rebuilt
+/// from its record range.
 async fn load_child<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, cid: &Cid, height: i32, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<Arc<Node>> {
     if let Some(n) = NODE_CACHE.get(cid).filter(|n| n.height == height) {
         return Ok(n);
@@ -532,11 +480,7 @@ async fn load_child_uncached<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, ci
         }
     }
     metrics::LAZY_MST_READS.with_label_values(&["leaf"]).inc();
-    let plen = state::record_prefix(did).len();
     let mut recs = Vec::new();
-    let mut it = state::BatchedScan::new(db.scan(record_range(did, lo, hi)).await.map_err(store_err)?);
-    while let Some(kv) = it.next().await.map_err(store_err)? {
-        push_record(plen, &kv, &mut recs)?;
-    }
+    scan_records(db, did, lo, hi, &mut recs).await?;
     crate::mst_lazy::rebuilt_subtree(&recs, height, cid)
 }

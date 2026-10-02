@@ -1,30 +1,16 @@
-//! Partial, lazily loaded MSTs (DESIGN.md "Partial MSTs"). The repo worker
-//! keeps every repo's tree as a [`LazyTree`]: only the visited paths are
-//! loaded (from `M/` and `R/`, `crate::mst_store`).
+//! Partial, lazily loaded MSTs (DESIGN.md "Partial MSTs"): an
+//! [`mst::Tree`](crate::mst::Tree) whose unvisited subtrees stay unloaded
+//! (`Entry::Child { node: None, cid }`). Nodes of height >= `persist_min`
+//! are persisted content-addressed and read by the CID their parent links
+//! to; lower subtrees are rebuilt from the records between the parent's
+//! separator keys (the MST layout is a pure function of the keys). Both are
+//! checked against the parent's link.
 //!
-//! A repo's tree is kept as an [`mst::Tree`](crate::mst::Tree) whose
-//! unvisited subtrees stay unloaded (`Entry::Child { node: None, cid }`).
-//! Nodes are loaded on demand from a [`Source`]:
-//! - nodes of height >= `persist_min` are persisted content-addressed (in
-//!   the real layout `M/{did}\0{cid}` -> node block, written in the same
-//!   state batch as the commit's `R/` and `h/` rows) and read by the CID
-//!   their parent links to, hash-checked;
-//! - lower subtrees (the leaves, at `persist_min = 1`) are rebuilt from the
-//!   records in their key range (an `R/` range scan bounded by the parent's
-//!   separator keys: the MST layout is a pure function of the keys) and
-//!   checked against the parent's link.
-//!
-//! Mutations, CIDs and proof blocks are `mst::Tree`'s own code: this module
-//! only makes sure every node an operation visits is loaded first, namely
-//! the search paths of the key and of its two neighbours in key order (the
-//! predecessor's path is the right spine a delete merges, the successor's the
-//! left spine, and `prove_mutation` only walks the key's own path). It then
-//! derives the persistence diff: new persisted nodes to put, and replaced
-//! ones to delete (every replaced node lies on those paths, so a check of
-//! the nodes seen there against the new tree finds them all).
-//!
-//! `persist_min` = 0 is option (a) (every node persisted), 1 option (b)
-//! (interior nodes), 2 the hybrid (height-1 subtrees rebuilt from records).
+//! Mutations, CIDs and proofs are `mst::Tree`'s own code: this module loads
+//! every node an operation visits first, namely the search paths of the key
+//! and of its two neighbours (the right and left spines a delete merges).
+//! Every replaced node lies on those paths, so checking the nodes seen there
+//! against the new tree finds all persisted nodes to delete.
 
 use crate::cid::Cid;
 use crate::mst::{decode_node, decode_trusted_node, encode_node, height_for_key, Entry, LeafEncoder, MstError, Node, Tree, MAX_DEPTH};
@@ -37,26 +23,18 @@ type Result<T> = std::result::Result<T, MstError>;
 /// A record key (`collection/rkey`).
 pub type Key = Arc<[u8]>;
 
-/// Where the lazy tree reads from: SlateDB in the real thing
-/// (`crate::mst_store`). A source that may not do I/O right now fails with
-/// [`MstError::NotLoaded`].
+/// A source that may not do I/O right now fails with [`MstError::NotLoaded`].
 pub trait Source {
-    /// A node loaded before (`mst_store::NODE_CACHE`): content-addressed,
-    /// so right wherever its CID is linked.
+    /// Content-addressed, so right wherever its CID is linked.
     fn cached(&self, _cid: &Cid) -> Option<Arc<Node>> {
         None
     }
-    /// Offers a node this source loaded to that cache.
     fn remember(&self, _n: &Arc<Node>) {}
-    /// A persisted node block by CID (`M/{did}\0{cid}` point read).
     fn node(&self, cid: &Cid) -> Result<Option<Arc<[u8]>>>;
-    /// Records with `lo < key < hi` in key order (`R/` range scan; `None`
-    /// bounds are open).
+    /// Records with `lo < key < hi` in key order (`None` bounds are open).
     fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()>;
-    /// [`records`](Source::records) as a leaf's entries: `enc` (cleared
-    /// first) gets them in key order. An export's leaves; a source
-    /// streaming its records encodes them from its buffers, without a key
-    /// copy per record.
+    /// [`records`](Source::records) into a cleared `enc`. A source streaming
+    /// its records can encode them without a key copy per record.
     fn leaf_records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, enc: &mut LeafEncoder) -> Result<()> {
         let mut recs = Vec::new();
         self.records(lo, hi, &mut recs)?;
@@ -68,24 +46,20 @@ pub trait Source {
     }
 }
 
-/// What loading cost (cumulative per [`LazyTree`] or export).
+/// Cumulative per [`LazyTree`] or export.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LoadStats {
-    /// Persisted node point reads, and their bytes.
     pub node_reads: u64,
     pub node_bytes: u64,
-    /// Record range scans, and the records they returned.
     pub scans: u64,
     pub scanned_records: u64,
     /// Persisted nodes that were missing and rebuilt from records instead.
     pub fallbacks: u64,
 }
 
-/// The persisted-node changes of one commit.
 #[derive(Clone, Debug, Default)]
 pub struct Persist {
-    /// The written nodes at persisted heights, in write order (re-puts of
-    /// unchanged proof neighbours included: idempotent).
+    /// In write order, re-puts of unchanged proof neighbours included.
     pub puts: Vec<(Cid, Vec<u8>)>,
     pub deletes: Vec<Cid>,
 }
@@ -96,13 +70,11 @@ impl Persist {
     }
 }
 
-// ---------- building subtrees from records ----------
-
-/// Finishes a node: encodes it and computes its CID (internal nodes keep
-/// their block, as `mst::Tree` does after a write; leaves too with
-/// `keep_leaves`, for an export that emits them next).
+/// Encodes the node and computes its CID. Internal nodes keep their block,
+/// as `mst::Tree` does after a write; leaves too with `keep_leaves`, for an
+/// export that emits them next.
 fn finish(height: i32, entries: Vec<Entry>, keep_leaves: bool) -> Result<Arc<Node>> {
-    let mut n = Node { height, entries, cid: None, dirty: false, stub: false, bytes: None };
+    let mut n = Node::clean(height, entries, None);
     let mut buf = Vec::with_capacity(64 + n.entries.len() * 80);
     encode_node(&n, &mut buf)?;
     n.cid = Some(Cid::dag_cbor(&buf));
@@ -113,14 +85,9 @@ fn finish(height: i32, entries: Vec<Entry>, keep_leaves: bool) -> Result<Arc<Nod
 }
 
 /// The canonical subtree at `height` holding exactly `recs` (sorted, with
-/// `heights[i] = height_for_key(recs[i].0)`, all <= `height`), CIDs computed.
-/// A key range of an MST is a pure function of its keys: every key of
+/// `heights[i] = height_for_key(recs[i].0)`, all <= `height`): every key of
 /// height `height` is an entry, every non-empty gap between them a child.
-pub fn build(recs: &[(Key, Cid)], heights: &[i32], height: i32) -> Result<Arc<Node>> {
-    build_with(recs, heights, height, false)
-}
-
-fn build_with(recs: &[(Key, Cid)], heights: &[i32], height: i32, keep_leaves: bool) -> Result<Arc<Node>> {
+fn build(recs: &[(Key, Cid)], heights: &[i32], height: i32, keep_leaves: bool) -> Result<Arc<Node>> {
     if height < 0 || height as usize > 4 * MAX_DEPTH {
         return Err(MstError::Invalid("bad subtree height"));
     }
@@ -133,33 +100,28 @@ fn build_with(recs: &[(Key, Cid)], heights: &[i32], height: i32, keep_leaves: bo
             std::cmp::Ordering::Equal => {}
         }
         if start < i {
-            let c = build_with(&recs[start..i], &heights[start..i], height - 1, keep_leaves)?;
+            let c = build(&recs[start..i], &heights[start..i], height - 1, keep_leaves)?;
             entries.push(Entry::Child { cid: c.cid, node: Some(c) });
         }
         entries.push(Entry::Value { key: recs[i].0.clone(), val: recs[i].1 });
         start = i + 1;
     }
     if start < recs.len() {
-        let c = build_with(&recs[start..], &heights[start..], height - 1, keep_leaves)?;
+        let c = build(&recs[start..], &heights[start..], height - 1, keep_leaves)?;
         entries.push(Entry::Child { cid: c.cid, node: Some(c) });
     }
     finish(height, entries, keep_leaves)
 }
 
-/// A whole tree built from all of a repo's records (sorted): the cold-load
-/// fallback, and the backfill of a repo without persisted nodes.
+/// From all of a repo's records, sorted.
 pub fn build_tree(recs: &[(Key, Cid)]) -> Result<Tree> {
     let heights: Vec<i32> = recs.iter().map(|(k, _)| height_for_key(k)).collect();
     let h = heights.iter().copied().max().unwrap_or(0);
     let mut t = Tree::new();
-    t.root = build(recs, &heights, h)?;
+    t.root = build(recs, &heights, h, false)?;
     Ok(t)
 }
 
-// ---------- loading ----------
-
-/// A persisted node, hash-checked, with its height fixed (a node without
-/// keys of its own takes it from its parent).
 fn read_node(src: &dyn Source, cid: &Cid, height: Option<i32>, stats: &mut LoadStats) -> Result<Option<Arc<Node>>> {
     let Some(b) = src.node(cid)? else { return Ok(None) };
     stats.node_reads += 1;
@@ -167,9 +129,9 @@ fn read_node(src: &dyn Source, cid: &Cid, height: Option<i32>, stats: &mut LoadS
     persisted_node(b, cid, height)
 }
 
-/// A persisted node's block `b` (read by `cid`), hash-checked, with its
-/// height fixed (`height`: the parent's minus one; a node without keys
-/// takes it). None for a key-less root (the empty tree's).
+/// Hash-checked, with its height fixed (`height`: the parent's minus one;
+/// a node without keys takes it). None for a key-less root (the empty
+/// tree's).
 pub fn persisted_node(b: Arc<[u8]>, cid: &Cid, height: Option<i32>) -> Result<Option<Arc<Node>>> {
     if Cid::dag_cbor(&b) != *cid {
         return Err(MstError::Invalid("persisted node doesn't hash to its cid"));
@@ -179,9 +141,7 @@ pub fn persisted_node(b: Arc<[u8]>, cid: &Cid, height: Option<i32>) -> Result<Op
 }
 
 /// [`persisted_node`] without the hash check or the keys' heights, for an
-/// export's nodes below the root (see [`export_blocks`]): `b` is a block
-/// this PDS encoded and hashed before writing it under `cid`, read back
-/// through SlateDB's per-block CRC32.
+/// export's nodes below the root (see [`export_blocks`]).
 fn trusted_node(b: Arc<[u8]>, cid: &Cid, height: i32) -> Result<Option<Arc<Node>>> {
     let n = decode_trusted_node(&b, *cid, height)?;
     fix_height(b, n, Some(height))
@@ -194,7 +154,6 @@ fn fix_height(b: Arc<[u8]>, mut n: Node, height: Option<i32>) -> Result<Option<A
         _ => {}
     }
     if n.height < 0 {
-        // a key-less root: only the empty tree, rebuilt from records
         return Ok(None);
     }
     if n.height >= 1 {
@@ -203,8 +162,8 @@ fn fix_height(b: Arc<[u8]>, mut n: Node, height: Option<i32>) -> Result<Option<A
     Ok(Some(Arc::new(n)))
 }
 
-/// The subtree at `height` whose CID is `cid` and whose keys lie strictly
-/// between `lo` and `hi`: read if persisted, else rebuilt from records.
+/// The subtree whose keys lie strictly between `lo` and `hi`: read if
+/// persisted, else rebuilt from records.
 fn load_subtree(
     src: &dyn Source,
     persist_min: i32,
@@ -217,11 +176,14 @@ fn load_subtree(
     if let Some(n) = src.cached(&cid).filter(|n| n.height == height) {
         return Ok(n);
     }
-    let n = load_subtree_uncached(src, persist_min, cid, height, lo, hi, stats)?;
+    let n = load_subtree_uncached(src, persist_min, cid, height, lo, hi, stats, false)?;
     src.remember(&n);
     Ok(n)
 }
 
+/// `export`: the node is trusted (see [`trusted_node`]) and rebuilt leaves
+/// keep their blocks (emitted right after).
+#[allow(clippy::too_many_arguments)]
 fn load_subtree_uncached(
     src: &dyn Source,
     persist_min: i32,
@@ -230,29 +192,42 @@ fn load_subtree_uncached(
     lo: Option<&[u8]>,
     hi: Option<&[u8]>,
     stats: &mut LoadStats,
+    export: bool,
 ) -> Result<Arc<Node>> {
     if height >= persist_min {
-        if let Some(n) = read_node(src, &cid, Some(height), stats)? {
-            return Ok(n);
+        if let Some(b) = src.node(&cid)? {
+            stats.node_reads += 1;
+            stats.node_bytes += b.len() as u64;
+            let n = match export {
+                true => trusted_node(b, &cid, height)?,
+                false => persisted_node(b, &cid, Some(height))?,
+            };
+            if let Some(n) = n {
+                return Ok(n);
+            }
         }
         stats.fallbacks += 1;
     }
+    let recs = scan(src, lo, hi, stats)?;
+    rebuilt_subtree_with(&recs, height, &cid, export)
+}
+
+fn scan(src: &dyn Source, lo: Option<&[u8]>, hi: Option<&[u8]>, stats: &mut LoadStats) -> Result<Vec<(Key, Cid)>> {
     let mut recs = Vec::new();
     src.records(lo, hi, &mut recs)?;
     stats.scans += 1;
     stats.scanned_records += recs.len() as u64;
-    rebuilt_subtree(&recs, height, &cid)
+    Ok(recs)
 }
 
-/// The subtree at `height` holding exactly `recs` (a record range scan
-/// bounded by the separators above it), checked against its link `cid`.
+/// The subtree at `height` holding exactly `recs`, checked against its link.
 pub fn rebuilt_subtree(recs: &[(Key, Cid)], height: i32, cid: &Cid) -> Result<Arc<Node>> {
     rebuilt_subtree_with(recs, height, cid, false)
 }
 
 fn rebuilt_subtree_with(recs: &[(Key, Cid)], height: i32, cid: &Cid, keep_leaves: bool) -> Result<Arc<Node>> {
     let heights: Vec<i32> = recs.iter().map(|(k, _)| height_for_key(k)).collect();
-    let n = build_with(recs, &heights, height, keep_leaves)?;
+    let n = build(recs, &heights, height, keep_leaves)?;
     if n.cid != Some(*cid) {
         return Err(MstError::Invalid("subtree rebuilt from records doesn't match its link"));
     }
@@ -264,27 +239,24 @@ fn rebuilt_subtree_with(recs: &[(Key, Cid)], height: i32, cid: &Cid, keep_leaves
 /// None where the path ends (`key` is here, or would be).
 pub fn proof_child(n: &Node, key: &[u8], lo: &Option<Key>, hi: &Option<Key>) -> Option<(usize, Option<Key>, Option<Key>)> {
     let Loc::Gap(Some(i)) = locate(n, key) else { return None };
-    let clo = if i > 0 { value_key(n.entries.get(i - 1)) } else { lo.clone() };
-    let chi = value_key(n.entries.get(i + 1)).or_else(|| hi.clone());
+    let (clo, chi) = child_bounds(n, i, lo, hi);
     Some((i, clo, chi))
 }
 
-/// A written node's block.
+/// The key bounds of child entry `i` of `n`, whose keys lie in (`lo`, `hi`).
+fn child_bounds(n: &Node, i: usize, lo: &Option<Key>, hi: &Option<Key>) -> (Option<Key>, Option<Key>) {
+    let clo = if i > 0 { value_key(n.entries.get(i - 1)) } else { lo.clone() };
+    let chi = value_key(n.entries.get(i + 1)).or_else(|| hi.clone());
+    (clo, chi)
+}
+
 pub fn node_block(n: &Node) -> Result<Vec<u8>> {
-    match &n.bytes {
-        Some(b) if !n.dirty => Ok(b.to_vec()),
-        _ => {
-            let mut buf = Vec::with_capacity(64 + n.entries.len() * 80);
-            encode_node(n, &mut buf)?;
-            Ok(buf)
-        }
-    }
+    Ok(n.block()?.into_owned())
 }
 
 enum Loc {
-    /// The key is entry `i` of this node.
     Found(usize),
-    /// The key falls in the gap at child entry `i` (None: an empty gap).
+    /// The child entry at the key's gap (None: an empty gap).
     Gap(Option<usize>),
 }
 
@@ -314,7 +286,7 @@ fn value_key(e: Option<&Entry>) -> Option<Key> {
     }
 }
 
-/// A key in the subtree of `n` (to find it again by position).
+/// To find `n` again by position.
 fn any_key(n: &Node) -> Option<Key> {
     for e in &n.entries {
         match e {
@@ -354,7 +326,6 @@ fn step(n: &Node, key: &[u8], mode: &mut Mode) -> Option<usize> {
     }
 }
 
-/// Which path a walk loads.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Mode {
     /// The key's search path (to the node holding it, or the bottom).
@@ -367,9 +338,7 @@ enum Mode {
     Max,
 }
 
-/// Approximate heap of the loaded part of a subtree: the node structs, entry
-/// vectors, key allocations and cached blocks (same accounting for full and
-/// lazy trees, so the two compare; not allocator-exact).
+/// Approximate heap of the loaded part of a subtree (not allocator-exact).
 pub fn heap_bytes(n: &Node) -> usize {
     let mut b = own_heap_bytes(n);
     for e in &n.entries {
@@ -380,7 +349,6 @@ pub fn heap_bytes(n: &Node) -> usize {
     b
 }
 
-/// [`heap_bytes`] of the node alone (its loaded children not counted).
 fn own_heap_bytes(n: &Node) -> usize {
     const ARC: usize = 16;
     let mut b = ARC + std::mem::size_of::<Node>() + n.entries.capacity() * std::mem::size_of::<Entry>();
@@ -396,9 +364,7 @@ fn own_heap_bytes(n: &Node) -> usize {
 }
 
 /// [`heap_bytes`] of successive versions of one tree, walking only what
-/// changed since the last call: the repo worker recharges a repo after
-/// every commit, and a full walk of its loaded paths (up to ~1 MiB of
-/// nodes) per commit was 6-8% of a node's CPU at saturation.
+/// changed since the last call (the worker recharges a repo every commit).
 ///
 /// It keeps the tree it last measured (`root`) and the subtree size of
 /// each of its interior nodes by address. Holding `root` freezes every
@@ -417,7 +383,6 @@ pub struct HeapMemo {
 }
 
 impl HeapMemo {
-    /// `heap_bytes(root)`.
     pub fn heap_bytes(&mut self, root: &Arc<Node>) -> usize {
         if self.root.as_ref().is_some_and(|r| Arc::ptr_eq(r, root)) {
             return self.total;
@@ -469,15 +434,7 @@ impl HeapMemo {
 pub fn loaded_blocks(n: &Node, want: &HashSet<Cid>, out: &mut Vec<(Cid, Vec<u8>)>) -> Result<()> {
     if let Some(c) = n.cid.filter(|c| want.contains(c)) {
         if !out.iter().any(|(o, _)| *o == c) {
-            let b = match &n.bytes {
-                Some(b) if !n.dirty => b.to_vec(),
-                _ => {
-                    let mut buf = Vec::new();
-                    encode_node(n, &mut buf)?;
-                    buf
-                }
-            };
-            out.push((c, b));
+            out.push((c, node_block(n)?));
         }
     }
     for e in &n.entries {
@@ -488,7 +445,6 @@ pub fn loaded_blocks(n: &Node, want: &HashSet<Cid>, out: &mut Vec<(Cid, Vec<u8>)
     Ok(())
 }
 
-/// Loaded nodes of a subtree.
 pub fn loaded_nodes(n: &Node) -> usize {
     1 + n
         .entries
@@ -503,20 +459,19 @@ pub fn loaded_nodes(n: &Node) -> usize {
 /// A repo's MST, loaded only along the paths operations have visited.
 #[derive(Clone)]
 pub struct LazyTree {
-    /// The partial tree (`mst::Tree` does every mutation and encoding).
     pub tree: Tree,
     persist_min: i32,
-    /// Persisted nodes (height >= persist_min, by their last written cid)
-    /// on this batch's mutation walks:
-    /// (cid, a key in the node's subtree, height). Replaced ones are deleted.
+    /// Persisted nodes on this batch's mutation walks, by their last written
+    /// cid: (cid, a key in the node's subtree, height). Replaced ones are
+    /// deleted.
     seen: Vec<(Cid, Key, i32)>,
     pub stats: LoadStats,
 }
 
 impl LazyTree {
-    /// Opens the tree at `root` with only its root node loaded (a repo
-    /// whose root isn't persisted is small, or lost its nodes: rebuilt from
-    /// all its records, and checked against `root`).
+    /// Only the root node is loaded. A repo whose root isn't persisted (an
+    /// empty one, or one that lost its nodes) is rebuilt from all its
+    /// records and checked against `root`.
     pub fn open(root: Cid, persist_min: i32, src: &dyn Source) -> Result<LazyTree> {
         let mut stats = LoadStats::default();
         let tree = match read_node(src, &root, None, &mut stats)? {
@@ -526,10 +481,7 @@ impl LazyTree {
                 t
             }
             None => {
-                let mut recs = Vec::new();
-                src.records(None, None, &mut recs)?;
-                stats.scans += 1;
-                stats.scanned_records += recs.len() as u64;
+                let recs = scan(src, None, None, &mut stats)?;
                 let t = build_tree(&recs)?;
                 if t.root.cid != Some(root) {
                     return Err(MstError::Invalid("tree rebuilt from records doesn't match its root"));
@@ -541,8 +493,7 @@ impl LazyTree {
     }
 
     /// A fully loaded tree whose nodes of height >= `persist_min` are
-    /// persisted (a new or imported repo, or one rebuilt from its records):
-    /// it can be unloaded and walked lazily from now on.
+    /// persisted: it can be unloaded and walked lazily from now on.
     pub fn loaded(tree: Tree, persist_min: i32) -> LazyTree {
         LazyTree { tree, persist_min, seen: Vec::new(), stats: LoadStats::default() }
     }
@@ -551,8 +502,8 @@ impl LazyTree {
         self.persist_min
     }
 
-    /// Loads one path (see [`Mode`]); with `note` (mutation walks), notes
-    /// the persisted nodes it passes as candidates for deletion.
+    /// With `note` (mutation walks), notes the persisted nodes it passes as
+    /// candidates for deletion.
     fn walk(&mut self, key: &[u8], mut mode: Mode, note: bool, src: &dyn Source) -> Result<()> {
         // most walks find their path loaded: check that without
         // `Arc::make_mut`, which copies every node shared with a view
@@ -586,8 +537,7 @@ impl LazyTree {
                 }
                 return Ok(());
             };
-            let clo = if idx > 0 { value_key(n.entries.get(idx - 1)) } else { lo.clone() };
-            let chi = value_key(n.entries.get(idx + 1)).or_else(|| hi.clone());
+            let (clo, chi) = child_bounds(n, idx, &lo, &hi);
             if let Entry::Child { node: None, cid } = &n.entries[idx] {
                 let c = cid.ok_or(MstError::Partial)?;
                 let child = load_subtree(src, persist_min, c, n.height - 1, clo.as_deref(), chi.as_deref(), stats)?;
@@ -602,8 +552,8 @@ impl LazyTree {
         Err(MstError::Invalid("tree too deep"))
     }
 
-    /// The walk of [`walk`](Self::walk) if every node on it is loaded:
-    /// the persisted nodes it notes (empty without `note`).
+    /// [`walk`](Self::walk)'s notes if every node on it is loaded, without
+    /// `Arc::make_mut`.
     fn loaded_path(&self, key: &[u8], mut mode: Mode, note: bool) -> Option<Vec<(Cid, Key, i32)>> {
         let mut n: &Node = &self.tree.root;
         let mut path = Vec::new();
@@ -631,18 +581,15 @@ impl LazyTree {
         None
     }
 
-    /// Loads everything a mutation at `key` visits: its own search path and
-    /// those of its neighbours.
     fn prepare(&mut self, key: &[u8], src: &dyn Source) -> Result<()> {
         self.walk(key, Mode::Key, true, src)?;
         self.walk(key, Mode::Before, true, src)?;
         self.walk(key, Mode::After, true, src)
     }
 
-    /// Loads what operations at `keys` will visit, without noting anything
-    /// (with a source that may not do I/O, the pass that finds what an
-    /// asynchronous fetch has to load first: [`MstError::NotLoaded`]).
-    /// A later batch op re-walks its paths for free.
+    /// Loads what operations at `keys` will visit, without noting anything.
+    /// With a source that may not do I/O, finds what an asynchronous fetch
+    /// has to load first ([`MstError::NotLoaded`]).
     pub fn fetch(&mut self, keys: &[&[u8]], probes: &[&[u8]], src: &dyn Source) -> Result<()> {
         for k in keys {
             self.walk(k, Mode::Key, false, src)?;
@@ -693,9 +640,8 @@ impl LazyTree {
         Err(MstError::Invalid("tree too deep"))
     }
 
-    /// Loads the whole tree (an account delete or repo import needs every
-    /// key and node of the current one). Unloaded subtrees come from `src` in
-    /// key order, so a [`Source`] over one forward record scan serves it.
+    /// Unloaded subtrees are asked for in key order, so a [`Source`] over
+    /// one forward record scan serves it.
     pub fn load_all(&mut self, src: &dyn Source) -> Result<()> {
         #[allow(clippy::too_many_arguments)]
         fn rec(n: &mut Arc<Node>, lo: Option<Key>, hi: Option<Key>, pm: i32, src: &dyn Source, stats: &mut LoadStats, depth: usize) -> Result<()> {
@@ -711,8 +657,7 @@ impl LazyTree {
             let nm = Arc::make_mut(n);
             for i in 0..nm.entries.len() {
                 let Entry::Child { node, cid } = &nm.entries[i] else { continue };
-                let clo = if i > 0 { value_key(nm.entries.get(i - 1)) } else { lo.clone() };
-                let chi = value_key(nm.entries.get(i + 1)).or_else(|| hi.clone());
+                let (clo, chi) = child_bounds(nm, i, &lo, &hi);
                 if node.is_none() {
                     let c = cid.ok_or(MstError::Partial)?;
                     let child = load_subtree(src, pm, c, nm.height - 1, clo.as_deref(), chi.as_deref(), stats)?;
@@ -726,7 +671,6 @@ impl LazyTree {
         rec(&mut self.tree.root, None, None, self.persist_min, src, &mut self.stats, 0)
     }
 
-    /// Whether every node is loaded.
     pub fn fully_loaded(&self) -> bool {
         fn rec(n: &Node) -> bool {
             n.entries.iter().all(|e| match e {
@@ -743,7 +687,6 @@ impl LazyTree {
         self.tree.get(key)
     }
 
-    /// Inserts or updates (proof nodes marked, as `Tree::insert`).
     pub fn insert(&mut self, key: &[u8], val: Cid, src: &dyn Source) -> Result<Option<Cid>> {
         self.prepare(key, src)?;
         self.tree.insert(key, val)
@@ -754,16 +697,14 @@ impl LazyTree {
         self.tree.remove(key)
     }
 
-    /// The commit's MST blocks and root (exactly `Tree::write_diff_blocks`),
-    /// plus the persisted-node changes for the state batch.
+    /// `Tree::write_diff_blocks` plus the persisted-node changes.
     pub fn write_diff_blocks(&mut self, out: &mut Vec<(Cid, Vec<u8>)>) -> Result<(Cid, Persist)> {
         self.write_diff_blocks_with_refs(out, None)
     }
 
-    /// [`write_diff_blocks`](Self::write_diff_blocks), also reporting where
-    /// the written nodes sit (`Tree::write_diff_blocks_with_refs`: nodes
-    /// whose first key is in an unloaded subtree are left out; all have
-    /// keys of their own but interior ones, which `M/` finds by CID).
+    /// Also reports where the written nodes sit, leaving out nodes whose
+    /// first key is in an unloaded subtree (interior ones, which `M/` finds
+    /// by CID).
     pub fn write_diff_blocks_with_refs(&mut self, out: &mut Vec<(Cid, Vec<u8>)>, report: Option<&mut Vec<(Cid, crate::mst::NodeRef)>>) -> Result<(Cid, Persist)> {
         let start = out.len();
         let mut refs = Vec::new();
@@ -830,7 +771,6 @@ impl LazyTree {
         }
     }
 
-    /// Inclusion / exclusion proof of `key` (exactly `Tree::proof_blocks`).
     pub fn proof_blocks(&mut self, key: &[u8], src: &dyn Source) -> Result<Vec<(Cid, Vec<u8>)>> {
         self.walk(key, Mode::Key, false, src)?;
         self.tree.proof_blocks(key)
@@ -895,16 +835,12 @@ impl LazyTree {
     }
 }
 
-// ---------- persistence of a commit's nodes ----------
-
-/// The blocks of a commit (`blocks`, in CAR order) that are nodes of the
-/// tree at `root` with height >= `persist_min`, in CAR order: a commit's
-/// `M/` puts. The worker and replay (`segment::derive_commit_muts_n`) derive
-/// them with this one function from the same blocks, so they agree. Nodes
-/// are found from the root through the links whose blocks the commit
-/// carries (every written node hangs from the root; record blocks are only
-/// ever values), and a node's height is its keys' (a node without keys
-/// takes its parent's minus one).
+/// A commit's `M/` puts: its blocks that are nodes of the tree at `root`
+/// with height >= `persist_min`, in CAR order. The worker and replay
+/// (`segment::derive_commit_muts_n`) both derive them with this function, so
+/// they agree; the decoder may not get stricter than what a writer at the
+/// segment's level emitted. Nodes are found from the root through the links
+/// whose blocks the commit carries (record blocks are only ever values).
 pub fn persisted_blocks<'a>(root: &Cid, blocks: &[(Cid, &'a [u8])], persist_min: i32) -> Result<Vec<(Cid, &'a [u8])>> {
     let by: HashMap<Cid, &[u8]> = blocks.iter().map(|(c, b)| (*c, *b)).collect();
     let mut seen = HashSet::new();
@@ -939,25 +875,17 @@ pub fn persisted_blocks<'a>(root: &Cid, blocks: &[(Cid, &'a [u8])], persist_min:
     Ok(blocks.iter().filter(|(c, _)| keep.contains(c)).map(|(c, b)| (*c, *b)).collect())
 }
 
-// ---------- export (getRepo) ----------
-
 /// Every node block of the tree at `root`, in `Tree::walk_blocks` order
-/// (pre-order), streamed from the store without a resident tree: persisted
-/// nodes by CID, lower subtrees rebuilt from their record ranges (which a
-/// real export reads with the one forward `R/` scan that also yields the
-/// records). Memory: one root-to-leaf path of nodes.
+/// (pre-order), streamed with one root-to-leaf path of nodes in memory.
 ///
-/// Checks: the root is hash-checked against `root` (the signed commit's
-/// data link), and every leaf and every subtree rebuilt from records
-/// against its parent's link, so the records exported are the ones the
-/// commit signs. Persisted nodes below the root are not re-hashed (nor
-/// their keys, for their heights): they are blocks this PDS encoded and
-/// hashed itself before writing them under their CIDs, and SlateDB checks
-/// each SST block's CRC32 when it reads it, so corruption at rest fails the
-/// read. A node that is wrong anyway (a bug) shows as its children not
-/// matching their links (failing the export), or else as a block not
-/// hashing to its CID in the CAR. The repo worker's and readers' walks
-/// keep the check (`persisted_node`): they cache what they load.
+/// The root is hash-checked against `root`, and every subtree rebuilt from
+/// records against its parent's link, so the records exported are the ones
+/// the commit signs. Persisted nodes below the root are not re-hashed: this
+/// PDS hashed them before writing them under their CIDs, and SlateDB's
+/// per-block CRC32 fails a read corrupted at rest. A wrong node (a bug)
+/// shows as children not matching their links, or as a block not hashing to
+/// its CID in the CAR. Walks that cache what they load keep the check
+/// (`persisted_node`).
 pub fn export_blocks(
     root: Cid,
     persist_min: i32,
@@ -971,15 +899,7 @@ pub fn export_blocks(
         return Ok(t.stats);
     };
     fn emit(n: &Node, f: &mut dyn FnMut(Cid, &[u8])) -> Result<()> {
-        let c = n.cid.ok_or(MstError::Invalid("unwritten node"))?;
-        match &n.bytes {
-            Some(b) => f(c, b),
-            None => {
-                let mut buf = Vec::new();
-                encode_node(n, &mut buf)?;
-                f(c, &buf)
-            }
-        }
+        f(n.cid.ok_or(MstError::Invalid("unwritten node"))?, &n.block()?);
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
@@ -1000,13 +920,10 @@ pub fn export_blocks(
         emit(n, f)?;
         for (i, e) in n.entries.iter().enumerate() {
             let Entry::Child { cid: Some(c), .. } = e else { continue };
-            let clo = if i > 0 { value_key(n.entries.get(i - 1)) } else { lo.clone() };
-            let chi = value_key(n.entries.get(i + 1)).or_else(|| hi.clone());
+            let (clo, chi) = child_bounds(n, i, &lo, &hi);
             if n.height == 1 && persist_min >= 1 {
-                // a leaf: encoded straight from its records. Its link
-                // checks it (a leaf holds every key between its parent's
-                // separators, all of height 0 in the tree the link was
-                // computed from), so no key heights or node to build
+                // a leaf, encoded straight from its records: its link checks
+                // it, so no key heights or node to build
                 src.leaf_records(clo.as_deref(), chi.as_deref(), enc)?;
                 stats.scans += 1;
                 stats.scanned_records += enc.len() as u64;
@@ -1017,12 +934,11 @@ pub fn export_blocks(
                 f(*c, block);
                 continue;
             }
-            let child = export_subtree(src, persist_min, *c, n.height - 1, clo.as_deref(), chi.as_deref(), stats)?;
+            let child = load_subtree_uncached(src, persist_min, *c, n.height - 1, clo.as_deref(), chi.as_deref(), stats, true)?;
             if child.height >= persist_min && !child.entries.iter().any(|e| matches!(e, Entry::Child { node: Some(_), .. })) {
                 visit(&child, clo, chi, persist_min, src, f, stats, enc, depth + 1)?;
             } else {
-                // rebuilt from records: fully loaded (blocks kept), walk it
-                // in place
+                // rebuilt from records: fully loaded, blocks kept
                 let mut t = Tree::new();
                 t.root = child;
                 t.walk_blocks(f)?;
@@ -1034,37 +950,7 @@ pub fn export_blocks(
     Ok(stats)
 }
 
-/// [`load_subtree`] for an export: nothing cached (every node is visited
-/// once), and rebuilt leaves keep their blocks (emitted right after).
-fn export_subtree(
-    src: &dyn Source,
-    persist_min: i32,
-    cid: Cid,
-    height: i32,
-    lo: Option<&[u8]>,
-    hi: Option<&[u8]>,
-    stats: &mut LoadStats,
-) -> Result<Arc<Node>> {
-    if height >= persist_min {
-        if let Some(b) = src.node(&cid)? {
-            stats.node_reads += 1;
-            stats.node_bytes += b.len() as u64;
-            if let Some(n) = trusted_node(b, &cid, height)? {
-                return Ok(n);
-            }
-        }
-        stats.fallbacks += 1;
-    }
-    let mut recs = Vec::new();
-    src.records(lo, hi, &mut recs)?;
-    stats.scans += 1;
-    stats.scanned_records += recs.len() as u64;
-    rebuilt_subtree_with(&recs, height, &cid, true)
-}
-
-// ---------- in-memory store (tests, benches) ----------
-
-/// `M/` and `R/` of one repo, in memory.
+/// `M/` and `R/` of one repo, in memory (tests, benches).
 #[derive(Clone, Default)]
 pub struct MemStore {
     pub nodes: HashMap<Cid, Arc<[u8]>>,
@@ -1072,8 +958,6 @@ pub struct MemStore {
 }
 
 impl MemStore {
-    /// A store holding a fully loaded, written tree: its records, and its
-    /// nodes of height >= `persist_min` (the backfill of a repo).
     pub fn from_tree(tree: &Tree, persist_min: i32) -> MemStore {
         let mut s = MemStore::default();
         tree.walk(&mut |k, c| {
@@ -1097,8 +981,7 @@ impl MemStore {
     }
 }
 
-/// The nodes of a fully loaded, written tree that `persist_min` persists
-/// (an empty root has no height and isn't).
+/// An empty root has no height and isn't persisted.
 pub fn persisted_nodes(tree: &Tree, persist_min: i32) -> HashMap<Cid, Arc<[u8]>> {
     fn rec(n: &Node, persist_min: i32, out: &mut HashMap<Cid, Arc<[u8]>>) {
         if n.height >= persist_min && !n.entries.is_empty() {
