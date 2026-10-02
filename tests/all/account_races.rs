@@ -126,7 +126,9 @@ async fn load_straddling_shard_bounce_is_dropped() {
     // ...the repo moves on, the shard bounces...
     let two = s.post(&a, "two").await;
     s.app.node.close(old.id).await.unwrap();
-    let opened = s.app.node.open_many(vec![(old.id, old.epoch, Vec::new())]).await;
+    // (its history: our own closed span, which the close's marker names)
+    let ours = vlpds::nodelog::Span { log_id: s.app.log.log_id.to_string(), epoch: old.epoch, start: 0, end: Some(s.app.log.next_ordinal()) };
+    let opened = s.app.node.open_many(vec![(old.id, old.epoch, vec![ours])]).await;
     assert!(opened.iter().all(|(_, r)| r.is_ok()), "reopen failed");
     assert!(!Arc::ptr_eq(&old, &s.app.partition(&a.did).unwrap_or_else(|e| panic!("{}", e.message))));
     // ...and the load completes (ahead of the next write in the worker's queue)
@@ -145,7 +147,9 @@ async fn load_straddling_shard_bounce_is_dropped() {
     assert_eq!(last.since.as_deref(), two.rev.as_deref(), "chained on the stale load");
     // durable state is consistent: another bounce forces a reload from it
     s.app.node.close(old.id).await.unwrap();
-    s.app.node.open_many(vec![(old.id, old.epoch, Vec::new())]).await;
+    let ours = vlpds::nodelog::Span { log_id: s.app.log.log_id.to_string(), epoch: old.epoch, start: 0, end: Some(s.app.log.next_ordinal()) };
+    let opened = s.app.node.open_many(vec![(old.id, old.epoch, vec![ours])]).await;
+    assert!(opened.iter().all(|(_, r)| r.is_ok()), "reopen failed");
     s.post(&a, "four").await;
     let repo = s.get_repo(&a.did).await;
     assert_eq!(repo.entries().len(), 4);

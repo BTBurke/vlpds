@@ -5,7 +5,7 @@
 //! Objects (all CAS via ETag or If-None-Match):
 //!   nodes/{node_id}     NodeLease {log_id, addr, writer, renewals, ..}  renewed by the node
 //!   writers/{w:03}      WriterClaim {node_id, log_id, confirmed}  unique seq low byte among live nodes
-//!   assign/{id:010}     Assignment {owner, log_id, addr, epoch, seq_floor, history[Span], frozen}
+//!   assign/{id:010}     Assignment {owner, log_id, addr, epoch, seq_floor, history[Span], frozen, applied_epoch}
 //!                       changes only when a shard moves: taken by CAS, or
 //!                       handed by its owner straight to a joiner (see `Handoff`)
 //!   assign/layout       Layout {version, shards[{id, lo, hi}], next_id, op}: the
@@ -111,10 +111,39 @@ pub struct Assignment {
     /// of every span in `history` (DESIGN.md "Online shard split/merge").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen: Option<u64>,
+    /// Every span of an epoch below this is in the shard's durable state,
+    /// and its applied marker names a span of this epoch or later: an owner
+    /// at this epoch closed the shard cleanly (`release`), or checkpointed
+    /// it inside its own span (`trim_owned`). Only spans below it ever leave
+    /// `history` (and only once it is longer than `TRIM_SPANS`): replay
+    /// never reads them again. 0 = no such owner yet: nothing is dropped.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub applied_epoch: u64,
     /// Fields of a newer feature level, kept when this node CASes the
     /// object (DESIGN.md "Rolling upgrades": tolerant control objects).
     #[serde(default, flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+/// A history longer than this drops its spans below `applied_epoch` (at a
+/// release, or by its owner once it checkpointed inside its own span).
+const TRIM_SPANS: usize = 8;
+
+/// A history is never longer than this. Spans no successful open has
+/// replayed are never dropped (that lost acked writes: DESIGN.md "HA"), so
+/// an acquire that would exceed it takes nothing, loudly: only a crash loop
+/// that never once opens the shard cleanly gets here.
+const MAX_SPANS: usize = 1024;
+
+/// Drops the spans below `applied` from a history longer than TRIM_SPANS.
+fn trim_history(history: &mut Vec<Span>, applied: u64) {
+    if history.len() > TRIM_SPANS {
+        history.retain(|sp| sp.epoch >= applied);
+    }
 }
 
 /// A shard handed straight to a joiner: the releaser closed it and CASed its
@@ -191,6 +220,12 @@ pub trait ShardHost: Send + Sync + 'static {
     /// it on shutdown). False if it did not quiesce in time.
     async fn quiesce(&self) -> bool {
         true
+    }
+    /// Whether a checkpoint of `shard`, at an ordinal inside its current
+    /// span on our log, is durable: its applied marker names that span, and
+    /// its state holds every earlier span (the open replayed them).
+    fn checkpointed(&self, _shard: ShardId) -> bool {
+        false
     }
     /// Our node lease was lost (CAS failed): must stop acking immediately.
     fn lost(&self);
@@ -346,6 +381,10 @@ pub struct Cluster {
     /// and must not be adopted again: its history minus our span would
     /// replay older owners' writes over ours.
     opened: RwLock<HashMap<ShardId, u64>>,
+    /// Epoch each shard last opened *successfully* here at. A release of a
+    /// shard we never served at its epoch logged nothing for it: its span
+    /// is dropped. One we served and closed raises `applied_epoch`.
+    served: RwLock<HashMap<ShardId, u64>>,
     /// Tests: skip every step (renewals go on), as a node whose step loop
     /// is stuck would (`test_hold_steps`).
     hold_steps: AtomicBool,
@@ -496,6 +535,7 @@ impl Cluster {
             nudged: tokio::sync::Notify::new(),
             handed: parking_lot::Mutex::new(Vec::new()),
             opened: RwLock::new(HashMap::new()),
+            served: RwLock::new(HashMap::new()),
             joined: AtomicBool::new(false),
             confirmed: parking_lot::Mutex::new(HashMap::new()),
             join_floor: std::sync::atomic::AtomicI64::new(0),
@@ -1356,10 +1396,13 @@ impl Cluster {
         for (s, res) in host.open_many(shards).await {
             match res {
                 Ok(()) => {
+                    if let Some(&e) = self.opened.read().get(&s) {
+                        self.served.write().insert(s, e);
+                    }
                     self.table.write().insert(s, (self.cfg.node_id.clone(), self.cfg.addr.clone()));
                 }
                 Err(e) => {
-                    // nothing was logged for it: release with an empty span
+                    // nothing was logged for it: release dropping our span
                     tracing::error!(shard = s.0, "open failed: {e:#}; releasing");
                     self.owned.write().remove(&s);
                     self.release(s, host.next_ordinal(), host.seq_high(), None, None).await?;
@@ -1937,6 +1980,8 @@ impl Cluster {
                 }
             }
         }
+        // 5b. long histories our own checkpoints made redundant
+        self.trim_owned(host).await;
         // 6. split/merge work: freeze parents we own, drive the op if ours
         if let Err(e) = self.reshard_step(host, &live_ids).await {
             tracing::warn!("reshard step failed (retried next step): {e:#}");
@@ -2002,6 +2047,8 @@ impl Cluster {
         use futures::StreamExt;
         let mut picked = Vec::new();
         let mut fresh: Option<Arc<Layout>> = None;
+        // owner -> its lease as re-read in this call (`superseded`)
+        let mut leases: HashMap<String, Option<String>> = HashMap::new();
         for s in candidates {
             if picked.len() == want {
                 break;
@@ -2033,27 +2080,40 @@ impl Cluster {
             let mut history = cur.history.clone();
             let mut seq_floor = cur.seq_floor;
             let stale_self = cur.owner.as_deref() == Some(&self.cfg.node_id) && cur.log_id.as_deref() != Some(&self.log_id);
-            match &cur.owner {
-                Some(o) if live_ids.contains(o) && !stale_self => continue, // healthy owner
-                Some(o) => {
-                    // orphaned (dead owner, or our own previous incarnation):
-                    // fence its log first so the span end is final
-                    let Some(log) = cur.log_id.clone().or_else(|| dead_logs.get(o).cloned()) else { continue };
-                    let (end, last_seq) = self.fence_dead(&log, if stale_self { "restart" } else { "peer" }).await?;
-                    seq_floor = seq_floor.max(last_seq);
-                    if let Some(last) = history.last_mut() {
-                        if last.end.is_none() {
-                            last.end = Some(end);
-                        }
+            let mut restarted = stale_self;
+            if let Some(o) = cur.owner.as_deref().filter(|o| live_ids.contains(*o) && !stale_self) {
+                // a live owner, unless the assignment names an earlier
+                // incarnation of it (a fast same-id restart: the new one
+                // reclaims only up to its fair share, and nobody else
+                // would ever take the rest)
+                if !self.superseded(o, cur.log_id.as_deref(), &mut leases).await? {
+                    continue; // healthy owner
+                }
+                restarted = true;
+            }
+            if let Some(o) = &cur.owner {
+                // orphaned (dead owner, or an earlier incarnation of a live
+                // one): fence its log first so the span end is final
+                let Some(log) = cur.log_id.clone().or_else(|| dead_logs.get(o).cloned()) else { continue };
+                let (end, last_seq) = self.fence_dead(&log, if restarted { "restart" } else { "peer" }).await?;
+                seq_floor = seq_floor.max(last_seq);
+                if let Some(last) = history.last_mut() {
+                    if last.end.is_none() {
+                        last.end = Some(end);
                     }
                 }
-                None => {}
             }
             let epoch = cur.epoch + 1;
             let mut next = history.clone();
             next.push(Span { log_id: self.log_id.clone(), epoch, start: host.next_ordinal(), end: None });
-            if next.len() > 16 {
-                next.drain(..next.len() - 16);
+            // Never drop a span to make room: one no successful open has
+            // replayed holds acked writes (the old 16-span cap dropped them
+            // after enough failed opens, and retention then deleted the log)
+            trim_history(&mut next, cur.applied_epoch);
+            if next.len() > MAX_SPANS {
+                tracing::error!(shard = s.0, spans = next.len(), applied_epoch = cur.applied_epoch, "shard history at its cap with no clean open to trim it: not taking it (spans are never dropped unreplayed)");
+                crate::metrics::LEASE_EVENTS.with_label_values(&["history_full"]).inc();
+                continue;
             }
             let newa = Assignment {
                 owner: Some(self.cfg.node_id.clone()),
@@ -2063,6 +2123,7 @@ impl Cluster {
                 seq_floor,
                 history: next,
                 frozen: None,
+                applied_epoch: cur.applied_epoch,
                 extra: cur.extra.clone(),
             };
             let mode = match etag {
@@ -2241,10 +2302,22 @@ impl Cluster {
             if a.owner.as_deref() != Some(&self.cfg.node_id) {
                 return Ok(None);
             }
-            if let Some(last) = a.history.last_mut() {
-                if last.log_id == self.log_id && last.end.is_none() {
-                    last.end = Some(end);
+            // Served at this epoch (and closed: we release only closed
+            // shards): its state holds every span up to ours, and the close
+            // put its marker in ours. Never served (a failed open, a handoff
+            // passed on unopened): nothing of it is in our log, and no
+            // marker names our span, so the span goes (failed opens no
+            // longer grow the history).
+            let served = a.log_id.as_deref() == Some(&self.log_id) && self.served.read().get(&shard) == Some(&a.epoch);
+            if a.history.last().is_some_and(|l| l.log_id == self.log_id && l.end.is_none()) {
+                if served || frozen.is_some() {
+                    a.history.last_mut().unwrap().end = Some(end);
+                } else {
+                    a.history.pop();
                 }
+            }
+            if served && frozen.is_none() {
+                a.applied_epoch = a.applied_epoch.max(a.epoch);
             }
             a.seq_floor = a.seq_floor.max(seq_floor);
             if frozen.is_some() {
@@ -2267,10 +2340,10 @@ impl Cluster {
                     a.addr = Some(l.addr.clone());
                     a.log_id = Some(l.log_id.clone());
                     a.history.push(Span { log_id: l.log_id.clone(), epoch: a.epoch, start, end: None });
-                    if a.history.len() > 16 {
-                        a.history.drain(..a.history.len() - 16);
-                    }
                 }
+            }
+            if frozen.is_none() {
+                trim_history(&mut a.history, a.applied_epoch);
             }
             match self.put_json(&path, &a, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
                 Ok(e) => {
@@ -2286,6 +2359,70 @@ impl Cluster {
             }
         }
         unreachable!("second attempt returns")
+    }
+
+    /// Whether an assignment naming live owner `o` with `log` names an
+    /// earlier incarnation of it: `o`'s lease (as listed this step) has
+    /// another log. The listing may predate the assignment (`o` restarted
+    /// and took the shard between our LIST of `nodes/` and of `assign/`), so
+    /// the lease is re-read first: an incarnation writes its lease before
+    /// any assignment, and a later one overwrites it, so a lease read after
+    /// the assignment that still names another log names a later one.
+    /// `leases` caches the re-reads (owner -> its log) for one acquire.
+    async fn superseded(&self, o: &str, log: Option<&str>, leases: &mut HashMap<String, Option<String>>) -> anyhow::Result<bool> {
+        let Some(log) = log else { return Ok(false) };
+        let listed = self.peers.read().get(o).map(|l| l.log_id.clone());
+        if listed.is_none_or(|l| l == log) {
+            return Ok(false);
+        }
+        if !leases.contains_key(o) {
+            let fresh = self.get_json::<NodeLease>(&self.path(&format!("nodes/{o}"))).await?.map(|(l, _)| l.log_id);
+            leases.insert(o.to_string(), fresh);
+        }
+        let fresh = leases[o].as_deref();
+        if fresh.is_some_and(|f| f != log) {
+            tracing::warn!(owner = o, stale_log = log, live_log = fresh, "shard still names an earlier incarnation of its live owner: taking it over");
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Drops the spans of our long shard histories that a durable checkpoint
+    /// inside our own span made redundant (`applied_epoch` = ours): a history
+    /// a crash loop or many takeovers grew past TRIM_SPANS, with no clean
+    /// release since to trim it. One CAS per such shard; best effort.
+    async fn trim_owned(&self, host: &Arc<dyn ShardHost>) {
+        let cands: Vec<(ShardId, Assignment, Option<String>)> = {
+            let assigns = self.assigns.read();
+            let served = self.served.read();
+            self.owned()
+                .into_iter()
+                .filter_map(|s| {
+                    let (a, e) = assigns.get(&s)?;
+                    let ours = a.owner.as_deref() == Some(&self.cfg.node_id) && a.log_id.as_deref() == Some(&self.log_id) && served.get(&s) == Some(&a.epoch);
+                    (ours && e.is_some() && a.frozen.is_none() && a.history.len() > TRIM_SPANS && a.history.iter().any(|sp| sp.epoch < a.epoch)).then(|| (s, a.clone(), e.clone()))
+                })
+                .filter(|(s, ..)| host.checkpointed(*s))
+                .collect()
+        };
+        for (s, mut a, etag) in cands {
+            a.applied_epoch = a.applied_epoch.max(a.epoch);
+            trim_history(&mut a.history, a.applied_epoch);
+            let path = self.path(&format!("assign/{}", s.key()));
+            match self.put_json(&path, &a, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
+                Ok(e) => {
+                    tracing::info!(shard = s.0, spans = a.history.len(), "trimmed a shard's history to our span (checkpointed in it)");
+                    self.assigns.write().insert(s, (a, e));
+                }
+                Err(e) => {
+                    // a conflict: re-read next step (and fail-stop if moved)
+                    if let Some((_, etag)) = self.assigns.write().get_mut(&s) {
+                        *etag = None;
+                    }
+                    tracing::warn!(shard = s.0, "trimming a shard's history failed: {e}");
+                }
+            }
+        }
     }
 
     /// Graceful shutdown: close and release every shard, fence our log, drop
@@ -2405,6 +2542,10 @@ mod tests {
         floors: Mutex<Vec<i64>>,
         lost: AtomicU64,
         fail_close: Mutex<HashSet<ShardId>>,
+        /// shards whose opens fail (a replay error, say)
+        fail_open: Mutex<HashSet<ShardId>>,
+        /// every shard checkpointed inside its span (`ShardHost::checkpointed`)
+        checkpointed: std::sync::atomic::AtomicBool,
         nudged: Mutex<Vec<(String, Vec<Handoff>)>>,
         /// peers answer our greetings "not following"
         unheard: std::sync::atomic::AtomicBool,
@@ -2427,8 +2568,12 @@ mod tests {
             self.floors.lock().push(seq);
         }
         async fn open_many(&self, v: Vec<(ShardId, u64, Vec<Span>)>) -> Vec<(ShardId, anyhow::Result<()>)> {
+            let fail = self.fail_open.lock().clone();
             v.into_iter()
                 .map(|(s, e, h)| {
+                    if fail.contains(&s) {
+                        return (s, Err(anyhow::anyhow!("replay failed")));
+                    }
                     self.opened.lock().push((s, e, h));
                     (s, Ok(()))
                 })
@@ -2438,6 +2583,9 @@ mod tests {
             self.closed.lock().push(v.clone());
             let fail = self.fail_close.lock().clone();
             v.into_iter().map(|s| (s, if fail.contains(&s) { Err(anyhow::anyhow!("barrier timed out")) } else { Ok(()) })).collect()
+        }
+        fn checkpointed(&self, _shard: ShardId) -> bool {
+            self.checkpointed.load(Ordering::SeqCst)
         }
         fn lost(&self) {
             self.lost.fetch_add(1, Ordering::SeqCst);
@@ -2767,6 +2915,151 @@ mod tests {
         assert_eq!(s7.owner.as_deref(), Some("a"), "not released");
         assert_eq!(s7.history.last().unwrap().end, None, "span left open: a successor ends it at the fence");
         assert_eq!(get(ShardId(6)).await.owner.as_deref(), Some("b"), "the closed ones are handed to b");
+    }
+
+    async fn read_assign(store: &Store, s: ShardId) -> Assignment {
+        let r = store.raw.get(&Path::from(format!("{}/assign/{}", store.prefix, s.key()))).await.unwrap();
+        serde_json::from_slice::<Assignment>(&r.bytes().await.unwrap()).unwrap()
+    }
+
+    async fn all_assigns(store: &Store) -> BTreeMap<ShardId, Assignment> {
+        let mut out = BTreeMap::new();
+        for i in 0..8 {
+            out.insert(ShardId(i), read_assign(store, ShardId(i)).await);
+        }
+        out
+    }
+
+    /// A node that took every shard, wrote `segs` segments, then died.
+    async fn dead_owner(store: &Store, segs: u64) -> Arc<Cluster> {
+        let d = join(cfg("d"), store.clone()).await.unwrap();
+        let (_hd, hd) = host();
+        d.step(&hd).await.unwrap();
+        assert_eq!(d.owned().len(), 8);
+        for ord in 0..segs {
+            store.raw.put(&crate::nodelog::segment_path(store, &d.log_id, ord), segment(&d.log_id, ord, 100 + ord as i64)).await.unwrap();
+        }
+        d.halt();
+        d
+    }
+
+    /// Opens that keep failing (a replay error, say) must never push a dead
+    /// owner's span out of a shard's history: each failed cycle used to add
+    /// a span and the history kept only the last 16, so the dead log's acked
+    /// tail was neither replayed by the next good open nor protected from
+    /// retention (`needed_by`).
+    #[tokio::test]
+    async fn failing_opens_never_drop_a_dead_span() {
+        let store = Store::memory(None);
+        let d = dead_owner(&store, 3).await;
+        let a = join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        ha.fail_open.lock().insert(ShardId(0));
+        let t = Instant::now();
+        while a.owned().len() < 7 {
+            a.step(&ha_dyn).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(t.elapsed() < Duration::from_secs(3), "never took over");
+        }
+        for _ in 0..24 {
+            a.step(&ha_dyn).await.unwrap();
+        }
+        assert!(!a.owned().contains(&ShardId(0)));
+        let s0 = read_assign(&store, ShardId(0)).await;
+        assert!(s0.epoch > 20, "24 failed open cycles: {}", s0.epoch);
+        assert!(s0.history.iter().any(|sp| sp.log_id == d.log_id && sp.end == Some(3)), "{:?}", s0.history);
+        assert!(s0.history.len() <= 2, "a failed open leaves no span behind: {:?}", s0.history);
+        let assigns = all_assigns(&store).await;
+        assert_eq!(crate::retention::needed_by(&d.log_id, &assigns, &HashMap::new()), Some(ShardId(0)), "retention keeps the dead log");
+        // the open finally succeeds: it replays the dead span
+        ha.fail_open.lock().clear();
+        a.step(&ha_dyn).await.unwrap();
+        assert!(a.owned().contains(&ShardId(0)));
+        let (_, _, hist) = ha.opened.lock().iter().rev().find(|o| o.0 == ShardId(0)).cloned().unwrap();
+        assert!(hist.iter().any(|sp| sp.log_id == d.log_id && sp.end == Some(3)), "{hist:?}");
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0);
+    }
+
+    /// A crash loop of same-id restarts (each incarnation reclaims every
+    /// shard and dies before closing any cleanly) keeps every span: the
+    /// first dead owner's included, however many incarnations pile up.
+    #[tokio::test]
+    async fn crash_looping_restarts_keep_every_span() {
+        let store = Store::memory(None);
+        let d = dead_owner(&store, 3).await;
+        for i in 0..20 {
+            let b = join(cfg("b"), store.clone()).await.unwrap();
+            let (hb, hb_dyn) = host();
+            // (each waits out its predecessor's published wm_cap to join)
+            let t = Instant::now();
+            while b.owned().len() < 8 {
+                b.step(&hb_dyn).await.unwrap();
+                if b.owned().len() < 8 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert!(t.elapsed() < Duration::from_secs(3), "incarnation {i} never took over");
+            }
+            let (_, _, hist) = hb.opened.lock().iter().find(|o| o.0 == ShardId(0)).cloned().unwrap();
+            assert!(hist.iter().any(|sp| sp.log_id == d.log_id && sp.end == Some(3)), "incarnation {i}: {hist:?}");
+            b.halt();
+        }
+        let s0 = read_assign(&store, ShardId(0)).await;
+        assert_eq!(s0.history.len(), 21, "{:?}", s0.history);
+        let assigns = all_assigns(&store).await;
+        assert!(crate::retention::needed_by(&d.log_id, &assigns, &HashMap::new()).is_some());
+        // an incarnation that serves and checkpoints inside its own span
+        // trims the history down to that span
+        let b = join(cfg("b"), store.clone()).await.unwrap();
+        let (hb, hb_dyn) = host();
+        let t = Instant::now();
+        while b.owned().len() < 8 {
+            b.step(&hb_dyn).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(t.elapsed() < Duration::from_secs(3), "never took over");
+        }
+        b.step(&hb_dyn).await.unwrap();
+        assert_eq!(read_assign(&store, ShardId(0)).await.history.len(), 22, "not checkpointed yet: nothing dropped");
+        hb.checkpointed.store(true, Ordering::SeqCst);
+        b.step(&hb_dyn).await.unwrap();
+        let s0 = read_assign(&store, ShardId(0)).await;
+        assert_eq!((s0.history.len(), s0.applied_epoch), (1, s0.epoch), "{s0:?}");
+        assert_eq!(s0.history[0].log_id, b.log_id);
+        assert_eq!(crate::retention::needed_by(&d.log_id, &all_assigns(&store).await, &HashMap::new()), None, "the dead log is no longer needed");
+    }
+
+    /// A same-id restart before peers presumed the old incarnation dead: b1
+    /// held all 8, a joined (fair share 4), b1 died before handing any back,
+    /// b2 came up. b2 reclaims its share of b1's shards; the rest name owner
+    /// "b" (live) with b1's log, and a must take them (fencing b1's log)
+    /// instead of skipping them as healthy: nobody served them.
+    #[tokio::test]
+    async fn fast_same_id_restart_strands_no_shard() {
+        let store = Store::memory(None);
+        let b1 = join(cfg("b"), store.clone()).await.unwrap();
+        let (_hb1, hb1) = host();
+        b1.step(&hb1).await.unwrap();
+        assert_eq!(b1.owned().len(), 8);
+        let a = join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        assert!(a.joined() && a.owned().is_empty());
+        b1.halt();
+        let b2 = join(cfg("b"), store.clone()).await.unwrap();
+        let (hb2, hb2_dyn) = host();
+        let t = Instant::now();
+        loop {
+            b2.step(&hb2_dyn).await.unwrap();
+            a.step(&ha_dyn).await.unwrap();
+            let assigns = all_assigns(&store).await;
+            let served = assigns.values().filter(|x| x.log_id.as_deref() == Some(a.log_id.as_str()) || x.log_id.as_deref() == Some(b2.log_id.as_str())).count();
+            if served == 8 && a.owned().len() + b2.owned().len() == 8 {
+                break;
+            }
+            assert!(t.elapsed() < Duration::from_secs(3), "stranded: a {:?}, b2 {:?}, {assigns:?}", a.owned(), b2.owned());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(a.fenced_logs().contains_key(&b1.log_id) || b2.fenced_logs().contains_key(&b1.log_id));
+        assert_eq!(ha.lost.load(Ordering::SeqCst) + hb2.lost.load(Ordering::SeqCst), 0);
     }
 
     /// Wall clocks minutes apart: liveness doesn't care (O3). With the old

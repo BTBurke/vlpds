@@ -238,6 +238,7 @@ fn assignment() -> vlpds::cluster::Assignment {
         seq_floor: 256_000,
         history: vec![Span { log_id: "node-b.1".into(), epoch: 2, start: 0, end: Some(9) }, Span { log_id: LOG.into(), epoch: 3, start: 6, end: None }],
         frozen: None,
+        applied_epoch: 0,
         extra: Default::default(),
     }
 }

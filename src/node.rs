@@ -4,7 +4,7 @@
 
 use crate::cluster::{Cluster, ShardHost};
 use crate::firehose::Firehose;
-use crate::nodelog::{self, LogBatch, LogEntry, NodeLog, ShardSink, Span};
+use crate::nodelog::{self, LogBatch, NodeLog, ShardSink, Span};
 use crate::partition::{self, Partition};
 use crate::partitions::PartitionTable;
 use crate::slots::ShardId;
@@ -224,7 +224,7 @@ impl ShardHost for Node {
             let recent = Arc::new(partition::RecentRepos::new(self.recent_cap));
             preload.push((shard, db.clone(), recent.clone()));
             let apply_lock = Arc::new(tokio::sync::RwLock::new(()));
-            self.log.sinks.insert(Arc::new(ShardSink { id: shard, epoch, db: db.clone(), apply_lock: apply_lock.clone(), applied: Default::default(), recent: recent.clone() }));
+            self.log.sinks.insert(Arc::new(ShardSink { id: shard, epoch, db: db.clone(), apply_lock: apply_lock.clone(), applied: Default::default(), recent: recent.clone(), barrier: Default::default() }));
             self.table.set(
                 shard,
                 Some(Arc::new(Partition {
@@ -303,25 +303,20 @@ impl ShardHost for Node {
         //    still in flight are dropped when they land: the worker caches a
         //    load only while its Partition is still the routed one (bench/ha N6)
         self.purge_worker_caches(&ids).await;
-        // 3. barriers: once an empty entry for a shard is durable, every
-        //    earlier entry for it is durable and applied (the log is FIFO).
-        //    Queued back to back, they share one segment (bench/ha O6).
+        // 3. barriers: once a shard's barrier is durable, every earlier entry
+        //    for it is durable and applied (the log is FIFO), and the log
+        //    refuses any later one (a `put_private` racing the close: it
+        //    would land past the span end we publish). Queued back to back,
+        //    they share one segment (bench/ha O6).
         let mut acks = Vec::with_capacity(sinks.len());
         for k in &sinks {
             let (tx, rx) = tokio::sync::oneshot::channel();
             let sent = self
                 .log
                 .tx
-                .send(LogEntry {
-                    shard: k.id,
-                    frames: Vec::new(),
-                    muts: Vec::new(),
-                    ack: Some(Box::new(move |r| {
-                        let _ = tx.send(r);
-                    })),
-                    pending: None,
-                    enqueued: Instant::now(),
-                })
+                .send(k.barrier_entry(Box::new(move |r| {
+                    let _ = tx.send(r);
+                })))
                 .await;
             acks.push(sent.map(|_| rx));
         }
@@ -353,9 +348,11 @@ impl ShardHost for Node {
                         }
                         k.db.write(wb).await?;
                     }
-                    // closing flushes the memtable (and fails if it can't)
+                    // closing flushes the memtable (and fails if it can't);
+                    // the shard's replay floor holds until it has
                     self.log.sinks.remove(k.id);
                     k.db.close().await?;
+                    self.log.sinks.retire(k.id);
                     crate::metrics::LEASE_EVENTS.with_label_values(&["closed"]).inc();
                     anyhow::Ok(())
                 }

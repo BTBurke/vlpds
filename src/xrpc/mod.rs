@@ -580,7 +580,19 @@ impl App {
             .map_err(|_| XrpcError::internal("partition sequencer gone"))?;
         rx.await
             .map_err(|_| XrpcError::internal("log dropped write"))?
-            .map_err(|e| XrpcError::internal(e.to_string()))
+            .map_err(|e| {
+                // refused: the shard closed between our lookup and the
+                // enqueue (behind its barrier); nothing was done, so the
+                // entry node resends it to the new owner (crate::forward)
+                if e.to_string() == crate::nodelog::NOT_HELD {
+                    return XrpcError {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        error: crate::forward::SHARD_MOVED.into(),
+                        message: format!("partition {} closed under this write", p.id),
+                    };
+                }
+                XrpcError::internal(e.to_string())
+            })
     }
 
     pub async fn get_private(&self, did: &str, name: &str) -> Result<Option<Bytes>, XrpcError> {

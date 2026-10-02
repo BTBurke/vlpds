@@ -37,6 +37,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 pub type AckFn = Box<dyn FnOnce(Result<(), Arc<anyhow::Error>>) + Send>;
+
+/// The error an entry is acked with when the log refused it (its shard isn't
+/// held here, or is closing): nothing of it is applied or replayed, so the
+/// write can be resent to the shard's owner.
+pub const NOT_HELD: &str = "partition not owned by this node (moved)";
 /// Returns false once this node may no longer act as an owner (lease lapsed).
 pub type LeaseCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
@@ -262,6 +267,36 @@ pub struct ShardSink {
     pub applied: AtomicU64,
     /// Shared with the shard's `Partition`; persisted by its checkpoints.
     pub recent: Arc<crate::partition::RecentRepos>,
+    /// The shard's close barrier, as the sequencer saw it.
+    pub barrier: Barrier,
+}
+
+/// A close barrier (`ShardSink::barrier_entry`) is marked by carrying the
+/// sink's own token as its `pending` counter, which no other entry holds.
+/// Once the sequencer takes it, it refuses every later entry for the sink:
+/// one logged behind the barrier lands past the span end the close
+/// publishes (read once the barrier is durable), where no successor replays
+/// it, so acking it would lose it. (`put_private` looks its Partition up
+/// and sends later, outside the repo workers a close purges: it could slip
+/// in after the barrier.)
+#[derive(Default)]
+pub struct Barrier {
+    token: Arc<AtomicU32>,
+    taken: std::sync::atomic::AtomicBool,
+}
+
+impl ShardSink {
+    /// The entry that closes this shard on our log: once it is durable,
+    /// every entry the log took for the shard is durable and applied, and
+    /// the log takes no more for this sink.
+    pub fn barrier_entry(&self, ack: AckFn) -> LogEntry {
+        LogEntry { shard: self.id, frames: Vec::new(), muts: Vec::new(), ack: Some(ack), pending: Some(self.barrier.token.clone()), enqueued: Instant::now() }
+    }
+
+    /// Whether the sequencer has taken this shard's close barrier.
+    pub fn barrier_taken(&self) -> bool {
+        self.barrier.taken.load(Ordering::Acquire)
+    }
 }
 
 pub struct ShardSinks {
@@ -271,9 +306,12 @@ pub struct ShardSinks {
     retain: Mutex<Retain>,
 }
 
-/// How long a closed shard still holds back this log's replay floor: a
-/// close that fails after its sink is removed fail-stops the node well
-/// within it, and a successor then replays from the shard's durable marker.
+/// How long a closed shard still holds back this log's replay floor once
+/// its close finished (its state flushed with the marker at its span end,
+/// so nothing of this log is replayed for it; the grace is a margin). A
+/// close in progress holds it however long it takes (`Retain::closing`):
+/// one that fails fail-stops the node, and a successor replays from the
+/// shard's durable marker.
 const RETIRED_GRACE: Duration = Duration::from_secs(120);
 
 /// What retention (retention.rs) may delete from this log, and what this
@@ -286,6 +324,9 @@ struct Retain {
     /// none of the shard's entries at this epoch are below it) until a
     /// checkpoint at or past the insert floor is durable, then its ordinal + 1.
     floors: HashMap<ShardId, (u64, u64)>,
+    /// replay floors of shards whose close is in progress (sink removed,
+    /// state not closed yet: `ShardSinks::retire`)
+    closing: HashMap<ShardId, u64>,
     /// replay floors of recently closed shards (see RETIRED_GRACE)
     retired: Vec<(u64, Instant)>,
     /// shard -> highest epoch opened here. Opening replays and flushes every
@@ -318,13 +359,26 @@ impl ShardSinks {
         }
         self.map.write().insert(s.id, s);
     }
+    /// The shard stops applying (its close barrier is durable). Its replay
+    /// floor holds until `retire` (its state closed), however long that is.
     pub fn remove(&self, id: ShardId) -> Option<Arc<ShardSink>> {
         let mut r = self.retain.lock();
         if let Some((floor, _)) = r.floors.remove(&id) {
-            r.retired.push((floor, Instant::now()));
+            let f = r.closing.entry(id).or_insert(floor);
+            *f = (*f).min(floor);
         }
         drop(r);
         self.map.write().remove(&id)
+    }
+
+    /// The shard's close finished (state flushed and closed): its replay
+    /// floor is held for RETIRED_GRACE more. A close that fails never
+    /// retires: the floor stays until the node fail-stops.
+    pub fn retire(&self, id: ShardId) {
+        let mut r = self.retain.lock();
+        if let Some(floor) = r.closing.remove(&id) {
+            r.retired.push((floor, Instant::now()));
+        }
     }
     pub fn all(&self) -> Vec<Arc<ShardSink>> {
         self.map.read().values().cloned().collect()
@@ -357,7 +411,7 @@ impl ShardSinks {
     }
 
     /// Every ordinal of this log below this may be deleted as far as replay
-    /// is concerned: no shard applying from it (or closed within
+    /// is concerned: no shard applying from it (or closing, or closed within
     /// RETIRED_GRACE) can need it after a crash. Never past the last durable
     /// segment, which is kept so fencing finds the end of the log.
     pub fn replay_floor(&self) -> u64 {
@@ -367,7 +421,7 @@ impl ShardSinks {
         }
         let mut r = self.retain.lock();
         r.retired.retain(|(_, at)| at.elapsed() < RETIRED_GRACE);
-        r.floors.values().map(|f| f.0).chain(r.retired.iter().map(|f| f.0)).fold(durable, u64::min)
+        r.floors.values().map(|f| f.0).chain(r.closing.values().copied()).chain(r.retired.iter().map(|f| f.0)).fold(durable, u64::min)
     }
 
     /// shard -> highest epoch this log's owner has opened it at.
@@ -653,18 +707,21 @@ struct Sealed {
     frames: Vec<(i64, std::ops::Range<usize>)>,
     /// muts grouped by shard, in log order
     muts: BTreeMap<ShardId, Vec<Mutation>>,
-    acks: Vec<(Option<AckFn>, Option<Arc<AtomicU32>>, Instant)>,
+    /// per entry: (its shard, ack, pending counter, enqueued)
+    acks: Vec<PendingAck>,
     last_seq: i64,
     put_secs: f64,
     /// Size of the stored (compressed) object.
     stored_bytes: usize,
 }
 
+type PendingAck = (ShardId, Option<AckFn>, Option<Arc<AtomicU32>>, Instant);
+
 struct Open {
     seg: SegmentBuilder,
     frames: Vec<(i64, std::ops::Range<usize>)>,
     muts: BTreeMap<ShardId, Vec<Mutation>>,
-    acks: Vec<(Option<AckFn>, Option<Arc<AtomicU32>>, Instant)>,
+    acks: Vec<PendingAck>,
 }
 
 impl Open {
@@ -677,16 +734,26 @@ impl Open {
         // cached repo that outlived close()) used to be logged with epoch 0 and
         // *acked*. But replay only applies entries whose epoch matches a span,
         // so the successor never saw it: an acked write lost. Refuse it.
-        let Some(epoch) = sinks.get(e.shard).map(|s| s.epoch) else {
-            tracing::warn!(shard = e.shard.0, "log entry for a shard this node no longer holds: rejected");
+        let reject = |e: LogEntry, why: &str| {
+            tracing::warn!(shard = e.shard.0, "log entry for a shard this node {why}: rejected");
             if let Some(p) = e.pending {
                 p.fetch_sub(1, Ordering::Release);
             }
             if let Some(ack) = e.ack {
-                ack(Err(Arc::new(anyhow::anyhow!("partition not owned by this node (moved)"))));
+                ack(Err(Arc::new(anyhow::anyhow!(NOT_HELD))));
             }
-            return;
         };
+        let Some(sink) = sinks.get(e.shard) else { return reject(e, "no longer holds") };
+        // Behind the shard's close barrier: past the span end its close
+        // publishes, so nobody would replay it (see `Barrier`).
+        if sink.barrier.taken.load(Ordering::Acquire) {
+            return reject(e, "is closing");
+        }
+        if e.pending.as_ref().is_some_and(|p| Arc::ptr_eq(p, &sink.barrier.token)) {
+            sink.barrier.taken.store(true, Ordering::Release);
+            e.pending = None;
+        }
+        let epoch = sink.epoch;
         if e.frames.is_empty() {
             // private-state write: an entry with an empty frame (skipped by the firehose)
             e.frames.push(Frame { prefix: Vec::new(), suffix: Vec::new(), derived_muts: 0 });
@@ -700,7 +767,7 @@ impl Open {
             self.frames.push((seq, range));
         }
         self.muts.entry(e.shard).or_default().append(&mut e.muts);
-        self.acks.push((e.ack, e.pending, e.enqueued));
+        self.acks.push((e.shard, e.ack, e.pending, e.enqueued));
     }
 }
 
@@ -799,7 +866,7 @@ async fn run_sequencer(
             }
             let o = std::mem::replace(&mut open, Open::new(&log_id));
             metrics::SEGMENT_EVENTS.observe(o.frames.len() as f64);
-            metrics::COMMIT_STAGE.with_label_values(&["seal_wait"]).observe(o.acks.first().map_or(0.0, |a| a.2.elapsed().as_secs_f64()));
+            metrics::COMMIT_STAGE.with_label_values(&["seal_wait"]).observe(o.acks.first().map_or(0.0, |a| a.3.elapsed().as_secs_f64()));
             if inflight.is_empty() {
                 prefix_end = ordinal;
             }
@@ -1064,13 +1131,22 @@ async fn run_finalizer(
         // than the repo views published by these acks.
         let mut guards = Vec::new();
         let mut targets = Vec::new();
+        let mut unheld = Vec::new();
         for (shard, muts) in std::mem::take(&mut s.muts) {
             match sinks.get(shard) {
                 Some(sink) => {
                     guards.push(sink.apply_lock.clone().write_owned().await);
                     targets.push((sink, muts));
                 }
-                None => tracing::error!(shard = shard.0, ordinal = s.ordinal, "durable entries for a shard we no longer hold; its owner will replay them"),
+                None => {
+                    // The sequencer took them while the sink was there, and
+                    // a sink goes only once its barrier is durable, after
+                    // which nothing is taken for it: unreachable. If it ever
+                    // happens, they may lie past the span end the close
+                    // published, where nobody replays them: never ack them.
+                    tracing::error!(shard = shard.0, ordinal = s.ordinal, "durable entries for a shard we no longer hold: not applied, acked as failed");
+                    unheld.push(shard);
+                }
             }
         }
         let t = Instant::now();
@@ -1122,14 +1198,18 @@ async fn run_finalizer(
         metrics::PUT_DURATION.with_label_values(&["node"]).observe(s.put_secs);
         metrics::COMMIT_STAGE.with_label_values(&["put"]).observe(s.put_secs);
         let n = s.acks.len();
-        for (ack, pending, enq) in s.acks {
+        for (shard, ack, pending, enq) in s.acks {
             STATS.record_commit_latency(enq.elapsed());
             metrics::COMMIT_LATENCY.observe(enq.elapsed().as_secs_f64());
             if let Some(p) = pending {
                 p.fetch_sub(1, Ordering::Release);
             }
             if let Some(ack) = ack {
-                ack(Ok(()));
+                if unheld.contains(&shard) {
+                    ack(Err(Arc::new(anyhow::anyhow!(NOT_HELD))));
+                } else {
+                    ack(Ok(()));
+                }
             }
         }
         drop(guards);
@@ -1171,25 +1251,33 @@ pub async fn replay_shard(store: &Store, shard: ShardId, db: &Db, history: &[Spa
 /// entries dispatched to every shard whose span covers it. Returns segments read.
 pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> anyhow::Result<u64> {
     use futures::StreamExt;
-    // per shard: the spans still to apply, with the ordinal to start from
-    let mut todo: Vec<Vec<(Span, u64)>> = Vec::with_capacity(shards.len());
+    // per shard: the spans still to apply, with the ordinal to start from,
+    // and whether that is a resume point (the marker strictly inside it)
+    let mut todo: Vec<Vec<(Span, u64, bool)>> = Vec::with_capacity(shards.len());
     for (shard, db, history) in shards {
         let marker = match db.get(META_APPLIED).await? {
             Some(b) => Some(decode_marker(&b).map_err(|e| e.context(format!("shard {shard}")))?),
             None => None,
         };
+        // A marker always names a span of the history: spans leave it only
+        // below `Assignment::applied_epoch`, before every marker's span. One
+        // that names none means a span the shard still needs was dropped:
+        // replaying from the oldest one left (as this once did) would serve
+        // without that span's acked writes, and let retention delete them.
         let first = match &marker {
-            Some((log, ord)) => marker_span(history, log, *ord).unwrap_or(0),
+            Some((log, ord)) => marker_span(history, log, *ord).ok_or_else(|| {
+                anyhow::anyhow!("shard {shard}: its applied marker ({log}, {ord}) names no span of its history {history:?}: a span it needs is missing; refusing to replay")
+            })?,
             None => 0,
         };
         let mut v = Vec::new();
         for (i, span) in history.iter().enumerate().skip(first) {
-            let from = match &marker {
-                Some((log, ord)) if i == first && &span.log_id == log => (ord + 1).max(span.start),
-                _ => span.start,
+            let (from, resume) = match &marker {
+                Some((log, ord)) if i == first && &span.log_id == log => ((ord + 1).max(span.start), ord + 1 > span.start),
+                _ => (span.start, false),
             };
             if span.end.is_none_or(|e| from < e) {
-                v.push((span.clone(), from));
+                v.push((span.clone(), from, resume));
             }
         }
         todo.push(v);
@@ -1199,9 +1287,13 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
     for k in 0..rounds {
         // group this round's spans by log
         let mut by_log: std::collections::BTreeMap<String, Vec<(usize, Span, u64)>> = Default::default();
+        let mut resumes: Vec<(String, u64, Span)> = Vec::new();
         for (i, v) in todo.iter().enumerate() {
-            if let Some((span, from)) = v.get(k) {
+            if let Some((span, from, resume)) = v.get(k) {
                 by_log.entry(span.log_id.clone()).or_default().push((i, span.clone(), *from));
+                if *resume {
+                    resumes.push((span.log_id.clone(), *from, span.clone()));
+                }
             }
         }
         for (log_id, members) in by_log {
@@ -1209,7 +1301,14 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
             // Retention may have pruned the log's head. What it pruned holds
             // nothing these spans still need (no entries of their shard and
             // epoch, or entries already durable): DESIGN.md "Log retention".
-            match crate::backfill::first_ordinal(store, &log_id).await? {
+            // Except never past a resume point (a marker inside its span:
+            // the shard's next entries may be right after it): that is an
+            // entry it needs, gone.
+            let head = crate::backfill::first_ordinal(store, &log_id).await?;
+            if let Some((_, from, span)) = resumes.iter().find(|(l, from, _)| *l == log_id && head.is_none_or(|h| h > *from)) {
+                anyhow::bail!("log {log_id} is pruned to {head:?}, past ordinal {from} where replay of {span:?} resumes after its applied marker");
+            }
+            match head {
                 Some(first) => lo = lo.max(first),
                 // Nothing left at all: retention pruned a dead log to its
                 // fence and later deleted the fence (--fence-retention),
@@ -1538,7 +1637,7 @@ mod tests {
         let cfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes, hedge_after: Duration::from_secs(10), lease_ok: None };
         let log = NodeLog::start_with_inflight(store.clone(), cfg, k, tx);
         let db = Arc::new(crate::partition::open_db(&Store { prefix: "apply".into(), ..store.clone() }, shard, None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: shard, epoch: 1, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default() }));
+        log.sinks.insert(Arc::new(ShardSink { id: shard, epoch: 1, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default(), barrier: Default::default() }));
         (log, db, rx)
     }
 
@@ -1728,6 +1827,87 @@ mod tests {
 
     fn batch(ordinal: u64, n: usize) -> Arc<LogBatch> {
         Arc::new(LogBatch { log_id: "A".into(), ordinal, events: vec![(ordinal as i64, Bytes::from(vec![0u8; n]))] })
+    }
+
+    /// A write enqueued behind a shard's close barrier (`put_private` looked
+    /// its Partition up before the close and sent after the barrier) must
+    /// never be acked Ok: its segment lands past the span end the close
+    /// publishes, where no successor replays it.
+    #[tokio::test]
+    async fn entry_behind_a_close_barrier_is_never_acked() {
+        let (fs, store) = fault_store();
+        let shard = ShardId(3);
+        let (log, _db, _merger) = test_log(&store, 1, shard, 1 << 20).await;
+        let sink = log.sinks.get(shard).unwrap();
+        // an entry ahead of the barrier is taken and acked
+        let (etx, erx) = tokio::sync::oneshot::channel();
+        log.tx.send(entry(shard, "early".into(), 10, Some(Box::new(move |r| { let _ = etx.send(r.is_ok()); })))).await.ok().unwrap();
+        let (btx, brx) = tokio::sync::oneshot::channel();
+        log.tx.send(sink.barrier_entry(Box::new(move |r| { let _ = btx.send(r.is_ok()); }))).await.ok().unwrap();
+        assert!(erx.await.unwrap() && brx.await.unwrap(), "the barrier is durable");
+        assert!(sink.barrier_taken());
+        // the late write; its segment (ordinal 1) is slow to land
+        fs.delays.lock().insert(1, Duration::from_millis(300));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        log.tx.send(entry(shard, "late".into(), 10, Some(Box::new(move |r| { let _ = tx.send(r.is_ok()); })))).await.ok().unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // the close completes: the sink goes, the span ends at the durable end
+        log.sinks.remove(shard);
+        assert_eq!(log.next_ordinal(), 1, "span end");
+        assert!(!rx.await.unwrap(), "acked Ok past the span end: nobody replays it");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!exists(&store, 1).await, "never even logged");
+    }
+
+    /// A closed shard's replay floor is held while its close runs, however
+    /// long (it was released RETIRED_GRACE after the sink went, even with
+    /// the state not closed yet), then for RETIRED_GRACE after it finished.
+    #[test]
+    fn closing_shard_holds_its_replay_floor_until_retired() {
+        let sinks = ShardSinks::new(Arc::new(AtomicU64::new(10)));
+        sinks.retain.lock().floors.insert(ShardId(1), (4, 4));
+        assert_eq!(sinks.replay_floor(), 4);
+        sinks.remove(ShardId(1));
+        assert_eq!(sinks.replay_floor(), 4, "closing");
+        assert!(sinks.retain.lock().retired.is_empty(), "no grace clock runs before the close finishes");
+        sinks.retire(ShardId(1));
+        assert_eq!(sinks.replay_floor(), 4, "within the grace");
+        sinks.retain.lock().retired[0].1 = Instant::now().checked_sub(RETIRED_GRACE + Duration::from_secs(1)).unwrap();
+        assert_eq!(sinks.replay_floor(), 10, "released after it");
+    }
+
+    /// An applied marker naming no span of the history (one it needs was
+    /// dropped) refuses to replay instead of starting at the oldest span
+    /// left; so does a resume point retention pruned past.
+    #[tokio::test]
+    async fn replay_refuses_a_marker_outside_its_history() {
+        let store = Store::memory(None);
+        let shard = ShardId(70_009);
+        for ord in 0..3 {
+            put_seg(&store, "D", ord, shard, 1, &format!("d{ord}")).await;
+        }
+        put_seg(&store, "E", 0, shard, 3, "e0").await;
+        let db = crate::partition::open_db(&store, shard, None).await.unwrap();
+        let mut wb = WriteBatch::new();
+        wb.put(META_APPLIED, encode_marker("C", 9));
+        db.write(wb).await.unwrap();
+        // C's span (which the marker names) is gone; D's is still needed
+        let history = vec![span("D", 2, 0, Some(3)), span("E", 3, 0, Some(1))];
+        let err = replay_many(&store, &[(shard, &db, &history)]).await.unwrap_err();
+        assert!(format!("{err:#}").contains("names no span"), "{err:#}");
+        assert!(db.get(b"e0").await.unwrap().is_none(), "nothing replayed");
+        // marker inside D's span at 0; D pruned to 2: entry 1 is gone
+        let mut wb = WriteBatch::new();
+        wb.put(META_APPLIED, encode_marker("D", 0));
+        db.write(wb).await.unwrap();
+        store.raw.delete(&segment_path(&store, "D", 0)).await.unwrap();
+        store.raw.delete(&segment_path(&store, "D", 1)).await.unwrap();
+        let err = replay_many(&store, &[(shard, &db, &history)]).await.unwrap_err();
+        assert!(format!("{err:#}").contains("resumes after its applied marker"), "{err:#}");
+        // a head pruned only up to the resume point is fine
+        put_seg(&store, "D", 1, shard, 2, "d1").await;
+        assert_eq!(replay_many(&store, &[(shard, &db, &history)]).await.unwrap(), 3);
+        assert!(db.get(b"d1").await.unwrap().is_some() && db.get(b"e0").await.unwrap().is_some());
     }
 
     #[test]

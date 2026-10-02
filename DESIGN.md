@@ -755,13 +755,36 @@ the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
   and is renewed by CAS on its ETag every TTL/5 (default TTL 10 s). Renewal
   bumps `renewals`, so every renewal changes the object.
 - **Assignments.** `assign/{shard}` holds `{owner, log_id, epoch, seq_floor,
-  history[spans]}` and changes only when a shard moves (CAS on its ETag). A
+  history[spans], applied_epoch}` and changes only when a shard moves (CAS on its ETag). A
   node takes free or orphaned shards up to its fair share (shards ÷ live
-  nodes) and closes and releases extras.
+  nodes) and closes and releases extras. An assignment naming a live
+  owner's *earlier* incarnation (its lease, re-read after the assignment,
+  has another log: a same-id restart before peers presumed the old one
+  dead) is orphaned too. The restarted node reclaims only up to its fair
+  share, and peers used to skip the rest as healthy, so nobody served them.
+- **Span history is never cut short.** A span leaves `history` only below
+  `applied_epoch`: the epoch of an owner that closed the shard cleanly
+  (release after a successful open), or that checkpointed it inside its own
+  span; its state then holds every earlier span and its applied marker
+  names its span or a later one. Trimming happens only past 8 spans (at a
+  release, or by the owner once checkpointed). A failed open logged nothing
+  for the shard, so its release removes its own span instead of closing it.
+  The history used to keep only its last 16 spans: repeated failed opens or
+  a crash loop (a span per cycle) pushed a dead owner's unreplayed span out,
+  the next good open replayed from the oldest span left (its marker named
+  none), and retention (`needed_by`) deleted the dead log: acked writes
+  lost. Replay now refuses a marker that names no span of the history.
+  A crash loop that never once opens a shard cleanly grows its history;
+  past 1,024 spans no node takes the shard (an error, metric
+  `vlpds_lease_events_total{event="history_full"}`), rather than drop one.
 - **Handoff.** A graceful release closes the shards together: one barrier
   segment for all of them (once it is durable, every earlier entry of those
   shards is durable and applied), a checkpoint, then the span end in the
-  assignment. A takeover from a dead node first **fences its log**: a
+  assignment. Once the sequencer takes a shard's barrier it refuses every
+  later entry for it (acked as "moved", resent by the entry node): one
+  behind the barrier (`put_private` looks up its partition, then enqueues;
+  the close purges only the repo workers) would land past the span end the
+  close publishes, where nobody replays it, and used to be acked anyway. A takeover from a dead node first **fences its log**: a
   conditional create of a fence object at the end of its durable prefix (its
   first ordinal that isn't a segment), which ends its last span for good. The new owner replays its shards' previous spans
   (one pass over each dead log for all shards) before serving.
@@ -1097,8 +1120,11 @@ into, `nodelog::ShardSinks` keeps the lowest ordinal of L a crash replay
 could read: its *insert floor* (L's next ordinal when the shard was opened)
 until a checkpoint at or past the insert floor is durable (memtable
 flushed), then that ordinal + 1. The log's floor is the minimum over its
-shards (and shards closed in the last 2 min), capped at the last durable
-segment, which is always kept so `first_free` finds the end of the log.
+shards (and shards whose close is still running, however long it takes,
+plus 2 min once it finished), capped at the last durable segment, which
+is always kept so `first_free` finds the end of the log. (A closing
+shard's floor used to be held only 2 min from when its sink went, before
+its state was closed: a close slower than that could lose the floor.)
 
 *(a) for a dead log X: successors opened every shard.* Each node publishes
 `retain/{log_id}`: the shards its log's owner opened, with epochs. X is
@@ -1133,7 +1159,13 @@ marker m = (log, ord) and reads forward through the spans after it
 Replay starts each log at its lowest stored object (`first_ordinal`), so a
 span start inside a pruned head (e.g. between a span's start and the
 shard's insert floor, which hold nothing of it) is skipped, not an error. A
-hole above the lowest object is still an error inside a closed span.
+hole above the lowest object is still an error inside a closed span, and
+so is a lowest object past a *resume point* (the marker strictly inside
+its span: the shard's next entries may follow it at once, and by fact 3
+no floor passes it). A marker that names no span of the history is an
+error too, never "replay from the oldest span left": spans leave a
+history only below `applied_epoch` (see "HA"), which is before every
+marker's span, so such a marker means a span the shard needs is gone.
 
 *Fences go after `--fence-retention` (7 days).* A dead log is pruned down
 to its fence: the segments below it, the K − 1 garbage segments past it,

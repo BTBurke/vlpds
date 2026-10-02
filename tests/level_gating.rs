@@ -100,9 +100,9 @@ struct Scan {
 async fn scan(store: &object_store::memory::InMemory, at_most: Option<u32>) -> Scan {
     use vlpds::segment;
     let mut s = Scan::default();
-    // fields the fixtures leave out because they were None there
+    // fields the fixtures leave out because they were None (or 0) there
     let optional: BTreeMap<&str, &[&str]> =
-        [("assign", &["frozen"][..]), ("layout", &["op"][..]), ("version", &["target"][..]), ("nodes", &[][..]), ("writers", &[][..]), ("retain", &[][..])].into();
+        [("assign", &["frozen", "applied_epoch"][..]), ("layout", &["op"][..]), ("version", &["target"][..]), ("nodes", &[][..]), ("writers", &[][..]), ("retain", &[][..])].into();
     let keys = |fixture: &str, family: &str, l: u32| -> BTreeSet<String> {
         let mut k = fixture_keys(l, fixture);
         k.extend(optional[family].iter().map(|s| s.to_string()));
