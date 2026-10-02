@@ -67,7 +67,7 @@ sha1 = "0.10"
 futures = "0.3"
 hdrhistogram = "7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls", "stream"] }
-tokio-tungstenite = "0.26"
+tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
 tikv-jemallocator = { version = "0.7", optional = true }
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"], optional = true }
 mimalloc = { version = "0.1", optional = true }
@@ -102,6 +102,16 @@ zeroize = { version = "1", features = ["derive"] }
 # already in the tree via rustls
 ring = "0.17"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "pool", "hostname", "builder", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
+# Peer mTLS (src/peer_tls.rs; DESIGN.md "Exposure"): rustls on both ends of
+# node-to-node traffic, ring provider (already in the tree via reqwest and
+# lettre); rcgen for `vlpds admin tls` (cluster CA, node certs); x509-parser
+# reads the node identity (URI SAN) and expiry from certs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
+x509-parser = "0.18"
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 [[test]]
 name = "all"

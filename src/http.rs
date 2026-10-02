@@ -777,25 +777,69 @@ pub fn guarded(dev_mode: bool) -> &'static reqwest::Client {
     }
 }
 
-/// Node-to-node client: `n` independent h2c clients (one connection per
-/// peer each), picked round-robin. Derefs to the next client, so
-/// `app.http.get(..)` spreads calls over the connections.
+/// Node-to-node client: `n` independent h2 clients (one connection per
+/// peer each), picked round-robin per request: `app.http.get(url)` spreads
+/// calls over the connections.
 ///
 /// Bulk downloads ([`is_bulk`]: repo exports, blobs, block fetches; large,
 /// unauthenticated, streamed to clients at their pace) go over `n` other
-/// connections ([`PeerClient::for_path`]): clients that read them slowly or
+/// connections (picked by the URL's path): clients that read them slowly or
 /// not at all fill only those connections' flow-control windows, never the
 /// ones every other forward shares (and [`stall::Watched`] drops a body
 /// whose client stopped reading).
+///
+/// Cleartext (h2c prior knowledge): one set of clients for every peer. Peer
+/// mTLS ([`PeerClient::with_tls`], `crate::peer_tls`): h2 over TLS 1.3
+/// (ALPN h2), https only, one set per peer origin, so each origin's TLS
+/// config checks that the server's certificate names the node whose lease
+/// advertises that origin ([`PeerClient::set_registry`]). Windows, PINGs,
+/// timeouts and connection counts are the same either way.
 #[derive(Clone)]
 pub struct PeerClient(Arc<PeerInner>);
 
 struct PeerInner {
+    n: usize,
+    /// cleartext peers (also the TLS mode's fallback: never, see `pool_for`)
+    plain: Pool,
+    tls: Option<TlsPeers>,
+}
+
+/// `n` clients for regular calls and `n` for bulk downloads.
+struct Pool {
     clients: Vec<reqwest::Client>,
     /// for [`is_bulk`] paths (empty: share `clients`)
     bulk: Vec<reqwest::Client>,
     next: AtomicUsize,
 }
+
+impl Pool {
+    fn build(n: usize, b: impl Fn() -> reqwest::ClientBuilder) -> reqwest::Result<Pool> {
+        let clients = (0..n.max(1)).map(|_| b().build()).collect::<Result<_, _>>()?;
+        let bulk = (0..n.max(1)).map(|_| b().build()).collect::<Result<_, _>>()?;
+        Ok(Pool { clients, bulk, next: AtomicUsize::new(0) })
+    }
+
+    fn pick(&self, path: &str) -> &reqwest::Client {
+        let c = if !self.bulk.is_empty() && is_bulk(path) { &self.bulk } else { &self.clients };
+        if c.len() == 1 {
+            return &c[0];
+        }
+        &c[self.next.fetch_add(1, Ordering::Relaxed) % c.len()]
+    }
+}
+
+/// Node ids whose lease advertises an origin (`scheme://host:port`).
+pub type Registry = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
+
+struct TlsPeers {
+    tls: Arc<crate::peer_tls::PeerTls>,
+    registry: Arc<std::sync::OnceLock<Registry>>,
+    /// per origin; a handful of peers, so a scan
+    origins: parking_lot::RwLock<Vec<(Arc<str>, Arc<Pool>)>>,
+}
+
+/// Origins kept before ones no lease names any more are dropped.
+const MAX_ORIGINS: usize = 256;
 
 /// Peer calls whose responses are bulk downloads (see [`PeerClient`]).
 pub fn is_bulk(path: &str) -> bool {
@@ -805,43 +849,120 @@ pub fn is_bulk(path: &str) -> bool {
     )
 }
 
+/// `url`'s origin (`scheme://authority`) and the rest (path and query).
+pub fn split_origin(url: &str) -> (&str, &str) {
+    let start = url.find("://").map_or(0, |i| i + 3);
+    match url[start..].find(['/', '?']) {
+        Some(i) => url.split_at(start + i),
+        None => (url, ""),
+    }
+}
+
 impl PeerClient {
+    /// Cleartext (h2c) peers.
     pub fn new(n: usize) -> reqwest::Result<PeerClient> {
-        let clients = (0..n.max(1)).map(|_| peer_builder().build()).collect::<Result<_, _>>()?;
-        let bulk = (0..n.max(1)).map(|_| peer_builder().build()).collect::<Result<_, _>>()?;
-        Ok(PeerClient(Arc::new(PeerInner { clients, bulk, next: AtomicUsize::new(0) })))
+        Ok(PeerClient(Arc::new(PeerInner { n, plain: Pool::build(n, peer_builder)?, tls: None })))
+    }
+
+    /// Peers over mTLS with `tls`'s certificate and CA.
+    pub fn with_tls(n: usize, tls: Arc<crate::peer_tls::PeerTls>) -> reqwest::Result<PeerClient> {
+        let tls = TlsPeers { tls, registry: Default::default(), origins: Default::default() };
+        // (unused in TLS mode: built so `pick` has something to give tests)
+        let plain = Pool { clients: vec![reqwest::Client::new()], bulk: Vec::new(), next: AtomicUsize::new(0) };
+        Ok(PeerClient(Arc::new(PeerInner { n, plain, tls: Some(tls) })))
     }
 
     /// Wraps one existing client (tests).
     pub fn single(c: reqwest::Client) -> PeerClient {
-        PeerClient(Arc::new(PeerInner { clients: vec![c], bulk: Vec::new(), next: AtomicUsize::new(0) }))
+        let plain = Pool { clients: vec![c], bulk: Vec::new(), next: AtomicUsize::new(0) };
+        PeerClient(Arc::new(PeerInner { n: 1, plain, tls: None }))
     }
 
+    /// Peer TLS on.
+    pub fn is_tls(&self) -> bool {
+        self.0.tls.is_some()
+    }
+
+    /// Where TLS clients look up which node an origin should be (the
+    /// cluster's leases); set once, after the cluster is joined. Until then
+    /// (and for an origin no lease names) any node of the cluster CA is
+    /// accepted.
+    pub fn set_registry(&self, r: Registry) {
+        if let Some(t) = &self.0.tls {
+            let _ = t.registry.set(r);
+        }
+    }
+
+    /// A cleartext client (tests; not for peer calls in TLS mode).
     pub fn pick(&self) -> &reqwest::Client {
-        Self::pick_of(&self.0.clients, &self.0.next)
+        self.0.plain.pick("")
     }
 
-    /// The client for a call to `path` (bulk downloads on their own
-    /// connections).
-    pub fn for_path(&self, path: &str) -> &reqwest::Client {
-        if !self.0.bulk.is_empty() && is_bulk(path) {
-            return Self::pick_of(&self.0.bulk, &self.0.next);
+    /// The client for a call to `url` (bulk downloads on their own
+    /// connections; with TLS, the URL origin's own clients).
+    pub fn client_for(&self, url: &str) -> reqwest::Client {
+        let (origin, rest) = split_origin(url);
+        let path = rest.split_once('?').map_or(rest, |(p, _)| p);
+        match &self.0.tls {
+            None => self.0.plain.pick(path).clone(),
+            Some(t) => self.origin_pool(t, origin).pick(path).clone(),
         }
-        self.pick()
     }
 
-    fn pick_of<'a>(c: &'a [reqwest::Client], next: &AtomicUsize) -> &'a reqwest::Client {
-        if c.len() == 1 {
-            return &c[0];
+    fn origin_pool(&self, t: &TlsPeers, origin: &str) -> Arc<Pool> {
+        if let Some((_, p)) = t.origins.read().iter().find(|(o, _)| **o == *origin) {
+            return p.clone();
         }
-        &c[next.fetch_add(1, Ordering::Relaxed) % c.len()]
+        let mut origins = t.origins.write();
+        if let Some((_, p)) = origins.iter().find(|(o, _)| **o == *origin) {
+            return p.clone();
+        }
+        if origins.len() >= MAX_ORIGINS {
+            // addresses churned (new IPs per restart): keep the live ones
+            if let Some(r) = t.registry.get() {
+                origins.retain(|(o, _)| !r(o).is_empty());
+            }
+        }
+        let o: Arc<str> = origin.into();
+        let (reg, key) = (t.registry.clone(), o.clone());
+        let expect = crate::peer_tls::Expect::Lookup(Arc::new(move || reg.get().map(|r| r(&key)).unwrap_or_default()));
+        let config = t.tls.client_config(expect, &[b"h2"]);
+        let pool = Pool::build(self.0.n, || peer_builder().https_only(true).use_preconfigured_tls(config.clone()))
+            .map(Arc::new)
+            .unwrap_or_else(|e| {
+                // (building a client only fails on a bad TLS backend: never
+                // with a preconfigured rustls config)
+                tracing::error!(origin, "peer TLS client: {e}");
+                Arc::new(Pool { clients: vec![reqwest::Client::new()], bulk: Vec::new(), next: AtomicUsize::new(0) })
+            });
+        origins.push((o, pool.clone()));
+        pool
     }
-}
 
-impl std::ops::Deref for PeerClient {
-    type Target = reqwest::Client;
-    fn deref(&self) -> &reqwest::Client {
-        self.pick()
+    pub fn get(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        let u = url.as_ref();
+        self.client_for(u).get(u)
+    }
+
+    pub fn post(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        let u = url.as_ref();
+        self.client_for(u).post(u)
+    }
+
+    pub fn request(&self, method: reqwest::Method, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        let u = url.as_ref();
+        self.client_for(u).request(method, u)
+    }
+
+    /// The websocket TLS connector for a log stream from `node` (None:
+    /// cleartext). HTTP/1.1 by ALPN: the stream is an upgrade.
+    pub fn ws_connector(&self, node: Option<&str>) -> Option<tokio_tungstenite::Connector> {
+        let t = self.0.tls.as_ref()?;
+        let expect = match node {
+            Some(n) => crate::peer_tls::Expect::Node(n.to_string()),
+            None => crate::peer_tls::Expect::Any,
+        };
+        Some(tokio_tungstenite::Connector::Rustls(Arc::new(t.tls.client_config(expect, &[b"http/1.1"]))))
     }
 }
 
@@ -855,7 +976,8 @@ impl std::ops::Deref for PeerClient {
 pub const PEER_STREAM_WINDOW: u32 = 1 << 20;
 pub const PEER_CONNECTION_WINDOW: u32 = 64 << 20;
 
-/// Peers speak h2c (the listener is HTTP/1 + HTTP/2 auto). With HTTP/1.1,
+/// Peers speak h2 (h2c, or over TLS with peer mTLS; the listener is HTTP/1 +
+/// HTTP/2 auto). With HTTP/1.1,
 /// forwarding ~10k writes/s at ~100 ms each needed ~1k concurrent
 /// connections per peer: beyond the 256 pooled ones every request opened and
 /// closed a TCP connection, and at 50k/s across 3 nodes the forwards blew
@@ -950,6 +1072,15 @@ mod tests {
         // dev mode reaches it
         let _ = tokio::time::timeout(Duration::from_secs(2), guarded(true).get(&url).send()).await;
         assert!(tokio::time::timeout(Duration::from_secs(2), accepted).await.unwrap().unwrap());
+    }
+
+    #[test]
+    fn origins_and_bulk_paths() {
+        assert_eq!(split_origin("https://10.0.0.1:2584/xrpc/a?b=c"), ("https://10.0.0.1:2584", "/xrpc/a?b=c"));
+        assert_eq!(split_origin("http://h:1?x"), ("http://h:1", "?x"));
+        assert_eq!(split_origin("http://h:1"), ("http://h:1", ""));
+        // (bulk routing by path with a query string: forward::tests::
+        // unread_forwarded_bodies_dont_stall_other_forwards)
     }
 
     #[tokio::test]

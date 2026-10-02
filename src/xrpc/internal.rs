@@ -1,6 +1,10 @@
 //! Node-to-node endpoints (cluster mode). Authenticated with the shared
 //! internal token (`Config::internal_token`, not the admin token) in
-//! `x-vlpds-internal`; never exposed publicly in production.
+//! `x-vlpds-internal`, and, with peer mTLS, by the caller's node
+//! certificate at the `--peer-listen` listener (crate::peer_tls). Served
+//! only there once `--peer-listen` is set (`server::public_router` 404s
+//! them), and not at all on a node no peer can reach
+//! (`Config::serve_internal`).
 
 use super::*;
 use crate::segment::Mutation;
@@ -25,6 +29,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/internal/v1/admin/inviteCodes", get(admin_invite_codes))
         .route("/internal/v1/sync/listRepos", get(sync_list_repos))
         .route("/internal/v1/sync/listReposByCollection", get(sync_list_repos_by_collection))
+        .merge(super::ratelimits::internal_routes())
 }
 
 /// Cluster view of this node (HA tests / ops): shards it owns, the routing
@@ -118,7 +123,7 @@ async fn cluster_hello(State(app): AppState, headers: HeaderMap, axum::Json(inp)
 
 /// Greets each peer (see [`cluster_hello`]): per peer, the floor of its
 /// follower of our log, or None if it didn't confirm.
-pub async fn hello_peers(http: &reqwest::Client, token: &str, node_id: &str, levels: crate::version::Window, addrs: Vec<String>) -> Vec<Option<i64>> {
+pub async fn hello_peers(http: &crate::http::PeerClient, token: &str, node_id: &str, levels: crate::version::Window, addrs: Vec<String>) -> Vec<Option<i64>> {
     let sends = addrs.into_iter().map(|addr| async move {
         let hello = HelloIn { node_id: node_id.to_string(), rev: crate::version::build_rev().to_string(), min_level: Some(levels.min), max_level: Some(levels.max) };
         let r = http
@@ -147,7 +152,7 @@ pub async fn hello_peers(http: &reqwest::Client, token: &str, node_id: &str, lev
 
 /// Sends each `(addr, handoffs)` nudge (see [`cluster_nudge`]). Best effort
 /// and bounded: a peer that misses one finds its handoffs on its next step.
-pub async fn nudge_peers(http: &reqwest::Client, token: &str, nudges: Vec<(String, Vec<crate::cluster::Handoff>)>) {
+pub async fn nudge_peers(http: &crate::http::PeerClient, token: &str, nudges: Vec<(String, Vec<crate::cluster::Handoff>)>) {
     let sends = nudges.into_iter().map(|(addr, handoffs)| async move {
         let r = http
             .post(format!("{}/internal/v1/cluster/nudge", addr.trim_end_matches('/')))

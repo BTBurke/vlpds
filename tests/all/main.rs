@@ -79,6 +79,7 @@ mod oauth;
 mod objstore_pressure;
 mod ops_metrics;
 mod oauth_replay_durable;
+mod peer_tls;
 mod plc;
 mod preferences;
 mod proxy;

@@ -85,7 +85,8 @@ impl Node {
             let cluster = self.cluster.clone();
             let log_id = p.log_id.clone();
             let addr = Arc::new(move || cluster.peers().into_iter().find(|l| l.log_id == log_id).map(|l| l.addr));
-            let fl = remote::follow_log(&p.log_id, &self.firehose, self.store.clone(), addr, self.internal_token.clone(), self.merger_tx.clone());
+            let tls = self.http.ws_connector(Some(&p.node_id));
+            let fl = remote::follow_log(&p.log_id, &self.firehose, self.store.clone(), addr, self.internal_token.clone(), self.merger_tx.clone(), tls);
             tracing::info!(log_id = %p.log_id, node = %p.node_id, "following peer log");
             f.insert(p.log_id.clone(), fl);
         }

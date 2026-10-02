@@ -31,6 +31,7 @@ pub mod objlimit;
 pub mod objstats;
 pub mod partition;
 pub mod partitions;
+pub mod peer_tls;
 pub mod plc;
 pub mod reshard;
 pub mod reshard_gc;

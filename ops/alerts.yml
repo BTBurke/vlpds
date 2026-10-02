@@ -1009,3 +1009,37 @@ groups:
         annotations:
           summary: "{{ $labels.instance }}'s tokio workers are {{ $value | humanizePercentage }} busy"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsruntimesaturated"
+
+      # Peer mTLS (--peer-tls-*): this node's certificate or the earliest
+      # trusted cluster CA expires within 14 days (design: renew well ahead;
+      # an expired node cert is refused by every peer, and the node itself
+      # refuses to start or reload with one). Exported only with peer TLS on.
+      - alert: VlpdsPeerTlsCertExpiring
+        expr: (vlpds_peer_tls_cert_expiry_seconds{job="vlpds"} - time()) < 14 * 86400
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}'s peer TLS {{ $labels.cert }} certificate expires in {{ $value | humanizeDuration }}"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdspeertlscertexpiring"
+
+      # A changed CA/cert/key set (or a SIGHUP) failed to load: the node keeps
+      # the previous set, which is what the rotation meant to replace.
+      - alert: VlpdsPeerTlsReloadFailing
+        expr: increase(vlpds_peer_tls_reloads_total{job="vlpds",result="error"}[15m]) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} failed to reload its peer TLS certificate (still using the previous one)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdspeertlsreloadfailing"
+
+      # Peers refused at the TLS handshake (guess: sustained for 10 min): a
+      # node with a cert from another CA, an expired cert, or a node at an
+      # address whose lease names another node.
+      - alert: VlpdsPeerTlsHandshakeFailures
+        expr: sum by (instance, side) (rate(vlpds_peer_tls_handshake_failures_total{job="vlpds"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: peer TLS handshakes failing ({{ $labels.side }} side, {{ $value | humanize }}/s)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdspeertlshandshakefailures"

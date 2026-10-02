@@ -47,7 +47,7 @@
 //! lease expiry moves the shard. Response bodies then stream without a size
 //! or time limit, but with a write-progress deadline: one whose client stops
 //! reading is dropped (`http::stall`), and bulk downloads (getRepo, getBlob,
-//! getBlocks) use their own peer connections (`http::PeerClient::for_path`).
+//! getBlocks) use their own peer connections (`http::PeerClient`, by path).
 //!
 //! A slow cold repo load is not a dead owner: a forwarded repo write that its
 //! worker hasn't started within [`FORWARDED_WRITE_START`] (its repo is still
@@ -632,8 +632,7 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
     crate::metrics::FORWARDED.inc();
     let ttfb = ttfb_for(&req);
     let t = Instant::now();
-    let peer = client.for_path(req.uri().path());
-    let resp = forward(peer, &owner, req, token, ttfb).await;
+    let resp = forward(client, &owner, req, token, ttfb).await;
     crate::metrics::observe_forward(resp.status().as_u16(), t);
     resp
 }
@@ -688,7 +687,7 @@ async fn write_with_retries(
             Some(owner) => {
                 crate::metrics::FORWARDED.inc();
                 let t = Instant::now();
-                let r = forward(client.pick(), &owner, req, token, ttfb).await;
+                let r = forward(client, &owner, req, token, ttfb).await;
                 crate::metrics::observe_forward(r.status().as_u16(), t);
                 r
             }
@@ -811,7 +810,7 @@ fn unavailable(message: String) -> Response {
 }
 
 async fn forward(
-    client: &reqwest::Client,
+    client: &crate::http::PeerClient,
     owner: &str,
     req: Request,
     internal_token: Option<&str>,
@@ -1115,7 +1114,7 @@ mod tests {
             .body(Body::from(r#"{"repo":"did:plc:x"}"#))
             .unwrap();
         let t = Instant::now();
-        let r = forward(&reqwest::Client::new(), &owner, req, None, Duration::from_millis(300)).await;
+        let r = forward(&crate::http::PeerClient::single(reqwest::Client::new()), &owner, req, None, Duration::from_millis(300)).await;
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(r.headers().get("retry-after").unwrap(), "1");
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
@@ -1159,7 +1158,7 @@ mod tests {
         let peers = PeerClient::new(1).unwrap();
         let fwd = |path: &'static str| {
             let req = Request::builder().uri(path).body(Body::empty()).unwrap();
-            forward(peers.for_path(req.uri().path()), &owner, req, None, TTFB_SLOW)
+            forward(&peers, &owner, req, None, TTFB_SLOW)
         };
         let read = |r: Response, within: Duration| async move {
             tokio::time::timeout(within, axum::body::to_bytes(r.into_body(), usize::MAX)).await.map(|b| b.map(|b| b.len()).ok())

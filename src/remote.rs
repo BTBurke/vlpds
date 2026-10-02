@@ -171,6 +171,7 @@ pub struct Follower {
 
 /// Registers the log as a firehose source of `fh` and follows it. `addr`
 /// returns the peer's base URL while it is alive, None once it's dead.
+/// `tls`: peer mTLS (`wss://`), checking the server is the log's node.
 pub fn follow_log(
     log_id: &str,
     fh: &Firehose,
@@ -178,6 +179,7 @@ pub fn follow_log(
     addr: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     token: String,
     merger_tx: mpsc::UnboundedSender<LogBatch>,
+    tls: Option<tokio_tungstenite::Connector>,
 ) -> Follower {
     let log_id: Arc<str> = log_id.into();
     let (floor, watermark) = fh.add_remote(&log_id);
@@ -195,7 +197,7 @@ pub fn follow_log(
         while !stop.load(Ordering::Acquire) {
             match addr() {
                 Some(base) => {
-                    if let Err(e) = stream_live(&log_id, &store, floor, &base, &token, &merger_tx, &wm, &mut next, &stop, &*addr).await {
+                    if let Err(e) = stream_live(&log_id, &store, floor, &base, &token, &merger_tx, &wm, &mut next, &stop, &*addr, tls.clone()).await {
                         tracing::debug!(%log_id, "log stream from {base} ended: {e:#}");
                     }
                 }
@@ -272,12 +274,15 @@ async fn stream_live(
     next: &mut Option<u64>,
     stop: &AtomicBool,
     addr: &(dyn Fn() -> Option<String> + Send + Sync),
+    tls: Option<tokio_tungstenite::Connector>,
 ) -> anyhow::Result<()> {
     // name the log: the address may already serve a later incarnation's log
     let url = format!("{}/internal/v1/log/stream?log={log_id}", base.replacen("http", "ws", 1));
     let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str())?;
     req.headers_mut().insert("x-vlpds-internal", token.parse()?);
-    let (mut ws, _) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, tokio_tungstenite::connect_async(req))
+    // (http(s) -> ws(s) above; with peer TLS the base is https://)
+    let connect = tokio_tungstenite::connect_async_tls_with_config(req, None, false, tls);
+    let (mut ws, _) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, connect)
         .await
         .map_err(|_| anyhow::anyhow!("log stream connect to {base} timed out"))??;
     // The owner subscribes to its log only after the upgrade, so wait for its

@@ -167,8 +167,16 @@ pub struct Config {
     /// rate-limit client IP. Empty = always the TCP peer (or, on a request a
     /// peer forwarded, the client address it vouched for).
     pub trusted_proxies: Vec<String>,
-    /// h2c connections to each peer node (crate::http::PeerClient).
+    /// h2 connections to each peer node (crate::http::PeerClient).
     pub peer_connections: usize,
+    /// Peer mTLS (`--peer-tls-*`, crate::peer_tls): the peer client speaks
+    /// TLS with this node's certificate, and [`spawn_split`] /
+    /// [`ServeOptions::tls`] serve the peer listener with it. None =
+    /// cleartext h2c.
+    pub peer_tls: Option<Arc<crate::peer_tls::PeerTls>>,
+    /// Mount `/internal/*` (node-to-node routes). Off on a node no peer can
+    /// reach (`peer_tls::PeerMode::Lone`).
+    pub serve_internal: bool,
     /// `x-ratelimit-bypass` header value that skips rate limits (reference
     /// PDS_RATE_LIMIT_BYPASS_KEY).
     pub rate_limit_bypass_key: Option<String>,
@@ -338,6 +346,8 @@ impl Default for Config {
             rate_limits_enabled: true,
             trusted_proxies: Vec::new(),
             peer_connections: crate::http::DEFAULT_PEER_CONNECTIONS,
+            peer_tls: None,
+            serve_internal: true,
             rate_limit_bypass_key: None,
             resolve_lexicons: None,
             max_import_bytes: crate::xrpc::DEFAULT_MAX_IMPORT_BYTES,
@@ -459,7 +469,29 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         // bound how much of our log a successor replays after a crash (~10 s)
         log.spawn_checkpoints(cfg.checkpoint_every, cfg.checkpoint_stagger);
     }
-    let http = crate::http::PeerClient::new(cfg.peer_connections)?;
+    let http = match &cfg.peer_tls {
+        Some(t) => {
+            anyhow::ensure!(
+                t.node_id() == cluster.cfg.node_id,
+                "the peer TLS certificate names node {:?} but this node is {:?} (--node-id)",
+                t.node_id(),
+                cluster.cfg.node_id
+            );
+            crate::http::PeerClient::with_tls(cfg.peer_connections, t.clone())?
+        }
+        None => crate::http::PeerClient::new(cfg.peer_connections)?,
+    };
+    {
+        // with TLS: which node each peer origin should present (its lease)
+        let c = cluster.clone();
+        http.set_registry(Arc::new(move |origin: &str| {
+            c.peers()
+                .into_iter()
+                .filter(|l| crate::http::split_origin(l.addr.trim_end_matches('/')).0 == origin)
+                .map(|l| l.node_id)
+                .collect()
+        }));
+    }
     let node = crate::node::Node::new(
         cluster.clone(),
         log.clone(),
@@ -584,6 +616,59 @@ pub async fn spawn(
     Ok((app, addr))
 }
 
+/// [`spawn`] with a separate peer listener: `public` serves
+/// [`public_router`] (clients; no `/internal/*`, forwarded markers ignored)
+/// with the public h2 profile, `peer` the full [`router`] with the peer
+/// profile, over mTLS when `cfg.peer_tls` is set. Returns the app and both
+/// bound addresses.
+pub async fn spawn_split(
+    cfg: Config,
+    public: tokio::net::TcpListener,
+    peer: tokio::net::TcpListener,
+) -> anyhow::Result<(Arc<xrpc::App>, std::net::SocketAddr, std::net::SocketAddr)> {
+    let app = build(cfg).await?;
+    let (public_addr, peer_addr) = (public.local_addr()?, peer.local_addr()?);
+    let full = router(&app);
+    let max_connections = app.config.max_connections;
+    let tls = app.config.peer_tls.as_ref().map(|t| t.server_config());
+    let peer_opts = ServeOptions { h2: H2Profile::Peer, max_connections, tls };
+    tokio::spawn(async move {
+        if let Err(e) = serve_with(peer, full, peer_opts).await {
+            tracing::error!("peer server exited: {e:#}");
+        }
+    });
+    let r = public_router(&app);
+    let opts = ServeOptions { h2: H2Profile::Public, max_connections, tls: None };
+    tokio::spawn(async move {
+        if let Err(e) = serve_with(public, r, opts).await {
+            tracing::error!("server exited: {e:#}");
+        }
+    });
+    Ok((app, public_addr, peer_addr))
+}
+
+/// Request headers only peers may send: on [`public_router`] they are
+/// stripped, so a client's copy means nothing.
+pub const PEER_ONLY_HEADERS: [&str; 3] = [crate::forward::FORWARDED_HEADER, "x-vlpds-internal", crate::ratelimit::CLIENT_IP_HEADER];
+
+/// The client-facing listener's router once peers have their own
+/// (`--peer-listen`): [`router`] without `/internal/*` (404), and with the
+/// peer-only headers dropped before anything reads them: a forwarded
+/// marker is served as the client request it is (routed, rate-limited),
+/// and `x-vlpds-internal` no longer skips rate limits.
+pub fn public_router(app: &Arc<xrpc::App>) -> axum::Router {
+    router(app).layer(axum::middleware::from_fn(|mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+        let p = req.uri().path();
+        if p == "/internal" || p.starts_with("/internal/") {
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
+        for h in PEER_ONLY_HEADERS {
+            req.headers_mut().remove(h);
+        }
+        next.run(req).await
+    }))
+}
+
 /// Paths served only by [`metrics_router`] when `metrics_listen` is set.
 const METRICS_PATHS: [&str; 2] = ["/metrics", "/debug/pprof/"];
 
@@ -627,18 +712,22 @@ pub enum H2Profile {
 }
 
 /// How a listener is served.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ServeOptions {
     pub h2: H2Profile,
     /// Most connections open at once; at the cap the listener stops
     /// accepting (new connections wait in the kernel's accept queue) until
     /// one closes. 0 = no cap.
     pub max_connections: usize,
+    /// Serve TLS (peer mTLS: `PeerTls::server_config`, client certs
+    /// required; ALPN h2 / http/1.1). The handshake runs on the
+    /// connection's task, bounded by `peer_tls::HANDSHAKE_TIMEOUT`.
+    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Default for ServeOptions {
     fn default() -> Self {
-        ServeOptions { h2: H2Profile::Peer, max_connections: DEFAULT_MAX_CONNECTIONS }
+        ServeOptions { h2: H2Profile::Peer, max_connections: DEFAULT_MAX_CONNECTIONS, tls: None }
     }
 }
 
@@ -711,6 +800,7 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
         h2: crate::metrics::HTTP_SERVER_ACTIVE.with_label_values(&["h2"]),
     };
     let slots = (opts.max_connections > 0).then(|| Arc::new(tokio::sync::Semaphore::new(opts.max_connections)));
+    let acceptor = opts.tls.clone().map(tokio_rustls::TlsAcceptor::from);
     loop {
         // a slot first: at the cap, connections wait in the accept queue
         let slot = match &slots {
@@ -729,23 +819,48 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
         };
         let _ = sock.set_nodelay(true);
         crate::metrics::HTTP_SERVER_CONNECTIONS.inc();
-        // peer address for rate limiting (axum ConnectInfo)
-        let svc = TowerToHyperService::new(Track {
-            inner: tower::ServiceExt::map_request(
-                router.clone(),
-                move |mut req: axum::http::Request<hyper::body::Incoming>| {
+        // peer address for rate limiting (axum ConnectInfo); with TLS the
+        // calling node's id (its certificate) too
+        let (router, active, acceptor, builder) = (router.clone(), active.clone(), acceptor.clone(), builder.clone());
+        let svc = move |node: Option<crate::peer_tls::PeerNode>| {
+            TowerToHyperService::new(Track {
+                inner: tower::ServiceExt::map_request(router, move |mut req: axum::http::Request<hyper::body::Incoming>| {
                     req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+                    if let Some(n) = &node {
+                        req.extensions_mut().insert(n.clone());
+                    }
                     req
-                },
-            ),
-            active: active.clone(),
-        });
-        let builder = builder.clone();
+                }),
+                active,
+            })
+        };
         tokio::spawn(async move {
-            crate::metrics::HTTP_SERVER_OPEN.inc();
-            let _ = builder
-                .serve_connection_with_upgrades(TokioIo::new(sock), svc)
-                .await;
+            match acceptor {
+                None => {
+                    crate::metrics::HTTP_SERVER_OPEN.inc();
+                    let _ = builder.serve_connection_with_upgrades(TokioIo::new(sock), svc(None)).await;
+                }
+                Some(acceptor) => {
+                    // on the connection's task: a slow or silent client
+                    // holds only its own slot
+                    let tls = match tokio::time::timeout(crate::peer_tls::HANDSHAKE_TIMEOUT, acceptor.accept(sock)).await {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            crate::peer_tls::server_handshake_failed();
+                            tracing::warn!(%peer, "peer TLS handshake failed: {e}");
+                            return;
+                        }
+                        Err(_) => {
+                            crate::peer_tls::server_handshake_failed();
+                            tracing::warn!(%peer, "peer TLS handshake timed out");
+                            return;
+                        }
+                    };
+                    let node = crate::peer_tls::peer_node(tls.get_ref().1).map(|n| crate::peer_tls::PeerNode(n.into()));
+                    crate::metrics::HTTP_SERVER_OPEN.inc();
+                    let _ = builder.serve_connection_with_upgrades(TokioIo::new(tls), svc(node)).await;
+                }
+            }
             crate::metrics::HTTP_SERVER_OPEN.dec();
             // an upgraded connection (subscribeRepos) lives on past this
             // without a slot: the firehose caps its subscribers itself

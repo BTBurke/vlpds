@@ -268,6 +268,8 @@ impl IntoResponse for XrpcError {
 type XResult<T> = Result<T, XrpcError>;
 
 pub fn router(app: Arc<App>) -> Router {
+    // node-to-node routes: not mounted on a node no peer can reach
+    let internal = if app.config.serve_internal { internal::routes() } else { Router::new() };
     let r = Router::new()
         .route(
             "/xrpc/_health",
@@ -287,7 +289,7 @@ pub fn router(app: Arc<App>) -> Router {
         ))
         .merge(proxy::routes())
         .merge(oauth::routes())
-        .merge(internal::routes())
+        .merge(internal)
         .merge(crate::profiling::routes())
         .merge(ratelimits::routes())
         .merge(feature_level::routes())

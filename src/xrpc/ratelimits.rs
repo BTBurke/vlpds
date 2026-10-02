@@ -31,6 +31,11 @@ pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/xrpc/vlpds.admin.getRateLimits", get(get_rate_limits))
         .route("/xrpc/vlpds.admin.updateRateLimits", post(update_rate_limits))
+}
+
+/// The node-to-node half (mounted with `internal::routes`).
+pub fn internal_routes() -> Router<Arc<App>> {
+    Router::new()
         .route("/internal/v1/ratelimits", get(internal_snapshot))
         .route("/internal/v1/ratelimits/reload", post(internal_reload))
 }
