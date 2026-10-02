@@ -22,6 +22,7 @@ runs in-region, so egress is $0.
 > compactor/worker slow polls 30 s, idle checkpoints skipped. With them the model prices Bluesky today
 > at 3 nodes / 256 shards at **$2,521 (S3) / $2,500 (GCS) / $2,244 (R2)**, and 8 / 1,024 at $7,182 S3.
 > The tables below are the measured runs and the projections at the *previous* defaults.
+> The default shard count then went from 256 to **64**: $1,714 / $1,693 / $1,510 (section "Default shard count").
 
 How the costs scale, in order of impact:
 1. **Requests cost far more than storage at Bluesky's write rate.** State plus log is ~4.9 TB
@@ -536,3 +537,23 @@ The remaining big lines at 3 / 256 are segment PUTs ($1,078 S3) and checkpoint f
   multipart for large blobs; parts of uploads whose process died are billed until aborted.
 
 The MinIO prefix `costdef` and the node caches were deleted after the runs.
+
+## Default shard count: 64 (was 256), 2026-10-02
+`--shards` (and `ClusterConfig::default()`) now creates new prefixes with 64 shards, not 256. Checkpoint
+flushes, SlateDB polling and GC are paid per shard, and SlateDB benchmarks against real GCS found fewer,
+busier shards cheaper per commit (CPU, compaction). Online split adds shards as load grows. Model with
+the new defaults, Bluesky today on 3 nodes (`fit(phase_list())`, then
+`project(c, "bluesky-today", 3, shards)`, `cost[p]["total_$"]`), $/mo:
+
+| shards | S3 | GCS | R2 |
+|---|---|---|---|
+| 8 | $1,360 | $1,338 | $1,189 |
+| 16 | $1,415 | $1,394 | $1,240 |
+| 32 | $1,521 | $1,500 | $1,336 |
+| **64 (new default)** | **$1,714** | **$1,693** | **$1,510** |
+| 128 | $2,038 | $2,016 | $1,804 |
+| 256 (old default) | $2,521 | $2,500 | $2,244 |
+
+Everything below 256 shards is extrapolated: the model was fitted on 256-shard runs and validated at
+1,024 shards, and no run measured fewer than 256. It assumes the per-shard terms stay linear and the
+per-node ones (segment PUTs, cold loads) stay fixed as each shard takes more commits.

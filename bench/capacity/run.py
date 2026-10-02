@@ -58,6 +58,7 @@ BUCKET = "vlpds"
 SCRATCH = os.environ.get("BENCH_SCRATCH") or os.path.join(PKG, "target", "capacity-scratch")
 ADMIN = "dev-admin-token"
 INTERNAL = "dev-internal-token"
+SHARDS = 64  # the server default (--shards); passed explicitly to every node
 GRAFANA = os.environ.get("GRAFANA_URL", "http://127.0.0.1:3300")
 
 
@@ -226,7 +227,7 @@ class Node:
              "--block-cache-mb", str(c.block_cache_mb), "--repo-cache-mb", str(c.repo_cache_mb),
              "--cache-budget-mb", str(c.cache_budget_mb),
              "--log-retention", c.log_retention, "--slatedb-checkpoint-lifetime", c.checkpoint_lifetime,
-             "--slatedb-gc-min-age", c.gc_min_age, "--lease-ttl-ms", str(c.lease_ttl_ms)]
+             "--slatedb-gc-min-age", c.gc_min_age, "--lease-ttl-ms", str(c.lease_ttl_ms), "--shards", str(SHARDS)]
         if self.cache:
             a += ["--cache-dir", self.cache]
         if c.inject:
@@ -319,7 +320,7 @@ def shq(s):
     return s if re.fullmatch(r"[A-Za-z0-9_./:=,@%+-]+", s) else "'" + s.replace("'", "'\\''") + "'"
 
 
-def wait_converged(nodes, shards=256, timeout=180):
+def wait_converged(nodes, shards=SHARDS, timeout=180):
     """Every live node's routing table names an owner for all shards and
     the owned counts sum to `shards`."""
     t = time.time()

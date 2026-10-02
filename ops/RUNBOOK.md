@@ -22,7 +22,7 @@ it is marked **(unverified)**.
   (who owns what, and the slot -> shard map), `nodes/{node_id}` (node leases),
   `writers/{w}` (unique seq low byte per live node), `retain/{log_id}` (retention
   reports), `handle/`, `email/`, `blob/`. The local disk is only a SlateDB SST cache.
-- **Shards.** 65,536 hash slots grouped into shards (default `--shards 256`,
+- **Shards.** 65,536 hash slots grouped into shards (default `--shards 64`,
   changed online by split/merge). Each shard has exactly one owner node at a time.
   A node takes free or orphaned shards up to its fair share, `ceil(shards / live
   nodes)`, and hands extras to joiners.

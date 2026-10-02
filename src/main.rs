@@ -81,7 +81,7 @@ struct Args {
     /// Shards (hash-slot ranges) of a new prefix's initial layout. Later the
     /// layout stored in the prefix wins; shards split and merge online
     /// (`vlpds admin shard-split`, `--reshard-split-mb`).
-    #[arg(long, env = "VLPDS_SHARDS", default_value_t = 256)]
+    #[arg(long, env = "VLPDS_SHARDS", default_value_t = 64)]
     shards: u16,
     /// Split policy: split a shard whose SSTs exceed this many MiB (0 = off).
     #[arg(long, env = "VLPDS_RESHARD_SPLIT_MB", default_value_t = 0)]

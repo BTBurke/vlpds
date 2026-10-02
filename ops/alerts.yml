@@ -13,7 +13,7 @@
 #   targets and to every `sum(...)` / `count(...)` below (`by (cluster)`).
 # - The recording rules in group vlpds-constants hold the two numbers no
 #   metric exports (see RUNBOOK.md "Metric gaps"): the shard count
-#   (--shards, default 256; changes with every online split/merge) and the
+#   (--shards, default 64; changes with every online split/merge) and the
 #   per-node memory limit used for the RSS alerts.
 #
 # Thresholds: the design numbers are ~40-50 ms p50 / ~150 ms p99 commit ack
@@ -28,7 +28,7 @@ groups:
       # Expected number of shards in the layout (--shards when the prefix was
       # created, +1 per split, -1 per merge). `vlpds admin layout` prints it.
       - record: vlpds:expected_shards
-        expr: vector(256)
+        expr: vector(64)
       # Memory available to one vlpds process (host RAM or cgroup limit).
       # DESIGN.md "Initial deployment sizing": 64 GB owner nodes.
       - record: vlpds:memory_limit_bytes

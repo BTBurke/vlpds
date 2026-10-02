@@ -115,7 +115,7 @@ impl Default for ClusterConfig {
         ClusterConfig {
             node_id: format!("node-{}", hex::encode(rand::random::<[u8; 4]>())),
             addr: "http://127.0.0.1:2583".into(),
-            shards: 256,
+            shards: 64,
             ttl: Duration::from_secs(10),
             renew_every: Duration::from_secs(2),
             skew: Duration::from_secs(2),

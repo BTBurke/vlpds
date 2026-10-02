@@ -111,8 +111,8 @@ impl RecentRepos {
 
 /// One SST block/meta cache shared by every shard DB in the process. SlateDB's
 /// default is a private 512 MiB block + 128 MiB meta cache per Db, which at
-/// 256 shards per node lets the caches grow toward ~160 GiB as reads touch
-/// more shards (the RSS creep seen at 1M–10M repos).
+/// 256 shards per node (the old default) let the caches grow toward ~160 GiB
+/// as reads touch more shards (the RSS creep seen at 1M–10M repos).
 static BLOCK_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(4 << 30);
 
 /// Size of the shared block cache (the meta cache gets a quarter on top).

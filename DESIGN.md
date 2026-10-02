@@ -428,8 +428,8 @@ the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
 `src/node.rs`, `src/nodelog.rs`); `bench/ha/RESULTS.md` has the failure matrix.
 
 - **Shards.** 65,536 fixed hash slots grouped into contiguous ranges by a
-  versioned layout (`assign/layout`; `--shards N` uniform ranges when a
-  prefix is created), which splits and merges change online (see "Online
+  versioned layout (`assign/layout`; `--shards N` uniform ranges, default
+  64, when a prefix is created), which splits and merges change online (see "Online
   shard split/merge"). A shard is the unit of ownership and state: one
   SlateDB at `state/{id}/` and an assignment object `assign/{id}`.
 - **One log per node incarnation.** A node group-commits every shard's entries,
@@ -1172,18 +1172,23 @@ one node, the survivors stay under ~60% CPU, i.e.
 - **Network.** Proxying is ~0.27 Gbit/s per node each direction today, and
   ~2.7 Gbit/s at 10× on 3 nodes (~1 Gbit/s on 8). Each full firehose
   subscriber adds ~12 Mbit/s (~120 at 10×).
-- **Shards.** 65,536 hash slots in **256 shards** (~220k repos each).
-  Shard count drives the object-store bill (polling, GC and checkpoint
-  flushes are per shard), so keep 256 and split hot or large shards online.
+- **Shards.** 65,536 hash slots in **64 shards** by default (~875k repos
+  each, ~21 per node at 3 nodes). Shard count drives the object-store bill
+  (polling, GC and checkpoint flushes are per shard) and busier shards flush
+  and compact more efficiently, so start at 64 and split hot or large shards
+  online. 64 instead of 256 saves ~$800/mo on S3 at today's load.
 
 ### Object store
-- **~$2.5k/mo on S3 (~$2.2k on R2, ~$2.5k on GCS)** at 3 nodes / 256
-  shards with the latency-neutral defaults (10 s manifest poll, 30 s
+- **~$1.7k/mo on S3 (~$1.5k on R2, ~$1.7k on GCS)** at 3 nodes / 64
+  shards (256 shards: ~$2.5k / $2.2k / $2.5k) with the latency-neutral defaults (10 s manifest poll, 30 s
   compactor polls, idle checkpoints skipped), in-region
   (bench/results/cost-model-2026-10-02, "Defaults changed"). Requests
   dominate: segment PUTs (~27/s per node at any load up to ~20k
   commits/s/node), checkpoint flushes plus compaction, and polling.
   Storage (~4.9 TB: state, replaced SSTs, 72 h of log) is ~$110/mo.
+  The model was fitted at ~34 ms mean PUT latency; at measured in-region
+  GCS latency (~57 ms mean for small objects) nodes send fewer, larger
+  segments and the 64-shard bill is ~$1.3k (GCS).
   8 nodes / 1,024 shards would be ~$7.2k. Off-cloud nodes (OVH) with S3 or
   GCS also pay egress for every state GET past the disk cache, every log
   read by a peer, and relay backfill: not modeled. R2 charges no egress.
