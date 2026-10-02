@@ -15,6 +15,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/internal/v1/private/put", post(put_private))
         .route("/internal/v1/private/get", get(get_private))
         .route("/internal/v1/private/scan", get(scan_private))
+        .route("/internal/v1/private/cas", post(private_cas))
         .route("/internal/v1/account", get(get_account))
         .route("/internal/v1/oauth/replay", post(claim_replay))
         .route("/internal/v1/cluster", get(cluster_status))
@@ -243,6 +244,85 @@ async fn put_private(State(app): AppState, headers: HeaderMap, axum::Json(inp): 
         super::server::ctl_changed(&app, &inp.routing);
     }
     Ok(Json(json!({})))
+}
+
+#[derive(serde::Serialize, Deserialize)]
+struct CasIn {
+    routing: String,
+    /// (name, expected value: None = absent), base64
+    conds: Vec<(String, Option<String>)>,
+    /// (name, value: None = delete), base64
+    puts: Vec<(String, Option<String>)>,
+    /// name prefixes whose rows are deleted
+    #[serde(default)]
+    delete_prefixes: Vec<String>,
+}
+
+fn b64_opt(v: Option<String>) -> XResult<Option<Bytes>> {
+    v.map(|v| B64.decode(v).map(Bytes::from)).transpose().map_err(XrpcError::from_err)
+}
+
+/// [`App::private_cas`] at this node, which must own the routing key.
+async fn private_cas(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<CasIn>) -> XResult<Json<J>> {
+    use super::cas::{Cond, Op};
+    check(&app, &headers)?;
+    let conds = inp.conds.into_iter().map(|(name, v)| Ok(Cond::Eq { name, val: b64_opt(v)? })).collect::<XResult<Vec<_>>>()?;
+    let mut ops = inp.puts.into_iter().map(|(name, v)| Ok(Op::Put { name, val: b64_opt(v)? })).collect::<XResult<Vec<_>>>()?;
+    ops.extend(inp.delete_prefixes.into_iter().map(|prefix| Op::DeletePrefix { prefix }));
+    // must be local now (no forwarding loops)
+    app.partition(&inp.routing)?;
+    let out = super::cas::private_cas_local(&app, &inp.routing, conds, ops).await?;
+    let deleted: Vec<(String, String)> = out.deleted.into_iter().map(|(n, v)| (n, B64.encode(v))).collect();
+    Ok(Json(json!({"applied": out.applied, "deleted": deleted})))
+}
+
+/// [`App::private_cas`] sent to `owner`.
+pub async fn forward_private_cas(
+    app: &App,
+    owner: &str,
+    routing: &str,
+    conds: Vec<super::cas::Cond>,
+    ops: Vec<super::cas::Op>,
+) -> XResult<super::cas::Outcome> {
+    use super::cas::{Cond, Op};
+    let enc = |v: Option<Bytes>| v.map(|v| B64.encode(v));
+    let mut body = CasIn { routing: routing.to_string(), conds: Vec::new(), puts: Vec::new(), delete_prefixes: Vec::new() };
+    for c in conds {
+        let Cond::Eq { name, val } = c;
+        body.conds.push((name, enc(val)));
+    }
+    for o in ops {
+        match o {
+            Op::Put { name, val } => body.puts.push((name, enc(val))),
+            Op::DeletePrefix { prefix } => body.delete_prefixes.push(prefix),
+        }
+    }
+    let r = app
+        .http
+        .post(format!("{owner}/internal/v1/private/cas"))
+        .header(HDR, &app.config.internal_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(upstream)?;
+    if !r.status().is_success() {
+        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
+    }
+    #[derive(Deserialize)]
+    struct Out {
+        applied: bool,
+        #[serde(default)]
+        deleted: Vec<(String, String)>,
+    }
+    let out: Out = r.json().await.map_err(upstream)?;
+    Ok(super::cas::Outcome {
+        applied: out.applied,
+        deleted: out
+            .deleted
+            .into_iter()
+            .map(|(n, v)| Ok((n, Bytes::from(B64.decode(v).map_err(upstream)?))))
+            .collect::<XResult<Vec<_>>>()?,
+    })
 }
 
 #[derive(Deserialize)]

@@ -12,7 +12,9 @@
 //!   p/_reset:{digest}\0t           password-reset token digest -> did
 //!   p/_invite:{code}\0c            invite code (+ p/{account}\0invite/{code} index)
 //!   p/{did}\0sec/rvk/f/{family}    revoked session family (access tokens), TTL'd
-//!   p/{did}\0sec/rvk/d             all sessions of the DID revoked before a time
+//!   p/{did}\0sec/rvk/d/{before}    all sessions of the DID revoked before a time
+//!   p/{did}\0auth_epoch            credential epoch, replaced by every revoke-all
+//!                                  ([`auth_epoch`]; logins racing one fail)
 //!   p/{did}\0sec/td/rec/{coll}/{rkey}, p/{did}\0sec/td/blob/{cid}
 //!                                  record / blob takedowns (admin.rs)
 //!   {prefix}/email/{sha256(email)} global email claim -> did (object store,
@@ -157,6 +159,18 @@ const REFRESH_TTL: u64 = 90 * 86400;
 const REFRESH_GRACE: u64 = 2 * 3600;
 /// How long a revocation must be remembered for access tokens: their lifetime + slack.
 const REVOKE_TTL: u64 = ACCESS_TTL + 600;
+/// How long a revoke-all row (`sec/rvk/d/`) is kept: past every refresh
+/// token it covers, not just the access tokens. Defense in depth: the
+/// refresh rows are deleted in the same conditional write
+/// ([`revoke_all_sessions`]), and a rotation can't recreate them
+/// ([`refresh_session`]), but even a row that did come back stays refused
+/// (`is_revoked` of its family) for as long as it could be used.
+const REVOKE_ALL_TTL: u64 = REFRESH_TTL + 600;
+/// Rounds of a read / conditional-write loop before giving up (each lost
+/// round means a concurrent change of the same rows).
+const CAS_ROUNDS: usize = 8;
+/// Private name of the account's credential epoch ([`auth_epoch`]).
+pub const AUTH_EPOCH: &str = "auth_epoch";
 /// A DID's revocations/takedowns read from another node (its owner) are
 /// re-read this often.
 const RELOAD_SECS: u64 = 10;
@@ -1059,23 +1073,68 @@ fn issue_pair(
     )
 }
 
+/// The account's credential epoch: a random value replaced by every
+/// revoke-all (password change or reset, takedown, deletion, OAuth
+/// credential deletion); None = never revoked. A login reads it *before*
+/// re-reading the account it checked the password against
+/// ([`epoch_for_login`]), and the session it then creates (a `sess/` row,
+/// an OAuth device login, an authorization code's session) is written only
+/// if the epoch is still that value (a conditional write at the owner,
+/// src/xrpc/cas.rs). A revoke-all replaces the epoch and deletes the
+/// sessions in one such write, so a login racing it either lands first (and
+/// is deleted) or fails: no node's clock is involved. "" = never revoked
+/// (no row).
+pub async fn auth_epoch(app: &App, did: &str) -> XResult<String> {
+    Ok(get_json::<String>(app, did, AUTH_EPOCH).await?.unwrap_or_default())
+}
+
+/// Condition: the credential epoch is still `epoch` ("" = no row).
+pub fn auth_epoch_cond(epoch: &str) -> super::cas::Cond {
+    super::cas::Cond::eq(AUTH_EPOCH, (!epoch.is_empty()).then(|| Bytes::from(to_json_bytes(&epoch))))
+}
+
+/// Write: a new credential epoch (part of every revoke-all).
+pub fn new_auth_epoch_op() -> super::cas::Op {
+    super::cas::Op::put(AUTH_EPOCH, Some(Bytes::from(to_json_bytes(&random_hex(16)))))
+}
+
+/// After a password check against `checked` (an account record read before
+/// it): the credential epoch to create the session under, or None if the
+/// password changed since `checked` was read (the login must fail). The
+/// epoch is read first, so a password change that the re-read misses
+/// replaces the epoch after it was read (see [`auth_epoch`]).
+pub async fn epoch_for_login(app: &App, checked: &Account) -> XResult<Option<String>> {
+    let epoch = auth_epoch(app, &checked.did).await?;
+    let now = super::internal::account_anywhere(app, &checked.did).await?;
+    Ok((now.password_hash == checked.password_hash).then_some(epoch))
+}
+
+/// A read / conditional-write loop lost [`CAS_ROUNDS`] times in a row.
+pub(super) fn cas_conflict() -> XrpcError {
+    err(StatusCode::SERVICE_UNAVAILABLE, "TemporarilyUnavailable", "concurrent update; retry")
+}
+
 /// Starts a new session family and returns (accessJwt, refreshJwt).
 pub(super) async fn create_session_tokens(
     app: &App,
     did: &str,
     ap: Option<AppPassRef>,
 ) -> XResult<(String, String)> {
-    create_session_tokens_scoped(app, did, ap, false).await
+    create_session_tokens_scoped(app, did, ap, false, None).await
 }
 
 /// `takendown`: the access token gets the restricted `com.atproto.takendown`
-/// scope (reference createSession for a soft-deleted account).
+/// scope (reference createSession for a soft-deleted account). `epoch`: the
+/// credential epoch the login was checked under ([`epoch_for_login`]); the
+/// session is created only if it is still current.
 async fn create_session_tokens_scoped(
     app: &App,
     did: &str,
     ap: Option<AppPassRef>,
     takendown: bool,
+    epoch: Option<&str>,
 ) -> XResult<(String, String)> {
+    use super::cas::{Cond, Op};
     let family = new_family_id();
     let rid = random_hex(24);
     let st = RefreshState {
@@ -1085,11 +1144,13 @@ async fn create_session_tokens_scoped(
         created_at: now_secs(),
         next_id: None,
     };
-    app.put_private(
-        did,
-        vec![pmut(did, &format!("sess/{rid}"), Some(to_json_bytes(&st)))],
-    )
-    .await?;
+    let name = format!("sess/{rid}");
+    let mut conds = vec![Cond::eq(&name, None)];
+    conds.extend(epoch.map(auth_epoch_cond));
+    let out = app.private_cas(did, conds, vec![Op::put(&name, Some(Bytes::from(to_json_bytes(&st))))]).await?;
+    if !out.applied {
+        return Err(auth_required("Credentials were revoked during sign-in"));
+    }
     let (access, refresh) = issue_pair(app, did, &family, &rid, &ap);
     if takendown {
         let access =
@@ -1121,21 +1182,21 @@ async fn revoke_families(app: &App, did: &str, families: &[String]) -> XResult<(
 }
 
 /// Revokes every session of `did` (refresh tokens deleted, outstanding access
-/// tokens rejected). Used on password change, takedown and deletion.
+/// tokens rejected) and replaces its credential epoch, in one conditional
+/// write at the owner: a refresh racing it either rotated first (its rows
+/// are deleted here) or finds its row gone, and a login racing it fails
+/// ([`auth_epoch`]). Used on password change, takedown and deletion.
 pub(super) async fn revoke_all_sessions(app: &App, did: &str) -> XResult<()> {
+    use super::cas::Op;
     let before = crate::tid::now_micros();
-    let exp = now_secs() + REVOKE_TTL;
-    put_sec(
-        app,
-        did,
-        vec![pmut(
-            did,
-            &format!("{REVOKED_ALL}{before:016x}"),
-            Some(to_json_bytes(&json!({"before": before, "exp": exp}))),
-        )],
-    )
-    .await?;
-    revoke_refresh_tokens(app, did).await
+    let exp = now_secs() + REVOKE_ALL_TTL;
+    let ops = vec![
+        Op::put(format!("{REVOKED_ALL}{before:016x}"), Some(Bytes::from(to_json_bytes(&json!({"before": before, "exp": exp}))))),
+        new_auth_epoch_op(),
+        Op::DeletePrefix { prefix: "sess/".into() },
+    ];
+    app.private_cas(did, Vec::new(), ops).await?;
+    Ok(())
 }
 
 /// For the private-row GC (`crate::oauth::gc`, which sweeps every `p/` row
@@ -1164,36 +1225,41 @@ pub async fn drop_revocation(app: &App, did: &str, name: &str) -> XResult<()> {
 /// (`revokeRefreshTokensByDid`), so the owner can still use the access token
 /// for what a taken-down account may do (e.g. sync its own repo).
 pub(super) async fn revoke_refresh_tokens(app: &App, did: &str) -> XResult<()> {
-    let sessions = scan_private(app, did, "sess/").await?;
-    if !sessions.is_empty() {
-        app.put_private(
-            did,
-            sessions
-                .iter()
-                .map(|(name, _)| pmut(did, name, None))
-                .collect(),
-        )
-        .await?;
-    }
+    // at the owner, under the lock of every conditional `sess/` write: no
+    // rotation lands between the listing and the delete
+    app.private_cas(did, Vec::new(), vec![super::cas::Op::DeletePrefix { prefix: "sess/".into() }]).await?;
     Ok(())
+}
+
+/// Deletes the refresh rows matching `pred`, each on condition that it
+/// still holds what was read: a rotation racing this changes the row it
+/// rotates, so the delete is redone over the new rows and no rotation of a
+/// matched session survives. Returns the matched states.
+async fn delete_sessions_where(app: &App, did: &str, pred: impl Fn(&str, &RefreshState) -> bool) -> XResult<Vec<RefreshState>> {
+    use super::cas::{Cond, Op};
+    for _ in 0..CAS_ROUNDS {
+        let (mut conds, mut ops, mut out) = (Vec::new(), Vec::new(), Vec::new());
+        for (name, v) in super::internal::scan_private_anywhere(app, did, "sess/").await? {
+            let Ok(st) = serde_json::from_slice::<RefreshState>(&v) else {
+                continue;
+            };
+            if pred(&name, &st) {
+                conds.push(Cond::eq(&name, Some(v)));
+                ops.push(Op::put(&name, None));
+                out.push(st);
+            }
+        }
+        if ops.is_empty() || app.private_cas(did, conds, ops).await?.applied {
+            return Ok(out);
+        }
+    }
+    Err(cas_conflict())
 }
 
 /// Revokes the sessions created with app password `name`.
 async fn revoke_app_password_sessions(app: &App, did: &str, name: &str) -> XResult<()> {
-    let mut dels = Vec::new();
-    let mut fams = Vec::new();
-    for (k, v) in scan_private(app, did, "sess/").await? {
-        let Ok(st) = serde_json::from_slice::<RefreshState>(&v) else {
-            continue;
-        };
-        if st.app_password.as_ref().is_some_and(|a| a.name == name) {
-            dels.push(pmut(did, &k, None));
-            fams.push(st.family);
-        }
-    }
-    if !dels.is_empty() {
-        app.put_private(did, dels).await?;
-    }
+    let gone = delete_sessions_where(app, did, |_, st| st.app_password.as_ref().is_some_and(|a| a.name == name)).await?;
+    let fams: Vec<String> = gone.into_iter().map(|st| st.family).collect();
     revoke_families(app, did, &fams).await
 }
 
@@ -1727,8 +1793,12 @@ async fn create_session(
     // else the email factor (src/xrpc/email2fa.rs); a code sent anyway is
     // still checked, as in the reference
     super::email2fa::check_second_factor(&app, &acct, inp.auth_factor_token.as_deref(), app_pass.is_some()).await?;
+    // the session is created only if no revocation (a password change) hit
+    // the account since its password was checked (see auth_epoch)
+    let epoch = epoch_for_login(&app, &acct).await?.ok_or_else(invalid)?;
+    super::cas::pause_point("legacy_login", &acct.did).await;
     let (access, refresh) =
-        create_session_tokens_scoped(&app, &acct.did, app_pass, soft_deleted).await?;
+        create_session_tokens_scoped(&app, &acct.did, app_pass, soft_deleted, Some(epoch.as_str())).await?;
     let mut out = session_info(&app, &acct, true).await;
     out["accessJwt"] = json!(access);
     out["refreshJwt"] = json!(refresh);
@@ -1758,34 +1828,54 @@ async fn refresh_session(State(app): AppState, headers: HeaderMap) -> XResult<Js
         return Err(takedown_error());
     }
     let e = ext(&app);
-    // serializes racing refreshes of one account on this node
+    // serializes racing refreshes of one account on this node (an economy:
+    // the conditional write below is what is correct across nodes)
     let _g = e.lock(&did).await;
-    let st: Option<RefreshState> = get_json(&app, &did, &format!("sess/{rid}")).await?;
-    // revoked (deleteSession, password change, ...) or past its grace period
-    let now = now_secs();
-    let st = st.filter(|s| s.exp >= now).ok_or_else(|| expired_token("Token has been revoked"))?;
-    if ctl(&app, &did).await?.is_revoked(Some(&st.family), 0) {
-        return Err(expired_token("Token has been revoked"));
-    }
-    // Rotation as in the reference: the old token stays usable for a grace
-    // period (min(2h, its expiry)) and reuse yields the same next token id;
-    // after that it is rejected.
-    let next = st.next_id.clone().unwrap_or_else(|| random_hex(24));
-    let mut muts = vec![pmut(
-        &did,
-        &format!("sess/{rid}"),
-        Some(to_json_bytes(&RefreshState { exp: st.exp.min(now + REFRESH_GRACE), next_id: Some(next.clone()), ..st.clone() })),
-    )];
-    if app.get_private(&did, &format!("sess/{next}")).await?.is_none() {
-        let next_st = RefreshState { exp: now + REFRESH_TTL, created_at: now, next_id: None, ..st.clone() };
-        muts.push(pmut(&did, &format!("sess/{next}"), Some(to_json_bytes(&next_st))));
-    }
-    app.put_private(&did, muts).await?;
+    let (st, next) = rotate_refresh(&app, &did, &rid).await?;
     let (access, refresh) = issue_pair(&app, &did, &st.family, &next, &st.app_password);
     let mut out = session_info(&app, &acct, true).await;
     out["accessJwt"] = json!(access);
     out["refreshJwt"] = json!(refresh);
     Ok(Json(out))
+}
+
+/// Rotates refresh token `rid` of `did`: (its session, the next refresh id).
+/// The rows are read, checked and rewritten on condition that they still
+/// hold what was read, at the owner (src/xrpc/cas.rs), so a revocation that
+/// lands meanwhile (deleteSession, password change, takedown: they delete
+/// the rows the same way) is never undone by the rewrite; a lost round
+/// re-reads.
+async fn rotate_refresh(app: &App, did: &str, rid: &str) -> XResult<(RefreshState, String)> {
+    use super::cas::{Cond, Op};
+    let name = format!("sess/{rid}");
+    for _ in 0..CAS_ROUNDS {
+        let raw = app.get_private(did, &name).await?;
+        let st: Option<RefreshState> = raw.as_deref().map(serde_json::from_slice).transpose().map_err(XrpcError::from_err)?;
+        // revoked (deleteSession, password change, ...) or past its grace period
+        let now = now_secs();
+        let st = st.filter(|s| s.exp >= now).ok_or_else(|| expired_token("Token has been revoked"))?;
+        if ctl(app, did).await?.is_revoked(Some(&st.family), 0) {
+            return Err(expired_token("Token has been revoked"));
+        }
+        // Rotation as in the reference: the old token stays usable for a
+        // grace period (min(2h, its expiry)) and reuse yields the same next
+        // token id; after that it is rejected.
+        let next = st.next_id.clone().unwrap_or_else(|| random_hex(24));
+        let next_name = format!("sess/{next}");
+        let next_raw = app.get_private(did, &next_name).await?;
+        let rotated = RefreshState { exp: st.exp.min(now + REFRESH_GRACE), next_id: Some(next.clone()), ..st.clone() };
+        let mut ops = vec![Op::put(&name, Some(Bytes::from(to_json_bytes(&rotated))))];
+        if next_raw.is_none() {
+            let next_st = RefreshState { exp: now + REFRESH_TTL, created_at: now, next_id: None, ..st.clone() };
+            ops.push(Op::put(&next_name, Some(Bytes::from(to_json_bytes(&next_st)))));
+        }
+        super::cas::pause_point("legacy_refresh", did).await;
+        let conds = vec![Cond::eq(&name, raw), Cond::eq(&next_name, next_raw)];
+        if app.private_cas(did, conds, ops).await?.applied {
+            return Ok((st, next));
+        }
+    }
+    Err(cas_conflict())
 }
 
 async fn delete_session(State(app): AppState, headers: HeaderMap) -> XResult<StatusCode> {
@@ -1794,15 +1884,10 @@ async fn delete_session(State(app): AppState, headers: HeaderMap) -> XResult<Sta
     let rid = c.jti.clone().unwrap_or_default();
     let e = ext(&app);
     let _g = e.lock(&did).await;
-    if let Some(st) = get_json::<RefreshState>(&app, &did, &format!("sess/{rid}")).await? {
+    let name = format!("sess/{rid}");
+    if let Some(st) = get_json::<RefreshState>(&app, &did, &name).await? {
         // the whole session: this token, its rotations and their access tokens
-        let mut dels = vec![pmut(&did, &format!("sess/{rid}"), None)];
-        for (name, v) in scan_private(&app, &did, "sess/").await? {
-            if serde_json::from_slice::<RefreshState>(&v).is_ok_and(|o| o.family == st.family) {
-                dels.push(pmut(&did, &name, None));
-            }
-        }
-        app.put_private(&did, dels).await?;
+        delete_sessions_where(&app, &did, |n, o| n == name || o.family == st.family).await?;
         revoke_families(&app, &did, &[st.family]).await?;
     }
     Ok(StatusCode::OK)
@@ -2210,9 +2295,10 @@ pub(super) async fn delete_account_fully(app: &App, did: &str) -> XResult<()> {
         }
     }
     // revocations stay (TTL'd), so a DID that comes back (migration) doesn't
-    // revive access tokens issued before
+    // revive access tokens issued before; so does the credential epoch
+    // (device logins and codes from before must not match a fresh account)
     let mut private = scan_private(app, did, "").await?;
-    private.retain(|(name, _)| !name.starts_with(REVOKED_ALL) && !name.starts_with(REVOKED_FAMILY));
+    private.retain(|(name, _)| !name.starts_with(REVOKED_ALL) && !name.starts_with(REVOKED_FAMILY) && name != AUTH_EPOCH);
     for chunk in private.chunks(500) {
         app.put_private(
             did,
@@ -3040,13 +3126,22 @@ async fn setup_totp(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>>
     let did = session_only(&creds)?;
     let acct = app.account(&did).await?;
     let _g = crate::totp::lock(&did).await;
-    let mut st = crate::totp::load(&app, &did).await?;
-    if st.enabled() {
-        return Err(invalid_request("TOTP is already enabled; disable it first"));
-    }
     let secret = crate::totp::base32_encode(&crate::totp::generate_secret());
-    st.pending = Some(secret.clone());
-    crate::totp::save(&app, &did, &st).await?;
+    let mut saved = false;
+    for _ in 0..crate::totp::CAS_ROUNDS {
+        let (mut st, raw) = crate::totp::load_raw(&app, &did).await?;
+        if st.enabled() {
+            return Err(invalid_request("TOTP is already enabled; disable it first"));
+        }
+        st.pending = Some(secret.clone());
+        if crate::totp::save_if(&app, &did, &st, raw).await? {
+            saved = true;
+            break;
+        }
+    }
+    if !saved {
+        return Err(crate::totp::conflict());
+    }
     let issuer = app
         .public_url
         .split("://")
@@ -3071,33 +3166,37 @@ async fn confirm_totp(
     Json(inp): Json<ConfirmTotpIn>,
 ) -> XResult<Json<J>> {
     let did = session_only(&creds)?;
-    let codes = {
+    let codes = 'cas: {
         let _g = crate::totp::lock(&did).await;
-        let mut st = crate::totp::load(&app, &did).await?;
-        if st.enabled() {
-            return Err(invalid_request("TOTP is already enabled"));
+        for _ in 0..crate::totp::CAS_ROUNDS {
+            let (mut st, raw) = crate::totp::load_raw(&app, &did).await?;
+            if st.enabled() {
+                return Err(invalid_request("TOTP is already enabled"));
+            }
+            let pending = st.pending.clone().ok_or_else(|| {
+                invalid_request("No pending TOTP setup; call vlpds.server.setupTotp first")
+            })?;
+            let secret = crate::totp::base32_decode(&pending)
+                .ok_or_else(|| XrpcError::internal("corrupt pending TOTP secret"))?;
+            let step = crate::totp::verify_code(&secret, &inp.code, crate::totp::now_secs(), 0)
+                .ok_or_else(|| invalid_token("Token is invalid"))?;
+            let codes = crate::totp::generate_recovery_codes();
+            st.secret = Some(pending);
+            st.pending = None;
+            st.last_step = step;
+            st.recovery = codes
+                .iter()
+                .map(|c| crate::totp::hash_recovery_code(&secret, c))
+                .collect();
+            st.enabled_at = Some(crate::events::now_rfc3339());
+            // flag first: a crash between the two writes must not leave TOTP
+            // enabled with the login fast path (totpEnabled=false) skipping it
+            set_totp_flag(&app, &did, true).await?;
+            if crate::totp::save_if(&app, &did, &st, raw).await? {
+                break 'cas codes;
+            }
         }
-        let pending = st.pending.clone().ok_or_else(|| {
-            invalid_request("No pending TOTP setup; call vlpds.server.setupTotp first")
-        })?;
-        let secret = crate::totp::base32_decode(&pending)
-            .ok_or_else(|| XrpcError::internal("corrupt pending TOTP secret"))?;
-        let step = crate::totp::verify_code(&secret, &inp.code, crate::totp::now_secs(), 0)
-            .ok_or_else(|| invalid_token("Token is invalid"))?;
-        let codes = crate::totp::generate_recovery_codes();
-        st.secret = Some(pending);
-        st.pending = None;
-        st.last_step = step;
-        st.recovery = codes
-            .iter()
-            .map(|c| crate::totp::hash_recovery_code(&secret, c))
-            .collect();
-        st.enabled_at = Some(crate::events::now_rfc3339());
-        // flag first: a crash between the two writes must not leave TOTP
-        // enabled with the login fast path (totpEnabled=false) skipping it
-        set_totp_flag(&app, &did, true).await?;
-        crate::totp::save(&app, &did, &st).await?;
-        codes
+        return Err(crate::totp::conflict());
     };
     Ok(Json(json!({"enabled": true, "recoveryCodes": codes})))
 }
@@ -3120,24 +3219,28 @@ async fn disable_totp(
     if !verify_password(&acct, &inp.password).await {
         return Err(auth_required("Invalid password"));
     }
-    {
+    'cas: {
         let _g = crate::totp::lock(&did).await;
-        let mut st = crate::totp::load(&app, &did).await?;
-        if !st.enabled() {
-            return Err(invalid_request("TOTP is not enabled"));
+        for _ in 0..crate::totp::CAS_ROUNDS {
+            let (mut st, raw) = crate::totp::load_raw(&app, &did).await?;
+            if !st.enabled() {
+                return Err(invalid_request("TOTP is not enabled"));
+            }
+            let code = inp
+                .code
+                .as_deref()
+                .or(inp.recovery_code.as_deref())
+                .filter(|c| !c.trim().is_empty())
+                .ok_or_else(|| invalid_request("code or recoveryCode is required"))?;
+            // counts toward the lockout like a sign-in attempt
+            let r = crate::totp::attempt(&mut st, code, crate::totp::now_secs());
+            let next = if r.is_ok() { crate::totp::TotpState::default() } else { st };
+            if crate::totp::save_if(&app, &did, &next, raw).await? {
+                r?;
+                break 'cas;
+            }
         }
-        let code = inp
-            .code
-            .as_deref()
-            .or(inp.recovery_code.as_deref())
-            .filter(|c| !c.trim().is_empty())
-            .ok_or_else(|| invalid_request("code or recoveryCode is required"))?;
-        // counts toward the lockout like a sign-in attempt
-        if let Err(e) = crate::totp::attempt(&mut st, code, crate::totp::now_secs()) {
-            crate::totp::save(&app, &did, &st).await?;
-            return Err(e);
-        }
-        crate::totp::save(&app, &did, &crate::totp::TotpState::default()).await?;
+        return Err(crate::totp::conflict());
     }
     set_totp_flag(&app, &did, false).await?;
     Ok(StatusCode::OK)
@@ -3182,6 +3285,10 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
         r("etok/update_email".into(), enc(&et)),
         r(format!("{REVOKED_ALL}{before:016x}"), enc(&json!({"before": before, "exp": 1_790_007_200u64}))),
         r(format!("{REVOKED_FAMILY}{fam}"), enc(&json!({"exp": 1_790_007_200u64}))),
+        // AUTH_EPOCH (a JSON string, check_row) came after L1 was released:
+        // its fixture belongs to the next level (L1's rows.json is frozen;
+        // the epoch fields of the OAuth rows are omitted when empty, so
+        // their L1 bytes are unchanged)
         r(
             format!("{TAKEDOWN}rec/app.bsky.feed.post/3l3qo2vutsw2b"),
             enc(&json!({"uri": format!("at://{did}/app.bsky.feed.post/3l3qo2vutsw2b"), "did": did, "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm", "ref": "mod-1"})),
@@ -3215,6 +3322,8 @@ pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow:
         utf8_row("app password hash", val)
     } else if name.starts_with("etok/") {
         typed_row::<EmailToken>("email token", val)
+    } else if name == AUTH_EPOCH {
+        typed_row::<String>("credential epoch", val)
     } else if name.starts_with(REVOKED_ALL) || name.starts_with(REVOKED_FAMILY) {
         let fields: &[(&str, char)] = if name.starts_with(REVOKED_ALL) { &[("before", 'u'), ("exp", 'u')] } else { &[("exp", 'u')] };
         json_row("session revocation", val, fields).and_then(|k| {

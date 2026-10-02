@@ -14,6 +14,13 @@
 //! [`LOCKOUT_SECS`], doubling with each further lockout (capped at a day).
 //! While locked every code, right or wrong, is refused with 429
 //! `RateLimitExceeded`; a correct code after the lock resets the count.
+//!
+//! Every change of the state (an accepted code's `last_step`, a recovery
+//! code used, the failure count) is a conditional write at the account's
+//! owner ([`save_if`], src/xrpc/cas.rs): it lands only if the row still
+//! holds what was read, else the attempt is redone on the new state. So
+//! concurrent attempts on several nodes neither lose failures (N nodes
+//! don't give N times the guesses) nor accept one code twice.
 
 use crate::state::{self, Account};
 use crate::xrpc::{App, XrpcError};
@@ -223,13 +230,23 @@ pub fn hash_recovery_code(secret: &[u8], code: &str) -> String {
 }
 
 pub async fn load(app: &App, did: &str) -> Result<TotpState, XrpcError> {
+    Ok(load_raw(app, did).await?.0)
+}
+
+/// The state and the stored bytes it was read from (the condition of
+/// [`save_if`]).
+pub async fn load_raw(app: &App, did: &str) -> Result<(TotpState, Option<Bytes>), XrpcError> {
     match app.get_private(did, PRIVATE_NAME).await? {
-        Some(v) => unseal(app, did, serde_json::from_slice(&v).map_err(XrpcError::from_err)?).await,
-        None => Ok(TotpState::default()),
+        Some(v) => Ok((unseal(app, did, serde_json::from_slice(&v).map_err(XrpcError::from_err)?).await?, Some(v))),
+        None => Ok((TotpState::default(), None)),
     }
 }
 
-pub async fn save(app: &App, did: &str, st: &TotpState) -> Result<(), XrpcError> {
+/// Writes `st` if the stored row is still `read` (what [`load_raw`]
+/// returned): Ok(false) = it changed meanwhile (another attempt, maybe on
+/// another node), nothing written; reload and redo.
+pub async fn save_if(app: &App, did: &str, st: &TotpState, read: Option<Bytes>) -> Result<bool, XrpcError> {
+    use crate::xrpc::cas::{Cond, Op};
     let val = if st.secret.is_none() && st.pending.is_none() {
         None
     } else {
@@ -237,14 +254,20 @@ pub async fn save(app: &App, did: &str, st: &TotpState) -> Result<(), XrpcError>
             serde_json::to_vec(&seal(app, did, st).await?).map_err(XrpcError::from_err)?,
         ))
     };
-    app.put_private(
-        did,
-        vec![crate::segment::Mutation {
-            key: state::private_key(did, PRIVATE_NAME).into(),
-            val,
-        }],
-    )
-    .await
+    let out = app.private_cas(did, vec![Cond::eq(PRIVATE_NAME, read)], vec![Op::put(PRIVATE_NAME, val)]).await?;
+    Ok(out.applied)
+}
+
+/// Rounds of a [`load_raw`] / [`save_if`] loop before giving up.
+pub const CAS_ROUNDS: usize = 8;
+
+/// A [`save_if`] loop lost [`CAS_ROUNDS`] times in a row (503, retryable).
+pub fn conflict() -> XrpcError {
+    XrpcError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        error: "TemporarilyUnavailable".into(),
+        message: "concurrent two-factor update; retry".into(),
+    }
 }
 
 /// KEK rotation (`vlpds.admin.rewrapSecrets`): rewraps `did`'s TOTP
@@ -260,16 +283,19 @@ pub async fn rewrap(app: &App, did: &str, check_versions: bool, dry_run: bool) -
         return Ok(false);
     }
     let _g = lock(did).await;
-    let st = load(app, did).await?;
-    // unseal memoized only the blobs that are current
-    let stale = st.sealed.len() < [&st.secret, &st.pending].into_iter().flatten().count();
-    if stale && !dry_run {
-        save(app, did, &st).await?;
+    for _ in 0..CAS_ROUNDS {
+        let (st, raw) = load_raw(app, did).await?;
+        // unseal memoized only the blobs that are current
+        let stale = st.sealed.len() < [&st.secret, &st.pending].into_iter().flatten().count();
+        if !stale || dry_run || save_if(app, did, &st, raw).await? {
+            return Ok(stale);
+        }
     }
-    Ok(stale)
+    Err(conflict())
 }
 
-/// Serializes read-modify-write of one account's TOTP state on this node.
+/// Serializes read-modify-write of one account's TOTP state on this node
+/// (an economy: [`save_if`] is what is correct across nodes).
 static LOCKS: [tokio::sync::Mutex<()>; 32] = [const { tokio::sync::Mutex::const_new(()) }; 32];
 
 pub async fn lock(did: &str) -> tokio::sync::MutexGuard<'static, ()> {
@@ -370,28 +396,34 @@ pub async fn check_second_factor(
         return Ok(());
     }
     let _g = lock(&account.did).await;
-    let mut st = load(app, &account.did).await?;
-    if !st.enabled() {
-        return Ok(());
+    for _ in 0..CAS_ROUNDS {
+        let (mut st, raw) = load_raw(app, &account.did).await?;
+        if !st.enabled() {
+            return Ok(());
+        }
+        let now = now_secs();
+        if now < st.locked_until {
+            return Err(locked_out());
+        }
+        let code = code
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .ok_or_else(factor_required)?;
+        // saved either way: the failure count is persisted, so it survives
+        // restarts and is shared by createSession and the OAuth sign-in
+        // page; and only if nothing changed since the read (module docs)
+        let r = attempt(&mut st, code, now);
+        crate::xrpc::cas::pause_point("totp", &account.did).await;
+        if save_if(app, &account.did, &st, raw).await? {
+            return r;
+        }
     }
-    let now = now_secs();
-    if now < st.locked_until {
-        return Err(locked_out());
-    }
-    let code = code
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .ok_or_else(factor_required)?;
-    // saved either way: the failure count is persisted, so it survives
-    // restarts and is shared by createSession and the OAuth sign-in page
-    let r = attempt(&mut st, code, now);
-    save(app, &account.did, &st).await?;
-    r
+    Err(conflict())
 }
 
 /// [`consume`] under the lockout: refuses while locked, records a wrong
 /// code (possibly locking), resets the count on success. The caller holds
-/// [`lock`] and persists `st` whatever the outcome.
+/// [`lock`] and persists `st` whatever the outcome, with [`save_if`].
 pub fn attempt(st: &mut TotpState, code: &str, now: u64) -> Result<(), XrpcError> {
     if now < st.locked_until {
         return Err(locked_out());

@@ -12,6 +12,13 @@
 //! proof needed). Results are cached in memory for 5 minutes and persisted
 //! (`oauth:lex:{nsid}`), so token refreshes keep working while a publisher is
 //! temporarily unreachable (as the reference LexiconGetter does).
+//!
+//! The token endpoint ([`build_token_scope_cached`]) never waits on a
+//! publisher it has a copy from: it uses the last good copy and re-resolves
+//! a stale one in the background, so a slow or failing publisher can't
+//! hold a code exchange or refresh open (and with it the window in which
+//! it races a revocation). Only a set never seen before is resolved inline,
+//! within [`INLINE_BUDGET`].
 
 use super::scopes::{is_nsid, IncludeScope};
 use super::store::{self, StoredLexicon};
@@ -25,6 +32,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 const REFRESH: Duration = Duration::from_secs(300);
+/// A background re-resolution that failed is retried after this.
+const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Longest the token endpoint waits for a permission set it has no copy of.
+pub const INLINE_BUDGET: Duration = Duration::from_secs(3);
 const LEXICON_COLLECTION: &str = "com.atproto.lexicon.schema";
 const MAX_CAR_BYTES: usize = 1 << 20;
 
@@ -34,6 +45,9 @@ const MAX_CAR_BYTES: usize = 1 << 20;
 static CACHE: LazyLock<Arc<parking_lot::Mutex<HashMap<String, (Instant, J)>>>> =
     LazyLock::new(|| crate::caches::track(crate::caches::Cache::PermissionSets, Default::default()));
 static OVERRIDES: LazyLock<parking_lot::Mutex<HashMap<String, String>>> =
+    LazyLock::new(Default::default);
+/// NSIDs being re-resolved in the background (one task per NSID).
+static IN_FLIGHT: LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
     LazyLock::new(Default::default);
 static DNS: LazyLock<Option<hickory_resolver::TokioResolver>> = LazyLock::new(|| {
     hickory_resolver::TokioResolver::builder_tokio()
@@ -327,6 +341,81 @@ fn verify_multikey(multibase: &str, msg: &[u8], sig: &[u8], allow_high_s: bool) 
         }
         _ => Err("unsupported key type".into()),
     }
+}
+
+/// [`permission_set`] for the token endpoint: the last good copy (memory,
+/// then durable) at once, re-resolved in the background when stale; only a
+/// set with no copy anywhere is resolved inline, within [`INLINE_BUDGET`].
+async fn permission_set_cached(app: &Arc<App>, nsid: &str) -> Result<J, String> {
+    if !is_nsid(nsid) {
+        return Err(format!("invalid NSID {nsid}"));
+    }
+    let cached = CACHE.lock().get(nsid).map(|(at, doc)| (at.elapsed() >= REFRESH, doc.clone()));
+    let cached = match cached {
+        Some(c) => Some(c),
+        None => match store::get_lexicon(app, nsid).await {
+            Ok(Some(l)) => {
+                cache_put(nsid, Instant::now() - REFRESH, l.doc.clone());
+                Some((true, l.doc))
+            }
+            _ => None,
+        },
+    };
+    match cached {
+        Some((stale, doc)) => {
+            if stale {
+                refresh_in_background(app, nsid);
+            }
+            main_def(nsid, &doc)
+        }
+        None => tokio::time::timeout(INLINE_BUDGET, permission_set(app, nsid))
+            .await
+            .map_err(|_| format!("Timed out resolving permission set {nsid}"))?,
+    }
+}
+
+/// Re-resolves `nsid` in a background task (unless one is running); a
+/// failure keeps the stale copy and is retried after [`RETRY_AFTER`].
+fn refresh_in_background(app: &Arc<App>, nsid: &str) {
+    if !IN_FLIGHT.lock().insert(nsid.to_string()) {
+        return;
+    }
+    let (app, nsid) = (app.clone(), nsid.to_string());
+    tokio::spawn(async move {
+        let _ = permission_set(&app, &nsid).await;
+        {
+            // still stale = the resolution failed (permission_set fell back
+            // to the old copy): back off instead of retrying on every call
+            let mut m = CACHE.lock();
+            if let Some((at, _)) = m.get_mut(&nsid) {
+                if at.elapsed() >= REFRESH {
+                    *at = Instant::now() - REFRESH + RETRY_AFTER;
+                }
+            }
+        }
+        IN_FLIGHT.lock().remove(&nsid);
+    });
+}
+
+/// [`build_token_scope`] from [`permission_set_cached`] sets (the token
+/// endpoint: bounded time).
+pub async fn build_token_scope_cached(app: &Arc<App>, scope: &str) -> Result<String, String> {
+    if !scope.split(' ').any(|s| IncludeScope::parse(s).is_some()) {
+        return Ok(scope.to_string());
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut others: Vec<String> = Vec::new();
+    for s in scope.split(' ') {
+        match IncludeScope::parse(s) {
+            Some(inc) => {
+                let set = permission_set_cached(app, &inc.nsid).await?;
+                out.extend(inc.to_permissions(&set).iter().map(|p| p.to_scope_string()));
+            }
+            None => others.push(s.to_string()),
+        }
+    }
+    out.extend(others);
+    Ok(out.join(" "))
 }
 
 /// Every permission set referenced by `include:` scopes in `scope`.

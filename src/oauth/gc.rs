@@ -92,7 +92,11 @@ fn session_expired(s: &Session, now: i64) -> bool {
 /// Whether the stored value is expired. Unparseable rows count as expired.
 fn expired(kind: Kind, routing: &str, name: &str, val: &[u8], now: i64) -> bool {
     match kind {
-        Kind::Replay => serde_json::from_slice::<i64>(val).map(|until| until <= now).unwrap_or(true),
+        // past its window, or claimed for longer than any claim may be (a
+        // row from before the cap: util::MAX_CLAIM_TTL)
+        Kind::Replay => serde_json::from_slice::<i64>(val)
+            .map(|until| until <= now || until > now + super::util::MAX_CLAIM_TTL)
+            .unwrap_or(true),
         Kind::Revocation => {
             crate::xrpc::revocation_expired(routing, name, val, now.max(0) as u64).unwrap_or(false)
         }
@@ -142,10 +146,12 @@ async fn delete_if_expired(
     if kind == Kind::Revocation {
         // through server.rs, which drops its cached view of the account
         crate::xrpc::drop_revocation(app, routing, name).await?;
-    } else {
-        store::put::<()>(app, routing, name, None).await?;
+        return Ok(true);
     }
-    Ok(true)
+    // on condition that it still holds what was judged expired: a row
+    // rewritten since (a session refreshed on another node) survives
+    let cond = crate::xrpc::cas::Cond::eq(name, Some(val));
+    store::put_if::<()>(app, routing, name, None, vec![cond]).await
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

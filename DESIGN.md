@@ -3168,6 +3168,77 @@ called through the SSRF-guarded client (§7). Without an AppView configured
 the reference doesn't register these methods; vlpds answers 400 "No service
 configured". Upstream errors pass through as for proxied calls.
 
+## Auth state under concurrency (`src/xrpc/cas.rs`)
+
+Several nodes can act on one account at once (a refresh forwarded to the
+owner while a password change arrives at another node; two logins with
+one TOTP code), and `put_private` is a blind write. Correctness never rests
+on a node-local lock or on comparing node clocks:
+
+- **Conditional private writes.** `App::private_cas(routing, conds, ops)`
+  checks `Eq(name, value | absent)` conditions and applies puts and
+  prefix deletes in one log write, at the routing key's owner (forwarded
+  there, `/internal/v1/private/cas`), under a per-routing-key lock that
+  every conditional write of that key takes, the write applied before the
+  lock is released. A prefix delete lists its rows under that lock, so no
+  row written by an earlier conditional write escapes it. An ownership move
+  between check and write fails the write (the old owner's log refuses an
+  entry for a shard it no longer holds). Rows that need it are written only
+  this way: OAuth rows (`oauth::store::put` is a condition-free
+  `private_cas`), legacy `sess/` rows, `auth_epoch`, TOTP state, the email
+  factor lockout and its code.
+- **Credential epoch** (`p/{did}\0auth_epoch`, `xrpc::auth_epoch`): a
+  random value replaced by every revoke-all (password change or reset,
+  takedown, deletion, OAuth credential deletion), in the same write that
+  deletes the sessions (`sess/` and/or `oauth/ses/` by prefix). A login
+  reads it *before* re-reading the account it checked the password against
+  (`epoch_for_login`: a hash that changed since fails the login) and keeps
+  it: createSession's new `sess/` row, an OAuth device login
+  (`DeviceAccount.auth_epoch`, also across the 2FA step), and so the code it
+  approves (`RequestData.auth_epoch`). Those sessions are written on
+  condition that the epoch is unchanged, so a login or code exchange racing
+  a revocation either landed first (and was deleted with the rest) or
+  fails; a device login or code from before a revocation is void
+  (`device_accounts` drops it; the code exchange fails). Deleting an
+  account keeps the row, so a DID that comes back doesn't match old logins.
+- **Rotations.** An OAuth refresh rewrites its session on condition that the
+  row is still the bytes it read (`SessionGuard::Row`); a legacy
+  refreshSession rewrites `sess/{rid}` and creates `sess/{next}` on
+  condition that both are as read, re-reading on a lost round
+  (`rotate_refresh`). A revocation that deleted the row meanwhile makes the
+  rotation fail instead of resurrecting the session. deleteSession and
+  app-password revocation delete the matching rows on condition that each
+  is unchanged (a concurrent rotation changes the row it rotates, so the
+  delete is redone over the new rows). Revoke-all rows (`sec/rvk/d/`) are
+  now kept for the refresh-token lifetime (`REVOKE_ALL_TTL`), not only the
+  access-token one: defense in depth for a family that somehow kept a row.
+  The OAuth GC deletes an expired row on condition it is unchanged.
+- **Token endpoint latency.** `include:` permission sets come from the last
+  good copy (memory, then durable) and are re-resolved in the background
+  when stale (one task per NSID, 30 s back-off after a failure); only a set
+  never seen is resolved inline, within 3 s. A slow or failing publisher no
+  longer holds a refresh open for up to 15 s per attempt.
+- **Second factors.** TOTP attempts (`totp::save_if`) and email-code checks
+  write the new state on condition that the row is still what was read,
+  redoing the attempt on the new state otherwise: N nodes don't get N× the
+  guesses per lockout (no lost failure count), and a code (TOTP step,
+  recovery code, email code) is accepted once cluster-wide.
+- **Replay caches** (`oauth::util`): one per claim kind (resource-request
+  proofs, authorization-server proofs, client assertions, request objects,
+  guards), each bounded in total and per routing key (a DID, a client, a
+  DPoP key). Full, a cache evicts the entry closest to expiry instead of
+  refusing every new claim (before, 2 M live entries from one flood locked
+  out every client). Evicting is safe for authorization-server claims (the
+  persisted `oauth/replay/` row still refuses a replay) and for resource
+  proofs only costs the key that exceeded its own cap (a proof evicted then
+  is replayable for the rest of its short window, and only with its bound
+  access token). No claim outlives `MAX_CLAIM_TTL` (600 s): a client
+  assertion is claimed until `iat` + 60 s + 10 s (it is refused after that
+  whatever its `exp`), and the GC drops persisted claims past their window
+  or claimed for longer than the cap.
+- Not covered here: per-IP/per-client rate limits on `/oauth/par` and
+  `/oauth/token` (src/ratelimit.rs).
+
 ## Email second factor (`src/xrpc/email2fa.rs`)
 
 The reference's `emailAuthFactor`, the only second factor the Bluesky app

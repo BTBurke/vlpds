@@ -20,7 +20,7 @@ const SHARDS: u32 = 8;
 
 /// A cluster node. `public` overrides the public URL (OAuth: every node
 /// must present the same issuer), the node still forwards to its own address.
-async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, public: Option<&str>) -> TestServer {
+pub(crate) async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, public: Option<&str>) -> TestServer {
     let (id, store, public) = (id.to_string(), store.clone(), public.map(String::from));
     TestServer::spawn_with(move |c| {
         c.memory_store = Some(store);
@@ -47,7 +47,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, public: Opt
 /// (e.g. 6/1/1): the hand-backs that follow answer 503 PartitionUnavailable
 /// (retry) while a shard moves, which the single-shot steps below would
 /// take for a failure.
-async fn balanced(nodes: &[&TestServer]) {
+pub(crate) async fn balanced(nodes: &[&TestServer]) {
     let mut stable_since: Option<(Vec<Vec<vlpds::slots::ShardId>>, std::time::Instant)> = None;
     for _ in 0..400 {
         let owned: Vec<Vec<vlpds::slots::ShardId>> = nodes
@@ -87,7 +87,7 @@ async fn balanced(nodes: &[&TestServer]) {
     panic!("cluster never balanced");
 }
 
-fn owner_of<'a>(nodes: &[&'a TestServer], key: &str) -> &'a TestServer {
+pub(crate) fn owner_of<'a>(nodes: &[&'a TestServer], key: &str) -> &'a TestServer {
     let p = vlpds::state::partition_of(key, SHARDS);
     nodes.iter().find(|n| n.app.partitions.get(p).is_some()).expect("owned")
 }
@@ -229,7 +229,7 @@ async fn takedowns_and_revocations_are_cluster_wide_and_survive_failover() {
 
 // ---------- OAuth across nodes ----------
 
-const PUBLIC: &str = "http://pds.cluster.test";
+pub(crate) const PUBLIC: &str = "http://pds.cluster.test";
 
 fn b64(b: impl AsRef<[u8]>) -> String {
     B64.encode(b)
@@ -244,7 +244,7 @@ fn form(pairs: &[(&str, &str)]) -> String {
     pairs.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&")
 }
 
-struct DpopKey {
+pub(crate) struct DpopKey {
     sk: SigningKey,
     nonce: parking_lot::Mutex<Option<String>>,
 }
@@ -277,7 +277,7 @@ fn http() -> reqwest::Client {
 
 /// POST to an AS endpoint of `node` with a fresh DPoP proof (htu on the
 /// shared issuer); retries once for a nonce. `proof` overrides the proof.
-async fn as_post(node: &TestServer, key: &DpopKey, path: &str, pairs: &[(&str, &str)], proof: Option<&str>) -> (u16, J) {
+pub(crate) async fn as_post(node: &TestServer, key: &DpopKey, path: &str, pairs: &[(&str, &str)], proof: Option<&str>) -> (u16, J) {
     for attempt in 0..2 {
         let p = proof.map(String::from).unwrap_or_else(|| key.proof("POST", &format!("{PUBLIC}{path}"), None));
         let r = http()
@@ -317,7 +317,7 @@ async fn xrpc_dpop(node: &TestServer, token: &str, proof: &str, nsid: &str, body
 }
 
 #[derive(Default)]
-struct Browser {
+pub(crate) struct Browser {
     cookie: Option<String>,
 }
 
@@ -338,11 +338,11 @@ impl Browser {
         (status, headers, r.text().await.unwrap())
     }
 
-    async fn get(&mut self, node: &TestServer, path: &str) -> (u16, reqwest::header::HeaderMap, String) {
+    pub(crate) async fn get(&mut self, node: &TestServer, path: &str) -> (u16, reqwest::header::HeaderMap, String) {
         self.send(http().get(format!("{}{path}", node.url))).await
     }
 
-    async fn post(&mut self, node: &TestServer, path: &str, pairs: &[(&str, &str)]) -> (u16, reqwest::header::HeaderMap, String) {
+    pub(crate) async fn post(&mut self, node: &TestServer, path: &str, pairs: &[(&str, &str)]) -> (u16, reqwest::header::HeaderMap, String) {
         let rb = http()
             .post(format!("{}{path}", node.url))
             .header("content-type", "application/x-www-form-urlencoded")
@@ -351,7 +351,7 @@ impl Browser {
     }
 }
 
-fn csrf_of(html: &str) -> String {
+pub(crate) fn csrf_of(html: &str) -> String {
     let i = html.find("name=\"csrf\" value=\"").expect("csrf field") + "name=\"csrf\" value=\"".len();
     html[i..i + html[i..].find('"').unwrap()].to_string()
 }
@@ -362,14 +362,14 @@ fn location_params(h: &reqwest::header::HeaderMap) -> HashMap<String, String> {
     vlpds::oauth::util::parse_form(q).into_iter().collect()
 }
 
-struct Client {
-    id: String,
+pub(crate) struct Client {
+    pub(crate) id: String,
     redirect: String,
-    key: DpopKey,
+    pub(crate) key: DpopKey,
 }
 
 impl Client {
-    fn new() -> Client {
+    pub(crate) fn new() -> Client {
         let redirect = "http://127.0.0.1/callback".to_string();
         let enc = vlpds::oauth::util::form_encode_component;
         let id = format!("http://localhost?scope={}&redirect_uri={}", enc("atproto transition:generic"), enc(&redirect));
@@ -378,7 +378,7 @@ impl Client {
 
     /// PAR on `par`, then the browser: authorization page on `page`, sign-in
     /// on `sign_in`, consent on `consent`. Returns (code, verifier).
-    async fn authorize(
+    pub(crate) async fn authorize(
         &self,
         b: &mut Browser,
         [par, page, sign_in, consent]: [&TestServer; 4],
@@ -429,7 +429,7 @@ impl Client {
         (q.get("code").expect("code").clone(), verifier)
     }
 
-    async fn exchange(&self, node: &TestServer, code: &str, verifier: &str) -> (u16, J) {
+    pub(crate) async fn exchange(&self, node: &TestServer, code: &str, verifier: &str) -> (u16, J) {
         as_post(
             node,
             &self.key,
@@ -440,12 +440,12 @@ impl Client {
         .await
     }
 
-    async fn refresh(&self, node: &TestServer, rt: &str) -> (u16, J) {
+    pub(crate) async fn refresh(&self, node: &TestServer, rt: &str) -> (u16, J) {
         as_post(node, &self.key, "/oauth/token", &[("grant_type", "refresh_token"), ("client_id", &self.id), ("refresh_token", rt)], None).await
     }
 
     /// createRecord with the access token on `node` (fresh proof, nonce retry).
-    async fn create_post(&self, node: &TestServer, token: &str, did: &str) -> (u16, J) {
+    pub(crate) async fn create_post(&self, node: &TestServer, token: &str, did: &str) -> (u16, J) {
         let body = json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("via oauth")});
         let htu = format!("{PUBLIC}/xrpc/com.atproto.repo.createRecord");
         for _ in 0..2 {

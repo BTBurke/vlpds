@@ -215,12 +215,11 @@ impl Client {
                     .claim_str("jti")
                     .filter(|j| !j.is_empty())
                     .ok_or_else(|| fail("missing \"jti\" claim"))?;
-                // jti must be unique for the assertion's whole validity period.
-                let until = jwt
-                    .claim_i64("exp")
-                    .unwrap_or(iat + CLIENT_ASSERTION_MAX_AGE)
-                    .max(iat + CLIENT_ASSERTION_MAX_AGE)
-                    + 10;
+                // jti must be unique for as long as the assertion is accepted:
+                // its `iat` age is checked above, so past iat + max age (+
+                // skew) it is refused whatever its `exp` (a far-future `exp`
+                // must not pin a claim: util::MAX_CLAIM_TTL)
+                let until = iat + CLIENT_ASSERTION_MAX_AGE + CLOCK_TOLERANCE;
                 let replay = Replay {
                     routing: client_routing(&self.id),
                     key: format!("assert:{}\0{jti}", self.id),
@@ -1185,5 +1184,49 @@ mod tests {
         let mut m = base.clone();
         m["client_id"] = json!("https://other.example.com/client-metadata.json");
         assert!(validate_metadata(id, m, false, false).is_err());
+    }
+
+    /// A client assertion's single-use claim lasts as long as the assertion
+    /// is accepted (`iat` + max age + skew), not until its `exp`: a client
+    /// can't pin replay-cache entries (or persisted claim rows) for years.
+    #[test]
+    fn assertion_claim_is_bounded_by_iat_not_exp() {
+        use p256::ecdsa::signature::Signer;
+        use super::super::util::b64u;
+        let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let mut jwk = super::super::jose::key_to_jwk(sk.verifying_key());
+        jwk["kid"] = json!("k1");
+        let id = "https://app.example/client-metadata.json";
+        let client = Client {
+            id: id.into(),
+            metadata: json!({}),
+            redirect_uris: vec![],
+            scopes: vec![],
+            grant_types: vec![],
+            response_types: vec![],
+            auth_method: "private_key_jwt".into(),
+            application_type: "web".into(),
+            jwks: vec![jwk],
+            loopback: false,
+        };
+        let issuer = "https://pds.example";
+        let sign = |exp: i64| {
+            let header = json!({"alg": "ES256", "kid": "k1"});
+            let now = now_secs();
+            let payload = json!({"iss": id, "sub": id, "aud": issuer, "jti": "j1", "iat": now, "exp": exp});
+            let input = format!("{}.{}", b64u(serde_json::to_vec(&header).unwrap()), b64u(serde_json::to_vec(&payload).unwrap()));
+            let sig: p256::ecdsa::Signature = sk.sign(input.as_bytes());
+            format!("{input}.{}", b64u(sig.to_bytes()))
+        };
+        let creds = |a: String| ClientCredentials {
+            client_id: id.into(),
+            client_assertion_type: Some(CLIENT_ASSERTION_TYPE_JWT_BEARER.into()),
+            client_assertion: Some(a),
+        };
+        let now = now_secs();
+        let (_, r) = client.authenticate(&creds(sign(now + 10 * 365 * 86_400)), issuer).unwrap();
+        let until = r.unwrap().until;
+        assert!(until <= now + CLIENT_ASSERTION_MAX_AGE + CLOCK_TOLERANCE + 1, "claim until {until}, now {now}");
+        assert!(until >= now + CLIENT_ASSERTION_MAX_AGE, "claimed for its whole acceptance window");
     }
 }

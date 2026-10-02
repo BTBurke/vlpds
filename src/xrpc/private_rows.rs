@@ -109,6 +109,7 @@ fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
         did: Some(did.into()),
         code_hash: Some("aGFzaA".into()),
         consumed: Some(("ses-fixture".into(), "tok-1".into())),
+        auth_epoch: String::new(),
     };
     let ses = o::Session {
         id: "ses-fixture".into(),
@@ -132,9 +133,10 @@ fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
         created_at: 1_790_000_000,
         last_seen_at: 1_790_000_100,
         user_agent: Some("Mozilla/5.0".into()),
-        accounts: vec![o::DeviceAccount { did: did.into(), authenticated_at: 1_790_000_050 }],
+        accounts: vec![o::DeviceAccount { did: did.into(), authenticated_at: 1_790_000_050, auth_epoch: String::new() }],
         pending_2fa: Some((did.into(), 1_790_000_060)),
         pending_2fa_failures: 1,
+        pending_2fa_epoch: String::new(),
     };
     let authz = o::Authorization { client_id: client.into(), scopes: vec!["atproto".into()], updated_at: 1_790_000_000 };
     let lex = o::StoredLexicon {

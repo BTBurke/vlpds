@@ -4,6 +4,7 @@
 use super::client::ClientAuth;
 use super::util::{b64u, b64u_decode, hmac_sha256, now_secs, random_id, sha256_b64u};
 use super::OAuthError;
+use crate::xrpc::cas::{Cond, Op};
 use crate::xrpc::App;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
@@ -11,20 +12,33 @@ use serde::{Deserialize, Serialize};
 
 pub const REQUEST_URI_PREFIX: &str = "urn:ietf:params:oauth:request_uri:";
 
+/// Writes (Some) or deletes (None) an OAuth row. Through the owner's
+/// conditional-write lock (src/xrpc/cas.rs), with no condition: so a blind
+/// write (a session revoked, a request consumed) never slips between the
+/// check and the write of a conditional one ([`put_session_if`]).
 pub(super) async fn put<T: Serialize>(
     app: &App,
     routing: &str,
     name: &str,
     v: Option<&T>,
 ) -> Result<(), OAuthError> {
+    put_if(app, routing, name, v, Vec::new()).await.and_then(|applied| {
+        applied.then_some(()).ok_or_else(|| OAuthError::server_error("unconditional write refused"))
+    })
+}
+
+/// [`put`] on condition that `conds` hold; Ok(false) = one didn't (nothing
+/// written).
+pub(super) async fn put_if<T: Serialize>(
+    app: &App,
+    routing: &str,
+    name: &str,
+    v: Option<&T>,
+    conds: Vec<Cond>,
+) -> Result<bool, OAuthError> {
     let val = v.map(|v| Bytes::from(serde_json::to_vec(v).expect("serialize")));
-    let m = crate::segment::Mutation {
-        key: Bytes::from(crate::state::private_key(routing, name)),
-        val,
-    };
-    app.put_private(routing, vec![m])
-        .await
-        .map_err(OAuthError::from)
+    let out = app.private_cas(routing, conds, vec![Op::put(name, val)]).await?;
+    Ok(out.applied)
 }
 
 pub(super) async fn get<T: DeserializeOwned>(
@@ -95,6 +109,12 @@ pub struct RequestData {
     /// detection).
     #[serde(default)]
     pub consumed: Option<(String, String)>,
+    /// The account's credential epoch (`crate::xrpc::auth_epoch`) of the
+    /// login that approved it: the code's session is created only while it
+    /// is still current, so a password change or takedown after the
+    /// approval voids the code.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auth_epoch: String,
 }
 
 pub fn req_routing(id: &str) -> String {
@@ -215,8 +235,36 @@ pub async fn get_session(app: &App, did: &str, id: &str) -> Result<Option<Sessio
     get(app, did, &session_key(id)).await
 }
 
-pub async fn put_session(app: &App, s: &Session) -> Result<(), OAuthError> {
-    put(app, &s.did, &session_key(&s.id), Some(s)).await
+/// A session and its stored bytes (the condition of its rewrite).
+pub async fn get_session_raw(app: &App, did: &str, id: &str) -> Result<Option<(Session, Bytes)>, OAuthError> {
+    match app.get_private(did, &session_key(id)).await? {
+        None => Ok(None),
+        Some(b) => serde_json::from_slice(&b)
+            .map(|s| Some((s, b)))
+            .map_err(|e| OAuthError::server_error(&format!("corrupt oauth record: {e}"))),
+    }
+}
+
+/// What a session write is conditional on.
+pub enum SessionGuard {
+    /// A refresh: the row still holds these bytes (not revoked, not rotated
+    /// meanwhile).
+    Row(Bytes),
+    /// A code exchange: no such row yet, and the account's credential epoch
+    /// is still the approving login's.
+    New { auth_epoch: String },
+}
+
+/// Writes `s` if `guard` holds, at the owner and serialized with every
+/// other write of the account's OAuth rows (src/xrpc/cas.rs). Ok(false) =
+/// it didn't (revoked or rotated meanwhile): nothing written.
+pub async fn put_session_if(app: &App, s: &Session, guard: SessionGuard) -> Result<bool, OAuthError> {
+    let name = session_key(&s.id);
+    let conds = match guard {
+        SessionGuard::Row(b) => vec![Cond::eq(&name, Some(b))],
+        SessionGuard::New { auth_epoch } => vec![Cond::eq(&name, None), crate::xrpc::auth_epoch_cond(&auth_epoch)],
+    };
+    put_if(app, &s.did, &name, Some(s), conds).await
 }
 
 pub async fn delete_session(app: &App, did: &str, id: &str) -> Result<(), OAuthError> {
@@ -233,24 +281,18 @@ pub async fn list_sessions(app: &App, did: &str) -> Result<Vec<Session>, OAuthEr
         .collect())
 }
 
-/// Deletes every OAuth session of `did` in one log write, so its DPoP access
-/// tokens stop verifying (verify_dpop requires the live session) and its
-/// refresh tokens are dead. Used by takedowns and password change/reset.
-/// Returns how many sessions were revoked.
+/// Deletes every OAuth session of `did` and replaces its credential epoch,
+/// in one conditional write at the owner (src/xrpc/cas.rs): its DPoP access
+/// tokens stop verifying (verify_dpop requires the live session), its
+/// refresh tokens are dead, and neither a refresh nor a code exchange
+/// racing this can bring a session back (both write conditionally:
+/// [`put_session_if`]); device logins and codes approved before it are void
+/// (`crate::xrpc::auth_epoch`). Used by takedowns, password change/reset,
+/// deletion and credential deletion. Returns how many sessions were revoked.
 pub async fn revoke_all_sessions(app: &App, did: &str) -> Result<usize, OAuthError> {
-    let muts: Vec<_> = list_sessions(app, did)
-        .await?
-        .iter()
-        .map(|s| crate::segment::Mutation {
-            key: Bytes::from(crate::state::private_key(did, &session_key(&s.id))),
-            val: None,
-        })
-        .collect();
-    let n = muts.len();
-    if n > 0 {
-        app.put_private(did, muts).await.map_err(OAuthError::from)?;
-    }
-    Ok(n)
+    let ops = vec![crate::xrpc::new_auth_epoch_op(), Op::DeletePrefix { prefix: "oauth/ses/".into() }];
+    let out = app.private_cas(did, Vec::new(), ops).await?;
+    Ok(out.deleted.len())
 }
 
 /// Refresh tokens: `ref-{b64u(did)}.{session id}.{generation}.{mac}` where
@@ -322,6 +364,11 @@ impl ParsedRefresh {
 pub struct DeviceAccount {
     pub did: String,
     pub authenticated_at: i64,
+    /// The account's credential epoch at the password check
+    /// (`crate::xrpc::epoch_for_login`): the login counts only while it is
+    /// current (a password change or takedown signs the device out).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub auth_epoch: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -340,6 +387,9 @@ pub struct Device {
     /// be redone.
     #[serde(default)]
     pub pending_2fa_failures: u32,
+    /// Credential epoch of the `pending_2fa` password check.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pending_2fa_epoch: String,
 }
 
 pub fn new_device_id() -> String {

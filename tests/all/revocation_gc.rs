@@ -52,10 +52,16 @@ async fn revocations_of_deleted_accounts_are_collected_after_expiry() {
     let mut sw = vlpds::oauth::gc::Sweeper::new();
     let st = sw.tick(&s.app, now, 10_000, 10_000).await.unwrap();
     assert_eq!(st.claims_removed, 0, "nothing expired yet: {st:?}");
-    // past the access-token lifetime (+ slack): bounded deletions per tick
+    // past the access-token lifetime (+ slack): the family revocation goes;
+    // revoke-all rows are kept for the refresh-token lifetime
     let later = now + 3 * 3600;
-    let st = sw.tick(&s.app, later, 10_000, 3).await.unwrap();
-    assert_eq!(st.claims_removed, 3, "{st:?}");
+    let st = sw.tick(&s.app, later, 10_000, 10).await.unwrap();
+    assert_eq!(st.claims_removed, 1, "{st:?}");
+    assert_eq!(revocation_rows(&s, &b.did).await.len(), 2);
+    // past the refresh-token lifetime (+ slack): bounded deletions per tick
+    let later = now + 91 * 86_400;
+    let st = sw.tick(&s.app, later, 10_000, 2).await.unwrap();
+    assert_eq!(st.claims_removed, 2, "{st:?}");
     let st = sw.tick(&s.app, later, 10_000, 10).await.unwrap();
     assert_eq!(st.claims_removed, 1, "{st:?}");
     assert!(revocation_rows(&s, &a.did).await.is_empty());

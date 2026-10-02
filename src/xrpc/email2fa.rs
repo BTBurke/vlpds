@@ -26,7 +26,7 @@
 //! weaker factor never stands in for the stronger one.
 
 use super::server::{
-    assert_email_token, create_email_token, delete_email_tokens, deliver, get_json, invalid_request, pmut,
+    assert_email_token, create_email_token, delete_email_tokens, deliver, invalid_request,
     to_json_bytes,
 };
 use super::*;
@@ -136,42 +136,47 @@ pub(super) async fn check_second_factor(
 /// Checks `code` (under the lockout), or mails a fresh one to `email` when
 /// there's none (the factor is on: `email` is always given then).
 async fn check_email_code(app: &App, acct: &Account, email: Option<&str>, code: Option<&str>) -> XResult<()> {
+    use super::cas::{Cond, Op};
     let did = acct.did.as_str();
-    // the TOTP lock also serializes this factor's counter updates
+    // the TOTP lock also serializes this factor's counter updates on this
+    // node; across nodes, every update below is conditional on the rows
+    // still holding what was read (src/xrpc/cas.rs), redone otherwise: no
+    // lost failure, and a code is accepted once
     let _g = crate::totp::lock(did).await;
-    let mut lk: Lockout = get_json(app, did, LOCKOUT_NAME).await?.unwrap_or_default();
-    let now = crate::totp::now_secs();
-    if now < lk.locked_until {
-        return Err(crate::totp::locked_out());
-    }
-    let Some(code) = code else {
-        let Some(email) = email else {
-            return Ok(());
+    let token_name = format!("etok/{PURPOSE}");
+    for _ in 0..crate::totp::CAS_ROUNDS {
+        let lk_raw = app.get_private(did, LOCKOUT_NAME).await?;
+        let mut lk: Lockout = lk_raw.as_deref().map(serde_json::from_slice).transpose().map_err(XrpcError::from_err)?.unwrap_or_default();
+        let now = crate::totp::now_secs();
+        if now < lk.locked_until {
+            return Err(crate::totp::locked_out());
+        }
+        let Some(code) = code else {
+            let Some(email) = email else {
+                return Ok(());
+            };
+            let token = create_email_token(app, did, PURPOSE).await?;
+            deliver(app, email, crate::mail::Email::SignInAuthFactor { handle: Some(&acct.handle), token: &token });
+            return Err(factor_required());
         };
-        let token = create_email_token(app, did, PURPOSE).await?;
-        deliver(app, email, crate::mail::Email::SignInAuthFactor { handle: Some(&acct.handle), token: &token });
-        return Err(factor_required());
-    };
-    match assert_email_token(app, did, PURPOSE, code).await {
-        Ok(()) => {
-            delete_email_tokens(app, did, &[PURPOSE]).await?;
-            if lk.failures > 0 {
-                save_lockout(app, did, None).await?;
+        let token_raw = app.get_private(did, &token_name).await?;
+        let (r, ops) = match assert_email_token(app, did, PURPOSE, code).await {
+            // consumed with the counter reset, in one write
+            Ok(()) => (Ok(()), vec![Op::put(&token_name, None), Op::put(LOCKOUT_NAME, None)]),
+            // an expired code was right once: not a guess
+            Err(e) if e.error != "InvalidToken" => return Err(e),
+            Err(e) => {
+                crate::totp::record_failure_in(&mut lk.failures, &mut lk.locked_until, now);
+                let e = if now < lk.locked_until { crate::totp::locked_out() } else { e };
+                (Err(e), vec![Op::put(LOCKOUT_NAME, Some(Bytes::from(to_json_bytes(&lk))))])
             }
-            Ok(())
-        }
-        // an expired code was right once: not a guess
-        Err(e) if e.error != "InvalidToken" => Err(e),
-        Err(e) => {
-            crate::totp::record_failure_in(&mut lk.failures, &mut lk.locked_until, now);
-            save_lockout(app, did, Some(&lk)).await?;
-            Err(if now < lk.locked_until { crate::totp::locked_out() } else { e })
+        };
+        let conds = vec![Cond::eq(LOCKOUT_NAME, lk_raw), Cond::eq(&token_name, token_raw)];
+        if app.private_cas(did, conds, ops).await?.applied {
+            return r;
         }
     }
-}
-
-async fn save_lockout(app: &App, did: &str, lk: Option<&Lockout>) -> XResult<()> {
-    app.put_private(did, vec![pmut(did, LOCKOUT_NAME, lk.map(to_json_bytes))]).await
+    Err(crate::totp::conflict())
 }
 
 /// updateEmail `emailAuthFactor: true` on the confirmed current address.

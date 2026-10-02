@@ -437,9 +437,9 @@ mod tests {
         );
         // single use is claimed by the caller, at the routing key's owner
         let r = ok.replay("did:plc:x".into());
-        let c = super::super::util::ReplayCache::new(10);
-        assert!(c.insert_unique(&r.key, r.until));
-        assert!(!c.insert_unique(&r.key, r.until), "replay");
+        let c = super::super::util::ReplayCache::new(10, 10);
+        assert!(c.insert_unique(&r.routing, &r.key, r.until));
+        assert!(!c.insert_unique(&r.routing, &r.key, r.until), "replay");
         let p = proof(&sk, "GET", htu, Some(&n), Some("tok"));
         assert!(check_proof(&p, "POST", htu, Some("tok"), &nonces).is_err());
         let p = proof(&sk, "POST", htu, Some(&n), Some("other"));

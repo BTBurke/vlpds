@@ -91,6 +91,7 @@ mod rate_limits_cluster;
 mod record_encode;
 mod reshard;
 mod revocation_gc;
+mod revocation_races;
 mod secrets_at_rest;
 mod segment_bytes;
 mod segment_compression;

@@ -59,14 +59,23 @@
 //!   request row / the session's account (`require_owner`; 503
 //!   `temporarily_unavailable` mid-handoff, so clients retry), under a lock
 //!   on that node (`store::lock`), so concurrent uses that hit different
-//!   nodes are serialized there: exactly one wins.
+//!   nodes are serialized there: exactly one wins. What makes them correct
+//!   against revocations from any node is the write itself: a session is
+//!   written conditionally at its owner (`store::put_session_if`,
+//!   src/xrpc/cas.rs; DESIGN.md "Auth state under concurrency"), on the row
+//!   it read (refresh) or on the account's credential epoch of the
+//!   approving login (code exchange), and every other OAuth row write goes
+//!   through the same per-account lock, so a revoke-all (password change,
+//!   takedown) is never undone by a refresh or exchange in flight.
 //! - DPoP proof, client-assertion and request-object (JAR) `jti`s are claimed
 //!   at the owner of a routing key (`xrpc::internal::claim_replay_anywhere`):
 //!   a resource request's proof under the access token's DID (`ath` binds it
 //!   to that token, and the request was routed there, so this is normally
 //!   local), an authorization-server proof under its key (`oauth:jkt:{jkt}`),
 //!   assertions and request objects under the client (`oauth:client:{hash}`).
-//!   The owner's in-memory TTL set settles concurrent claims. Claims at the
+//!   The owner's in-memory TTL sets (one per claim kind, bounded per routing
+//!   key; full, they evict instead of refusing: `util::ReplayCache`) settle
+//!   concurrent claims. Claims at the
 //!   authorization server (token endpoint and PAR proofs, client assertions,
 //!   request objects) are also persisted as `oauth/replay/{hash}` in that
 //!   partition (awaited before the claim counts) and a claim missing from

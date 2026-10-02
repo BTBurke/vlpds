@@ -500,6 +500,7 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
         did: None,
         code_hash: None,
         consumed: None,
+        auth_epoch: String::new(),
     };
     store::put_request(app, &id, Some(&req)).await?;
     Ok(json!({"request_uri": store::request_uri(&id), "expires_in": PAR_EXPIRES_IN - 1}))
@@ -789,6 +790,7 @@ async fn device_for(app: &App, headers: &HeaderMap) -> Result<(Device, bool), OA
         accounts: vec![],
         pending_2fa: None,
         pending_2fa_failures: 0,
+        pending_2fa_epoch: String::new(),
     };
     store::put_device(app, &d).await?;
     Ok((d, true))
@@ -1098,11 +1100,16 @@ fn server_name(app: &App) -> String {
 }
 
 /// Accounts signed in on this device whose login is still fresh, with handles.
+/// A login from before the account's credentials were revoked (password
+/// change, takedown: its credential epoch changed) no longer counts.
 async fn device_accounts(app: &App, d: &Device) -> Vec<(String, String)> {
     let now = now_secs();
     let mut out = Vec::new();
     for a in &d.accounts {
         if now - a.authenticated_at > AUTHENTICATION_MAX_AGE {
+            continue;
+        }
+        if crate::xrpc::auth_epoch(app, &a.did).await.ok().as_deref() != Some(a.auth_epoch.as_str()) {
             continue;
         }
         if let Ok(acct) = account_any(app, &a.did).await {
@@ -1216,7 +1223,13 @@ async fn issue_code(app: &App, mut flow: Flow, did: &str) -> Response {
             &format!("Account unavailable: {}", e.message),
         );
     }
+    // the code's session is created only while the approving login's
+    // credential epoch is current (code_grant)
+    let Some(epoch) = flow.device.accounts.iter().find(|a| a.did == did).map(|a| a.auth_epoch.clone()) else {
+        return login_page(app, &flow, "", Some("Please sign in again"), false, StatusCode::UNAUTHORIZED);
+    };
     let code = store::new_code(&flow.id);
+    flow.req.auth_epoch = epoch;
     flow.req.did = Some(did.to_string());
     flow.req.code_hash = Some(store::hash_secret(&code));
     flow.req.expires_at = now_secs() + AUTHORIZATION_INACTIVITY_TIMEOUT;
@@ -1458,7 +1471,7 @@ async fn sign_in(
         return limited(ident);
     }
     let password_step = f.get("step").map(String::as_str) != Some("totp");
-    let (acct, ident) = if !password_step {
+    let (acct, ident, epoch) = if !password_step {
         // Second step: password already verified for the pending account.
         let Some((did, _)) = device
             .pending_2fa
@@ -1477,7 +1490,7 @@ async fn sign_in(
         {
             return limited(String::new());
         }
-        (account_any(app, &did).await?, String::new())
+        (account_any(app, &did).await?, String::new(), device.pending_2fa_epoch.clone())
     } else {
         let invalid = || Ok(SignIn::Failed(ident.clone(), LoginError::Invalid));
         let password = f.get("password").cloned().unwrap_or_default();
@@ -1512,13 +1525,19 @@ async fn sign_in(
         if acct.status.is_some() {
             return Ok(SignIn::Failed(ident, LoginError::Inactive));
         }
-        (acct, ident)
+        // the epoch this login holds (a password change since the check
+        // above fails it; see crate::xrpc::auth_epoch)
+        let Some(epoch) = crate::xrpc::epoch_for_login(app, &acct).await? else {
+            return invalid();
+        };
+        (acct, ident, epoch)
     };
     // TOTP, else the email factor (which mails the code on the password step)
     match super::email2fa::check_second_factor(app, &acct, code, false).await {
         Ok(()) => {}
         Err(fe) if fe.err.error == "AuthFactorTokenRequired" => {
             device.pending_2fa = Some((acct.did.clone(), now));
+            device.pending_2fa_epoch = epoch;
             device.pending_2fa_failures = 0;
             store::put_device(app, device).await?;
             return Ok(SignIn::NeedTotp(acct.handle, email_hint(fe.factor)));
@@ -1529,6 +1548,7 @@ async fn sign_in(
             // a password step starts a new pending sign-in
             if password_step {
                 device.pending_2fa = Some((acct.did.clone(), now));
+                device.pending_2fa_epoch = epoch;
                 device.pending_2fa_failures = 0;
             }
             device.pending_2fa_failures += 1;
@@ -1551,6 +1571,7 @@ async fn sign_in(
     device.accounts.push(DeviceAccount {
         did: did.clone(),
         authenticated_at: now,
+        auth_epoch: epoch,
     });
     device.last_seen_at = now;
     store::put_device(app, device).await?;
@@ -1684,8 +1705,12 @@ async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxByt
         Err(e) => return signup_page(&app, &flow, &v, Some(&e.message), StatusCode::BAD_REQUEST),
     };
     let now = now_secs();
+    let epoch = match crate::xrpc::auth_epoch(&app, &acct.did).await {
+        Ok(e) => e,
+        Err(e) => return error_page(&app, StatusCode::INTERNAL_SERVER_ERROR, "Sign-up failed", &e.message),
+    };
     flow.device.accounts.retain(|a| a.did != acct.did);
-    flow.device.accounts.push(DeviceAccount { did: acct.did.clone(), authenticated_at: now });
+    flow.device.accounts.push(DeviceAccount { did: acct.did.clone(), authenticated_at: now, auth_epoch: epoch });
     flow.device.last_seen_at = now;
     if let Err(e) = store::put_device(&app, &flow.device).await {
         return error_page(&app, StatusCode::INTERNAL_SERVER_ERROR, "Sign-up failed", &e.description);
@@ -1818,7 +1843,7 @@ fn same_client_auth(a: &ClientAuth, b: &ClientAuth) -> bool {
     }
 }
 
-async fn token_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAuthError> {
+async fn token_inner(app: &Arc<App>, headers: &HeaderMap, body: &[u8]) -> Result<J, OAuthError> {
     let p = parse_params(headers, body)?;
     let proof = check_as_dpop(app, headers, "/oauth/token").await?;
     let creds = ClientCredentials::from_params(&p)?;
@@ -1855,7 +1880,7 @@ fn verify_pkce(verifier: &str, challenge: &str) -> bool {
 }
 
 async fn code_grant(
-    app: &App,
+    app: &Arc<App>,
     client: &Client,
     client_auth: ClientAuth,
     p: &HashMap<String, String>,
@@ -1917,7 +1942,7 @@ async fn code_grant(
     ensure_active_any(app, &did)
         .await
         .map_err(|e| OAuthError::invalid_grant(&e.message))?;
-    let token_scope = lexicon::build_token_scope(app, &params.scope)
+    let token_scope = lexicon::build_token_scope_cached(app, &params.scope)
         .await
         .map_err(|e| OAuthError::invalid_request(&e))?;
     let now = now_secs();
@@ -1940,10 +1965,16 @@ async fn code_grant(
     };
     req.consumed = Some((did.clone(), s.id.clone()));
     store::put_request(app, &rid, Some(&req)).await?;
-    issue_tokens(app, client, &mut s).await
+    super::cas::pause_point("oauth_code", &did).await;
+    // created only while the approving login's credential epoch is current:
+    // a password change or takedown since the approval voids the code
+    let guard = store::SessionGuard::New { auth_epoch: req.auth_epoch.clone() };
+    issue_tokens(app, client, &mut s, guard).await
 }
 
-async fn issue_tokens(app: &App, client: &Client, s: &mut Session) -> Result<J, OAuthError> {
+/// Signs the access token and writes the session, on condition `guard`
+/// (store::put_session_if): a session revoked meanwhile is not brought back.
+async fn issue_tokens(app: &App, client: &Client, s: &mut Session, guard: store::SessionGuard) -> Result<J, OAuthError> {
     let now = now_secs();
     let lifetime = ACCESS_TOKEN_TTL.min(s.created_at + client.session_lifetime() - now);
     if lifetime <= 1 {
@@ -1969,7 +2000,9 @@ async fn issue_tokens(app: &App, client: &Client, s: &mut Session) -> Result<J, 
     // new token: a signature fault (503) never stores a token id that no
     // client received
     let access = keys(app).server.sign("at+jwt", &claims).map_err(|e| unavailable(&e.to_string()))?;
-    store::put_session(app, s).await?;
+    if !store::put_session_if(app, s, guard).await? {
+        return Err(OAuthError::invalid_grant("The session was revoked"));
+    }
     let mut out = json!({
         "access_token": access,
         "token_type": "DPoP",
@@ -1984,7 +2017,7 @@ async fn issue_tokens(app: &App, client: &Client, s: &mut Session) -> Result<J, 
 }
 
 async fn refresh_grant(
-    app: &App,
+    app: &Arc<App>,
     client: &Client,
     client_auth: ClientAuth,
     p: &HashMap<String, String>,
@@ -1998,7 +2031,7 @@ async fn refresh_grant(
     let parsed = store::parse_refresh_token(tok).ok_or_else(invalid)?;
     require_owner(app, &parsed.did)?;
     let _g = store::lock(app, &format!("ses:{}", parsed.session_id)).await;
-    let mut s = store::get_session(app, &parsed.did, &parsed.session_id)
+    let (mut s, raw) = store::get_session_raw(app, &parsed.did, &parsed.session_id)
         .await?
         .ok_or_else(invalid)?;
     let k = keys(app);
@@ -2043,11 +2076,16 @@ async fn refresh_grant(
     ensure_active_any(app, &s.did)
         .await
         .map_err(|e| OAuthError::invalid_grant(&e.message))?;
-    s.token_scope = lexicon::build_token_scope(app, &s.scope)
+    // bounded: the last good permission sets, refreshed in the background
+    // (a slow or failing publisher must not hold the refresh open)
+    s.token_scope = lexicon::build_token_scope_cached(app, &s.scope)
         .await
         .map_err(|e| OAuthError::server_error(&e))?;
     s.refresh_gen += 1;
-    issue_tokens(app, client, &mut s).await
+    super::cas::pause_point("oauth_refresh", &s.did).await;
+    // rewritten only if the row is still the one read: a revocation since
+    // (password change, takedown, revoke) is not undone
+    issue_tokens(app, client, &mut s, store::SessionGuard::Row(raw)).await
 }
 
 // ---------- revocation (RFC 7009) ----------

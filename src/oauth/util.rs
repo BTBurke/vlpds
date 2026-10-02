@@ -220,12 +220,75 @@ pub fn jkt_routing(jkt: &str) -> String {
     format!("oauth:jkt:{jkt}")
 }
 
-/// Per-node OAuth state: the replay set of the routing keys this node owns
+/// Longest a single-use claim is kept (unix secs from now). Every claim's
+/// own window is shorter (DPoP proofs: `iat` within 10 s + 180 s skew
+/// either way; client assertions: `iat` + 60 s + 10 s; request objects:
+/// `iat` + 59 s + 10 s), so this only bounds what a caller (or a peer, over
+/// the internal endpoint) passes: no claim, in memory or persisted, can
+/// outlive it, whatever `exp` a client put in its JWT.
+pub const MAX_CLAIM_TTL: i64 = 600;
+
+/// What a single-use claim is: each kind has its own replay cache, so a
+/// flood of one (resource-request proofs) can't evict another's
+/// (authorization-server proofs, client assertions, request objects).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimKind {
+    /// DPoP proofs of resource requests (memory only).
+    ResourceProof = 0,
+    /// DPoP proofs at the authorization server (PAR, token).
+    AsProof = 1,
+    /// Client assertion `jti`s.
+    Assertion = 2,
+    /// Request object (JAR) `jti`s.
+    RequestObject = 3,
+    /// Short guards released right after (PKCE code_challenge claims).
+    Guard = 4,
+}
+
+impl ClaimKind {
+    const ALL: [ClaimKind; 5] =
+        [ClaimKind::ResourceProof, ClaimKind::AsProof, ClaimKind::Assertion, ClaimKind::RequestObject, ClaimKind::Guard];
+
+    /// The kind of `key` (by the prefix its maker gives it: jose.rs,
+    /// client.rs, store.rs); `durable`: persisted (AS) or memory-only.
+    pub fn of(key: &str, durable: bool) -> ClaimKind {
+        if key.starts_with("dpop:") {
+            if durable {
+                ClaimKind::AsProof
+            } else {
+                ClaimKind::ResourceProof
+            }
+        } else if key.starts_with("assert:") {
+            ClaimKind::Assertion
+        } else if key.starts_with("jar:") {
+            ClaimKind::RequestObject
+        } else {
+            ClaimKind::Guard
+        }
+    }
+
+    /// (entries, entries per routing key) of this kind's cache.
+    fn caps(self) -> (usize, usize) {
+        match self {
+            ClaimKind::ResourceProof => (2_000_000, 50_000),
+            ClaimKind::AsProof | ClaimKind::Assertion | ClaimKind::RequestObject => (500_000, 50_000),
+            ClaimKind::Guard => (100_000, 1_000),
+        }
+    }
+}
+
+/// Per-node OAuth state: the replay sets of the routing keys this node owns
 /// and the locks for single-use read-modify-writes. Per `App` (not per
 /// process), so in-process test clusters behave like separate machines.
 pub(crate) struct NodeState {
-    replays: ReplayCache,
+    replays: [ReplayCache; 5],
     pub(crate) locks: Vec<std::sync::Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl NodeState {
+    fn replays(&self, kind: ClaimKind) -> &ReplayCache {
+        &self.replays[kind as usize]
+    }
 }
 
 static NODES: parking_lot::RwLock<Vec<(usize, std::sync::Arc<NodeState>)>> =
@@ -241,7 +304,10 @@ pub(crate) fn node_state(app: &crate::xrpc::App) -> std::sync::Arc<NodeState> {
         return n.clone();
     }
     let n = std::sync::Arc::new(NodeState {
-        replays: ReplayCache::new(2_000_000),
+        replays: ClaimKind::ALL.map(|k| {
+            let (max, per_group) = k.caps();
+            ReplayCache::new(max, per_group)
+        }),
         locks: (0..256).map(|_| std::sync::Arc::new(tokio::sync::Mutex::new(()))).collect(),
     });
     w.push((id, n.clone()));
@@ -256,16 +322,18 @@ fn replay_row(key: &str) -> String {
     format!("{REPLAY_ROW}{}", sha256_b64u(key))
 }
 
-/// Claims `key` (single use until `until`, unix secs) at this node, which
-/// owns `routing`'s partition. False = already claimed (a replay).
+/// Claims `key` (single use until `until`, unix secs, capped at
+/// [`MAX_CLAIM_TTL`] from now) at this node, which owns `routing`'s
+/// partition. False = already claimed (a replay).
 ///
 /// The in-memory set is the fast path and settles concurrent claims here.
 /// A `durable` claim is also written to the partition (and awaited) before
 /// it counts, and a claim missing from memory is checked against the
-/// partition first, so a new owner after a failover (empty set) still sees
-/// the claims its predecessor accepted. Expired rows are removed by the
-/// OAuth GC (`gc.rs`). Transient claims (a guard released right after,
-/// with a durable record of its own) skip both.
+/// partition first, so a new owner after a failover (empty set), or this
+/// node after evicting it from a full cache, still sees the claims accepted
+/// before. Expired rows are removed by the OAuth GC (`gc.rs`). Transient
+/// claims (a guard released right after, with a durable record of its own)
+/// skip both.
 pub async fn claim_replay_owned(
     app: &crate::xrpc::App,
     routing: &str,
@@ -273,7 +341,8 @@ pub async fn claim_replay_owned(
     until: i64,
     durable: bool,
 ) -> Result<bool, crate::xrpc::XrpcError> {
-    if !node_state(app).replays.insert_unique(key, until) {
+    let until = until.min(now_secs() + MAX_CLAIM_TTL);
+    if !node_state(app).replays(ClaimKind::of(key, durable)).insert_unique(routing, key, until) {
         return Ok(false);
     }
     if !durable {
@@ -297,70 +366,149 @@ pub async fn claim_replay_owned(
 /// Forgets the in-memory claims of this node (tests: what a node that just
 /// took over a partition starts with).
 pub fn forget_replays(app: &crate::xrpc::App) {
-    node_state(app).replays.inner.lock().0.clear();
+    for c in &node_state(app).replays {
+        c.clear();
+    }
 }
 
 /// Releases a transient claim made with [`claim_replay_owned`] (a guard
 /// whose durable record is now written).
 pub fn release_replay_local(app: &crate::xrpc::App, key: &str) {
-    node_state(app).replays.inner.lock().0.remove(key);
+    node_state(app).replays(ClaimKind::of(key, false)).remove(key);
 }
 
 /// Drops expired replay keys (OAuth GC task). Returns how many were removed.
 pub fn sweep_replays(app: &crate::xrpc::App) -> usize {
-    node_state(app).replays.sweep()
+    node_state(app).replays.iter().map(|c| c.sweep()).sum()
 }
 
-/// Simple TTL set used for replay detection (DPoP proof `jti`s, client
-/// assertion `jti`s): [`claim_replay_owned`].
+/// Entries in this node's replay cache of `kind` (tests, metrics).
+pub fn replay_entries(app: &crate::xrpc::App, kind: ClaimKind) -> usize {
+    node_state(app).replays(kind).len()
+}
+
+/// TTL set used for replay detection ([`claim_replay_owned`]), bounded in
+/// total and per routing key (a DID, a client, a DPoP key).
+///
+/// Full, it evicts the entry closest to expiry (of the routing key over its
+/// cap, else of the whole set) instead of refusing every new claim, which
+/// would let one client flooding it lock every other client out. Evicting
+/// is safe for persisted claims (the partition row still refuses a replay)
+/// and, for memory-only resource-request proofs, only affects a routing key
+/// that exceeded its own cap (or a set full across many keys): a proof
+/// evicted then could be replayed for what is left of its short window,
+/// and only with the access token it is bound to.
 pub struct ReplayCache {
-    inner: parking_lot::Mutex<(std::collections::HashMap<String, i64>, i64)>,
+    inner: parking_lot::Mutex<ReplayInner>,
     max: usize,
+    max_per_group: usize,
+}
+
+#[derive(Default)]
+struct ReplayInner {
+    /// key -> (until, seq, group)
+    map: std::collections::HashMap<String, (i64, u64, std::sync::Arc<str>)>,
+    /// (until, seq) -> key: expiry order
+    order: std::collections::BTreeMap<(i64, u64), String>,
+    /// group -> its entries' (until, seq)
+    groups: std::collections::HashMap<std::sync::Arc<str>, std::collections::BTreeSet<(i64, u64)>>,
+    seq: u64,
+}
+
+impl ReplayInner {
+    fn remove_at(&mut self, at: (i64, u64)) {
+        if let Some(key) = self.order.remove(&at) {
+            if let Some((_, _, g)) = self.map.remove(&key) {
+                if let Some(set) = self.groups.get_mut(&g) {
+                    set.remove(&at);
+                    if set.is_empty() {
+                        self.groups.remove(&g);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drops every entry expired at `now`; returns how many.
+    fn expire(&mut self, now: i64) -> usize {
+        let mut n = 0;
+        while let Some((&at, _)) = self.order.first_key_value() {
+            if at.0 > now {
+                break;
+            }
+            self.remove_at(at);
+            n += 1;
+        }
+        n
+    }
 }
 
 impl ReplayCache {
-    pub fn new(max: usize) -> ReplayCache {
-        ReplayCache {
-            inner: parking_lot::Mutex::new((std::collections::HashMap::new(), 0)),
-            max,
-        }
+    pub fn new(max: usize, max_per_group: usize) -> ReplayCache {
+        ReplayCache { inner: parking_lot::Mutex::new(ReplayInner::default()), max: max.max(1), max_per_group: max_per_group.max(1) }
     }
 
-    /// Drops expired entries (also done lazily by `insert_unique`; the OAuth
-    /// GC task calls this so an idle cache does not hold its peak size).
-    /// Returns how many were removed.
+    /// Drops expired entries (also done on every insert; the OAuth GC task
+    /// calls this so an idle cache does not hold its peak size). Returns
+    /// how many were removed.
     pub fn sweep(&self) -> usize {
-        let now = now_secs();
-        let mut g = self.inner.lock();
-        let (map, last_sweep) = &mut *g;
-        let before = map.len();
-        map.retain(|_, exp| *exp > now);
-        *last_sweep = now;
-        before - map.len()
+        self.inner.lock().expire(now_secs())
     }
 
-    /// Records `key` until `expires_at` (unix secs). Returns false if it was
-    /// already present (a replay).
-    pub fn insert_unique(&self, key: &str, expires_at: i64) -> bool {
+    pub fn len(&self) -> usize {
+        self.inner.lock().map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn clear(&self) {
+        *self.inner.lock() = ReplayInner::default();
+    }
+
+    fn remove(&self, key: &str) {
+        let mut g = self.inner.lock();
+        if let Some(&(until, seq, _)) = g.map.get(key) {
+            g.remove_at((until, seq));
+        }
+    }
+
+    /// Records `key` of routing key `group` until `expires_at` (unix secs).
+    /// Returns false if it was already present (a replay). Never refuses a
+    /// new key: a full set evicts (type docs).
+    pub fn insert_unique(&self, group: &str, key: &str, expires_at: i64) -> bool {
         let now = now_secs();
         let mut g = self.inner.lock();
-        let (map, last_sweep) = &mut *g;
-        if now - *last_sweep > 30 || map.len() >= self.max {
-            map.retain(|_, exp| *exp > now);
-            *last_sweep = now;
-            if map.len() >= self.max {
-                // Over capacity even after expiry: refuse rather than forget
-                // entries (forgetting would re-open the replay window).
-                return false;
-            }
+        g.expire(now);
+        if g.map.contains_key(key) {
+            return false;
         }
-        match map.get(key) {
-            Some(exp) if *exp > now => false,
-            _ => {
-                map.insert(key.to_string(), expires_at);
-                true
-            }
+        if expires_at <= now {
+            // nothing to remember: it can't be presented again in time
+            return true;
         }
+        g.seq += 1;
+        let at = (expires_at, g.seq);
+        let group: std::sync::Arc<str> = match g.groups.get_key_value(group) {
+            Some((k, _)) => k.clone(),
+            None => group.into(),
+        };
+        g.map.insert(key.to_string(), (expires_at, at.1, group.clone()));
+        g.order.insert(at, key.to_string());
+        let over = {
+            let set = g.groups.entry(group).or_default();
+            set.insert(at);
+            (set.len() > self.max_per_group).then(|| *set.first().expect("non-empty"))
+        };
+        if let Some(oldest) = over {
+            g.remove_at(oldest);
+        }
+        while g.map.len() > self.max {
+            let oldest = *g.order.first_key_value().expect("non-empty").0;
+            g.remove_at(oldest);
+        }
+        true
     }
 }
 
@@ -387,10 +535,44 @@ mod tests {
 
     #[test]
     fn replay() {
-        let c = ReplayCache::new(10);
+        let c = ReplayCache::new(10, 10);
         let exp = now_secs() + 60;
-        assert!(c.insert_unique("x", exp));
-        assert!(!c.insert_unique("x", exp));
-        assert!(c.insert_unique("y", exp));
+        assert!(c.insert_unique("g", "x", exp));
+        assert!(!c.insert_unique("g", "x", exp));
+        assert!(c.insert_unique("g", "y", exp));
+        c.remove("x");
+        assert!(c.insert_unique("g", "x", exp), "released");
+        // already expired: accepted, not kept
+        assert!(c.insert_unique("g", "old", now_secs() - 1));
+        assert_eq!(c.len(), 2);
+    }
+
+    /// A full cache evicts (the entry closest to expiry) instead of refusing
+    /// new claims; one routing key over its cap evicts only its own entries.
+    #[test]
+    fn replay_cache_full_evicts() {
+        let now = now_secs();
+        let c = ReplayCache::new(100, 10);
+        // another client's claims, expiring late
+        for i in 0..5 {
+            assert!(c.insert_unique("victim", &format!("v{i}"), now + 300));
+        }
+        // a flood from one routing key: never refused, capped at 10 of its own
+        for i in 0..1_000 {
+            assert!(c.insert_unique("flood", &format!("f{i}"), now + 60 + i), "claim {i} refused");
+        }
+        assert_eq!(c.len(), 15);
+        for i in 0..5 {
+            assert!(!c.insert_unique("victim", &format!("v{i}"), now + 300), "victim claim {i} evicted by another key's flood");
+        }
+        // the newest of the flood are still claimed
+        assert!(!c.insert_unique("flood", "f999", now + 60));
+        // a flood across many keys fills the whole set: still no refusal,
+        // the soonest-expiring entries go first
+        for i in 0..1_000 {
+            assert!(c.insert_unique(&format!("k{i}"), &format!("m{i}"), now + 400 + i));
+        }
+        assert_eq!(c.len(), 100);
+        assert!(!c.insert_unique("k999", "m999", now + 400));
     }
 }
