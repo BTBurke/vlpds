@@ -227,6 +227,7 @@ impl Retention {
 
     /// Runs a pass every `interval`, forever.
     pub fn spawn(self: &Arc<Self>) {
+        metrics::init_retention_counters();
         let me = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(me.cfg.interval);

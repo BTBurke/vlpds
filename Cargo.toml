@@ -113,6 +113,12 @@ path = "tests/all/main.rs"
 name = "argon2_shed"
 path = "tests/argon2_shed.rs"
 
+# A fresh node's /metrics exports the counters alerts rely on at 0: its own
+# binary because metrics are process-wide (other tests would move them)
+[[test]]
+name = "fresh_metrics"
+path = "tests/fresh_metrics.rs"
+
 # Rolling upgrades with the test feature level: its own binary (the active
 # level is process-wide), so `cargo test --features test-level --test level_gating`
 [[test]]

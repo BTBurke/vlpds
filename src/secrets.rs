@@ -767,6 +767,15 @@ impl Secrets {
         anyhow::ensure!(!wrappers.is_empty(), "no key-encryption key");
         let n = if kms_concurrency == 0 { DEFAULT_KMS_CONCURRENCY } else { kms_concurrency };
         let keys = crate::caches::track(crate::caches::Cache::SigningKeys, Arc::new(KeyCache::new()));
+        // exported at 0, so the alerts' rate() / increase() see the first
+        // unavailable or rejected call (metrics::init_counters)
+        for w in &wrappers {
+            for op in ["wrap", "unwrap"] {
+                for r in ["ok", "unavailable", "rejected"] {
+                    KMS_REQUESTS.with_label_values(&[w.backend(), op, r]);
+                }
+            }
+        }
         Ok(Secrets {
             wrappers,
             dev_kek: false,

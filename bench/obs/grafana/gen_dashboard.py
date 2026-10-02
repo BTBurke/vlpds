@@ -352,7 +352,8 @@ stat("Lease renew/TTL", f"max({hq(0.99, 'vlpds_lease_renew_ttl_ratio', by='insta
 stat("Store errors/s", f'sum(rate(vlpds_object_store_requests_total{{{I}, result=~"error|timeout"}}{RI})) or vector(0)', "reqps",
      [(0.01, "yellow"), (1, "red")], decimals=2,
      desc="vlpds' object-store requests that failed or timed out (all clients: log, state, control plane). "
-          f"Red at 1/s = {rb('VlpdsObjectStoreRequestErrors')}. Per client and component: Object store row.")
+          f"Red at 1/s on one component = {rb('VlpdsObjectStoreErrors')} (state_*: SlateDB) or {rb('VlpdsObjectStoreRequestErrors')} "
+          f"(the rest); on 2+ nodes at once = {rb('VlpdsObjectStoreBrownout')}. Per client and component: Object store row.")
 stat("Store permit waits/s", f"sum(rate(vlpds_object_store_permit_waits_total{{{I}}}{RI})) or vector(0)", "reqps",
      [(0.01, "yellow"), (1, "red")], decimals=2,
      desc="Object-store requests that found every in-flight permit of their pool (log / state / ctl) and lane taken and queued. "
@@ -731,7 +732,7 @@ ts("Object store requests/s and errors (SlateDB)", [t(f"sum by (api) (rate(slate
    overrides=[{"matcher": {"id": "byName", "options": "errors (incl. not found)"}, "properties": [{"id": "color", "value": {"mode": "fixed", "fixedColor": "red"}}]}],
    desc="SlateDB's own view of its store calls. Its error count includes normal answers (GETs of objects that don't exist yet, "
         "e.g. compactor polls; lost CAS races), so a steady rate here is not trouble by itself: real failures are result=error|timeout "
-        f"in the Object store row. {rb('VlpdsObjectStoreErrors')} alerts on this counter.")
+        f"in the Object store row, where {rb('VlpdsObjectStoreErrors')} counts them for the state_* components (no alert reads this counter).")
 
 # ============================================================== process
 row("Process and runtime")

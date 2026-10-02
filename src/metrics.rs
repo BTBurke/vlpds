@@ -165,12 +165,12 @@ lazy!(BUILD_INFO: IntGaugeVec = register_int_gauge_vec!("vlpds_build_info", "1, 
 
 // ---- process / runtime (the prometheus crate's process collector is Linux-only and off) ----
 lazy!(PROCESS_RSS: IntGauge = register_int_gauge!("vlpds_process_resident_bytes", "Resident set size"));
-lazy!(PROCESS_CPU: GaugeVec = register_gauge_vec!("vlpds_process_cpu_seconds_total", "CPU time consumed by mode (getrusage)", &["mode"]));
+lazy!(PROCESS_CPU: prometheus::CounterVec = prometheus::register_counter_vec!("vlpds_process_cpu_seconds_total", "CPU time consumed by mode (getrusage)", &["mode"]));
 lazy!(PROCESS_THREADS: IntGauge = register_int_gauge!("vlpds_process_threads", "OS threads"));
 lazy!(TOKIO_WORKERS: IntGauge = register_int_gauge!("vlpds_tokio_workers", "Tokio worker threads"));
 lazy!(TOKIO_TASKS: IntGauge = register_int_gauge!("vlpds_tokio_alive_tasks", "Tokio tasks alive"));
 lazy!(TOKIO_GLOBAL_QUEUE: IntGauge = register_int_gauge!("vlpds_tokio_global_queue_depth", "Tasks in the tokio injection queue"));
-lazy!(TOKIO_BUSY: Gauge = register_gauge!("vlpds_tokio_busy_seconds_total", "Busy time summed over tokio workers (rate / workers = utilization)"));
+lazy!(TOKIO_BUSY: prometheus::Counter = prometheus::register_counter!("vlpds_tokio_busy_seconds_total", "Busy time summed over tokio workers (rate / workers = utilization)"));
 
 // ---- leases, fail-stops, takeovers (ops/RUNBOOK.md) ----
 /// `vlpds_lease_renew_seconds`, plus the same round trip as a fraction of
@@ -232,6 +232,123 @@ lazy!(RETENTION_PASS_SECONDS: Histogram = register_histogram!("vlpds_retention_p
 lazy!(RETENTION_DEAD_SEGMENTS: IntGauge = register_int_gauge!("vlpds_retention_dead_log_segments", "Log objects left below the end of dead (writer gone) logs, as of the last pass that checked them all; only the dead-log pruner (owner of slot 0's shard) reports non-zero"));
 lazy!(RETENTION_DEAD_LOGS: IntGaugeVec = register_int_gauge_vec!("vlpds_retention_dead_logs", "Dead logs by state as of the last pass that checked them all: unfenced (no successor fenced it yet), needed (a shard's replay may still read it), pruning (segments inside the window, or deleting), fenced (pruned to its fence, which goes after --fence-retention)", &["state"]));
 
+/// Exports counters at 0 before their first event. A counter series that
+/// first appears already at 1 has no earlier sample, so `rate()` and
+/// `increase()` never see that event: a kill -9 survivor's
+/// `vlpds_peer_takeovers_total{reason="peer"}` showed 1 and
+/// `VlpdsUncleanNodeExit` never fired. Covers every unlabelled counter here,
+/// the histograms alerts take `_count` from, and the bounded label values of
+/// the labelled counters ops/alerts.yml and the dashboard read. Elsewhere:
+/// `vlpds_format_errors_total` (version::init_metrics), the signature
+/// failures (crypto::touch_metrics), PLC write ops (plc::touch_metrics), KMS
+/// requests (Secrets::new, per configured backend), permit waits
+/// (objlimit's lanes), retention passes and retired-state GC / forced
+/// compactions (when their loops are spawned, so `VlpdsRetentionNotRunning`
+/// stays quiet on nodes that don't run retention). Not pre-created:
+/// per-route families (`vlpds_http_requests_total`,
+/// `vlpds_rate_limit_rejections_total`: limiter x route, of which
+/// `vlpds_rate_limited_total` is the bounded total) and
+/// `vlpds_object_store_requests_total` (op x component x client x result;
+/// its alerts are rates over 1/s).
+///
+/// Idempotent and cheap after the first call; server startup calls it
+/// before joining the cluster (a restart's own takeover), and [`render`]
+/// does too.
+pub fn init_counters() {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| {
+        for c in UNLABELLED_COUNTERS {
+            LazyLock::force(c);
+        }
+        LazyLock::force(&RUNTIME_LATE_TOTAL);
+        for h in ALERT_HISTOGRAMS {
+            LazyLock::force(h);
+        }
+        for (vec, values) in LABELLED_COUNTERS {
+            for v in *values {
+                vec.with_label_values(&[v]);
+            }
+        }
+        for kind in ["replay", "clean"] {
+            SHARD_OPEN_SECONDS.with_label_values(&[kind]);
+        }
+    });
+}
+
+/// Unlabelled integer counters, exported at 0 by [`init_counters`].
+static UNLABELLED_COUNTERS: &[&LazyLock<IntCounter>] = &[
+    &HTTP_SERVER_CONNECTIONS,
+    &HTTP_SERVER_ACCEPT_ERRORS,
+    &RATE_LIMITED,
+    &WRITES_SHED,
+    &ARGON2_SHED,
+    &HTTP_STALLED_BODIES,
+    &COMMITS,
+    &REPO_EVICTIONS,
+    &LAZY_MST_UNLOADS,
+    &WRITES_ABANDONED,
+    &SEGMENT_BYTES_TOTAL,
+    &SEGMENT_STALL_SEALS,
+    &SEGMENT_STORED_BYTES_TOTAL,
+    &SEGMENT_DECODES,
+    &PUT_HEDGES,
+    &REPLAYED_SEGMENTS,
+    &FIREHOSE_EVENTS,
+    &FIREHOSE_SENT,
+    &FIREHOSE_SPILLS,
+    &FIREHOSE_SPILL_SEGMENTS,
+    &FIREHOSE_SENT_BYTES,
+    &FIREHOSE_BACKFILL_GETS,
+    &FIREHOSE_BACKFILL_EVENTS,
+    &LOG_STREAM_LAGGED,
+    &FORWARDED,
+    &RESHARD_GC_SKIPPED,
+];
+
+/// Unlabelled histograms whose `_count` an alert rates (a node that never
+/// observed one must still show 0, e.g. `VlpdsCheckpointsStalled`).
+static ALERT_HISTOGRAMS: &[&LazyLock<Histogram>] = &[&COMMIT_LATENCY, &CHECKPOINT_SHARD, &FORWARD_DURATION, &FIREHOSE_EMIT_DELAY, &REPLAY_SECONDS];
+
+/// One-label counters and every value their code paths emit.
+#[allow(clippy::type_complexity)]
+static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
+    (&PEER_TAKEOVERS, &["peer", "restart"]),
+    (&LEASE_EVENTS, &["opened", "closed", "lost", "peer_refused", "lease_recreated", "history_full", "join_lease_moved", "shutdown_fence_failed"]),
+    (&LEASE_RENEW_ERRORS, &["timeout", "error", "conflict", "lapsed"]),
+    (&CLUSTER_STORE_TIMEOUTS, &["get", "put", "list", "delete", "fence", "fence-scan"]),
+    (&SHARDS_OPENED, &["ok", "error"]),
+    (&PUT_ATTEMPTS, &["ok", "already_exists", "error"]),
+    (&WRITE_ERRORS, &["repo_not_found", "repo_inactive", "invalid_swap", "invalid", "internal", "unavailable", "key_unavailable", "signature_fault", "not_started"]),
+    (&WRITE_RETRIES, &["unreachable", "loading", "moved"]),
+    (&FORWARDS, &["2xx", "3xx", "4xx", "5xx"]),
+    (&PROXY_REJECTED, &["account_cap"]),
+    (&REPO_CACHE, &["hit", "miss", "loading"]),
+    (&REPO_LOADS, &["ok", "error", "not_found", "stale"]),
+    (&LAZY_MST_FALLBACKS, &["missing", "missing_node", "invalid"]),
+    (&FIREHOSE_DISCONNECTS, &["too_slow"]),
+    (&FIREHOSE_REJECTED, &["per_ip"]),
+    (&SYNC_EXPORTS_ENDED, &["done", "client_gone", "stalled", "error", "shed"]),
+];
+
+/// Retention passes at 0 (Retention::spawn: only nodes that run it).
+pub fn init_retention_counters() {
+    for r in ["ok", "error"] {
+        RETENTION_TICKS.with_label_values(&[r]);
+    }
+}
+
+/// Retired-state GC passes and forced compactions at 0 (ReshardGc::spawn).
+pub fn init_reshard_gc_counters() {
+    for r in ["ok", "error"] {
+        RESHARD_GC_PASSES.with_label_values(&[r]);
+    }
+    for kind in ["detach", "full"] {
+        for r in ["submitted", "completed", "failed"] {
+            FORCED_COMPACTIONS.with_label_values(&[kind, r]);
+        }
+    }
+}
+
 /// Increments a gauge until dropped (in-flight counts that survive cancellation).
 pub struct InflightGuard(&'static IntGauge);
 
@@ -287,6 +404,7 @@ pub fn on_render(f: impl Fn() -> bool + Send + Sync + 'static) {
 }
 
 pub fn render() -> String {
+    init_counters();
     REFRESHERS.lock().retain(|f| f());
     crate::lifecycle::refresh_metrics();
     crate::crypto::touch_metrics();
@@ -324,6 +442,19 @@ fn refresh_jemalloc() {
     }
 }
 
+/// Moves a counter that mirrors a cumulative total read at scrape time
+/// (getrusage, tokio's busy time) up to `total`. Never down: a total read
+/// from another runtime, or one that went back, leaves it where it is.
+/// Serialized, so concurrent scrapes don't add the same delta twice.
+fn advance(c: &prometheus::Counter, total: f64) {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _g = LOCK.lock();
+    let cur = c.get();
+    if total > cur {
+        c.inc_by(total - cur);
+    }
+}
+
 fn refresh_tokio() {
     let Ok(h) = tokio::runtime::Handle::try_current() else { return };
     let m = h.metrics();
@@ -331,7 +462,7 @@ fn refresh_tokio() {
     TOKIO_WORKERS.set(n as i64);
     TOKIO_TASKS.set(m.num_alive_tasks() as i64);
     TOKIO_GLOBAL_QUEUE.set(m.global_queue_depth() as i64);
-    TOKIO_BUSY.set((0..n).map(|w| m.worker_total_busy_duration(w).as_secs_f64()).sum());
+    advance(&TOKIO_BUSY, (0..n).map(|w| m.worker_total_busy_duration(w).as_secs_f64()).sum());
 }
 
 /// Resident set size of this process (benchmarks), if the platform reports it.
@@ -344,8 +475,8 @@ pub fn resident_bytes() -> Option<u64> {
 
 fn refresh_process() {
     if let Some((user, system)) = sys::cpu_seconds() {
-        PROCESS_CPU.with_label_values(&["user"]).set(user);
-        PROCESS_CPU.with_label_values(&["system"]).set(system);
+        advance(&PROCESS_CPU.with_label_values(&["user"]), user);
+        advance(&PROCESS_CPU.with_label_values(&["system"]), system);
     }
     if let Some((rss, threads)) = sys::rss_threads() {
         PROCESS_RSS.set(rss as i64);

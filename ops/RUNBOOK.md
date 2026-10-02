@@ -343,6 +343,11 @@ fencing it itself. `reason="peer"`: a survivor took over a dead peer's shards
 `reason="restart"`: a node fenced its own previous incarnation at startup (it
 came back before a peer took over). Graceful stops never count. This is
 counted on a live node, so it reports deaths of nodes that never come back.
+Every node exports both reasons at 0 from startup (`metrics::init_counters`),
+so `increase()` sees the first takeover: a counter series that first appeared
+at 1 had no earlier sample, and the alert missed it. A `restart` lands before
+the new process is first scraped, but in the series its predecessor exported
+at 0.
 
 **Confirm:** `fenced dead node's log` (log_id) in the fencer's logs; the dead
 incarnation's `vlpds_last_exit_reason_info` once it restarts.
@@ -531,7 +536,8 @@ the next step, here or elsewhere.
 
 **Confirm:** `open failed: ...; releasing` and `replay failed` log lines (shard,
 error); [VlpdsObjectStoreRequestErrors](#vlpdsobjectstorerequesterrors) for
-`log_segment` reads; `VlpdsObjectStoreErrors` (SlateDB). Replay treats a hole
+`log_segment` reads; [VlpdsObjectStoreErrors](#vlpdsobjectstoreerrors) for
+shard state (SlateDB). Replay treats a hole
 inside a span as an error: someone deleted log objects by hand?
 
 **Do:** fix the store problem. Do not edit `assign/` or `log/` to "unstick" a
@@ -690,8 +696,9 @@ Do not raise `--max-segment-mb` to compensate (bigger PUTs are slower; DESIGN
 hedge race verified by content). They are retried; acks wait. Unrecoverable
 failure of the upload task exits 2.
 
-**Confirm:** node logs for the store error text; [VlpdsObjectStoreErrors](#vlpdsobjectstoreerrors)
-on the same node (credentials, bucket policy, throttling).
+**Confirm:** node logs for the store error text; [VlpdsObjectStoreRequestErrors](#vlpdsobjectstorerequesterrors)
+(`log_segment`) and [VlpdsObjectStoreErrors](#vlpdsobjectstoreerrors) (shard
+state) on the same node (credentials, bucket policy, throttling).
 
 **Do:** fix credentials/permissions/quotas. A `segment PUT conflicted but no object
 is there; retrying` warning is handled by the code.
@@ -884,22 +891,32 @@ abandoned calls); one node or many (see
 
 ### VlpdsObjectStoreBrownout
 
-**Means:** two or more nodes timing out control-plane calls in the same 5
-minutes. DESIGN: a cluster-wide brownout past the 0.4 x TTL renewal ceiling (4 s at
+**Means:** two or more nodes, in the same 5 minutes, either timing out
+control-plane calls or failing over 1/s of their object-store requests
+(`vlpds_object_store_requests_total{result=~"error|timeout"}`, any component:
+the failures [VlpdsObjectStoreErrors](#vlpdsobjectstoreerrors) and
+[VlpdsObjectStoreRequestErrors](#vlpdsobjectstorerequesterrors) count on one
+node). DESIGN: a cluster-wide brownout past the 0.4 x TTL renewal ceiling (4 s at
 the default TTL) stops every node.
+
+**Confirm:** `sum by (instance, component, result) (rate(vlpds_object_store_requests_total{result=~"error|timeout"}[5m]))`
+and `sum by (instance, op) (increase(vlpds_cluster_store_timeouts_total[5m]))`
+across nodes; the store provider's status page.
 
 **Do:** [Object-store outage](#object-store-outage) procedure.
 
 ### VlpdsObjectStoreRequestErrors
 
 **Means:** over 1/s of this node's own object-store requests failed (`result`
-`error` or `timeout`) on one key component, for 5 minutes. Counted at the
-bottom of vlpds' store clients (`src/objstats.rs`), so it covers SlateDB and
-everything SlateDB's metrics don't: control plane (`ctl_lease`, `ctl_assign`,
-`ctl_writer`), `log_segment` (segment PUTs, fences, replay, firehose backfill
-and follower catch-up), `retention_report`, `account_index`, `blob`.
-`not_found` and `precondition` (a lost CAS / create race) are normal answers;
-`cancelled` is a caller that gave up (control-plane deadline, a lost hedge).
+`error` or `timeout`) on one key component outside shard state, for 5
+minutes. Counted at the bottom of vlpds' store clients (`src/objstats.rs`):
+control plane (`ctl_lease`, `ctl_assign`, `ctl_writer`, `ctl_version`),
+`log_segment` (segment PUTs, fences, replay, firehose backfill and follower
+catch-up), `retention_report`, `account_index`, `blob`. Shard state
+(`state_*`, SlateDB's requests) is [VlpdsObjectStoreErrors](#vlpdsobjectstoreerrors),
+the same counter and threshold. `not_found` and `precondition` (a lost CAS /
+create race) are normal answers; `cancelled` is a caller that gave up
+(control-plane deadline, a lost hedge).
 
 **Confirm:** `sum by (component, op, result) (rate(vlpds_object_store_requests_total{instance="..."}[5m]))`;
 the matching warn/error log lines.
@@ -955,12 +972,24 @@ node; [VlpdsLeaseRenewalSlow](#vlpdsleaserenewalslow); the same on other nodes.
 
 ### VlpdsObjectStoreErrors
 
-**Means:** SlateDB (shard state: memtable flushes, manifests, SST reads, GC,
-compaction) sees object-store errors over 1/s. SlateDB retries; persistent apply
-failure exits 4.
+**Means:** over 1/s of this node's shard-state object-store requests (SlateDB:
+WAL, memtable flushes, manifests, SST reads, compaction, GC) failed (`result`
+`error` or `timeout`) on one `state_*` component (`state_wal`,
+`state_manifest`, `state_sst`, `state_compactions`, `state_gc_boundary`,
+`state_other`), for 5 minutes. Counted by vlpds under SlateDB
+(`vlpds_object_store_requests_total`, `src/objstats.rs`), like
+[VlpdsObjectStoreRequestErrors](#vlpdsobjectstorerequesterrors) for every other
+component. SlateDB retries; persistent apply failure exits 4.
 
-**Confirm:** `sum by (component, op, api) (rate(slatedb_object_store_error_count_total[5m]))`;
-logs. Errors only from `gc`/`compactor` don't affect acks directly but let L0 grow.
+Not SlateDB's own `slatedb_object_store_error_count_total`: it counts every
+call that didn't succeed, including the not-found GETs of normal traffic
+(each node's compactors poll for manifests and compactions about 12 times a
+second) and lost CAS races, and has no label to tell them apart. A steady
+rate there is not trouble by itself; it is only useful next to this one.
+
+**Confirm:** `sum by (component, op, result) (rate(vlpds_object_store_requests_total{instance="...",component=~"state_.*",result!="ok"}[5m]))`;
+logs. Failures only on `state_compactions` / `state_gc_boundary` (compaction,
+GC) don't affect acks directly but let L0 grow.
 
 **Do:** credentials, permissions, throttling, provider status.
 
@@ -979,7 +1008,11 @@ local SST disk cache (`--cache-dir`) is set and healthy (hit rates in
 compaction is behind. Segment apply (and so acks) waits.
 
 **Confirm:** `slatedb_db_l0_sst_count`, `vlpds_compaction_poll_switches_total`,
-compactor errors in `slatedb_object_store_error_count_total{component="compactor"}`,
+failed shard-state requests in
+`vlpds_object_store_requests_total{component=~"state_.*",result=~"error|timeout"}`
+([VlpdsObjectStoreErrors](#vlpdsobjectstoreerrors); SlateDB's
+`slatedb_object_store_error_count_total{component="compactor"}` also counts
+its normal not-found polls),
 `vlpds_commit_stage_seconds{stage="apply"}`.
 
 **Do:** fix store errors/latency; check CPU for the compactor. **(unverified)**

@@ -1083,7 +1083,7 @@
    "type": "stat",
    "id": 13,
    "title": "Store errors/s",
-   "description": "vlpds' object-store requests that failed or timed out (all clients: log, state, control plane). Red at 1/s = [VlpdsObjectStoreRequestErrors](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorerequesterrors). Per client and component: Object store row.",
+   "description": "vlpds' object-store requests that failed or timed out (all clients: log, state, control plane). Red at 1/s on one component = [VlpdsObjectStoreErrors](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstoreerrors) (state_*: SlateDB) or [VlpdsObjectStoreRequestErrors](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorerequesterrors) (the rest); on 2+ nodes at once = [VlpdsObjectStoreBrownout](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorebrownout). Per client and component: Object store row.",
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -9888,7 +9888,7 @@
      "type": "timeseries",
      "id": 122,
      "title": "Object store requests/s and errors (SlateDB)",
-     "description": "SlateDB's own view of its store calls. Its error count includes normal answers (GETs of objects that don't exist yet, e.g. compactor polls; lost CAS races), so a steady rate here is not trouble by itself: real failures are result=error|timeout in the Object store row. [VlpdsObjectStoreErrors](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstoreerrors) alerts on this counter.",
+     "description": "SlateDB's own view of its store calls. Its error count includes normal answers (GETs of objects that don't exist yet, e.g. compactor polls; lost CAS races), so a steady rate here is not trouble by itself: real failures are result=error|timeout in the Object store row, where [VlpdsObjectStoreErrors](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstoreerrors) counts them for the state_* components (no alert reads this counter).",
      "datasource": {
       "type": "prometheus",
       "uid": "prom"

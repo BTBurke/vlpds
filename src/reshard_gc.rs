@@ -184,6 +184,7 @@ impl ReshardGc {
 
     /// Runs both halves every `interval`, forever.
     pub fn spawn(self: &Arc<Self>) {
+        metrics::init_reshard_gc_counters();
         let me = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(me.cfg.interval);

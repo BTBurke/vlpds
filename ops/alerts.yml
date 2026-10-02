@@ -610,25 +610,34 @@ groups:
           summary: "{{ $labels.instance }}: control-plane {{ $labels.op }} calls timed out (5 s deadline) in the last 5 minutes"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscontrolplanetimeouts"
 
-      # The same on two or more nodes at once: a store brownout, which stops
-      # every node once renewals take over 0.4 x TTL (DESIGN "Renewal RTT
-      # ceiling").
+      # Two or more nodes at once timing out control-plane calls, or failing
+      # object-store requests at the VlpdsObjectStoreErrors /
+      # VlpdsObjectStoreRequestErrors rate (vlpds_object_store_requests_total
+      # result=error|timeout, any component, over 1/s): a store brownout,
+      # which stops every node once renewals take over 0.4 x TTL (DESIGN
+      # "Renewal RTT ceiling").
       - alert: VlpdsObjectStoreBrownout
-        expr: count(sum by (instance) (increase(vlpds_cluster_store_timeouts_total{job="vlpds"}[5m])) > 0) >= 2
+        expr: >-
+          count(
+            (sum by (instance) (increase(vlpds_cluster_store_timeouts_total{job="vlpds"}[5m])) > 0)
+            or
+            (sum by (instance) (rate(vlpds_object_store_requests_total{job="vlpds",result=~"error|timeout"}[5m])) > 1)
+          ) >= 2
         labels:
           severity: page
         annotations:
-          summary: "{{ $value }} vlpds nodes are timing out object-store control-plane calls: cluster-wide fail-stop risk"
+          summary: "{{ $value }} vlpds nodes are timing out control-plane calls or failing object-store requests: cluster-wide fail-stop risk"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorebrownout"
 
-      # vlpds' own object-store clients (objstats.rs: every request, SlateDB's
-      # included, by key component): failed or timed-out requests. Covers
-      # what SlateDB's metrics don't: control plane (ctl_*), log segment
-      # reads (replay, backfill, follower catch-up), retention reports and
-      # deletes. not_found / precondition are normal answers; cancelled is a
-      # caller giving up (see VlpdsControlPlaneTimeouts). 1/s (guess).
+      # vlpds' own object-store clients (objstats.rs: every request, by key
+      # component): failed or timed-out requests outside shard state (that is
+      # VlpdsObjectStoreErrors): control plane (ctl_*), log segments (PUTs,
+      # fences, replay, backfill, follower catch-up), retention reports and
+      # deletes, account index, blobs. not_found / precondition are normal
+      # answers; cancelled is a caller giving up (see
+      # VlpdsControlPlaneTimeouts). 1/s (guess).
       - alert: VlpdsObjectStoreRequestErrors
-        expr: sum by (instance, component) (rate(vlpds_object_store_requests_total{job="vlpds",result=~"error|timeout"}[5m])) > 1
+        expr: sum by (instance, component) (rate(vlpds_object_store_requests_total{job="vlpds",component!~"state_.*",result=~"error|timeout"}[5m])) > 1
         for: 5m
         labels:
           severity: ticket
@@ -664,16 +673,20 @@ groups:
           summary: "Control-plane object-store p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }}"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscontrolplanelatencyhigh"
 
-      # SlateDB's own instrumented store (feature slatedb-metrics, on by
-      # default): every SlateDB request, success or error, by component
-      # (db, reader, gc, compactor). SlateDB retries failures (guess: 1/s).
+      # Shard state (SlateDB: WAL, memtable flushes, manifests, SSTs,
+      # compaction, GC; the state_* components of vlpds' own counter,
+      # objstats.rs): failed or timed-out requests. Not
+      # slatedb_object_store_error_count_total: that counts every
+      # non-success answer, including the not-found GETs of normal traffic
+      # (each node's compactors poll ~12/s) and lost CAS races, with no label
+      # to tell them apart. SlateDB retries failures (guess: 1/s).
       - alert: VlpdsObjectStoreErrors
-        expr: sum by (instance, component) (rate(slatedb_object_store_error_count_total{job="vlpds"}[5m])) > 1
+        expr: sum by (instance, component) (rate(vlpds_object_store_requests_total{job="vlpds",component=~"state_.*",result=~"error|timeout"}[5m])) > 1
         for: 5m
         labels:
           severity: ticket
         annotations:
-          summary: "{{ $labels.instance }}: {{ $value | humanize }} SlateDB object-store errors/s (component={{ $labels.component }})"
+          summary: "{{ $labels.instance }}: {{ $value | humanize }} failed shard-state (SlateDB) object-store requests/s on {{ $labels.component }}"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstoreerrors"
 
       # SlateDB request latency (buckets 1 ms .. 10 s). 1 s p99 (guess).
