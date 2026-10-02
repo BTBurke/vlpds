@@ -1,0 +1,2282 @@
+{
+ "lat.w.p50": {
+  "key": "lat.w.p50",
+  "label": "write p50 (ms)",
+  "path": "latency",
+  "mode": "calm",
+  "n": 52,
+  "first": 3.326,
+  "last": 3.728,
+  "mean": 3.5481,
+  "change_pct": 12.1,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 2.23821041328236,
+    "r2": 0.169,
+    "t": 3.1922978291269994
+   },
+   "h.incarnations": {
+    "per_unit": 8.974612129760295,
+    "r2": 0.345,
+    "t": 5.136862998179406
+   },
+   "h.reshards": {
+    "per_unit": 2.3383924948870205,
+    "r2": 0.067,
+    "t": 1.8885042344408123
+   },
+   "h.commits": {
+    "per_unit": 4.144715886234847,
+    "r2": 0.169,
+    "t": 3.192521415753399
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.429,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 22.372567646491603,
+    "effect": 1.7898054117193283,
+    "effect_pct": 53.812549961495144,
+    "t": 2.3479049166899
+   },
+   "h.reshards": {
+    "coef_per_unit": 3.750554443268328,
+    "effect": 0.7126053442209823,
+    "effect_pct": 21.42529597778059,
+    "t": 0.4752395029325529
+   },
+   "h.commits": {
+    "coef_per_unit": -13.189828930631856,
+    "effect": -2.3343886834589487,
+    "effect_pct": -70.18606985745487,
+    "t": -0.9566342871488881
+   }
+  },
+  "verdict": "changes +12%, attribution unclear; best single fit: incarnations r2 0.345"
+ },
+ "lat.w.p99": {
+  "key": "lat.w.p99",
+  "label": "write p99 (ms)",
+  "path": "latency",
+  "mode": "calm",
+  "n": 52,
+  "first": 17.524,
+  "last": 12.236,
+  "mean": 14.6883,
+  "change_pct": -30.2,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": -0.47178517523451546,
+    "r2": 0.0,
+    "t": -0.05759980914041577
+   },
+   "h.incarnations": {
+    "per_unit": 3.461448048895477,
+    "r2": 0.0,
+    "t": 0.15057490273910396
+   },
+   "h.reshards": {
+    "per_unit": 2.602288628892735,
+    "r2": 0.001,
+    "t": 0.1907622185767739
+   },
+   "h.commits": {
+    "per_unit": -0.8651191826610947,
+    "r2": 0.0,
+    "t": -0.057040566578081625
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.186,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 386.77164573317384,
+    "effect": 30.941731658653907,
+    "effect_pct": 176.5677451418278,
+    "t": 3.1923443606283977
+   },
+   "h.reshards": {
+    "coef_per_unit": 328.06806607550953,
+    "effect": 62.33293255434681,
+    "effect_pct": 355.7003683767793,
+    "t": 3.269425506806557
+   },
+   "h.commits": {
+    "coef_per_unit": -579.2525749019791,
+    "effect": -102.51843771645186,
+    "effect_pct": -585.0173346065502,
+    "t": -3.3041912880469813
+   }
+  },
+  "verdict": "falls (-30%)"
+ },
+ "lat.r_getRecord.p99": {
+  "key": "lat.r_getRecord.p99",
+  "label": "getRecord p99 (ms)",
+  "path": "a: read amplification",
+  "mode": "calm",
+  "n": 52,
+  "first": 10.24,
+  "last": 5.39,
+  "mean": 7.5602,
+  "change_pct": -47.4,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": -9.2476745733494,
+    "r2": 0.092,
+    "t": -2.2555707051956433
+   },
+   "h.incarnations": {
+    "per_unit": -18.465491302303594,
+    "r2": 0.047,
+    "t": -1.5655558911532768
+   },
+   "h.reshards": {
+    "per_unit": -15.552119300163113,
+    "r2": 0.094,
+    "t": -2.2790238571890953
+   },
+   "h.commits": {
+    "per_unit": -17.1262658070475,
+    "r2": 0.092,
+    "t": -2.2559229594788337
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.141,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 103.95903798469988,
+    "effect": 8.31672303877599,
+    "effect_pct": 81.21799842554678,
+    "t": 1.5897725445369895
+   },
+   "h.reshards": {
+    "coef_per_unit": 69.01991558893243,
+    "effect": 13.113783961897163,
+    "effect_pct": 128.06429650290198,
+    "t": 1.2743817626870626
+   },
+   "h.commits": {
+    "coef_per_unit": -152.30170792923485,
+    "effect": -26.954965476147702,
+    "effect_pct": -263.2320847280049,
+    "t": -1.6096061337541354
+   }
+  },
+  "verdict": "falls (-47%)"
+ },
+ "lat.r_listRecords.p99": {
+  "key": "lat.r_listRecords.p99",
+  "label": "listRecords p99 (ms)",
+  "path": "a: read amplification",
+  "mode": "calm",
+  "n": 52,
+  "first": 15.024,
+  "last": 11.45,
+  "mean": 9.504,
+  "change_pct": -23.8,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": -5.26750729381979,
+    "r2": 0.021,
+    "t": -1.0274912431082996
+   },
+   "h.incarnations": {
+    "per_unit": -13.504889515749774,
+    "r2": 0.017,
+    "t": -0.9367827120529444
+   },
+   "h.reshards": {
+    "per_unit": -7.693378377259474,
+    "r2": 0.016,
+    "t": -0.8985617115893273
+   },
+   "h.commits": {
+    "per_unit": -9.757927736149291,
+    "r2": 0.021,
+    "t": -1.0279355311584213
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.027,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 43.4484444053993,
+    "effect": 3.475875552431944,
+    "effect_pct": 23.135486903833492,
+    "t": 0.5187843319443878
+   },
+   "h.reshards": {
+    "coef_per_unit": 40.04369065909472,
+    "effect": 7.608301225227997,
+    "effect_pct": 50.64098259603299,
+    "t": 0.5772967341257582
+   },
+   "h.commits": {
+    "coef_per_unit": -78.10915536525174,
+    "effect": -13.824070753163712,
+    "effect_pct": -92.0132504869789,
+    "t": -0.6445500779318014
+   }
+  },
+  "verdict": "falls (-24%)"
+ },
+ "lat.r_syncGetRecord.p99": {
+  "key": "lat.r_syncGetRecord.p99",
+  "label": "sync.getRecord p99 (ms)",
+  "path": "a: read amplification",
+  "mode": "calm",
+  "n": 52,
+  "first": 9.078,
+  "last": 8.104,
+  "mean": 8.3452,
+  "change_pct": -10.7,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 0.6034539326773256,
+    "r2": 0.0,
+    "t": 0.15070909818984235
+   },
+   "h.incarnations": {
+    "per_unit": 7.934226610249162,
+    "r2": 0.01,
+    "t": 0.709266012759689
+   },
+   "h.reshards": {
+    "per_unit": -0.9841021437265729,
+    "r2": 0.0,
+    "t": -0.1475190029777009
+   },
+   "h.commits": {
+    "per_unit": 1.1151036255761566,
+    "r2": 0.0,
+    "t": 0.15039783447938398
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.045,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 73.56688388553465,
+    "effect": 5.885350710842772,
+    "effect_pct": 64.83091772243635,
+    "t": 1.1465299523731547
+   },
+   "h.reshards": {
+    "coef_per_unit": 34.53716024478126,
+    "effect": 6.56206044650844,
+    "effect_pct": 72.28531005186649,
+    "t": 0.6498932903746742
+   },
+   "h.commits": {
+    "coef_per_unit": -79.39580012225959,
+    "effect": -14.05178628883799,
+    "effect_pct": -154.78945019649694,
+    "t": -0.8551507444970716
+   }
+  },
+  "verdict": "falls (-11%)"
+ },
+ "lat.r_getRepo.p50": {
+  "key": "lat.r_getRepo.p50",
+  "label": "getRepo p50 (ms)",
+  "path": "a: read amplification",
+  "mode": "calm",
+  "n": 52,
+  "first": 3.398,
+  "last": 3.578,
+  "mean": 3.3188,
+  "change_pct": 5.3,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 1.2315625030636568,
+    "r2": 0.051,
+    "t": 1.6466998572604474
+   },
+   "h.incarnations": {
+    "per_unit": 2.5708509637988097,
+    "r2": 0.028,
+    "t": 1.209949847975341
+   },
+   "h.reshards": {
+    "per_unit": 2.2525440710104205,
+    "r2": 0.062,
+    "t": 1.8179342855716365
+   },
+   "h.commits": {
+    "per_unit": 2.2801717603067138,
+    "r2": 0.051,
+    "t": 1.6464701018618146
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.064,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 2.601824389667229,
+    "effect": 0.2081459511733783,
+    "effect_pct": 6.125543000982292,
+    "t": 0.21363730629103753
+   },
+   "h.reshards": {
+    "coef_per_unit": 5.188400770271073,
+    "effect": 0.9857961463515039,
+    "effect_pct": 29.011069639538075,
+    "t": 0.5143811103378392
+   },
+   "h.commits": {
+    "coef_per_unit": -4.767499064860757,
+    "effect": -0.8437710544953162,
+    "effect_pct": -24.83140242776092,
+    "t": -0.2705402168346907
+   }
+  },
+  "verdict": "flat"
+ },
+ "lat.r_listRecords_dh.p99": {
+  "key": "lat.r_listRecords_dh.p99",
+  "label": "listRecords delete-heavy p99 (ms)",
+  "path": "f: tombstones",
+  "mode": "calm",
+  "n": 52,
+  "first": 6.91,
+  "last": 6.868,
+  "mean": 6.9058,
+  "change_pct": -0.6,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": -1.5511638967880117,
+    "r2": 0.005,
+    "t": -0.4929174873210844
+   },
+   "h.incarnations": {
+    "per_unit": -0.23930418429696232,
+    "r2": 0.0,
+    "t": -0.027024106603643752
+   },
+   "h.reshards": {
+    "per_unit": -3.766980483725413,
+    "r2": 0.01,
+    "t": -0.7204710722942709
+   },
+   "h.commits": {
+    "per_unit": -2.872695132072789,
+    "r2": 0.005,
+    "t": -0.4929896444134983
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.025,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 29.75422615476333,
+    "effect": 2.3803380923810664,
+    "effect_pct": 34.44772926745393,
+    "t": 0.5827159983660652
+   },
+   "h.reshards": {
+    "coef_per_unit": 8.342780947556605,
+    "effect": 1.585128380035755,
+    "effect_pct": 22.9396292335131,
+    "t": 0.19727475207697887
+   },
+   "h.commits": {
+    "coef_per_unit": -29.478720475175496,
+    "effect": -5.21726186457846,
+    "effect_pct": -75.50306605757541,
+    "t": -0.3989872479679502
+   }
+  },
+  "verdict": "flat"
+ },
+ "req.per_commit": {
+  "key": "req.per_commit",
+  "label": "object-store requests / commit",
+  "path": "requests",
+  "mode": "calm",
+  "n": 52,
+  "first": 1.9934,
+  "last": 2.7032,
+  "mean": 3.022,
+  "change_pct": 35.6,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 0.9618399575058731,
+    "r2": 0.004,
+    "t": 0.4391618608039039
+   },
+   "h.incarnations": {
+    "per_unit": 2.9640009402915,
+    "r2": 0.005,
+    "t": 0.4822874609298893
+   },
+   "h.reshards": {
+    "per_unit": 1.657850808555028,
+    "r2": 0.004,
+    "t": 0.4544046175371343
+   },
+   "h.commits": {
+    "per_unit": 1.781078069163129,
+    "r2": 0.004,
+    "t": 0.43917358956202174
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.015,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 26.196888742116542,
+    "effect": 2.0957510993693234,
+    "effect_pct": 105.13449881455419,
+    "t": 0.7338151754912864
+   },
+   "h.reshards": {
+    "coef_per_unit": 21.190296813369258,
+    "effect": 4.026156394540159,
+    "effect_pct": 201.97433503261556,
+    "t": 0.7166818343985443
+   },
+   "h.commits": {
+    "coef_per_unit": -36.30328796810391,
+    "effect": -6.425101117746902,
+    "effect_pct": -322.3187076224993,
+    "t": -0.7027891339636665
+   }
+  },
+  "verdict": "changes +36%, attribution unclear; best single fit: incarnations r2 0.005"
+ },
+ "req.state_reads_per_read": {
+  "key": "req.state_reads_per_read",
+  "label": "state SST GET+HEAD / client read",
+  "path": "a: read amplification",
+  "mode": "calm",
+  "n": 52,
+  "first": 1.7146,
+  "last": 2.6712,
+  "mean": 2.1229,
+  "change_pct": 55.8,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 2.637333460498489,
+    "r2": 0.169,
+    "t": 3.1894469176619635
+   },
+   "h.incarnations": {
+    "per_unit": 2.769515749882512,
+    "r2": 0.024,
+    "t": 1.1007099244857195
+   },
+   "h.reshards": {
+    "per_unit": 5.739559993707094,
+    "r2": 0.288,
+    "t": 4.502284628383676
+   },
+   "h.commits": {
+    "per_unit": 4.882979540429223,
+    "r2": 0.169,
+    "t": 3.1890162985700243
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.435,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -19.764697773283757,
+    "effect": -1.5811758218627006,
+    "effect_pct": -92.21834957790158,
+    "t": -1.7676056904680886
+   },
+   "h.reshards": {
+    "coef_per_unit": 1.8950702092100258,
+    "effect": 0.3600633397499049,
+    "effect_pct": 20.999844847189134,
+    "t": 0.20463169480894164
+   },
+   "h.commits": {
+    "coef_per_unit": 14.682125689832477,
+    "effect": 2.598501333089311,
+    "effect_pct": 151.55145999587722,
+    "t": 0.9074574180227495
+   }
+  },
+  "verdict": "changes +56%, attribution unclear; best single fit: reshard ops r2 0.288"
+ },
+ "reqc.state_manifest_s": {
+  "key": "reqc.state_manifest_s",
+  "label": "manifest requests/s",
+  "path": "requests",
+  "mode": "calm",
+  "n": 52,
+  "first": 30.38,
+  "last": 29.34,
+  "mean": 28.9596,
+  "change_pct": -3.4,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 2.560906851934419,
+    "r2": 0.012,
+    "t": 0.764971964474617
+   },
+   "h.incarnations": {
+    "per_unit": 3.6920545369067526,
+    "r2": 0.003,
+    "t": 0.39119271997692756
+   },
+   "h.reshards": {
+    "per_unit": 5.571619014498452,
+    "r2": 0.02,
+    "t": 1.0031126208002912
+   },
+   "h.commits": {
+    "per_unit": 4.74121197220536,
+    "r2": 0.012,
+    "t": 0.7648418932728104
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.028,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 13.553848843929472,
+    "effect": 1.0843079075143578,
+    "effect_pct": 3.5691504526476554,
+    "t": 0.2491072970882002
+   },
+   "h.reshards": {
+    "coef_per_unit": 26.538487947129852,
+    "effect": 5.042312709954672,
+    "effect_pct": 16.597474357981145,
+    "t": 0.58891466612832
+   },
+   "h.commits": {
+    "coef_per_unit": -31.454081771006837,
+    "effect": -5.566869208159874,
+    "effect_pct": -18.32412510915034,
+    "t": -0.39952404983989576
+   }
+  },
+  "verdict": "flat"
+ },
+ "reqc.state_sst_s": {
+  "key": "reqc.state_sst_s",
+  "label": "SST requests/s",
+  "path": "requests",
+  "mode": "calm",
+  "n": 52,
+  "first": 55.3,
+  "last": 83.46,
+  "mean": 67.0269,
+  "change_pct": 50.9,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 78.43549294903937,
+    "r2": 0.159,
+    "t": 3.0775889188136323
+   },
+   "h.incarnations": {
+    "per_unit": 80.69299482839796,
+    "r2": 0.021,
+    "t": 1.0454264930494395
+   },
+   "h.reshards": {
+    "per_unit": 171.4890164029443,
+    "r2": 0.274,
+    "t": 4.3470671850843114
+   },
+   "h.commits": {
+    "per_unit": 145.22243624881395,
+    "r2": 0.159,
+    "t": 3.0771885912869004
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.417,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -587.099037818507,
+    "effect": -46.96792302548056,
+    "effect_pct": -84.9329530298021,
+    "t": -1.6871788636107603
+   },
+   "h.reshards": {
+    "coef_per_unit": 65.45983875840875,
+    "effect": 12.437369364097663,
+    "effect_pct": 22.490722177391795,
+    "t": 0.22713134474433452
+   },
+   "h.commits": {
+    "coef_per_unit": 426.5933689659579,
+    "effect": 75.50020081307109,
+    "effect_pct": 136.52839206703632,
+    "t": 0.847239045340727
+   }
+  },
+  "verdict": "changes +51%, attribution unclear; best single fit: reshard ops r2 0.274"
+ },
+ "reqc.ctl_assign_s": {
+  "key": "reqc.ctl_assign_s",
+  "label": "assign/ requests/s (all ops)",
+  "path": "c: retired assign/ records",
+  "mode": "calm",
+  "n": 52,
+  "first": 1.84,
+  "last": 1.5,
+  "mean": 2.0,
+  "change_pct": -18.5,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": -0.0953535874880842,
+    "r2": 0.0,
+    "t": -0.05763241284437644
+   },
+   "h.incarnations": {
+    "per_unit": 1.8335684062059654,
+    "r2": 0.003,
+    "t": 0.3953887642185948
+   },
+   "h.reshards": {
+    "per_unit": -0.8697452202929556,
+    "r2": 0.002,
+    "t": -0.31583244349012285
+   },
+   "h.commits": {
+    "per_unit": -0.1756932479507348,
+    "r2": 0.0,
+    "t": -0.057347713539465155
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.023,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 17.479688008241112,
+    "effect": 1.398375040659289,
+    "effect_pct": 75.9986435140918,
+    "t": 0.6521266918534615
+   },
+   "h.reshards": {
+    "coef_per_unit": 5.412873092406834,
+    "effect": 1.0284458875572984,
+    "effect_pct": 55.893798236809694,
+    "t": 0.24382516579130678
+   },
+   "h.commits": {
+    "coef_per_unit": -16.347757678863115,
+    "effect": -2.89329154503591,
+    "effect_pct": -157.24410570847337,
+    "t": -0.4215009867134171
+   }
+  },
+  "verdict": "falls (-18%)"
+ },
+ "req.ctl_assign_get_s": {
+  "key": "req.ctl_assign_get_s",
+  "label": "assign/ GETs/s",
+  "path": "c: retired assign/ records",
+  "mode": "calm",
+  "n": 52,
+  "first": 0.34,
+  "last": 0.0,
+  "mean": 0.4904,
+  "change_pct": -100.0,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": -0.09716374368959535,
+    "r2": 0.0,
+    "t": -0.05982656418319513
+   },
+   "h.incarnations": {
+    "per_unit": 1.771979313587213,
+    "r2": 0.003,
+    "t": 0.38924578977454943
+   },
+   "h.reshards": {
+    "per_unit": -0.8547581787018408,
+    "r2": 0.002,
+    "t": -0.31620440213991236
+   },
+   "h.commits": {
+    "per_unit": -0.17905864688219394,
+    "r2": 0.0,
+    "t": -0.059541035810103594
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.023,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 16.868195712153167,
+    "effect": 1.3494556569722533,
+    "effect_pct": 396.89872263889805,
+    "t": 0.6409431854720804
+   },
+   "h.reshards": {
+    "coef_per_unit": 5.144696522822034,
+    "effect": 0.9774923393361865,
+    "effect_pct": 287.4977468635843,
+    "t": 0.23602774016059544
+   },
+   "h.commits": {
+    "coef_per_unit": -15.701921589608897,
+    "effect": -2.778988890615341,
+    "effect_pct": -817.3496737103944,
+    "t": -0.41233083341397864
+   }
+  },
+  "verdict": "falls (-100%)"
+ },
+ "req.log_list_s": {
+  "key": "req.log_list_s",
+  "label": "log/ LIST pages/s (wrapper)",
+  "path": "d: dead-log fences",
+  "mode": "calm",
+  "n": 52,
+  "first": 0.76,
+  "last": 0.1,
+  "mean": 0.575,
+  "change_pct": -86.8,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": -0.5268723928798718,
+    "r2": 0.002,
+    "t": -0.3238030304862913
+   },
+   "h.incarnations": {
+    "per_unit": 1.3018335684062299,
+    "r2": 0.002,
+    "t": 0.28494587645922725
+   },
+   "h.reshards": {
+    "per_unit": -1.4843795281979932,
+    "r2": 0.006,
+    "t": -0.5486374383266186
+   },
+   "h.commits": {
+    "per_unit": -0.9736866698856885,
+    "r2": 0.002,
+    "t": -0.32316499660368936
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.063,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 40.80102295860595,
+    "effect": 3.264081836688476,
+    "effect_pct": 429.4844521958521,
+    "t": 1.5786426164235934
+   },
+   "h.reshards": {
+    "coef_per_unit": 23.76379382239957,
+    "effect": 4.515120826255918,
+    "effect_pct": 594.0948455599893,
+    "t": 1.1101481258900798
+   },
+   "h.commits": {
+    "coef_per_unit": -50.50613386395331,
+    "effect": -8.938777595777912,
+    "effect_pct": -1176.1549468128833,
+    "t": -1.3505137202143238
+   }
+  },
+  "verdict": "falls (-87%)"
+ },
+ "reqc.retention_report_s": {
+  "key": "reqc.retention_report_s",
+  "label": "retain/ requests/s",
+  "path": "d: dead-log fences",
+  "mode": "calm",
+  "n": 23,
+  "first": 0.45,
+  "last": 0.1,
+  "mean": 0.5043,
+  "change_pct": -77.8,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": -0.8153890959820593,
+    "r2": 0.014,
+    "t": -0.5488184985609738
+   },
+   "h.incarnations": {
+    "per_unit": 1.4789789789789731,
+    "r2": 0.006,
+    "t": 0.35657594504756934
+   },
+   "h.reshards": {
+    "per_unit": -2.4204727208103765,
+    "r2": 0.045,
+    "t": -0.9993293268369381
+   },
+   "h.commits": {
+    "per_unit": -1.508521028082969,
+    "r2": 0.014,
+    "t": -0.5482456751526519
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.747,
+   "h.incarnations~h.commits": 0.904,
+   "h.reshards~h.commits": 0.956
+  },
+  "mr2": 0.223,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 34.80956118712886,
+    "effect": 2.7847648949703085,
+    "effect_pct": 618.8366433267353,
+    "t": 1.5197381638112966
+   },
+   "h.reshards": {
+    "coef_per_unit": 14.714440417396846,
+    "effect": 2.7957436793054007,
+    "effect_pct": 621.2763731789779,
+    "t": 0.7411023521273912
+   },
+   "h.commits": {
+    "coef_per_unit": -38.177462472864065,
+    "effect": -6.699381114738186,
+    "effect_pct": -1488.7513588307079,
+    "t": -1.1093919804302599
+   }
+  },
+  "verdict": "falls (-78%)"
+ },
+ "assign.keys": {
+  "key": "assign.keys",
+  "label": "assign/ objects",
+  "path": "c: retired assign/ records",
+  "mode": "all",
+  "n": 139,
+  "first": 17.0,
+  "last": 46.0,
+  "mean": 31.554,
+  "change_pct": 170.6,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 81.73130957824617,
+    "r2": 0.923,
+    "t": 40.48368181927874
+   },
+   "h.incarnations": {
+    "per_unit": 191.15236090833818,
+    "r2": 0.666,
+    "t": 16.51601627644718
+   },
+   "h.reshards": {
+    "per_unit": 152.26547594234495,
+    "r2": 0.999,
+    "t": 371.4650571810278
+   },
+   "h.commits": {
+    "per_unit": 151.39339343374814,
+    "r2": 0.923,
+    "t": 40.50202220943591
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.999,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -5.670992578541245,
+    "effect": -0.7939389609957743,
+    "effect_pct": -4.670229182328084,
+    "t": -1.7227376356297042
+   },
+   "h.reshards": {
+    "coef_per_unit": 147.66651989163222,
+    "effect": 28.05663877941012,
+    "effect_pct": 165.03905164358895,
+    "t": 54.134924612204344
+   },
+   "h.commits": {
+    "coef_per_unit": 8.19285882226739,
+    "effect": 1.6960610548093284,
+    "effect_pct": 9.97682973417252,
+    "t": 1.7762612034169436
+   }
+  },
+  "verdict": "grows with history (reshard ops: +165%)"
+ },
+ "assign.list_bytes": {
+  "key": "assign.list_bytes",
+  "label": "assign/ LIST response bytes",
+  "path": "c: retired assign/ records",
+  "mode": "all",
+  "n": 139,
+  "first": 3860.0,
+  "last": 10008.0,
+  "mean": 6945.4388,
+  "change_pct": 159.3,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 17327.037630588195,
+    "r2": 0.923,
+    "t": 40.483681819278765
+   },
+   "h.incarnations": {
+    "per_unit": 40524.3005125677,
+    "r2": 0.666,
+    "t": 16.51601627644718
+   },
+   "h.reshards": {
+    "per_unit": 32280.280899777154,
+    "r2": 0.999,
+    "t": 371.4650571810284
+   },
+   "h.commits": {
+    "per_unit": 32095.39940795464,
+    "r2": 0.923,
+    "t": 40.50202220943595
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.999,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -1202.250426649698,
+    "effect": -168.31505973095773,
+    "effect_pct": -4.3604937754134125,
+    "t": -1.7227376356282065
+   },
+   "h.reshards": {
+    "coef_per_unit": 31305.302217025746,
+    "effect": 5948.007421234892,
+    "effect_pct": 154.09345650867596,
+    "t": 54.134924612203875
+   },
+   "h.commits": {
+    "coef_per_unit": 1736.8860703230737,
+    "effect": 359.56494362007174,
+    "effect_pct": 9.315153979794603,
+    "t": 1.7762612034193856
+   }
+  },
+  "verdict": "grows with history (reshard ops: +154%)"
+ },
+ "log.ids": {
+  "key": "log.ids",
+  "label": "log ids under log/ (incarnations kept)",
+  "path": "d: dead-log fences",
+  "mode": "all",
+  "n": 139,
+  "first": 9.6154,
+  "last": 19.9231,
+  "mean": 14.8921,
+  "change_pct": 107.2,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 33.96371500655374,
+    "r2": 0.876,
+    "t": 31.10855252678426
+   },
+   "h.incarnations": {
+    "per_unit": 99.90772517269946,
+    "r2": 1.0,
+    "t": 560.523734157111
+   },
+   "h.reshards": {
+    "per_unit": 53.08503417720849,
+    "r2": 0.667,
+    "t": 16.58229695488195
+   },
+   "h.commits": {
+    "per_unit": 62.911340214035675,
+    "r2": 0.876,
+    "t": 31.114590837186572
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 1.0,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 98.47567979181804,
+    "effect": 13.786595170854525,
+    "effect_pct": 143.38058977688706,
+    "t": 105.54005726598584
+   },
+   "h.reshards": {
+    "coef_per_unit": -0.9538037319657633,
+    "effect": -0.18122270907349503,
+    "effect_pct": -1.8847161743643484,
+    "t": -1.233623941123976
+   },
+   "h.commits": {
+    "coef_per_unit": 1.8907033782003535,
+    "effect": 0.3914077412449026,
+    "effect_pct": 4.070640508946987,
+    "t": 1.4461822753396054
+   }
+  },
+  "verdict": "grows with history (incarnations: +143%)"
+ },
+ "log.fence_only": {
+  "key": "log.fence_only",
+  "label": "fence-only dead logs",
+  "path": "d: dead-log fences",
+  "mode": "all",
+  "n": 139,
+  "first": 0.5385,
+  "last": 16.0,
+  "mean": 9.8489,
+  "change_pct": 2871.4,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 39.097830132199135,
+    "r2": 0.851,
+    "t": 27.95068391666501
+   },
+   "h.incarnations": {
+    "per_unit": 97.94846514097202,
+    "r2": 0.704,
+    "t": 18.057286421314473
+   },
+   "h.reshards": {
+    "per_unit": 67.02781207078078,
+    "r2": 0.78,
+    "t": 22.03311270926597
+   },
+   "h.commits": {
+    "per_unit": 72.41887581125526,
+    "r2": 0.851,
+    "t": 27.94888329366479
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.871,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -87.16499034341467,
+    "effect": -12.203098648078054,
+    "effect_pct": -2266.2897489287816,
+    "t": -4.6098634716651254
+   },
+   "h.reshards": {
+    "coef_per_unit": -63.88517018779041,
+    "effect": -12.138182335680177,
+    "effect_pct": -2254.2338623406044,
+    "t": -4.077382614422989
+   },
+   "h.commits": {
+    "coef_per_unit": 190.76689281122793,
+    "effect": 39.49198984910197,
+    "effect_pct": 7334.226686261794,
+    "t": 7.200460614118953
+   }
+  },
+  "verdict": "grows with data (+7334%)"
+ },
+ "log.list_bytes": {
+  "key": "log.list_bytes",
+  "label": "log/ delimiter LIST response bytes",
+  "path": "d: dead-log fences",
+  "mode": "all",
+  "n": 139,
+  "first": 1071.6154,
+  "last": 1927.6154,
+  "mean": 1510.0,
+  "change_pct": 79.9,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 2819.6304459674247,
+    "r2": 0.876,
+    "t": 31.11466321007312
+   },
+   "h.incarnations": {
+    "per_unit": 8294.027733009738,
+    "r2": 1.0,
+    "t": 560.4813706517143
+   },
+   "h.reshards": {
+    "per_unit": 4407.130450583338,
+    "r2": 0.668,
+    "t": 16.584292473676225
+   },
+   "h.commits": {
+    "per_unit": 5222.8304654014655,
+    "r2": 0.876,
+    "t": 31.120697976885385
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 1.0,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 8172.923245782476,
+    "effect": 1144.2092544095467,
+    "effect_pct": 106.77424669674903,
+    "t": 105.54356345514243
+   },
+   "h.reshards": {
+    "coef_per_unit": -79.97137832098815,
+    "effect": -15.194561880987749,
+    "effect_pct": -1.4179118832304984,
+    "t": -1.2463050300486078
+   },
+   "h.commits": {
+    "coef_per_unit": 159.26962948875632,
+    "effect": 32.97152088787387,
+    "effect_pct": 3.076805480886945,
+    "t": 1.4679071936317898
+   }
+  },
+  "verdict": "grows with history (incarnations: +107%)"
+ },
+ "log.live_objects": {
+  "key": "log.live_objects",
+  "label": "objects in live logs",
+  "path": "retention",
+  "mode": "all",
+  "n": 139,
+  "first": 10358.0769,
+  "last": 13458.7692,
+  "mean": 14343.3597,
+  "change_pct": 29.9,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 4279.828126395063,
+    "r2": 0.016,
+    "t": 1.5051060337009479
+   },
+   "h.incarnations": {
+    "per_unit": 1319.343268677585,
+    "r2": 0.0,
+    "t": 0.16712972025610257
+   },
+   "h.reshards": {
+    "per_unit": 11908.31342557708,
+    "r2": 0.039,
+    "t": 2.3666559869347115
+   },
+   "h.commits": {
+    "per_unit": 7957.413517161338,
+    "r2": 0.016,
+    "t": 1.5109032599203942
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.107,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -63158.70289170707,
+    "effect": -8842.21840483899,
+    "effect_pct": -85.3654444787842,
+    "t": -1.6024218754446513
+   },
+   "h.reshards": {
+    "coef_per_unit": 14756.615485969814,
+    "effect": 2803.7569423342647,
+    "effect_pct": 27.06831551026359,
+    "t": 0.45182042288351143
+   },
+   "h.commits": {
+    "coef_per_unit": 33034.896413264294,
+    "effect": 6838.785150784734,
+    "effect_pct": 66.02369534009249,
+    "t": 0.5981745182563952
+   }
+  },
+  "verdict": "changes +30%, attribution unclear; best single fit: reshard ops r2 0.039"
+ },
+ "retain.keys": {
+  "key": "retain.keys",
+  "label": "retain/ reports",
+  "path": "d: dead-log fences",
+  "mode": "all",
+  "n": 139,
+  "first": 4.5385,
+  "last": 3.0,
+  "mean": 4.0,
+  "change_pct": -33.9,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": -0.8722791669902676,
+    "r2": 0.004,
+    "t": -0.7332752812592963
+   },
+   "h.incarnations": {
+    "per_unit": 7.818711565322323,
+    "r2": 0.041,
+    "t": 2.4330676597832848
+   },
+   "h.reshards": {
+    "per_unit": -4.940062956609115,
+    "r2": 0.039,
+    "t": -2.3613513106793413
+   },
+   "h.commits": {
+    "per_unit": -1.613490321490305,
+    "r2": 0.004,
+    "t": -0.7322717662653341
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.609,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 120.61229862854148,
+    "effect": 16.885721807995807,
+    "effect_pct": 372.05827712533136,
+    "t": 11.129679428373985
+   },
+   "h.reshards": {
+    "coef_per_unit": 39.32243880892301,
+    "effect": 7.471263373695372,
+    "effect_pct": 164.6210573865082,
+    "t": 4.378919286145701
+   },
+   "h.commits": {
+    "coef_per_unit": -116.59571807565855,
+    "effect": -24.137295768868604,
+    "effect_pct": -531.8387203310032,
+    "t": -7.678651525764067
+   }
+  },
+  "verdict": "falls (-34%)"
+ },
+ "state.retired_dirs": {
+  "key": "state.retired_dirs",
+  "label": "retired state dirs",
+  "path": "b: retired parents",
+  "mode": "all",
+  "n": 139,
+  "first": 0.0,
+  "last": 28.0,
+  "mean": 14.0576,
+  "change_pct": 199.2,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 79.63395382816947,
+    "r2": 0.928,
+    "t": 42.11894309501225
+   },
+   "h.incarnations": {
+    "per_unit": 187.33306788520014,
+    "r2": 0.677,
+    "t": 16.962443949367156
+   },
+   "h.reshards": {
+    "per_unit": 147.70032012740967,
+    "r2": 0.996,
+    "t": 185.15160390807185
+   },
+   "h.commits": {
+    "per_unit": 147.5039305092511,
+    "r2": 0.928,
+    "t": 42.121670638648546
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.996,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -5.143015753267832,
+    "effect": -0.7200222054574965,
+    "effect_pct": -5.121959393991403,
+    "t": -0.8242975991650615
+   },
+   "h.reshards": {
+    "coef_per_unit": 135.6343387755942,
+    "effect": 25.770524367362896,
+    "effect_pct": 183.32153976783226,
+    "t": 26.234408014983153
+   },
+   "h.commits": {
+    "coef_per_unit": 15.930214429219976,
+    "effect": 3.297825200493832,
+    "effect_pct": 23.45945255213115,
+    "t": 1.8222128222528857
+   }
+  },
+  "verdict": "grows with history (reshard ops: +183%)"
+ },
+ "state.retired_bytes": {
+  "key": "state.retired_bytes",
+  "label": "retired state bytes",
+  "path": "b: retired parents",
+  "mode": "all",
+  "n": 139,
+  "first": 0.0,
+  "last": 67423801.1538,
+  "mean": 31788642.0072,
+  "change_pct": 212.1,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 197055874.36072707,
+    "r2": 0.923,
+    "t": 40.48342361730816
+   },
+   "h.incarnations": {
+    "per_unit": 466566714.4176263,
+    "r2": 0.682,
+    "t": 17.14996601502399
+   },
+   "h.reshards": {
+    "per_unit": 363409042.5832252,
+    "r2": 0.979,
+    "t": 79.79781333313365
+   },
+   "h.commits": {
+    "per_unit": 365013358.65946156,
+    "r2": 0.923,
+    "t": 40.502861045900964
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.98,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -25273311.02731228,
+    "effect": -3538263.543823719,
+    "effect_pct": -11.130590426048892,
+    "t": -0.7066599072761828
+   },
+   "h.reshards": {
+    "coef_per_unit": 299676414.98375535,
+    "effect": 56938518.84691352,
+    "effect_pct": 179.1159208185977,
+    "t": 10.111982479716136
+   },
+   "h.commits": {
+    "coef_per_unit": 83061994.53476438,
+    "effect": 17195244.922603317,
+    "effect_pct": 54.09241740717259,
+    "t": 1.6575321532852114
+   }
+  },
+  "verdict": "grows with history (reshard ops: +179%)"
+ },
+ "state.pinned_bytes": {
+  "key": "state.pinned_bytes",
+  "label": "retired bytes still referenced by live manifests",
+  "path": "a: parent pinning",
+  "mode": "all",
+  "n": 139,
+  "first": 0.0,
+  "last": 37257361.5385,
+  "mean": 18598229.0504,
+  "change_pct": 200.3,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 97986750.6517024,
+    "r2": 0.626,
+    "t": 15.141969823109187
+   },
+   "h.incarnations": {
+    "per_unit": 189652742.52921528,
+    "r2": 0.309,
+    "t": 7.831289870719787
+   },
+   "h.reshards": {
+    "per_unit": 202648153.6650313,
+    "r2": 0.835,
+    "t": 26.33525524328964
+   },
+   "h.commits": {
+    "per_unit": 181505606.66166145,
+    "r2": 0.626,
+    "t": 15.143777577068187
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.943,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -181877110.0118786,
+    "effect": -25462795.401663005,
+    "effect_pct": -136.90978497315865,
+    "t": -4.969364652711294
+   },
+   "h.reshards": {
+    "coef_per_unit": 316563649.18756634,
+    "effect": 60147093.345637605,
+    "effect_pct": 323.40226148830175,
+    "t": 10.438048229813486
+   },
+   "h.commits": {
+    "coef_per_unit": -18682940.36201405,
+    "effect": -3867686.2649230626,
+    "effect_pct": -20.79599221221688,
+    "t": -0.3643169232193199
+   }
+  },
+  "verdict": "grows with history (reshard ops: +323%)"
+ },
+ "state.live_with_ext": {
+  "key": "state.live_with_ext",
+  "label": "live shards with external SSTs",
+  "path": "a: parent pinning",
+  "mode": "all",
+  "n": 139,
+  "first": 0.0,
+  "last": 9.6923,
+  "mean": 6.0072,
+  "change_pct": 161.3,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 22.762705731000025,
+    "r2": 0.546,
+    "t": 12.830071342039778
+   },
+   "h.incarnations": {
+    "per_unit": 42.21668151912175,
+    "r2": 0.248,
+    "t": 6.713694499151025
+   },
+   "h.reshards": {
+    "per_unit": 48.33042065489839,
+    "r2": 0.767,
+    "t": 21.259251568763975
+   },
+   "h.commits": {
+    "per_unit": 42.15649265339413,
+    "r2": 0.546,
+    "t": 12.825994073668717
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.912,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -35.310092359534195,
+    "effect": -4.943412930334787,
+    "effect_pct": -82.29154458880664,
+    "t": -3.1061271294851207
+   },
+   "h.reshards": {
+    "coef_per_unit": 94.80812316301765,
+    "effect": 18.013543400973354,
+    "effect_pct": 299.8661715850654,
+    "t": 10.064712099249231
+   },
+   "h.commits": {
+    "coef_per_unit": -29.855605799432826,
+    "effect": -6.180617945781186,
+    "effect_pct": -102.88693346869279,
+    "t": -1.8743796366863272
+   }
+  },
+  "verdict": "grows with history (reshard ops: +300%)"
+ },
+ "state.ext_refs_mean": {
+  "key": "state.ext_refs_mean",
+  "label": "external dbs per live shard",
+  "path": "a: parent pinning",
+  "mode": "all",
+  "n": 139,
+  "first": 0.0,
+  "last": 0.9646,
+  "mean": 0.5622,
+  "change_pct": 171.6,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 2.22615190809379,
+    "r2": 0.402,
+    "t": 9.594217619443345
+   },
+   "h.incarnations": {
+    "per_unit": 3.345847316761774,
+    "r2": 0.12,
+    "t": 4.316349937023507
+   },
+   "h.reshards": {
+    "per_unit": 5.084847124464894,
+    "r2": 0.654,
+    "t": 16.090310214613893
+   },
+   "h.commits": {
+    "per_unit": 4.123582884961019,
+    "r2": 0.402,
+    "t": 9.59483202521299
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.95,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -8.791917519512804,
+    "effect": -1.2308684527317926,
+    "effect_pct": -218.92605877123373,
+    "t": -9.040994987824902
+   },
+   "h.reshards": {
+    "coef_per_unit": 10.202919978256686,
+    "effect": 1.9385547958687703,
+    "effect_pct": 344.79733413404875,
+    "t": 12.661715110841577
+   },
+   "h.commits": {
+    "coef_per_unit": -0.4847691187581877,
+    "effect": -0.10035544865796374,
+    "effect_pct": -17.849529575760663,
+    "t": -0.3557778168041735
+   }
+  },
+  "verdict": "grows with history (reshard ops: +345%)"
+ },
+ "state.total_over_live": {
+  "key": "state.total_over_live",
+  "label": "state bytes / live-shard bytes",
+  "path": "a/b: pinning + leak",
+  "mode": "all",
+  "n": 139,
+  "first": 1.0,
+  "last": 2.0393,
+  "mean": 1.6581,
+  "change_pct": 103.9,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 3.2515385611560035,
+    "r2": 0.761,
+    "t": 20.882187088870925
+   },
+   "h.incarnations": {
+    "per_unit": 7.451662842949491,
+    "r2": 0.527,
+    "t": 12.355070582326734
+   },
+   "h.reshards": {
+    "per_unit": 6.280974197410122,
+    "r2": 0.886,
+    "t": 32.5643657407524
+   },
+   "h.commits": {
+    "per_unit": 6.023511642274717,
+    "r2": 0.761,
+    "t": 20.89376962881337
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.91,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 5.652745919187296,
+    "effect": 0.7913844286862215,
+    "effect_pct": 79.13844286862215,
+    "t": 4.061461856631925
+   },
+   "h.reshards": {
+    "coef_per_unit": 12.875490887344476,
+    "effect": 2.4463432685954505,
+    "effect_pct": 244.63432685954504,
+    "t": 11.164059524915817
+   },
+   "h.commits": {
+    "coef_per_unit": -10.330888938654908,
+    "effect": -2.1386696354135233,
+    "effect_pct": -213.86696354135233,
+    "t": -5.297511433953159
+   }
+  },
+  "verdict": "grows with history (reshard ops: +245%)"
+ },
+ "state.live_bytes_per_record": {
+  "key": "state.live_bytes_per_record",
+  "label": "live-shard bytes / live record",
+  "path": "f: tombstones",
+  "mode": "all",
+  "n": 139,
+  "first": 370.0308,
+  "last": 296.9923,
+  "mean": 332.7439,
+  "change_pct": -19.7,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": -397.5381075587211,
+    "r2": 0.518,
+    "t": -12.126404294263908
+   },
+   "h.incarnations": {
+    "per_unit": -1090.8150521732068,
+    "r2": 0.514,
+    "t": -12.037024144828292
+   },
+   "h.reshards": {
+    "per_unit": -711.8429772383536,
+    "r2": 0.518,
+    "t": -12.12696580582542
+   },
+   "h.commits": {
+    "per_unit": -736.5953396023493,
+    "r2": 0.518,
+    "t": -12.134914922956947
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.677,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -3078.468245380782,
+    "effect": -430.98555435330945,
+    "effect_pct": -116.47289636190386,
+    "t": -7.8886818423765055
+   },
+   "h.reshards": {
+    "coef_per_unit": -2507.4157587306445,
+    "effect": -476.40899415882245,
+    "effect_pct": -128.7484808761162,
+    "t": -7.754102679157319
+   },
+   "h.commits": {
+    "coef_per_unit": 3692.7975640287937,
+    "effect": 764.4718733125487,
+    "effect_pct": 206.59683920387357,
+    "t": 6.753619047613638
+   }
+  },
+  "verdict": "falls (-20%)"
+ },
+ "state.sst_per_shard_mean": {
+  "key": "state.sst_per_shard_mean",
+  "label": "SSTs per live shard",
+  "path": "f: compaction",
+  "mode": "all",
+  "n": 139,
+  "first": 26.7308,
+  "last": 71.9692,
+  "mean": 51.0971,
+  "change_pct": 169.2,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 76.95647453502158,
+    "r2": 0.398,
+    "t": 9.518259202447242
+   },
+   "h.incarnations": {
+    "per_unit": 142.42177180308744,
+    "r2": 0.18,
+    "t": 5.479915778403215
+   },
+   "h.reshards": {
+    "per_unit": 147.05695221604066,
+    "r2": 0.453,
+    "t": 10.659229726091779
+   },
+   "h.commits": {
+    "per_unit": 142.49144831293475,
+    "r2": 0.398,
+    "t": 9.512449137804818
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.699,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -866.4982348025546,
+    "effect": -121.30975287235765,
+    "effect_pct": -453.820658227525,
+    "t": -10.41383472177935
+   },
+   "h.reshards": {
+    "coef_per_unit": -412.91434399973923,
+    "effect": -78.45372535995045,
+    "effect_pct": -293.495950986865,
+    "t": -5.988780588039449
+   },
+   "h.commits": {
+    "coef_per_unit": 1098.1654178184863,
+    "effect": 227.3389103005296,
+    "effect_pct": 850.47649896601,
+    "t": 9.419374365332171
+   }
+  },
+  "verdict": "grows with data (+850%)"
+ },
+ "state.manifests_live_total": {
+  "key": "state.manifests_live_total",
+  "label": "manifest objects (live shards)",
+  "path": "requests",
+  "mode": "all",
+  "n": 139,
+  "first": 805.3077,
+  "last": 1520.8462,
+  "mean": 1241.9353,
+  "change_pct": 88.9,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 1359.1477764200572,
+    "r2": 0.446,
+    "t": 10.505723137578128
+   },
+   "h.incarnations": {
+    "per_unit": 3923.635628195643,
+    "r2": 0.49,
+    "t": 11.480586731829307
+   },
+   "h.reshards": {
+    "per_unit": 1938.076456472828,
+    "r2": 0.283,
+    "t": 7.352729968362227
+   },
+   "h.commits": {
+    "per_unit": 2516.562587738677,
+    "r2": 0.446,
+    "t": 10.49864119904851
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.651,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -6476.342314842805,
+    "effect": -906.6879240779926,
+    "effect_pct": -112.58900575999527,
+    "t": -4.333857112524829
+   },
+   "h.reshards": {
+    "coef_per_unit": -9716.803745376274,
+    "effect": -1846.192711621492,
+    "effect_pct": -229.25308292176328,
+    "t": -7.847000091585522
+   },
+   "h.commits": {
+    "coef_per_unit": 16249.74260744949,
+    "effect": 3363.972965366371,
+    "effect_pct": 417.7251747995303,
+    "t": 7.760730014463541
+   }
+  },
+  "verdict": "grows with data (+418%)"
+ },
+ "node.n1.series": {
+  "key": "node.n1.series",
+  "label": "n1 /metrics series",
+  "path": "e: metric cardinality",
+  "mode": "all",
+  "n": 139,
+  "first": 1496.3077,
+  "last": 1587.0,
+  "mean": 1559.8058,
+  "change_pct": 6.1,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 272.48728621592454,
+    "r2": 0.749,
+    "t": 20.193414899118824
+   },
+   "h.incarnations": {
+    "per_unit": 664.6906581217536,
+    "r2": 0.587,
+    "t": 13.964141581080437
+   },
+   "h.reshards": {
+    "per_unit": 501.6002362208951,
+    "r2": 0.791,
+    "t": 22.777947657102732
+   },
+   "h.commits": {
+    "per_unit": 504.76026705291446,
+    "r2": 0.749,
+    "t": 20.200003443782652
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.803,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 458.53014628246456,
+    "effect": 64.19422047954504,
+    "effect_pct": 4.290175129724889,
+    "t": 2.637354536725348
+   },
+   "h.reshards": {
+    "coef_per_unit": 746.34796719929,
+    "effect": 141.8061137678651,
+    "effect_pct": 9.477069087920245,
+    "t": 5.180568371183787
+   },
+   "h.commits": {
+    "coef_per_unit": -525.5954774283645,
+    "effect": -108.80719895078772,
+    "effect_pct": -7.271712864282543,
+    "t": -2.157563256794005
+   }
+  },
+  "verdict": "flat"
+ },
+ "node.n1.rss_mb": {
+  "key": "node.n1.rss_mb",
+  "label": "n1 RSS (MB)",
+  "path": "memory",
+  "mode": "all",
+  "n": 139,
+  "first": 147.6,
+  "last": 226.2308,
+  "mean": 382.1942,
+  "change_pct": 53.3,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 662.0765115900367,
+    "r2": 0.155,
+    "t": 5.0221971202242095
+   },
+   "h.incarnations": {
+    "per_unit": 2294.529145573023,
+    "r2": 0.246,
+    "t": 6.690288661199505
+   },
+   "h.reshards": {
+    "per_unit": 917.0985580905665,
+    "r2": 0.093,
+    "t": 3.749023427937245
+   },
+   "h.commits": {
+    "per_unit": 1226.7850869067156,
+    "r2": 0.156,
+    "t": 5.024347657015127
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.29,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 6087.475542696711,
+    "effect": 852.2465759775396,
+    "effect_pct": 577.4028292530757,
+    "t": 3.461397952998386
+   },
+   "h.reshards": {
+    "coef_per_unit": 1350.7993551509117,
+    "effect": 256.6518774786732,
+    "effect_pct": 173.88338582565936,
+    "t": 0.9269164327900303
+   },
+   "h.commits": {
+    "coef_per_unit": -3946.524122104722,
+    "effect": -816.9975841857532,
+    "effect_pct": -553.5213984998328,
+    "t": -1.6015494810383304
+   }
+  },
+  "verdict": "grows with history (incarnations: +577%)"
+ },
+ "node.n1.tasks": {
+  "key": "node.n1.tasks",
+  "label": "n1 tokio alive tasks",
+  "path": "memory",
+  "mode": "all",
+  "n": 139,
+  "first": 201.1538,
+  "last": 206.1538,
+  "mean": 200.9784,
+  "change_pct": 2.5,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 22.597069864258174,
+    "r2": 0.063,
+    "t": 3.0464041283046863
+   },
+   "h.incarnations": {
+    "per_unit": 48.963488241275854,
+    "r2": 0.039,
+    "t": 2.3667282239600103
+   },
+   "h.reshards": {
+    "per_unit": 46.25974678402898,
+    "r2": 0.083,
+    "t": 3.519719363359881
+   },
+   "h.commits": {
+    "per_unit": 41.8880111768688,
+    "r2": 0.064,
+    "t": 3.0489092311564066
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.094,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 77.87672197716802,
+    "effect": 10.902741076803522,
+    "effect_pct": 5.420100726518004,
+    "t": 0.7339212916336508
+   },
+   "h.reshards": {
+    "coef_per_unit": 150.0433207704191,
+    "effect": 28.508230946379626,
+    "effect_pct": 14.172351904509947,
+    "t": 1.7064514064351568
+   },
+   "h.commits": {
+    "coef_per_unit": -156.2496751695841,
+    "effect": -32.34633900458179,
+    "effect_pct": -16.08039797550911,
+    "t": -1.0509262593230506
+   }
+  },
+  "verdict": "flat"
+ },
+ "node.n1.cache_mb": {
+  "key": "node.n1.cache_mb",
+  "label": "n1 in-memory caches (MB)",
+  "path": "memory",
+  "mode": "all",
+  "n": 139,
+  "first": 1.3092,
+  "last": 1.8215,
+  "mean": 1.6879,
+  "change_pct": 39.1,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 1.2390804866869836,
+    "r2": 0.736,
+    "t": 19.535321725683147
+   },
+   "h.incarnations": {
+    "per_unit": 3.3862396743836287,
+    "r2": 0.725,
+    "t": 18.991034348643733
+   },
+   "h.reshards": {
+    "per_unit": 2.044211252024181,
+    "r2": 0.625,
+    "t": 15.09983381005169
+   },
+   "h.commits": {
+    "per_unit": 2.2951456106563968,
+    "r2": 0.736,
+    "t": 19.536586686898367
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.755,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 1.3597488218334064,
+    "effect": 0.1903648350566769,
+    "effect_pct": 14.540204792813158,
+    "t": 1.530285289162944
+   },
+   "h.reshards": {
+    "coef_per_unit": -0.1919946344431267,
+    "effect": -0.03647898054419407,
+    "effect_pct": -2.7862911108961397,
+    "t": -0.26075835816665205
+   },
+   "h.commits": {
+    "coef_per_unit": 1.6303125933052678,
+    "effect": 0.33750242212827664,
+    "effect_pct": 25.778680891113964,
+    "t": 1.3094710206378053
+   }
+  },
+  "verdict": "changes +39%, attribution unclear; best single fit: commits r2 0.736"
+ },
+ "node.n1.merge_queue_mb": {
+  "key": "node.n1.merge_queue_mb",
+  "label": "n1 firehose merge queues (MB)",
+  "path": "memory",
+  "mode": "all",
+  "n": 139,
+  "first": 0.0,
+  "last": 0.0,
+  "mean": 0.0001,
+  "change_pct": 0.0,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 0.00070762009242838,
+    "r2": 0.009,
+    "t": 1.0969772702249065
+   },
+   "h.incarnations": {
+    "per_unit": 0.0018012551904590377,
+    "r2": 0.007,
+    "t": 1.0133684969262007
+   },
+   "h.reshards": {
+    "per_unit": 0.0013694933008396,
+    "r2": 0.01,
+    "t": 1.186541010024161
+   },
+   "h.commits": {
+    "per_unit": 0.0013116645303331645,
+    "r2": 0.009,
+    "t": 1.0977912287853773
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.817,
+   "h.incarnations~h.commits": 0.936,
+   "h.reshards~h.commits": 0.961
+  },
+  "mr2": 0.014,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 0.006222745640072601,
+    "effect": 0.0008711843896101641,
+    "effect_pct": 1210.9463015581282,
+    "t": 0.6647314291534709
+   },
+   "h.reshards": {
+    "coef_per_unit": 0.006308441918814262,
+    "effect": 0.0011986039645747097,
+    "effect_pct": 1666.0595107588465,
+    "t": 0.8132455708397065
+   },
+   "h.commits": {
+    "coef_per_unit": -0.008874282866322065,
+    "effect": -0.0018371274161373952,
+    "effect_pct": -2553.607108430979,
+    "t": -0.6765637548365273
+   }
+  },
+  "verdict": "flat"
+ },
+ "fh.lag_p99": {
+  "key": "fh.lag_p99",
+  "label": "firehose lag p99 (ms)",
+  "path": "latency",
+  "mode": "calm",
+  "n": 52,
+  "first": 15.158,
+  "last": 12.326,
+  "mean": 15.4065,
+  "change_pct": -18.7,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": 3.6403544238589802,
+    "r2": 0.004,
+    "t": 0.4518466656978493
+   },
+   "h.incarnations": {
+    "per_unit": 13.902679830747822,
+    "r2": 0.008,
+    "t": 0.6157943312869486
+   },
+   "h.reshards": {
+    "per_unit": 8.148363431618533,
+    "r2": 0.007,
+    "t": 0.6080640990949324
+   },
+   "h.commits": {
+    "per_unit": 6.746619463215823,
+    "r2": 0.004,
+    "t": 0.4522374976416924
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.745,
+   "h.incarnations~h.commits": 0.906,
+   "h.reshards~h.commits": 0.953
+  },
+  "mr2": 0.131,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": 317.89178733390315,
+    "effect": 25.431342986712252,
+    "effect_pct": 167.77505598833784,
+    "t": 2.5766501085013465
+   },
+   "h.reshards": {
+    "coef_per_unit": 265.502551910032,
+    "effect": 50.445484862906085,
+    "effect_pct": 332.7977626527648,
+    "t": 2.5983474445569548
+   },
+   "h.commits": {
+    "coef_per_unit": -464.2526251983324,
+    "effect": -82.16528661810166,
+    "effect_pct": -542.0588904743479,
+    "t": -2.600594338191937
+   }
+  },
+  "verdict": "falls (-19%)"
+ },
+ "backfill.first_event_s": {
+  "key": "backfill.first_event_s",
+  "label": "backfill time to first event (s)",
+  "path": "d: dead-log fences",
+  "mode": "probe",
+  "n": 25,
+  "first": 0.266,
+  "last": 0.129,
+  "mean": 0.0536,
+  "change_pct": -51.5,
+  "slopes": {
+   "h.soak_h": {
+    "per_unit": -0.3762567178002609,
+    "r2": 0.12,
+    "t": -1.7699644685861968
+   },
+   "h.incarnations": {
+    "per_unit": -1.0889354568315177,
+    "r2": 0.154,
+    "t": -2.043249423626949
+   },
+   "h.reshards": {
+    "per_unit": -0.6325790521117415,
+    "r2": 0.098,
+    "t": -1.5831443606088407
+   },
+   "h.commits": {
+    "per_unit": -0.6965579971545537,
+    "r2": 0.12,
+    "t": -1.7692597131010421
+   }
+  },
+  "collinear": {
+   "h.incarnations~h.reshards": 0.848,
+   "h.incarnations~h.commits": 0.948,
+   "h.reshards~h.commits": 0.966
+  },
+  "mr2": 0.184,
+  "effects": {
+   "h.incarnations": {
+    "coef_per_unit": -3.775953357107617,
+    "effect": -0.6419120707082949,
+    "effect_pct": -241.32032733394544,
+    "t": -1.2153779784826306
+   },
+   "h.reshards": {
+    "coef_per_unit": -2.1827212405754666,
+    "effect": -0.4147170357093386,
+    "effect_pct": -155.90866004110472,
+    "t": -0.7826058692666744
+   },
+   "h.commits": {
+    "coef_per_unit": 4.0000442373567475,
+    "effect": 0.8759576874060421,
+    "effect_pct": 329.30740128046693,
+    "t": 0.8630524153568728
+   }
+  },
+  "verdict": "falls (-52%)"
+ }
+}
