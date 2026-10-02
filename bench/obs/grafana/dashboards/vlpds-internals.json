@@ -6537,7 +6537,7 @@
      "type": "timeseries",
      "id": 77,
      "title": "Connections",
-     "description": "Outbound connects should stay flat under steady load (pooled h2c to peers).",
+     "description": "Outbound connects should stay flat under steady load (pooled h2 over mTLS to peers).",
      "datasource": {
       "type": "prometheus",
       "uid": "prom"

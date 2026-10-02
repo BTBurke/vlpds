@@ -233,7 +233,7 @@ refuse without `--yes`.
 | `rebuild-repo DID` | `vlpds admin rebuild-repo DID [--dry-run] [--yes]` | `vlpds.admin.rebuildRepo`: see below |
 | (none) | `vlpds admin check-repo DID` | `vlpds.admin.checkRepo`: see below |
 | `sequencer-recovery`, `recovery-repair-repos`, `rotate-keys-recovery` | (none) | no single sequencer DB to replay: durability is the log + SlateDB per shard (DESIGN "Backups and restore") |
-| (none) | `vlpds admin cluster-status` (or `cluster status`) | `vlpds.admin.getClusterStatus`: this node, layout, unowned shards, firehose, feature level (and the finalize/mixed-builds banner), a row per node (`*` = the one asked) with its rev and level window |
+| (none) | `vlpds admin cluster status` | `vlpds.admin.getClusterStatus`: this node, layout, unowned shards, firehose, feature level (and the finalize/mixed-builds banner), a row per node (`*` = the one asked) with its rev and level window |
 | (none) | `vlpds admin cluster finalize [--level N] [--yes]` | `vlpds.admin.setFeatureLevel` (default N = active + 1; asks first): [Rolling upgrade](#rolling-upgrade-finalize-rollback) |
 | (none) | `vlpds admin cluster lower --level N [--yes]` | `vlpds.admin.setFeatureLevel {"level": N, "lower": true}`: only past wire-only (non-persistent) levels: [Rolling upgrade](#rolling-upgrade-finalize-rollback) |
 | (none) | `vlpds admin layout`, `shard-split`, `shard-merge`, `reshard-abort` | [Shard split / merge](#shard-split--merge) |
@@ -313,7 +313,7 @@ pipeline, not vlpds, is broken).
 
 **Do:** fix the scrape pipeline (deploy roles/alloy with the `vlpds-monitoring`
 fragment, or repair remote_write). Meanwhile check the cluster by hand
-(`vlpds admin cluster-status`). Silence it only for a cluster that is
+(`vlpds admin cluster status`). Silence it only for a cluster that is
 intentionally unmonitored.
 
 ### VlpdsNodeRestarted
@@ -397,7 +397,7 @@ for the minutes of a rolling deploy.
 **Do:** finish or roll back the deploy ([Rolling upgrade](#rolling-upgrade-finalize-rollback)).
 Mixed builds are safe while the cluster's feature level is one every node's
 build can run (they all write that level's formats); `vlpds admin
-cluster-status` shows each node's rev and level window. Tested with two real
+cluster status` shows each node's rev and level window. Tested with two real
 builds: the `upgrade-*` HA scenarios (rolling upgrade, rollback, old-node
 refusal, raise race) pass, see `bench/ha/RESULTS.md` "Two-build upgrade
 scenarios".
@@ -415,7 +415,7 @@ read it run.
 
 **Confirm:** the node's logs at that time (`bad segment magic`, `skipping a
 log stream message of an unknown type`, `malformed applied marker`);
-`vlpds admin cluster-status`: is a node on a build whose `maxLevel` is above
+`vlpds admin cluster status`: is a node on a build whose `maxLevel` is above
 the active level writing early (a bug), or is the object corrupt?
 
 **Do:** stop the writer that emits it if one build is at fault (roll it
@@ -434,14 +434,14 @@ image runs there again.
 
 **Confirm:** the node's log line `incompatible feature level: ...` names the
 active level (and a raise `target`, if one was running) and its build's
-window; `vlpds admin cluster-status` shows `version.active`.
+window; `vlpds admin cluster status` shows `version.active`.
 
 **Do:** deploy a build whose level window contains the active level (the
 current release). After a finalize, an older image can never rejoin: that
 is by design (rollback after finalize is forward-fix only). A raise in
 progress (`target` set) that made a starting node refuse finishes or aborts
 by itself within seconds; start the node again afterwards. A `target` that
-stays (the finalizing node died between its steps; `cluster-status` keeps
+stays (the finalizing node died between its steps; `cluster status` keeps
 saying "raising to N") is cleared by `vlpds admin cluster finalize --level
 <active> --yes`.
 
@@ -1592,7 +1592,7 @@ until the level is raised, which is what makes rollback a plain redeploy.
 
 **Upgrade** to build B (`MAX_LEVEL = L+1`) on a cluster at level L:
 
-1. Pre-flight: `vlpds admin cluster-status` shows every node healthy and
+1. Pre-flight: `vlpds admin cluster status` shows every node healthy and
    `Feature level: L active`; B's `MIN_LEVEL <= L` (a build whose `MIN_LEVEL`
    is past the active level refuses to start: exit 7).
 2. Roll B out exactly as [Rolling deploy](#rolling-deploy) (SIGTERM, >= 60 s
@@ -1600,7 +1600,7 @@ until the level is raised, which is what makes rollback a plain redeploy.
    restarted node's row shows B's rev and `1..=L+1`-style levels, and
    `vlpds_format_errors_total` stays flat.
 3. Soak with the whole fleet on B at level L (default 24 h). The console's
-   Cluster page and `cluster-status` say "every node can run level L+1:
+   Cluster page and `cluster status` say "every node can run level L+1:
    finalize available". **Rollback is a plain redeploy** of the previous
    build, node by node, in any order, at any time.
 4. Finalize: `vlpds admin cluster finalize --level L+1` (asks; `--yes` off a

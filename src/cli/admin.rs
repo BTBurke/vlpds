@@ -2,7 +2,7 @@
 //! (account list/create/delete/takedown/untakedown/reset-password,
 //! create-invite-code, request-crawl) and its packages/pds/src/scripts
 //! (publish-identity, rotate-keys, rebuild-repo), plus the vlpds-only
-//! cluster operations (cluster-status, cluster finalize/lower, rotate-plc-keys,
+//! cluster operations (cluster status/finalize/lower, rotate-plc-keys,
 //! rewrap-secrets, check-repo). Each is admin XRPC against any node (`--url`, Basic
 //! `admin:<token>`); DID-keyed calls are routed to the repo's owner by
 //! the node, per-node maintenance (rotate-plc-keys, rewrap-secrets) goes to
@@ -103,8 +103,6 @@ pub enum Cmd {
         #[arg(long, short)]
         yes: bool,
     },
-    /// Nodes, leases, shard ownership, firehose position.
-    ClusterStatus,
     /// Cluster-wide operations: status, feature levels.
     #[command(subcommand)]
     Cluster(ClusterCmd),
@@ -112,7 +110,7 @@ pub enum Cmd {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum ClusterCmd {
-    /// Same as cluster-status.
+    /// Nodes, leases, shard ownership, firehose position.
     Status,
     /// Raise the cluster's feature level (vlpds.admin.setFeatureLevel) once
     /// every node runs a build that supports it. The point of no return:
@@ -434,7 +432,7 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
             writeln!(out, "After        : {}", if r["after"]["ok"] == json!(true) { "ok".to_string() } else { s(&r["after"]["problems"]) })?;
             Ok(())
         }
-        Cmd::ClusterStatus | Cmd::Cluster(ClusterCmd::Status) => {
+        Cmd::Cluster(ClusterCmd::Status) => {
             let r = c.get("vlpds.admin.getClusterStatus", &[]).await?;
             if opts.json {
                 return pretty(out, &r);

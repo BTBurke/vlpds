@@ -591,7 +591,7 @@ ts("In flight", [t(f"sum(vlpds_http_requests_inflight{{{I}}})", "requests in fli
 ts("Connections", [t(f"sum(vlpds_http_server_connections_open{{{I}}})", "inbound open"),
                    rate("vlpds_http_server_connections_total", legend="inbound accepted/s"),
                    rate("vlpds_http_client_connects_total", by="role", legend="outbound connects/s {{role}}")], "short",
-   desc="Outbound connects should stay flat under steady load (pooled h2c to peers).")
+   desc="Outbound connects should stay flat under steady load (pooled h2 over mTLS to peers).")
 ts("Proxied requests/s by status", status_classes(f'{I}, method=~"{PROXY_METHODS}"'), "reqps", stack=True, nonzero=True, empty="nothing proxied",
    desc="app.bsky / chat.bsky / tools.ozone and unmatched paths, proxied to the AppView or service.")
 ts("Proxied latency", quantiles("vlpds_http_request_duration_seconds", f'{I}, method=~"{PROXY_METHODS}"', qs=(0.5, 0.99)), "s")

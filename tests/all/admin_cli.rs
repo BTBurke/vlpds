@@ -399,7 +399,7 @@ async fn per_node_commands_cover_the_cluster() {
     assert!(out.lines().any(|l| l.starts_with("total") && l.split_whitespace().nth(1) == Some("4")), "{out}");
 
     // cluster status lists both
-    let out = ok(admin(&b.url, &["cluster-status"]).await);
+    let out = ok(admin(&b.url, &["cluster", "status"]).await);
     assert!(out.contains("cli-a") && out.contains("cli-b*") && out.contains("0 unowned"), "{out}");
 
     // DID-keyed calls through the other node reach the owner

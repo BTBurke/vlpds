@@ -2851,8 +2851,8 @@ SMTP (`src/mail.rs`, lettre over rustls) when configured:
 
 | Flag | Env | Reference PDS env (also read) |
 |---|---|---|
-| `--email-smtp-url` (alias `--smtp-url`) | `VLPDS_EMAIL_SMTP_URL` | `PDS_EMAIL_SMTP_URL` |
-| `--email-from-address` (alias `--email-from`) | `VLPDS_EMAIL_FROM_ADDRESS` | `PDS_EMAIL_FROM_ADDRESS` |
+| `--email-smtp-url` | `VLPDS_EMAIL_SMTP_URL` | `PDS_EMAIL_SMTP_URL` |
+| `--email-from-address` | `VLPDS_EMAIL_FROM_ADDRESS` | `PDS_EMAIL_FROM_ADDRESS` |
 | `--moderation-email-smtp-url` | `VLPDS_MODERATION_EMAIL_SMTP_URL` | `PDS_MODERATION_EMAIL_SMTP_URL` |
 | `--moderation-email-address` | `VLPDS_MODERATION_EMAIL_ADDRESS` | `PDS_MODERATION_EMAIL_ADDRESS` |
 | `--email-brand-name` | `VLPDS_EMAIL_BRAND_NAME` | `PDS_SERVICE_NAME` |
@@ -3852,7 +3852,7 @@ costs one seek per populated slot of each owned shard per minute.
 `vlpds admin <command>` covers the reference's `pdsadmin` (account
 list/create/delete/takedown/untakedown/reset-password, create-invite-code,
 request-crawl) and its maintenance scripts (publish-identity, rotate-keys,
-rebuild-repo), plus cluster-status, rotate-plc-keys, rewrap-secrets and
+rebuild-repo), plus cluster status, rotate-plc-keys, rewrap-secrets and
 check-repo. ops/RUNBOOK.md "Admin CLI" maps each reference command to
 ours. It is a client of admin XRPC on any node, nothing else: no direct
 bucket access, so it needs only the URL and the admin token, and a node's
@@ -4078,7 +4078,7 @@ old node silently rewrites a new node's objects.
 ### Procedures
 
 **Upgrade (build B, `MAX_LEVEL = L+1`, cluster `active = L`).**
-1. Pre-flight: `vlpds admin cluster-status` shows every node healthy and
+1. Pre-flight: `vlpds admin cluster status` shows every node healthy and
    `active = L`; B's release notes list its levels and whether they are
    persistent. B's `MIN_LEVEL <= L`.
 2. Rolling deploy exactly as ops/RUNBOOK.md "Rolling deploy" (SIGTERM,

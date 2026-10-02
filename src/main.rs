@@ -393,11 +393,11 @@ struct Args {
     /// offered; ?tls=required|none) or smtps://... (implicit TLS). Falls back
     /// to the reference PDS's PDS_EMAIL_SMTP_URL. Unset: mail is only logged
     /// (DESIGN.md "Email").
-    #[arg(long, alias = "smtp-url", env = "VLPDS_EMAIL_SMTP_URL", hide_env_values = true)]
+    #[arg(long, env = "VLPDS_EMAIL_SMTP_URL", hide_env_values = true)]
     email_smtp_url: Option<String>,
     /// From address for email ("addr@host" or "Name <addr@host>"); falls
     /// back to PDS_EMAIL_FROM_ADDRESS. Required with --email-smtp-url.
-    #[arg(long, alias = "email-from", env = "VLPDS_EMAIL_FROM_ADDRESS")]
+    #[arg(long, env = "VLPDS_EMAIL_FROM_ADDRESS")]
     email_from_address: Option<String>,
     /// Service name in email (falls back to PDS_SERVICE_NAME; default
     /// "{hostname} PDS").
