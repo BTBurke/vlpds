@@ -25,7 +25,7 @@ mod webui;
 pub use blobs::spawn_blob_gc;
 pub use server::{drop_revocation, reset_token_did, revocation_expired, set_stale_claim_grace, spawn_reserved_key_gc, sweep_reserved_keys};
 pub use server::{auth_epoch, auth_epoch_cond, epoch_for_login, new_auth_epoch_op, AUTH_EPOCH};
-pub use sync::{request_crawl, set_export_buffer_max_mb};
+pub use sync::{request_crawl, set_export_buffer_max_mb, DEFAULT_EXPORT_STALL, DEFAULT_MAX_EXPORTS};
 pub use server::{set_mailer, LogMailer, Mail, Mailer};
 
 /// Imports shared by every XRPC module (they `use super::*`).
@@ -73,8 +73,15 @@ pub struct App {
     pub tids: TidClock,
     pub public_url: String,
     pub handle_domain: String,
-    /// Admission control: write requests beyond this many in flight get a fast 503.
-    pub write_permits: tokio::sync::Semaphore,
+    /// Admission control: write requests beyond this many in flight get a
+    /// fast 503. A write's permit travels with its queued message, so it is
+    /// held until its worker takes it, even if the handler is gone.
+    pub write_permits: Arc<tokio::sync::Semaphore>,
+    /// Admission control for repo-view reads queued at the workers
+    /// (`Config::max_queued_reads`), held the same way.
+    pub read_permits: Arc<tokio::sync::Semaphore>,
+    /// getRepo exports streaming at once (`Config::max_exports`).
+    pub exports: Arc<tokio::sync::Semaphore>,
     pub admin_token: String,
     pub config: Arc<crate::server::Config>,
     pub did_resolver: Arc<crate::did_resolver::DidResolver>,
@@ -512,10 +519,17 @@ impl App {
         &self,
         did: &str,
     ) -> Result<(Arc<crate::worker::DurableView>, Arc<slatedb::DbSnapshot>), XrpcError> {
+        let Ok(permit) = self.read_permits.clone().try_acquire_owned() else {
+            return Err(XrpcError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error: "Overloaded".into(),
+                message: "too many reads queued; retry with backoff".into(),
+            });
+        };
         let (tx, rx) = oneshot::channel();
         self.workers
             .route(did)
-            .send(WorkerMsg::Snapshot(crate::worker::SnapshotReq { did: did.into(), reply: tx }))
+            .send(WorkerMsg::Snapshot(crate::worker::SnapshotReq { did: did.into(), reply: tx, permit: Some(permit) }))
             .map_err(XrpcError::from_err)?;
         let cell = rx.await.map_err(|_| XrpcError::internal("worker dropped request"))??;
         let p = self.partition(did)?;

@@ -241,10 +241,41 @@ impl Slot {
     }
 }
 
-/// Resolutions (resolved, failed or in flight), at most the `lexicons` cap
-/// ([`crate::caches`]).
-static RESOLVED: LazyLock<Arc<parking_lot::Mutex<HashMap<String, Slot>>>> =
-    LazyLock::new(|| crate::caches::track(crate::caches::Cache::Lexicons, Default::default()));
+/// Resolutions (resolved, failed or in flight), least recently used
+/// first out past the `lexicons` cap ([`crate::caches`]): O(1) per insert
+/// under the lock (it used to sweep the whole map for expired entries and
+/// then the oldest, per insert, at the cap).
+static RESOLVED: LazyLock<Arc<Resolved>> = LazyLock::new(|| crate::caches::track(crate::caches::Cache::Lexicons, Default::default()));
+
+struct Resolved(parking_lot::Mutex<lru::LruCache<String, Slot>>);
+
+impl Default for Resolved {
+    fn default() -> Self {
+        Resolved(parking_lot::Mutex::new(lru::LruCache::unbounded()))
+    }
+}
+
+impl crate::caches::Len for Resolved {
+    fn len(&self) -> usize {
+        self.0.lock().len()
+    }
+}
+
+impl Resolved {
+    fn lock(&self) -> parking_lot::MutexGuard<'_, lru::LruCache<String, Slot>> {
+        self.0.lock()
+    }
+}
+
+/// Inserts (or refreshes) `k`, evicting least recently used entries past
+/// the cap (the cap is runtime-configurable, so it isn't the LRU's own).
+fn insert_capped(m: &mut lru::LruCache<String, Slot>, k: String, v: Slot) {
+    m.put(k, v);
+    let cap = crate::caches::cap(crate::caches::Cache::Lexicons).max(1);
+    while m.len() > cap {
+        m.pop_lru();
+    }
+}
 
 /// The dynamically resolved (and compiled) lexicon for a record type, when
 /// resolution is enabled, validation isn't skipped and no schema is bundled.
@@ -270,36 +301,13 @@ pub async fn resolve_record_schema(
                     Some(Slot::Done { doc, .. }) => doc.clone(),
                     _ => None,
                 };
-                if m.len() >= crate::caches::cap(crate::caches::Cache::Lexicons) {
-                    evict(&mut m);
-                }
                 let fut = spawn_resolution(app.clone(), collection.to_string(), prev.clone());
-                m.insert(
-                    collection.to_string(),
-                    Slot::Pending { fut: fut.clone(), prev: prev.clone() },
-                );
+                insert_capped(&mut m, collection.to_string(), Slot::Pending { fut: fut.clone(), prev: prev.clone() });
                 (fut, prev)
             }
         }
     };
     tokio::time::timeout(timeout, fut).await.unwrap_or(prev)
-}
-
-/// Drops expired entries, then the oldest finished one if still full.
-fn evict(m: &mut HashMap<String, Slot>) {
-    m.retain(|_, s| s.fresh());
-    if m.len() >= crate::caches::cap(crate::caches::Cache::Lexicons) {
-        let oldest = m
-            .iter()
-            .filter_map(|(k, s)| match s {
-                Slot::Done { at, .. } => Some((*at, k.clone())),
-                Slot::Pending { .. } => None,
-            })
-            .min();
-        if let Some((_, k)) = oldest {
-            m.remove(&k);
-        }
-    }
 }
 
 /// Resolves in a task of its own, so a write that stops waiting doesn't
@@ -317,9 +325,7 @@ fn spawn_resolution(app: Arc<App>, nsid: String, prev: Option<Arc<Lexicons>>) ->
                 prev
             }
         };
-        RESOLVED
-            .lock()
-            .insert(nsid, Slot::Done { at: Instant::now(), doc: doc.clone() });
+        insert_capped(&mut RESOLVED.lock(), nsid, Slot::Done { at: Instant::now(), doc: doc.clone() });
         doc
     });
     async move { task.await.ok().flatten() }.boxed().shared()

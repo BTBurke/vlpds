@@ -524,16 +524,11 @@ impl NodeLog {
         let sinks = Arc::new(ShardSinks::new(durable_ordinal.clone()));
         let log_id: Arc<str> = cfg.log_id.clone().into();
         let seq_cfg = SeqConfig { log_id: cfg.log_id.clone(), max_segment_bytes: cfg.max_segment_bytes, inflight: inflight.max(1), hedge_after: cfg.hedge_after };
-        tokio::spawn(run_sequencer(store, seq_cfg, cfg.lease_ok.clone(), wm.clone(), sinks.clone(), rx, fin_tx));
-        tokio::spawn(run_finalizer(
-            log_id.clone(),
-            sinks.clone(),
-            wm.clone(),
-            fin_rx,
-            merger_tx,
-            live.clone(),
-            cfg.lease_ok,
-            durable_ordinal.clone(),
+        // critical: a panic in either fail-stops the node (lifecycle.rs)
+        tokio::spawn(crate::lifecycle::critical("log_sequencer", run_sequencer(store, seq_cfg, cfg.lease_ok.clone(), wm.clone(), sinks.clone(), rx, fin_tx)));
+        tokio::spawn(crate::lifecycle::critical(
+            "log_finalizer",
+            run_finalizer(log_id.clone(), sinks.clone(), wm.clone(), fin_rx, merger_tx, live.clone(), cfg.lease_ok, durable_ordinal.clone()),
         ));
         Arc::new(NodeLog { log_id, tx, wm, live, durable_ordinal, sinks, closed: Default::default() })
     }
@@ -588,6 +583,14 @@ impl NodeLog {
             return;
         }
         let t = Instant::now();
+        // The lock orders this marker with the finalizer's own (a marker
+        // older than one already written would only lengthen a replay, but
+        // the finalizer's per-segment markers stay monotonic this way). It
+        // covers no store call: SlateDB's `write` returns once the batch is
+        // in the memtable (0.17 has no durable writes; the WAL is off), and
+        // the flush that makes it durable runs after the guard is dropped. A
+        // shard in memtable backpressure would block the finalizer's write
+        // to it anyway.
         let _g = s.apply_lock.write().await;
         // the finalizer has applied every segment <= ord (it updates
         // durable_ordinal only after applying)
@@ -827,7 +830,7 @@ async fn run_sequencer(
                 // few ms for a full segment); the finalizer keeps slicing
                 // frames out of the uncompressed `data`
                 let raw = sealed.data.clone();
-                let put = tokio::task::spawn_blocking(move || {
+                let put = commit_pool().run(move || {
                     let t = Instant::now();
                     let z = segment::compress(&raw, segment::compression_level());
                     metrics::SEGMENT_COMPRESS.observe(t.elapsed().as_secs_f64());
@@ -853,6 +856,59 @@ async fn run_sequencer(
             return;
         }
     }
+}
+
+/// A small fixed pool of threads for CPU work on the commit path (segment
+/// compression), apart from tokio's shared blocking pool. That pool also runs
+/// request-driven work (getRepo walks, cold repo loads, Argon2): with its
+/// threads all busy or parked on slow clients, a `spawn_blocking` queues
+/// behind them, and a compression stuck there stalls every write's ack.
+/// Nothing a request can start runs here.
+pub struct BlockingPool {
+    tx: crossbeam_channel::Sender<Box<dyn FnOnce() + Send>>,
+}
+
+impl BlockingPool {
+    /// `threads` threads named `{name}-{i}`.
+    pub fn new(name: &str, threads: usize) -> BlockingPool {
+        let (tx, rx) = crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send>>();
+        for i in 0..threads.max(1) {
+            let rx = rx.clone();
+            std::thread::Builder::new()
+                .name(format!("{name}-{i}"))
+                .spawn(move || {
+                    while let Ok(job) = rx.recv() {
+                        // a panicking job fails its caller (its reply is
+                        // dropped), not the pool
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    }
+                })
+                .expect("spawning a pool thread");
+        }
+        BlockingPool { tx }
+    }
+
+    /// Runs `f` on the pool; Err if it panicked.
+    pub async fn run<R: Send + 'static>(&self, f: impl FnOnce() -> R + Send + 'static) -> Result<R, tokio::sync::oneshot::error::RecvError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let job: Box<dyn FnOnce() + Send> = Box::new(move || {
+            let _ = tx.send(f());
+        });
+        if self.tx.send(job).is_err() {
+            unreachable!("pool threads never exit while the pool is alive");
+        }
+        rx.await
+    }
+}
+
+/// The commit-path pool: a quarter of the cores, 2 to 8 threads (a full
+/// segment compresses in a few ms; K PUTs in flight need at most K).
+pub fn commit_pool() -> &'static BlockingPool {
+    static POOL: std::sync::LazyLock<BlockingPool> = std::sync::LazyLock::new(|| {
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        BlockingPool::new("commit-pool", (cores / 4).clamp(2, 8))
+    });
+    &POOL
 }
 
 async fn put_once(store: &Store, path: &Path, data: Bytes) -> object_store::Result<()> {
@@ -925,17 +981,23 @@ async fn upload(store: &Store, log_id: &str, ordinal: u64, data: Bytes, hedge_af
                     // write conflicts too, e.g. our own hedge racing: nothing
                     // is there (yet), so PUT again.
                     tracing::warn!(log_id, ordinal, "segment PUT conflicted but no object is there; retrying");
-                    tokio::time::sleep(backoff).await;
+                    tokio::time::sleep(jittered(backoff)).await;
                     backoff = (backoff * 2).min(Duration::from_secs(2));
                 }
             },
             Err(e) => {
                 tracing::warn!(log_id, ordinal, "segment PUT failed, retrying: {e}");
-                tokio::time::sleep(backoff).await;
+                tokio::time::sleep(jittered(backoff)).await;
                 backoff = (backoff * 2).min(Duration::from_secs(2));
             }
         }
     }
+}
+
+/// `d` scaled by a random factor in [0.5, 1.5): K segments failing on the
+/// same S3 hiccup retry spread out instead of in lockstep.
+fn jittered(d: Duration) -> Duration {
+    d.mul_f64(rand::Rng::gen_range(&mut rand::thread_rng(), 0.5..1.5))
 }
 
 #[derive(Debug, PartialEq)]
@@ -1413,6 +1475,9 @@ mod tests {
         inner: object_store::memory::InMemory,
         delays: Mutex<HashMap<u64, Duration>>,
         holds: Mutex<std::collections::HashSet<u64>>,
+        /// Delay for every PUT that isn't a segment (SlateDB's SSTs and
+        /// manifests).
+        slow_state: Mutex<Option<Duration>>,
     }
 
     impl std::fmt::Display for FaultStore {
@@ -1429,6 +1494,11 @@ mod tests {
                     futures::future::pending::<()>().await;
                 }
                 let delay = self.delays.lock().get(&ord).copied();
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+            } else {
+                let delay = *self.slow_state.lock();
                 if let Some(d) = delay {
                     tokio::time::sleep(d).await;
                 }
@@ -1501,6 +1571,38 @@ mod tests {
 
     async fn exists(store: &Store, ord: u64) -> bool {
         read_head(store, "L", ord).await.unwrap().is_segment()
+    }
+
+    /// A checkpoint on a slow state store doesn't hold the apply lock
+    /// across its store calls: commits keep being applied and acked while
+    /// its memtable flush waits on the store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_checkpoint_does_not_stall_the_finalizer() {
+        let (fs, store) = fault_store();
+        let shard = ShardId(5);
+        let (log, _db, _merger) = test_log(&store, 2, shard, 1024).await;
+        let acked = send_n(&log, shard, 1).await;
+        let t = Instant::now();
+        while acked.lock().is_empty() {
+            assert!(t.elapsed() < Duration::from_secs(5), "first commit never acked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        *fs.slow_state.lock() = Some(Duration::from_millis(1500));
+        let l = log.clone();
+        let s = log.sinks.get(shard).unwrap();
+        let ckpt = tokio::spawn(async move { l.checkpoint_shard(&s).await });
+        // the checkpoint is now in its (slow) flush
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!ckpt.is_finished());
+        let t = Instant::now();
+        let acked = send_n(&log, shard, 3).await;
+        while acked.lock().len() < 3 {
+            assert!(t.elapsed() < Duration::from_millis(1000), "commits stalled behind the checkpoint ({} acked)", acked.lock().len());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!ckpt.is_finished(), "the checkpoint was still flushing");
+        *fs.slow_state.lock() = None;
+        ckpt.await.unwrap();
     }
 
     /// K = 4 with segment 0 slow: 1..3 land first but are acked, applied,

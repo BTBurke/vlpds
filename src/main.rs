@@ -29,6 +29,17 @@ struct Args {
     /// (public: only behind a proxy that blocks /metrics).
     #[arg(long, env = "VLPDS_METRICS_LISTEN")]
     metrics_listen: Option<String>,
+    /// A second app listener for peers (node-to-node forwarding and
+    /// /internal), served with the large peer HTTP/2 windows and stream
+    /// count; point --advertise-url at it. Once set, --listen gets the
+    /// smaller client settings (DESIGN.md "HTTP"). Unset = peers share
+    /// --listen, which keeps the peer settings.
+    #[arg(long, env = "VLPDS_PEER_LISTEN")]
+    peer_listen: Option<String>,
+    /// Connections open at once per listener; at the cap new ones wait in
+    /// the accept queue (0 = no cap).
+    #[arg(long, env = "VLPDS_MAX_CONNECTIONS", default_value_t = vlpds::server::DEFAULT_MAX_CONNECTIONS)]
+    max_connections: usize,
     #[arg(
         long,
         env = "VLPDS_PUBLIC_URL",
@@ -153,6 +164,25 @@ struct Args {
     /// Cursor backfill: segment cache shared by subscribers replaying the same range (MiB).
     #[arg(long, env = "VLPDS_BACKFILL_CACHE_MB", default_value_t = 256)]
     backfill_cache_mb: usize,
+    /// Cursor backfills running at once; more wait for a slot. Read-ahead
+    /// memory is at most this x --backfill-readahead-mb.
+    #[arg(long, env = "VLPDS_FIREHOSE_MAX_BACKFILLS", default_value_t = vlpds::firehose::DEFAULT_MAX_BACKFILLS)]
+    firehose_max_backfills: usize,
+    /// subscribeRepos connections per client IP (IPv6: per /64; behind
+    /// --trusted-proxies, the forwarded client); more get 429 (0 = no cap).
+    #[arg(long, env = "VLPDS_FIREHOSE_MAX_PER_IP", default_value_t = vlpds::firehose::DEFAULT_MAX_PER_IP)]
+    firehose_max_per_ip: usize,
+    /// getRepo exports streaming at once; more wait up to 10 s for a slot,
+    /// then get 503.
+    #[arg(long, env = "VLPDS_MAX_EXPORTS", default_value_t = vlpds::xrpc::DEFAULT_MAX_EXPORTS)]
+    max_exports: usize,
+    /// End a getRepo export whose client has read nothing for this long.
+    #[arg(long, env = "VLPDS_EXPORT_STALL_SECS", default_value_t = vlpds::xrpc::DEFAULT_EXPORT_STALL.as_secs())]
+    export_stall_secs: u64,
+    /// Repo-view reads (getRepo, getRecord, getBlocks, ...) queued at the
+    /// repo workers before shedding with 503.
+    #[arg(long, env = "VLPDS_MAX_QUEUED_READS", default_value_t = 20000)]
+    max_queued_reads: usize,
     /// Start a second, identical segment PUT if the first takes longer than this.
     #[arg(long, env = "VLPDS_HEDGE_AFTER_MS", default_value_t = 100)]
     hedge_after_ms: u64,
@@ -672,6 +702,9 @@ fn main() -> anyhow::Result<()> {
     }
     let args = Args::parse();
     init_logging(args.log_format)?;
+    // a panic in a critical thread or task (repo worker, node log
+    // sequencer/finalizer, firehose merger) fail-stops (exit 9)
+    vlpds::lifecycle::install_panic_hook();
     raise_nofile_limit();
     let node_id = args.node_id.clone().unwrap_or_else(|| "single".into());
     let exit_state = match (args.exit_state_file.as_str(), args.cache_dir.as_str()) {
@@ -895,8 +928,14 @@ async fn run(args: Args) -> anyhow::Result<()> {
         firehose_max_lag_bytes: args.firehose_max_lag_mb << 20,
         backfill_readahead_bytes: args.backfill_readahead_mb << 20,
         backfill_cache_bytes: args.backfill_cache_mb << 20,
+        firehose_max_backfills: args.firehose_max_backfills.max(1),
+        firehose_max_per_ip: args.firehose_max_per_ip,
         hedge_after: Duration::from_millis(args.hedge_after_ms),
         max_inflight_writes: args.max_inflight_writes,
+        max_queued_reads: args.max_queued_reads.max(1),
+        max_exports: args.max_exports.max(1),
+        export_stall: Duration::from_secs(args.export_stall_secs.max(1)),
+        max_connections: args.max_connections,
         cache_dir: (!args.cache_dir.is_empty()).then(|| std::path::PathBuf::from(&args.cache_dir)),
         disk_cache_bytes: args.disk_cache_mb.map(|m| m << 20),
         disk_cache_shard_bytes: args.disk_cache_shard_mb.map(|m| m << 20),
@@ -988,6 +1027,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         Some(a) => Some(bind(&a, args.listen_backlog).await?),
         None => None,
     };
+    let peer_listener = match &args.peer_listen {
+        Some(a) => Some(bind(a, args.listen_backlog).await?),
+        None => None,
+    };
     let app = server::build(cfg).await?;
     if let Some(c) = app.node.shard_disk_cache() {
         tracing::info!(dir = %c.dir.display(), shard_mb = c.shard_bytes >> 20, "SST disk cache (per shard)");
@@ -1013,7 +1056,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // our handoff nudges reach them, and a forward we drop mid-request is
     // ambiguous to them (a client 503), while one we answer "not owned"
     // (ShardMoved) they resend to the new owner.
-    let mut serving = tokio::spawn(server::serve(listener, router));
+    let max_connections = args.max_connections;
+    let public = match peer_listener {
+        Some(l) => {
+            let opts = server::ServeOptions { h2: server::H2Profile::Peer, max_connections };
+            tokio::spawn(server::serve_with(l, router.clone(), opts));
+            tracing::info!(peer_listen = args.peer_listen.as_deref().unwrap_or(""), "peer listener (peer HTTP/2 settings; --listen has the client ones)");
+            server::H2Profile::Public
+        }
+        None => server::H2Profile::Peer,
+    };
+    let opts = server::ServeOptions { h2: public, max_connections };
+    let mut serving = tokio::spawn(server::serve_with(listener, router, opts));
     tokio::select! {
         r = &mut serving => r?,
         _ = shutdown_signal() => {

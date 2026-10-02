@@ -197,7 +197,9 @@ async fn submit(
     writes: Vec<Write>,
     swap_commit: Option<Cid>,
 ) -> XResult<CommitAck> {
-    let Ok(_permit) = app.write_permits.try_acquire() else {
+    // held by the queued message until the worker takes it (a handler that
+    // goes away doesn't free its slot while its write still sits queued)
+    let Ok(permit) = app.write_permits.clone().try_acquire_owned() else {
         STATS.write_errors.fetch_add(1, Ordering::Relaxed);
         metrics::WRITES_SHED.inc();
         return Err(XrpcError {
@@ -222,6 +224,7 @@ async fn submit(
             swap_commit,
             reply: tx,
             claim: claim.clone(),
+            permit: Some(permit),
         }))
         .map_err(XrpcError::from_err)?;
     let r = match (start_wait, &claim) {

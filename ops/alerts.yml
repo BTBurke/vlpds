@@ -86,10 +86,10 @@ groups:
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsnoderestarted"
 
       # The process exits on purpose (fail-stop) when its lease lapses, its
-      # log is fenced, a segment upload / state apply fails, a signature
-      # faults repeatedly, its build can't run the cluster's feature level,
-      # or a graceful stop's shutdown fence fails (exit codes 2-8: 6
-      # signature_fault, 7 incompatible_level, 8 shutdown_fence). It records why in its exit-state file (--exit-state-file, by
+      # log is fenced, or a segment upload / state apply fails (exit codes
+      # 2-5), and on signature faults (6), an incompatible feature level (7),
+      # a failed shutdown fence (8) or a panic in a critical thread or task
+      # (9, critical_task_panicked). It records why in its exit-state file (--exit-state-file, by
       # default in --cache-dir) and the next process exports it while it runs.
       # crash = the previous process recorded no exit (SIGKILL, OOM, abort).
       # Only reported for 30 minutes after the restart.

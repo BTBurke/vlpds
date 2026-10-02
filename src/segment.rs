@@ -333,6 +333,10 @@ pub fn compress(obj: &[u8], level: i32) -> anyhow::Result<Option<Vec<u8>>> {
     Ok(Some(out))
 }
 
+/// Largest body [`decode`] allocates for a zstd frame that doesn't state
+/// its decompressed size.
+const MAX_UNDECLARED_BODY: usize = 1 << 30;
+
 /// A stored log object in the form the writer sealed it: a compressed
 /// segment's body decompressed (and its codec byte reset), so entry offsets
 /// match the writer's in-memory object. Fences and uncompressed segments
@@ -346,6 +350,15 @@ pub fn decode(data: Bytes) -> anyhow::Result<Bytes> {
             Ok(data)
         }
         CODEC_ZSTD => {
+            // body_len comes from the object: allocate it only if the zstd
+            // frame declares the same size (the writer's always does), or,
+            // for a frame without one, up to a sanity bound
+            let declared = zstd::zstd_safe::get_frame_content_size(&data[hl..]).ok().flatten();
+            anyhow::ensure!(
+                declared.map_or(body_len <= MAX_UNDECLARED_BODY, |d| d == body_len as u64),
+                "segment {} header says {body_len} body bytes, its zstd frame {declared:?}",
+                h.ordinal
+            );
             let mut out = Vec::with_capacity(hl + body_len);
             out.extend_from_slice(&data[..hl]);
             out[hl - 5] = CODEC_NONE;
@@ -686,5 +699,12 @@ mod tests {
         let n = bad.len();
         bad.truncate(n - 8);
         assert!(decode(Bytes::from(bad)).is_err());
+        // a header claiming a body its frame doesn't declare is refused
+        // before anything is allocated for it
+        let mut big = compress(&sealed, 1).unwrap().unwrap();
+        let (_, hl) = parse_header(&big).unwrap().unwrap();
+        big[hl - 4..hl].copy_from_slice(&u32::MAX.to_be_bytes());
+        let e = decode(Bytes::from(big)).unwrap_err();
+        assert!(e.to_string().contains("zstd frame"), "{e}");
     }
 }

@@ -131,6 +131,9 @@ pub struct WriteReq {
     /// Set for a forwarded write the owner may give up on before it starts
     /// (see [`Claim`]); None = always applied once queued.
     pub claim: Option<Arc<Claim>>,
+    /// The handler's admission permit (`App::write_permits`), released when
+    /// the request is consumed, not when the handler goes away.
+    pub permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Who decides a queued write's fate: its worker taking it into a commit,
@@ -339,6 +342,8 @@ pub type ViewCell = Arc<parking_lot::RwLock<Arc<DurableView>>>;
 pub struct SnapshotReq {
     pub did: Arc<str>,
     pub reply: oneshot::Sender<Result<ViewCell, WriteError>>,
+    /// Admission permit (`App::read_permits`), held while queued.
+    pub permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 pub struct RepoState {
@@ -531,7 +536,10 @@ pub fn spawn_with_secrets(
         let fallbacks = lazy_fallbacks.clone();
         std::thread::Builder::new()
             .name(format!("repo-worker-{i}"))
-            .spawn(move || Worker::new(i, me, partitions, rt, limits, secrets, fallbacks).run(rx))
+            .spawn(move || {
+                crate::lifecycle::mark_critical_thread("repo_worker");
+                Worker::new(i, me, partitions, rt, limits, secrets, fallbacks).run(rx)
+            })
             .unwrap();
     }
     Workers {
@@ -2884,7 +2892,7 @@ mod tests {
         let bytes = Bytes::from(format!("record {rkey}"));
         let (reply, rx) = oneshot::channel();
         let w = Write::Create { collection: "app.test.thing".into(), rkey: rkey.into(), cid: Cid::dag_cbor(&bytes), bytes, blobs: Vec::new(), prune_backlinks: false };
-        (WorkerMsg::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None }), rx)
+        (WorkerMsg::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None, permit: None }), rx)
     }
 
     /// A commit that fails while an earlier one is still in flight must not
@@ -3032,7 +3040,7 @@ mod tests {
         let did: Arc<str> = "did:plc:blobrefs".into();
         let op = |w: Write| {
             let (reply, rx) = oneshot::channel();
-            (WorkerMsg::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None }), rx)
+            (WorkerMsg::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None, permit: None }), rx)
         };
         let blob = |i: u8| Cid::dag_cbor(&[i]);
         let rec = |rkey: &str, blobs: Vec<Cid>, update: bool| {
@@ -3268,7 +3276,7 @@ mod tests {
                 };
                 let (reply, _rx) = oneshot::channel();
                 let w = Write::Create { collection: collection.into(), rkey, cid: Cid::dag_cbor(&bytes), bytes, blobs: Vec::new(), prune_backlinks: kind != "post" };
-                let reqs = vec![Queued::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None })];
+                let reqs = vec![Queued::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None, permit: None })];
                 let reqs = match lazy_needs(st, reqs) {
                     Ok(reqs) => reqs,
                     // the backlink read a fetch does off the worker thread

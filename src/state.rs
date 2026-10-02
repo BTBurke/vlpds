@@ -393,11 +393,44 @@ pub struct PendingSigningKey {
     pub pubkey: String,
 }
 
+/// Concurrent Argon2 hashes and verifications, process-wide: as many as
+/// there are pooled block buffers (one per core, at most 16). Each takes
+/// ~20 ms of a core and 19 MiB, so more at once only adds memory and
+/// blocking-pool threads (a login flood used to take up to the whole
+/// 512-thread pool and ~10 GB); the rest wait their turn.
+static ARGON2_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> = std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*ARGON2_POOL_MAX));
+
+/// How long the `try_` variants wait for an Argon2 permit before shedding.
+pub const ARGON2_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Every Argon2 permit stayed busy for [`ARGON2_MAX_WAIT`]: answer 503.
+#[derive(Debug, thiserror::Error)]
+#[error("password hashing is saturated; retry shortly")]
+pub struct Argon2Busy;
+
+async fn argon2_permit(wait: Option<std::time::Duration>) -> Result<tokio::sync::SemaphorePermit<'static>, Argon2Busy> {
+    let acquire = ARGON2_PERMITS.acquire();
+    let p = match wait {
+        None => acquire.await,
+        Some(w) => tokio::time::timeout(w, acquire).await.map_err(|_| Argon2Busy)?,
+    };
+    Ok(p.expect("the Argon2 semaphore is never closed"))
+}
+
 /// Argon2id (OWASP baseline: m=19 MiB, t=2, p=1) PHC string. ~20 ms of CPU,
-/// so it runs on the blocking pool.
+/// so it runs on the blocking pool, at most [`ARGON2_PERMITS`] at once
+/// (waits for a turn).
 pub async fn hash_password(password: &str) -> String {
+    let _p = argon2_permit(None).await.expect("unbounded wait");
     let pw = password.to_string();
     tokio::task::spawn_blocking(move || hash_password_blocking(&pw)).await.expect("argon2 task")
+}
+
+/// [`hash_password`], shedding ([`Argon2Busy`]) after [`ARGON2_MAX_WAIT`].
+pub async fn try_hash_password(password: &str) -> Result<String, Argon2Busy> {
+    let _p = argon2_permit(Some(ARGON2_MAX_WAIT)).await?;
+    let pw = password.to_string();
+    Ok(tokio::task::spawn_blocking(move || hash_password_blocking(&pw)).await.expect("argon2 task"))
 }
 
 pub fn hash_password_blocking(password: &str) -> String {
@@ -409,7 +442,20 @@ pub fn hash_password_blocking(password: &str) -> String {
         .to_string()
 }
 
+/// Checks `password` against a PHC string (waits for an Argon2 permit).
 pub async fn verify_password_hash(phc: &str, password: &str) -> bool {
+    let _p = argon2_permit(None).await.expect("unbounded wait");
+    verify_blocking(phc, password).await
+}
+
+/// [`verify_password_hash`], shedding ([`Argon2Busy`]) after
+/// [`ARGON2_MAX_WAIT`].
+pub async fn try_verify_password_hash(phc: &str, password: &str) -> Result<bool, Argon2Busy> {
+    let _p = argon2_permit(Some(ARGON2_MAX_WAIT)).await?;
+    Ok(verify_blocking(phc, password).await)
+}
+
+async fn verify_blocking(phc: &str, password: &str) -> bool {
     let (phc, pw) = (phc.to_string(), password.to_string());
     tokio::task::spawn_blocking(move || {
         use argon2::password_hash::{PasswordHash, PasswordVerifier};
@@ -531,5 +577,19 @@ mod tests {
         let salt = SaltString::encode_b64(&[9; 16]).unwrap();
         let h = small.hash_password(b"pw", &salt).unwrap().to_string();
         assert!(PooledArgon2.verify_password(b"pw", &PasswordHash::new(&h).unwrap()).is_ok());
+    }
+
+    /// Argon2 runs at most ARGON2_POOL_MAX at once; with every permit
+    /// taken, a bounded wait sheds and an unbounded one waits its turn.
+    #[tokio::test]
+    async fn argon2_concurrency_is_bounded() {
+        let held = ARGON2_PERMITS.acquire_many(*ARGON2_POOL_MAX as u32).await.unwrap();
+        assert!(argon2_permit(Some(std::time::Duration::from_millis(20))).await.is_err());
+        let phc = hash_password_blocking("pw");
+        let waiting = tokio::spawn(async move { verify_password_hash(&phc, "pw").await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished(), "verified without a permit");
+        drop(held);
+        assert!(waiting.await.unwrap());
     }
 }

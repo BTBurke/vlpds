@@ -226,6 +226,14 @@ pub struct Options {
     pub readahead_bytes: usize,
     /// Segments cached for backfills replaying the same range.
     pub backfill_cache_bytes: usize,
+    /// Cursor backfills running at once; more wait for a slot. Read-ahead
+    /// memory is at most this x `readahead_bytes`.
+    pub max_backfills: usize,
+    /// Subscriber connections per client IP (IPv6: per /64); 0 = no cap.
+    pub max_per_ip: usize,
+    /// A write to a subscriber outside the live path (backfill, info
+    /// frames, pongs) that makes no progress for this long drops it.
+    pub write_idle: Duration,
     /// Runtime subscriber connections run on (None = the caller's).
     pub runtime: Option<tokio::runtime::Handle>,
 }
@@ -237,10 +245,22 @@ impl Default for Options {
             max_lag_bytes: DEFAULT_MAX_LAG_BYTES,
             readahead_bytes: crate::backfill::DEFAULT_READAHEAD_BYTES,
             backfill_cache_bytes: crate::backfill::DEFAULT_CACHE_BYTES,
+            max_backfills: DEFAULT_MAX_BACKFILLS,
+            max_per_ip: DEFAULT_MAX_PER_IP,
+            write_idle: DEFAULT_WRITE_IDLE,
             runtime: None,
         }
     }
 }
+
+/// Default bound on cursor backfills running at once (x 64 MiB read-ahead
+/// each: 1 GiB).
+pub const DEFAULT_MAX_BACKFILLS: usize = 16;
+/// Default bound on subscriber connections per client IP (a relay may open
+/// one per `?shard=k/n` slice).
+pub const DEFAULT_MAX_PER_IP: usize = 256;
+/// Default [`Options::write_idle`].
+pub const DEFAULT_WRITE_IDLE: Duration = Duration::from_secs(30);
 
 /// Default bound on a live subscriber's lag behind the head.
 pub const DEFAULT_MAX_LAG_BYTES: usize = 128 << 20;
@@ -292,6 +312,14 @@ pub struct Firehose {
     max_lag_bytes: u64,
     readahead_bytes: usize,
     backfill_cache: Arc<SegCache>,
+    /// Running backfills (`Options::max_backfills`).
+    backfill_slots: Arc<tokio::sync::Semaphore>,
+    max_per_ip: usize,
+    /// Subscriber connections per client IP key ([`ip_key`]).
+    per_ip: parking_lot::Mutex<HashMap<std::net::IpAddr, usize>>,
+    write_idle: Duration,
+    /// `settled`, for backfills waiting on it.
+    settled_tx: watch::Sender<i64>,
 }
 
 impl Firehose {
@@ -315,6 +343,11 @@ impl Firehose {
             max_lag_bytes: opts.max_lag_bytes as u64,
             readahead_bytes: opts.readahead_bytes,
             backfill_cache: SegCache::new(opts.backfill_cache_bytes),
+            backfill_slots: Arc::new(tokio::sync::Semaphore::new(opts.max_backfills.max(1))),
+            max_per_ip: opts.max_per_ip,
+            per_ip: Default::default(),
+            write_idle: opts.write_idle,
+            settled_tx: watch::channel(i64::MIN).0,
         })
     }
 
@@ -401,7 +434,8 @@ impl Firehose {
     /// S3 before any producer hands them to us).
     pub fn spawn_merger(self: &Arc<Self>, mut rx: mpsc::UnboundedReceiver<LogBatch>) {
         let fh = self.clone();
-        tokio::spawn(async move {
+        // critical: a panic here fail-stops the node (lifecycle.rs)
+        tokio::spawn(crate::lifecycle::critical("firehose_merger", async move {
             let mut logs: HashMap<Arc<str>, LogQ> = HashMap::new();
             // Everything at or below this has been emitted (or is below the
             // start floor): later events at or below it are late.
@@ -435,7 +469,9 @@ impl Firehose {
                     let Some(w) = s.values().map(|s| s.get()).min() else {
                         continue;
                     };
-                    fh.settled.fetch_max(w, Ordering::AcqRel);
+                    if fh.settled.fetch_max(w, Ordering::AcqRel) < w {
+                        fh.settled_tx.send_if_modified(|v| std::mem::replace(v, w) < w);
+                    }
                     w
                 };
                 let max = fh.max_queue_bytes.load(Ordering::Relaxed);
@@ -459,7 +495,7 @@ impl Firehose {
                         None if total >= max && store.is_some() => {
                             tracing::warn!(log_id = %b.log_id, ordinal = b.ordinal, queued = total, "firehose merger: queue over budget, spilling log to S3 read-back");
                             metrics::FIREHOSE_SPILLS.inc();
-                            lq.spill = Some(Spill { next: b.ordinal, loaded: lq.high, end: false });
+                            lq.spill = Some(Spill { next: b.ordinal, loaded: lq.high, end: false, checked: None });
                             continue;
                         }
                         None => {}
@@ -498,8 +534,27 @@ impl Firehose {
                                 // not written: every event <= w of this log was
                                 // PUT before w was published, so all are loaded
                                 // (w only covers the log's gap-free prefix: a
-                                // later ordinal that landed early is past it)
-                                Ok(None) => caught_up = true,
+                                // later ordinal that landed early is past it).
+                                // Unless retention deleted it (the read-back is
+                                // a whole window behind): then it never appears
+                                // and the log would be ignored for good (live
+                                // batches only rejoin at `next`). Skip to the
+                                // log's first segment, as remote::catch_up does.
+                                Ok(None) => {
+                                    if sp.checked.is_none_or(|t| t.elapsed() >= SPILL_PRUNE_CHECK) {
+                                        sp.checked = Some(std::time::Instant::now());
+                                        match crate::backfill::first_ordinal(store, log_id).await {
+                                            Ok(Some(first)) if first > sp.next => {
+                                                tracing::warn!(%log_id, from = sp.next, to = first, "firehose merger: spilled log pruned ahead of its read-back; skipping");
+                                                sp.next = first;
+                                                continue;
+                                            }
+                                            Ok(_) => {}
+                                            Err(e) => tracing::warn!(%log_id, "firehose merger: listing a spilled log failed: {e:#}"),
+                                        }
+                                    }
+                                    caught_up = true;
+                                }
                                 Err(e) => {
                                     tracing::warn!(%log_id, ordinal = sp.next, "firehose merger: reading back a spilled log failed: {e:#}");
                                     failed = true;
@@ -551,7 +606,7 @@ impl Firehose {
                 metrics::FIREHOSE_EMIT_DELAY.observe(crate::tid::now_micros().saturating_sub((batch.first >> 8) as u64) as f64 / 1e6);
                 fh.push(batch);
             }
-        });
+        }));
     }
 
     fn push(&self, batch: Arc<MergedBatch>) {
@@ -596,14 +651,28 @@ impl Firehose {
     /// into that slice of the slot space. Same seqs, order and cursors as the
     /// full stream (a cursor from either works on the other); the union of
     /// the n streams is the full stream.
-    pub fn upgrade(self: &Arc<Self>, mut req: axum::extract::Request, cursor: Option<i64>, shard: Option<SlotRange>) -> Response {
+    ///
+    /// `client` (the trusted-proxy-resolved client address): at most
+    /// `Options::max_per_ip` connections per address (IPv6: per /64), 429
+    /// past it.
+    pub fn upgrade(self: &Arc<Self>, mut req: axum::extract::Request, cursor: Option<i64>, shard: Option<SlotRange>, client: Option<std::net::IpAddr>) -> Response {
         let accept = match handshake(req.headers()) {
             Ok(a) => a,
             Err(e) => return e.into_response(),
         };
+        let slot = match client.map(|ip| self.ip_slot(ip)) {
+            Some(None) => {
+                metrics::FIREHOSE_REJECTED.with_label_values(&["per_ip"]).inc();
+                let body = serde_json::json!({"error": "RateLimitExceeded", "message": "too many subscribeRepos connections from this address"});
+                return (StatusCode::TOO_MANY_REQUESTS, axum::Json(body)).into_response();
+            }
+            Some(Some(s)) => Some(s),
+            None => None,
+        };
         let on_upgrade = hyper::upgrade::on(&mut req);
         let fh = self.clone();
         self.runtime.spawn(async move {
+            let _slot = slot;
             match on_upgrade.await {
                 Ok(up) => fh.serve(up, cursor, shard).await,
                 Err(e) => tracing::debug!("subscribeRepos upgrade failed: {e}"),
@@ -614,6 +683,26 @@ impl Firehose {
             [(header::CONNECTION, "upgrade".to_string()), (header::UPGRADE, "websocket".to_string()), (header::SEC_WEBSOCKET_ACCEPT, accept)],
         )
             .into_response()
+    }
+
+    /// A connection slot for `ip`'s key (None = at the cap).
+    fn ip_slot(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<IpSlot> {
+        if self.max_per_ip == 0 {
+            return Some(IpSlot { fh: None, key: ip });
+        }
+        let key = ip_key(ip);
+        let mut m = self.per_ip.lock();
+        let n = m.entry(key).or_default();
+        if *n >= self.max_per_ip {
+            return None;
+        }
+        *n += 1;
+        Some(IpSlot { fh: Some(self.clone()), key })
+    }
+
+    /// Subscriber connections held by `ip`'s key.
+    pub fn connections_from(&self, ip: std::net::IpAddr) -> usize {
+        self.per_ip.lock().get(&ip_key(ip)).copied().unwrap_or(0)
     }
 
     async fn serve(self: Arc<Self>, up: hyper::upgrade::Upgraded, cursor: Option<i64>, shard: Option<SlotRange>) {
@@ -650,7 +739,7 @@ impl Firehose {
     {
         let (ctl_tx, ctl) = mpsc::channel(8);
         let reader = tokio::spawn(read_client(r, ctl_tx));
-        let mut out = Out { w, ctl };
+        let mut out = Out { w, ctl, idle: self.write_idle };
         let reason = match self.stream(&mut out, cursor, shard).await {
             Ok(()) => "shutdown",
             Err(reason) => reason,
@@ -770,16 +859,30 @@ impl Firehose {
         let Some(store) = self.store.read().clone() else { return Ok(false) };
         let reader = Reader { store, cache: self.backfill_cache.clone(), readahead_bytes: self.readahead_bytes, shard };
         let (mut overtaken, mut failures) = (0u32, 0u32);
+        // a running-backfill slot, taken once there is something to read
+        let mut slot: Option<BackfillSlot> = None;
         loop {
             let floor = self.ring_floor.load(Ordering::Acquire);
             if *last >= floor {
                 return Ok(true);
             }
             // right after startup the start floor can be ahead of a peer's
-            // watermark: its events <= F may not be in S3 yet
+            // watermark: its events <= F may not be in S3 yet. Wait for the
+            // merger to settle past it, answering the client meanwhile (and
+            // noticing it leave).
             if self.settled.load(Ordering::Acquire) < floor {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                let mut settled = self.settled_tx.subscribe();
+                tokio::select! {
+                    _ = async { settled.wait_for(|s| *s >= floor).await.is_ok() } => {}
+                    c = out.ctl.recv() => out.control(c).await?,
+                    // the floor moves as the ring evicts: look again
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
                 continue;
+            }
+            if slot.is_none() {
+                slot = Some(self.backfill_slot(out).await?);
+                continue; // the floor moved while it waited
             }
             // older than what log retention deleted: OutdatedCursor, then the
             // oldest events left (retention.rs raises this before deleting)
@@ -792,7 +895,7 @@ impl Firehose {
                 Ok(_) => {}
                 Err(e) => tracing::warn!("reading the retained floor failed: {e:#}"),
             }
-            let (tx, mut rx) = mpsc::channel(4096);
+            let (tx, mut rx) = mpsc::channel(BACKFILL_CHANNEL);
             let (r, from) = (reader.clone(), *last);
             let mut job = AbortOnDrop(tokio::spawn(async move { crate::backfill::backfill_with(&r, from, floor, &tx).await }));
             let mut chunk = Vec::with_capacity(1024);
@@ -851,6 +954,76 @@ impl Firehose {
 
 /// Tries per backfill before a subscriber is disconnected (S3 errors).
 const BACKFILL_ATTEMPTS: u32 = 3;
+/// Frames between a backfill reader and its subscriber's writer (they are
+/// slices of segments the reader holds anyway).
+const BACKFILL_CHANNEL: usize = 1024;
+
+/// A running backfill's slot (`Options::max_backfills`).
+struct BackfillSlot(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
+
+impl Drop for BackfillSlot {
+    fn drop(&mut self) {
+        metrics::FIREHOSE_BACKFILLS.with_label_values(&["running"]).dec();
+    }
+}
+
+impl Firehose {
+    /// Waits for a backfill slot, answering the client meanwhile (Err: it
+    /// left).
+    async fn backfill_slot<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>) -> Result<BackfillSlot, &'static str> {
+        let p = match self.backfill_slots.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let waiting = metrics::FIREHOSE_BACKFILLS.with_label_values(&["waiting"]);
+                waiting.inc();
+                let acquire = self.backfill_slots.clone().acquire_owned();
+                tokio::pin!(acquire);
+                let r = loop {
+                    tokio::select! {
+                        p = &mut acquire => break Ok(p.expect("never closed")),
+                        c = out.ctl.recv() => {
+                            if let Err(e) = out.control(c).await {
+                                break Err(e);
+                            }
+                        }
+                    }
+                };
+                waiting.dec();
+                r?
+            }
+        };
+        metrics::FIREHOSE_BACKFILLS.with_label_values(&["running"]).inc();
+        Ok(BackfillSlot(p))
+    }
+}
+
+/// A subscriber connection counted against its address ([`ip_key`]).
+struct IpSlot {
+    fh: Option<Arc<Firehose>>,
+    key: std::net::IpAddr,
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let Some(fh) = &self.fh else { return };
+        let mut m = fh.per_ip.lock();
+        if let Some(n) = m.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// What subscriber connections are counted by: the IPv4 address, or the
+/// IPv6 /64 (one host's usual allocation).
+fn ip_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip.to_canonical() {
+        std::net::IpAddr::V6(v6) => std::net::IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
+        v4 => v4,
+    }
+}
 /// Re-reads after retention overtook a backfill, before it's an error.
 const MAX_PRUNED_RETRIES: u32 = 64;
 
@@ -876,7 +1049,13 @@ struct Spill {
     loaded: i64,
     /// read up to the log's fence
     end: bool,
+    /// When `next` was last checked against the log's first ordinal.
+    checked: Option<std::time::Instant>,
 }
+
+/// How often a spilled log's missing next segment is checked for having
+/// been pruned (one LIST).
+const SPILL_PRUNE_CHECK: Duration = Duration::from_secs(1);
 
 impl LogQ {
     fn accept(&mut self, events: Vec<(i64, Bytes)>, emitted: i64, start_floor: i64, late: &mut usize) -> usize {
@@ -1038,11 +1217,22 @@ async fn read_client<R: AsyncRead + Unpin>(mut r: R, ctl: mpsc::Sender<Ctl>) {
 struct Out<W> {
     w: W,
     ctl: mpsc::Receiver<Ctl>,
+    /// Longest a write outside the live path may go without progress.
+    idle: Duration,
 }
 
 impl<W: AsyncWrite + Unpin> Out<W> {
+    /// Writes `data`; a client that takes nothing for `idle` is dropped
+    /// (the live path bounds lag instead, `send_live`).
     async fn write(&mut self, data: &[u8]) -> Result<(), &'static str> {
-        self.w.write_all(data).await.map_err(|_| "client_gone")?;
+        let mut at = 0;
+        while at < data.len() {
+            match tokio::time::timeout(self.idle, self.w.write(&data[at..])).await {
+                Ok(Ok(0)) | Ok(Err(_)) => return Err("client_gone"),
+                Ok(Ok(n)) => at += n,
+                Err(_) => return Err("write_stalled"),
+            }
+        }
         metrics::FIREHOSE_SENT_BYTES.inc_by(data.len() as u64);
         Ok(())
     }
@@ -1311,6 +1501,134 @@ mod tests {
         obj.extend_from_slice(&b.body);
         store.raw.put(&crate::nodelog::segment_path(store, log, ord), PutPayload::from(obj)).await.unwrap();
         LogBatch { log_id: log.into(), ordinal: ord, events: vec![(seq, frame)] }
+    }
+
+    /// A spilled log whose next segment retention deleted (the read-back a
+    /// whole window behind) skips to the log's first segment instead of
+    /// waiting for it forever: its later events are emitted and its live
+    /// batches rejoin.
+    #[tokio::test]
+    async fn spilled_log_skips_pruned_segments() {
+        let store = crate::store::Store::memory(None);
+        let fh = Firehose::new(Options::default());
+        fh.set_max_queue_bytes(2000);
+        *fh.store.write() = Some(store.clone());
+        let (_, wa) = fh.add_remote("A");
+        let (_, wb) = fh.add_remote("B");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut sub = fh.subscribe();
+        let mut last = i64::MIN;
+        fh.spawn_merger(rx);
+        let base = fh.position();
+        let seq = |k: i64| base + k * 256 + 1;
+        let n = 60u64;
+        for k in 0..n {
+            tx.send(put_seg(&store, "B", k, seq(k as i64), 200).await).unwrap();
+            wb.store(seq(k as i64), Ordering::Release);
+            if k % 8 == 0 {
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // retention deletes B's oldest segments, past where its read-back is
+        for k in 0..=40u64 {
+            store.raw.delete(&crate::nodelog::segment_path(&store, "B", k)).await.unwrap();
+        }
+        wa.store(seq(n as i64 + 10), Ordering::Release);
+        let mut got = Vec::new();
+        while got.last() != Some(&seq(n as i64 - 1)) {
+            for b in next_batches(&fh, &mut sub, &mut last).await {
+                got.extend(b.events.iter().map(|(s, _)| *s));
+            }
+        }
+        assert!(got.windows(2).all(|w| w[0] < w[1]), "in order");
+        // and B's live stream is taken again
+        tx.send(put_seg(&store, "B", n, seq(n as i64), 200).await).unwrap();
+        wb.store(seq(n as i64), Ordering::Release);
+        let b = next_batches(&fh, &mut sub, &mut last).await;
+        assert_eq!(b[0].events[0].0, seq(n as i64));
+    }
+
+    /// Writes outside the live path give up on a client that takes nothing
+    /// for `idle`.
+    #[tokio::test]
+    async fn stalled_writes_drop_the_subscriber() {
+        let (w, _r) = tokio::io::duplex(64);
+        let (_ctl_tx, ctl) = mpsc::channel(1);
+        let mut out = Out { w, ctl, idle: Duration::from_millis(100) };
+        let t = std::time::Instant::now();
+        assert_eq!(out.write(&[0u8; 4096]).await, Err("write_stalled"));
+        assert!(t.elapsed() < Duration::from_secs(2));
+        // a reader that keeps taking bytes is fine, however slowly
+        let (w, mut r) = tokio::io::duplex(64);
+        let (_ctl_tx, ctl) = mpsc::channel(1);
+        let mut out = Out { w, ctl, idle: Duration::from_millis(100) };
+        let reader = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let mut n = 0;
+            while n < 4096 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                n += r.read(&mut buf).await.unwrap();
+            }
+        });
+        assert_eq!(out.write(&[0u8; 4096]).await, Ok(()));
+        reader.await.unwrap();
+    }
+
+    /// Backfills beyond `max_backfills` wait for a slot (answering their
+    /// client meanwhile), and one whose client leaves stops waiting.
+    #[tokio::test]
+    async fn backfills_wait_for_a_slot() {
+        let fh = Firehose::new(Options { max_backfills: 1, ..Options::default() });
+        let out = || {
+            let (w, _r) = tokio::io::duplex(1 << 16);
+            let (tx, ctl) = mpsc::channel(1);
+            (Out { w, ctl, idle: Duration::from_secs(5) }, tx, _r)
+        };
+        let (mut a, _a_tx, _ar) = out();
+        let first = fh.backfill_slot(&mut a).await.unwrap();
+        // the second waits; its client leaving ends the wait
+        let (mut b, b_tx, _br) = out();
+        let fh2 = fh.clone();
+        let waiting = tokio::spawn(async move { fh2.backfill_slot(&mut b).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        drop(b_tx);
+        assert_eq!(waiting.await.unwrap(), Err("client_gone"));
+        // a third gets the slot once the first ends
+        let (mut c, _c_tx, _cr) = out();
+        let fh3 = fh.clone();
+        let next = tokio::spawn(async move { fh3.backfill_slot(&mut c).await.is_ok() });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!next.is_finished());
+        drop(first);
+        assert!(tokio::time::timeout(Duration::from_secs(5), next).await.unwrap().unwrap());
+    }
+
+    /// At most `max_per_ip` subscriber connections per address (IPv6: per
+    /// /64); a closed one frees its slot.
+    #[test]
+    fn subscribers_per_ip_are_capped() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _g = rt.enter();
+        let fh = Firehose::new(Options { max_per_ip: 2, ..Options::default() });
+        let v4: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+        let a = fh.ip_slot(v4).expect("first");
+        let _b = fh.ip_slot(v4).expect("second");
+        assert!(fh.ip_slot(v4).is_none(), "third from the same address");
+        assert!(fh.ip_slot("192.0.2.8".parse().unwrap()).is_some(), "another address");
+        drop(a);
+        assert!(fh.ip_slot(v4).is_some(), "a closed connection frees its slot");
+        let x: std::net::IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let y: std::net::IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let _x = fh.ip_slot(x).unwrap();
+        let _y = fh.ip_slot(y).unwrap();
+        assert!(fh.ip_slot("2001:db8:1:2::77".parse().unwrap()).is_none(), "same /64");
+        assert!(fh.ip_slot("2001:db8:1:3::1".parse().unwrap()).is_some(), "another /64");
+        assert_eq!(fh.connections_from(x), 2);
+        let open = Firehose::new(Options { max_per_ip: 0, ..Options::default() });
+        let all: Vec<_> = (0..10).map(|_| open.ip_slot(v4).unwrap()).collect();
+        assert_eq!((all.len(), open.connections_from(v4)), (10, 0), "0 = no cap");
     }
 
     /// A stalled log holds the min watermark back while another keeps

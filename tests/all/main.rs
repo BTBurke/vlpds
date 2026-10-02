@@ -41,6 +41,7 @@ mod e2e_regressions;
 mod fast_failover;
 mod email_flows;
 mod email_2fa;
+mod export_limits;
 mod smtp_mail;
 mod file_uploads;
 mod firehose_backfill;

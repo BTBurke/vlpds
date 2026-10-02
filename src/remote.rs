@@ -42,6 +42,21 @@ use tokio::sync::mpsc;
 const HEARTBEAT: Duration = Duration::from_millis(5);
 /// A live log stream (or its connect) silent this long is presumed dead.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Owner side: a send (batch, heartbeat, close) that makes no progress for
+/// this long drops the stream. The follower presumed it dead long before
+/// (`STREAM_IDLE_TIMEOUT`) and reconnects; a stuck peer socket mustn't pin
+/// the task and its live-ring subscription.
+const STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One owner-side send, bounded by [`STREAM_SEND_TIMEOUT`]; false = drop
+/// the stream.
+async fn send_bounded(ws: &mut WebSocket, m: Message) -> bool {
+    matches!(tokio::time::timeout(STREAM_SEND_TIMEOUT, ws.send(m)).await, Ok(Ok(())))
+}
+
+async fn close_bounded(ws: &mut WebSocket) {
+    let _ = tokio::time::timeout(STREAM_SEND_TIMEOUT, ws.close()).await;
+}
 /// How often a live stream checks that its log's lease is still live.
 const LEASE_CHECK: Duration = Duration::from_millis(50);
 
@@ -82,7 +97,8 @@ pub fn decode(log_id: &Arc<str>, data: Bytes) -> anyhow::Result<StreamMsg> {
             anyhow::ensure!(r.remaining() >= 12, "short batch");
             let ordinal = r.get_u64();
             let n = r.get_u32() as usize;
-            let mut events = Vec::with_capacity(n);
+            // a count from the wire: each event takes at least 12 bytes
+            let mut events = Vec::with_capacity(n.min(r.remaining() / 12));
             for _ in 0..n {
                 anyhow::ensure!(r.remaining() >= 12, "short event");
                 let seq = r.get_i64();
@@ -112,7 +128,7 @@ pub async fn serve_stream(mut ws: WebSocket, log: Arc<NodeLog>) {
         if log.closed.load(Ordering::Acquire) {
             // fenced by our shutdown (or a halted test node): the follower
             // drains the rest from S3 up to the fence
-            let _ = ws.close().await;
+            close_bounded(&mut ws).await;
             return;
         }
         // Read the watermark *before* draining: batches covered by it were
@@ -121,7 +137,7 @@ pub async fn serve_stream(mut ws: WebSocket, log: Arc<NodeLog>) {
         loop {
             match rx.try_recv() {
                 LiveRecv::Batch(b) => {
-                    if ws.send(Message::Binary(encode_batch(&b))).await.is_err() {
+                    if !send_bounded(&mut ws, Message::Binary(encode_batch(&b))).await {
                         return;
                     }
                 }
@@ -130,12 +146,12 @@ pub async fn serve_stream(mut ws: WebSocket, log: Arc<NodeLog>) {
                     // the peer catches up from S3 when it reconnects
                     crate::metrics::LOG_STREAM_LAGGED.inc();
                     tracing::warn!(log_id = %log.log_id, "peer fell behind our live ring: dropping its stream (it catches up from S3)");
-                    let _ = ws.close().await;
+                    close_bounded(&mut ws).await;
                     return;
                 }
             }
         }
-        if ws.send(Message::Binary(encode_watermark(w))).await.is_err() {
+        if !send_bounded(&mut ws, Message::Binary(encode_watermark(w))).await {
             return;
         }
     }
@@ -354,6 +370,23 @@ mod tests {
     use super::*;
     use crate::segment::SegmentBuilder;
     use object_store::PutPayload;
+
+    /// A batch claiming 4G events in a few bytes is an error, without
+    /// reserving room for them first; a real one round-trips.
+    #[test]
+    fn decode_caps_the_claimed_count() {
+        let log: Arc<str> = "A".into();
+        let mut m = vec![0u8];
+        m.extend_from_slice(&7u64.to_be_bytes());
+        m.extend_from_slice(&u32::MAX.to_be_bytes());
+        m.extend_from_slice(&[0u8; 12]);
+        assert!(decode(&log, Bytes::from(m)).is_err());
+        let b = LogBatch { log_id: log.clone(), ordinal: 3, events: vec![(5, Bytes::from_static(b"xy")), (9, Bytes::new())] };
+        match decode(&log, encode_batch(&b)).unwrap() {
+            StreamMsg::Batch(got) => assert_eq!((got.ordinal, got.events), (3, b.events)),
+            _ => panic!("not a batch"),
+        }
+    }
 
     async fn put(store: &Store, ord: u64, prefix_end: u64) {
         let mut b = SegmentBuilder::new();

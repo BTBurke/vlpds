@@ -213,8 +213,24 @@ async fn get_checkout(
 }
 
 /// An export reads up to this much of the repo's `M/` range with one scan
-/// (~28 B/record: a 1M-record repo's), point reads beyond.
+/// (~28 B/record: a 1M-record repo's), point reads beyond. Taken from a
+/// process-wide budget ([`EXPORT_PREFETCH_MB`]): less, or none, while other
+/// exports hold it.
 const EXPORT_PREFETCH_BYTES: usize = 64 << 20;
+
+/// `M/` prefetch all exports may hold at once, in MiB.
+static EXPORT_PREFETCH_MB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(512);
+
+/// Default `Config::max_exports`: exports streaming at once. Each holds a
+/// blocking-pool thread for its MST walk, so this also bounds what slow
+/// readers can take from that pool.
+pub const DEFAULT_MAX_EXPORTS: usize = 32;
+/// Default `Config::export_stall`.
+pub const DEFAULT_EXPORT_STALL: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long an export waits for a slot before 503.
+const EXPORT_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Body chunks queued between an export and its response body.
+const EXPORT_QUEUE: usize = 4;
 
 /// Record blocks exports may hold while they stream the MST nodes (the CAR
 /// puts every node before any record), in MiB, process-wide; and per export.
@@ -237,14 +253,43 @@ const EXPORT_BATCH: usize = 512;
 /// The body chunks an export sends (~1 MiB each).
 const EXPORT_CHUNK: usize = 1 << 20;
 
+/// Record CIDs an export has written, by the first 128 bits of their
+/// SHA-256 digest (which hash well as they are): records with identical
+/// contents share a block, and the CAR carries it once.
+type SeenCids = HashSet<u128, std::hash::BuildHasherDefault<DigestHasher>>;
+
+#[derive(Default)]
+struct DigestHasher(u64);
+
+impl std::hash::Hasher for DigestHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = self.0.rotate_left(8) ^ *b as u64;
+        }
+    }
+    fn write_u128(&mut self, v: u128) {
+        self.0 = v as u64;
+    }
+}
+
+fn cid_key(c: &Cid) -> u128 {
+    let mut k = [0u8; 16];
+    k.copy_from_slice(&c.digest[..16]);
+    u128::from_le_bytes(k)
+}
+
 /// What an export's `R/` scan kept for the CAR's tail: the record blocks
-/// (CAR-encoded, `since`-filtered) up to the buffer budget, in body chunks,
-/// and the first record it didn't keep, if any (the rest is read again from
-/// there).
+/// (CAR-encoded, `since`-filtered, each block once) up to the buffer budget,
+/// in body chunks, and the first record it didn't keep, if any (the rest is
+/// read again from there).
 struct Buffered {
     chunks: Vec<Vec<u8>>,
     bytes: usize,
     resume_at: Option<Vec<u8>>,
+    seen: SeenCids,
     _permit: Option<tokio::sync::SemaphorePermit<'static>>,
 }
 
@@ -266,7 +311,7 @@ async fn scan_records(
             return Err(e.into());
         }
     };
-    let mut out = Buffered { chunks: Vec::new(), bytes: 0, resume_at: None, _permit: None };
+    let mut out = Buffered { chunks: Vec::new(), bytes: 0, resume_at: None, seen: SeenCids::default(), _permit: None };
     let (mut held_mb, cap) = (0u32, EXPORT_BUFFER_MAX_MB.load(std::sync::atomic::Ordering::Relaxed));
     let new_batch = || crate::mst_store::Records::with_capacity(EXPORT_BATCH);
     let mut batch = new_batch();
@@ -297,6 +342,10 @@ async fn scan_records(
         if out.resume_at.is_some() || since.is_some_and(|s| state::record_value_rev(&kv.value) <= s) {
             continue;
         }
+        let k = cid_key(&cid);
+        if out.seen.contains(&k) {
+            continue;
+        }
         let need = (out.bytes + bytes.len() + 64).div_ceil(1 << 20) as u32;
         while held_mb < need {
             let Some(p) = (held_mb < cap).then(|| EXPORT_BUFFER_MB.try_acquire().ok()).flatten() else { break };
@@ -310,6 +359,7 @@ async fn scan_records(
             out.resume_at = Some(key.to_vec());
             continue;
         }
+        out.seen.insert(k);
         if out.chunks.last().is_none_or(|c| c.len() >= EXPORT_CHUNK) {
             out.chunks.push(Vec::with_capacity(EXPORT_CHUNK + 4096));
         }
@@ -324,6 +374,129 @@ async fn scan_records(
     Ok(out)
 }
 
+/// An export's slot (`App::exports`).
+struct ExportSlot(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
+
+impl Drop for ExportSlot {
+    fn drop(&mut self) {
+        metrics::SYNC_EXPORTS.with_label_values(&["running"]).dec();
+    }
+}
+
+/// Decrements a gauge when dropped.
+struct GaugeGuard(prometheus::IntGauge);
+
+impl Drop for GaugeGuard {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
+/// A slot to stream an export in: waits up to [`EXPORT_SLOT_WAIT`], then 503.
+async fn export_slot(app: &App) -> XResult<ExportSlot> {
+    let p = match app.exports.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            let waiting = metrics::SYNC_EXPORTS.with_label_values(&["waiting"]);
+            waiting.inc();
+            let _w = GaugeGuard(waiting);
+            match tokio::time::timeout(EXPORT_SLOT_WAIT, app.exports.clone().acquire_owned()).await {
+                Ok(Ok(p)) => p,
+                _ => {
+                    metrics::SYNC_EXPORTS_ENDED.with_label_values(&["shed"]).inc();
+                    return Err(XrpcError {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        error: "Overloaded".into(),
+                        message: "too many repo exports in progress; retry shortly".into(),
+                    });
+                }
+            }
+        }
+    };
+    metrics::SYNC_EXPORTS.with_label_values(&["running"]).inc();
+    Ok(ExportSlot(p))
+}
+
+/// The `M/` prefetch an export may make now, and its budget permit.
+fn prefetch_budget() -> (Option<tokio::sync::SemaphorePermit<'static>>, usize) {
+    let want = (EXPORT_PREFETCH_BYTES >> 20) as u32;
+    for mb in [want, want / 4, want / 16] {
+        if let Ok(p) = EXPORT_PREFETCH_MB.try_acquire_many(mb) {
+            return (Some(p), (mb as usize) << 20);
+        }
+    }
+    (None, 0)
+}
+
+type ChunkTx = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
+
+/// Queues one body chunk. Err: the client is gone, or took nothing for
+/// `stall` (a reader that stopped reading, e.g. an h2 stream at a zero
+/// window): the export ends either way.
+async fn send_chunk(tx: &ChunkTx, chunk: Vec<u8>, stall: std::time::Duration) -> Result<(), &'static str> {
+    match tokio::time::timeout(stall, tx.send(Ok(Bytes::from(chunk)))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err("client_gone"),
+        Err(_) => Err("stalled"),
+    }
+}
+
+/// The body end of an export's chunk queue. An export that gives up
+/// (stalled reader, read error) aborts it: the queued chunks are freed at
+/// once, and the body ends with an error (the client sees a failed
+/// transfer, not a short CAR that looks complete).
+struct ExportBody {
+    rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>>,
+    aborted: std::sync::atomic::AtomicBool,
+}
+
+impl ExportBody {
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+        let mut rx = self.rx.lock();
+        rx.close();
+        while rx.try_recv().is_ok() {}
+    }
+}
+
+/// A source that fails once its export has ended (`stop` set by a failed
+/// send), so the MST walk stops at its next read instead of walking (and
+/// reading) the rest of the tree for nobody.
+struct Stoppable<'a, S> {
+    inner: S,
+    stop: &'a std::cell::Cell<Option<&'static str>>,
+}
+
+impl<S> Stoppable<'_, S> {
+    fn check(&self) -> Result<(), crate::mst::MstError> {
+        match self.stop.get() {
+            Some(r) => Err(crate::mst::MstError::Store(format!("export ended: {r}"))),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<S: crate::mst_lazy::Source> crate::mst_lazy::Source for Stoppable<'_, S> {
+    fn cached(&self, cid: &Cid) -> Option<Arc<crate::mst::Node>> {
+        self.inner.cached(cid)
+    }
+    fn remember(&self, n: &Arc<crate::mst::Node>) {
+        self.inner.remember(n)
+    }
+    fn node(&self, cid: &Cid) -> Result<Option<Arc<[u8]>>, crate::mst::MstError> {
+        self.check()?;
+        self.inner.node(cid)
+    }
+    fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(crate::mst_lazy::Key, Cid)>) -> Result<(), crate::mst::MstError> {
+        self.check()?;
+        self.inner.records(lo, hi, out)
+    }
+    fn leaf_records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, enc: &mut crate::mst::LeafEncoder) -> Result<(), crate::mst::MstError> {
+        self.check()?;
+        self.inner.leaf_records(lo, hi, enc)
+    }
+}
+
 /// Streams the repo CAR: commit, MST nodes, then records, from one SlateDB
 /// snapshot. One forward `R/` scan feeds both: the MST walk (on a blocking
 /// thread: interior nodes from `M/`, read ahead with one range scan, leaves
@@ -331,105 +504,156 @@ async fn scan_records(
 /// alongside it, and the record blocks wait in a bounded buffer
 /// ([`EXPORT_BUFFER_MB`]) for the nodes to be written; records past the
 /// buffer are read again afterwards. Bytes are the same either way.
+///
+/// Bounded: at most `Config::max_exports` run at once (each holds a
+/// blocking thread for its walk), the `M/` prefetch comes from a
+/// process-wide budget, and an export whose client goes away or reads
+/// nothing for `Config::export_stall` stops at once (walk, scans, queued
+/// chunks), so slow readers can't pin blocking threads, snapshots or
+/// memory.
 async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Response> {
-    const CHUNK: usize = EXPORT_CHUNK;
+    let slot = export_slot(app).await?;
     let (view, snap) = app.repo_view(did).await?;
     let head = view.head.clone();
     drop(view);
-    let prefix = state::record_prefix(did);
     let did: Arc<str> = did.into();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    let stall = app.config.export_stall;
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(EXPORT_QUEUE);
+    let body = Arc::new(ExportBody { rx: parking_lot::Mutex::new(rx), aborted: Default::default() });
+    let ours = body.clone();
     tokio::spawn(async move {
-        let mut buf = Vec::with_capacity(CHUNK + 4096);
-        car::write_header(&mut buf, &head.commit);
-        car::write_block(&mut buf, &head.commit, &head.commit_block);
-        let tx2 = tx.clone();
-        let (ktx, krx) = tokio::sync::mpsc::channel(64);
-        let walk = async {
-            let pre = crate::mst_store::prefetch(&*snap, &did, EXPORT_PREFETCH_BYTES).await.map(|p| p.0).unwrap_or_default();
-            let (snap2, did2, root) = (snap.clone(), did.clone(), head.data);
-            tokio::task::spawn_blocking(move || {
-                let mut emit = |c: Cid, b: &[u8]| {
-                    car::write_block(&mut buf, &c, b);
-                    if buf.len() >= CHUNK {
-                        let _ = tx2.blocking_send(Ok(Bytes::from(std::mem::replace(&mut buf, Vec::with_capacity(CHUNK + 4096)))));
-                    }
-                };
-                let rt = tokio::runtime::Handle::current();
-                let nodes = crate::mst_store::DbSource::new(&*snap2, &did2, &rt).with_prefetched(Some(&pre));
-                let src = crate::mst_store::FedSource::new(nodes, krx);
-                let r = crate::mst_lazy::export_blocks(root, 1, &src, &mut emit).map(|_| ());
-                (r, buf)
-            })
-            .await
+        let _slot = slot;
+        let reason = match stream_export(snap, did.clone(), head, since, &tx, stall).await {
+            Ok(()) => "done",
+            Err(r) => r,
         };
-        let (walked, scanned) = tokio::join!(walk, scan_records(&snap, &did, since, ktx));
-        let (mut buf, scanned) = match (walked, scanned) {
-            (Ok((Ok(()), buf)), Ok(s)) => (buf, s),
-            (_, Err(e)) => {
-                let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
-                return;
-            }
-            _ => {
-                let _ = tx.send(Err(std::io::Error::other("mst walk failed"))).await;
-                return;
-            }
-        };
-        // the buffered records (no copies)
-        let Buffered { chunks, resume_at, _permit: permit, .. } = scanned;
-        if !chunks.is_empty() {
-            if !buf.is_empty() && tx.send(Ok(Bytes::from(std::mem::take(&mut buf)))).await.is_err() {
-                return; // client went away
-            }
-            for c in chunks {
-                if tx.send(Ok(Bytes::from(c))).await.is_err() {
-                    return;
-                }
-            }
-        }
-        drop(permit);
-        let Some(start) = resume_at else {
-            if !buf.is_empty() {
-                let _ = tx.send(Ok(Bytes::from(buf))).await;
-            }
-            return;
-        };
-        let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, ..Default::default() };
-        let mut iter = match snap.scan_with_options([&prefix[..], &start[..]].concat()..state::prefix_end(&prefix), &opts).await {
-            Ok(it) => state::BatchedScan::new(it),
-            Err(e) => {
-                let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
-                return;
-            }
-        };
-        loop {
-            match iter.next().await {
-                Ok(Some(kv)) => {
-                    if since.is_none_or(|s| state::record_value_rev(&kv.value) > s) {
-                        if let Ok((cid, bytes)) = state::record_value_parts(&kv.value) {
-                            car::write_block(&mut buf, &cid, bytes);
-                        }
-                    }
-                    if buf.len() >= CHUNK && tx.send(Ok(Bytes::from(std::mem::replace(&mut buf, Vec::with_capacity(CHUNK + 4096))))).await.is_err() {
-                        return; // client went away
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
-                    return;
-                }
-            }
-        }
-        if !buf.is_empty() {
-            let _ = tx.send(Ok(Bytes::from(buf))).await;
+        metrics::SYNC_EXPORTS_ENDED.with_label_values(&[reason]).inc();
+        if reason != "done" && reason != "client_gone" {
+            tracing::debug!(%did, reason, "getRepo export ended early");
+            ours.abort();
         }
     });
     // fused: body wrappers (response compression) may poll past the end
-    let stream = futures::StreamExt::fuse(futures::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
+    let stream = futures::StreamExt::fuse(futures::stream::poll_fn(move |cx| match body.rx.lock().poll_recv(cx) {
+        std::task::Poll::Ready(None) if body.aborted.swap(false, Ordering::AcqRel) => {
+            std::task::Poll::Ready(Some(Err(std::io::Error::other("repo export aborted"))))
+        }
+        r => r,
     }));
     Ok(([(header::CONTENT_TYPE, "application/vnd.ipld.car")], Body::from_stream(stream)).into_response())
+}
+
+/// [`export_repo`]'s producer. Err: why it ended early (`client_gone`,
+/// `stalled`, `error`).
+async fn stream_export(
+    snap: Arc<slatedb::DbSnapshot>,
+    did: Arc<str>,
+    head: Head,
+    since: Option<u64>,
+    tx: &ChunkTx,
+    stall: std::time::Duration,
+) -> Result<(), &'static str> {
+    const CHUNK: usize = EXPORT_CHUNK;
+    let prefix = state::record_prefix(&did);
+    let mut buf = Vec::with_capacity(CHUNK + 4096);
+    car::write_header(&mut buf, &head.commit);
+    car::write_block(&mut buf, &head.commit, &head.commit_block);
+    let (ktx, krx) = tokio::sync::mpsc::channel(64);
+    let walk = async {
+        let (budget, bytes) = prefetch_budget();
+        let pre = crate::mst_store::prefetch(&*snap, &did, bytes).await.map(|p| p.0).unwrap_or_default();
+        let (snap2, did2, root, tx2) = (snap.clone(), did.clone(), head.data, tx.clone());
+        let r = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            let stop = std::cell::Cell::new(None);
+            let mut emit = |c: Cid, b: &[u8]| {
+                if stop.get().is_some() {
+                    return;
+                }
+                car::write_block(&mut buf, &c, b);
+                if buf.len() >= CHUNK {
+                    let chunk = std::mem::replace(&mut buf, Vec::with_capacity(CHUNK + 4096));
+                    if let Err(r) = rt.block_on(send_chunk(&tx2, chunk, stall)) {
+                        stop.set(Some(r));
+                    }
+                }
+            };
+            let nodes = crate::mst_store::DbSource::new(&*snap2, &did2, &rt).with_prefetched(Some(&pre));
+            let src = Stoppable { inner: crate::mst_store::FedSource::new(nodes, krx), stop: &stop };
+            let r = crate::mst_lazy::export_blocks(root, 1, &src, &mut emit).map(|_| ());
+            (r, stop.get(), buf)
+        })
+        .await;
+        drop(budget);
+        r
+    };
+    let (walked, scanned) = tokio::join!(walk, scan_records(&snap, &did, since, ktx));
+    let mut buf = match walked {
+        Ok((_, Some(reason), _)) => return Err(reason),
+        Ok((Ok(()), None, buf)) => buf,
+        Ok((Err(e), None, _)) => {
+            tracing::warn!(%did, "getRepo: MST walk failed: {e}");
+            return Err("error");
+        }
+        Err(e) => {
+            tracing::warn!(%did, "getRepo: MST walk task: {e}");
+            return Err("error");
+        }
+    };
+    let scanned = scanned.map_err(|e| {
+        tracing::warn!(%did, "getRepo: record scan failed: {e:#}");
+        "error"
+    })?;
+    // the buffered records (no copies)
+    let Buffered { chunks, resume_at, mut seen, _permit: permit, .. } = scanned;
+    if !chunks.is_empty() {
+        if !buf.is_empty() {
+            send_chunk(tx, std::mem::take(&mut buf), stall).await?;
+        }
+        for c in chunks {
+            send_chunk(tx, c, stall).await?;
+        }
+    }
+    drop(permit);
+    let Some(start) = resume_at else {
+        if !buf.is_empty() {
+            send_chunk(tx, buf, stall).await?;
+        }
+        return Ok(());
+    };
+    let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, ..Default::default() };
+    let mut iter = match snap.scan_with_options([&prefix[..], &start[..]].concat()..state::prefix_end(&prefix), &opts).await {
+        Ok(it) => state::BatchedScan::new(it),
+        Err(e) => {
+            tracing::warn!(%did, "getRepo: record rescan failed: {e}");
+            return Err("error");
+        }
+    };
+    loop {
+        match iter.next().await {
+            Ok(Some(kv)) => {
+                if since.is_none_or(|s| state::record_value_rev(&kv.value) > s) {
+                    if let Ok((cid, bytes)) = state::record_value_parts(&kv.value) {
+                        if seen.insert(cid_key(&cid)) {
+                            car::write_block(&mut buf, &cid, bytes);
+                        }
+                    }
+                }
+                if buf.len() >= CHUNK {
+                    send_chunk(tx, std::mem::replace(&mut buf, Vec::with_capacity(CHUNK + 4096)), stall).await?;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(%did, "getRepo: record rescan failed: {e}");
+                return Err("error");
+            }
+        }
+    }
+    if !buf.is_empty() {
+        send_chunk(tx, buf, stall).await?;
+    }
+    Ok(())
 }
 
 /// Blocks by CID from the repo's current state: the commit, MST nodes of the
@@ -642,10 +866,10 @@ async fn lazy_nodes(
         }
         return Ok(out);
     }
-    let refs = {
+    let covered = |want: &HashSet<Cid>| {
         let mut cell = view.nodes.lock();
         match cell.index.as_ref().filter(|ix| ix.covers(rev)) {
-            Some(ix) => Some(lookup(ix, &want)),
+            Some(ix) => Some(lookup(ix, want)),
             None => {
                 // from now on the worker reports written nodes, so the index
                 // built below can catch up with commits made meanwhile
@@ -654,9 +878,23 @@ async fn lazy_nodes(
             }
         }
     };
+    let mut refs = covered(&want);
+    // One build per repo at a time (the others wait for it and use its
+    // index), and a few process-wide: each walks the whole tree on a
+    // blocking thread and holds a map of every leaf until it is installed.
+    let _turn = match refs {
+        Some(_) => None,
+        None => {
+            let gate = index_build_gate(&view.nodes);
+            let turn = gate.lock_owned().await;
+            refs = covered(&want);
+            Some(turn)
+        }
+    };
     let refs = match refs {
         Some(r) => r,
         None => {
+            let _slot = INDEX_BUILDS.acquire().await.expect("never closed");
             let (snap, did, root) = (snap.clone(), did.to_string(), view.head.data);
             let ix = tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Handle::current();
@@ -686,6 +924,27 @@ async fn lazy_nodes(
         }
     }
     Ok(out)
+}
+
+/// Node index builds running at once, process-wide.
+static INDEX_BUILDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+/// The lock a repo's node index builds take turns on, keyed by its shared
+/// index cell (one per cached repo).
+fn index_build_gate(cell: &crate::mst::SharedNodeIndex) -> Arc<tokio::sync::Mutex<()>> {
+    type Gates = HashMap<usize, std::sync::Weak<tokio::sync::Mutex<()>>>;
+    static GATES: std::sync::LazyLock<parking_lot::Mutex<Gates>> = std::sync::LazyLock::new(Default::default);
+    let key = Arc::as_ptr(cell) as usize;
+    let mut g = GATES.lock();
+    if let Some(gate) = g.get(&key).and_then(|w| w.upgrade()) {
+        return gate;
+    }
+    if g.len() >= 1024 {
+        g.retain(|_, w| w.strong_count() > 0);
+    }
+    let gate = Arc::new(tokio::sync::Mutex::new(()));
+    g.insert(key, Arc::downgrade(&gate));
+    gate
 }
 
 /// The block of node `c` if it ends `key`'s path in the view's tree (the
@@ -785,6 +1044,25 @@ fn unowned(shard: crate::slots::ShardId) -> XrpcError {
 /// isn't ours. The local half of listRepos (also served to peers by
 /// /internal/v1/sync/listRepos).
 pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> XResult<(Vec<RepoView>, Option<RepoPos>)> {
+    let mut repos = Vec::with_capacity(limit.min(1000));
+    match list_repos_into(app, pos, limit, &mut repos).await {
+        Ok(next) => Ok((repos, next)),
+        Err(e) => match repos.last() {
+            None => Err(e),
+            // a shard read failed partway (its handoff closed the DB, a
+            // store error): what was listed stands, the next page resumes
+            // right after it
+            Some(last) => {
+                tracing::warn!("listRepos: ending the page early: {}", e.message);
+                let next = RepoPos::after(&last.did);
+                Ok((repos, Some(next)))
+            }
+        },
+    }
+}
+
+/// [`list_repos_local`] into `repos`; returns the next page's start.
+async fn list_repos_into(app: &App, pos: RepoPos, limit: usize, repos: &mut Vec<RepoView>) -> XResult<Option<RepoPos>> {
     /// Only an account's status (serde skips the rest of the JSON).
     #[derive(Deserialize)]
     struct Status<'a> {
@@ -794,7 +1072,6 @@ pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> X
     let layout = app.partitions.layout();
     let mut pos = pos;
     let mut first = true;
-    let mut repos = Vec::with_capacity(limit.min(1000));
     let fam = state::HEAD_FAMILY.len();
     while pos.slot < crate::slots::SLOTS {
         let range = layout.shards[layout.index_of_slot(pos.slot as u16)];
@@ -802,7 +1079,7 @@ pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> X
             if first {
                 return Err(unowned(range.id));
             }
-            return Ok((repos, Some(pos)));
+            return Ok(Some(pos));
         };
         first = false;
         let (h_lo, a_lo) = match &pos.after {
@@ -854,12 +1131,11 @@ pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> X
             });
         }
         if repos.len() >= limit {
-            let last = repos.last().map(|r| RepoPos::after(&r.did));
-            return Ok((repos, last));
+            return Ok(repos.last().map(|r| RepoPos::after(&r.did)));
         }
         pos = RepoPos { slot: range.hi, after: None };
     }
-    Ok((repos, None))
+    Ok(None)
 }
 
 /// Most owners one listRepos page visits (a page crossing many small or
@@ -892,10 +1168,19 @@ async fn list_repos(State(app): AppState, Query(q): Query<ListReposQ>) -> XResul
         let want = limit - repos.len();
         let shard = app.partitions.layout().shard_of_slot(p.slot as u16);
         if app.partitions.get(shard).is_some() || app.cluster.is_none() {
-            let (r, next) = list_repos_local(&app, p, want).await?;
-            repos.extend(r);
-            pos = next;
-            continue;
+            match list_repos_local(&app, p, want).await {
+                Ok((r, next)) => {
+                    repos.extend(r);
+                    pos = next;
+                    continue;
+                }
+                Err(e) if repos.is_empty() => return Err(e),
+                // what earlier owners listed stands: the cursor resumes here
+                Err(e) => {
+                    tracing::warn!(shard = shard.0, "listRepos: local shard failed, ending the page early: {}", e.message);
+                    break;
+                }
+            }
         }
         match owner_page(&app, shard, &p, want).await {
             Ok((body, page)) => {
@@ -1043,7 +1328,9 @@ async fn subscribe_repos(State(app): AppState, Query(q): Query<SubQ>, req: axum:
             return XrpcError::bad("InvalidRequest", "shard must be k/n with 0 <= k < n <= 65536").into_response();
         }
     };
-    app.firehose.upgrade(req, q.cursor, shard)
+    let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip());
+    let client = crate::ratelimit::client_ip(req.headers(), peer, &app.ratelimit.trusted);
+    app.firehose.upgrade(req, q.cursor, shard, client)
 }
 
 /// Asks each configured relay (`config.crawlers`) to crawl this PDS:

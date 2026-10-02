@@ -121,6 +121,7 @@ curl -s -u "admin:$VLPDS_ADMIN_TOKEN" http://NODE:2583/xrpc/vlpds.admin.getClust
 | 6 | `signature_fault` | 3 signatures failed verification right after signing within a minute (suspected memory/CPU fault; see [VlpdsSignatureFault](#vlpdssignaturefault)) | `repeated signature faults: fail-stop (suspect this host's memory or CPU)`, preceded by `signature failed verification against the signing key's public key` (purpose, recent) |
 | 7 | `incompatible_level` | This build can't run the cluster's feature level (`cluster/version`): checked before the node reads or writes anything, again right after its lease write (lease deleted), and once per TTL while running. An old image after a finalize, or a new image whose `MIN_LEVEL` is past the cluster's (see [VlpdsIncompatibleNode](#vlpdsincompatiblenode)) | `incompatible feature level: cluster level N is outside this build's levels A..=B` / `cluster is raising its level to N, past this build's max level B; fail-stop (exit 7)` |
 | 8 | `shutdown_fence` | A graceful stop could not fence its own log within min(TTL, 30 s) of retries. It keeps its lease, so peers presume it dead and fence the log, or the restart (same `--node-id`) does. Its shards were already handed out | `fencing our log on shutdown failed: giving up`, then `...: exiting nonzero without dropping our lease` |
+| 9 | `critical_task_panicked` | A thread or task the node can't run without panicked: a repo worker thread (`repo_worker`), the log sequencer or finalizer (`log_sequencer`, `log_finalizer`), the firehose merger (`firehose_merger`). A bug: the panic message and location are on stderr just before. Peers take its shards over; the restart is clean | the panic (`thread '...' panicked at src/...`), then `critical task panicked: fail-stop (exit 9)` (`task` field) |
 
 **How the previous process ended** is a metric on the next one
 (`src/lifecycle.rs`): each fail-stop writes its `reason` and code to the
@@ -135,6 +136,24 @@ OOM kill, abort, host loss), `none` (first start or no file).
 an incarnation that ended without fencing its own log counts
 `vlpds_peer_takeovers_total{reason="peer"|"restart"}` (a graceful stop fences
 its own log, so it never counts): that survives a node that never comes back.
+
+**Serving limits** (DESIGN.md "HTTP", "Firehose", "Stage 3: readers"):
+
+| Flag (env) | Default | Bounds | Past it |
+|---|---|---|---|
+| `--max-connections` (`VLPDS_MAX_CONNECTIONS`) | 50,000 | open connections per listener | accepts pause (connections wait in the accept queue) |
+| `--peer-listen` (`VLPDS_PEER_LISTEN`) | unset | a second listener for peers, with the large h2 windows; point `--advertise-url` at it. Then `--listen` gets the client settings (1 MiB / 8 MiB windows, 256 streams per connection) | - |
+| `--max-exports` (`VLPDS_MAX_EXPORTS`) | 32 | getRepo exports streaming at once | waits 10 s for a slot, then 503 `Overloaded` (`vlpds_sync_exports_ended_total{reason="shed"}`) |
+| `--export-stall-secs` (`VLPDS_EXPORT_STALL_SECS`) | 60 | how long an export waits for a client that reads nothing | export ended, body errors (`reason="stalled"`) |
+| `--max-queued-reads` (`VLPDS_MAX_QUEUED_READS`) | 20,000 | repo-view reads (getRepo, getRecord, getBlocks, ...) queued at the repo workers | 503 `Overloaded` |
+| `--firehose-max-backfills` (`VLPDS_FIREHOSE_MAX_BACKFILLS`) | 16 | cursor backfills running at once (x `--backfill-readahead-mb` of read-ahead) | waits for a slot (`vlpds_firehose_backfills{state="waiting"}`) |
+| `--firehose-max-per-ip` (`VLPDS_FIREHOSE_MAX_PER_IP`) | 256 | subscribeRepos connections per client IP (IPv6 /64) | 429 `RateLimitExceeded` (`vlpds_firehose_rejected_total{reason="per_ip"}`) |
+
+Not flags: a subscriber that takes no bytes for 30 s outside the live path
+(backfill, pongs) is dropped (`vlpds_firehose_disconnects_total{reason="write_stalled"}`);
+Argon2 runs at most one per core (16 max) at once, the rest queue; accept
+errors are retried every 50 ms (`vlpds_http_server_accept_errors_total`,
+log `accept failed (retrying)`: usually out of file descriptors).
 
 **Logs** go to stderr; stdout carries only machine output (wrapped keys,
 `vlpds admin` tables and `--json`). `--log-format json` (`VLPDS_LOG_FORMAT`)

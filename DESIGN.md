@@ -149,7 +149,13 @@ deletes), all in one state batch.
 - **Failure policy: fail-stop.** A segment PUT is retried until it succeeds (the
   idempotent key makes this safe). If it is unrecoverable, the process exits and
   recovery replays from durable state. Unacked in-memory commits are discarded,
-  which is safe because they were never acknowledged or broadcast.
+  which is safe because they were never acknowledged or broadcast. The same
+  goes for a panic in a thread or task the node can't run without and never
+  restarts (repo worker threads, the log's sequencer and finalizer, the
+  firehose merger): the binary's panic hook fail-stops (exit 9,
+  `critical_task_panicked`) when the panicking thread or task is marked
+  critical (`lifecycle::critical`, `mark_critical_thread`). Before, tokio
+  caught the panic and the node stayed up, wedged.
 - Segment format: a header (uncompressed, so header-only range GETs work)
   and a body of length-prefixed entries (firehose frame + state mutations),
   stored zstd-compressed (see "Log compression" under HA). Serving the
@@ -382,7 +388,25 @@ swappable.
 - Backfill: a cursor behind the ring is served from S3 with read-ahead (up to 32
   GETs per log, `--backfill-readahead-mb` total) through a shared segment cache
   (`--backfill-cache-mb`), then handed to the live ring once it reaches the ring
-  floor. Readers stop at a log's first non-segment (hole rule).
+  floor. Readers stop at a log's first non-segment (hole rule). At most
+  `--firehose-max-backfills` (16) backfills run at once, so read-ahead is
+  bounded process-wide (16 x 64 MiB); more wait for a slot
+  (`vlpds_firehose_backfills{state}`), answering pings and noticing a client
+  that leaves. A backfill waiting for the merger to settle past the start
+  floor waits on it (a watch), not a 5 ms poll, and notices a client that
+  leaves meanwhile.
+- Bounds on the slow paths: every subscriber write outside the live path
+  (backfill chunks, info frames, pongs) that makes no progress for 30 s
+  drops the subscriber (`write_stalled`); the live path bounds lag instead.
+  At most `--firehose-max-per-ip` (256) subscribeRepos connections per
+  client address (IPv6: per /64; the forwarded client behind
+  `--trusted-proxies`), 429 `RateLimitExceeded` past it
+  (`vlpds_firehose_rejected_total{reason="per_ip"}`). subscribeRepos is
+  exempt from the rate limiter, so this is its only per-client cap.
+- A spilled log whose next segment never appears because retention deleted
+  it (its read-back a whole window behind) skips to the log's first
+  segment with a warning, as a follower's catch-up does; otherwise its live
+  batches, which rejoin only at that ordinal, were ignored for good.
 - Events: `#commit` (sync 1.1), `#sync` (account creation / repo reset),
   `#identity`, `#account`.
 - Sharded subscriptions (vlpds extension):
@@ -482,7 +506,9 @@ VLAN, WireGuard/Tailscale, a VPC), and an edge proxy must not pass
 role's Caddy answers 404 for them and publishes the app port on loopback
 only. There is no separate internal listener yet: the peer address
 (`--advertise-url`) is used for both forwarding and internal calls, so
-splitting them needs a second advertised address. `/metrics` and
+splitting them needs a second advertised address (`--peer-listen` moves peer
+traffic, forwards and `/internal/*`, to its own listener, but the public
+listener still serves `/internal/*` with the token). `/metrics` and
 `/debug/pprof` are on `--metrics-listen` (default `127.0.0.1:9583`; on the
 app port only with `--dev-mode` or `--metrics-listen app`).
 
@@ -506,14 +532,26 @@ fill a connection window. Cost: one allocation and an uncontended shard
 lock per watched body, an uncontended lock per chunk; small proxied
 responses (the common case) are buffered and not watched.
 
-Server (`server::serve`, HTTP/1.1 + h2c auto): h1 header read timeout 30 s
-(slowloris; also the idle keep-alive bound), h2 windows as above, 1,024
-concurrent streams per connection, 32 KiB header list, PING every 20 s with a
-10 s timeout, rapid-reset limits at hyper/h2's defaults (20 pending accept
-resets, 1,024 local error resets; CVE-2023-44487). Metrics:
-`vlpds_http_server_connections_total`, `_connections_open`,
-`vlpds_http_server_active_requests{version}` (h2 = streams awaiting a
-response head).
+Server (`server::serve_with`, HTTP/1.1 + h2c auto): h1 header read timeout 30 s
+(slowloris; also the idle keep-alive bound), 32 KiB header list, PING every
+20 s with a 10 s timeout, rapid-reset limits at hyper/h2's defaults (20
+pending accept resets, 1,024 local error resets; CVE-2023-44487). h2 windows
+and streams by profile: *peer* (4 MiB stream / 64 MiB connection windows,
+1,024 streams per connection; the peer client's own stream window is 1 MiB) and *public* (1 MiB / 8
+MiB, 256 streams). Peers forward to `--advertise-url`, which is `--listen`
+unless `--peer-listen` adds a second listener for them: then `--peer-listen`
+serves the peer profile and `--listen` the public one; without it
+`--listen` keeps the peer profile (peers use it). A client's buffered
+request bytes and concurrent requests per connection scale with these. At
+most `--max-connections` (50,000) connections per listener: at the cap the
+listener stops accepting (new ones wait in the accept queue); an upgraded
+subscribeRepos connection gives its slot back (the firehose caps those).
+An accept error (EMFILE, ENFILE, ...) is logged, counted
+(`vlpds_http_server_accept_errors_total`) and retried after 50 ms, as
+axum::serve does; it used to end the server and the process, without a
+graceful handoff. Metrics: `vlpds_http_server_connections_total`,
+`_connections_open`, `vlpds_http_server_active_requests{version}` (h2 =
+streams awaiting a response head).
 
 Deployment endpoints (`src/xrpc/identity.rs`; any node answers for any
 account, as `/.well-known/atproto-did` does):
@@ -975,9 +1013,14 @@ zstd frame (level 1 by default, 0 = off) behind an uncompressed header
 
 - **Writer.** The finalizer keeps the *uncompressed* sealed object: the live
   ring, the merger and peers' live streams get zero-copy slices of it, as
-  before. Compression runs in the segment's upload task on the blocking
-  pool (a few ms per full segment), and hedges/retries PUT the same
-  compressed bytes (conflict resolution compares those).
+  before. Compression runs in the segment's upload task on a small
+  dedicated thread pool (`nodelog::commit_pool`: cores/4, 2 to 8 threads;
+  a few ms per full segment), not tokio's shared blocking pool: that one
+  also runs request-driven work (getRepo walks, cold loads, Argon2), and a
+  compression queued behind it stalled every ack. Hedges/retries PUT the
+  same compressed bytes (conflict resolution compares those), after a
+  jittered backoff (x0.5-1.5) so K segments failing on one S3 hiccup don't
+  retry in lockstep.
 - **Readers.** `segment::decode` restores exactly the bytes the writer sealed
   (codec byte reset), so entry offsets agree; `segment::parse` decodes
   first, so replay (decompressing its 16 read-ahead GETs in parallel),
@@ -1776,7 +1819,12 @@ priced in the cost model (8 nodes / 1,024 shards) and designed for in
 | Login (Argon2) | ~20 ms | ~1.2 (5 M logins/day, assumed) | ~12 |
 | **Busy cores, fleet-wide** | | **~3** | **~25** |
 
-Logins and proxying set the CPU, not commits. Sizing rule: after losing
+Logins and proxying set the CPU, not commits. Argon2 runs at most one
+hash or verification per core (at most 16) at once, process-wide
+(`state::ARGON2_PERMITS`); the rest wait their turn, so a login flood
+costs queueing, not 19 MiB and a blocking-pool thread per request. The
+`try_` variants shed with `Argon2Busy` after 2 s for handlers that answer
+503 instead. Sizing rule: after losing
 one node, the survivors stay under ~60% CPU, i.e.
 (nodes − 1) × cores × 0.6 ≥ busy cores.
 
@@ -2113,11 +2161,29 @@ root through the store).
   same bytes as before). The buffer is 1 MiB grants from a process-wide
   256 MiB, at most 64 MiB per export; records past it are read again by a
   second scan (`tests/all/mst_lazy.rs` `export_buffer_caps_give_same_bytes`).
+  Records with identical contents share a CID: the export writes that block
+  once (a per-export set of written record CIDs, 16 B each).
+  Exports are bounded (`tests/all/export_limits.rs`): at most
+  `--max-exports` (32) stream at once (each holds a blocking-pool thread for
+  its walk; more wait up to 10 s for a slot, then 503 `Overloaded`); the
+  `M/` prefetch (64 MiB per export) comes from a process-wide 512 MiB budget
+  (less, or point reads only, while others hold it); and an export whose
+  client is gone, or has read nothing for `--export-stall-secs` (60; an h2
+  stream at a zero window), stops at once: the walk at its next read, the
+  scans, and its queued body chunks are freed, and the body ends with an
+  error rather than a short CAR. Before, a client that never read parked
+  its walk's blocking thread forever (and a gone client's walk ran to the
+  end): ~512 such streams emptied tokio's blocking pool, which segment
+  compression shared, and commits stopped
+  (`vlpds_sync_exports{state}`, `vlpds_sync_exports_ended_total{reason}`).
   getBlocks: loaded nodes, leaves the repo's `NodeIndex` places (once built,
   without probing `M/` and the record index first), `M/` point reads
   (interior), record CIDs as before, then the rest via the `NodeIndex`
   (built once by a streamed walk, advanced by the worker per commit; a miss
   in an index covering the view is final), each read by a walk to its key.
+  Index builds are single-flight per repo (concurrent getBlocks wait for
+  the one build and use its index) and at most 4 run process-wide. The
+  installed index is not yet charged to the repo cache budget.
   A walk that has to rebuild a leaf rebuilds its unloaded siblings from the
   same scan of the parent's range (`mst_store::load_leaves`: a small range
   scan costs mostly its setup). Loaded nodes are kept process-wide by CID

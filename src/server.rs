@@ -64,8 +64,24 @@ pub struct Config {
     /// shared by subscribers replaying the same range.
     pub backfill_readahead_bytes: usize,
     pub backfill_cache_bytes: usize,
+    /// Cursor backfills running at once (more wait their turn): with
+    /// `backfill_readahead_bytes` each, the process-wide read-ahead bound.
+    pub firehose_max_backfills: usize,
+    /// subscribeRepos connections per client IP (IPv6: per /64); 0 = no cap.
+    pub firehose_max_per_ip: usize,
     pub hedge_after: Duration,
     pub max_inflight_writes: usize,
+    /// Reads queued at the repo workers (repo views for getRepo, getRecord,
+    /// getBlocks, ...) before shedding with 503: each holds its slot until
+    /// its worker answers, so a slow repo load can't queue them unbounded.
+    pub max_queued_reads: usize,
+    /// getRepo / getCheckout exports streaming at once; more wait up to 10 s
+    /// for a slot, then get 503.
+    pub max_exports: usize,
+    /// An export whose client reads nothing for this long is ended.
+    pub export_stall: Duration,
+    /// Connections open at once per listener (0 = no cap).
+    pub max_connections: usize,
     pub cache_dir: Option<std::path::PathBuf>,
     /// The SST disk cache budget of this node (`--disk-cache-mb`), split
     /// over the layout's shards; None = SlateDB's 16 GiB per shard.
@@ -268,8 +284,14 @@ impl Default for Config {
             firehose_max_lag_bytes: crate::firehose::DEFAULT_MAX_LAG_BYTES,
             backfill_readahead_bytes: crate::backfill::DEFAULT_READAHEAD_BYTES,
             backfill_cache_bytes: crate::backfill::DEFAULT_CACHE_BYTES,
+            firehose_max_backfills: crate::firehose::DEFAULT_MAX_BACKFILLS,
+            firehose_max_per_ip: crate::firehose::DEFAULT_MAX_PER_IP,
             hedge_after: Duration::from_millis(100),
             max_inflight_writes: 20_000,
+            max_queued_reads: 20_000,
+            max_exports: crate::xrpc::DEFAULT_MAX_EXPORTS,
+            export_stall: crate::xrpc::DEFAULT_EXPORT_STALL,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             cache_dir: None,
             disk_cache_bytes: None,
             disk_cache_shard_bytes: None,
@@ -348,6 +370,9 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         max_lag_bytes: cfg.firehose_max_lag_bytes,
         readahead_bytes: cfg.backfill_readahead_bytes,
         backfill_cache_bytes: cfg.backfill_cache_bytes,
+        max_backfills: cfg.firehose_max_backfills,
+        max_per_ip: cfg.firehose_max_per_ip,
+        write_idle: crate::firehose::DEFAULT_WRITE_IDLE,
         runtime: (cfg.firehose_threads > 0).then(|| crate::firehose::runtime(cfg.firehose_threads)),
     });
     firehose.set_max_queue_bytes(cfg.firehose_merge_queue_bytes.max(1));
@@ -463,7 +488,9 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         tids: crate::tid::TidClock::new(),
         public_url: cfg.public_url.clone(),
         handle_domain: cfg.handle_domain.clone(),
-        write_permits: tokio::sync::Semaphore::new(cfg.max_inflight_writes),
+        write_permits: Arc::new(tokio::sync::Semaphore::new(cfg.max_inflight_writes)),
+        read_permits: Arc::new(tokio::sync::Semaphore::new(cfg.max_queued_reads.max(1))),
+        exports: Arc::new(tokio::sync::Semaphore::new(cfg.max_exports.max(1))),
         admin_token: cfg.admin_token.clone(),
         did_resolver: Arc::new(crate::did_resolver::DidResolver::new(&cfg.plc_url, cfg.dev_mode)),
         http,
@@ -505,8 +532,9 @@ pub async fn spawn(
     let app = build(cfg).await?;
     let addr = listener.local_addr()?;
     let router = router(&app);
+    let opts = ServeOptions { max_connections: app.config.max_connections, ..Default::default() };
     tokio::spawn(async move {
-        if let Err(e) = serve(listener, router).await {
+        if let Err(e) = serve_with(listener, router, opts).await {
             tracing::error!("server exited: {e:#}");
         }
     });
@@ -551,14 +579,72 @@ pub fn metrics_router(app: &Arc<xrpc::App>) -> axum::Router {
         .with_state(app.clone())
 }
 
+/// HTTP/2 settings profile of a listener (DESIGN.md "HTTP").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum H2Profile {
+    /// Node-to-node forwarding (and a `--listen` that peers also use):
+    /// 4 MiB stream / 64 MiB connection windows, 1,024 streams.
+    Peer,
+    /// Clients only (`--listen` once `--peer-listen` takes the peers): 1 MiB
+    /// stream / 8 MiB connection windows, 256 streams. What one connection
+    /// can make the server buffer, and how many requests it can start at
+    /// once, scale with these.
+    Public,
+}
+
+/// How a listener is served.
+#[derive(Clone, Copy, Debug)]
+pub struct ServeOptions {
+    pub h2: H2Profile,
+    /// Most connections open at once; at the cap the listener stops
+    /// accepting (new connections wait in the kernel's accept queue) until
+    /// one closes. 0 = no cap.
+    pub max_connections: usize,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        ServeOptions { h2: H2Profile::Peer, max_connections: DEFAULT_MAX_CONNECTIONS }
+    }
+}
+
+/// Default `--max-connections` (per listener).
+pub const DEFAULT_MAX_CONNECTIONS: usize = 50_000;
+
+/// What `serve` accepts connections from: a TCP listener (tests inject
+/// failing ones).
+pub trait Accept: Send + 'static {
+    fn poll_accept(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>>;
+}
+
+impl Accept for tokio::net::TcpListener {
+    fn poll_accept(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>> {
+        tokio::net::TcpListener::poll_accept(self, cx)
+    }
+}
+
+/// [`serve_with`] with the peer profile and the default connection cap.
+pub async fn serve(listener: tokio::net::TcpListener, router: axum::Router) -> anyhow::Result<()> {
+    serve_with(listener, router, ServeOptions::default()).await
+}
+
 /// HTTP/1.1 + HTTP/2 (h2c) server. axum::serve doesn't expose HTTP/2 settings,
 /// and hyper's default 64KB connection window chops request bodies on busy
 /// connections into tiny DATA frames, which trips h2's small-frame flood guard.
 /// Settings and their reasons: DESIGN.md "HTTP".
-pub async fn serve(listener: tokio::net::TcpListener, router: axum::Router) -> anyhow::Result<()> {
+///
+/// Runs until the process ends: an accept error (EMFILE, ENFILE, ENOBUFS,
+/// a connection reset while queued) is logged and retried after a short
+/// pause, as axum::serve does, instead of ending the server (and with it
+/// the process, without a graceful handoff).
+pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: ServeOptions) -> anyhow::Result<()> {
     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
     use hyper_util::server::conn::auto::Builder;
     use hyper_util::service::TowerToHyperService;
+    let (stream_window, conn_window, streams) = match opts.h2 {
+        H2Profile::Peer => (4 << 20, 64 << 20, 1024),
+        H2Profile::Public => (1 << 20, 8 << 20, 256),
+    };
     let mut builder = Builder::new(TokioExecutor::new());
     builder
         .http1()
@@ -571,12 +657,12 @@ pub async fn serve(listener: tokio::net::TcpListener, router: axum::Router) -> a
     builder
         .http2()
         .timer(TokioTimer::new())
-        .initial_stream_window_size(4 << 20)
-        .initial_connection_window_size(64 << 20)
+        .initial_stream_window_size(stream_window)
+        .initial_connection_window_size(conn_window)
         .max_frame_size(256 << 10)
         // per connection; the load generator spreads its requests over 64
         // connections, peers over --peer-connections
-        .max_concurrent_streams(1024)
+        .max_concurrent_streams(streams)
         // atproto heads (DPoP proof + access token) are a few KiB
         .max_header_list_size(32 << 10)
         // PING idle clients; drop the connection after 10 s without a PONG
@@ -590,8 +676,23 @@ pub async fn serve(listener: tokio::net::TcpListener, router: axum::Router) -> a
         h1: crate::metrics::HTTP_SERVER_ACTIVE.with_label_values(&["h1"]),
         h2: crate::metrics::HTTP_SERVER_ACTIVE.with_label_values(&["h2"]),
     };
+    let slots = (opts.max_connections > 0).then(|| Arc::new(tokio::sync::Semaphore::new(opts.max_connections)));
     loop {
-        let (sock, peer) = listener.accept().await?;
+        // a slot first: at the cap, connections wait in the accept queue
+        let slot = match &slots {
+            Some(s) => Some(s.clone().acquire_owned().await.expect("never closed")),
+            None => None,
+        };
+        let (sock, peer) = match std::future::poll_fn(|cx| listener.poll_accept(cx)).await {
+            Ok(c) => c,
+            Err(e) => {
+                crate::metrics::HTTP_SERVER_ACCEPT_ERRORS.inc();
+                tracing::warn!("accept failed (retrying): {e}");
+                // EMFILE and friends last until something closes: don't spin
+                tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
+                continue;
+            }
+        };
         let _ = sock.set_nodelay(true);
         crate::metrics::HTTP_SERVER_CONNECTIONS.inc();
         // peer address for rate limiting (axum ConnectInfo)
@@ -612,9 +713,15 @@ pub async fn serve(listener: tokio::net::TcpListener, router: axum::Router) -> a
                 .serve_connection_with_upgrades(TokioIo::new(sock), svc)
                 .await;
             crate::metrics::HTTP_SERVER_OPEN.dec();
+            // an upgraded connection (subscribeRepos) lives on past this
+            // without a slot: the firehose caps its subscribers itself
+            drop(slot);
         });
     }
 }
+
+/// Pause after a failed accept.
+const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
 
 #[derive(Clone)]
 struct ActiveRequests {
@@ -779,6 +886,51 @@ mod tests {
         Config { s3: Some(s3(DEV_S3_CREDENTIAL)), ..Config::default() }.check_secrets().expect("dev mode allows them");
         let dbg = format!("{:?}", s3("AKIAREAL"));
         assert!(!dbg.contains("AKIAREAL"), "{dbg}");
+    }
+
+    /// Accept errors (EMFILE and the like) are retried, not fatal: the
+    /// server keeps serving; and at the connection cap a new connection
+    /// waits until one closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_errors_are_retried_and_connections_capped() {
+        struct Flaky {
+            inner: tokio::net::TcpListener,
+            fail: usize,
+        }
+        impl Accept for Flaky {
+            fn poll_accept(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>> {
+                if self.fail > 0 {
+                    self.fail -= 1;
+                    return std::task::Poll::Ready(Err(std::io::Error::from_raw_os_error(24))); // EMFILE
+                }
+                self.inner.poll_accept(cx)
+            }
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let before = crate::metrics::HTTP_SERVER_ACCEPT_ERRORS.get();
+        let router = axum::Router::new().route("/ok", axum::routing::get(|| async { "ok" }));
+        let server = tokio::spawn(serve_with(Flaky { inner: l, fail: 3 }, router, ServeOptions { max_connections: 1, ..Default::default() }));
+        let get = || async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"GET /ok HTTP/1.1\r\nhost: x\r\n\r\n").await.unwrap();
+            let mut buf = [0u8; 256];
+            let n = c.read(&mut buf).await.unwrap();
+            (String::from_utf8_lossy(&buf[..n]).into_owned(), c)
+        };
+        let (first, held) = tokio::time::timeout(Duration::from_secs(5), get()).await.expect("served after accept errors");
+        assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+        assert!(crate::metrics::HTTP_SERVER_ACCEPT_ERRORS.get() >= before + 3);
+        assert!(!server.is_finished(), "accept errors don't end the server");
+        // the one slot is held by `held` (keep-alive): the next connection waits
+        let second = tokio::spawn(get());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!second.is_finished(), "served past the connection cap");
+        drop(held);
+        let (r, _) = tokio::time::timeout(Duration::from_secs(5), second).await.expect("served once a slot freed").unwrap();
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        server.abort();
     }
 
     /// `metrics_listen` moves /metrics and /debug/pprof off the app port.

@@ -653,7 +653,8 @@ pub fn parse_duration(s: &str) -> anyhow::Result<Duration> {
         _ => anyhow::bail!("bad duration unit in {s:?} (ms, s, m, h, d)"),
     };
     anyhow::ensure!(secs.is_finite() && secs >= 0.0, "bad duration {s:?}");
-    Ok(Duration::from_secs_f64(secs))
+    // from_secs_f64 panics past Duration::MAX (a flag of 10^23 days)
+    Duration::try_from_secs_f64(secs).map_err(|_| anyhow::anyhow!("duration {s:?} out of range"))
 }
 
 #[cfg(test)]
@@ -671,6 +672,8 @@ mod tests {
         assert_eq!(parse_duration("250ms").unwrap(), Duration::from_millis(250));
         assert_eq!(parse_duration("3d").unwrap(), Duration::from_secs(3 * 86400));
         assert!(parse_duration("3w").is_err() && parse_duration("h").is_err());
+        // past Duration::MAX: an error, not a panic
+        assert!(parse_duration("99999999999999999999999d").is_err());
     }
 
     /// A one-entry segment sealed with `prefix_end`.

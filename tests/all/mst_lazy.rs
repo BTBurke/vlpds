@@ -760,7 +760,9 @@ impl RefRepo {
         let tail = car_tail(&r.body);
         assert!(tail.len() >= nodes.len() && tail[..nodes.len()] == nodes[..], "{did}: getRepo MST blocks differ ({} vs {} nodes)", tail.len(), nodes.len());
         let got: Vec<Cid> = tail[nodes.len()..].iter().map(|b| b.0).collect();
-        assert_eq!(got, recs.iter().map(|r| r.1).collect::<Vec<_>>(), "{did}: getRepo records");
+        // in key order, each block once (records with the same contents share one)
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(got, recs.iter().map(|r| r.1).filter(|c| seen.insert(*c)).collect::<Vec<_>>(), "{did}: getRepo records");
         let record_bytes: HashMap<Cid, Vec<u8>> = tail[nodes.len()..].iter().cloned().collect();
         for (c, b) in &record_bytes {
             assert_eq!(Cid::dag_cbor(b), *c);
