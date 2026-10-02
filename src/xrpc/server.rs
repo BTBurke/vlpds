@@ -464,6 +464,8 @@ pub(super) struct Ext {
     gen: AtomicU64,
     pub(super) dev_mail: PMutex<HashMap<String, Vec<Mail>>>,
     locks: Vec<tokio::sync::Mutex<()>>,
+    /// [`STALE_CLAIM_GRACE`] (tests shorten it: [`set_stale_claim_grace`])
+    claim_grace_ms: AtomicU64,
 }
 
 static EXTS: RwLock<Vec<(usize, Arc<Ext>)>> = RwLock::new(Vec::new());
@@ -482,6 +484,7 @@ pub(super) fn ext(app: &App) -> Arc<Ext> {
         gen: AtomicU64::new(0),
         dev_mail: PMutex::new(HashMap::new()),
         locks: (0..64).map(|_| tokio::sync::Mutex::new(())).collect(),
+        claim_grace_ms: AtomicU64::new(STALE_CLAIM_GRACE.as_millis() as u64),
     });
     w.push((id, e.clone()));
     e
@@ -865,44 +868,82 @@ pub(super) async fn did_by_email(app: &App, email: &str) -> XResult<Option<Strin
 
 /// Claims `email` for `did`. Ok(false) when another account holds it.
 pub(super) async fn claim_email(app: &App, email: &str, did: &str) -> XResult<bool> {
-    let opts = PutOptions {
-        mode: PutMode::Create,
-        ..Default::default()
-    };
-    match app
-        .store
-        .raw
-        .put_opts(
-            &email_path(app, email),
-            PutPayload::from(did.as_bytes().to_vec()),
-            opts,
-        )
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(object_store::Error::AlreadyExists { .. }) => {
-            let holder = did_by_email(app, email).await?;
-            if holder.as_deref() == Some(did) {
-                return Ok(true);
-            }
-            // stale claim from a deleted account
-            if let Some(h) = &holder {
-                if app.partition(h).is_ok() && app.account(h).await.is_err() {
-                    app.store
-                        .raw
-                        .put(
-                            &email_path(app, email),
-                            PutPayload::from(did.as_bytes().to_vec()),
-                        )
-                        .await
-                        .map_err(XrpcError::from_err)?;
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+    let email = email.to_ascii_lowercase();
+    claim(app, &email_path(app, &email), did, move |a: &Account| a.email.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(&email))).await
+}
+
+/// How old a handle or email claim must be before it can be taken over
+/// from a holder without an account standing on it ([`claim`]): longer than
+/// any createAccount / updateHandle / updateEmail between its claim and
+/// its account write (the account doesn't exist yet while it's created).
+pub const STALE_CLAIM_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Test hook: this server's [`STALE_CLAIM_GRACE`].
+#[doc(hidden)]
+pub fn set_stale_claim_grace(app: &App, grace: std::time::Duration) {
+    ext(app).claim_grace_ms.store(grace.as_millis() as u64, Ordering::Relaxed);
+}
+
+/// The claim object at `path`: its holder, version and age.
+async fn read_claim(app: &App, path: &object_store::path::Path) -> XResult<Option<(String, object_store::UpdateVersion, std::time::Duration)>> {
+    match app.store.raw.get(path).await {
+        Ok(r) => {
+            let meta = r.meta.clone();
+            let holder = String::from_utf8_lossy(&r.bytes().await.map_err(XrpcError::from_err)?).to_string();
+            let age = (chrono::Utc::now() - meta.last_modified).to_std().unwrap_or_default();
+            Ok(Some((holder, object_store::UpdateVersion { e_tag: meta.e_tag, version: meta.version }, age)))
         }
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
         Err(e) => Err(XrpcError::from_err(e)),
     }
+}
+
+/// Global uniqueness of a handle or email: a conditional create of the claim
+/// object holding `did`. Ok(true): claimed (or already ours). A claim held by
+/// another DID is taken over only when it is stale: older than the grace
+/// period and its holder definitely has no account standing on it (`holds`;
+/// no account at all, or one that moved to another value; a failed lookup
+/// is not "no account"), by a compare-and-swap on the version read, so two
+/// takers can't both win and a holder that just claimed (mid-createAccount:
+/// no account yet) keeps it. Claims a failed release or a deletion left
+/// behind are reclaimed this way.
+async fn claim(app: &App, path: &object_store::path::Path, did: &str, holds: impl Fn(&Account) -> bool) -> XResult<bool> {
+    let payload = || PutPayload::from(did.as_bytes().to_vec());
+    let grace = std::time::Duration::from_millis(ext(app).claim_grace_ms.load(Ordering::Relaxed));
+    for _ in 0..3 {
+        let create = PutOptions { mode: PutMode::Create, ..Default::default() };
+        match app.store.raw.put_opts(path, payload(), create).await {
+            Ok(_) => return Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) => {}
+            Err(e) => return Err(XrpcError::from_err(e)),
+        }
+        // released meanwhile: create again
+        let Some((holder, version, age)) = read_claim(app, path).await? else { continue };
+        if holder == did {
+            return Ok(true);
+        }
+        if age < grace {
+            return Ok(false);
+        }
+        let stale = match super::internal::account_anywhere(app, &holder).await {
+            Ok(a) => !holds(&a),
+            Err(e) => e.error == "AccountNotFound",
+        };
+        if !stale || (version.e_tag.is_none() && version.version.is_none()) {
+            return Ok(false);
+        }
+        let swap = PutOptions { mode: PutMode::Update(version), ..Default::default() };
+        match app.store.raw.put_opts(path, payload(), swap).await {
+            Ok(_) => {
+                tracing::info!(%did, %holder, claim = %path, "took over a stale claim");
+                return Ok(true);
+            }
+            // changed since read (another taker, or released): look again
+            Err(object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. } | object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(XrpcError::from_err(e)),
+        }
+    }
+    Ok(false)
 }
 
 /// Releases `email` if `did` holds it.
@@ -918,28 +959,10 @@ fn handle_path(app: &App, handle: &str) -> object_store::path::Path {
     object_store::path::Path::from(format!("{}/handle/{}", app.store.prefix, handle))
 }
 
-/// Claims `handle` for `did` (conditional create). Ok(false) when taken.
+/// Claims `handle` for `did` ([`claim`]). Ok(false) when taken.
 pub(super) async fn claim_handle(app: &App, handle: &str, did: &str) -> XResult<bool> {
-    let opts = PutOptions {
-        mode: PutMode::Create,
-        ..Default::default()
-    };
-    match app
-        .store
-        .raw
-        .put_opts(
-            &handle_path(app, handle),
-            PutPayload::from(did.as_bytes().to_vec()),
-            opts,
-        )
-        .await
-    {
-        Ok(_) => Ok(true),
-        Err(object_store::Error::AlreadyExists { .. }) => {
-            Ok(app.resolve_handle(handle).await?.as_deref() == Some(did))
-        }
-        Err(e) => Err(XrpcError::from_err(e)),
-    }
+    let h = handle.to_string();
+    claim(app, &handle_path(app, handle), did, move |a: &Account| a.handle == h).await
 }
 
 pub(super) async fn release_handle(app: &App, handle: &str, did: &str) {
@@ -1419,7 +1442,12 @@ async fn create_account(
 ) -> XResult<Json<J>> {
     const LXM: &str = "com.atproto.server.createAccount";
     let requester = super::authn::optional_service_auth(&app, &headers, LXM).await?;
-    let acct = create_account_inner(&app, inp, requester.as_ref().map(|r| r.did())).await?;
+    // The requester is the token's whole `iss` (the reference's
+    // userServiceAuth credentials.did = payload.iss): a `did#service` issuer
+    // (e.g. `#atproto_labeler`, verified with the DID's label key) is a
+    // service of the DID, never the account holder, so it can't bring the DID.
+    let requester = requester.filter(|r| !r.iss.contains('#'));
+    let acct = create_account_inner(&app, inp, requester.as_ref().map(|r| r.iss.as_str())).await?;
     let (access, refresh) = create_session_tokens(&app, &acct.did, None).await?;
     let mut out = json!({
         "handle": acct.handle,
@@ -1609,6 +1637,11 @@ pub(super) async fn create_account_inner(
             release_handle(app, &handle, &did).await;
             release_email(app, &email, &did).await;
             release(claim).await;
+            if matches!(err, crate::plc::PlcError::Unavailable(_)) {
+                // maybe registered (a timeout after the directory applied
+                // it); a retry mints another DID, so this one is an orphan
+                tombstone_if_registered(plc.clone(), did.clone());
+            }
             return Err(err.into());
         }
     }
@@ -1625,6 +1658,10 @@ pub(super) async fn create_account_inner(
     set_extra(&mut acct, "totpEnabled", json!(false));
     if let Some(code) = &invite {
         set_extra(&mut acct, "invitedBy", json!(code));
+    }
+    if genesis.is_some() && recovery_key.is_some() {
+        // the user's own rotation key can change the DID without us
+        set_extra(&mut acct, super::identity::PLC_EXTERNAL, json!(true));
     }
     if external {
         // deactivated until the migration completes (activateAccount); the
@@ -1646,14 +1683,43 @@ pub(super) async fn create_account_inner(
             records: Vec::new(),
             reply: tx,
         }));
-    let created = match sent {
-        Ok(()) => rx
-            .await
-            .map_err(|_| XrpcError::internal("worker dropped request"))
-            .and_then(|r| r.map_err(XrpcError::from)),
-        Err(e) => Err(XrpcError::from_err(e)),
+    // (error, definite): definite failures applied nothing
+    let created: Result<(), (XrpcError, bool)> = match sent {
+        Ok(()) => match rx.await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => {
+                let definite = match &e {
+                    WriteError::Unavailable(_) | WriteError::KeyUnavailable(_) | WriteError::SignatureFault(_) => true,
+                    // "repo already exists": maybe an earlier attempt of ours
+                    WriteError::Invalid(m) => m != crate::worker::REPO_EXISTS,
+                    // incl. the log write failing or timing out: maybe durable
+                    _ => false,
+                };
+                Err((e.into(), definite))
+            }
+            Err(_) => Err((XrpcError::internal("worker dropped request"), false)),
+        },
+        // never reached the worker
+        Err(e) => Err((XrpcError::from_err(e), true)),
     };
-    if let Err(e) = created {
+    if let Err((e, false)) = &created {
+        // Ambiguous: the account may exist (or still appear). Ours if it
+        // carries this request's password hash (salted: unique per request).
+        match account_if_exists(app, &did).await {
+            Ok(Some(a)) if a.password_hash == acct.password_hash => {
+                tracing::warn!(%did, "account creation reported {} but the account exists: completed", e.message);
+            }
+            r => {
+                // Not known to be absent for good (the write may still
+                // land): compensate nothing. The claims are taken over once
+                // stale if no account appears (`claim`); the DID, if
+                // registered, stays registered.
+                tracing::error!(%did, existing = matches!(r, Ok(Some(_))), "account creation outcome unknown, leaving its claims and DID: {}", e.message);
+                return Err(XrpcError { status: e.status, error: e.error.clone(), message: e.message.clone() });
+            }
+        }
+    }
+    if let Err((e, true)) = created {
         release_handle(app, &handle, &did).await;
         release_email(app, &email, &did).await;
         release(claim).await;
@@ -1671,6 +1737,31 @@ pub(super) async fn create_account_inner(
         }
     }
     Ok(acct)
+}
+
+/// After a genesis op's submission timed out or failed ambiguously: in the
+/// background, a few times, looks the DID up in the directory and
+/// tombstones it if it was registered after all (best effort: the account
+/// was never created, and a retry of createAccount mints another DID).
+fn tombstone_if_registered(plc: Arc<crate::plc::Plc>, did: String) {
+    tokio::spawn(async move {
+        for wait in [5u64, 30, 120] {
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            match plc.client.last_op(&did).await {
+                Err(crate::plc::PlcError::NotFound(_)) => return,
+                Ok(last) if last["type"] == "plc_tombstone" => return,
+                Ok(_) => match plc.tombstone(&did).await {
+                    Ok(()) | Err(crate::plc::PlcError::Tombstoned) => {
+                        tracing::warn!(%did, "tombstoned the DID of a failed account creation (its genesis op had landed)");
+                        return;
+                    }
+                    Err(e) => tracing::warn!(%did, "tombstoning an orphaned DID: {e}"),
+                },
+                Err(e) => tracing::warn!(%did, "checking for an orphaned DID: {e}"),
+            }
+        }
+        tracing::error!(%did, "a genesis op of a failed account creation may be registered; not tombstoned");
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2285,7 +2376,9 @@ async fn request_account_delete(State(app): AppState, Auth(creds): Auth) -> XRes
 /// Deletes an account entirely: sessions, repo + account (#account deleted
 /// event), handle and email claims, private state.
 pub(super) async fn delete_account_fully(app: &App, did: &str) -> XResult<()> {
-    let acct = app.account(did).await.ok();
+    // (from the owner wherever it is; an unreadable account leaves its claims
+    // to be taken over once stale: `claim`)
+    let acct = super::internal::account_anywhere(app, did).await.ok();
     revoke_all_sessions(app, did).await?;
     app.account_op(did, AccountOp::Delete).await?;
     if let Some(a) = &acct {

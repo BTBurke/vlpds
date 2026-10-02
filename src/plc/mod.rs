@@ -850,7 +850,15 @@ pub struct Plc {
     recovery_did_key: Option<String>,
     /// Retired server rotation keys and their did:keys.
     old: Vec<(Arc<Keypair>, String)>,
+    /// Per-DID update locks ([`Plc::update`]): this node's updates of one
+    /// DID (handle, signing key, tombstone, key rotation) build on each
+    /// other instead of forking `prev`.
+    locks: parking_lot::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
+
+/// Attempts of one update when another op lands between reading the log
+/// and submitting (a `prev` race, from another node or a user's key).
+const UPDATE_ATTEMPTS: usize = 4;
 
 /// What [`Plc::rotate_server_key`] found (or did) for one DID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -872,7 +880,56 @@ impl std::fmt::Debug for Plc {
 impl Plc {
     pub fn new(plc_url: &str, key: Arc<Keypair>, recovery_did_key: Option<String>) -> Plc {
         let did_key = key.did_key();
-        Plc { client: PlcClient::new(plc_url), key, did_key, recovery_did_key, old: Vec::new() }
+        Plc { client: PlcClient::new(plc_url), key, did_key, recovery_did_key, old: Vec::new(), locks: Default::default() }
+    }
+
+    /// This node's update lock of `did`.
+    async fn lock(&self, did: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let m = {
+            let mut g = self.locks.lock();
+            if g.len() > 1024 {
+                g.retain(|_, w| w.strong_count() > 0);
+            }
+            match g.get(did).and_then(|w| w.upgrade()) {
+                Some(m) => m,
+                None => {
+                    let m = Arc::new(tokio::sync::Mutex::new(()));
+                    g.insert(did.to_string(), Arc::downgrade(&m));
+                    m
+                }
+            }
+        };
+        m.lock_owned().await
+    }
+
+    /// Read-modify-write of the DID's log: `build` makes the op following
+    /// the last one (None: nothing to submit), which is submitted as
+    /// `label`. Updates of one DID are serialized on this node; when the
+    /// directory refuses the op because another one landed after the log
+    /// was read (any node, or a user's own rotation key: a same-key fork is
+    /// refused), the update is rebuilt on the new last op and retried, so
+    /// concurrent updates of different fields (handle, signing key) both
+    /// land instead of one failing. Ok(false): nothing submitted.
+    async fn update(&self, did: &str, label: &'static str, build: impl Fn(&J) -> Result<Option<J>, PlcError>) -> Result<bool, PlcError> {
+        let _g = self.lock(did).await;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let last = self.client.last_op(did).await?;
+            let Some(op) = build(&last)? else { return Ok(false) };
+            match self.client.send(did, &op, label).await {
+                Ok(()) => return Ok(true),
+                Err(e @ PlcError::Rejected { .. }) if attempt < UPDATE_ATTEMPTS => {
+                    // raced: the log moved on since `last`
+                    let now = self.client.last_op(did).await?;
+                    if op_cid(&now)? == op_cid(&last)? {
+                        return Err(e);
+                    }
+                    tracing::info!(did, op = label, "PLC log changed while updating, rebuilding the op: {e}");
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Adds retired rotation keys (signing updates of DIDs that still list
@@ -886,6 +943,13 @@ impl Plc {
     /// retired).
     pub fn is_server_key(&self, did_key: &str) -> bool {
         did_key == self.did_key || self.old.iter().any(|(_, d)| d == did_key)
+    }
+
+    /// Whether `did_key` is this deployment's (a server rotation key or
+    /// the operator's `--plc-recovery-did-key`): ops it signs go through
+    /// this PDS or its operator.
+    pub fn is_operator_key(&self, did_key: &str) -> bool {
+        self.is_server_key(did_key) || self.recovery_did_key.as_deref() == Some(did_key)
     }
 
     /// The server key to sign the op following `last` with: the current key
@@ -1004,8 +1068,14 @@ impl Plc {
             return Ok(KeyRotation::Foreign);
         }
         if !dry {
-            let op = self.update_op(&last, |_| Ok(()))?;
-            self.client.send(did, &op, "rotate_key").await?;
+            self.update(did, "rotate_key", |last| {
+                let keys = rotation_keys(not_tombstone(last)?);
+                if keys.contains(&self.did_key) || !self.old.iter().any(|(_, d)| keys.contains(d)) {
+                    return Ok(None);
+                }
+                self.update_op(last, |_| Ok(())).map(Some)
+            })
+            .await?;
         }
         Ok(KeyRotation::Rotated)
     }
@@ -1028,49 +1098,62 @@ impl Plc {
     /// first `at://` entry replaced, else prepended). Ok(false): the log
     /// already says so and nothing was submitted.
     pub async fn update_handle(&self, did: &str, handle: &str) -> Result<bool, PlcError> {
-        let last = self.last_op(did).await?;
         let formatted = ensure_atproto_prefix(handle);
-        let aka: Vec<J> = normalize(&last)["alsoKnownAs"].as_array().cloned().unwrap_or_default();
-        let i = aka.iter().position(|h| h.as_str().is_some_and(|h| h.starts_with("at://")));
-        if i.is_some_and(|i| aka[i] == formatted) {
-            return Ok(false);
-        }
-        let op = self.update_op(&last, |m| {
-            let mut aka = aka.clone();
-            match i {
-                Some(i) => aka[i] = J::String(formatted),
-                None => aka.insert(0, J::String(formatted)),
+        self.update(did, "update_handle", |last| {
+            let aka: Vec<J> = normalize(not_tombstone(last)?)["alsoKnownAs"].as_array().cloned().unwrap_or_default();
+            let i = aka.iter().position(|h| h.as_str().is_some_and(|h| h.starts_with("at://")));
+            if i.is_some_and(|i| aka[i] == formatted) {
+                return Ok(None);
             }
-            m.insert("alsoKnownAs".into(), J::Array(aka));
-            Ok(())
-        })?;
-        self.client.send(did, &op, "update_handle").await?;
-        Ok(true)
+            self.update_op(last, |m| {
+                let mut aka = aka.clone();
+                match i {
+                    Some(i) => aka[i] = J::String(formatted.clone()),
+                    None => aka.insert(0, J::String(formatted.clone())),
+                }
+                m.insert("alsoKnownAs".into(), J::Array(aka));
+                Ok(())
+            })
+            .map(Some)
+        })
+        .await
     }
 
     /// Sets the DID's `atproto` verification method (`updateAtprotoKeyOp`).
     /// Ok(false): already that key.
     pub async fn update_signing_key(&self, did: &str, signing_did_key: &str) -> Result<bool, PlcError> {
-        let last = self.last_op(did).await?;
-        if normalize(&last)["verificationMethods"]["atproto"] == signing_did_key {
-            return Ok(false);
-        }
-        let op = self.update_op(&last, |m| {
-            let vms = m.entry("verificationMethods").or_insert_with(|| json!({}));
-            vms["atproto"] = J::String(signing_did_key.to_string());
-            Ok(())
-        })?;
-        self.client.send(did, &op, "update_signing_key").await?;
-        Ok(true)
+        self.update(did, "update_signing_key", |last| {
+            if normalize(not_tombstone(last)?)["verificationMethods"]["atproto"] == signing_did_key {
+                return Ok(None);
+            }
+            self.update_op(last, |m| {
+                let vms = m.entry("verificationMethods").or_insert_with(|| json!({}));
+                vms["atproto"] = J::String(signing_did_key.to_string());
+                Ok(())
+            })
+            .map(Some)
+        })
+        .await
     }
 
     /// Tombstones the DID (`tombstone`): undoing a genesis op whose account
     /// creation failed afterwards.
     pub async fn tombstone(&self, did: &str) -> Result<(), PlcError> {
-        let last = self.last_op(did).await?;
-        let op = sign(json!({"type": "plc_tombstone", "prev": op_cid(&last)?.to_string()}), self.signer_for(&last).0)?;
-        self.client.send(did, &op, "tombstone").await
+        self.update(did, "tombstone", |last| {
+            let last = not_tombstone(last)?;
+            sign(json!({"type": "plc_tombstone", "prev": op_cid(last)?.to_string()}), self.signer_for(last).0).map(Some)
+        })
+        .await
+        .map(|_| ())
     }
+}
+
+/// `ensureLastOp`'s refusal of a tombstoned DID.
+fn not_tombstone(last: &J) -> Result<&J, PlcError> {
+    if last["type"] == "plc_tombstone" {
+        return Err(PlcError::Tombstoned);
+    }
+    Ok(last)
 }
 
 #[cfg(test)]

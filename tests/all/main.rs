@@ -55,6 +55,7 @@ mod ha_auth;
 mod ha_liveness;
 mod handle_validation;
 mod handles;
+mod identity_races;
 mod harness;
 mod internal_auth;
 mod interop_crypto;

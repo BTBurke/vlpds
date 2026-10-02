@@ -24,6 +24,9 @@ struct Inner {
     fail_posts: Mutex<(u32, u16)>,
     /// Every request answered 503.
     down: AtomicBool,
+    /// Ops applied just before the next POST of their DID is handled, as if
+    /// another writer had landed between that client's read and its submit.
+    race: Mutex<HashMap<String, Vec<J>>>,
     posts: AtomicU64,
     accepted: AtomicU64,
 }
@@ -61,6 +64,12 @@ impl MockPlc {
     /// The next `n` POSTs fail with `status` (and change nothing).
     pub fn fail_posts(&self, n: u32, status: u16) {
         *self.inner.fail_posts.lock() = (n, status);
+    }
+
+    /// Before the next POST for `did` is handled, `op` is applied (a
+    /// concurrent writer winning the race for `prev`).
+    pub fn race_next_post(&self, did: &str, op: J) {
+        self.inner.race.lock().entry(did.to_string()).or_default().push(op);
     }
 
     /// While set, every request is answered 503.
@@ -186,6 +195,13 @@ async fn post_op(State(s): State<Arc<Inner>>, Path(did): Path<String>, body: axu
     }
     let mut logs = s.logs.lock();
     let mut l = logs.get(&did).cloned().unwrap_or_else(|| PlcLog::new(&did));
+    for raced in s.race.lock().remove(&did).unwrap_or_default() {
+        let at = now_ms().max(l.entries.last().map_or(0, |e| e.created_at_ms + 1));
+        if l.apply(raced, at).is_ok() {
+            s.accepted.fetch_add(1, Ordering::SeqCst);
+            logs.insert(did.clone(), l.clone());
+        }
+    }
     // strictly increasing timestamps, as the directory's clock would give
     let at = now_ms().max(l.entries.last().map_or(0, |e| e.created_at_ms + 1));
     match l.apply(op, at) {
@@ -237,5 +253,34 @@ mod tests {
         // a doc served like the directory's
         let doc: J = reqwest::get(format!("{}/{did}", m.url)).await.unwrap().json().await.unwrap();
         assert_eq!(doc["message"], json!(format!("DID not available: {did}")));
+    }
+
+    /// An op landing between an update's read and its submit (another node,
+    /// or a key rotation racing a handle change) forks `prev`; the directory
+    /// refuses the second one and the update is rebuilt on the new last op:
+    /// both changes land.
+    #[tokio::test]
+    async fn prev_race_is_rebuilt_not_lost() {
+        let m = MockPlc::start().await;
+        let plc = Plc::new(&m.url, Arc::new(Keypair::generate()), None);
+        let (did, op) = plc.genesis(&Keypair::generate().did_key(), "alice.test", "https://pds.example", None).unwrap();
+        plc.create(&did, &op).await.unwrap();
+        let new_key = Keypair::generate().did_key();
+        let raced = plc
+            .update_op(&op, |m| {
+                m.insert("verificationMethods".into(), json!({"atproto": new_key}));
+                Ok(())
+            })
+            .unwrap();
+        m.race_next_post(&did, raced);
+        assert!(plc.update_handle(&did, "bob.test").await.unwrap());
+        let d = m.data(&did).unwrap();
+        assert_eq!(d["alsoKnownAs"], json!(["at://bob.test"]));
+        assert_eq!(d["verificationMethods"]["atproto"], json!(new_key), "the racing op stays");
+        assert_eq!(m.ops(&did).len(), 3);
+        assert_eq!(m.posts(), 3, "genesis, the refused fork, the rebuilt update");
+        // a refusal with the log unchanged is final
+        m.fail_posts(1, 400);
+        assert!(matches!(plc.update_handle(&did, "carol.test").await, Err(crate::plc::PlcError::Rejected { .. })));
     }
 }

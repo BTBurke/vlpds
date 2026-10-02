@@ -82,6 +82,19 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
     `ha_auth::user_service_auth_uploads_route_to_the_owner` (cluster routing by `iss`). Account status: taken-down accounts are
     refused also with service auth (divergence below). createAccount's `userServiceAuthOptional` (migration in) was already
     verified the same way (`authn::optional_service_auth`).
+16. **Identity fixes** (`src/plc`, `src/xrpc/identity.rs`, claims in `src/xrpc/server.rs`; DESIGN.md "PLC identity"). Not
+    reached by the reference suite, which runs against its in-process PLC server through `@did-plc/lib`'s client (it ignores
+    POST bodies) and never resolves another server's handle:
+    - every PLC write against a real did-method-plc directory was applied and then reported as failed (its `POST /:did`
+      answers a text/plain `OK`, parsed as JSON). The mock directory now answers the same;
+    - resolveHandle / resolveIdentity resolve handles and DIDs hosted elsewhere (AppView's resolveHandle, else the handle
+      resolver), as the reference's resolveHandle does, so @-mentions of other servers' users resolve through the PDS;
+    - createAccount with an existing DID refuses a `did#service` issuer (the reference compares the whole `iss`);
+    - concurrent signups with one email can no longer both win; stale handle/email claims are taken over after a grace period;
+    - concurrent PLC updates of one DID are serialized and rebuilt on `prev` races; updateHandle reconciles directory and
+      account; submitPlcOperation is refused during a pending signing-key rotation; signPlcOperation consumes its token last
+      (reference order); a DID with a signed op handed out or a user rotation key resolves through the directory.
+    Tests: `plc::mock::tests::*`, `identity_races::*`.
 
 ## Notable divergences
 
@@ -99,8 +112,11 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
   `modServiceUrl` routing).
 - **Unresolvable proxy DIDs** (`did:foo#bar`) are 400 "could not resolve proxy did". The reference's resolver throws, which surfaces
   as a 500.
-- **Stricter session requirements.** `revokeAppPassword` and `identity.updateHandle` need a full session; the reference accepts an
-  app-password session.
+- **Stricter session requirements.** `revokeAppPassword`, `identity.updateHandle` and `identity.submitPlcOperation` need a full
+  session (or OAuth with the identity scope); the reference accepts an app-password session (`ACCESS_STANDARD`; its
+  `assertIdentity` applies to OAuth only). Deliberate: an app password can't move the account's identity.
+- **resolveHandle of an unresolvable external handle** is 400 `HandleNotFound` (the lexicon's error); the reference throws a plain
+  `InvalidRequest` "Unable to resolve handle". A dev-mode vlpds resolves external handles only through the AppView.
 - **disable/enableAccountInvites** act on the account's existing codes as well as the flag. The reference only flips the flag,
   which marks interval-generated codes disabled when they are created (vlpds does that too).
 - **OAuth UI** has no forgot-password step and no deactivate button. Those are the XRPC flows, and the pages are English only.

@@ -23,7 +23,7 @@ mod sync;
 pub mod syntax;
 mod webui;
 pub use blobs::spawn_blob_gc;
-pub use server::{drop_revocation, reset_token_did, revocation_expired, spawn_reserved_key_gc, sweep_reserved_keys};
+pub use server::{drop_revocation, reset_token_did, revocation_expired, set_stale_claim_grace, spawn_reserved_key_gc, sweep_reserved_keys};
 pub use server::{auth_epoch, auth_epoch_cond, epoch_for_login, new_auth_epoch_op, AUTH_EPOCH};
 pub use sync::{request_crawl, set_export_buffer_max_mb};
 pub use server::{set_mailer, LogMailer, Mail, Mailer};

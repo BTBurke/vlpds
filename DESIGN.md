@@ -3400,10 +3400,91 @@ local document; a failed resolution is `DidNotFound` / 502
 `UpstreamFailure` (resolveDid), `InvalidRequest` (describeRepo) or an
 omitted `didDoc` (sessions, reference `safeResolveDidDoc`).
 
+**Directory responses.** did-method-plc answers an accepted `POST /{did}`
+with `res.sendStatus(200)`, a text/plain `OK`: a POST's 2xx body is ignored
+(only the GETs `/log/last` and `/data` are JSON; errors are `{message}`).
+The mock answers the same, so the suite covers it (before, every write to a
+real directory was applied and then reported as failed).
+
+**Concurrent updates of one DID.** Every server-signed update (handle,
+signing key, tombstone, rotation-key rotation) is a read-modify-write of
+the log (`Plc::update`): serialized per DID on the node, and when the
+directory refuses it because another op landed after the read (another
+node, a user's key; a same-key fork is refused), rebuilt on the new last
+op and resubmitted (4 attempts), so a handle change racing a signing-key
+rotation lands both instead of aborting the rotation. Two updateHandles of
+one account can still finish their PLC and local steps in opposite orders,
+so every updateHandle ends by pointing the directory at the account's
+handle as read *after* the local swap, re-reading until they agree
+(`identity::reconcile_did_doc_handle`): the last to finish leaves directory
+and account agreeing, whichever node ran it. A failed update releases its
+new handle's claim only if the account isn't standing on it (a concurrent
+update to the same handle may have won), and a successful one re-asserts
+its claim. submitPlcOperation is refused while a signing-key rotation is
+pending (the op would name the old key).
+
+**Claims** (handle and email uniqueness: conditional creates of
+`handle/{h}` and `email/{sha256}`). A claim held by another DID is taken
+over only when it is older than `STALE_CLAIM_GRACE` (15 min, longer than
+any createAccount/updateHandle/updateEmail between claim and account
+write) and its holder definitely has no account standing on it (no
+account, or one with another handle/email; an owner that can't be reached
+is not "no account"), by a compare-and-swap on the version read. Before,
+an email claim was taken over on any account-read error, including the
+holder being mid-creation, so two concurrent signups with one email both
+succeeded; handle claims were never reclaimed. This is also the GC for
+claims a failed release or a deletion that couldn't read the account left
+behind (deletion now reads it from the owner wherever it is).
+
+**createAccount failures.** A CreateRepo failure that may have applied
+(the worker's reply dropped, the log write failing or timing out, "repo
+already exists") is not compensated blindly: the account is looked up and,
+if it exists with this request's (salted) password hash, the creation
+completed; otherwise nothing is released or tombstoned (the claims are
+taken over once stale; the DID stays registered). Definite failures
+(shard moved, key service down, signature fault, never sent) release and
+tombstone as before. A genesis POST that failed ambiguously (timeout, 5xx)
+releases the claims and, in the background (5 s, 30 s, 2 min), tombstones
+the DID if it turns out registered (a retry mints another DID). The
+service-auth issuer of createAccount with an existing DID must be the DID
+itself: a `did#service` issuer (e.g. `#atproto_labeler`, verified with the
+label key) is refused, as the reference compares the whole `iss`.
+
+**Handles and identities of other servers.** resolveHandle answers for an
+active account here; a handle under our handle domains that isn't here is
+`HandleNotFound`; any other handle is resolved for the caller (the Bluesky
+app resolves @-mention facets through its PDS): the AppView's
+resolveHandle when configured (its answer is final, as the reference's;
+unreachable or 5xx falls back), else the handle resolver (DNS TXT, then
+`https://<handle>/.well-known/atproto-did`, SSRF-guarded). Not found is
+`HandleNotFound` (the reference throws a plain `InvalidRequest` for an
+external miss; the lexicon's error is used so a valid handle is never a
+parameter error). Dev mode asks only the AppView. resolveIdentity /
+refreshIdentity resolve non-local identities the same way (the DID through
+the DID resolver; by handle, the document must name the handle back, else
+`HandleNotFound`; by DID, its handle is `handle.invalid` unless it resolves
+back); refreshIdentity emits nothing for them. A local account's handle
+outside our domains is verified by the resolver too (outside dev mode),
+not just by its claim here.
+
+**DIDs that can change elsewhere.** The local document assumes every change
+of the DID goes through this PDS. That stops holding once
+signPlcOperation hands out a server-signed op (anyone can submit it: the
+migration-out flow does, from the new PDS), or the DID lists a rotation key
+that isn't this deployment's (createAccount `recoveryKey`, a submitted op
+adding one). Those accounts get the `plcExternalOps` flag, and their
+document is resolved through the directory (cached; the local one if the
+directory can't be reached while the account is active), service-auth
+issuer keys included. signPlcOperation now consumes its token only after
+the op is made (reference order), so a directory outage doesn't burn it.
+
 **Not done / differences.** An account that migrates away but is left
 *active* here keeps the local (stale) document until it is deactivated
-or deleted (the reference would serve the directory's after its cache
-TTL); other nodes' DID caches (10 min TTL) aren't invalidated on
+or deleted, unless it was flagged above (an op signed here, a user
+rotation key; the reference would serve the directory's after its cache
+TTL). updateHandle and submitPlcOperation refuse app passwords (stricter
+than the reference, which accepts any `ACCESS_STANDARD` token there:
+an app password can't move the account's identity); other nodes' DID caches (10 min TTL) aren't invalidated on
 deactivation (they hold an entry only if they resolved the DID while it
 was not active here). No `PDS_PLC_ROTATION_KEY_KMS_KEY_ID` (a KMS-resident signing key): the key
 is KMS-*wrapped* instead. signPlcOperation refuses a requested field of the
@@ -3417,7 +3498,7 @@ rejected, unavailable, not_found) and `vlpds_plc_request_seconds{op}`; alert
 Tests: `plc::tests` (vectors, op construction, log rules, config),
 `plc::mock::tests`, `tests/all/plc.rs` (genesis, failures, handle and key
 updates, sign/submit, migration out, unregistered mode, bulkCreate, key
-rotation), `tests/all/secrets_at_rest.rs`
+rotation), `tests/all/identity_races.rs` (external handles and identities, the createAccount issuer, email and handle claim races, stale claims, PLC update races, rotation vs submit, signed ops), `tests/all/secrets_at_rest.rs`
 (`plc_rotation_key_never_reaches_the_bucket`).
 
 ## Signing-key rotation (`src/xrpc/key_rotation.rs`)

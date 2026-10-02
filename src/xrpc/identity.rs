@@ -166,17 +166,27 @@ pub(super) fn did_doc(app: &App, acct: &Account) -> J {
 pub(crate) fn serves_local_doc(app: &App, acct: &Account) -> bool {
     let deactivated = acct.extra.get("deactivatedAt").is_some_and(|v| !v.is_null());
     let resolvable = app.plc.is_some() || super::server::has_external_did(acct);
-    !acct.signing_pubkey.is_empty() && !(deactivated && resolvable)
+    // a did:plc that can change without us (a signed op handed out, a user
+    // rotation key) is the directory's to describe, active or not
+    let external_ops = app.plc.is_some() && has_plc_external(acct);
+    !acct.signing_pubkey.is_empty() && !(deactivated && resolvable) && !external_ops
 }
 
 /// The current DID document of an account hosted here: ours
 /// ([`serves_local_doc`]), else resolved (cached; the cache is invalidated
-/// when the account is deactivated).
+/// when the account is deactivated). An active account whose did:plc may
+/// change elsewhere falls back to ours when the directory can't be reached.
 pub(crate) async fn account_did_doc(app: &App, acct: &Account) -> Result<Arc<J>, crate::did_resolver::ResolveError> {
     if serves_local_doc(app, acct) {
         return Ok(Arc::new(did_doc(app, acct)));
     }
-    app.did_resolver.resolve(&acct.did).await
+    let r = app.did_resolver.resolve(&acct.did).await;
+    match r {
+        Err(crate::did_resolver::ResolveError::Failed(..)) if acct.status.is_none() && !acct.signing_pubkey.is_empty() => {
+            Ok(Arc::new(did_doc(app, acct)))
+        }
+        r => r,
+    }
 }
 
 fn resolve_error(e: crate::did_resolver::ResolveError) -> XrpcError {
@@ -200,20 +210,113 @@ async fn resolve_handle(State(app): AppState, Query(q): Query<HandleQ>) -> XResu
             "Error: handle must be a valid handle",
         ));
     }
-    // Like the reference's getAccount(handle): deactivated and taken-down
-    // accounts don't resolve.
-    let did = app.resolve_handle(&handle).await?;
-    // a shard mid-move is a 503 (retry), not "no such handle"
-    let active = match &did {
-        Some(d) => super::server::account_if_exists(&app, d)
-            .await?
-            .is_some_and(|a| a.status.is_none()),
-        None => false,
-    };
-    match did {
-        Some(did) if active => Ok(Json(json!({"did": did}))),
-        _ => Err(XrpcError::bad("HandleNotFound", "Unable to resolve handle")),
+    match resolve_any_handle(&app, &handle).await? {
+        Some(did) => Ok(Json(json!({"did": did}))),
+        // (the reference answers an unresolvable external handle with a
+        // plain InvalidRequest; the lexicon's HandleNotFound is used for
+        // both here, so a valid handle is never a parameter error)
+        None => Err(XrpcError::bad("HandleNotFound", "Unable to resolve handle")),
     }
+}
+
+/// Whether `handle` is ours to know (the reference's
+/// `serviceHandleDomains` check: under the handle domain, or the domain
+/// itself).
+fn is_service_handle(app: &App, handle: &str) -> bool {
+    under_handle_domain(app, handle) || handle == app.handle_domain
+}
+
+/// The DID of the active account here whose handle is `handle`, as the
+/// reference's getAccount(handle): deactivated and taken-down accounts
+/// don't resolve. A shard mid-move is a 503 (retry), not "no such handle".
+async fn local_handle_did(app: &App, handle: &str) -> XResult<Option<String>> {
+    let Some(did) = app.resolve_handle(handle).await? else { return Ok(None) };
+    let acct = super::server::account_if_exists(app, &did).await?;
+    Ok(acct.is_some_and(|a| a.status.is_none() && a.handle == handle).then_some(did))
+}
+
+/// resolveHandle (reference identity/resolveHandle.ts): an active account
+/// here; else, for a handle under our handle domains, nobody (it would be
+/// here); else the handle is resolved for the caller: the Bluesky app
+/// resolves @-mention facets through its PDS, so other servers' users must
+/// resolve too ([`resolve_external_handle`]).
+async fn resolve_any_handle(app: &App, handle: &str) -> XResult<Option<String>> {
+    if let Some(did) = local_handle_did(app, handle).await? {
+        return Ok(Some(did));
+    }
+    if is_service_handle(app, handle) {
+        return Ok(None);
+    }
+    Ok(resolve_external_handle(app, handle).await)
+}
+
+/// AppView `com.atproto.identity.resolveHandle` deadline.
+const APPVIEW_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The DID of a handle hosted elsewhere: the configured AppView's
+/// resolveHandle (as the reference: its answer, a DID or "unknown", is
+/// final); without an AppView, or when it can't be reached or fails (5xx),
+/// the handle resolver (DNS TXT `_atproto.<handle>`, then
+/// `https://<handle>/.well-known/atproto-did`, SSRF-guarded:
+/// crate::handle_resolver). In dev mode only the AppView is asked (a dev or
+/// test server looks up no arbitrary names).
+pub(super) async fn resolve_external_handle(app: &App, handle: &str) -> Option<String> {
+    if let Some((url, _)) = &app.config.appview {
+        match appview_resolve_handle(url, handle).await {
+            Ok(r) => return r,
+            Err(e) => tracing::warn!(%handle, "AppView resolveHandle failed, resolving the handle here: {e}"),
+        }
+    }
+    if app.config.dev_mode {
+        return None;
+    }
+    let txt = crate::handle_resolver::resolver(app.config.txt_resolver.as_ref());
+    let http = async { well_known_did(handle, false).await.ok() };
+    crate::handle_resolver::resolve(txt.as_ref(), handle, http).await.filter(|d| super::syntax::valid_did(d))
+}
+
+/// GET resolveHandle from the AppView (unauthenticated, like the
+/// reference's `bskyAppView.client`). Ok(None): it answered that the handle
+/// doesn't resolve (4xx); Err: unreachable, 5xx, or a malformed answer.
+async fn appview_resolve_handle(base: &str, handle: &str) -> Result<Option<String>, String> {
+    let url = format!("{}/xrpc/com.atproto.identity.resolveHandle", base.trim_end_matches('/'));
+    let fetch = async {
+        let r = crate::http::public().get(&url).query(&[("handle", handle)]).send().await.map_err(|e| e.to_string())?;
+        let status = r.status();
+        if status.is_client_error() {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(format!("status {status}"));
+        }
+        let body = r.bytes().await.map_err(|e| e.to_string())?;
+        if body.len() > 16 << 10 {
+            return Err("response too large".into());
+        }
+        let j: J = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+        match j["did"].as_str() {
+            Some(d) if super::syntax::valid_did(d) => Ok(Some(d.to_string())),
+            _ => Err("no valid did in the response".into()),
+        }
+    };
+    tokio::time::timeout(APPVIEW_RESOLVE_TIMEOUT, fetch).await.map_err(|_| "timed out".to_string())?
+}
+
+/// Whether `handle` resolves to `did`, verified as the reference verifies
+/// a handle (bidirectionally): the claim here for a handle under our
+/// domains, else the external resolution ([`resolve_external_handle`]). In
+/// dev mode, where nothing external is looked up, a claim here suffices.
+async fn handle_resolves_to(app: &App, handle: &str, did: &str) -> XResult<bool> {
+    let service = is_service_handle(app, handle);
+    if service || app.config.dev_mode {
+        if app.resolve_handle(handle).await?.as_deref() == Some(did) {
+            return Ok(true);
+        }
+        if service {
+            return Ok(false);
+        }
+    }
+    Ok(resolve_external_handle(app, handle).await.as_deref() == Some(did))
 }
 
 /// Local accounts only (documents per [`account_did_doc`]). Anything else is
@@ -246,40 +349,69 @@ async fn resolve_did(State(app): AppState, Query(q): Query<DidQ>) -> XResult<Jso
     Ok(Json(json!({"didDoc": doc})))
 }
 
-/// identifier (handle or DID) -> (did, handle, didDoc). The handle is
-/// "handle.invalid" unless it resolves back to the DID.
-async fn identity_info(app: &App, identifier: &str) -> XResult<(Account, J)> {
-    let acct = if identifier.starts_with("did:") {
+/// identifier (handle or DID) -> (the account, if hosted here; {did,
+/// handle, didDoc}). The handle is "handle.invalid" unless it resolves back
+/// to the DID ([`handle_resolves_to`]). Accounts here use their documents
+/// ([`account_did_doc`]); any other identity is resolved (a handle as
+/// resolveHandle does, the DID through the DID resolver; `fresh` skips its
+/// cache), so a client can look up anyone through its PDS.
+async fn identity_info(app: &App, identifier: &str, fresh: bool) -> XResult<(Option<Account>, J)> {
+    let bad_ident = || XrpcError::bad("InvalidRequest", "Error: identifier must be a valid at-identifier");
+    let not_found = |h: &str| XrpcError::bad("HandleNotFound", format!("Unable to resolve handle: {h}"));
+    let (did, by_handle) = if identifier.starts_with("did:") {
         if !super::syntax::valid_did(identifier) {
-            return Err(XrpcError::bad(
-                "InvalidRequest",
-                "Error: identifier must be a valid at-identifier",
-            ));
+            return Err(bad_ident());
         }
-        local_account(app, identifier).await?
+        (identifier.to_string(), None)
     } else {
         let handle = identifier.to_ascii_lowercase();
         if !super::syntax::valid_handle(&handle) {
-            return Err(XrpcError::bad(
-                "InvalidRequest",
-                "Error: identifier must be a valid at-identifier",
-            ));
+            return Err(bad_ident());
         }
-        let did = app.resolve_handle(&handle).await?.ok_or_else(|| {
-            XrpcError::bad(
-                "HandleNotFound",
-                format!("Unable to resolve handle: {handle}"),
-            )
-        })?;
-        local_account(app, &did).await?
+        // a claim here names an account here (whatever its status)
+        let did = match app.resolve_handle(&handle).await? {
+            Some(d) => Some(d),
+            None if is_service_handle(app, &handle) => None,
+            None => resolve_external_handle(app, &handle).await,
+        };
+        (did.ok_or_else(|| not_found(&handle))?, Some(handle))
     };
-    let handle = match app.resolve_handle(&acct.handle).await? {
-        Some(d) if d == acct.did => acct.handle.clone(),
+    if let Some(acct) = super::server::account_if_exists(app, &did).await? {
+        let valid = handle_resolves_to(app, &acct.handle, &acct.did).await?;
+        let handle = if valid { acct.handle.clone() } else { "handle.invalid".to_string() };
+        if fresh && !serves_local_doc(app, &acct) {
+            app.did_resolver.invalidate(&acct.did);
+        }
+        let doc = account_did_doc(app, &acct).await.map_err(resolve_error)?;
+        let info = json!({"did": acct.did, "handle": handle, "didDoc": doc});
+        return Ok((Some(acct), info));
+    }
+    if let Some(h) = by_handle.as_deref().filter(|h| is_service_handle(app, h)) {
+        // a stale claim under our domains: no account behind it
+        return Err(not_found(h));
+    }
+    if fresh {
+        app.did_resolver.invalidate(&did);
+    }
+    let doc = app.did_resolver.resolve(&did).await.map_err(resolve_error)?;
+    let claimed = doc["alsoKnownAs"]
+        .as_array()
+        .and_then(|a| a.iter().filter_map(J::as_str).find_map(|h| h.strip_prefix("at://")))
+        .map(str::to_ascii_lowercase);
+    let verified = match (&claimed, &by_handle) {
+        // resolved from the handle: the document must name it back
+        (Some(c), Some(h)) => c == h,
+        (Some(c), None) => super::syntax::valid_handle(c) && handle_resolves_to(app, c, &did).await?,
+        (None, _) => false,
+    };
+    if let (Some(h), false) = (&by_handle, verified) {
+        return Err(not_found(h));
+    }
+    let handle = match (verified, claimed) {
+        (true, Some(c)) => c,
         _ => "handle.invalid".to_string(),
     };
-    let doc = account_did_doc(app, &acct).await.map_err(resolve_error)?;
-    let info = json!({"did": acct.did, "handle": handle, "didDoc": doc});
-    Ok((acct, info))
+    Ok((None, json!({"did": did, "handle": handle, "didDoc": *doc})))
 }
 
 #[derive(Deserialize)]
@@ -288,7 +420,7 @@ struct IdentifierQ {
 }
 
 async fn resolve_identity(State(app): AppState, Query(q): Query<IdentifierQ>) -> XResult<Json<J>> {
-    Ok(Json(identity_info(&app, &q.identifier).await?.1))
+    Ok(Json(identity_info(&app, &q.identifier, false).await?.1))
 }
 
 /// Returns the identity info. When called by the account itself (or an
@@ -299,7 +431,9 @@ async fn refresh_identity(
     MaybeAuth(creds): MaybeAuth,
     Json(inp): Json<IdentifierQ>,
 ) -> XResult<Json<J>> {
-    let (acct, info) = identity_info(&app, &inp.identifier).await?;
+    let (acct, info) = identity_info(&app, &inp.identifier, true).await?;
+    // only an account hosted here has events to emit
+    let Some(acct) = acct else { return Ok(Json(info)) };
     let may_emit = match &creds {
         Some(Credentials::Admin) => true,
         Some(c) => c.did() == Some(acct.did.as_str()) && c.allows_identity("*"),
@@ -429,7 +563,7 @@ pub(super) async fn set_handle(app: &App, did: &str, handle: &str, user: bool) -
     // no-op.)
     if let Err(e) = update_did_doc_handle(app, did, handle).await {
         if claimed {
-            super::server::release_handle(app, handle, did).await;
+            release_unless_current(app, did, handle).await;
         }
         return Err(e);
     }
@@ -452,14 +586,65 @@ pub(super) async fn set_handle(app: &App, did: &str, handle: &str, user: bool) -
             if before.handle != handle {
                 super::server::release_handle(app, &before.handle, did).await;
             }
+            // a concurrent update of the same DID that failed may have
+            // released the claim we now stand on: take it back (a no-op
+            // when it's still ours)
+            if claimed && !super::server::claim_handle(app, handle, did).await.unwrap_or(true) {
+                tracing::error!(%did, %handle, "handle claim lost to another account during an update");
+            }
+            reconcile_did_doc_handle(app, did).await;
             Ok(())
         }
         Err(e) => {
             // keep the claim if a concurrent update moved us onto it anyway
-            if claimed && app.account(did).await.map_or(true, |a| a.handle != handle) {
-                super::server::release_handle(app, handle, did).await;
+            if claimed {
+                release_unless_current(app, did, handle).await;
             }
+            reconcile_did_doc_handle(app, did).await;
             Err(e)
+        }
+    }
+}
+
+/// Releases our claim of `handle` unless the account (read now) stands on
+/// it: a concurrent update of the same DID to the same handle may have
+/// succeeded. An unreadable account keeps the claim (stale claims are taken
+/// over after a grace period: `server::claim_handle`).
+async fn release_unless_current(app: &App, did: &str, handle: &str) {
+    if super::internal::account_anywhere(app, did).await.is_ok_and(|a| a.handle != handle) {
+        super::server::release_handle(app, handle, did).await;
+    }
+}
+
+/// Points the DID document at the account's current handle (did:plc with PLC
+/// registration on). Two updates of one DID can finish their PLC and local
+/// steps in opposite orders (PLC says one handle, the account the other);
+/// every update ends with this, which re-reads the account after each PLC
+/// step until they agree, so the last update to finish leaves them agreeing
+/// whichever node ran it. Failures are logged (the next update or a
+/// refreshIdentity by the user fixes it): the local change is done.
+async fn reconcile_did_doc_handle(app: &App, did: &str) {
+    let Some(plc) = &app.plc else { return };
+    if !did.starts_with("did:plc:") {
+        return;
+    }
+    for _ in 0..3 {
+        let Ok(before) = super::internal::account_anywhere(app, did).await else { return };
+        match plc.update_handle(did, &before.handle).await {
+            Ok(false) => return,
+            Ok(true) => {
+                app.did_resolver.invalidate(did);
+                tracing::info!(%did, handle = %before.handle, "PLC handle reconciled with the account's");
+            }
+            Err(e) => {
+                tracing::warn!(%did, "reconciling the PLC handle: {e}");
+                return;
+            }
+        }
+        match super::internal::account_anywhere(app, did).await {
+            Ok(a) if a.handle == before.handle => return,
+            Ok(_) => continue,
+            Err(_) => return,
         }
     }
 }
@@ -575,7 +760,6 @@ async fn sign_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp): 
         .filter(|t| !t.is_empty())
         .ok_or_else(|| XrpcError::bad("InvalidRequest", "email confirmation token required to sign PLC operations"))?;
     super::server::assert_email_token(&app, &did, "plc_operation", token).await?;
-    super::server::delete_email_tokens(&app, &did, &["plc_operation"]).await?;
     if !did.starts_with("did:plc:") {
         return Err(XrpcError::bad("InvalidRequest", format!("not a did:plc: {did}")));
     }
@@ -595,7 +779,36 @@ async fn sign_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp): 
         }
         Ok(())
     })?;
+    // the op may be submitted by anyone, anywhere: from now on this DID can
+    // change without this PDS ([`serves_local_doc`])
+    mark_plc_external(&app, &did).await?;
+    // consumed only once the op is made (reference: deleteEmailToken last),
+    // so a directory outage doesn't burn the emailed token
+    super::server::delete_email_tokens(&app, &did, &["plc_operation"]).await?;
     Ok(Json(json!({"operation": operation})))
+}
+
+/// Account extension flag: this did:plc may change without going through
+/// this PDS (a server-signed op was handed out by signPlcOperation, a user
+/// rotation key is listed), so its document is resolved through the
+/// directory ([`serves_local_doc`]).
+pub(super) const PLC_EXTERNAL: &str = "plcExternalOps";
+
+fn has_plc_external(a: &Account) -> bool {
+    a.extra.get(PLC_EXTERNAL).and_then(J::as_bool).unwrap_or(false)
+}
+
+async fn mark_plc_external(app: &App, did: &str) -> XResult<()> {
+    app.mutate_account(did, false, false, false, |a| {
+        if has_plc_external(a) {
+            return Ok(false);
+        }
+        super::server::set_extra(a, PLC_EXTERNAL, json!(true));
+        Ok(true)
+    })
+    .await?;
+    app.did_resolver.invalidate(did);
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -628,6 +841,12 @@ async fn submit_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp)
         return Err(bad("Incorrect endpoint on atproto_pds service"));
     }
     let acct = app.account(&did).await?;
+    // a signing-key rotation in flight: the op names the old key, and
+    // submitting it after the directory took the new one would point the
+    // DID back at a key the repo is no longer signed with
+    if acct.pending_signing_key.is_some() {
+        return Err(bad("A signing key rotation is in progress, retry when it completes"));
+    }
     if op["verificationMethods"]["atproto"] != format!("did:key:{}", acct.signing_pubkey).as_str() {
         return Err(bad("Incorrect signing key"));
     }
@@ -639,6 +858,11 @@ async fn submit_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp)
     }
     plc.client.send(&did, &op, "submit").await?;
     app.did_resolver.invalidate(&did);
+    // rotation keys of the user's own can change the DID without us
+    let foreign_keys = op["rotationKeys"].as_array().is_some_and(|a| a.iter().filter_map(J::as_str).any(|k| !plc.is_operator_key(k)));
+    if foreign_keys {
+        mark_plc_external(&app, &did).await?;
+    }
     // #identity (writes nothing; not for a taken-down account, as refreshIdentity)
     app.mutate_account(&did, true, false, false, |a| Ok(a.status.as_deref() != Some("takendown"))).await?;
     Ok(StatusCode::OK)
