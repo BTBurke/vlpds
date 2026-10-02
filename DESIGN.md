@@ -2066,3 +2066,48 @@ rotation and rewrap, cache, KEK parsing, the dev-KEK rules) and
   while warm; at most one decrypt per account after a restart, even with
   racing writes; with KMS down, 503 `KeyUnavailable` with nothing written,
   while reads and getRepo work; writes resume after recovery.
+
+### Signing hardening (`src/crypto.rs`)
+With deterministic ECDSA, one faulty signature (Rowhammer, glitching, a bad
+DIMM) next to a correct one over the same message gives away the key, and
+commit signatures are public on the firehose. So, for every signature that
+leaves the node:
+- **Hedged nonces.** 32 fresh bytes from a thread-local CSPRNG
+  (`rand::thread_rng`, ChaCha12 seeded from the OS) go into the RFC 6979
+  nonce as §3.6 additional data (libsecp256k1's `ndata`; our hardware-SHA
+  nonce function appends them to the seed exactly as
+  `nonce_function_rfc6979` does, tested against it). A broken RNG degrades
+  to plain RFC 6979. Signatures stay low-S compact but are no longer
+  reproducible; `Keypair::sign_deterministic` remains for tests that compare
+  with k256/shrike. The OAuth server key (ES256) uses `p256`'s hedged
+  `sign_with_rng`.
+- **Verify after sign.** Commits, service-auth JWTs (proxy, getServiceAuth)
+  and OAuth access tokens are verified against the key's cached public key,
+  over a freshly hashed message, before they can be sequenced or returned.
+  A failure is never emitted: it counts
+  `vlpds_signature_verify_failures_total{purpose}`, logs an error and signs
+  again with a fresh nonce; a second failure is a 503 `SignatureFault` with
+  nothing applied (the repo is evicted and reloads). Three failures within a
+  minute fail-stop the node (`signature_fault`, exit 6). A repo load also
+  re-derives the public key from the cached scalar and checks it against
+  `signing_pubkey` (`purpose="key_load"`). Session JWTs are HMACs; nothing
+  here signs PLC operations.
+
+Alerts `VlpdsSignatureFault`, `VlpdsSignatureFaultFailStop` (RUNBOOK: suspect
+hardware; drain and replace the host). Tests: `crypto::tests`,
+`oauth::jose::tests::server_key_faults_are_caught`, and
+`tests/all/signature_faults.rs`, which injects faults (`crypto::fault`, a
+test-only hook flipping a bit of the signature or of the scalar while
+signing) and checks that no faulty commit reaches the firehose or getRepo,
+that one fault is re-signed and two give a clean 503, and that the metric
+moves and the third fault fail-stops.
+
+**Cost (M4 Pro, release, shared laptop; medians of 11 interleaved rounds,
+`crypto::tests::bench_sign`).** Deterministic sign 11.4 µs, hedged 11.5 µs
+(the CSPRNG is 24 ns: noise), hedged + verify 26.3 µs (verify alone 13.2
+µs). `worker::tests::bench_commit_cpu`, old and new binaries interleaved, 6
+runs each, median for 20 / 5000 records: 20.1 / 20.4 µs/commit before
+(range 19.9–21.3), 35.0 / 34.6 µs after (33.0–36.3).
+Verification is the whole ~15 µs: about +15% of the ~96 µs whole-node commit
+(see "CPU"). Verifying only a sample would leave the skipped signatures
+free to leak the key.

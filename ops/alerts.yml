@@ -717,6 +717,27 @@ groups:
           summary: "{{ $labels.instance }}: wrapped secrets rejected by the KEK"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssecretunwraprejected"
 
+      # A signature failed verification right after signing (crypto.rs):
+      # it was not emitted, but this host is flipping bits (memory/CPU).
+      # Three within a minute fail-stop the node (next alert).
+      - alert: VlpdsSignatureFault
+        expr: sum by (instance, purpose) (increase(vlpds_signature_verify_failures_total{job="vlpds"}[1h])) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $labels.purpose }} signature failed verification after signing (suspect hardware)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssignaturefault"
+
+      # The previous process fail-stopped on repeated signature faults. Kept
+      # for as long as the new process runs: the host stays suspect.
+      - alert: VlpdsSignatureFaultFailStop
+        expr: vlpds_last_exit_reason_info{job="vlpds",reason="signature_fault"} == 1
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }} fail-stopped on repeated signature faults; drain and replace the host"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssignaturefault"
+
       # A persisted MST node or rebuilt subtree didn't match its link: the
       # repo was rebuilt from its records instead. Should never happen.
       - alert: VlpdsLazyMstInvalid

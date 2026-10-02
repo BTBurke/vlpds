@@ -100,7 +100,8 @@ pub fn record_exit(code: i32, reason: &str) {
 }
 
 /// Fail-stop: records `reason` and exits with `code` (2: segment upload,
-/// 3: log fenced / ordinal taken, 4: state apply, 5: lease lost or lapsed).
+/// 3: log fenced / ordinal taken, 4: state apply, 5: lease lost or lapsed,
+/// 6: repeated signature faults, `crypto::record_fault`).
 pub fn fail_stop(code: i32, reason: &str) -> ! {
     record_exit(code, reason);
     std::process::exit(code)

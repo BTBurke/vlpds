@@ -88,6 +88,7 @@ curl -s -u "admin:$VLPDS_ADMIN_TOKEN" http://NODE:2583/xrpc/vlpds.admin.getClust
 | 3 | `fenced` / `ordinal_taken` | Our log was fenced by a successor, or another writer took our segment ordinal | `our log was fenced by a successor: fail-stop` / `segment ordinal taken by another writer: fail-stop` |
 | 4 | `state_apply` | SlateDB apply of a durable segment failed | `state apply failed: ...; exiting` |
 | 5 | `lease_lost` / `lease_lapsed` | Lease lost or lapsed (any reason) | `node lease lost unexpectedly: fail-stop` (`lease_lost`), preceded by one of: `node lease lost (CAS conflict)`, `node lease lapsed before renewal`, `node lease lapsed past takeover` (watchdog), `a shard we hold was reassigned`, `a shard failed to close cleanly`, `our log did not quiesce`; or `node lease lapsed before segment PUT` / `before ack` (`lease_lapsed`) |
+| 6 | `signature_fault` | 3 signatures failed verification right after signing within a minute (suspected memory/CPU fault; see [VlpdsSignatureFault](#vlpdssignaturefault)) | `repeated signature faults: fail-stop (suspect this host's memory or CPU)`, preceded by `signature failed verification against the signing key's public key` (purpose, recent) |
 
 **How the previous process ended** is a metric on the next one
 (`src/lifecycle.rs`): each fail-stop writes its `reason` and code to the
@@ -806,6 +807,46 @@ key-encryption key L…/G…`): usually an old KEK retired before the rewrap fin
 the kid is unknown, add the old KEK back (`--kek-old-file` / `--gcp-kms-old-key`)
 on every node and rerun the rewrap ([KEK rotation](#kek-rotation)). Otherwise
 compare the node's KEK config with its peers'. Never "fix" a row by hand.
+
+### VlpdsSignatureFault
+
+Also covers **VlpdsSignatureFaultFailStop** (the previous process exited
+with code 6, `signature_fault`).
+
+**Means:** a signature failed verification against the key's own public key
+right after it was made (`vlpds_signature_verify_failures_total{purpose}`:
+`commit`, `service_auth`, `oauth_token`; `key_load` = a cached signing key's
+scalar no longer derives its public key). Correct code never does this: the
+CPU or memory of this host computed something wrong (bad DIMM, Rowhammer,
+overheating, failing CPU). The bad signature was **not** emitted: the node
+signed once more with a fresh nonce, and if that failed too the write got a
+503 `SignatureFault` with nothing applied. Nonces are hedged, so a faulty
+signature leaks nothing even if one had got out, but the host is no longer
+trustworthy. Three failures within a minute fail-stop the node (exit 6);
+the supervisor restarts it on the same host, so expect it to recur.
+
+**Confirm:** `signature failed verification against the signing key's public
+key` error logs (`purpose`, `recent`); `vlpds_last_exit_reason_info{reason="signature_fault"}`.
+On the host: `journalctl -k | grep -iE 'mce|edac|machine check|hardware error'`,
+`edac-util -v` (or `/sys/devices/system/edac/mc/mc*/ce_count`/`ue_count`),
+`rasdaemon`/`ras-mc-ctl --summary` if installed, CPU temperatures, and the
+cloud provider's host-maintenance or hardware-degradation events.
+
+**Do:**
+1. Drain the host now, even after a single fault: stop vlpds there
+   gracefully (`SIGTERM`; peers take its shards over) and keep the
+   supervisor from restarting it on that host.
+2. Check ECC/EDAC and machine-check logs as above. Corrected-error counts
+   that climb, any uncorrected error, or MCEs = hardware fault.
+3. Replace the host (cloud: stop/start onto new hardware, or recreate the
+   VM; bare metal: pull it and run memtest86+ / the vendor diagnostics)
+   before it serves again. Don't return it on the strength of a clean
+   restart.
+4. Nothing to repair in data: no faulty signature was sequenced, and the
+   failed writes were refused with a retryable 503.
+5. Faults on several hosts at once point at a software or build problem
+   rather than hardware: compare the vlpds versions (VlpdsMixedVersions)
+   and escalate to development.
 
 ### VlpdsCacheAtCapacity
 

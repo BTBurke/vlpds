@@ -211,13 +211,15 @@ impl Jwt {
 /// Inter-service auth JWT (ES256K) signed with the account's signing key, as
 /// used by getServiceAuth and service proxying. `aud` is the target service DID
 /// (optionally with a #fragment); `lxm` binds the token to one XRPC method.
+/// The signature is hedged and verified before it is returned (src/crypto.rs);
+/// Err: it failed twice, nothing was issued.
 pub fn service_auth_jwt(
     key: &crate::crypto::Keypair,
     iss: &str,
     aud: &str,
     lxm: Option<&str>,
     ttl_secs: u64,
-) -> String {
+) -> Result<String, crate::crypto::SignatureFault> {
     let now = crate::tid::now_micros() / 1_000_000;
     let header = B64.encode(r#"{"typ":"JWT","alg":"ES256K"}"#);
     let mut claims = serde_json::json!({
@@ -232,8 +234,8 @@ pub fn service_auth_jwt(
     }
     let payload = B64.encode(serde_json::to_vec(&claims).unwrap());
     let signing_input = format!("{header}.{payload}");
-    let sig = key.sign(signing_input.as_bytes());
-    format!("{signing_input}.{}", B64.encode(sig))
+    let sig = key.sign_verified(crate::crypto::Purpose::ServiceAuth, signing_input.as_bytes())?;
+    Ok(format!("{signing_input}.{}", B64.encode(sig)))
 }
 
 /// Constant-time secret comparison for admin / internal / bypass tokens.

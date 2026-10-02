@@ -48,6 +48,10 @@ pub enum WriteError {
     /// The repo's signing key couldn't be unwrapped (key service down; see
     /// src/secrets.rs). Nothing was applied: 503 `KeyUnavailable`.
     KeyUnavailable(String),
+    /// The commit signature failed verification twice (src/crypto.rs:
+    /// suspected memory/CPU fault). Nothing was applied or emitted: 503
+    /// `SignatureFault`.
+    SignatureFault(String),
 }
 
 pub enum Write {
@@ -996,7 +1000,13 @@ impl Worker {
             }
         };
         let rev = tid::next_rev(None, self.clock_id);
-        let (commit, commit_block) = sign_commit(&req.did, &rev.to_string(), &data, &req.key);
+        let (commit, commit_block) = match sign_commit(&req.did, &rev.to_string(), &data, &req.key) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = req.reply.send(Err(signature_fault(&e)));
+                return;
+            }
+        };
         let head = Head {
             commit,
             data,
@@ -1328,11 +1338,19 @@ pub fn spawn_preload(workers: &Workers, shards: Vec<(u16, Arc<slatedb::Db>, Arc<
     });
 }
 
-pub fn sign_commit(did: &str, rev: &str, data: &Cid, key: &Keypair) -> (Cid, Bytes) {
+/// The signed commit block: hedged nonce, and verified against the key's
+/// public key before anything can sequence it (src/crypto.rs). Err: the
+/// signature failed twice (suspected hardware fault; counted, and repeats
+/// fail-stop the node): nothing may be emitted for this commit.
+pub fn sign_commit(did: &str, rev: &str, data: &Cid, key: &Keypair) -> Result<(Cid, Bytes), crate::crypto::SignatureFault> {
     let unsigned = events::encode_commit(did, rev, data, None);
-    let sig = key.sign(&unsigned);
+    let sig = key.sign_verified(crate::crypto::Purpose::Commit, &unsigned)?;
     let signed = events::encode_commit(did, rev, data, Some(&sig));
-    (Cid::dag_cbor(&signed), Bytes::from(signed))
+    Ok((Cid::dag_cbor(&signed), Bytes::from(signed)))
+}
+
+fn signature_fault(e: &crate::crypto::SignatureFault) -> WriteError {
+    WriteError::SignatureFault(e.to_string())
 }
 
 /// Opens a repo cold: its root (the default `M/` prefetch), nothing else.
@@ -1363,6 +1381,14 @@ pub async fn load_repo_with(
     // (process_with) and the next one reloads (retries the unwrap).
     let secrets = opts.secrets.clone().unwrap_or_else(Secrets::dev);
     let key = match secrets.account_signing_key(&acct).await {
+        // once per load: the (possibly long-cached) scalar still derives
+        // the account's public key; if not, drop it and treat the key as
+        // unavailable (writes 503 and reload, which unwraps afresh)
+        Ok(k) if !k.matches_public(&acct.signing_pubkey) => {
+            crate::crypto::record_fault(crate::crypto::Purpose::KeyLoad);
+            secrets.forget(&did);
+            None
+        }
         Ok(k) => Some(k),
         Err(e) if e.retryable() => None,
         Err(e) => return Err(anyhow::anyhow!("signing key of {did}: {e}")),
@@ -1539,6 +1565,21 @@ fn key_unavailable(did: &str) -> WriteError {
 }
 
 fn process_with(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, src: &dyn Source) -> anyhow::Result<()> {
+    let mut rest = reqs.into_iter();
+    let r = process_reqs(st, &mut rest, clock_id, src);
+    // a commit whose signature failed: the requests not reached yet were
+    // not applied either; answer them retryably rather than dropping them
+    if let Err(e) = &r {
+        if let Some(f) = e.downcast_ref::<crate::crypto::SignatureFault>() {
+            for q in rest {
+                q.fail(signature_fault(f));
+            }
+        }
+    }
+    r
+}
+
+fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock_id: u64, src: &dyn Source) -> anyhow::Result<()> {
     let mut batch = Batch::new();
     for q in reqs {
         let req = match q {
@@ -1761,7 +1802,17 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
     let since_s = st.head.rev.to_string();
     // process_with refuses writes to a repo without its key
     let key = st.key.as_deref().ok_or_else(|| anyhow::anyhow!("signing key unavailable"))?;
-    let (commit, commit_block) = sign_commit(&st.did, &rev_s, &data, key);
+    let (commit, commit_block) = match sign_commit(&st.did, &rev_s, &data, key) {
+        Ok(c) => c,
+        Err(e) => {
+            // nothing sequenced; the tree already holds the batch, so the
+            // caller evicts the repo (it reloads from durable state)
+            for (reply, _) in batch.waiters {
+                let _ = reply.send(Err(signature_fault(&e)));
+            }
+            return Err(e.into());
+        }
+    };
 
     let mut ops = Vec::with_capacity(batch.ops.len());
     let mut muts = Vec::with_capacity(batch.ops.len() + 1);
@@ -2163,7 +2214,14 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             }
             let data = tree.root_cid()?;
             replace_nodes_mutations(&st.did, old_nodes, &tree, &mut muts);
-            let (commit, commit_block) = sign_commit(&st.did, &rev.to_string(), &data, &key);
+            let (commit, commit_block) = match sign_commit(&st.did, &rev.to_string(), &data, &key) {
+                Ok(c) => c,
+                Err(e) => {
+                    // nothing sequenced; evict (the import's reads loaded the tree)
+                    let _ = req.reply.send(Err(signature_fault(&e)));
+                    return Err(e.into());
+                }
+            };
             // a deactivated account (mid-migration) is announced with #sync
             // when activated (reference importRepo sequences nothing)
             if st.account.status.is_none() {

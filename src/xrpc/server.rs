@@ -2661,7 +2661,7 @@ async fn get_service_auth(
         )));
     }
     let key = app.secrets.account_signing_key(&acct).await?;
-    let token = crate::auth::service_auth_jwt(&key, &did, &q.aud, lxm, ttl);
+    let token = crate::auth::service_auth_jwt(&key, &did, &q.aud, lxm, ttl)?;
     Ok(Json(json!({"token": token})))
 }
 

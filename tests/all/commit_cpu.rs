@@ -1,16 +1,20 @@
 //! The write path's CPU work changed without changing its output: commit
-//! signatures (RFC 6979 nonce on hardware SHA-256, src/crypto.rs) and the
-//! getBlocks node index keying each written node by its own first value
-//! instead of its subtree's leftmost key (src/mst.rs `subtree_key`).
+//! signatures (RFC 6979 nonce on hardware SHA-256, src/crypto.rs; hedged
+//! with fresh nonce data since) and the getBlocks node index keying each
+//! written node by its own first value instead of its subtree's leftmost key
+//! (src/mst.rs `subtree_key`).
 use crate::common::*;
 use std::collections::HashSet;
 
-/// Signatures are the RFC 6979 ones: equal to RustCrypto k256's
+/// The deterministic path is RFC 6979: equal to RustCrypto k256's
 /// (deterministic, low-S) for many keys, and over every message length
-/// around the SHA-256 block boundaries.
+/// around the SHA-256 block boundaries. What a worker emits is hedged: the
+/// same commit object with a low-S signature k256 verifies, different each
+/// time.
 #[test]
 fn commit_signatures_match_k256_across_keys_and_lengths() {
-    use k256::ecdsa::signature::Signer;
+    use k256::ecdsa::signature::{Signer, Verifier};
+    let did = "did:plc:abcdefghijklmnopqrstuvwx";
     for k in 0..64u32 {
         let kp = vlpds::crypto::Keypair::generate();
         let sk = k256::ecdsa::SigningKey::from_slice(&kp.to_bytes()).unwrap();
@@ -18,21 +22,20 @@ fn commit_signatures_match_k256_across_keys_and_lengths() {
             let msg: Vec<u8> = (0..len).map(|i| (i as u32 * 31 + k) as u8).collect();
             let theirs: k256::ecdsa::Signature = sk.sign(&msg);
             let theirs = theirs.normalize_s().unwrap_or(theirs);
-            assert_eq!(kp.sign(&msg)[..], theirs.to_bytes()[..], "key {k} len {len}");
+            assert_eq!(kp.sign_deterministic(&msg)[..], theirs.to_bytes()[..], "key {k} len {len}");
         }
         // the commit object a worker signs
         let data = vlpds::cid::Cid::dag_cbor(format!("data {k}").as_bytes());
-        let (_, block) = vlpds::worker::sign_commit("did:plc:abcdefghijklmnopqrstuvwx", "3lbcdefghij22", &data, &kp);
-        let unsigned = vlpds::events::encode_commit("did:plc:abcdefghijklmnopqrstuvwx", "3lbcdefghij22", &data, None);
-        let theirs: k256::ecdsa::Signature = sk.sign(&unsigned);
-        let theirs = theirs.normalize_s().unwrap_or(theirs);
-        let want = vlpds::events::encode_commit(
-            "did:plc:abcdefghijklmnopqrstuvwx",
-            "3lbcdefghij22",
-            &data,
-            Some(&theirs.to_bytes()),
-        );
-        assert_eq!(&block[..], &want[..]);
+        let (_, block) = vlpds::worker::sign_commit(did, "3lbcdefghij22", &data, &kp).unwrap();
+        let (_, again) = vlpds::worker::sign_commit(did, "3lbcdefghij22", &data, &kp).unwrap();
+        assert_ne!(block, again, "hedged signatures repeat");
+        let unsigned = vlpds::events::encode_commit(did, "3lbcdefghij22", &data, None);
+        let Some(Value::Bytes(sig)) = Value::decode(&block).unwrap().get("sig").cloned() else { panic!("commit without sig") };
+        let sig: [u8; 64] = sig[..].try_into().unwrap();
+        assert_eq!(&block[..], &vlpds::events::encode_commit(did, "3lbcdefghij22", &data, Some(&sig))[..]);
+        let theirs = k256::ecdsa::Signature::from_slice(&sig).unwrap();
+        assert!(theirs.normalize_s().is_none(), "high-S");
+        sk.verifying_key().verify(&unsigned, &theirs).unwrap();
     }
 }
 

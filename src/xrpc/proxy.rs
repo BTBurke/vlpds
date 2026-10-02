@@ -633,17 +633,17 @@ async fn cached_account(app: &App, did: &str) -> XResult<CachedAcct> {
     Ok(c)
 }
 
-fn service_jwt(acct: &CachedAcct, iss: &str, aud: &str, lxm: &str) -> Arc<str> {
+fn service_jwt(acct: &CachedAcct, iss: &str, aud: &str, lxm: &str) -> XResult<Arc<str>> {
     let h = fixed_hash(&(iss, aud, lxm, acct.key_id));
     let hit = |j: &CachedJwt| j.0 == iss && j.1 == aud && j.2 == lxm && j.3 == acct.key_id;
     if let Some(j) = JWTS.get(&h, JWT_REUSE).filter(hit) {
         crate::metrics::PROXY_CACHE.with_label_values(&["jwt_hit"]).inc();
-        return j.4.clone();
+        return Ok(j.4.clone());
     }
     crate::metrics::PROXY_CACHE.with_label_values(&["jwt_miss"]).inc();
-    let j: Arc<str> = crate::auth::service_auth_jwt(&acct.key, iss, aud, Some(lxm), SERVICE_JWT_TTL_SECS).into();
+    let j: Arc<str> = crate::auth::service_auth_jwt(&acct.key, iss, aud, Some(lxm), SERVICE_JWT_TTL_SECS)?.into();
     JWTS.put(h, Arc::new((iss.into(), aud.into(), lxm.into(), acct.key_id, j.clone())), JWT_REUSE);
-    j
+    Ok(j)
 }
 
 /// A service endpoint as the proxy uses it.
@@ -765,7 +765,7 @@ async fn forward(app: &App, target: &Target<'_>, f: Forward<'_>, acct: Option<&C
                 }
             };
             // Phase 1 of service-auth updates: the outbound JWT aud is the bare DID.
-            Some(service_jwt(acct, iss, &target.did, f.lxm))
+            Some(service_jwt(acct, iss, &target.did, f.lxm)?)
         }
         None => None,
     };

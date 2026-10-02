@@ -189,12 +189,24 @@ impl From<WriteError> for XrpcError {
             WriteError::Unavailable(m) => XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: crate::forward::SHARD_MOVED.into(), message: m },
             // the repo's signing key couldn't be unwrapped (KMS down): nothing applied
             WriteError::KeyUnavailable(m) => XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: KEY_UNAVAILABLE.into(), message: m },
+            // the signature failed verification twice: nothing applied
+            WriteError::SignatureFault(m) => XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: SIGNATURE_FAULT.into(), message: m },
         }
     }
 }
 
 /// 503 error of a write whose signing key can't be unwrapped right now.
 pub const KEY_UNAVAILABLE: &str = "KeyUnavailable";
+
+/// 503 error of a signature that failed verification after signing
+/// (src/crypto.rs): nothing was emitted, retry.
+pub const SIGNATURE_FAULT: &str = "SignatureFault";
+
+impl From<crate::crypto::SignatureFault> for XrpcError {
+    fn from(e: crate::crypto::SignatureFault) -> XrpcError {
+        XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: SIGNATURE_FAULT.into(), message: e.to_string() }
+    }
+}
 
 impl From<crate::secrets::SecretError> for XrpcError {
     fn from(e: crate::secrets::SecretError) -> XrpcError {

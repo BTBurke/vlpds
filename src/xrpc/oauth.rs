@@ -1918,7 +1918,6 @@ async fn issue_tokens(app: &App, client: &Client, s: &mut Session) -> Result<J, 
     s.token_id = ou::random_id("tok-", 16);
     s.updated_at = now;
     s.expires_at = now + lifetime;
-    store::put_session(app, s).await?;
     let claims = json!({
         "iss": issuer(app),
         "aud": app.jwt.service_did,
@@ -1931,7 +1930,11 @@ async fn issue_tokens(app: &App, client: &Client, s: &mut Session) -> Result<J, 
         "cnf": {"jkt": s.dpop_jkt},
         "sid": s.id,
     });
-    let access = keys(app).server.sign("at+jwt", &claims);
+    // signed and verified (src/crypto.rs) before the session row names the
+    // new token: a signature fault (503) never stores a token id that no
+    // client received
+    let access = keys(app).server.sign("at+jwt", &claims).map_err(|e| unavailable(&e.to_string()))?;
+    store::put_session(app, s).await?;
     let mut out = json!({
         "access_token": access,
         "token_type": "DPoP",

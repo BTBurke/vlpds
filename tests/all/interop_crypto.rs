@@ -149,7 +149,8 @@ fn service_auth_jwt_is_es256k_and_verifies() {
         "did:web:example.com",
         Some("com.example.method"),
         60,
-    );
+    )
+    .unwrap();
     let parts: Vec<&str> = tok.split('.').collect();
     assert_eq!(parts.len(), 3);
     let dec = |s: &str| {
@@ -175,8 +176,9 @@ fn service_auth_jwt_is_es256k_and_verifies() {
 #[test]
 fn signatures_byte_identical_to_rustcrypto_k256() {
     // libsecp256k1 and k256 both use RFC 6979 nonces: after low-S
-    // normalization the compact signatures must match byte for byte.
-    use k256::ecdsa::signature::Signer;
+    // normalization the compact signatures must match byte for byte. (The
+    // deterministic path; what a node emits is hedged, and k256 verifies it.)
+    use k256::ecdsa::signature::{Signer, Verifier};
     for k in 0..16u32 {
         let kp = vlpds::crypto::Keypair::generate();
         let sk = k256::ecdsa::SigningKey::from_slice(&kp.to_bytes()).unwrap();
@@ -188,7 +190,10 @@ fn signatures_byte_identical_to_rustcrypto_k256() {
             let msg = format!("commit {k} {i} {}", "x".repeat(i as usize));
             let theirs: k256::ecdsa::Signature = sk.sign(msg.as_bytes());
             let theirs = theirs.normalize_s().unwrap_or(theirs);
-            assert_eq!(kp.sign(msg.as_bytes())[..], theirs.to_bytes()[..], "key {k} msg {i}");
+            assert_eq!(kp.sign_deterministic(msg.as_bytes())[..], theirs.to_bytes()[..], "key {k} msg {i}");
+            let hedged = kp.sign_verified(vlpds::crypto::Purpose::Commit, msg.as_bytes()).unwrap();
+            assert_ne!(hedged, kp.sign_deterministic(msg.as_bytes()));
+            sk.verifying_key().verify(msg.as_bytes(), &k256::ecdsa::Signature::from_slice(&hedged).unwrap()).unwrap();
             assert!(vlpds::crypto::verify_k256(&kp.public_key_sec1(), msg.as_bytes(), &theirs.to_bytes()).unwrap());
             assert!(!vlpds::crypto::verify_k256(&kp.public_key_sec1(), b"other", &theirs.to_bytes()).unwrap());
         }

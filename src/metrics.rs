@@ -156,6 +156,7 @@ lazy!(PROCESS_START: Gauge = register_gauge!("vlpds_process_start_time_seconds",
 lazy!(PROCESS_START_STD: Gauge = register_gauge!("process_start_time_seconds", "Start time of the process since unix epoch in seconds."));
 lazy!(LAST_EXIT: IntGaugeVec = register_int_gauge_vec!("vlpds_last_exit_reason_info", "1, labeled with how the previous process using this exit-state file ended (lifecycle.rs): a fail-stop reason with its exit code, clean, error, crash (no exit recorded: SIGKILL, OOM kill, abort, host loss) or none (first run, or no exit-state file)", &["reason", "code"]));
 lazy!(LAST_EXIT_TIME: Gauge = register_gauge!("vlpds_last_exit_time_seconds", "When the previous process recorded its exit (Unix seconds; 0 if unknown)"));
+lazy!(SIGNATURE_VERIFY_FAILURES: IntCounterVec = register_int_counter_vec!("vlpds_signature_verify_failures_total", "Signatures that failed verification right after signing (never emitted; crypto.rs), by purpose (commit, service_auth, oauth_token; key_load: a loaded key's scalar no longer derives its public key). Any is a suspected memory/CPU fault; 3 within a minute fail-stop the node (signature_fault)", &["purpose"]));
 
 // ---- shard opens / replay ----
 lazy!(SHARDS_OPENED: IntCounterVec = register_int_counter_vec!("vlpds_shards_opened_total", "Shard opens (acquire, adopt, takeover, reshard children) by result", &["result"]));
@@ -217,6 +218,7 @@ pub fn on_render(f: impl Fn() -> bool + Send + Sync + 'static) {
 pub fn render() -> String {
     REFRESHERS.lock().retain(|f| f());
     crate::lifecycle::refresh_metrics();
+    crate::crypto::touch_metrics();
     refresh_jemalloc();
     refresh_process();
     refresh_tokio();

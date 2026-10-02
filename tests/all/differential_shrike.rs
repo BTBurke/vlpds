@@ -1719,10 +1719,13 @@ fn k256_signatures_and_did_keys() {
         let vk = shrike::crypto::parse_did_key(&kp.did_key()).unwrap();
         for j in 0..8 {
             let msg: Vec<u8> = (0..rng.gen_range(0..300)).map(|_| rng.gen()).collect();
-            let a = kp.sign(&msg);
+            let a = kp.sign_deterministic(&msg);
             let b = sk.sign(&msg).unwrap();
             // RFC 6979 + low-S on both sides: byte-identical
             assert_eq!(&a, b.as_bytes(), "key {i} msg {j}");
+            // what a node emits (hedged nonce) verifies on the other side
+            let h = kp.sign_verified(crypto::Purpose::Commit, &msg).unwrap();
+            vk.verify(&msg, &shrike::crypto::Signature::from_bytes(h)).unwrap();
             vk.verify(&msg, &shrike::crypto::Signature::from_bytes(a)).unwrap();
             assert!(crypto::verify_k256(&kp.public_key_sec1(), &msg, b.as_bytes()).unwrap());
             // a flipped bit fails in both

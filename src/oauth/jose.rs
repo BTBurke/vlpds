@@ -5,7 +5,7 @@
 use super::util::{
     b64u, b64u_decode, derive_secret, hmac_sha256, now_secs, sha256_b64u, Replay,
 };
-use p256::ecdsa::signature::{Signer, Verifier};
+use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::EncodedPoint;
 use serde_json::{json, Value as J};
@@ -155,15 +155,33 @@ impl ServerKey {
         j
     }
 
-    pub fn sign(&self, typ: &str, payload: &J) -> String {
+    /// An ES256 JWT. Hedged nonce (RFC 6979 with fresh additional data) and
+    /// verified against the public key before it is returned, as commit
+    /// signatures are (src/crypto.rs): a failure is recorded and retried
+    /// once; Err after two.
+    pub fn sign(&self, typ: &str, payload: &J) -> Result<String, crate::crypto::SignatureFault> {
+        use crate::crypto::{fault, record_fault, Purpose, SignatureFault};
+        use p256::ecdsa::signature::RandomizedSigner;
         let header = json!({"alg": "ES256", "typ": typ, "kid": self.kid});
         let input = format!(
             "{}.{}",
             b64u(serde_json::to_vec(&header).unwrap()),
             b64u(serde_json::to_vec(payload).unwrap())
         );
-        let sig: Signature = self.sk.sign(input.as_bytes());
-        format!("{input}.{}", b64u(sig.to_bytes()))
+        let vk = self.sk.verifying_key();
+        for _ in 0..2 {
+            let sig: Signature = self.sk.sign_with_rng(&mut rand::thread_rng(), input.as_bytes());
+            let mut bytes = sig.to_bytes();
+            if fault::armed() && fault::take(vk.to_encoded_point(true).as_bytes()).is_some() {
+                bytes[40] ^= 0x04;
+            }
+            let ok = Signature::from_slice(&bytes).is_ok_and(|s| vk.verify(input.as_bytes(), &s).is_ok());
+            if ok {
+                return Ok(format!("{input}.{}", b64u(bytes)));
+            }
+            record_fault(Purpose::OAuthToken);
+        }
+        Err(SignatureFault { purpose: Purpose::OAuthToken.as_str() })
     }
 
     /// Verifies signature and `typ`; claims are checked by the caller.
@@ -367,6 +385,7 @@ pub fn check_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::ecdsa::signature::Signer;
 
     fn proof(
         sk: &SigningKey,
@@ -437,8 +456,28 @@ mod tests {
         let a = ServerKey::derive("s1");
         let b = ServerKey::derive("s1");
         assert_eq!(a.kid, b.kid);
-        let t = a.sign("at+jwt", &json!({"sub": "x"}));
+        let t = a.sign("at+jwt", &json!({"sub": "x"})).unwrap();
         assert!(b.verify(&t, "at+jwt").is_ok());
         assert!(ServerKey::derive("s2").verify(&t, "at+jwt").is_err());
+        // hedged: the same token signs differently each time
+        assert_ne!(t, a.sign("at+jwt", &json!({"sub": "x"})).unwrap());
+    }
+
+    /// A corrupted access-token signature is never returned: one fault is
+    /// re-signed, two fail.
+    #[test]
+    fn server_key_faults_are_caught() {
+        use crate::crypto::fault::{inject, Fault};
+        let a = ServerKey::derive("fault-test");
+        let id = a.sk.verifying_key().to_encoded_point(true);
+        let failures = || crate::metrics::SIGNATURE_VERIFY_FAILURES.with_label_values(&["oauth_token"]).get();
+        let before = failures();
+        inject(id.as_bytes(), Fault::Signature, 1);
+        let t = a.sign("at+jwt", &json!({"sub": "x"})).unwrap();
+        assert!(a.verify(&t, "at+jwt").is_ok());
+        inject(id.as_bytes(), Fault::Signature, 2);
+        assert!(a.sign("at+jwt", &json!({"sub": "x"})).is_err());
+        assert!(failures() >= before + 3);
+        assert!(a.verify(&a.sign("at+jwt", &json!({"sub": "x"})).unwrap(), "at+jwt").is_ok());
     }
 }

@@ -80,6 +80,7 @@ mod sequencer;
 mod shrike_adopt;
 mod server_basics;
 mod service_auth;
+mod signature_faults;
 mod shard_ingest;
 mod subscribe_repos;
 mod sync_list;
