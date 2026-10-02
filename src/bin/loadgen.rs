@@ -471,7 +471,7 @@ async fn setup(
                     left -= n;
                 }
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if d % 1000 == 0 {
+                if d.is_multiple_of(1000) {
                     eprintln!("setup: {d} accounts ({:.0}/s)", d as f64 / started.elapsed().as_secs_f64());
                 }
                 anyhow::Ok(Acct { did, handle, token })
@@ -769,7 +769,7 @@ async fn run(
     let elapsed = duration as f64;
     let ok = st.ok.load(Ordering::Relaxed);
     let report = |name: &str, h: &Histogram<u64>| {
-        if h.len() == 0 {
+        if h.is_empty() {
             return;
         }
         let q = |p: f64| h.value_at_quantile(p) as f64 / 1000.0;
@@ -1136,7 +1136,7 @@ async fn bulk(
                 tick.tick().await;
                 let v = wp(false);
                 n += 1;
-                if n % 5 == 0 {
+                if n.is_multiple_of(5) {
                     eprintln!("bulk: {}/{count} accounts, {} records ({:.0} accounts/s, {:.0} records/s)",
                         v["accounts"], v["records"], v["accounts_s"].as_f64().unwrap_or(0.0), v["records_s"].as_f64().unwrap_or(0.0));
                 }
@@ -1645,7 +1645,7 @@ async fn verify(args: &Args, acked: &str) -> anyhow::Result<()> {
     let m: std::collections::HashMap<String, Vec<String>> = serde_json::from_slice(&std::fs::read(acked)?)?;
     let c = client();
     let total: usize = m.values().map(|v| v.len()).sum();
-    let results: Vec<anyhow::Result<usize>> = futures::stream::iter(m.into_iter())
+    let results: Vec<anyhow::Result<usize>> = futures::stream::iter(m)
         .map(|(did, rkeys)| {
             let c = c.clone();
             let host = args.host.clone();
@@ -1945,10 +1945,9 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
         let runs = if size >= 1_000_000 { 2 } else { 5 };
         for i in 0..runs {
             let t = Instant::now();
-            let ttfb;
             let mut bytes = 0usize;
             let mut resp = c.get(format!("{h}/xrpc/com.atproto.sync.getRepo?did={did}")).send().await?;
-            ttfb = t.elapsed().as_secs_f64();
+            let ttfb = t.elapsed().as_secs_f64();
             while let Some(chunk) = resp.chunk().await? {
                 bytes += chunk.len();
             }

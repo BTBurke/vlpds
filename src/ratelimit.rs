@@ -387,7 +387,7 @@ pub struct Consumer {
 impl Counters {
     /// Windows are keyed by (bucket, window length, key): a new limit keeps
     /// a key's live window, a new window length starts a fresh one.
-    pub fn consume_spec(&self, spec: &Spec, limit: u32, key: &str, points: u32, now_ms: u64) -> Status {
+    fn consume_spec(&self, spec: &Spec, limit: u32, key: &str, points: u32, now_ms: u64) -> Status {
         let mut h = self.hasher.build_hasher();
         spec.name.hash(&mut h);
         spec.window_ms.hash(&mut h);
@@ -899,29 +899,29 @@ fn exceeded_error() -> XrpcError {
     }
 }
 
+/// Outside a rate-limited request: Ok.
+fn with_ctx(f: impl FnOnce(&mut Ctx) -> Result<(), XrpcError>) -> Result<(), XrpcError> {
+    CTX.try_with(|c| f(&mut c.borrow_mut())).unwrap_or(Ok(()))
+}
+
 /// No-op when rate limiting is off or bypassed.
 pub fn check(limits: &[&'static Limit], key: &str, points: u32) -> Result<(), XrpcError> {
-    CTX.try_with(|c| c.borrow_mut().consume(limits, key, points))
-        .unwrap_or(Ok(()))
+    with_ctx(|c| c.consume(limits, key, points))
 }
 
 /// Keyed by `{prefix}-{client ip}`.
 pub fn check_with_ip(limits: &[&'static Limit], prefix: &str, points: u32) -> Result<(), XrpcError> {
-    CTX.try_with(|c| {
-        let mut c = c.borrow_mut();
+    with_ctx(|c| {
         let key = format!("{prefix}-{}", c.ip);
         c.consume(limits, &key, points)
     })
-    .unwrap_or(Ok(()))
 }
 
 pub fn check_ip(limits: &[&'static Limit], points: u32) -> Result<(), XrpcError> {
-    CTX.try_with(|c| {
-        let mut c = c.borrow_mut();
+    with_ctx(|c| {
         let key = c.ip.clone();
         c.consume(limits, &key, points)
     })
-    .unwrap_or(Ok(()))
 }
 
 pub fn check_repo_write(did: Option<&str>, points: u32) -> Result<(), XrpcError> {

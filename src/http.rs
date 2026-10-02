@@ -603,7 +603,7 @@ pub mod stall {
     impl<B: hyper::body::Body + Send + 'static, H> Watched<B, H> {
         /// Watched from now on: a client whose h2 window is zero from the
         /// start never polls the body at all.
-        pub fn with_hold(body: B, hold: H) -> Self {
+        fn with_hold(body: B, hold: H) -> Self {
             let waiting = if body.is_end_stream() { 0 } else { now_ms() };
             let s = Arc::new(Shared { body: parking_lot::Mutex::new(Some(body)), waiting: AtomicU64::new(waiting) });
             register(Arc::downgrade(&s) as Weak<dyn Reap>);
@@ -694,7 +694,7 @@ pub fn guarded(dev_mode: bool) -> &'static reqwest::Client {
 /// each) per peer origin, picked round-robin. Each origin's TLS config checks
 /// that the server's certificate names the node the cluster expects there.
 ///
-/// Bulk downloads ([`is_bulk`]) go over `n` other connections: clients that
+/// Bulk downloads (`is_bulk`) go over `n` other connections: clients that
 /// read them slowly fill only those connections' flow-control windows, never
 /// the ones every other forward shares.
 #[derive(Clone)]
@@ -736,7 +736,7 @@ pub type Registry = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 
 const MAX_ORIGINS: usize = 256;
 
-pub fn is_bulk(path: &str) -> bool {
+fn is_bulk(path: &str) -> bool {
     matches!(
         path.strip_prefix("/xrpc/"),
         Some("com.atproto.sync.getRepo" | "com.atproto.sync.getBlob" | "com.atproto.sync.getBlocks")
@@ -781,7 +781,7 @@ impl PeerClient {
         let _ = self.0.registry.set(r);
     }
 
-    pub fn client_for(&self, url: &str) -> reqwest::Client {
+    fn client_for(&self, url: &str) -> reqwest::Client {
         let Some(tls) = &self.0.tls else { return refusing().clone() };
         let (origin, rest) = split_origin(url);
         let path = rest.split_once('?').map_or(rest, |(p, _)| p);

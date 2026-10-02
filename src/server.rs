@@ -144,7 +144,7 @@ const MIN_SECRET_LEN: usize = 32;
 impl Config {
     /// The binary calls it; in-process tests may skip it. Secrets are never
     /// empty, and outside dev mode they must be real, at least
-    /// [`MIN_SECRET_LEN`] bytes, and pairwise distinct.
+    /// 32 bytes, and pairwise distinct.
     pub fn check_secrets(&self) -> anyhow::Result<()> {
         let secrets = [
             ("VLPDS_JWT_SECRET", &self.jwt_secret, DEV_JWT_SECRET),
@@ -574,7 +574,7 @@ pub fn router(app: &Arc<xrpc::App>) -> axum::Router {
     }))
 }
 
-pub fn metrics_router(app: &Arc<xrpc::App>) -> axum::Router {
+fn metrics_router(app: &Arc<xrpc::App>) -> axum::Router {
     axum::Router::new()
         .route("/metrics", axum::routing::get(|| async { crate::metrics::render() }))
         .merge(crate::profiling::routes())

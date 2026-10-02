@@ -152,7 +152,7 @@ impl Doc {
     }
 }
 
-pub fn route_name(nsid: &str) -> String {
+fn route_name(nsid: &str) -> String {
     format!("route:{nsid}")
 }
 
