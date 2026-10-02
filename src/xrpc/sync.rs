@@ -22,7 +22,7 @@ pub fn routes() -> Router<Arc<App>> {
             "/xrpc/com.atproto.sync.subscribeRepos",
             get(subscribe_repos),
         )
-        // Relay-side methods: a PDS doesn't serve these.
+        // relay-side methods
         .route("/xrpc/com.atproto.sync.getHostStatus", get(not_implemented))
         .route("/xrpc/com.atproto.sync.listHosts", get(not_implemented))
         .route(
@@ -40,24 +40,16 @@ pub(super) async fn not_implemented() -> XrpcError {
     }
 }
 
-/// Reference `assertRepoAvailability`: the account must exist; unless the
-/// caller is the repo's own user or an admin, it must also be active
-/// (RepoTakendown / RepoDeactivated / RepoSuspended otherwise).
+/// Reference `assertRepoAvailability`: only the repo's own user or an admin
+/// may read an inactive repo.
 pub(super) async fn assert_available(
     app: &App,
     did: &str,
     creds: Option<&Credentials>,
 ) -> XResult<Account> {
-    let acct = match app.account(did).await {
-        Ok(a) => a,
-        Err(e) if e.error == "AccountNotFound" => {
-            return Err(XrpcError::bad(
-                "RepoNotFound",
-                format!("Could not find repo for DID: {did}"),
-            ))
-        }
-        Err(e) => return Err(e),
-    };
+    let acct = super::server::account_if_exists(app, did)
+        .await?
+        .ok_or_else(|| XrpcError::bad("RepoNotFound", format!("Could not find repo for DID: {did}")))?;
     let self_or_admin = match creds {
         Some(Credentials::Admin) => true,
         Some(c) => c.did() == Some(did),
@@ -68,44 +60,35 @@ pub(super) async fn assert_available(
     }
     match acct.status.as_deref() {
         None => Ok(acct),
-        Some("takendown") => Err(XrpcError::bad(
-            "RepoTakendown",
-            format!("Repo has been takendown: {did}"),
-        )),
-        Some("deactivated") => Err(XrpcError::bad(
-            "RepoDeactivated",
-            format!("Repo has been deactivated: {did}"),
-        )),
-        Some(st) => Err(XrpcError::bad(
-            &inactive_error(st),
-            format!("Repo is {st}: {did}"),
-        )),
+        Some("takendown") => Err(XrpcError::bad("RepoTakendown", format!("Repo has been takendown: {did}"))),
+        Some("deactivated") => Err(XrpcError::bad("RepoDeactivated", format!("Repo has been deactivated: {did}"))),
+        Some(st) => Err(XrpcError::bad(&inactive_error(st), format!("Repo is {st}: {did}"))),
     }
 }
 
-/// Parses a raw query string into decoded pairs, keeping repeated keys
-/// (`cids=a&cids=b`), which axum's `Query` can't express.
-pub(super) fn query_pairs(raw: &str) -> Vec<(String, String)> {
-    fn decode(s: &str) -> String {
-        let b = s.as_bytes();
-        let mut out = Vec::with_capacity(b.len());
-        let mut i = 0;
-        while i < b.len() {
-            match b[i] {
-                b'+' => out.push(b' '),
-                b'%' if i + 2 < b.len()
-                    && b[i + 1].is_ascii_hexdigit()
-                    && b[i + 2].is_ascii_hexdigit() =>
-                {
-                    out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap_or(b'%'));
-                    i += 2;
-                }
-                c => out.push(c),
+/// Lenient percent-decoding: a malformed escape is kept as is. `plus`:
+/// form encoding, '+' is a space.
+pub(super) fn pct_decode(s: &str, plus: bool) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' if plus => out.push(b' '),
+            b'%' if i + 2 < b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() => {
+                out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap_or(b'%'));
+                i += 2;
             }
-            i += 1;
+            c => out.push(c),
         }
-        String::from_utf8_lossy(&out).into_owned()
+        i += 1;
     }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Keeps repeated keys (`cids=a&cids=b`), which axum's `Query` can't express.
+pub(super) fn query_pairs(raw: &str) -> Vec<(String, String)> {
+    let decode = |s: &str| pct_decode(s, true);
     raw.split('&')
         .filter(|p| !p.is_empty())
         .map(|p| match p.split_once('=') {
@@ -132,36 +115,24 @@ async fn get_latest_commit(
     ))
 }
 
-/// Deprecated: the current commit CID.
 async fn get_head(
     State(app): AppState,
     MaybeAuth(creds): MaybeAuth,
     Query(q): Query<DidQ>,
 ) -> XResult<Json<J>> {
     assert_available(&app, &q.did, creds.as_ref()).await?;
-    let head = app.head(&q.did).await.map_err(|e| {
-        if e.error == "RepoNotFound" {
-            XrpcError::bad(
-                "HeadNotFound",
-                format!("Could not find root for DID: {}", q.did),
-            )
-        } else {
-            e
-        }
+    let head = app.head(&q.did).await.map_err(|e| match e.error.as_str() {
+        "RepoNotFound" => XrpcError::bad("HeadNotFound", format!("Could not find root for DID: {}", q.did)),
+        _ => e,
     })?;
     Ok(Json(json!({"root": head.commit.to_string()})))
 }
 
-/// active/status per the lexicon; `rev` only while active.
-fn status_fields(acct: &Account) -> (bool, Option<&str>) {
-    (acct.status.is_none(), acct.status.as_deref())
-}
-
 async fn get_repo_status(State(app): AppState, Query(q): Query<DidQ>) -> XResult<Json<J>> {
     let acct = assert_available(&app, &q.did, Some(&Credentials::Admin)).await?;
-    let (active, status) = status_fields(&acct);
+    let active = acct.status.is_none();
     let mut out = json!({"did": q.did, "active": active});
-    if let Some(st) = status {
+    if let Some(st) = &acct.status {
         out["status"] = json!(st);
     }
     if active {
@@ -185,9 +156,8 @@ struct GetRepoQ {
     since: Option<String>,
 }
 
-/// Repo CAR. With `since`, records are limited to those written after that
-/// rev (each record value carries the rev that wrote it). MST nodes aren't
-/// stored per rev, so the current tree is always included: a superset of the
+/// With `since`, only records written after that rev. MST nodes aren't
+/// stored per rev, so the whole current tree is included: a superset of the
 /// reference's block set that still applies cleanly for incremental sync.
 async fn get_repo(
     State(app): AppState,
@@ -202,7 +172,6 @@ async fn get_repo(
     export_repo(&app, &q.did, since).await
 }
 
-/// Deprecated alias of getRepo.
 async fn get_checkout(
     State(app): AppState,
     MaybeAuth(creds): MaybeAuth,
@@ -213,49 +182,39 @@ async fn get_checkout(
 }
 
 /// An export reads up to this much of the repo's `M/` range with one scan
-/// (~28 B/record: a 1M-record repo's), point reads beyond. Taken from a
-/// process-wide budget ([`EXPORT_PREFETCH_MB`]): less, or none, while other
-/// exports hold it.
+/// (~28 B/record), point reads beyond; less while other exports hold the
+/// process-wide [`EXPORT_PREFETCH_MB`].
 const EXPORT_PREFETCH_BYTES: usize = 64 << 20;
 
-/// `M/` prefetch all exports may hold at once, in MiB.
 static EXPORT_PREFETCH_MB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(512);
 
-/// Default `Config::max_exports`: exports streaming at once. Each holds a
-/// blocking-pool thread for its MST walk, so this also bounds what slow
-/// readers can take from that pool.
+/// Each export holds a blocking-pool thread for its MST walk, so this also
+/// bounds what slow readers can take from that pool.
 pub const DEFAULT_MAX_EXPORTS: usize = 32;
-/// Default `Config::export_stall`.
 pub const DEFAULT_EXPORT_STALL: std::time::Duration = std::time::Duration::from_secs(60);
-/// How long an export waits for a slot before 503.
 const EXPORT_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Body chunks queued between an export and its response body.
 const EXPORT_QUEUE: usize = 4;
 
-/// Record blocks exports may hold while they stream the MST nodes (the CAR
-/// puts every node before any record), in MiB, process-wide; and per export.
-/// An export takes it 1 MiB at a time as its buffer grows; one that can't
-/// get more (or reaches its cap) reads the records it couldn't buffer with a
-/// second scan afterwards. A 100k-record repo holds ~15 MB of records.
+/// MiB of record blocks exports may hold while they stream the MST nodes
+/// (the CAR puts every node before any record), process-wide and per
+/// export. An export that can't get more reads the rest with a second scan
+/// afterwards.
 static EXPORT_BUFFER_MB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
 static EXPORT_BUFFER_MAX_MB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(64);
 
-/// The per-export record buffer cap in MiB (tests: 0 makes every export
-/// read its records twice, 1 splits a ~1 MB repo's between the buffer and
-/// the second scan; the bytes are the same).
+/// Tests: 0 makes every export read its records twice.
 pub fn set_export_buffer_max_mb(mb: u32) {
     EXPORT_BUFFER_MAX_MB.store(mb, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Records per batch handed from an export's `R/` scan to its MST walk.
 const EXPORT_BATCH: usize = 512;
 
-/// The body chunks an export sends (~1 MiB each).
 const EXPORT_CHUNK: usize = 1 << 20;
 
 /// Record CIDs an export has written, by the first 128 bits of their
-/// SHA-256 digest (which hash well as they are): records with identical
-/// contents share a block, and the CAR carries it once.
+/// digest (which hash well as they are): identical records share a block,
+/// carried once.
 type SeenCids = HashSet<u128, std::hash::BuildHasherDefault<DigestHasher>>;
 
 #[derive(Default)]
@@ -281,10 +240,8 @@ fn cid_key(c: &Cid) -> u128 {
     u128::from_le_bytes(k)
 }
 
-/// What an export's `R/` scan kept for the CAR's tail: the record blocks
-/// (CAR-encoded, `since`-filtered, each block once) up to the buffer budget,
-/// in body chunks, and the first record it didn't keep, if any (the rest is
-/// read again from there).
+/// Record blocks an export's `R/` scan kept for the CAR's tail, and the
+/// first record it didn't keep (read again from there).
 struct Buffered {
     chunks: Vec<Vec<u8>>,
     bytes: usize,
@@ -293,9 +250,8 @@ struct Buffered {
     _permit: Option<tokio::sync::SemaphorePermit<'static>>,
 }
 
-/// One forward `R/` scan for an export: every record's (key, CID), in
-/// batches, to the MST walk (`tx`: it rebuilds the leaves from them), and
-/// the record blocks kept for after the nodes, up to the buffer budget.
+/// Feeds every record's (key, CID) to the MST walk (`tx`: it rebuilds the
+/// leaves from them) while buffering record blocks for after the nodes.
 async fn scan_records(
     snap: &slatedb::DbSnapshot,
     did: &str,
@@ -374,7 +330,6 @@ async fn scan_records(
     Ok(out)
 }
 
-/// An export's slot (`App::exports`).
 struct ExportSlot(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
 
 impl Drop for ExportSlot {
@@ -383,7 +338,6 @@ impl Drop for ExportSlot {
     }
 }
 
-/// Decrements a gauge when dropped.
 struct GaugeGuard(prometheus::IntGauge);
 
 impl Drop for GaugeGuard {
@@ -392,7 +346,6 @@ impl Drop for GaugeGuard {
     }
 }
 
-/// A slot to stream an export in: waits up to [`EXPORT_SLOT_WAIT`], then 503.
 async fn export_slot(app: &App) -> XResult<ExportSlot> {
     let p = match app.exports.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -417,7 +370,6 @@ async fn export_slot(app: &App) -> XResult<ExportSlot> {
     Ok(ExportSlot(p))
 }
 
-/// The `M/` prefetch an export may make now, and its budget permit.
 fn prefetch_budget() -> (Option<tokio::sync::SemaphorePermit<'static>>, usize) {
     let want = (EXPORT_PREFETCH_BYTES >> 20) as u32;
     for mb in [want, want / 4, want / 16] {
@@ -430,9 +382,8 @@ fn prefetch_budget() -> (Option<tokio::sync::SemaphorePermit<'static>>, usize) {
 
 type ChunkTx = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
 
-/// Queues one body chunk. Err: the client is gone, or took nothing for
-/// `stall` (a reader that stopped reading, e.g. an h2 stream at a zero
-/// window): the export ends either way.
+/// Err: the client is gone, or took nothing for `stall` (e.g. an h2 stream
+/// at a zero window).
 async fn send_chunk(tx: &ChunkTx, chunk: Vec<u8>, stall: std::time::Duration) -> Result<(), &'static str> {
     match tokio::time::timeout(stall, tx.send(Ok(Bytes::from(chunk)))).await {
         Ok(Ok(())) => Ok(()),
@@ -441,10 +392,9 @@ async fn send_chunk(tx: &ChunkTx, chunk: Vec<u8>, stall: std::time::Duration) ->
     }
 }
 
-/// The body end of an export's chunk queue. An export that gives up
-/// (stalled reader, read error) aborts it: the queued chunks are freed at
-/// once, and the body ends with an error (the client sees a failed
-/// transfer, not a short CAR that looks complete).
+/// An export that gives up aborts its body: the queued chunks are freed at
+/// once and the body ends with an error, so the client sees a failed
+/// transfer, not a short CAR that looks complete.
 struct ExportBody {
     rx: parking_lot::Mutex<tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>>,
     aborted: std::sync::atomic::AtomicBool,
@@ -497,20 +447,12 @@ impl<S: crate::mst_lazy::Source> crate::mst_lazy::Source for Stoppable<'_, S> {
     }
 }
 
-/// Streams the repo CAR: commit, MST nodes, then records, from one SlateDB
-/// snapshot. One forward `R/` scan feeds both: the MST walk (on a blocking
-/// thread: interior nodes from `M/`, read ahead with one range scan, leaves
-/// rebuilt from the scanned keys and CIDs, one path in memory) runs
-/// alongside it, and the record blocks wait in a bounded buffer
-/// ([`EXPORT_BUFFER_MB`]) for the nodes to be written; records past the
-/// buffer are read again afterwards. Bytes are the same either way.
-///
-/// Bounded: at most `Config::max_exports` run at once (each holds a
-/// blocking thread for its walk), the `M/` prefetch comes from a
-/// process-wide budget, and an export whose client goes away or reads
-/// nothing for `Config::export_stall` stops at once (walk, scans, queued
-/// chunks), so slow readers can't pin blocking threads, snapshots or
-/// memory.
+/// Streams the repo CAR (commit, MST nodes, then records) from one SlateDB
+/// snapshot. One forward `R/` scan feeds the MST walk, which runs alongside
+/// it on a blocking thread, while record blocks wait in a bounded buffer
+/// ([`EXPORT_BUFFER_MB`]) for the nodes to be written. An export whose
+/// client goes away or stalls for `Config::export_stall` stops at once, so
+/// slow readers can't pin blocking threads, snapshots or memory.
 async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Response> {
     let slot = export_slot(app).await?;
     let (view, snap) = app.repo_view(did).await?;
@@ -543,8 +485,7 @@ async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Respon
     Ok(([(header::CONTENT_TYPE, "application/vnd.ipld.car")], Body::from_stream(stream)).into_response())
 }
 
-/// [`export_repo`]'s producer. Err: why it ended early (`client_gone`,
-/// `stalled`, `error`).
+/// Err: why it ended early (`client_gone`, `stalled`, `error`).
 async fn stream_export(
     snap: Arc<slatedb::DbSnapshot>,
     did: Arc<str>,
@@ -604,7 +545,6 @@ async fn stream_export(
         tracing::warn!(%did, "getRepo: record scan failed: {e:#}");
         "error"
     })?;
-    // the buffered records (no copies)
     let Buffered { chunks, resume_at, mut seen, _permit: permit, .. } = scanned;
     if !chunks.is_empty() {
         if !buf.is_empty() {
@@ -656,9 +596,8 @@ async fn stream_export(
     Ok(())
 }
 
-/// Blocks by CID from the repo's current state: the commit, MST nodes of the
-/// (rebuilt) current tree, and current records. Blocks only reachable from
-/// older revisions aren't kept and report BlockNotFound.
+/// Only the current state's blocks: ones only reachable from older revisions
+/// aren't kept and report BlockNotFound.
 async fn get_blocks(
     State(app): AppState,
     MaybeAuth(creds): MaybeAuth,
@@ -669,12 +608,7 @@ async fn get_blocks(
         .iter()
         .find(|(k, _)| k == "did")
         .map(|(_, v)| v.clone())
-        .ok_or_else(|| {
-            XrpcError::bad(
-                "InvalidRequest",
-                "Error: Params must have the property \"did\"",
-            )
-        })?;
+        .ok_or_else(|| XrpcError::bad("InvalidRequest", "Error: Params must have the property \"did\""))?;
     let mut want = Vec::new();
     for (k, v) in &pairs {
         if k == "cids" || k == "cids[]" {
@@ -712,16 +646,9 @@ async fn get_blocks(
     if !todo.is_empty() {
         found.extend(lazy_nodes(&view, &snap, &did, todo, true).await?);
     }
-    let missing: Vec<String> = want
-        .iter()
-        .filter(|c| !found.contains_key(c))
-        .map(|c| c.to_string())
-        .collect();
+    let missing: Vec<String> = rest(&found).iter().map(|c| c.to_string()).collect();
     if !missing.is_empty() {
-        return Err(XrpcError::bad(
-            "BlockNotFound",
-            format!("Could not find cids: {}", missing.join(",")),
-        ));
+        return Err(XrpcError::bad("BlockNotFound", format!("Could not find cids: {}", missing.join(","))));
     }
     // CAR v1 with no roots, as the reference does
     let mut out = Vec::new();
@@ -739,8 +666,8 @@ async fn get_blocks(
     Ok(car_response(out))
 }
 
-/// A record block by CID: the c/ index names the paths holding that CID
-/// (or one sharing its key prefix); the record at a path must match.
+/// The c/ index names the paths holding that CID (or one sharing its key
+/// prefix), so the record at a path must match.
 async fn find_record(snap: &slatedb::DbSnapshot, did: &str, cid: &Cid) -> XResult<Option<Vec<u8>>> {
     let prefix = state::record_cid_prefix(did, cid);
     let mut iter = snap
@@ -761,7 +688,6 @@ async fn find_record(snap: &slatedb::DbSnapshot, did: &str, cid: &Cid) -> XResul
     Ok(None)
 }
 
-
 #[derive(Deserialize)]
 struct SyncRecordQ {
     did: String,
@@ -775,10 +701,7 @@ async fn sync_get_record(
     Query(q): Query<SyncRecordQ>,
 ) -> XResult<Response> {
     if !super::syntax::valid_nsid(&q.collection) || !super::syntax::valid_rkey(&q.rkey) {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            "invalid collection or rkey",
-        ));
+        return Err(XrpcError::bad("InvalidRequest", "invalid collection or rkey"));
     }
     assert_available(&app, &q.did, creds.as_ref()).await?;
     let (view, snap) = app.repo_view(&q.did).await?;
@@ -787,7 +710,7 @@ async fn sync_get_record(
     let mut out = Vec::new();
     car::write_header(&mut out, &head.commit);
     car::write_block(&mut out, &head.commit, &head.commit_block);
-    let proof = lazy_proof(&view, &snap, &q.did, &path).await?;
+    let proof = crate::mst_store::proof_blocks(&view.tree.root, &*snap, &q.did, path.as_bytes()).await;
     for (c, b) in proof.map_err(XrpcError::from_err)? {
         car::write_block(&mut out, &c, &b);
     }
@@ -802,28 +725,12 @@ async fn sync_get_record(
     Ok(car_response(out))
 }
 
-/// A view's proof of `path`: its loaded nodes, the rest read from the
-/// view's snapshot (`M/` nodes, a leaf from its record range), checked
-/// against their links, without touching the shared tree.
-async fn lazy_proof(
-    view: &Arc<crate::worker::DurableView>,
-    snap: &Arc<slatedb::DbSnapshot>,
-    did: &str,
-    path: &str,
-) -> XResult<Result<Vec<(Cid, Vec<u8>)>, crate::mst::MstError>> {
-    Ok(crate::mst_store::proof_blocks(&view.tree.root, &**snap, did, path.as_bytes()).await)
-}
-
-/// MST node blocks of a view by CID. First pass (`walk` false): its loaded
-/// nodes; leaves the repo's node index places, if it covers the view (no
-/// `M/` or record probe first: getBlocks of leaves); then `M/` point reads
-/// on its snapshot (which holds exactly the interior nodes of the view's
-/// tree). Second pass (`walk`, for what neither found nor the records
-/// matched): by the node index, built if needed (one streamed walk of the
-/// whole tree from the snapshot, then advanced by the worker per commit). A
-/// node found in the index is the end of its first key's path, read by a
-/// walk to that key. A miss in an index covering the view is final, so
-/// unknown CIDs don't walk the tree again.
+/// MST node blocks of a view by CID. First pass (`walk` false): loaded
+/// nodes, leaves an index covering the view places, then `M/` point reads
+/// (the snapshot holds exactly the view's interior nodes). Second pass
+/// (`walk`): by the node index, built if needed with one walk of the whole
+/// tree and then advanced by the worker per commit. A miss in an index
+/// covering the view is final, so unknown CIDs don't walk the tree again.
 async fn lazy_nodes(
     view: &Arc<crate::worker::DurableView>,
     snap: &Arc<slatedb::DbSnapshot>,
@@ -926,11 +833,9 @@ async fn lazy_nodes(
     Ok(out)
 }
 
-/// Node index builds running at once, process-wide.
 static INDEX_BUILDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
-/// The lock a repo's node index builds take turns on, keyed by its shared
-/// index cell (one per cached repo).
+/// Keyed by the repo's shared index cell (one per cached repo).
 fn index_build_gate(cell: &crate::mst::SharedNodeIndex) -> Arc<tokio::sync::Mutex<()>> {
     type Gates = HashMap<usize, std::sync::Weak<tokio::sync::Mutex<()>>>;
     static GATES: std::sync::LazyLock<parking_lot::Mutex<Gates>> = std::sync::LazyLock::new(Default::default);
@@ -947,14 +852,14 @@ fn index_build_gate(cell: &crate::mst::SharedNodeIndex) -> Arc<tokio::sync::Mute
     gate
 }
 
-/// The block of node `c` if it ends `key`'s path in the view's tree (the
-/// node holding its own first key does).
+/// The block of node `c` if it ends `key`'s path in the view's tree (a node
+/// holding its own first key does).
 async fn path_end_block(view: &crate::worker::DurableView, snap: &slatedb::DbSnapshot, did: &str, key: &[u8], c: &Cid) -> XResult<Option<Vec<u8>>> {
     let n = crate::mst_store::path_end(&view.tree.root, snap, did, key).await.map_err(XrpcError::from_err)?;
-    match n.cid == Some(*c) {
-        true => Ok(Some(crate::mst_lazy::node_block(&n).map_err(XrpcError::from_err)?)),
-        false => Ok(None),
+    if n.cid != Some(*c) {
+        return Ok(None);
     }
+    crate::mst_lazy::node_block(&n).map(Some).map_err(XrpcError::from_err)
 }
 
 #[derive(Deserialize)]
@@ -963,12 +868,9 @@ pub(super) struct ListReposQ {
     cursor: Option<String>,
 }
 
-/// A listRepos position: a shard, and the last DID listed in it (None =
-/// from the shard's start). Cursor form "{shard}:{did}" / "{shard}:".
-/// A position in the global listRepos order, (slot, DID): every repo
-/// before it was listed. `after` = the last DID listed (in `slot`), or None
-/// at the start of `slot`. Independent of the shard layout, so a cursor
-/// stays valid across splits and merges.
+/// A position in the global listRepos order, (slot, DID): every repo before
+/// it was listed. Independent of the shard layout, so a cursor stays valid
+/// across splits and merges.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct RepoPos {
     pub slot: u32,
@@ -985,7 +887,7 @@ impl RepoPos {
     }
 }
 
-/// `{slot}:{last DID}` (DID empty at a slot's start).
+/// `{slot}:{last DID}`, the DID empty at a slot's start.
 pub(super) fn parse_list_cursor(c: &str) -> XResult<RepoPos> {
     let bad = || XrpcError::bad("InvalidRequest", "Malformed cursor");
     let (p, d) = c.split_once(':').ok_or_else(bad)?;
@@ -1000,7 +902,6 @@ fn list_cursor(p: &RepoPos) -> String {
     format!("{}:{}", p.slot, p.after.as_deref().unwrap_or(""))
 }
 
-/// One listRepos entry.
 #[derive(serde::Serialize, Deserialize)]
 pub(super) struct RepoView {
     did: String,
@@ -1011,7 +912,7 @@ pub(super) struct RepoView {
     status: Option<String>,
 }
 
-/// A listRepos page, as served (and as the internal page endpoint returns it).
+/// As served, and as the internal page endpoint returns it.
 #[derive(serde::Serialize, Deserialize)]
 pub(super) struct ReposPage {
     repos: Vec<RepoView>,
@@ -1037,21 +938,18 @@ fn unowned(shard: crate::slots::ShardId) -> XrpcError {
     }
 }
 
-/// Up to `limit` repos from `pos` on, through the shards (in slot order)
-/// this node holds consecutively; plus where the next page starts (None =
-/// past the last slot). Each shard is read from one SlateDB snapshot, heads
-/// merge-joined with accounts in (slot, DID) order. 503 if `pos`'s shard
-/// isn't ours. The local half of listRepos (also served to peers by
-/// /internal/v1/sync/listRepos).
+/// Up to `limit` repos from `pos` on, through the shards this node holds
+/// consecutively, and where the next page starts (None: past the last
+/// slot). 503 if `pos`'s shard isn't ours. Also served to peers by
+/// /internal/v1/sync/listRepos.
 pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> XResult<(Vec<RepoView>, Option<RepoPos>)> {
     let mut repos = Vec::with_capacity(limit.min(1000));
     match list_repos_into(app, pos, limit, &mut repos).await {
         Ok(next) => Ok((repos, next)),
         Err(e) => match repos.last() {
             None => Err(e),
-            // a shard read failed partway (its handoff closed the DB, a
-            // store error): what was listed stands, the next page resumes
-            // right after it
+            // a shard read failed partway (handoff, store error): what was
+            // listed stands
             Some(last) => {
                 tracing::warn!("listRepos: ending the page early: {}", e.message);
                 let next = RepoPos::after(&last.did);
@@ -1061,9 +959,9 @@ pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> X
     }
 }
 
-/// [`list_repos_local`] into `repos`; returns the next page's start.
+/// Heads merge-joined with accounts in (slot, DID) order, each shard from
+/// one snapshot.
 async fn list_repos_into(app: &App, pos: RepoPos, limit: usize, repos: &mut Vec<RepoView>) -> XResult<Option<RepoPos>> {
-    /// Only an account's status (serde skips the rest of the JSON).
     #[derive(Deserialize)]
     struct Status<'a> {
         #[serde(borrow, default)]
@@ -1138,20 +1036,14 @@ async fn list_repos_into(app: &App, pos: RepoPos, limit: usize, repos: &mut Vec<
     Ok(None)
 }
 
-/// Most owners one listRepos page visits (a page crossing many small or
-/// empty shards owned by different nodes returns early with a cursor).
+/// A page crossing many small or empty shards owned by different nodes
+/// returns early with a cursor.
 const LIST_REPOS_MAX_HOPS: usize = 16;
 
-/// Repos in (slot, DID) order: the cursor is `{slot}:{last DID}`, a
-/// position in an order that doesn't depend on the shard layout. A page is
-/// served from the shard owner's own SlateDB (this node, or the owner via
-/// /internal/v1/sync/listRepos), continuing through the following shards
-/// that owner holds, and on to the next owner only to fill the page. A repo
-/// that exists for the whole enumeration is listed exactly once, even across
-/// shard splits and merges (DESIGN.md "Online shard split/merge"); one
-/// created or deleted meanwhile may or may not be. An unreachable owner ends
-/// the page early with a cursor at its shard (503 if nothing was listed),
-/// so a relay never skips repos.
+/// A repo that exists for the whole enumeration is listed exactly once, even
+/// across shard splits and merges; one created or deleted meanwhile may or
+/// may not be. An unreachable owner ends the page early with a cursor at its
+/// shard (503 if nothing was listed), so a relay never skips repos.
 async fn list_repos(State(app): AppState, Query(q): Query<ListReposQ>) -> XResult<Response> {
     let limit = super::extract::limit_param(q.limit, 500, 1, 1000)?;
     let mut pos = Some(match &q.cursor {
@@ -1202,7 +1094,6 @@ async fn list_repos(State(app): AppState, Query(q): Query<ListReposQ>) -> XResul
     Ok(json_response(serde_json::to_vec(&page).map_err(XrpcError::from_err)?))
 }
 
-/// A page from the owner of `shard` (holding `pos`): its body and parsed form.
 async fn owner_page(app: &App, shard: crate::slots::ShardId, pos: &RepoPos, limit: usize) -> XResult<(Bytes, ReposPage)> {
     let c = app.cluster.as_ref().ok_or_else(|| unowned(shard))?;
     let Some((owner, addr)) = c.owner_of(shard).filter(|(id, _)| *id != c.cfg.node_id) else {
@@ -1226,19 +1117,14 @@ pub(super) struct ByCollectionQ {
     cursor: Option<String>,
 }
 
-/// DIDs with records in the collection on this node's shards, in (slot,
-/// DID) order after the cursor, at most `limit`; plus the shards it owns. The
-/// local half of listReposByCollection (also
-/// /internal/v1/sync/listReposByCollection).
+/// DIDs on this node's shards, and the shards it owns. Also served to peers
+/// by /internal/v1/sync/listReposByCollection.
 pub(super) async fn list_repos_by_collection_local(
     app: &App,
     q: &ByCollectionQ,
 ) -> XResult<(Vec<String>, Vec<crate::slots::ShardId>)> {
     if !super::syntax::valid_nsid(&q.collection) {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            "collection must be a valid nsid",
-        ));
+        return Err(XrpcError::bad("InvalidRequest", "collection must be a valid nsid"));
     }
     let limit = super::extract::limit_param(q.limit, 500, 1, 2000)?;
     let fam = state::collection_family(&q.collection);
@@ -1269,17 +1155,13 @@ pub(super) async fn list_repos_by_collection_local(
     Ok((all, ids))
 }
 
-/// Sorts DIDs into the global (slot, DID) order and dedups them.
 fn sort_slot_order(dids: &mut Vec<String>) {
     dids.sort_by_cached_key(|d| (crate::slots::slot_of(d), d.clone()));
     dids.dedup();
 }
 
-/// Scans the collection index of every shard in the cluster (peers via
-/// /internal/v1/sync/listReposByCollection) and merges in (slot, DID) order,
-/// an order independent of the shard layout. The cursor is the last DID
-/// returned. That order spans every shard, so a shard with no answering
-/// owner fails the page with 503 (retry).
+/// The (slot, DID) order spans every shard, so a shard with no answering
+/// owner fails the page with 503.
 async fn list_repos_by_collection(
     State(app): AppState,
     Query(q): Query<ByCollectionQ>,
@@ -1297,11 +1179,7 @@ async fn list_repos_by_collection(
         all.extend(serde_json::from_value::<Vec<String>>(r.body["repos"].clone()).unwrap_or_default());
     }
     if let Some(m) = app.partitions.layout().ids().into_iter().find(|p| !covered.contains(p)) {
-        return Err(XrpcError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            error: "PartitionUnavailable".into(),
-            message: format!("shard {m} has no reachable owner; retry"),
-        });
+        return Err(unowned(m));
     }
     sort_slot_order(&mut all);
     all.truncate(limit);
@@ -1328,15 +1206,11 @@ async fn subscribe_repos(State(app): AppState, Query(q): Query<SubQ>, req: axum:
             return XrpcError::bad("InvalidRequest", "shard must be k/n with 0 <= k < n <= 65536").into_response();
         }
     };
-    // the rate limiter's client address (a peer-forwarded request's
-    // vouched-for client, not the forwarding node), so the per-IP cap and
-    // the rate limits count the same client
+    // a peer-forwarded request's vouched-for client, not the forwarding node
     let client = crate::ratelimit::request_client_ip(req.headers(), req.extensions(), &app.ratelimit.trusted);
     app.firehose.upgrade(req, q.cursor, shard, client)
 }
 
-/// Asks each configured relay (`config.crawlers`) to crawl this PDS:
-/// POST {crawler}/xrpc/com.atproto.sync.requestCrawl {"hostname": <our host>}.
 /// Failures are logged, not returned.
 pub async fn request_crawl(app: Arc<App>) {
     let hostname = public_hostname(&app.config.public_url);
