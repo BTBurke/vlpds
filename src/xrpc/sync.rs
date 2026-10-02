@@ -931,7 +931,7 @@ pub async fn request_crawl(app: Arc<App>) {
 }
 
 /// "https://pds.example.com/" -> "pds.example.com" (port kept if present).
-fn public_hostname(url: &str) -> String {
+pub(super) fn public_hostname(url: &str) -> String {
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     rest.split('/').next().unwrap_or(rest).to_string()
 }

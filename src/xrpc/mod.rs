@@ -2,6 +2,7 @@
 //! `routes()`. Shared state, errors and auth helpers live here.
 
 mod admin;
+mod admin_tools;
 mod email2fa;
 pub mod extract;
 pub mod internal;
@@ -256,7 +257,8 @@ pub fn router(app: Arc<App>) -> Router {
                 .merge(repo::routes())
                 .merge(sync::routes())
                 .merge(blobs::routes())
-                .merge(admin::routes()),
+                .merge(admin::routes())
+                .merge(admin_tools::routes()),
         ))
         .merge(proxy::routes())
         .fallback(proxy::fallback)

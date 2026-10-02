@@ -171,7 +171,7 @@ async fn abort_reshard(State(app): AppState, Auth(creds): Auth) -> XResult<Json<
     Ok(Json(json!({"aborted": op, "layout": layout_json(&app)?})))
 }
 
-fn require_admin(creds: &Credentials) -> XResult<()> {
+pub(super) fn require_admin(creds: &Credentials) -> XResult<()> {
     match creds {
         Credentials::Admin => Ok(()),
         _ => Err(XrpcError {

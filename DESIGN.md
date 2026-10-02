@@ -2471,3 +2471,41 @@ Tests: `plc::tests` (vectors, op construction, log rules, config),
 updates, sign/submit, migration out, unregistered mode, bulkCreate, key
 rotation), `tests/all/secrets_at_rest.rs`
 (`plc_rotation_key_never_reaches_the_bucket`).
+
+## Admin CLI (`src/cli/admin.rs`, `src/xrpc/admin_tools.rs`)
+
+`vlpds admin <command>` covers the reference's `pdsadmin` (account
+list/create/delete/takedown/untakedown/reset-password, create-invite-code,
+request-crawl) and its maintenance scripts (publish-identity, rotate-keys,
+rebuild-repo), plus cluster-status, rotate-plc-keys, rewrap-secrets and
+check-repo. ops/RUNBOOK.md "Admin CLI" maps each reference command to
+ours. It is a client of admin XRPC on any node, nothing else: no direct
+bucket access, so it needs only the URL and the admin token, and a node's
+routing (`crate::forward`) sends DID-keyed calls to the repo's owner. Calls
+that act on "this node's shards" (rotatePlcKeys, rewrapSecrets) are sent to
+every node `getClusterStatus` lists. The library entry (`cli::admin::run`)
+is what the binary calls and what `tests/all/admin_cli.rs` drives.
+
+Endpoints added where com.atproto.admin.* has nothing:
+`vlpds.admin.publishIdentity {did, syncPlc?}` (the reference's
+`sequenceIdentity`, an unchanged account row rewritten through the repo's
+worker carrying `#identity`; `syncPlc` first sets the PLC `atproto` key to
+the held signing key, the rotate-keys script without its empty commit, as
+the commit key didn't change), `vlpds.admin.checkRepo?did=` (one shard
+snapshot under the apply lock: commit hash / data / DID / signature,
+records hash, MST from `R/` vs the head's data root, `M/` vs that tree,
+record-CID / blob-ref / collection indexes; no worker involved, so it works
+on a repo that won't load), `vlpds.admin.rebuildRepo {did, dryRun?}` (the
+rebuild-repo script: the worker's `ReplaceRepo` with the snapshot's records,
+new commit and `#sync`, also deleting the stale `M/` nodes and index entries
+the snapshot showed; `ReplaceRepo.swap_commit` makes it refuse if a
+commit landed after the snapshot, so a concurrent acked write is never
+dropped) and `vlpds.admin.requestCrawl {relays?}` (the node's own public
+host, per-relay results).
+
+**Not done.** rebuild-repo refuses a repo whose records no longer rebuild
+to its head's data root (records lost): such a repo can't be loaded by its
+worker, and re-signing the remainder would drop data silently, unlike the
+reference, which trusts its records table. The sequencer-recovery scripts
+have no counterpart (no single sequencer DB; see "Backups and restore").
+`pdsadmin update` is a deploy concern.

@@ -184,9 +184,16 @@ pub enum AccountOp {
     },
     /// Replace the whole repo contents (importRepo / reset): new commit, #sync
     /// (none while the account is deactivated: activation emits it).
-    /// Records are (path, cid, bytes, blob refs).
+    /// Records are (path, cid, bytes, blob refs). `swap_commit`: refused
+    /// (`InvalidSwap`) unless the repo's head commit is still this one (the
+    /// admin rebuildRepo, which read the records from a snapshot);
+    /// `stale_keys`: state keys that snapshot found stale (garbage `M/`
+    /// nodes, index entries), deleted in the same batch (only meaningful
+    /// with `swap_commit`: the state they were read from is still current).
     ReplaceRepo {
         records: Vec<(String, Cid, Bytes, Vec<Cid>)>,
+        swap_commit: Option<Cid>,
+        stale_keys: Vec<Bytes>,
     },
     /// Delete the account and repo: #account(active=false, status=deleted).
     Delete,
@@ -2228,7 +2235,13 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             ));
             st.account = account;
         }
-        AccountOp::ReplaceRepo { records } => {
+        AccountOp::ReplaceRepo { records, swap_commit, stale_keys } => {
+            if let Some(swap) = swap_commit.filter(|c| *c != st.head.commit) {
+                let _ = req.reply.send(Err(WriteError::InvalidSwap(format!("head commit is {}, not {swap}", st.head.commit))));
+                return Ok(());
+            }
+            // first: a stale key the replace writes again ends up written
+            muts.extend(stale_keys.into_iter().map(|key| Mutation { key, val: None }));
             // deactivated accounts may import (the migration flow); others may not
             if let Some(status) = st.account.status.as_ref().filter(|s| *s != "deactivated") {
                 let _ = req

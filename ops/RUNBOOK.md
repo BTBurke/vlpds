@@ -7,6 +7,7 @@ it is marked **(unverified)**.
 
 - [Background you need](#background-you-need)
 - [Tools: endpoints, CLI, logs, exit codes](#tools-endpoints-cli-logs-exit-codes)
+- [Admin CLI](#admin-cli)
 - [Alerts](#alerts)
 - [Procedures](#procedures)
 - [What NOT to do](#what-not-to-do)
@@ -68,6 +69,7 @@ it is marked **(unverified)**.
 | Cluster view (node-to-node) | `GET /internal/v1/cluster` with header `x-vlpds-internal: $VLPDS_INTERNAL_TOKEN`: this node's `owned`, `table`, `layout`, `peers`, `lease_valid`, `log_durable_ordinal`, `firehose_last_emitted`, `firehose_min_watermark`. |
 | Operator console | `/admin` (Cluster page polls getClusterStatus), `/admin/metrics` (live metrics). |
 | Shard layout | `vlpds admin layout --url http://<node>:2583` (`VLPDS_ADMIN_TOKEN` env), or `GET /xrpc/vlpds.admin.getShardLayout`. Also `shard-split`, `shard-merge`, `reshard-abort` (abort only before the flip). |
+| Accounts, identity, repos | `vlpds admin ...`: the pdsadmin equivalents, see [Admin CLI](#admin-cli). |
 | CPU profile | `just profile <node:port> [seconds]` (`/debug/pprof/`) |
 
 A quick cluster check:
@@ -114,6 +116,73 @@ its own log, so it never counts): that survives a node that never comes back.
 `previous owner's clock is more than 30s ahead of ours: serving anyway` (error),
 `tokio runtime stall` (late_ms), `log retention pass failed`,
 `reshard step failed (retried next step)`, `fencing our log on shutdown failed`.
+
+---
+
+## Admin CLI
+
+`vlpds admin [--url URL] [--admin-token T] [--json] <command>` talks admin
+XRPC to one node (`--url`, default `http://127.0.0.1:2583`, env `VLPDS_URL`;
+token from `VLPDS_ADMIN_TOKEN`, as the node's). Any node will do: calls naming
+a DID are routed to the repo's owner, and the per-node maintenance commands
+(`rotate-plc-keys`, `rewrap-secrets`) are sent to every node that
+`getClusterStatus` lists (`--node-only`: just `--url`). Output is a table or a
+short message; `--json` prints the raw results. Exit 1 on an XRPC error, on any
+failed item of a batch (the other items still run, as the reference scripts
+do), and from `check-repo` when it finds a problem. Destructive commands
+(`account delete`, `rebuild-repo`) ask for confirmation; off a terminal they
+refuse without `--yes`.
+
+| Reference (`pdsadmin` / `node run-script.js`) | vlpds | Via |
+|---|---|---|
+| `pdsadmin account list` | `vlpds admin account list [--email PREFIX]` | `admin.searchAccounts` (every node's shards, paged; warns on `unreachableNodes` / `missingShards`) |
+| `pdsadmin account create EMAIL HANDLE` | `vlpds admin account create EMAIL HANDLE [--password P] [--invite-code C]` | a single-use invite only if `describeServer.inviteCodeRequired`, then `server.createAccount`; prints the generated 24-char password once |
+| `pdsadmin account delete DID` | `vlpds admin account delete DID [--yes]` | `admin.deleteAccount` |
+| `pdsadmin account takedown DID` | `vlpds admin account takedown DID [--ref R]` | `admin.updateSubjectStatus` (repoRef, `ref` default unix time) |
+| `pdsadmin account untakedown DID` | `vlpds admin account untakedown DID` | same, `applied: false` |
+| `pdsadmin account reset-password DID` | `vlpds admin account reset-password DID [--password P]` | `admin.updateAccountPassword`; prints the new password |
+| (none) | `vlpds admin account info DID` | `admin.getAccountInfo` + `getSubjectStatus` |
+| `pdsadmin create-invite-code` | `vlpds admin create-invite-code [--uses N] [--count N] [--for-account DID]` | `server.createInviteCode`; one code per line |
+| `pdsadmin request-crawl [RELAY,...]` | `vlpds admin request-crawl [RELAY,...]` | `vlpds.admin.requestCrawl`: the node asks each relay (default its `--crawlers`) to crawl its `--public-url` host; per-relay result, exit 1 if any refused |
+| `pdsadmin update` | (none) | roll the image: [Rolling deploy](#rolling-deploy) |
+| `publish-identity DID...` / `publish-identity-file F` | `vlpds admin publish-identity [DID...] [--file F]` | `vlpds.admin.publishIdentity`: `#identity` for each DID (any status but deleted), DID-document caches dropped |
+| `rotate-keys DID...` / `rotate-keys-file F` | `vlpds admin rotate-keys [DID...] [--file F]` | `vlpds.admin.publishIdentity {syncPlc: true}`: a did:plc whose PLC `atproto` key isn't the signing key held here gets a PLC update (server rotation key), then `#identity`. No new commit is needed: the local key didn't change |
+| (admin `updateAccountSigningKey`) | `vlpds admin rotate-keys --generate DID...` | a fresh signing key, PLC updated first, `#identity` |
+| (`PDS_PLC_ROTATION_KEY` change) | `vlpds admin rotate-plc-keys [--dry-run]` | `vlpds.admin.rotatePlcKeys` on every node ([PLC rotation key rotation](#plc-rotation-key-rotation)) |
+| (none) | `vlpds admin rewrap-secrets [--dry-run] [--check-versions]` | `vlpds.admin.rewrapSecrets` on every node ([KEK rotation](#kek-rotation)) |
+| `rebuild-repo DID` | `vlpds admin rebuild-repo DID [--dry-run] [--yes]` | `vlpds.admin.rebuildRepo`: see below |
+| (none) | `vlpds admin check-repo DID` | `vlpds.admin.checkRepo`: see below |
+| `sequencer-recovery`, `recovery-repair-repos`, `rotate-keys-recovery` | (none) | no single sequencer DB to replay: durability is the log + SlateDB per shard (DESIGN "Backups and restore") |
+| (none) | `vlpds admin cluster-status` | `vlpds.admin.getClusterStatus`: this node, layout, unowned shards, firehose, a row per node (`*` = the one asked) |
+| (none) | `vlpds admin layout`, `shard-split`, `shard-merge`, `reshard-abort` | [Shard split / merge](#shard-split--merge) |
+
+Per-DID batches (`publish-identity`, `rotate-keys`) run one DID at a time,
+like the reference scripts without their sleep; a file is one DID per line,
+blank lines and `#` comments skipped. For millions of DIDs split the file and
+run several in parallel against different nodes; the PLC directory
+rate-limits, so `rotate-keys` should stay at a few in flight per IP.
+
+**check-repo** reads the repo's state from one shard snapshot (it doesn't need
+the repo to load) and reports: the head commit (hashes to its CID, names the
+head's data root and the DID, signature valid for the account's key), every
+record (hashes to its CID), the MST rebuilt from the records against the
+head's data root, the persisted interior nodes (`M/`: missing, extra, corrupt)
+against that tree, and the record-CID, blob-ref and collection indexes. A
+missing or wrong `M/` node is self-healing (the next cold load rebuilds from
+`R/` and backfills, `vlpds_lazy_mst_fallbacks_total`), so a check with only
+node or index problems is not an emergency; run `rebuild-repo` to clean it
+up now.
+
+**rebuild-repo** is the reference script: the repo re-derived from its
+records (MST, `M/` written whole and stale nodes deleted, record-CID,
+blob-ref and collection indexes) under a new signed commit (rev bumped) and a
+`#sync` (none while deactivated: activation sends it). It prints the check
+first and asks. It is refused (`RepoUnrecoverable`) when the records can't be
+the repo: one doesn't hash to its CID, or they don't rebuild to the head's
+data root (records were lost: the repo can't load, and re-signing what is
+left would silently drop data; restore from a backup instead), and for a
+taken-down account (untakedown first). A write landing between the check and
+the rewrite makes it fail with `InvalidSwap`: run it again.
 
 ---
 
@@ -967,6 +1036,7 @@ configured for unwrap.
      --gcp-kms-old-key OLD` (or `--gcp-kms-key NEW --kek-file old.bin`; with
      `--gcp-kms-key` set, the local KEK is unwrap-only).
 2. On **every** node (each covers the shards it owns):
+   `vlpds admin rewrap-secrets` (every node at once), or per node
    `curl -XPOST -u admin:$ADMIN -H 'content-type: application/json' -d '{}' $NODE/xrpc/vlpds.admin.rewrapSecrets`.
    For a version rotation inside one CryptoKey, pass `{"checkVersions": true}`
    (one KMS decrypt per secret). It reports `stale` (rewrapped), `failed` and
@@ -1040,7 +1110,8 @@ For local e2e runs, point `--plc-url` at a local did-method-plc server
    New DIDs list the new key; any update of an old DID (handle change,
    signPlcOperation) is signed by the old key and lists the new one instead.
 2. On **every** node (each covers the shards it owns):
-   `curl -XPOST -u admin:$ADMIN -H 'content-type: application/json' -d '{"dryRun": true}' $NODE/xrpc/vlpds.admin.rotatePlcKeys`
+   `vlpds admin rotate-plc-keys --dry-run` (every node at once), or per node
+   `curl -XPOST -u admin:$ADMIN -H 'content-type: application/json' -d '{"dryRun": true}' $NODE/xrpc/vlpds.admin.rotatePlcKeys`,
    reports `current`, `rotated` (still on the old key), `foreign` (DIDs that
    list neither: migrated away, or synthetic bulkCreate DIDs) and `failed`.
    Run it without `dryRun` to submit the updates (4 in flight per node; the

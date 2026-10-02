@@ -871,7 +871,7 @@ async fn import_repo(
         .await
         .map_err(XrpcError::from_err)?;
     let (did, records) = records?;
-    app.account_op(&did, crate::worker::AccountOp::ReplaceRepo { records })
+    app.account_op(&did, crate::worker::AccountOp::ReplaceRepo { records, swap_commit: None, stale_keys: Vec::new() })
         .await?;
     Ok(StatusCode::OK)
 }

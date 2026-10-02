@@ -501,9 +501,11 @@ fn raise_nofile_limit() {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn raise_nofile_limit() {}
 
-/// `vlpds admin <command>`: shard layout operations against a running node.
+/// `vlpds admin <command>`: operator commands against a running node
+/// (shard layout here; accounts, identity, repos, secrets, cluster status in
+/// `vlpds::cli::admin`).
 #[derive(Parser)]
-#[command(name = "vlpds admin", about = "Shard layout operations against a running vlpds node")]
+#[command(name = "vlpds admin", about = "Operator commands against a running vlpds node (pdsadmin equivalents, shard layout)")]
 struct AdminArgs {
     /// Any node of the cluster.
     #[arg(long, env = "VLPDS_URL", default_value = "http://127.0.0.1:2583")]
@@ -511,6 +513,9 @@ struct AdminArgs {
     /// Admin token (default: the dev token).
     #[arg(long, env = "VLPDS_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
+    /// Print raw JSON results instead of tables.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: AdminCmd,
 }
@@ -538,12 +543,18 @@ enum AdminCmd {
     },
     /// Abort the split/merge in progress (only before it flips).
     ReshardAbort,
+    #[command(flatten)]
+    Ops(vlpds::cli::admin::Cmd),
 }
 
 fn admin_main(args: AdminArgs) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async move {
         let token = args.admin_token.unwrap_or_else(|| server::DEV_ADMIN_TOKEN.to_string());
+        if let AdminCmd::Ops(cmd) = args.cmd {
+            let opts = vlpds::cli::admin::Opts { url: args.url, token, json: args.json };
+            return vlpds::cli::admin::run(cmd, &opts, &mut std::io::stdout()).await;
+        }
         let http = reqwest::Client::new();
         let url = |nsid: &str| format!("{}/xrpc/{nsid}", args.url.trim_end_matches('/'));
         let rb = match args.cmd {
@@ -555,6 +566,7 @@ fn admin_main(args: AdminArgs) -> anyhow::Result<()> {
                 http.post(url("vlpds.admin.mergeShards")).json(&serde_json::json!({"left": left, "right": right, "wait": !no_wait}))
             }
             AdminCmd::ReshardAbort => http.post(url("vlpds.admin.abortReshard")).json(&serde_json::json!({})),
+            AdminCmd::Ops(_) => unreachable!("handled above"),
         };
         let r = rb.basic_auth("admin", Some(token)).timeout(Duration::from_secs(300)).send().await?;
         let status = r.status();

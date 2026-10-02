@@ -9,6 +9,7 @@ mod common;
 
 mod account_deactivation;
 mod account_races;
+mod admin_cli;
 mod admin_cluster;
 mod account_status;
 mod account;
