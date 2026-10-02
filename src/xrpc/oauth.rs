@@ -1,17 +1,6 @@
-//! atproto OAuth authorization server (PAR, PKCE, DPoP, client metadata,
-//! token/refresh/revocation, consent UI, granular permission scopes) and
-//! DPoP verification of resource requests. Building blocks live in
-//! `crate::oauth`; see its module docs for keys, storage layout and HA notes.
-//!
-//! Endpoints:
-//! - `GET /.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`
-//! - `GET /oauth/jwks` (access-token verification key)
-//! - `POST /oauth/par`, `GET /oauth/authorize` (+ form posts under it),
-//!   `POST /oauth/token`, `POST /oauth/revoke`
-//! - `GET /oauth/account` (+ form posts): signed-in user's connected apps
-//!   (no-JS, cookie based; `/account/*` is the embedded web UI)
-//! - `vlpds.oauth.listSessions` / `vlpds.oauth.revokeSession` (XRPC, full
-//!   account session required)
+//! The atproto OAuth authorization server's HTTP surface and DPoP
+//! verification of resource requests. Keys, storage layout and HA notes:
+//! `crate::oauth`.
 
 use super::authn::Credentials;
 use super::*;
@@ -34,11 +23,9 @@ pub use crate::oauth::ScopeSet;
 
 const DEVICE_COOKIE: &str = "vlpds-device";
 const PENDING_2FA_TTL: i64 = 5 * 60;
-/// Wrong authenticator codes per pending sign-in before the password step
-/// must be redone (the per-account lockout in `crate::totp` still applies).
+/// Per pending sign-in, before the password step must be redone (the
+/// per-account lockout in `crate::totp` still applies).
 const PENDING_2FA_MAX_FAILURES: u32 = 3;
-
-// ---------- per-secret keys ----------
 
 struct Keys {
     server: ServerKey,
@@ -47,12 +34,11 @@ struct Keys {
     refresh: [u8; 32],
 }
 
-/// Keys of the first secret seen: a production process has one, so the
-/// per-request lookup (every DPoP request) is a compare against it,
-/// lock-free and without cloning the secret.
+/// A production process has one secret, so the per-request lookup (every
+/// DPoP request) is a lock-free compare against it.
 static FIRST_KEYS: std::sync::OnceLock<(Box<str>, Keys)> = std::sync::OnceLock::new();
-/// Further secrets (in-process tests run servers with several); their keys
-/// are leaked once each, to live as long as the first's.
+/// In-process tests run servers with several secrets; their keys are leaked
+/// once each.
 static OTHER_KEYS: LazyLock<parking_lot::Mutex<HashMap<Box<str>, &'static Keys>>> =
     LazyLock::new(Default::default);
 
@@ -88,8 +74,6 @@ fn is_https(app: &App) -> bool {
     app.public_url.starts_with("https://")
 }
 
-// ---------- routes ----------
-
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route(
@@ -117,12 +101,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/vlpds.oauth.revokeSession", post(xrpc_revoke_session))
 }
 
-// ---------- CORS / common headers ----------
-
-// ---------- HA routing ----------
-
-/// Login identifier (handle, DID or email; `@` prefix and case ignored) ->
-/// DID. Global lookups (handle / email claims), so any node can resolve.
+/// Handle, DID or email to DID; global lookups, so any node can resolve.
 pub async fn resolve_identifier(app: &App, ident: &str) -> Option<String> {
     let ident = ident.trim().trim_start_matches('@').to_ascii_lowercase();
     if ident.starts_with("did:") {
@@ -137,9 +116,7 @@ pub async fn resolve_identifier(app: &App, ident: &str) -> Option<String> {
     app.resolve_handle(&ident).await.ok().flatten()
 }
 
-/// The routing key an `/oauth/*` request is served by, for the forwarding
-/// layer (`crate::forward`); None = any node. See the HA notes in
-/// `crate::oauth`. `body` is the (form or JSON) request body.
+/// For `crate::forward`; None: any node.
 pub async fn route_key(
     app: &App,
     path: &str,
@@ -152,7 +129,7 @@ pub async fn route_key(
         store::request_id_from_uri(uri?).map(store::req_routing)
     };
     match path {
-        // the account owner (so the whole flow tends to stay there: the
+        // the account owner, so the whole flow tends to stay there (the
         // request id is minted local to whichever node runs PAR)
         "/oauth/par" => {
             let hint = params().remove("login_hint")?;
@@ -249,7 +226,6 @@ async fn preflight() -> Response {
     r
 }
 
-/// JSON response for the AS endpoints: CORS, no-store, fresh DPoP nonce.
 fn as_json(app: &App, status: StatusCode, body: J) -> Response {
     let mut r = (status, Json(body)).into_response();
     finish_as(app, &mut r);
@@ -271,8 +247,6 @@ fn as_error(app: &App, e: OAuthError) -> Response {
     finish_as(app, &mut r);
     r
 }
-
-// ---------- metadata ----------
 
 async fn protected_resource_metadata(State(app): AppState) -> Response {
     let iss = issuer(&app);
@@ -331,10 +305,7 @@ async fn jwks(State(app): AppState) -> Response {
     r
 }
 
-// ---------- request parsing ----------
-
-/// Parses an urlencoded (or JSON) request body. Repeated parameters are an
-/// error (RFC 6749 §3.1).
+/// Urlencoded or JSON. Repeated parameters are an error (RFC 6749 §3.1).
 fn parse_params(headers: &HeaderMap, body: &[u8]) -> Result<HashMap<String, String>, OAuthError> {
     let ct = headers
         .get(header::CONTENT_TYPE)
@@ -392,8 +363,7 @@ fn dpop_header(headers: &HeaderMap) -> Result<Option<String>, String> {
     }
 }
 
-/// DPoP proof at the authorization server (PAR / token): required, and
-/// single use cluster-wide (claimed at the owner of the key's routing).
+/// Required, and single use cluster-wide.
 async fn check_as_dpop(app: &App, headers: &HeaderMap, path: &str) -> Result<DpopProof, OAuthError> {
     let proof = dpop_header(headers)
         .map_err(|e| OAuthError::invalid_dpop_proof(&e))?
@@ -409,8 +379,6 @@ async fn check_as_dpop(app: &App, headers: &HeaderMap, path: &str) -> Result<Dpo
     Ok(proof)
 }
 
-/// Claims a single-use value at the owner of its routing key (see the HA
-/// notes in `crate::oauth`). `replayed` is the error for a second use.
 async fn claim(app: &App, r: &ou::Replay, replayed: OAuthError) -> Result<(), OAuthError> {
     match super::internal::claim_replay_anywhere(app, &r.routing, &r.key, r.until).await {
         Ok(true) => Ok(()),
@@ -423,10 +391,9 @@ fn unavailable(msg: &str) -> OAuthError {
     OAuthError::new(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable", msg)
 }
 
-/// Single-use state (a request row's code, a session's refresh rotation) is
-/// read-modify-written only by the node owning its routing key, under a
-/// process-local lock there. Forwarding sends the request to that node; this
-/// refuses (retryably) if it isn't us, e.g. mid-handoff.
+/// Single-use state is read-modify-written only by its owner, under a local
+/// lock there. Forwarding sends the request to the owner; this refuses
+/// (retryably) if it isn't us, e.g. mid-handoff.
 fn require_owner(app: &App, routing: &str) -> Result<(), OAuthError> {
     if app.remote_owner(routing).is_some() || app.partition(routing).is_err() {
         return Err(unavailable("this grant's partition is moving; retry"));
@@ -434,12 +401,10 @@ fn require_owner(app: &App, routing: &str) -> Result<(), OAuthError> {
     Ok(())
 }
 
-/// Account record of `did`, from its owner if that is another node.
 async fn account_any(app: &App, did: &str) -> XResult<Account> {
     super::internal::account_anywhere(app, did).await
 }
 
-/// [`App::ensure_active`] wherever the account lives.
 async fn ensure_active_any(app: &App, did: &str) -> XResult<Account> {
     let a = account_any(app, did)
         .await
@@ -449,8 +414,6 @@ async fn ensure_active_any(app: &App, did: &str) -> XResult<Account> {
         None => Ok(a),
     }
 }
-
-// ---------- PAR ----------
 
 async fn par(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
     match par_inner(&app, &headers, &body).await {
@@ -473,7 +436,7 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
             "\"request_uri\" is not supported in pushed authorization requests",
         ));
     }
-    // JAR (RFC 9101): only the request object's parameters are used.
+    // JAR (RFC 9101): only the request object's parameters are used
     let p = match p.get("request") {
         Some(jar) => {
             let (payload, r) = client.decode_request_object(jar, &issuer(app))?;
@@ -506,9 +469,8 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
     Ok(json!({"request_uri": store::request_uri(&id), "expires_in": PAR_EXPIRES_IN - 1}))
 }
 
-/// Authorization request parameters from a verified request object payload
-/// (`oauthAuthorizationRequestParametersSchema` in the reference): string
-/// values as-is, scalars stringified, registered JWT claims dropped.
+/// The reference's `oauthAuthorizationRequestParametersSchema`: scalars
+/// stringified, registered JWT claims dropped.
 fn request_object_params(payload: &J) -> Result<HashMap<String, String>, OAuthError> {
     let bad = |k: &str| {
         OAuthError::invalid_request(&format!("Invalid parameters in JAR: invalid \"{k}\""))
@@ -541,25 +503,7 @@ fn request_object_params(payload: &J) -> Result<HashMap<String, String>, OAuthEr
     Ok(out)
 }
 
-fn is_valid_handle(h: &str) -> bool {
-    h.len() <= 253
-        && h.split('.').count() >= 2
-        && h.split('.').all(|l| {
-            !l.is_empty()
-                && l.len() <= 63
-                && !l.starts_with('-')
-                && !l.ends_with('-')
-                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
-        && !h
-            .rsplit('.')
-            .next()
-            .unwrap_or("")
-            .starts_with(|c: char| c.is_ascii_digit())
-}
-
-/// Authorization request validation (`RequestManager.validate` + the
-/// client-side checks of `Client.validateRequest`).
+/// `RequestManager.validate` + `Client.validateRequest`.
 async fn validate_authorization_request(
     app: &App,
     client: &Client,
@@ -602,7 +546,6 @@ async fn validate_authorization_request(
             &format!("Unsupported response_type \"{response_type}\""),
         ));
     }
-    // client checks
     if !client.response_types.contains(&response_type) {
         return Err(OAuthError::invalid_request(&format!(
             "Invalid response_type \"{response_type}\" requested by the client"
@@ -627,49 +570,8 @@ async fn validate_authorization_request(
             .map(String::from)
             .ok_or_else(|| OAuthError::invalid_request("redirect_uri is required"))?,
     };
-    let requested = g("scope").unwrap_or_default();
-    for s in requested.split(' ').filter(|s| !s.is_empty()) {
-        if !client.scopes.iter().any(|c| c == s) {
-            return Err(OAuthError::invalid_scope(&format!(
-                "Scope \"{s}\" is not declared in the client metadata"
-            )));
-        }
-    }
-    let mut scopes: Vec<String> = Vec::new();
-    for s in requested.split(' ').filter(|s| !s.is_empty()) {
-        if s == "openid" {
-            return Err(OAuthError::invalid_scope(
-                "OpenID Connect is not compatible with atproto",
-            ));
-        }
-        if is_atproto_oauth_scope(s) && !scopes.iter().any(|x| x == s) {
-            scopes.push(s.to_string());
-        }
-    }
-    if !scopes.iter().any(|s| s == "atproto") {
-        return Err(OAuthError::invalid_scope(
-            "The \"atproto\" scope is required",
-        ));
-    }
-    let scope = scopes.join(" ");
-    let code_challenge = g("code_challenge").ok_or_else(|| {
-        if p.contains_key("code_challenge_method") {
-            OAuthError::invalid_request(
-                "code_challenge is required when code_challenge_method is provided",
-            )
-        } else {
-            OAuthError::invalid_request("Use of PKCE is required")
-        }
-    })?;
-    let method = g("code_challenge_method").unwrap_or_else(|| "plain".into());
-    if method != "S256" {
-        return Err(OAuthError::invalid_request(
-            "atproto requires use of \"S256\" code_challenge_method",
-        ));
-    }
-    if code_challenge.len() != 43 || ou::b64u_decode(&code_challenge).map(|b| b.len()) != Some(32) {
-        return Err(OAuthError::invalid_request("Invalid code_challenge"));
-    }
+    let scope = requested_scope(client, &g("scope").unwrap_or_default())?;
+    let (code_challenge, method) = pkce_challenge(p)?;
     let response_mode = g("response_mode");
     match response_mode.as_deref() {
         None | Some("query") | Some("fragment") | Some("form_post") => {}
@@ -693,9 +595,9 @@ async fn validate_authorization_request(
             )))
         }
     }
-    // atproto: public (unauthenticated) clients may not sign in silently and
-    // always get the consent screen (unless they ask for account creation,
-    // which keeps its prompt; consent_required still holds for them).
+    // atproto: public clients may not sign in silently and always get the
+    // consent screen (prompt=create keeps its prompt; consent_required
+    // still holds for them)
     if !client.is_confidential() {
         if prompt.as_deref() == Some("none") {
             return Err(OAuthError::new(
@@ -712,7 +614,7 @@ async fn validate_authorization_request(
         Some(h) => {
             let h = h.to_lowercase();
             let h = h.strip_prefix('@').unwrap_or(&h).to_string();
-            if !is_atproto_did(&h) && !is_valid_handle(&h) {
+            if !is_atproto_did(&h) && !super::syntax::valid_handle(&h) {
                 return Err(OAuthError::invalid_request(&format!(
                     "Invalid login_hint \"{h}\""
                 )));
@@ -728,7 +630,7 @@ async fn validate_authorization_request(
             ));
         }
     }
-    // Every include: scope must resolve to a permission set.
+    // every include: scope must resolve to a permission set
     lexicon::permission_sets_for_scope(app, &scope)
         .await
         .map_err(|e| OAuthError::invalid_scope(&e))?;
@@ -749,7 +651,57 @@ async fn validate_authorization_request(
     })
 }
 
-// ---------- authorization endpoint (UI) ----------
+/// Declared by the client, deduplicated, with `atproto`.
+fn requested_scope(client: &Client, requested: &str) -> Result<String, OAuthError> {
+    let mut scopes: Vec<&str> = Vec::new();
+    for s in requested.split(' ').filter(|s| !s.is_empty()) {
+        if !client.scopes.iter().any(|c| c == s) {
+            return Err(OAuthError::invalid_scope(&format!(
+                "Scope \"{s}\" is not declared in the client metadata"
+            )));
+        }
+    }
+    for s in requested.split(' ').filter(|s| !s.is_empty()) {
+        if s == "openid" {
+            return Err(OAuthError::invalid_scope(
+                "OpenID Connect is not compatible with atproto",
+            ));
+        }
+        if is_atproto_oauth_scope(s) && !scopes.contains(&s) {
+            scopes.push(s);
+        }
+    }
+    if !scopes.contains(&"atproto") {
+        return Err(OAuthError::invalid_scope(
+            "The \"atproto\" scope is required",
+        ));
+    }
+    Ok(scopes.join(" "))
+}
+
+/// (code_challenge, method): S256 only.
+fn pkce_challenge(p: &HashMap<String, String>) -> Result<(String, String), OAuthError> {
+    let g = |k: &str| p.get(k).filter(|v| !v.is_empty()).cloned();
+    let code_challenge = g("code_challenge").ok_or_else(|| {
+        if p.contains_key("code_challenge_method") {
+            OAuthError::invalid_request(
+                "code_challenge is required when code_challenge_method is provided",
+            )
+        } else {
+            OAuthError::invalid_request("Use of PKCE is required")
+        }
+    })?;
+    let method = g("code_challenge_method").unwrap_or_else(|| "plain".into());
+    if method != "S256" {
+        return Err(OAuthError::invalid_request(
+            "atproto requires use of \"S256\" code_challenge_method",
+        ));
+    }
+    if code_challenge.len() != 43 || ou::b64u_decode(&code_challenge).map(|b| b.len()) != Some(32) {
+        return Err(OAuthError::invalid_request("Invalid code_challenge"));
+    }
+    Ok((code_challenge, method))
+}
 
 fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     for v in headers.get_all(header::COOKIE) {
@@ -764,8 +716,7 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
-/// Loads (or starts) the browser device session. Returns the device and
-/// whether a cookie must be set.
+/// Loads or starts the browser device session; true: a cookie must be set.
 async fn device_for(app: &App, headers: &HeaderMap) -> Result<(Device, bool), OAuthError> {
     let ua = headers
         .get(header::USER_AGENT)
@@ -812,8 +763,8 @@ fn csrf_token(app: &App, device_id: &str, scope: &str) -> String {
     ))
 }
 
-/// CSRF defence for form posts: a token bound to the device cookie and the
-/// request, plus Fetch-Metadata / Origin checks when the browser sends them.
+/// A token bound to the device cookie and the request, plus Fetch-Metadata
+/// and Origin checks when the browser sends them.
 fn check_csrf(
     app: &App,
     headers: &HeaderMap,
@@ -843,7 +794,7 @@ fn check_csrf(
     }
 }
 
-/// form-action source allowing the post-consent redirect to the client.
+/// The form-action source allowing the post-consent redirect.
 fn redirect_source(redirect_uri: &str) -> Option<String> {
     let u = reqwest::Url::parse(redirect_uri).ok()?;
     match u.scheme() {
@@ -893,18 +844,19 @@ fn error_page(app: &App, status: StatusCode, title: &str, msg: &str) -> Response
     html(app, status, ui::error(title, msg), &[], None)
 }
 
-/// Shown on a 503 from the sign-in/sign-up forms (password hashing shed).
+fn server_error_page(app: &App, title: &str, msg: &str) -> Response {
+    error_page(app, StatusCode::INTERNAL_SERVER_ERROR, title, msg)
+}
+
+/// A 503 from the sign-in/sign-up forms (password hashing shed).
 const BUSY_MESSAGE: &str = "The server is busy. Please try again in a moment.";
 
-/// Adds `Retry-After: 1` (a transient 503 page).
 fn with_retry_after(mut r: Response) -> Response {
     r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
     r
 }
 
-/// Builds the redirect back to the client (RFC 6749 §4.1.2 + RFC 9207 `iss`)
-/// in the request's response mode: query (default), fragment, or form_post
-/// (an auto-submitting form page).
+/// RFC 6749 §4.1.2 + RFC 9207 `iss`, in the request's response mode.
 fn client_redirect(app: &App, params: &AuthParams, mut pairs: Vec<(String, String)>) -> Response {
     if let Some(s) = &params.state {
         pairs.push(("state".into(), s.clone()));
@@ -924,8 +876,8 @@ fn client_redirect(app: &App, params: &AuthParams, mut pairs: Vec<(String, Strin
             header::CONTENT_SECURITY_POLICY,
             HeaderValue::from_str(&ui::csp_form_post(&form_action)).unwrap(),
         );
-        // Keep the page out of the back/forward cache, so going "back" never
-        // re-posts the response (as the reference does).
+        // out of the back/forward cache, so going "back" never re-posts the
+        // response (as the reference does)
         h.append(
             header::SET_COOKIE,
             HeaderValue::from_static("bfCacheBypass=1; Path=/; Max-Age=1; SameSite=Lax"),
@@ -968,7 +920,6 @@ fn redirect_error(app: &App, params: &AuthParams, error: &str, desc: &str) -> Re
     )
 }
 
-/// A loaded authorization request in the context of a browser device.
 struct Flow {
     id: String,
     uri: String,
@@ -979,9 +930,8 @@ struct Flow {
 }
 
 enum FlowError {
-    /// Show an error page (redirect target not trustworthy / unknown).
+    /// The redirect target is not trustworthy or unknown.
     Page(StatusCode, String),
-    /// Redirect to the client with an OAuth error.
     Redirect(Box<AuthParams>, &'static str, String),
 }
 
@@ -1000,8 +950,7 @@ impl From<OAuthError> for FlowError {
     }
 }
 
-/// Loads the request named by `request_uri` and binds it to this device
-/// (`RequestManager.get`). Failed requests are deleted.
+/// `RequestManager.get`: binds the request to this device.
 async fn load_flow(
     app: &App,
     headers: &HeaderMap,
@@ -1038,10 +987,9 @@ async fn load_flow(
     };
     if let Some(e) = err {
         // Only an expired, unauthorized request is deleted. The reference
-        // deletes on every failure, but these checks are reachable by anyone
-        // holding the request_uri (it is in the browser's URL): deleting an
-        // authorized request would break the client's code exchange, and a
-        // wrong client_id or device would kill the user's flow in progress.
+        // deletes on every failure, but anyone holding the request_uri (it
+        // is in the browser's URL) reaches these checks: deleting would break
+        // the client's code exchange or the user's flow in progress.
         if !authorized && req.expires_at < now {
             store::put_request(app, &id, None).await?;
         }
@@ -1108,9 +1056,8 @@ fn server_name(app: &App) -> String {
         .unwrap_or_else(|| app.public_url.clone())
 }
 
-/// Accounts signed in on this device whose login is still fresh, with handles.
-/// A login from before the account's credentials were revoked (password
-/// change, takedown: its credential epoch changed) no longer counts.
+/// (did, handle) of fresh logins. A login from before a password change or
+/// takedown (its credential epoch changed) no longer counts.
 async fn device_accounts(app: &App, d: &Device) -> Vec<(String, String)> {
     let now = now_secs();
     let mut out = Vec::new();
@@ -1128,10 +1075,6 @@ async fn device_accounts(app: &App, d: &Device) -> Vec<(String, String)> {
         }
     }
     out
-}
-
-fn hint_matches(hint: &str, did: &str, handle: &str) -> bool {
-    hint == did || hint == handle
 }
 
 async fn consent_required(app: &App, flow: &Flow, did: &str) -> Result<bool, OAuthError> {
@@ -1175,8 +1118,8 @@ fn login_page(
     r
 }
 
-/// After an account is chosen: show consent, or approve directly when the
-/// user already granted these scopes to this (confidential) client.
+/// Approves directly when the user already granted these scopes to this
+/// confidential client.
 async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
     let acct = match account_any(app, did).await {
         Ok(a) => a,
@@ -1194,14 +1137,7 @@ async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
     match consent_required(app, &flow, did).await {
         Ok(false) => return issue_code(app, flow, did).await,
         Ok(true) => {}
-        Err(e) => {
-            return error_page(
-                app,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Authorization failed",
-                &e.description,
-            )
-        }
+        Err(e) => return server_error_page(app, "Authorization failed", &e.description),
     }
     let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope)
         .await
@@ -1220,8 +1156,7 @@ async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
     flow.page(app, body)
 }
 
-/// Binds the request to the account and redirects with the code
-/// (`RequestManager.setAuthorized`).
+/// `RequestManager.setAuthorized`.
 async fn issue_code(app: &App, mut flow: Flow, did: &str) -> Response {
     if let Err(e) = ensure_active_any(app, did).await {
         let _ = store::put_request(app, &flow.id, None).await;
@@ -1232,8 +1167,8 @@ async fn issue_code(app: &App, mut flow: Flow, did: &str) -> Response {
             &format!("Account unavailable: {}", e.message),
         );
     }
-    // the code's session is created only while the approving login's
-    // credential epoch is current (code_grant)
+    // the code's session is created only while this login's credential
+    // epoch is current (code_grant)
     let Some(epoch) = flow.device.accounts.iter().find(|a| a.did == did).map(|a| a.auth_epoch.clone()) else {
         return login_page(app, &flow, "", Some("Please sign in again"), false, StatusCode::UNAUTHORIZED);
     };
@@ -1243,14 +1178,9 @@ async fn issue_code(app: &App, mut flow: Flow, did: &str) -> Response {
     flow.req.code_hash = Some(store::hash_secret(&code));
     flow.req.expires_at = now_secs() + AUTHORIZATION_INACTIVITY_TIMEOUT;
     if let Err(e) = store::put_request(app, &flow.id, Some(&flow.req)).await {
-        return error_page(
-            app,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Authorization failed",
-            &e.description,
-        );
+        return server_error_page(app, "Authorization failed", &e.description);
     }
-    // Remember consent (union with earlier grants).
+    // remember consent, union with earlier grants
     let mut scopes: Vec<String> = flow.req.params.scope.split(' ').map(String::from).collect();
     if let Ok(Some(prev)) = store::get_authorization(app, did, &flow.client.id).await {
         for s in prev.scopes {
@@ -1306,7 +1236,7 @@ async fn authorize(
     let hint = params.login_hint.clone().unwrap_or_default();
     let hinted = accounts
         .iter()
-        .find(|(d, h)| !hint.is_empty() && hint_matches(&hint, d, h))
+        .find(|(d, h)| !hint.is_empty() && (hint == *d || hint == *h))
         .cloned();
     // the sign-in <-> sign-up links between the two pages
     match q.get("screen").map(String::as_str) {
@@ -1319,10 +1249,7 @@ async fn authorize(
             let chosen = match (&hinted, accounts.len()) {
                 (Some(a), _) => a.clone(),
                 (None, 1) if hint.is_empty() => accounts[0].clone(),
-                (None, 0) => {
-                    return redirect_error(&app, &params, "login_required", "Login is required")
-                }
-                (None, _) if !hint.is_empty() => {
+                (None, n) if n == 0 || !hint.is_empty() => {
                     return redirect_error(&app, &params, "login_required", "Login is required")
                 }
                 (None, _) => {
@@ -1364,16 +1291,18 @@ fn chooser_page(app: &App, flow: &Flow, accounts: &[(String, String)]) -> Respon
     flow.page(app, ui::chooser(&flow.ctx(&csrf, &name), accounts))
 }
 
-/// Loads a form-post flow and checks CSRF.
+fn form_fields(body: &[u8]) -> HashMap<String, String> {
+    ou::parse_form(std::str::from_utf8(body).unwrap_or("")).into_iter().collect()
+}
+
+/// Also checks CSRF.
 #[allow(clippy::result_large_err)]
 async fn form_flow(
     app: &App,
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<(Flow, HashMap<String, String>), Response> {
-    let f: HashMap<String, String> = ou::parse_form(std::str::from_utf8(body).unwrap_or(""))
-        .into_iter()
-        .collect();
+    let f = form_fields(body);
     let flow = load_flow(app, headers, f.get("request_uri").map(String::as_str), None)
         .await
         .map_err(|e| e.into_response(app))?;
@@ -1390,24 +1319,23 @@ async fn form_flow(
 
 enum SignIn {
     Ok(String),
-    /// Password accepted; a second-factor code is needed (handle; the
-    /// obfuscated address when it is an emailed code).
+    /// Password accepted, a code is needed: (handle, the obfuscated address
+    /// when it is an emailed code).
     NeedTotp(String, Option<String>),
-    /// Wrong code; still pending (handle, email hint).
+    /// Wrong code, still pending.
     NeedTotpErr(String, Option<String>),
     /// (identifier to pre-fill, why)
     Failed(String, LoginError),
 }
 
-/// Sign-in failures. Pages show only these fixed messages, and
-/// `/oauth/account?error=` carries the code, never request-supplied text.
+/// Pages show only these fixed messages, and `/oauth/account?error=` carries
+/// the code, never request-supplied text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LoginError {
     Invalid,
     Timeout,
     BadCode,
-    /// Too many wrong codes: password step again (or the account's factor
-    /// is locked out).
+    /// Password step again, or the account's factor is locked out.
     TooManyCodes,
     RateLimited,
     Inactive,
@@ -1459,10 +1387,9 @@ impl LoginError {
     }
 }
 
-/// Password (+ TOTP) sign-in; records the login on the device. Rate limited
-/// per IP, per identifier + IP and per account (src/ratelimit.rs); wrong
-/// codes count against the account's TOTP lockout and, past
-/// [`PENDING_2FA_MAX_FAILURES`], drop the pending sign-in.
+/// Records the login on the device. Wrong codes count against the account's
+/// TOTP lockout and, past [`PENDING_2FA_MAX_FAILURES`], drop the pending
+/// sign-in.
 async fn sign_in(
     app: &App,
     device: &mut Device,
@@ -1500,7 +1427,7 @@ async fn sign_in_inner(
     }
     let password_step = f.get("step").map(String::as_str) != Some("totp");
     let (acct, ident, epoch) = if !password_step {
-        // Second step: password already verified for the pending account.
+        // password already verified for the pending account
         let Some((did, _)) = device
             .pending_2fa
             .clone()
@@ -1547,8 +1474,7 @@ async fn sign_in_inner(
         if ident.contains('@') && acct.email.as_deref() != Some(ident.as_str()) {
             return invalid();
         }
-        // 503 temporarily_unavailable (+ Retry-After) rather than queue
-        // behind a login flood (the form handlers render a 503 page)
+        // 503 rather than queue behind a login flood
         match state::try_verify_password_hash(&acct.password_hash, &password).await {
             Ok(true) => {}
             Ok(false) => return invalid(),
@@ -1560,8 +1486,7 @@ async fn sign_in_inner(
         if acct.status.is_some() {
             return Ok(SignIn::Failed(ident, LoginError::Inactive));
         }
-        // the epoch this login holds (a password change since the check
-        // above fails it; see crate::xrpc::auth_epoch)
+        // a password change since the check above fails it
         let Some(epoch) = crate::xrpc::epoch_for_login(app, &acct).await? else {
             return invalid();
         };
@@ -1620,8 +1545,7 @@ fn email_hint(f: super::email2fa::Factor) -> Option<String> {
     }
 }
 
-/// The second-factor step of the sign-in page: an authenticator code, or
-/// (`email_hint`) the code just mailed.
+/// `email_hint`: the code was just mailed rather than from an authenticator.
 fn code_page(app: &App, flow: &Flow, handle: &str, email_hint: Option<&str>, bad_code: bool) -> Response {
     let csrf = flow.csrf(app);
     let name = server_name(app);
@@ -1667,16 +1591,11 @@ async fn authorize_sign_in(State(app): AppState, headers: HeaderMap, body: AxByt
             let ident = f.get("identifier").map(|s| s.trim().to_string()).unwrap_or_default();
             with_retry_after(login_page(&app, &flow, &ident, Some(BUSY_MESSAGE), false, e.status))
         }
-        Err(e) => error_page(
-            &app,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Sign-in failed",
-            &e.description,
-        ),
+        Err(e) => server_error_page(&app, "Sign-in failed", &e.description),
     }
 }
 
-/// What the sign-up form keeps when it is shown again after an error.
+/// Kept when the sign-up form is shown again after an error.
 #[derive(Default)]
 struct SignupValues {
     handle: String,
@@ -1703,9 +1622,8 @@ fn signup_page(app: &App, flow: &Flow, v: &SignupValues, error: Option<&str>, st
     r
 }
 
-/// The sign-up form: creates the account (as createAccount does, without a
-/// legacy session), signs it in on this device and continues to consent.
-/// Rate limited like createAccount (per IP).
+/// Creates the account as createAccount does (without a legacy session),
+/// signs it in on this device and continues to consent.
 async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
     use crate::ratelimit as rl;
     let (mut flow, f) = match form_flow(&app, &headers, &body).await {
@@ -1738,25 +1656,22 @@ async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxByt
     };
     let acct = match super::server::create_account_inner(&app, inp, None).await {
         Ok(a) => a,
-        // Argon2 saturated (or another transient 503): retryable
         Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {
             return with_retry_after(signup_page(&app, &flow, &v, Some(BUSY_MESSAGE), e.status))
         }
-        Err(e) if e.status.is_server_error() => {
-            return error_page(&app, StatusCode::INTERNAL_SERVER_ERROR, "Sign-up failed", &e.message)
-        }
+        Err(e) if e.status.is_server_error() => return server_error_page(&app, "Sign-up failed", &e.message),
         Err(e) => return signup_page(&app, &flow, &v, Some(&e.message), StatusCode::BAD_REQUEST),
     };
     let now = now_secs();
     let epoch = match crate::xrpc::auth_epoch(&app, &acct.did).await {
         Ok(e) => e,
-        Err(e) => return error_page(&app, StatusCode::INTERNAL_SERVER_ERROR, "Sign-up failed", &e.message),
+        Err(e) => return server_error_page(&app, "Sign-up failed", &e.message),
     };
     flow.device.accounts.retain(|a| a.did != acct.did);
     flow.device.accounts.push(DeviceAccount { did: acct.did.clone(), authenticated_at: now, auth_epoch: epoch });
     flow.device.last_seen_at = now;
     if let Err(e) = store::put_device(&app, &flow.device).await {
-        return error_page(&app, StatusCode::INTERNAL_SERVER_ERROR, "Sign-up failed", &e.description);
+        return server_error_page(&app, "Sign-up failed", &e.description);
     }
     consent_step(&app, flow, &acct.did).await
 }
@@ -1831,19 +1746,15 @@ fn is_email_read_scope(s: &str) -> bool {
     crate::oauth::scopes::Permission::parse(s).is_some_and(|p| p.matches_account("email", "read"))
 }
 
-/// The consent form may withhold the email address when it is requested
-/// through a granular `account:email` scope (transition scopes cannot be
-/// narrowed).
+/// Only a granular `account:email` scope can be withheld: transition scopes
+/// cannot be narrowed.
 fn can_withhold_email(scope: &str) -> bool {
     !scope.split(' ').any(|s| s.starts_with("transition:"))
         && scope.split(' ').any(is_email_read_scope)
 }
 
-/// Scope the user granted on the consent form (`setAuthorized` with a scope
-/// override in the reference): the requested scope, narrowed to the form's
-/// `scope` field when present (scopes can be removed, never added) and
-/// without the `account:email` scopes when the email checkbox was cleared.
-/// None if the result lacks `atproto`.
+/// The reference's `setAuthorized` scope override: the form can only remove
+/// scopes, never add them. None if the result lacks `atproto`.
 fn granted_scope(requested: &str, f: &HashMap<String, String>) -> Option<String> {
     let allowed: Option<Vec<&str>> = f.get("scope").map(|s| s.split(' ').collect());
     let withhold_email = f.contains_key("email_choice")
@@ -1858,31 +1769,10 @@ fn granted_scope(requested: &str, f: &HashMap<String, String>) -> Option<String>
     granted.contains(&"atproto").then(|| granted.join(" "))
 }
 
-// ---------- token endpoint ----------
-
 async fn token(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
     match token_inner(&app, &headers, &body).await {
         Ok(j) => as_json(&app, StatusCode::OK, j),
         Err(e) => as_error(&app, e),
-    }
-}
-
-fn same_client_auth(a: &ClientAuth, b: &ClientAuth) -> bool {
-    match (a, b) {
-        (ClientAuth::None, ClientAuth::None) => true,
-        (
-            ClientAuth::PrivateKeyJwt {
-                alg: a1,
-                kid: k1,
-                jkt: j1,
-            },
-            ClientAuth::PrivateKeyJwt {
-                alg: a2,
-                kid: k2,
-                jkt: j2,
-            },
-        ) => a1 == a2 && k1 == k2 && j1 == j2,
-        _ => false,
     }
 }
 
@@ -1913,6 +1803,10 @@ async fn token_inner(app: &Arc<App>, headers: &HeaderMap, body: &[u8]) -> Result
     }
 }
 
+fn code_matches(req: &RequestData, code: &str) -> bool {
+    req.code_hash.as_deref().is_some_and(|h| ou::ct_eq(h.as_bytes(), store::hash_secret(code).as_bytes()))
+}
+
 fn verify_pkce(verifier: &str, challenge: &str) -> bool {
     let ok_chars = verifier
         .bytes()
@@ -1940,15 +1834,11 @@ async fn code_grant(
     let mut req = store::get_request(app, &rid)
         .await?
         .ok_or_else(|| OAuthError::invalid_grant("Invalid code"))?;
-    let code_ok = req
-        .code_hash
-        .as_deref()
-        .is_some_and(|h| ou::ct_eq(h.as_bytes(), store::hash_secret(code).as_bytes()));
-    if !code_ok {
+    if !code_matches(&req, code) {
         return Err(OAuthError::invalid_grant("Invalid code"));
     }
     if let Some((did, sid)) = &req.consumed {
-        // Code reuse: revoke everything issued from the first use.
+        // code reuse: revoke what the first use issued
         store::delete_session(app, did, sid).await?;
         return Err(OAuthError::invalid_grant("Code replayed"));
     }
@@ -1965,7 +1855,7 @@ async fn code_grant(
     if req.client_id != client.id {
         return Err(fail("The code was not issued to this client"));
     }
-    if !same_client_auth(&req.client_auth, &client_auth) {
+    if req.client_auth != client_auth {
         return Err(fail("Client authentication mismatch"));
     }
     if p.get("redirect_uri").map(String::as_str) != Some(params.redirect_uri.as_str()) {
@@ -2009,14 +1899,12 @@ async fn code_grant(
     req.consumed = Some((did.clone(), s.id.clone()));
     store::put_request(app, &rid, Some(&req)).await?;
     super::cas::pause_point("oauth_code", &did).await;
-    // created only while the approving login's credential epoch is current:
     // a password change or takedown since the approval voids the code
     let guard = store::SessionGuard::New { auth_epoch: req.auth_epoch.clone() };
     issue_tokens(app, client, &mut s, guard).await
 }
 
-/// Signs the access token and writes the session, on condition `guard`
-/// (store::put_session_if): a session revoked meanwhile is not brought back.
+/// A session revoked meanwhile is not brought back (`guard`).
 async fn issue_tokens(app: &App, client: &Client, s: &mut Session, guard: store::SessionGuard) -> Result<J, OAuthError> {
     let now = now_secs();
     let lifetime = ACCESS_TOKEN_TTL.min(s.created_at + client.session_lifetime() - now);
@@ -2082,7 +1970,7 @@ async fn refresh_grant(
         return Err(invalid());
     }
     if parsed.generation < s.refresh_gen {
-        // A rotated-out token was presented again: assume theft, kill the session.
+        // a rotated-out token presented again: assume theft
         store::delete_session(app, &s.did, &s.id).await?;
         return Err(OAuthError::invalid_grant("Refresh token replayed"));
     }
@@ -2092,14 +1980,12 @@ async fn refresh_grant(
         ));
     }
     if !client.has_key(&s.client_auth) {
-        // The client's authentication key is gone from its metadata: the
-        // session must be revoked.
         store::delete_session(app, &s.did, &s.id).await?;
         return Err(OAuthError::invalid_grant(
             "Client authentication key no longer available",
         ));
     }
-    if !same_client_auth(&s.client_auth, &client_auth) {
+    if s.client_auth != client_auth {
         return Err(OAuthError::invalid_grant("Client authentication mismatch"));
     }
     if proof.jkt != s.dpop_jkt {
@@ -2119,20 +2005,16 @@ async fn refresh_grant(
     ensure_active_any(app, &s.did)
         .await
         .map_err(|e| OAuthError::invalid_grant(&e.message))?;
-    // bounded: the last good permission sets, refreshed in the background
-    // (a slow or failing publisher must not hold the refresh open)
     s.token_scope = lexicon::build_token_scope_cached(app, &s.scope)
         .await
         .map_err(|e| OAuthError::server_error(&e))?;
     s.refresh_gen += 1;
     super::cas::pause_point("oauth_refresh", &s.did).await;
-    // rewritten only if the row is still the one read: a revocation since
-    // (password change, takedown, revoke) is not undone
+    // only if the row is still the one read: a revocation since is not undone
     issue_tokens(app, client, &mut s, store::SessionGuard::Row(raw)).await
 }
 
-// ---------- revocation (RFC 7009) ----------
-
+/// RFC 7009.
 async fn revoke(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
     match revoke_inner(&app, &headers, &body).await {
         Ok(()) => as_json(&app, StatusCode::OK, json!({})),
@@ -2152,7 +2034,7 @@ async fn revoke_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(),
         claim(app, &r, OAuthError::invalid_client("client assertion replayed")).await?;
     }
     let k = keys(app);
-    // Invalid or unknown tokens are not an error (RFC 7009 §2.2).
+    // invalid or unknown tokens are not an error (RFC 7009 §2.2)
     if let Some(r) = store::parse_refresh_token(tok) {
         if let Some(s) = store::get_session(app, &r.did, &r.session_id).await? {
             if r.authentic(&k.refresh, &s) && s.client_id == client.id {
@@ -2171,11 +2053,7 @@ async fn revoke_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(),
         require_owner(app, &store::req_routing(&rid))?;
         let _g = store::lock(app, &format!("req:{rid}")).await;
         if let Some(req) = store::get_request(app, &rid).await? {
-            let ok = req
-                .code_hash
-                .as_deref()
-                .is_some_and(|h| ou::ct_eq(h.as_bytes(), store::hash_secret(tok).as_bytes()));
-            if ok && req.client_id == client.id {
+            if code_matches(&req, tok) && req.client_id == client.id {
                 if let Some((did, sid)) = &req.consumed {
                     store::delete_session(app, did, sid).await?;
                 }
@@ -2186,11 +2064,8 @@ async fn revoke_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(),
     Ok(())
 }
 
-// ---------- resource requests (DPoP-bound access tokens) ----------
-
 tokio::task_local! {
-    /// WWW-Authenticate challenge recorded by `verify_dpop` for the response
-    /// layer (XrpcError can't carry headers).
+    /// For the response layer: XrpcError can't carry headers.
     static DPOP_CHALLENGE: RefCell<Option<String>>;
 }
 
@@ -2207,11 +2082,9 @@ fn dpop_fail(error: &str, desc: &str) -> XrpcError {
     }
 }
 
-/// Response layer for requests authenticated with `Authorization: DPoP`:
-/// adds a fresh `DPoP-Nonce` (RFC 9449 §8.2/§9) and, when verification
-/// failed, the `WWW-Authenticate: DPoP error=...` challenge.
-/// Installed with [`with_dpop_layer`], which clones the app only for DPoP
-/// requests (not one `Arc<App>` refcount round trip per request).
+/// Adds a fresh `DPoP-Nonce` (RFC 9449 §8.2/§9) and, when verification
+/// failed, the `WWW-Authenticate` challenge. [`with_dpop_layer`] clones the
+/// app only for DPoP requests, not once per request.
 async fn dpop_layer(app: Option<Arc<App>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let Some(app) = app else {
         return next.run(req).await;
@@ -2240,7 +2113,6 @@ async fn dpop_layer(app: Option<Arc<App>>, req: axum::extract::Request, next: ax
         .await
 }
 
-/// Adds [`dpop_layer`] to `r`.
 pub fn with_dpop_layer(r: axum::Router<Arc<App>>, app: &Arc<App>) -> axum::Router<Arc<App>> {
     let app = app.clone();
     r.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
@@ -2249,7 +2121,6 @@ pub fn with_dpop_layer(r: axum::Router<Arc<App>>, app: &Arc<App>) -> axum::Route
     }))
 }
 
-/// Verifies `Authorization: DPoP <token>` on a resource request.
 pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Credentials> {
     let k = keys(app);
     let jwt = super::authn::verify_access_token(&k.server, token)
@@ -2296,22 +2167,16 @@ pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Crede
             "Access token is bound to another DPoP key",
         ));
     }
-    // single use, claimed at the token DID's owner (normally this node: the
-    // request was routed by that DID); `ath` binds the proof to this token.
-    // In the owner's memory only, like the reference's replay store: a
-    // durable claim would put a log write on every resource request (HA
-    // notes in crate::oauth for the residual risk)
+    // claimed at the token DID's owner (normally this node: the request was
+    // routed by that DID), in memory only (crate::oauth: residual risk)
     let replay = checked.replay(did.to_string());
     match super::internal::claim_transient_anywhere(app, &replay.routing, &replay.key, replay.until).await {
         Ok(true) => {}
         Ok(false) => return Err(dpop_fail("invalid_dpop_proof", "DPoP proof replayed")),
         Err(e) => return Err(e),
     }
-    // Stateful check: the session must still exist and this must be its
-    // current token (rotation and revocation take effect immediately).
-    // ... and the account must not be taken down (its sessions are revoked
-    // by the takedown too; this holds even if that revocation was missed).
-    // Both reads are point gets in the owner's partition, run together.
+    // rotation and revocation take effect immediately; a takedown is
+    // checked too, in case its session revocation was missed
     let (s, acct) = tokio::join!(store::get_session(app, did, sid), account_any(app, did));
     let s = s.map_err(|e| XrpcError::internal(e.description))?;
     if acct.is_ok_and(|a| super::server::is_takendown_account(&a)) {
@@ -2334,8 +2199,6 @@ pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Crede
         scopes,
     })
 }
-
-// ---------- session management: /oauth/account UI ----------
 
 fn redirect_to(path: &str) -> Response {
     let mut r = StatusCode::SEE_OTHER.into_response();
@@ -2363,14 +2226,7 @@ async fn account_page(
 ) -> Response {
     let (device, new_cookie) = match device_for(&app, &headers).await {
         Ok(d) => d,
-        Err(e) => {
-            return error_page(
-                &app,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Error",
-                &e.description,
-            )
-        }
+        Err(e) => return server_error_page(&app, "Error", &e.description),
     };
     let csrf = csrf_token(&app, &device.id, "account");
     let accounts = device_accounts(&app, &device).await;
@@ -2387,7 +2243,7 @@ async fn account_page(
             &ui::LoginForm {
                 action: "/oauth/account/sign-in",
                 identifier: "",
-                // fixed messages by code only (never echo the query text)
+                // never echo the query text
                 error: q
                     .get("error")
                     .and_then(|c| LoginError::from_code(c))
@@ -2431,17 +2287,8 @@ async fn account_form(
     headers: &HeaderMap,
     body: &[u8],
 ) -> Result<(Device, HashMap<String, String>), Response> {
-    let f: HashMap<String, String> = ou::parse_form(std::str::from_utf8(body).unwrap_or(""))
-        .into_iter()
-        .collect();
-    let (device, new_cookie) = device_for(app, headers).await.map_err(|e| {
-        error_page(
-            app,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Error",
-            &e.description,
-        )
-    })?;
+    let f = form_fields(body);
+    let (device, new_cookie) = device_for(app, headers).await.map_err(|e| server_error_page(app, "Error", &e.description))?;
     if new_cookie || !check_csrf(app, headers, &device, "account", f.get("csrf")) {
         return Err(error_page(
             app,
@@ -2474,12 +2321,7 @@ async fn account_sign_in(State(app): AppState, headers: HeaderMap, body: AxBytes
         Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {
             with_retry_after(error_page(&app, e.status, "Sign-in failed", BUSY_MESSAGE))
         }
-        Err(e) => error_page(
-            &app,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Sign-in failed",
-            &e.description,
-        ),
+        Err(e) => server_error_page(&app, "Sign-in failed", &e.description),
     }
 }
 
@@ -2491,12 +2333,7 @@ async fn account_sign_out(State(app): AppState, headers: HeaderMap, body: AxByte
     let did = f.get("did").cloned().unwrap_or_default();
     device.accounts.retain(|a| a.did != did);
     if let Err(e) = store::put_device(&app, &device).await {
-        return error_page(
-            &app,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Error",
-            &e.description,
-        );
+        return server_error_page(&app, "Error", &e.description);
     }
     redirect_to("/oauth/account")
 }
@@ -2521,17 +2358,10 @@ async fn account_revoke(State(app): AppState, headers: HeaderMap, body: AxBytes)
         );
     }
     if let Err(e) = store::delete_session(&app, &did, &sid).await {
-        return error_page(
-            &app,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Error",
-            &e.description,
-        );
+        return server_error_page(&app, "Error", &e.description);
     }
     redirect_to("/oauth/account")
 }
-
-// ---------- session management: XRPC ----------
 
 /// Only full account sessions (password login) may manage OAuth grants.
 fn full_session(creds: &Credentials) -> XResult<String> {

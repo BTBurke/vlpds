@@ -764,6 +764,56 @@ fn has_dup(v: &[String]) -> Option<&String> {
         .map(|(_, x)| x)
 }
 
+fn check_redirect_uri(r: &str, application_type: &str, loopback: bool, dev_mode: bool) -> Result<(), OAuthError> {
+    let bad_uri = |m: &str| OAuthError::invalid_redirect_uri(m);
+    let u = parse_redirect_uri(r)?;
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err(bad_uri(&format!(
+            "Redirect URI {r} must not contain credentials"
+        )));
+    }
+    let host = host_str(&u);
+    if host == "localhost" {
+        return Err(bad_uri(&format!(
+            "Loopback redirect URI {r} is not allowed (use explicit IPs instead)"
+        )));
+    } else if host == "127.0.0.1" || host == "[::1]" {
+        if application_type != "native" {
+            return Err(bad_uri(
+                "Loopback redirect URIs are only allowed for native apps",
+            ));
+        }
+        if u.scheme() != "http" {
+            return Err(bad_uri(&format!("Loopback redirect URI {r} must use HTTP")));
+        }
+    } else if u.scheme() == "http" {
+        // dev mode: allow http redirect URIs of dev-mode http clients
+        if !(dev_mode && !loopback) {
+            return Err(bad_uri(
+                "Only loopback redirect URIs are allowed to use the \"http\" scheme",
+            ));
+        }
+    } else if u.scheme() == "https" {
+        if is_local_hostname(&host) && !dev_mode {
+            return Err(bad_uri(&format!(
+                "Redirect URI \"{r}\"'s domain name must not be a local hostname"
+            )));
+        }
+    } else if is_private_use_scheme(&u) {
+        if application_type != "native" {
+            return Err(bad_uri(
+                "Private-Use URI Scheme redirect URI are only allowed for native apps",
+            ));
+        }
+    } else {
+        return Err(bad_uri(&format!(
+            "Invalid redirect URI scheme \"{}:\"",
+            u.scheme()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_metadata(
     client_id: &str,
     md: J,
@@ -906,51 +956,7 @@ fn validate_metadata(
         ));
     }
     for r in &redirect_uris {
-        let u = parse_redirect_uri(r)?;
-        if !u.username().is_empty() || u.password().is_some() {
-            return Err(bad_uri(&format!(
-                "Redirect URI {r} must not contain credentials"
-            )));
-        }
-        let host = host_str(&u);
-        if host == "localhost" {
-            return Err(bad_uri(&format!(
-                "Loopback redirect URI {r} is not allowed (use explicit IPs instead)"
-            )));
-        } else if host == "127.0.0.1" || host == "[::1]" {
-            if application_type != "native" {
-                return Err(bad_uri(
-                    "Loopback redirect URIs are only allowed for native apps",
-                ));
-            }
-            if u.scheme() != "http" {
-                return Err(bad_uri(&format!("Loopback redirect URI {r} must use HTTP")));
-            }
-        } else if u.scheme() == "http" {
-            // dev mode: allow http redirect URIs of dev-mode http clients
-            if !(dev_mode && !loopback) {
-                return Err(bad_uri(
-                    "Only loopback redirect URIs are allowed to use the \"http\" scheme",
-                ));
-            }
-        } else if u.scheme() == "https" {
-            if is_local_hostname(&host) && !dev_mode {
-                return Err(bad_uri(&format!(
-                    "Redirect URI \"{r}\"'s domain name must not be a local hostname"
-                )));
-            }
-        } else if is_private_use_scheme(&u) {
-            if application_type != "native" {
-                return Err(bad_uri(
-                    "Private-Use URI Scheme redirect URI are only allowed for native apps",
-                ));
-            }
-        } else {
-            return Err(bad_uri(&format!(
-                "Invalid redirect URI scheme \"{}:\"",
-                u.scheme()
-            )));
-        }
+        check_redirect_uri(r, &application_type, loopback, dev_mode)?;
     }
     if loopback {
         if gs("client_uri").is_some() {
