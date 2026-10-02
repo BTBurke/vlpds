@@ -210,6 +210,105 @@ fn random_histories_match_full_tree() {
     }
 }
 
+/// The repo worker's incremental recharge (`HeapMemo`, re-walking only the
+/// nodes that changed since the last measure) equals a full walk of the
+/// loaded tree after every operation of random histories over a store:
+/// loads by every entry point, inserts, deletes, writes, unloads, whole
+/// loads and reopens, with views sharing the tree (copy-on-write).
+#[test]
+fn heap_memo_matches_full_walk() {
+    for seed in 0..12u64 {
+        let mut rng = StdRng::seed_from_u64(1000 + seed);
+        let pm = (seed % 3) as i32;
+        let mut reference = Tree::new();
+        let mut live: Vec<Vec<u8>> = Vec::new();
+        let size = [0usize, 30, 2000][(seed / 3 % 3) as usize];
+        for i in 0..size {
+            let k = format!("app.bsky.feed.post/{}", tid(i as u64 * 7919)).into_bytes();
+            reference.insert_no_proof(&k, rand_cid(&mut rng)).unwrap();
+            live.push(k);
+        }
+        let mut root = reference.root_cid().unwrap();
+        let mut store = MemStore::from_tree(&reference, pm);
+        let mut lazy = LazyTree::open(root, pm, &store).unwrap();
+        let mut memo = mst_lazy::HeapMemo::default();
+        let check = |lazy: &LazyTree, memo: &mut mst_lazy::HeapMemo, after: &str| {
+            assert_eq!(memo.heap_bytes(&lazy.tree.root), heap_bytes(&lazy.tree.root), "seed {seed}: heap bytes after {after}");
+        };
+        check(&lazy, &mut memo, "open");
+        let mut views: Vec<Tree> = Vec::new();
+        let mut clock = 1u64 << 50;
+        for step in 0..300 {
+            if rng.gen_bool(0.3) {
+                views.push(lazy.tree.clone());
+            }
+            if views.len() > 3 {
+                views.remove(0);
+            }
+            let ops: Vec<Op> = (0..rng.gen_range(1..=4))
+                .map(|_| match rng.gen_range(0..10) {
+                    0..=3 => {
+                        clock += rng.gen_range(1..1 << 16);
+                        Op::Put(format!("app.bsky.feed.post/{}", tid(clock)).into_bytes(), rand_cid(&mut rng))
+                    }
+                    4 => Op::Put(small_key(&mut rng), rand_cid(&mut rng)),
+                    5..=6 if !live.is_empty() => Op::Put(live.choose(&mut rng).unwrap().clone(), rand_cid(&mut rng)),
+                    _ if !live.is_empty() => Op::Del(live.choose(&mut rng).unwrap().clone()),
+                    _ => Op::Del(small_key(&mut rng)),
+                })
+                .collect();
+            for op in &ops {
+                match rng.gen_range(0..6) {
+                    0 => {
+                        let k = small_key(&mut rng);
+                        lazy.fetch(&[&k[..]], &[&b"x.y/"[..]], &store).unwrap();
+                    }
+                    1 => {
+                        lazy.has_prefix(b"app.bsky.feed.like/", &store).unwrap();
+                    }
+                    _ => {}
+                }
+                check(&lazy, &mut memo, "fetch / has_prefix");
+                match op {
+                    Op::Put(k, v) => lazy.insert(k, *v, &store).unwrap(),
+                    Op::Del(k) => lazy.remove(k, &store).unwrap(),
+                };
+                check(&lazy, &mut memo, &format!("{op:?}"));
+            }
+            let mut blocks = Vec::new();
+            let (r, persist) = lazy.write_diff_blocks(&mut blocks).unwrap();
+            check(&lazy, &mut memo, "write");
+            store.apply(&persist);
+            for op in &ops {
+                match op {
+                    Op::Put(k, v) => {
+                        store.records.insert(Arc::from(&k[..]), *v);
+                    }
+                    Op::Del(k) => {
+                        store.records.remove(&k[..]);
+                    }
+                }
+            }
+            track_live(&mut live, &ops);
+            root = r;
+            match rng.gen_range(0..8) {
+                0 => lazy.unload(rng.gen_range(0..3)),
+                1 => {
+                    // keep a random part of what this commit wrote
+                    let keep = blocks.iter().filter(|_| rng.gen_bool(0.5)).map(|(c, _)| *c).collect();
+                    lazy.unload_except(&keep);
+                }
+                2 if step % 50 == 0 => lazy.load_all(&store).unwrap(),
+                3 => lazy = LazyTree::open(root, pm, &store).unwrap(),
+                // the worker drops its memo when it unloads
+                4 => memo = Default::default(),
+                _ => {}
+            }
+            check(&lazy, &mut memo, "unload / load_all / reopen");
+        }
+    }
+}
+
 /// Subtrees rebuilt from records are exactly the full tree's, and a store
 /// missing a node falls back to rebuilding it (and still matches).
 #[test]
