@@ -1,39 +1,21 @@
 //! Bounds the object-store requests one client (connection pool) has in
-//! flight, so a burst of requests queues for a permit instead of opening a
-//! connection each.
+//! flight, so a burst queues for a permit instead of opening a connection
+//! each. The HTTP client opens a connection whenever every pooled one is
+//! busy and closes the surplus into TIME_WAIT; unbounded, a takeover at load
+//! exhausted the host's ephemeral ports and lease renewals failed with
+//! everything else. With `limit` permits and `limit` idle connections kept,
+//! a pool never churns.
 //!
-//! Why: the HTTP client opens a new connection whenever every pooled one is
-//! busy, and keeps at most `pool_max_idle_per_host` of them afterwards; the
-//! rest close into TIME_WAIT. Unbounded, a takeover at load (shard opens,
-//! replay, and a cold repo load for every write to the moved shards) had
-//! 21,500 + 8,255 sockets open on two nodes within 10 s, the host's whole
-//! ephemeral port range: every new connection then failed (`transport error
-//! of kind Connect`), lease renewals with them, and both survivors
-//! fail-stopped (bench/results/benchbox-2026-10-02-head, "Failover"). With
-//! at most `limit` requests in flight and the pool keeping `limit` idle
-//! connections, a pool never holds more than `limit` connections and never
-//! churns them.
+//! A client may have a reserved lane for requests matching its [`Reserve`]
+//! (segment PUTs on the log client, lease renewals on the control plane), so
+//! bulk traffic never delays them.
 //!
-//! Each client has a main lane and optionally a reserved one that requests
-//! matching its [`Reserve`] use instead (the log client: segment PUTs, so
-//! replay and backfill reads never delay a commit; the control-plane client:
-//! node-lease PUTs, so a step's fan-out never delays a renewal). The
-//! control plane also has its own client (connection pool) altogether.
-//!
-//! A permit is held for the whole request: retries and backoff inside the
-//! client, and a GET's body until it is read to its end or dropped (the
-//! connection is busy until then) — except blob GETs, whose bodies stream to
-//! HTTP clients at their pace (one slow reader must not hold a permit), and
-//! LIST / bulk-DELETE streams, which hold one until their first response
-//! only (a caller may issue requests while it walks a listing; holding it
-//! across them could deadlock a saturated pool). Uncontended, acquiring is
-//! one atomic op: steady state never waits.
-//!
-//! Metrics (`client` = log | state | ctl, `lane` = main | reserved):
-//! `vlpds_object_store_inflight` (requests holding a permit),
-//! `vlpds_object_store_inflight_limit`, `vlpds_object_store_permit_waits_total`
-//! (requests that found every permit taken) and
-//! `vlpds_object_store_permit_wait_seconds` (how long those waited).
+//! A permit is held for the whole request, including retries and a GET's
+//! body until read or dropped (the connection is busy until then), except:
+//! blob bodies stream to HTTP clients at their pace, so one slow reader
+//! must not hold a permit; LIST and bulk-DELETE streams release at their
+//! first response, since a caller may issue requests while walking a listing
+//! and holding it could deadlock a saturated pool.
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -48,36 +30,24 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// Default in-flight bound of the state client (SlateDB, blobs, account
-/// indexes): `--store-inflight`. Steady state at 20k writes/s was under 100
-/// sockets per node (xh3g); this is headroom, not a throttle.
+/// Headroom, not a throttle: steady state is far below it.
 pub const DEFAULT_STATE_INFLIGHT: usize = 1024;
-/// Default in-flight bound of the log client's reads (replay, firehose
-/// backfill, peer followers, retention): `--log-store-inflight`.
 pub const DEFAULT_LOG_INFLIGHT: usize = 256;
-/// Log client writes (segment PUTs and their hedges, fences): their own
-/// lane, at least this many (see [`log_write_permits`]).
 pub const LOG_WRITE_PERMITS: usize = 64;
-/// Control-plane client: every control-plane call but lease writes. A step
-/// fans out to at most 32 calls at once.
+/// A control-plane step fans out to at most 32 calls at once.
 pub const CTL_PERMITS: usize = 64;
-/// Control-plane client, node-lease PUTs (renewals) only.
 pub const LEASE_PERMITS: usize = 8;
 
-/// The log client's write lane for `log_inflight` segment PUTs in flight
-/// (each may be hedged once more).
+/// Each in-flight segment PUT may be hedged once more.
 pub fn log_write_permits(log_inflight: usize) -> usize {
     LOG_WRITE_PERMITS.max(4 * log_inflight)
 }
 
-/// Which requests take the reserved lane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reserve {
-    /// No reserved lane.
     None,
-    /// Every write (PUT, multipart, copy): the log client's segment PUTs.
     Writes,
-    /// PUTs to node leases (`nodes/*`): the control plane's renewals.
+    /// PUTs to node leases (`nodes/*`).
     LeaseWrites,
 }
 
@@ -91,14 +61,11 @@ impl Reserve {
     }
 }
 
-/// One client's in-flight bounds.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// Main lane permits.
-    pub main: usize,
-    /// Reserved lane permits (used when `reserve` isn't None).
-    pub reserved: usize,
-    pub reserve: Reserve,
+    main: usize,
+    reserved: usize,
+    reserve: Reserve,
 }
 
 impl Limits {
@@ -110,14 +77,12 @@ impl Limits {
         Limits { reserved: n.max(1), reserve, ..self }
     }
 
-    /// Connections the client may have open at once: what its pool should
-    /// keep idle so none is closed and reopened.
+    /// What the client's pool should keep idle so none is closed and reopened.
     pub fn connections(&self) -> usize {
         self.main + if self.reserve == Reserve::None { 0 } else { self.reserved }
     }
 }
 
-/// One lane: a semaphore and its metrics.
 #[derive(Clone, Debug)]
 struct Lane {
     sem: Arc<Semaphore>,
@@ -154,7 +119,6 @@ impl Lane {
     }
 }
 
-/// A request in flight (dropped: the permit goes back).
 struct Permit {
     _p: OwnedSemaphorePermit,
     inflight: IntGauge,
@@ -167,7 +131,7 @@ impl Drop for Permit {
 }
 
 #[derive(Debug)]
-pub struct Limited {
+struct Limited {
     inner: Arc<dyn ObjectStore>,
     prefix: String,
     client: &'static str,
@@ -176,23 +140,18 @@ pub struct Limited {
     reserve: Reserve,
 }
 
-/// Wraps `inner` so at most `limits` of its requests are in flight.
 pub fn limited(inner: Arc<dyn ObjectStore>, prefix: &str, client: &'static str, limits: Limits) -> Arc<dyn ObjectStore> {
-    Arc::new(Limited::new(inner, prefix, client, limits))
+    Arc::new(Limited {
+        inner,
+        prefix: prefix.trim_end_matches('/').to_string(),
+        client,
+        main: Lane::new(client, "main", limits.main),
+        reserved: (limits.reserve != Reserve::None).then(|| Lane::new(client, "reserved", limits.reserved)),
+        reserve: limits.reserve,
+    })
 }
 
 impl Limited {
-    pub fn new(inner: Arc<dyn ObjectStore>, prefix: &str, client: &'static str, limits: Limits) -> Limited {
-        Limited {
-            inner,
-            prefix: prefix.trim_end_matches('/').to_string(),
-            client,
-            main: Lane::new(client, "main", limits.main),
-            reserved: (limits.reserve != Reserve::None).then(|| Lane::new(client, "reserved", limits.reserved)),
-            reserve: limits.reserve,
-        }
-    }
-
     fn lane(&self, write: bool, p: &Path) -> &Lane {
         match &self.reserved {
             Some(r) if self.reserve.reserved(write, crate::objstats::component(&self.prefix, p.as_ref())) => r,
@@ -207,10 +166,8 @@ impl std::fmt::Display for Limited {
     }
 }
 
-/// `s`, holding `permit` until it ends (or fails) or is dropped.
-fn hold_until_end<T: Send + 'static>(s: BoxStream<'static, Result<T>>, permit: Permit) -> BoxStream<'static, Result<T>> {
+fn hold_until_end<T: Send + 'static>(mut s: BoxStream<'static, Result<T>>, permit: Permit) -> BoxStream<'static, Result<T>> {
     let mut permit = Some(permit);
-    let mut s = s;
     futures::stream::poll_fn(move |cx| {
         let item = futures::ready!(s.poll_next_unpin(cx));
         if !matches!(item, Some(Ok(_))) {
@@ -221,8 +178,6 @@ fn hold_until_end<T: Send + 'static>(s: BoxStream<'static, Result<T>>, permit: P
     .boxed()
 }
 
-/// The stream `make` opens once a permit of `lane` is held, holding it until
-/// the first response (item, error or end).
 fn hold_until_first<T: Send + 'static>(lane: Lane, make: impl FnOnce() -> BoxStream<'static, T> + Send + 'static) -> BoxStream<'static, T> {
     futures::stream::once(async move {
         let mut permit = Some(lane.acquire().await);
@@ -254,7 +209,6 @@ impl ObjectStore for Limited {
         let p = self.lane(false, location).acquire().await;
         let head = options.head;
         let mut r = self.inner.get_opts(location, options).await?;
-        // see the module doc: blob bodies stream at an HTTP client's pace
         if !head && crate::objstats::component(&self.prefix, location.as_ref()) != "blob" {
             if let GetResultPayload::Stream(s) = r.payload {
                 r.payload = GetResultPayload::Stream(hold_until_end(s, p));
@@ -319,7 +273,7 @@ impl MultipartUpload for LimitedUpload {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use object_store::{ObjectStoreExt, PutMode};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -328,20 +282,20 @@ pub(crate) mod tests {
     /// Counts concurrent requests (to the response head; a GET's body until
     /// read) and their peak; each takes `delay`.
     #[derive(Debug)]
-    pub(crate) struct Gauge {
+    struct Gauge {
         inner: Arc<dyn ObjectStore>,
         read_delay: Duration,
         write_delay: Duration,
-        pub now: Arc<AtomicUsize>,
-        pub peak: Arc<AtomicUsize>,
+        now: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
     }
 
     impl Gauge {
-        pub(crate) fn new(inner: Arc<dyn ObjectStore>, delay: Duration) -> Arc<Gauge> {
+        fn new(inner: Arc<dyn ObjectStore>, delay: Duration) -> Arc<Gauge> {
             Self::with(inner, delay, delay)
         }
 
-        pub(crate) fn with(inner: Arc<dyn ObjectStore>, read_delay: Duration, write_delay: Duration) -> Arc<Gauge> {
+        fn with(inner: Arc<dyn ObjectStore>, read_delay: Duration, write_delay: Duration) -> Arc<Gauge> {
             Arc::new(Gauge { inner, read_delay, write_delay, now: Default::default(), peak: Default::default() })
         }
 

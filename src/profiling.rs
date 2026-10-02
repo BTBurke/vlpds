@@ -1,17 +1,9 @@
-//! CPU profiling (cargo feature `profiling`; bench/obs/README.md).
-//!
-//! - Continuous: `--pyroscope-url` starts a Pyroscope agent (pprof-rs,
-//!   100 Hz SIGPROF sampling, framehop unwinding) pushing every 10 s, tagged
-//!   with the node id and git revision.
-//! - On demand: `GET /debug/pprof/profile?seconds=N` (admin token, Bearer or
-//!   Basic `admin:<token>`) samples for N seconds and returns a pprof protobuf
-//!   (`go tool pprof -top`), or a flamegraph SVG with `format=svg`.
-//!
-//! Both use pyroscope's pprof-rs backend, a single SIGPROF sampler: with the
-//! agent running the endpoint answers 409 (query Pyroscope instead:
-//! bench/obs/profile.sh -p).
-//! Heap profiling is not wired up: jemalloc_pprof needs Linux (/proc maps);
-//! the `vlpds_jemalloc_bytes` gauges cover allocator totals.
+//! CPU profiling (cargo feature `profiling`; bench/obs/README.md): a
+//! continuous Pyroscope agent (`--pyroscope-url`) or on-demand
+//! `GET /debug/pprof/profile?seconds=N` (admin token; pprof protobuf, or a
+//! flamegraph with `format=svg`). Both use the one SIGPROF sampler, so the
+//! endpoint answers 409 while the agent runs. Heap profiling is not wired
+//! up: jemalloc_pprof needs Linux (/proc maps).
 
 use crate::xrpc::App;
 use axum::extract::{Query, State};
@@ -23,13 +15,10 @@ use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Set while the Pyroscope agent owns SIGPROF.
 static CONTINUOUS: AtomicBool = AtomicBool::new(false);
-/// Set while an on-demand profile runs (one at a time).
 static ON_DEMAND: AtomicBool = AtomicBool::new(false);
 
-/// The source tree's `git describe --always --dirty` (tags the profiles and
-/// `vlpds_build_info`), else VLPDS_GIT_REV at build time, else "unknown".
+/// VLPDS_GIT_REV at build time, else the source tree's `git describe`.
 pub fn git_rev() -> String {
     if let Some(r) = option_env!("VLPDS_GIT_REV") {
         return r.to_string();
@@ -53,8 +42,8 @@ pub fn git_rev() -> String {
 
 pub const ENABLED: bool = cfg!(feature = "profiling");
 
-/// Starts the Pyroscope agent for the life of the process. Call before the
-/// tokio runtime exists (the agent's blocking HTTP client owns a runtime).
+/// Call before the tokio runtime exists: the agent's blocking HTTP client
+/// owns a runtime.
 #[cfg(feature = "profiling")]
 pub fn start_pyroscope(url: &str, node_id: &str, rev: &str) -> anyhow::Result<()> {
     use pyroscope::backend::{pprof_backend, BackendConfig, PprofConfig};
@@ -93,9 +82,7 @@ pub fn routes() -> Router<Arc<App>> {
 #[derive(Deserialize)]
 struct ProfileQ {
     seconds: Option<u64>,
-    /// Sampling rate (Hz), default 99.
     frequency: Option<i32>,
-    /// `svg` for a flamegraph; default pprof protobuf.
     format: Option<String>,
 }
 
@@ -146,7 +133,6 @@ async fn profile(
     let secs = q.seconds.unwrap_or(10).clamp(1, 300);
     let freq = q.frequency.unwrap_or(99).clamp(1, 1000);
     let svg = q.format.as_deref() == Some("svg");
-    // sampling sleeps and symbolizing is CPU-heavy: a blocking thread
     let r = tokio::task::spawn_blocking(move || sample(secs, freq, svg)).await;
     ON_DEMAND.store(false, Ordering::Release);
     match r {
@@ -185,7 +171,7 @@ fn sample(secs: u64, freq: i32, svg: bool) -> anyhow::Result<(&'static str, Vec<
     };
     let reports: Vec<_> = reports.into_iter().map(tidy_report).collect();
     if svg {
-        // collapsed stacks (root first) for inferno
+        // collapsed stacks, root first
         let mut lines = Vec::new();
         for r in &reports {
             for (st, n) in &r.data {

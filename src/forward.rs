@@ -1,64 +1,24 @@
-//! HA request routing: any node accepts any request; requests for a DID whose
-//! partition is owned by another node are proxied to that owner.
+//! HA request routing: any node accepts any request; requests for a DID
+//! whose shard another node owns are proxied to that owner.
 //!
-//! XRPC: methods outside `com.atproto.*` / `vlpds.*` (proxied to the
-//! AppView and other services, or the app.bsky preferences) route by the
-//! bearer token's `sub` alone. The unauthenticated calls that name their
-//! account in the body (createSession, requestPasswordReset,
-//! resetPassword) route by the body alone, so per-account state (the
-//! sign-in-account rate limit) lives on the account's owner whatever query
-//! or token a client adds. Otherwise the routing DID comes from (in
-//! order) the `repo` / `did` /
-//! `handle` / `identifier` query parameter (GET only: procedures take their
-//! input in the body; handles resolved), the bearer
-//! token's `sub` (uploadBlob: or, for a user service JWT, which has none,
-//! its `iss`; when that is ours the body is never parsed), then the
-//! `repo` / `did` / `identifier` field of a JSON body (handles and emails
-//! resolved) and, for `com.atproto.admin.*`, the moderation `subject` (`did`,
-//! or the DID of its `uri`; also the `uri` query parameter) or the `account`
-//! / `recipientDid`, then the token `sub` (requestPasswordReset: its
-//! `email`'s account; resetPassword: the account its token was issued for).
-//! Requests without one (describeServer, subscribeRepos, ...) are served
-//! locally.
-//! Bodies are only buffered for JSON requests (bounded), so blob uploads
-//! stream straight through; routing reads them with a borrowed struct that
-//! skips every other field. A `Content-Encoding: gzip` / `deflate` body
-//! (decoded by the server's decompression layer, which runs after this one)
-//! is decoded for routing only, bounded like a plain one, and forwarded as
-//! sent; any other encoding routes as if it had no body.
-//!
-//! OAuth (`/oauth/*`): routed by `xrpc::oauth::route_key` (the account, the
-//! pushed request or the grant's owner; see the HA notes in `crate::oauth`).
+//! Routing key, XRPC: methods outside `com.atproto.*` / `vlpds.*` route by
+//! the bearer token's `sub` alone (the caller's account and signing key live
+//! at its owner, whatever DIDs the parameters name). createSession,
+//! requestPasswordReset and resetPassword route by their body alone, so
+//! per-account state (the sign-in rate limit) lives at the account's owner
+//! whatever query or token a client adds. Otherwise: the query (GET only),
+//! then the token's `sub`, then the JSON body. Bodies are only buffered for
+//! JSON requests (bounded), so blob uploads stream straight through. OAuth
+//! routes by `xrpc::oauth::route_key`.
 //!
 //! A forwarded request carries `x-vlpds-forwarded: <internal token>` and is
-//! served by the receiver whatever its routing table says (no loops). The
-//! marker is honored only with a valid internal token, and stripped either
-//! way (a client's copy just routes normally). It is not `x-vlpds-internal`,
-//! which would exempt forwarded requests from the owner's rate limits.
-//! Next to it the entry node sends the client address it resolved
-//! (`crate::ratelimit::CLIENT_IP_HEADER`: its TCP peer, or the client behind
-//! its `trusted_proxies`), which the owner's per-IP limits then key on; the
-//! owner trusts it only with the marker's valid token and drops a client's
-//! copy otherwise.
+//! served by the receiver whatever its routing table says (no loops). It is
+//! not `x-vlpds-internal`, which would exempt forwarded requests from the
+//! owner's rate limits. The entry node also sends the client address it
+//! resolved, trusted by the owner only next to a valid marker.
 //!
-//! Forwards fail fast: if the owner hasn't started answering within a
-//! time-to-first-byte deadline (counted once the request body is sent) the
-//! client gets 503 `PartitionUnavailable` + `Retry-After`, and the owner's
-//! lease expiry moves the shard. Response bodies then stream without a size
-//! or time limit, but with a write-progress deadline: one whose client stops
-//! reading is dropped (`http::stall`), and bulk downloads (getRepo, getBlob,
-//! getBlocks) use their own peer connections (`http::PeerClient`, by path).
-//!
-//! A slow cold repo load is not a dead owner: a forwarded repo write that its
-//! worker hasn't started within [`FORWARDED_WRITE_START`] (its repo is still
-//! loading, e.g. right after a restart or takeover) is abandoned unapplied
-//! and answered 503 `RepoLoading` (see `worker::Claim`), well inside the
-//! deadline; a write that finds its shard gone (moving between owners) is
-//! answered 503 `ShardMoved`, also before it started. The node the client
-//! called resends such writes (the body is buffered), to whoever owns the
-//! repo by then, until answered or [`WRITE_RETRY_BUDGET`] runs out, so the
-//! client sees a load or a shard move as latency, not as an error; a frozen
-//! owner still fails in TTFB_FAST (ambiguous: never resent).
+//! Deadlines and resends of not-applied writes: DESIGN.md "Forwarding
+//! deadlines and not-applied writes".
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -74,54 +34,40 @@ use std::time::{Duration, Instant};
 
 /// Forwarded-request marker; its value is the internal token.
 pub const FORWARDED_HEADER: &str = "x-vlpds-forwarded";
-/// Names the node a `vlpds.admin.*` call is for (`vlpds admin` per-node
-/// maintenance: rotate-plc-keys, rewrap-secrets). The node a client reaches
-/// relays it to that node over peer mTLS: operators reach nodes through
-/// `--listen` only, peer listeners take node certificates only.
+/// Names the node a `vlpds.admin.*` call is for. The node a client reaches
+/// relays it over peer mTLS: operators reach nodes through `--listen` only,
+/// and peer listeners take node certificates only.
 pub const NODE_HEADER: &str = "x-vlpds-node";
 const MAX_JSON_BODY: usize = 4 << 20;
-/// Owner time-to-first-byte for quick local work (repo/sync reads and
-/// writes, sessions, admin, OAuth).
 pub const TTFB_FAST: Duration = Duration::from_millis(3000);
-/// ... for calls whose owner waits on something else (AppView proxying, PLC,
-/// mail) or does bulk work (repo exports/imports, blobs).
+/// For calls whose owner waits on something else (AppView, PLC, mail) or
+/// does bulk work.
 pub const TTFB_SLOW: Duration = Duration::from_secs(30);
 /// An upload whose body the owner stops reading for this long fails too.
 const BODY_STALL: Duration = Duration::from_secs(10);
-/// Ceiling on one forwarded exchange (response streaming included);
-/// overrides the internal client's short default.
+/// Overrides the peer client's short default; response streaming included.
 const FORWARD_MAX: Duration = Duration::from_secs(3600);
-/// How long the owner waits for a forwarded write to start before answering
-/// 503 `RepoLoading` (well under TTFB_FAST, so it is never mistaken for a
-/// frozen owner).
+/// Well under TTFB_FAST, so a loading repo is never mistaken for a frozen
+/// owner.
 pub const FORWARDED_WRITE_START: Duration = Duration::from_millis(1000);
-/// How long the entry node keeps resending a write answered "not applied"
-/// before passing the 503 (+ Retry-After) to the client.
 pub const WRITE_RETRY_BUDGET: Duration = Duration::from_secs(20);
-/// Error name of a forwarded write abandoned before it started.
 pub const REPO_LOADING: &str = "RepoLoading";
-/// Error name of a write that found its repo's shard gone from this node
-/// before it started (moving between owners): not applied either.
 pub const SHARD_MOVED: &str = "ShardMoved";
 
 /// Response extension on a forward's 503 when the owner refused the
-/// connection: nothing was sent, so a write can be resent (its owner died;
-/// routing follows once a peer presumes it dead, see `Cluster::read_nodes`).
+/// connection: nothing was sent, so a write can be resent.
 #[derive(Clone, Copy, Debug)]
 pub struct NotSent;
 
 tokio::task_local! {
-    /// Set while a request a peer forwarded here is being served.
     static FORWARDED: ();
 }
 
-/// The request being served was forwarded by a peer (its client waits on the
-/// peer's time-to-first-byte deadline).
+/// Its client waits on the peer's time-to-first-byte deadline.
 pub fn is_forwarded() -> bool {
     FORWARDED.try_with(|_| ()).is_ok()
 }
 
-/// Repo writes the entry node resends after a not-applied 503.
 fn retryable_write(req: &Request) -> bool {
     req.method() == Method::POST
         && matches!(
@@ -135,26 +81,21 @@ fn retryable_write(req: &Request) -> bool {
 
 #[async_trait::async_trait]
 pub trait Router: Send + Sync + 'static {
-    /// Owner base URL for `did` if a *different* node owns it; None = handle here.
+    /// None: serve here.
     fn remote_owner(&self, did: &str) -> Option<String>;
-    /// Handle -> DID (for routing createSession by identifier).
     async fn resolve_handle(&self, handle: &str) -> Option<String>;
-    /// The node itself: its internal token (forwarded markers are trusted
-    /// and sent only with it), OAuth routing and email lookups. None (tests)
-    /// = XRPC routing only, and no forwarded marker is trusted.
+    /// None (tests): XRPC routing only, and no forwarded marker is trusted.
     fn app(&self) -> Option<&crate::xrpc::App> {
         None
     }
-    /// No live peer: every shard is ours or unowned, so nothing routes
-    /// elsewhere and requests skip the routing work (token and body parse).
+    /// No live peer: requests skip the routing work.
     fn alone(&self) -> bool {
         false
     }
 }
 
-/// Routing key from the query string: a DID in `repo`/`did`, else a handle in
-/// `repo`/`did`/`handle`/`identifier` (resolved to its DID by the caller). `admin` also
-/// takes the DID of an at:// `uri` (getSubjectStatus).
+/// (DID, handle to resolve). `admin` also takes an at:// `uri`'s DID
+/// (getSubjectStatus).
 fn query_target(query: Option<&str>, admin: bool) -> (Option<String>, Option<String>) {
     let mut handle = None;
     for kv in query.unwrap_or("").split('&') {
@@ -179,7 +120,6 @@ fn query_target(query: Option<&str>, admin: bool) -> (Option<String>, Option<Str
     (None, handle)
 }
 
-/// The DID authority of an at:// URI.
 fn uri_did(uri: &str) -> Option<&str> {
     uri.strip_prefix("at://")?.split('/').next().filter(|d| d.starts_with("did:"))
 }
@@ -202,19 +142,15 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `sub` of a JWT (unverified: routing only; the owner verifies).
+/// Unverified: routing only; the owner verifies.
+fn jwt_payload(req: &Request, dpop: bool) -> Option<Vec<u8>> {
+    let h = req.headers().get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let tok = h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("DPoP ").filter(|_| dpop))?;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(tok.split('.').nth(1)?).ok()
+}
+
 fn token_sub(req: &Request) -> Option<String> {
-    let h = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?;
-    let tok = h
-        .strip_prefix("Bearer ")
-        .or_else(|| h.strip_prefix("DPoP "))?;
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(tok.split('.').nth(1)?)
-        .ok()?;
+    let payload = jwt_payload(req, true)?;
     #[derive(Deserialize)]
     struct Claims<'a> {
         #[serde(borrow, default)]
@@ -224,18 +160,9 @@ fn token_sub(req: &Request) -> Option<String> {
     c.sub.0.filter(|s| s.starts_with("did:")).map(Cow::into_owned)
 }
 
-/// The DID of a Bearer JWT's `iss` (unverified, `#fragment` dropped:
-/// routing only; the owner verifies).
+/// A Bearer JWT's `iss` without its `#fragment`.
 fn token_iss(req: &Request) -> Option<String> {
-    let tok = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")?;
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(tok.split('.').nth(1)?)
-        .ok()?;
+    let payload = jwt_payload(req, false)?;
     #[derive(Deserialize)]
     struct Claims<'a> {
         #[serde(borrow, default)]
@@ -246,8 +173,6 @@ fn token_iss(req: &Request) -> Option<String> {
     let did = iss.split('#').next()?;
     did.starts_with("did:").then(|| did.to_string())
 }
-
-// ---------- borrowed body routing ----------
 
 /// A string field, or None for anything else (skipped without allocating).
 #[derive(Default, Debug)]
@@ -301,7 +226,6 @@ impl<'de: 'a, 'a> Deserialize<'de> for Str<'a> {
     }
 }
 
-/// The routing fields of a moderation `subject` (any other shape: none).
 #[derive(Default, Debug)]
 struct Subject<'a> {
     did: Str<'a>,
@@ -356,7 +280,7 @@ impl<'de: 'a, 'a> Deserialize<'de> for Subject<'a> {
     }
 }
 
-/// Only the fields routing looks at; serde skips the rest of the body.
+/// Only the fields routing looks at, borrowed; serde skips the rest.
 #[derive(Deserialize, Default, Debug)]
 struct BodyKeys<'a> {
     #[serde(borrow, default)]
@@ -382,9 +306,6 @@ enum BodyTarget {
     Ident(String),
 }
 
-/// Routing target of a JSON body: a DID in `repo` / `did` / `identifier`
-/// (`admin`: also the moderation subject's), else a handle (or an email
-/// `identifier`) to resolve.
 fn body_target(body: &[u8], admin: bool) -> Option<BodyTarget> {
     let k: BodyKeys = serde_json::from_slice(body).ok()?;
     let is_did = |s: &Str| s.0.as_deref().filter(|v| v.starts_with("did:")).map(String::from);
@@ -413,17 +334,15 @@ fn body_target(body: &[u8], admin: bool) -> Option<BodyTarget> {
         .map(|s| BodyTarget::Ident(s.to_string()))
 }
 
-/// Unauthenticated XRPC calls that name their account in the body: routed
-/// by the body only (see the module notes).
 const BODY_ROUTED: [&str; 3] = [
     "com.atproto.server.createSession",
     "com.atproto.server.requestPasswordReset",
     "com.atproto.server.resetPassword",
 ];
 
-/// The body as routing reads it: decoded when `Content-Encoding` is gzip or
-/// deflate (bounded by [`MAX_JSON_BODY`]; past it, or undecodable: empty),
-/// empty for any other encoding.
+/// The server's decompression layer runs after this one, so routing decodes
+/// gzip / deflate itself (bounded; forwarded as sent). Any other encoding
+/// routes as if it had no body.
 fn routing_body<'a>(headers: &axum::http::HeaderMap, raw: &'a [u8]) -> Cow<'a, [u8]> {
     use std::io::Read;
     let enc = headers
@@ -444,10 +363,7 @@ fn routing_body<'a>(headers: &axum::http::HeaderMap, raw: &'a [u8]) -> Cow<'a, [
     }
 }
 
-// ---------- the layer ----------
-
-/// Strips the forwarded marker from a request; true when it carried a valid
-/// internal token (a peer forwarded it).
+/// True when the stripped marker carried a valid internal token.
 fn take_forwarded(req: &mut Request, app: Option<&crate::xrpc::App>) -> bool {
     let Some(token) = req.headers_mut().remove(FORWARDED_HEADER) else {
         return false;
@@ -476,9 +392,8 @@ async fn resolve_ident(router: &dyn Router, app: Option<&crate::xrpc::App>, iden
     }
 }
 
-/// Unauthenticated calls that name their account another way:
-/// requestPasswordReset by `email`, resetPassword by its token (the account
-/// it was issued for). Both run through that account's owner.
+/// requestPasswordReset names its account by `email`, resetPassword by the
+/// account its token was issued for.
 async fn named_account(router: &dyn Router, app: Option<&crate::xrpc::App>, path: &str, body: &[u8]) -> Option<String> {
     #[derive(Deserialize)]
     struct Named<'a> {
@@ -500,7 +415,6 @@ async fn named_account(router: &dyn Router, app: Option<&crate::xrpc::App>, path
     crate::xrpc::reset_token_did(app?, n.token.0.as_deref()?).await.ok()?
 }
 
-/// XRPC routing DID (None = serve here).
 #[allow(clippy::result_large_err)]
 async fn xrpc_target(
     router: &dyn Router,
@@ -509,10 +423,7 @@ async fn xrpc_target(
 ) -> Result<(Request, Option<String>), Response> {
     let nsid = req.uri().path().strip_prefix("/xrpc/").unwrap_or("");
     if !nsid.starts_with("com.atproto.") && !nsid.starts_with("vlpds.") {
-        // app.bsky.* / chat.bsky.* / tools.ozone.* / ...: proxied (or the
-        // app.bsky preferences), on behalf of the caller, whose account (and
-        // signing key) is at its owner, whatever DIDs the parameters name
-        // (e.g. tools.ozone.moderation.getRepo?did=). Nothing else to parse.
+        // e.g. tools.ozone.moderation.getRepo?did= still routes by caller
         let sub = token_sub(&req);
         return Ok((req, sub));
     }
@@ -561,7 +472,6 @@ async fn xrpc_target(
     Ok((req, did.or(sub)))
 }
 
-/// OAuth routing key (None = serve here).
 #[allow(clippy::result_large_err)]
 async fn oauth_target(
     app: Option<&crate::xrpc::App>,
@@ -601,7 +511,6 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
         }
         return FORWARDED.scope((), next.run(req)).await;
     }
-    // the client address as this node sees it, sent along if forwarded
     if let Some(a) = app {
         if let Some(ip) = crate::ratelimit::request_client_ip(req.headers(), req.extensions(), &a.ratelimit.trusted) {
             req.extensions_mut().insert(crate::ratelimit::ClientIp(ip));
@@ -637,21 +546,22 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
     let Some(owner) = key.as_deref().and_then(|k| router.remote_owner(k)) else {
         return next.run(req).await;
     };
-    crate::metrics::FORWARDED.inc();
     let ttfb = ttfb_for(&req);
+    forward_counted(client, &owner, req, token, ttfb).await
+}
+
+async fn forward_counted(client: &crate::http::PeerClient, owner: &str, req: Request, token: Option<&str>, ttfb: Duration) -> Response {
+    crate::metrics::FORWARDED.inc();
     let t = Instant::now();
-    let resp = forward(client, &owner, req, token, ttfb).await;
+    let resp = forward(client, owner, req, token, ttfb).await;
     crate::metrics::observe_forward(resp.status().as_u16(), t);
     resp
 }
 
-/// Serves a repo write here or at its owner, and sends it again (to whoever
-/// owns `key` by then) while the answer says it was not applied: the owner
-/// gave it up while its repo loaded ([`REPO_LOADING`]), or the shard moved
-/// away before it started ([`SHARD_MOVED`]). Within [`WRITE_RETRY_BUDGET`];
-/// after that the last 503 (+ Retry-After) goes to the client. The body is
-/// buffered for the resends (JSON, at most 4 MiB). `key` None: served here
-/// first (a lone node), the key is worked out for a resend.
+/// Resends a repo write (to whoever owns `key` by then) while the answer
+/// says it was not applied ([`REPO_LOADING`], [`SHARD_MOVED`], or a refused
+/// connection), within [`WRITE_RETRY_BUDGET`]. `key` None: served here first
+/// (a lone node), the key is worked out for a resend.
 async fn write_with_retries(
     router: &dyn Router,
     client: &crate::http::PeerClient,
@@ -677,10 +587,9 @@ async fn write_with_retries(
     };
     let mut key = key.map(str::to_string);
     let started = Instant::now();
-    // Resends back off (doubling, at most 1 s): an owner that is reopening
-    // shards must not be swamped by every entry node's resends (seen at
-    // 50 ms fixed: ~20 resends/s per held write starved a restarted node's
-    // replay, 0.5 s -> 60 s).
+    // Resends back off (doubling, at most 1 s): an owner reopening shards
+    // must not be swamped by every entry node's resends, which starves its
+    // replay.
     let mut attempt = 0u32;
     loop {
         if attempt > 0 && key.is_none() {
@@ -692,13 +601,7 @@ async fn write_with_retries(
         let req = rebuild();
         let resp = match key.as_deref().and_then(|k| router.remote_owner(k)) {
             None => next.clone().run(req).await,
-            Some(owner) => {
-                crate::metrics::FORWARDED.inc();
-                let t = Instant::now();
-                let r = forward(client, &owner, req, token, ttfb).await;
-                crate::metrics::observe_forward(r.status().as_u16(), t);
-                r
-            }
+            Some(owner) => forward_counted(client, &owner, req, token, ttfb).await,
         };
         if resp.status() != StatusCode::SERVICE_UNAVAILABLE {
             return resp;
@@ -724,7 +627,6 @@ async fn write_with_retries(
     }
 }
 
-/// Time-to-first-byte deadline for forwarding `req` (see [`TTFB_FAST`]).
 fn ttfb_for(req: &Request) -> Duration {
     let path = req.uri().path();
     if path.starts_with("/oauth/") {
@@ -753,10 +655,9 @@ fn ttfb_for(req: &Request) -> Duration {
     }
 }
 
-/// Request body progress, for the time-to-first-byte deadline.
+/// The TTFB deadline counts from the end of the request body.
 struct Progress {
     start: Instant,
-    /// millis since `start` of the last chunk handed to the owner
     last_ms: AtomicU64,
     done: AtomicBool,
     done_notify: tokio::sync::Notify,
@@ -790,7 +691,6 @@ impl Progress {
     }
 }
 
-/// The request body as a stream that records progress.
 fn tracked_body(body: Body, p: Arc<Progress>) -> reqwest::Body {
     use futures::StreamExt;
     let p2 = p.clone();
@@ -807,9 +707,8 @@ fn tracked_body(body: Body, p: Arc<Progress>) -> reqwest::Body {
     reqwest::Body::wrap_stream(s)
 }
 
-/// An admin call naming another node ([`NODE_HEADER`]): forwarded to it
-/// (it serves the call as forwarded, under the caller's admin credentials).
-/// None: served here (no header, this node, or not an admin call).
+/// An admin call naming another node ([`NODE_HEADER`]) is forwarded to it.
+/// None: served here.
 fn relay_to_node<'a>(
     app: Option<&crate::xrpc::App>,
     client: &'a crate::http::PeerClient,
@@ -869,10 +768,7 @@ async fn forward(
             rb = rb.header(k, v);
         }
     }
-    // the marker (dropped by the receiver unless the token is valid)
     rb = rb.header(FORWARDED_HEADER, internal_token.unwrap_or("-"));
-    // the client address for the owner's per-IP rate limits (trusted there
-    // only next to the marker's valid token)
     let client = parts.extensions.get::<crate::ratelimit::ClientIp>().map(|c| c.0).or_else(|| {
         parts.extensions.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip())
     });

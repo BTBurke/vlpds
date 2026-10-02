@@ -1,31 +1,15 @@
-//! Counts object-store requests by billable operation and by what the key
-//! is (log segment, SlateDB manifest/SST, control plane, ...), at the
-//! bottom of the stack: every request that reaches the wire is counted
-//! once (SlateDB's retries and hedged segment PUTs included; SlateDB's
-//! disk-cache hits never get here). This is what an S3/GCS/R2 bill counts.
+//! Counts object-store requests by billable operation and key component at
+//! the bottom of the stack, so every request on the wire is counted once
+//! (SlateDB retries and hedged PUTs included, disk-cache hits not): this is
+//! what an S3/GCS/R2 bill counts.
 //!
-//! Exported as `vlpds_object_store_requests_total{op,component,client,result}`
-//! and `vlpds_object_store_bytes_total{dir,component,client}` (dir = up |
-//! down). `client` is the connection pool (`log`: segment PUTs, fences,
-//! retention, replay and firehose reads; `state`: SlateDB, blobs, account
-//! indexes; `ctl`: the control plane, see `objlimit`). `result` is `ok`, `not_found`, `precondition` (If-Match /
-//! If-None-Match failed), `timeout`, `error`, or `cancelled` (the caller
-//! dropped the request unanswered: a control-plane deadline, a lost hedge);
-//! a request is counted when it is answered (or dropped).
-//! `vlpds_object_store_request_seconds{op,component}` times answered
-//! requests (to the response head; LISTs to their first page). Who inside
-//! SlateDB issued a request (db / gc / compactor) is in SlateDB's own
-//! `slatedb_object_store_request_count_total{component}`.
+//! `client` is the connection pool (`log`, `state`, `ctl`). `result` is
+//! `ok`, `not_found`, `precondition`, `timeout`, `error`, or `cancelled`
+//! (dropped unanswered: a deadline, a lost hedge). `list` counts one request
+//! per 1,000-key page; `delete_batch` one per 1,000 objects of a stream.
 //!
-//! Ops: `put` (overwrite), `put_create` (If-None-Match), `put_cas`
-//! (If-Match), `get`, `get_range`, `head`, `list` (one per 1,000-key
-//! page), `delete` (objects), `delete_batch` (bulk-delete requests, one
-//! per 1,000 objects of a stream), `copy`, `mpu_create`, `mpu_part`,
-//! `mpu_complete`, `mpu_abort`.
-//!
-//! `VLPDS_INJECT_STATE_MS` / `VLPDS_INJECT_LOG_MS` / `VLPDS_INJECT_CTL_MS`
-//! (bench only; the control plane had the state client's before) add S3-like
-//! latency per request of that client; see `Latency`.
+//! `VLPDS_INJECT_{STATE,LOG,CTL}_MS` (bench only) add S3-like latency; see
+//! `Latency`.
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -37,7 +21,6 @@ use object_store::{
 };
 use std::sync::Arc;
 
-/// What an object key is, from its path under the store prefix.
 pub fn component(prefix: &str, path: &str) -> &'static str {
     let rel = path.strip_prefix(prefix).and_then(|r| r.strip_prefix('/')).unwrap_or(path);
     let mut it = rel.split('/');
@@ -75,13 +58,10 @@ pub struct Counting {
     latency: Option<Latency>,
 }
 
-/// Bench-only injected latency for every request of a client (lognormal
-/// around a median; reads = get/head/list_with_delimiter, writes =
-/// put/copy/multipart create; streamed LISTs and DELETEs are not delayed).
-/// Segment PUTs have their own (`--inject-put-ms`); this emulates S3 for
-/// SlateDB and the control plane over a local MinIO, where call latency
-/// paces the timer-driven loops (checkpoints, compaction) and so the op
-/// counts. Set by `VLPDS_INJECT_STATE_MS=<read ms>,<write ms>[,<sigma>]`.
+/// Bench-only lognormal latency, `<read ms>,<write ms>[,<sigma>]`: emulates
+/// S3 over a local MinIO, where call latency paces the timer-driven loops
+/// (checkpoints, compaction) and so the op counts. Streamed LISTs and
+/// DELETEs are not delayed.
 #[derive(Debug, Clone, Copy)]
 struct Latency {
     read_ms: f64,
@@ -107,7 +87,6 @@ async fn sleep_lognormal(median_ms: f64, sigma: f64) {
     tokio::time::sleep(std::time::Duration::from_secs_f64(median_ms * (sigma * z).exp() / 1000.0)).await;
 }
 
-/// Wraps `inner` so every request is counted under `client`.
 pub fn counted(inner: Arc<dyn ObjectStore>, prefix: &str, client: &'static str) -> Arc<dyn ObjectStore> {
     Arc::new(Counting { inner, prefix: prefix.trim_end_matches('/').to_string(), client, latency: Latency::from_env(client) })
 }
@@ -122,8 +101,7 @@ fn bytes(dir: &str, comp: &str, client: &str, n: u64) {
     }
 }
 
-/// The `result` label of a failed request.
-pub fn result_label(e: &object_store::Error) -> &'static str {
+fn result_label(e: &object_store::Error) -> &'static str {
     use object_store::Error as E;
     match e {
         E::NotFound { .. } => "not_found",
@@ -133,9 +111,8 @@ pub fn result_label(e: &object_store::Error) -> &'static str {
     }
 }
 
-/// Whether a store error is a timeout (the HTTP client's, or a deadline of
-/// ours), from its message chain. Not "timeout" alone: object_store's retry
-/// errors print their `retry_timeout` setting whatever the cause.
+/// From the message chain. Not "timeout" alone: object_store's retry errors
+/// print their `retry_timeout` setting whatever the cause.
 pub fn is_timeout(e: &object_store::Error) -> bool {
     let mut cur: Option<&dyn std::error::Error> = Some(e);
     while let Some(x) = cur {
@@ -147,9 +124,7 @@ pub fn is_timeout(e: &object_store::Error) -> bool {
     false
 }
 
-/// One request in flight: counted with its result (and timed) once
-/// answered, or counted `cancelled` if dropped unanswered (a caller's
-/// deadline, a lost hedge).
+/// Counted `cancelled` if dropped before `finish`.
 struct Req {
     op: &'static str,
     comp: &'static str,
@@ -195,9 +170,8 @@ impl Counting {
         component(&self.prefix, p.as_ref())
     }
 
-    /// Counts a listing: one request answered with the first page (timed
-    /// to it), one more per 1,000 keys (S3/GCS/R2 page size), and a failed
-    /// one for an error mid-listing.
+    /// Timed to the first page; one more request per 1,000 keys (the
+    /// S3/GCS/R2 page size).
     fn count_list(&self, comp: &'static str, mut s: BoxStream<'static, Result<ObjectMeta>>) -> BoxStream<'static, Result<ObjectMeta>> {
         let client = self.client;
         let mut first = Some(Req::new("list", comp, client));
@@ -275,8 +249,8 @@ impl ObjectStore for Counting {
         Ok(r)
     }
 
-    /// `delete_batch` is counted when sent (result `ok`: a bulk request's
-    /// outcome is per object); `delete` per object with its result.
+    /// `delete_batch` is counted `ok` when sent: a bulk request's outcome is
+    /// per object.
     fn delete_stream(&self, locations: BoxStream<'static, Result<Path>>) -> BoxStream<'static, Result<Path>> {
         let (prefix, client) = (self.prefix.clone(), self.client);
         // an error may not name its key: count it under the last one sent
@@ -418,7 +392,6 @@ mod tests {
         assert!(matches!(s.get(&p).await, Err(object_store::Error::NotFound { .. })));
         s.put_opts(&p, PutPayload::from_static(b"a"), PutMode::Create.into()).await.unwrap();
         assert!(s.put_opts(&p, PutPayload::from_static(b"b"), PutMode::Create.into()).await.is_err());
-        // an empty listing is still one answered request
         let _: Vec<_> = s.list(Some(&Path::from("objstats-res/nodes"))).collect().await;
         assert_eq!(n("get", c, "not_found") - nf0, 1);
         assert_eq!(n("put_create", c, "precondition") - pre0, 1);

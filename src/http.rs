@@ -1,27 +1,11 @@
-//! Outbound HTTP clients: one builder per role, each client built once and
-//! shared, so connections are pooled and reused (DESIGN.md "HTTP").
-//!
-//! - [`PeerClient`]: node-to-node (forwarding, internal calls). h2 over
-//!   peer mTLS, large windows, keepalive PINGs, a few connections per peer.
-//! - [`public`]: operator-configured upstreams (AppView, report service, PLC
-//!   directory, relays). h2 via ALPN on https, a pooled HTTP/1.1 on http.
-//!   The AppView proxy has its own: [`proxy`] (https, one client per IO
-//!   thread) and [`h1`] (plain http, one capped pool per host with
-//!   per-thread slots).
-//! - [`guarded`]: targets derived from user input (did:web hosts, handle
-//!   `.well-known`, OAuth client metadata, lexicon authorities, service
-//!   endpoints from DID documents). [`public`] plus a DNS resolver that drops
-//!   non-public addresses (unless dev mode).
+//! Outbound HTTP clients, one per role, each built once and shared so
+//! connections are reused (DESIGN.md "HTTP"): [`PeerClient`] (node to
+//! node), [`public`] (operator-configured upstreams), [`proxy`] and [`h1`]
+//! (the AppView proxy), and [`guarded`] (URLs derived from user input).
 //!
 //! No client follows redirects: forwarded and proxied responses go back to
 //! the caller as they are, and a redirect from a user-controlled host could
-//! point anywhere. Every new outbound connection counts in
-//! `vlpds_http_client_connects_total{role}`, so reuse regressions show up.
-//!
-//! Response bodies streamed from an upstream to a client (forwards, proxied
-//! calls) go through [`stall::Watched`]: one whose client stops taking it
-//! is dropped after [`stall::WRITE_STALL`], so a client that never reads
-//! can't pin upstream flow-control windows or pooled connections.
+//! point anywhere.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,15 +15,11 @@ use std::time::Duration;
 
 const USER_AGENT: &str = concat!("vlpds/", env!("CARGO_PKG_VERSION"));
 
-/// Connections per peer node (`--peer-connections`). reqwest multiplexes
-/// every request to a host over ONE h2 connection; several spread the h2
-/// connection driver's work over threads and keep one stalled connection
-/// from black-holing every forward.
+/// reqwest multiplexes every request to a host over ONE h2 connection;
+/// several spread the connection driver's work over threads and keep one
+/// stalled connection from black-holing every forward.
 pub const DEFAULT_PEER_CONNECTIONS: usize = 4;
 
-/// Every role: TCP_NODELAY, TCP keepalive (dead peers behind NATs and
-/// half-open connections are noticed even without traffic), no redirects,
-/// connection counting.
 fn base(role: &'static str) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -49,15 +29,13 @@ fn base(role: &'static str) -> reqwest::ClientBuilder {
         .connector_layer(CountConnects(role))
 }
 
-/// Outbound to the internet (h2 negotiated by ALPN, else HTTP/1.1).
 /// `max_idle` must cover the steady-state concurrency per host: a busy
 /// HTTP/1.1 upstream beyond it opens and closes a connection per request.
 fn outbound(role: &'static str, max_idle: usize) -> reqwest::ClientBuilder {
     outbound_no_read_timeout(role, max_idle).read_timeout(Duration::from_secs(30))
 }
 
-/// [`outbound`] without the per-read timeout. reqwest arms that timer for
-/// the response head and re-arms it for every body frame, and every tokio
+/// reqwest re-arms the read timeout for every body frame, and every tokio
 /// timer operation takes the runtime's one timer-wheel lock: callers that
 /// bound their requests themselves skip it.
 fn outbound_no_read_timeout(role: &'static str, max_idle: usize) -> reqwest::ClientBuilder {
@@ -67,14 +45,12 @@ fn outbound_no_read_timeout(role: &'static str, max_idle: usize) -> reqwest::Cli
         // below the 90-120 s idle close of common load balancers/CDNs, so we
         // close first instead of racing a reused socket the server dropped
         .pool_idle_timeout(Duration::from_secs(60))
-        // h2 only: a PING after 20 s without frames; no answer in 10 s = dead
         .http2_keep_alive_interval(Duration::from_secs(20))
         .http2_keep_alive_timeout(Duration::from_secs(10))
         .http2_adaptive_window(true)
 }
 
-/// Operator-configured upstreams (AppView proxy, report service, PLC
-/// directory, requestCrawl). Callers set per-request deadlines.
+/// Operator-configured upstreams. Callers set per-request deadlines.
 pub fn public() -> &'static reqwest::Client {
     static C: LazyLock<reqwest::Client> = LazyLock::new(|| {
         // the AppView proxy runs ~100-500 requests in flight to one host
@@ -83,13 +59,10 @@ pub fn public() -> &'static reqwest::Client {
     &C
 }
 
-/// The AppView / report-service proxy client for `https://` upstreams
-/// (plain `http://` ones use [`h1`]): [`public`]'s settings without the read
-/// timeout (the proxy bounds the response head and body idle time itself),
-/// as one client (connection pool; one h2 connection per host) per IO
-/// thread. A single pool is one mutex that every proxied request takes
-/// twice (checkout, return): at ~50k req/s over 6 threads that lock was
-/// ~10% of the proxy's CPU. Each thread sticks to its own client.
+/// The proxy client for `https://` upstreams (plain `http://` uses [`h1`]),
+/// one per IO thread: a single pool is one mutex that every proxied request
+/// takes twice (checkout, return), and that contention showed up in proxy
+/// CPU profiles. The proxy bounds head and body idle time itself.
 pub fn proxy() -> &'static reqwest::Client {
     static C: LazyLock<Vec<reqwest::Client>> = LazyLock::new(|| {
         let n = std::thread::available_parallelism().map_or(8, |n| n.get()).clamp(2, 64);
@@ -105,29 +78,19 @@ pub fn proxy() -> &'static reqwest::Client {
 }
 
 /// Plain-HTTP/1.1 client for the proxy fast path (an operator-configured
-/// `http://` AppView): hyper's connection API under a lock-light pool.
-/// Compared with reqwest + hyper-util's pool, a request normally takes only
-/// its own thread's slot lock (uncontended), parses no URL and runs no
-/// retry/redirect layers.
+/// `http://` AppView): hyper's connection API under a lock-light pool, so a
+/// request normally takes only its own thread's uncontended slot lock and
+/// runs no URL parsing or retry/redirect layers.
 ///
-/// Pool, per upstream host ("host:port"):
-/// - idle connections sit in per-thread slots: a finished response puts its
-///   connection in the slot of the thread that read its body to the end, and
-///   a request takes from its own thread's slot first (most recent first);
-/// - a thread whose slot is empty takes one from another slot before it
-///   connects, so connections never pile up per thread when tasks hop
-///   threads: the count follows the concurrency, not threads x peak;
-/// - at most [`MAX_CONNS`] connections are open per host (idle + busy; a
-///   permit is held by each connection's task until the socket closes).
-///   A request at the cap waits for a connection to come back or close
-///   (`vlpds_http_client_pool_waits_total`), within the caller's deadline.
+/// Idle connections sit in per-thread slots; a thread whose slot is empty
+/// steals from another before connecting, so the connection count follows
+/// concurrency rather than threads x peak when tasks hop threads. At most
+/// [`MAX_CONNS`] are open per host; a request at the cap waits for one.
 ///
-/// A connection is reused once its response body has been read to the end;
-/// one dropped mid-body (e.g. the client went away) is closed, which also
-/// ends the upstream exchange. A request that fails before it was written
-/// on a reused connection (the server closed it while idle) is retried once
-/// on a new one, like hyper-util's pool. Idle connections are closed after
-/// [`H1_IDLE`] (checked when their slot is next used).
+/// A connection is reused only once its response body was read to the end;
+/// one dropped mid-body is closed, which also ends the upstream exchange. A
+/// request that fails unwritten on a reused connection (closed while idle)
+/// is retried once on a new one, like hyper-util's pool.
 ///
 /// Hosts are never dropped: only operator-configured upstreams use this.
 pub mod h1 {
@@ -143,15 +106,11 @@ pub mod h1 {
 
     pub type Response = http::Response<PooledBody>;
 
-    /// Connections open per upstream host (idle and in use). The AppView
-    /// proxy runs ~100-500 requests in flight to one host per node.
     pub const MAX_CONNS: usize = 1024;
-    /// Idle connections older than this are closed (below the 90-120 s idle
-    /// close of common load balancers, like [`super::public`]'s pool).
+    /// Below the 90-120 s idle close of common load balancers.
     pub const H1_IDLE: Duration = Duration::from_secs(60);
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-    /// A waiter at the cap re-checks the pool this often (a backstop: a
-    /// returned connection or a freed permit wakes it first).
+    /// A backstop: a returned connection or a freed permit wakes a waiter first.
     const WAIT_RECHECK: Duration = Duration::from_millis(50);
 
     struct Idle {
@@ -159,23 +118,21 @@ pub mod h1 {
         since: Instant,
     }
 
-    /// One thread's idle connections (most recent last). Padded to its own
-    /// cache lines: threads update their own slots on every request.
+    /// Most recent last. Padded to its own cache lines: threads update their
+    /// own slots on every request.
     #[repr(align(128))]
     struct Slot {
         idle: parking_lot::Mutex<Vec<Idle>>,
-        /// `idle.len()`, readable without the lock (stealers skip empty slots)
+        /// `idle.len()`, readable without the lock so stealers skip empty slots
         len: AtomicUsize,
     }
 
-    /// The pool of one upstream host.
     pub struct Host {
         authority: Box<str>,
         slots: Box<[Slot]>,
         /// one permit per open connection
         open: Arc<Semaphore>,
         max: usize,
-        /// requests waiting at the cap
         waiting: AtomicUsize,
         returned: Notify,
     }
@@ -184,14 +141,13 @@ pub mod h1 {
     static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 
     thread_local! {
-        /// this thread's slot number (modulo each host's slot count)
         static SLOT: usize = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
         /// the last host this thread used (nearly always the one AppView)
         static LAST: Cell<Option<&'static Host>> = const { Cell::new(None) };
     }
 
-    /// The pool for `authority`, created with `max` connections if new.
-    fn host_with(authority: &str, max: usize) -> &'static Host {
+    /// `max` applies only if the pool is new.
+    pub(crate) fn host_with(authority: &str, max: usize) -> &'static Host {
         if let Some(h) = LAST.get().filter(|h| *h.authority == *authority) {
             return h;
         }
@@ -217,24 +173,16 @@ pub mod h1 {
         h
     }
 
-    /// The pool for `authority`.
     pub fn host(authority: &str) -> &'static Host {
         host_with(authority, MAX_CONNS)
     }
 
-    /// Creates `authority`'s pool with a cap of `max` connections (tests).
-    /// No effect if the pool exists.
-    pub fn host_with_max(authority: &str, max: usize) -> &'static Host {
-        host_with(authority, max)
-    }
-
     impl Host {
-        /// Connections open (idle and in use).
+        /// Idle and in use.
         pub fn open_connections(&self) -> usize {
             self.max - self.open.available_permits()
         }
 
-        /// Idle connections across all slots.
         pub fn idle_connections(&self) -> usize {
             self.slots.iter().map(|s| s.len.load(Ordering::Relaxed)).sum()
         }
@@ -243,8 +191,6 @@ pub mod h1 {
             SLOT.with(|s| *s) % self.slots.len()
         }
 
-        /// The most recent live idle connection of slot `i`; drops expired
-        /// and closed ones on the way.
         fn take_from(&self, i: usize) -> Option<SendRequest<Body>> {
             let slot = &self.slots[i];
             let mut idle = slot.idle.lock();
@@ -265,7 +211,6 @@ pub mod h1 {
             got
         }
 
-        /// An idle connection: this thread's slot first, then the others'.
         fn take(&self) -> Option<SendRequest<Body>> {
             let mine = self.my_slot();
             if self.slots[mine].len.load(Ordering::SeqCst) > 0 {
@@ -280,7 +225,6 @@ pub mod h1 {
                 .find_map(|i| self.take_from(i))
         }
 
-        /// Back to this thread's slot (a closed one is dropped).
         fn put(&self, conn: SendRequest<Body>) {
             if conn.is_closed() {
                 return;
@@ -298,9 +242,7 @@ pub mod h1 {
             }
         }
 
-        /// A connection to send on and whether it was reused: an idle one,
-        /// else a new one if under the cap, else the first to come back or
-        /// the first permit a closed one frees.
+        /// Returns whether the connection was reused.
         async fn checkout(&'static self, role: &'static str) -> Result<(SendRequest<Body>, bool), BoxError> {
             if let Some(c) = self.take() {
                 return Ok((c, true));
@@ -335,7 +277,6 @@ pub mod h1 {
             }
         }
 
-        /// A new connection, within the cap (waits for a permit).
         async fn fresh(&'static self, role: &'static str) -> Result<SendRequest<Body>, BoxError> {
             let p = match self.open.clone().try_acquire_owned() {
                 Ok(p) => p,
@@ -345,8 +286,7 @@ pub mod h1 {
         }
     }
 
-    /// Opens a connection to `host`; its task holds `permit` until the
-    /// connection closes.
+    /// The connection's task holds `permit` until the connection closes.
     async fn connect(
         role: &'static str,
         host: &Host,
@@ -380,9 +320,7 @@ pub mod h1 {
 
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-    /// Sends `req` (origin-form URI; Host is set here) to `authority`
-    /// ("host:port") and returns the response, whose body hands the
-    /// connection back to the pool once read to the end.
+    /// `req` has an origin-form URI; Host is set here from `authority`.
     pub async fn send(
         role: &'static str,
         authority: &str,
@@ -426,7 +364,6 @@ pub mod h1 {
         Ok(http::Response::from_parts(parts, body))
     }
 
-    /// A request body that flags when it has been sent to the end.
     struct TrackEnd {
         body: Body,
         done: Arc<std::sync::atomic::AtomicBool>,
@@ -456,21 +393,17 @@ pub mod h1 {
         }
     }
 
-    /// A response body that returns its connection to the pool at its end.
     pub struct PooledBody {
         body: hyper::body::Incoming,
         conn: Option<SendRequest<Body>>,
         host: &'static Host,
-        /// set once the request body was sent to the end (None: no body)
+        /// None: no request body
         req_done: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl PooledBody {
-        /// Back to the pool, if the exchange is complete: the response read
-        /// to the end and the request body sent. One whose upload is still
-        /// going (the upstream answered early) is not pooled: the next
-        /// request on it would wait for that upload. Dropping the handle
-        /// lets the connection finish the exchange and close.
+        /// One whose upload is still going (the upstream answered early) is
+        /// not pooled: the next request on it would wait for that upload.
         fn release(&mut self) {
             if hyper::body::Body::is_end_stream(&self.body) {
                 if let Some(c) = self.conn.take() {
@@ -484,8 +417,7 @@ pub mod h1 {
 
     impl Drop for PooledBody {
         fn drop(&mut self) {
-            // e.g. a body with nothing in it, never polled; one dropped
-            // mid-way closes its connection instead
+            // an empty body may never be polled
             self.release();
         }
     }
@@ -516,29 +448,20 @@ pub mod h1 {
     }
 }
 
-/// Write-progress deadlines for response bodies streamed from an upstream
-/// to a client (forwarded peer responses, proxied AppView responses).
+/// Write-progress deadlines for response bodies streamed from an upstream to
+/// a client.
 ///
-/// The server polls a response body only when it can send more: an h2
-/// stream whose client keeps its window at zero, or an HTTP/1.1 socket
-/// whose client doesn't read, is never polled again. The upstream side then
-/// stays busy for as long as the client likes: a peer h2 stream holds its
-/// unread bytes out of the connection's flow-control window (enough of them
-/// stall every forward on that connection), and a pooled AppView
-/// connection is never returned. Each upstream call has its own deadlines
-/// (time to first byte, upstream idle), but none of them sees a client that
-/// stopped reading.
+/// The server polls a response body only when it can send more, so a client
+/// that stops reading leaves the upstream busy as long as it likes: a peer
+/// h2 stream holds its unread bytes out of the connection's flow-control
+/// window (enough of them stall every forward on that connection), and a
+/// pooled AppView connection is never returned. The upstream calls' own
+/// deadlines don't see this.
 ///
-/// [`Watched`] notes when the client got the response head, and then each
-/// chunk that wasn't the last; a sweeper thread drops the upstream body of
-/// every watched body whose next poll hasn't come [`WRITE_STALL`] later (h2
-/// resets the upstream stream and frees its window; an h1 connection
-/// closes). A later poll gets an error, which resets the client's stream /
-/// closes its connection. An upstream that keeps the body waiting is not a
-/// stall (the callers' own idle deadlines cover that). Cost per body: one
-/// allocation and an uncontended shard lock at creation, an uncontended
-/// lock per chunk; bodies already buffered need none
-/// ([`Watched::unwatched`]).
+/// A sweeper thread drops the upstream body of every [`Watched`] body not
+/// polled within [`WRITE_STALL`] of handing out a chunk (or the head); a
+/// later poll errors, which resets the client's stream. An upstream that
+/// keeps the body waiting is not a stall.
 pub mod stall {
     use super::*;
     use bytes::Bytes;
@@ -546,9 +469,7 @@ pub mod stall {
     use std::sync::Weak;
     use std::time::Instant;
 
-    /// How long a client may leave a watched body unpolled after taking a
-    /// chunk. Generous: a client reading at all is polled far more often (a
-    /// socket buffer or window's worth at its pace).
+    /// Generous: a client reading at all is polled far more often.
     pub const WRITE_STALL: Duration = Duration::from_secs(30);
     const SWEEP: Duration = Duration::from_secs(1);
     const SHARDS: usize = 16;
@@ -557,17 +478,16 @@ pub mod stall {
     static EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
     static STALLED: AtomicU64 = AtomicU64::new(0);
 
-    /// Changes [`WRITE_STALL`] for this process (tests).
+    /// Tests.
     pub fn set_limit(d: Duration) {
         LIMIT_MS.store(d.as_millis().max(1) as u64, Ordering::Relaxed);
     }
 
-    /// Bodies dropped for a stalled client so far.
     pub fn stalled_total() -> u64 {
         STALLED.load(Ordering::Relaxed)
     }
 
-    /// ms since [`EPOCH`], never 0.
+    /// Never 0.
     fn now_ms() -> u64 {
         EPOCH.elapsed().as_millis() as u64 + 1
     }
@@ -605,8 +525,6 @@ pub mod stall {
         REG.shards[i].lock().push(w);
     }
 
-    /// One pass: forgets finished bodies, drops stalled ones' upstreams.
-    /// Returns how many were dropped.
     fn sweep() -> usize {
         let (now, limit) = (now_ms(), LIMIT_MS.load(Ordering::Relaxed));
         let mut stalled = Vec::new();
@@ -639,11 +557,10 @@ pub mod stall {
     }
 
     struct Shared<B> {
-        /// None once dropped for a stall
+        /// None once dropped for a stall.
         body: parking_lot::Mutex<Option<B>>,
-        /// when a chunk (not the last) was handed out and no poll has come
-        /// since ([`now_ms`]); 0 = not waiting on the client. Written under
-        /// `body`'s lock.
+        /// When a chunk (not the last) was handed out with no poll since; 0 =
+        /// not waiting on the client. Written under `body`'s lock.
         waiting: AtomicU64,
     }
 
@@ -667,13 +584,11 @@ pub mod stall {
     }
 
     enum State<B> {
-        /// not watched
         Own(B),
         Shared(Arc<Shared<B>>),
     }
 
-    /// A response body with a write-progress deadline (module docs), and
-    /// `H` held until the body is dropped (e.g. an admission slot).
+    /// `H` is held until the body is dropped (e.g. an admission slot).
     pub struct Watched<B, H = ()> {
         state: State<B>,
         _hold: H,
@@ -686,9 +601,8 @@ pub mod stall {
     }
 
     impl<B: hyper::body::Body + Send + 'static, H> Watched<B, H> {
-        /// Watched from now on: the client has the response head and must
-        /// start taking the body (a client whose h2 window is zero from the
-        /// start never polls it at all).
+        /// Watched from now on: a client whose h2 window is zero from the
+        /// start never polls the body at all.
         pub fn with_hold(body: B, hold: H) -> Self {
             let waiting = if body.is_end_stream() { 0 } else { now_ms() };
             let s = Arc::new(Shared { body: parking_lot::Mutex::new(Some(body)), waiting: AtomicU64::new(waiting) });
@@ -696,7 +610,7 @@ pub mod stall {
             Watched { state: State::Shared(s), _hold: hold }
         }
 
-        /// Not watched (a body that holds no upstream), only holding `hold`.
+        /// For a body that holds no upstream.
         pub fn unwatched(body: B, hold: H) -> Self {
             Watched { state: State::Own(body), _hold: hold }
         }
@@ -751,16 +665,15 @@ pub mod stall {
         }
     }
 
-    /// Runs one sweep now (tests).
+    /// Tests.
     pub fn sweep_now() -> usize {
         sweep()
     }
 }
 
-/// Client for user-controlled URLs: [`public`]'s settings, plus (outside
-/// dev mode) a resolver that refuses non-public addresses. Pair it with
-/// [`crate::did_resolver::check_outbound_url`] for the scheme and IP literals
-/// (the resolver only sees DNS names). Callers set per-request deadlines.
+/// For user-controlled URLs: outside dev mode, a resolver refuses non-public
+/// addresses. Pair it with [`crate::did_resolver::check_outbound_url`] for
+/// the scheme and IP literals (the resolver only sees DNS names).
 pub fn guarded(dev_mode: bool) -> &'static reqwest::Client {
     static STRICT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         outbound("guarded", 32)
@@ -777,35 +690,25 @@ pub fn guarded(dev_mode: bool) -> &'static reqwest::Client {
     }
 }
 
-/// Node-to-node client: h2 over peer mTLS (TLS 1.3, ALPN h2, https only;
-/// `crate::peer_tls`), `n` independent clients per peer origin (one
-/// connection to that peer each), picked round-robin per request:
-/// `app.http.get(url)` spreads calls over the connections. Each origin's TLS
-/// config checks that the server's certificate names the node the cluster
-/// expects at that origin ([`PeerClient::set_registry`]).
+/// Node-to-node client: h2 over peer mTLS, `n` clients (one connection
+/// each) per peer origin, picked round-robin. Each origin's TLS config checks
+/// that the server's certificate names the node the cluster expects there.
 ///
-/// Bulk downloads ([`is_bulk`]: repo exports, blobs, block fetches; large,
-/// unauthenticated, streamed to clients at their pace) go over `n` other
-/// connections (picked by the URL's path): clients that read them slowly or
-/// not at all fill only those connections' flow-control windows, never the
-/// ones every other forward shares (and [`stall::Watched`] drops a body
-/// whose client stopped reading).
-///
-/// A lone node (no peer TLS, [`PeerClient::lone`]) has no peers to call:
-/// its requests fail without reaching anyone.
+/// Bulk downloads ([`is_bulk`]) go over `n` other connections: clients that
+/// read them slowly fill only those connections' flow-control windows, never
+/// the ones every other forward shares.
 #[derive(Clone)]
 pub struct PeerClient(Arc<PeerInner>);
 
 struct PeerInner {
     n: usize,
-    /// None: a lone node
+    /// None: a lone node, whose requests all fail.
     tls: Option<Arc<crate::peer_tls::PeerTls>>,
     registry: Arc<std::sync::OnceLock<Registry>>,
-    /// per origin; a handful of peers, so a scan
+    /// A handful of peers, so a scan.
     origins: parking_lot::RwLock<Vec<(Arc<str>, Arc<Pool>)>>,
 }
 
-/// `n` clients for regular calls and `n` for bulk downloads.
 struct Pool {
     clients: Vec<reqwest::Client>,
     bulk: Vec<reqwest::Client>,
@@ -828,14 +731,11 @@ impl Pool {
     }
 }
 
-/// Node ids the cluster expects at an origin (`https://host:port`): the
-/// nodes whose lease or routing-table entry names it.
+/// Node ids the cluster expects at an origin (`https://host:port`).
 pub type Registry = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 
-/// Origins kept before ones the registry no longer names are dropped.
 const MAX_ORIGINS: usize = 256;
 
-/// Peer calls whose responses are bulk downloads (see [`PeerClient`]).
 pub fn is_bulk(path: &str) -> bool {
     matches!(
         path.strip_prefix("/xrpc/"),
@@ -843,7 +743,6 @@ pub fn is_bulk(path: &str) -> bool {
     )
 }
 
-/// `url`'s origin (`scheme://authority`) and the rest (path and query).
 pub fn split_origin(url: &str) -> (&str, &str) {
     let start = url.find("://").map_or(0, |i| i + 3);
     match url[start..].find(['/', '?']) {
@@ -852,8 +751,7 @@ pub fn split_origin(url: &str) -> (&str, &str) {
     }
 }
 
-/// A lone node's peer client: https only, trusting no CA, so every request
-/// fails (there is no peer to reach).
+/// Trusts no CA, so every request fails.
 fn refusing() -> &'static reqwest::Client {
     static C: LazyLock<reqwest::Client> = LazyLock::new(|| {
         let tls = rustls::ClientConfig::builder_with_provider(crate::peer_tls::provider())
@@ -867,27 +765,22 @@ fn refusing() -> &'static reqwest::Client {
 }
 
 impl PeerClient {
-    /// Peers over mTLS with `tls`'s certificate and CA. Until
-    /// [`PeerClient::set_registry`] (a client that isn't a node: tests,
-    /// tools) any node of the cluster CA is accepted at any origin.
+    /// Until [`PeerClient::set_registry`], any node of the cluster CA is
+    /// accepted at any origin.
     pub fn new(n: usize, tls: Arc<crate::peer_tls::PeerTls>) -> PeerClient {
         PeerClient(Arc::new(PeerInner { n, tls: Some(tls), registry: Default::default(), origins: Default::default() }))
     }
 
-    /// A lone node's: no peer TLS, no peers (requests fail).
     pub fn lone() -> PeerClient {
         PeerClient(Arc::new(PeerInner { n: 1, tls: None, registry: Default::default(), origins: Default::default() }))
     }
 
-    /// Where the client looks up which node(s) an origin should present
-    /// (the cluster's leases and routing table); set once, right after the
-    /// cluster is joined. An origin it names no node for is refused.
+    /// Set once, right after the cluster is joined. An origin it names no
+    /// node for is refused.
     pub fn set_registry(&self, r: Registry) {
         let _ = self.0.registry.set(r);
     }
 
-    /// The client for a call to `url`: the URL origin's own clients, bulk
-    /// downloads on their own connections.
     pub fn client_for(&self, url: &str) -> reqwest::Client {
         let Some(tls) = &self.0.tls else { return refusing().clone() };
         let (origin, rest) = split_origin(url);
@@ -905,7 +798,7 @@ impl PeerClient {
             return p.clone();
         }
         if origins.len() >= MAX_ORIGINS {
-            // addresses churned (new IPs per restart): keep the live ones
+            // addresses churn (new IPs per restart): keep the live ones
             if let Some(r) = inner.registry.get() {
                 origins.retain(|(o, _)| !r(o).is_empty());
             }
@@ -917,8 +810,6 @@ impl PeerClient {
         let pool = Pool::build(inner.n, || peer_builder().https_only(true).use_preconfigured_tls(config.clone()))
             .map(Arc::new)
             .unwrap_or_else(|e| {
-                // (building a client only fails on a bad TLS backend: never
-                // with a preconfigured rustls config)
                 tracing::error!(origin, "peer TLS client: {e}");
                 Arc::new(Pool { clients: vec![refusing().clone()], bulk: vec![refusing().clone()], next: AtomicUsize::new(0) })
             });
@@ -941,9 +832,8 @@ impl PeerClient {
         self.client_for(u).request(method, u)
     }
 
-    /// The TLS connector for a log stream (`wss://`) from `node`, checking
-    /// the server is that node; None on a lone node. HTTP/1.1 by ALPN: the
-    /// stream is an upgrade.
+    /// For a log stream (`wss://`) from `node`; HTTP/1.1 by ALPN since the
+    /// stream is an upgrade. None on a lone node.
     pub fn ws_connector(&self, node: &str) -> Option<tokio_tungstenite::Connector> {
         let tls = self.0.tls.as_ref()?;
         let config = tls.client_config(crate::peer_tls::Expect::Node(node.to_string()), &[b"http/1.1"]);
@@ -951,21 +841,16 @@ impl PeerClient {
     }
 }
 
-/// Peer h2 receive windows. A response the entry node's client doesn't
-/// read keeps its unread bytes, at most one stream window, out of the
-/// connection window until [`stall::Watched`] drops it. 1 MiB per stream /
-/// 64 MiB per connection takes 64 such responses per connection (x
-/// connections per peer) to stall it, while one stream still moves ~5 GB/s
-/// at LAN RTTs. (Was 4 MiB / 64 MiB: 16 unread exports stalled a
-/// connection.)
+/// Peer h2 receive windows. A response the entry node's client doesn't read
+/// keeps up to one stream window out of the connection window until
+/// [`stall::Watched`] drops it: 64 such responses are needed to stall a
+/// connection, while one stream still moves ~5 GB/s at LAN RTTs.
 pub const PEER_STREAM_WINDOW: u32 = 1 << 20;
 pub const PEER_CONNECTION_WINDOW: u32 = 64 << 20;
 
-/// Peers speak h2 over TLS (the peer listener is HTTP/1 + HTTP/2 auto,
-/// ALPN h2 / http/1.1). With HTTP/1.1, forwarding ~10k writes/s at ~100 ms each needed ~1k concurrent
-/// connections per peer: beyond the 256 pooled ones every request opened and
-/// closed a TCP connection, and at 50k/s across 3 nodes the forwards blew
-/// the TTFB deadline and the cluster collapsed to ~2k/s (bench 2026-10-02).
+/// h2, not HTTP/1.1: forwarding at load needs ~1k concurrent requests per
+/// peer, and HTTP/1.1 beyond the pooled connections opens and closes a TCP
+/// connection per request.
 fn peer_builder() -> reqwest::ClientBuilder {
     base("peer")
         .http2_prior_knowledge()
@@ -977,14 +862,12 @@ fn peer_builder() -> reqwest::ClientBuilder {
         .http2_keep_alive_interval(Duration::from_secs(10))
         .http2_keep_alive_timeout(Duration::from_secs(5))
         .http2_keep_alive_while_idle(true)
-        // fail fast when a peer is unreachable (forwards return 503)
         .connect_timeout(Duration::from_secs(1))
         .timeout(Duration::from_secs(15))
 }
 
-/// DNS resolver that drops non-public addresses, so a hostname can't be used
-/// to reach internal services (SSRF).
-pub struct PublicOnlyResolver;
+/// SSRF guard: a hostname can't be used to reach internal services.
+struct PublicOnlyResolver;
 
 impl reqwest::dns::Resolve for PublicOnlyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
@@ -996,8 +879,7 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
     }
 }
 
-/// `host`'s public unicast addresses; an error when it has none.
-pub async fn public_addrs(host: &str) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+async fn public_addrs(host: &str) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 0))
         .await?
         .filter(|a| crate::did_resolver::is_public_ip(a.ip()))
@@ -1008,7 +890,7 @@ pub async fn public_addrs(host: &str) -> Result<Vec<SocketAddr>, Box<dyn std::er
     Ok(addrs)
 }
 
-/// Connector layer counting new connections per client role.
+/// `vlpds_http_client_connects_total{role}`: reuse regressions show up.
 #[derive(Clone)]
 struct CountConnects(&'static str);
 
@@ -1063,8 +945,6 @@ pub(crate) mod tests {
         assert_eq!(split_origin("https://10.0.0.1:2584/xrpc/a?b=c"), ("https://10.0.0.1:2584", "/xrpc/a?b=c"));
         assert_eq!(split_origin("http://h:1?x"), ("http://h:1", "?x"));
         assert_eq!(split_origin("http://h:1"), ("http://h:1", ""));
-        // (bulk routing by path with a query string: forward::tests::
-        // unread_forwarded_bodies_dont_stall_other_forwards)
     }
 
     /// A TLS peer listener of `ca` serving `router`; returns its base URL.
@@ -1190,7 +1070,7 @@ pub(crate) mod tests {
     async fn h1_pool_is_capped() {
         const ROLE: &str = "test-h1-cap";
         let authority = h1_upstream(Duration::from_millis(20)).await;
-        let host = h1::host_with_max(&authority, 4);
+        let host = h1::host_with(&authority, 4);
         let tasks: Vec<_> = (0..32)
             .map(|_| {
                 let a = authority.clone();
