@@ -2562,7 +2562,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blob_refs_load_on_first_need() {
         let store = crate::store::Store::memory(None);
-        let db = Arc::new(crate::partition::open_db(&store, 0, None).await.unwrap());
+        let db = Arc::new(crate::partition::open_db(&store, crate::slots::ShardId(0), None).await.unwrap());
         let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
         let log = NodeLog::start(
             store.clone(),
@@ -2571,7 +2571,7 @@ mod tests {
         );
         // the sequencer is this test: it applies entries when it chooses
         let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(16);
-        let part = Arc::new(Partition { id: 0, epoch: 1, db: db.clone(), apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() });
+        let part = Arc::new(Partition { id: crate::slots::ShardId(0), epoch: 1, db: db.clone(), apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() });
         let apply = |e: LogEntry| {
             let db = db.clone();
             async move {

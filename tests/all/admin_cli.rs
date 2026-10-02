@@ -354,7 +354,7 @@ async fn check_and_rebuild_repo() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn per_node_commands_cover_the_cluster() {
-    const SHARDS: u16 = 8;
+    const SHARDS: u32 = 8;
     let store = Arc::new(object_store::memory::InMemory::new());
     let node = |id: &str| {
         let (id, store) = (id.to_string(), store.clone());

@@ -68,7 +68,7 @@ pub fn keeps_bytes(path: &str) -> bool {
 }
 
 /// (partition id, ownership epoch) an entry was made in.
-pub type Part = (u16, u64);
+pub type Part = (crate::slots::ShardId, u64);
 
 struct Entry {
     part: Part,
@@ -313,7 +313,7 @@ mod tests {
     fn commit(did: &str, since: u64, rev: u64, ops: Vec<(&str, bool)>) -> Commit {
         Commit {
             did: did.into(),
-            part: (1, 1),
+            part: (crate::slots::ShardId(1), 1),
             since,
             rev,
             prev_nonempty: true,
@@ -336,17 +336,17 @@ mod tests {
     fn commits_extend_and_answer() {
         let did = "did:plc:rwtest1";
         invalidate(did);
-        assert!(matches!(lookup(did, (1, 1), 5), Since::Unknown));
+        assert!(matches!(lookup(did, (crate::slots::ShardId(1), 1), 5), Since::Unknown));
         commit(did, 10, 20, vec![("app.bsky.feed.post/a", true)]).apply();
         commit(did, 20, 30, vec![("app.bsky.feed.like/b", true), ("app.bsky.feed.post/a", false)]).apply();
-        assert!(matches!(lookup(did, (1, 1), 30), Since::Nothing));
-        assert_eq!(paths(lookup(did, (1, 1), 10)), vec!["app.bsky.feed.like/b"]);
-        assert!(matches!(lookup(did, (1, 1), 9), Since::Unknown), "below base");
-        assert!(matches!(lookup(did, (2, 1), 30), Since::Unknown), "other epoch");
+        assert!(matches!(lookup(did, (crate::slots::ShardId(1), 1), 30), Since::Nothing));
+        assert_eq!(paths(lookup(did, (crate::slots::ShardId(1), 1), 10)), vec!["app.bsky.feed.like/b"]);
+        assert!(matches!(lookup(did, (crate::slots::ShardId(1), 1), 9), Since::Unknown), "below base");
+        assert!(matches!(lookup(did, (crate::slots::ShardId(2), 1), 30), Since::Unknown), "other epoch");
         // the wrong-epoch lookup dropped it; a commit that doesn't follow restarts it
         commit(did, 40, 50, vec![("app.bsky.feed.post/c", true)]).apply();
-        assert_eq!(paths(lookup(did, (1, 1), 40)), vec!["app.bsky.feed.post/c"]);
-        assert!(matches!(lookup(did, (1, 1), 30), Since::Unknown));
+        assert_eq!(paths(lookup(did, (crate::slots::ShardId(1), 1), 40)), vec!["app.bsky.feed.post/c"]);
+        assert!(matches!(lookup(did, (crate::slots::ShardId(1), 1), 30), Since::Unknown));
     }
 
     #[test]
@@ -357,20 +357,20 @@ mod tests {
         c.prev_nonempty = false;
         c.apply();
         // no record at or below the AppView's rev: nothing (reference sanity check)
-        assert!(matches!(lookup(did, (1, 1), 1), Since::Nothing));
+        assert!(matches!(lookup(did, (crate::slots::ShardId(1), 1), 1), Since::Nothing));
         for i in 2..60u64 {
             commit(did, i, i + 1, vec![(&format!("app.bsky.feed.post/{i}"), true)]).apply();
         }
-        assert!(matches!(lookup(did, (1, 1), 2), Since::Unknown), "trimmed below");
-        let r = paths(lookup(did, (1, 1), 40));
+        assert!(matches!(lookup(did, (crate::slots::ShardId(1), 1), 2), Since::Unknown), "trimmed below");
+        let r = paths(lookup(did, (crate::slots::ShardId(1), 1), 40));
         assert_eq!(r.len(), LIMIT);
         assert_eq!(r[0], "app.bsky.feed.post/40");
         // a filled entry raced by a commit is not cached
         invalidate(did);
         let g = generation(did);
         commit(did, 70, 71, vec![]).apply();
-        fill(did, (1, 1), g, Read { head: 60, base: 60, old_exists: true, recs: vec![] }, 60);
-        assert!(matches!(lookup(did, (1, 1), 70), Since::Nothing));
-        assert!(matches!(lookup(did, (1, 1), 69), Since::Unknown));
+        fill(did, (crate::slots::ShardId(1), 1), g, Read { head: 60, base: 60, old_exists: true, recs: vec![] }, 60);
+        assert!(matches!(lookup(did, (crate::slots::ShardId(1), 1), 70), Since::Nothing));
+        assert!(matches!(lookup(did, (crate::slots::ShardId(1), 1), 69), Since::Unknown));
     }
 }
