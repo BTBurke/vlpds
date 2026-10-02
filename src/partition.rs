@@ -990,9 +990,14 @@ mod tests {
         }
         // the manifest update that replaced the L0s carries the compactor's
         // checkpoint of the old manifest, with our lifetime (what keeps the
-        // replaced SSTs for in-flight reads, and nothing longer)
-        let m = db.manifest();
-        let cp = m.checkpoints().iter().filter_map(|c| Some(c.expire_time? - c.create_time)).max().expect("compactor checkpoint");
+        // replaced SSTs for in-flight reads, and nothing longer). Looked up in
+        // the stored manifest history, not the writer's latest view: test
+        // checkpoints live 1 s and the GC (detach ticks every 500 ms) drops
+        // expired ones, so on a loaded machine it can be gone before the
+        // writer's next manifest poll shows the compaction.
+        let admin = slatedb::admin::AdminBuilder::new(db_path(&store, ShardId(0)), store.raw.clone()).build();
+        let manifests = admin.list_manifests(..).await.unwrap();
+        let cp = manifests.iter().flat_map(|m| m.checkpoints().iter().filter_map(|c| Some(c.expire_time? - c.create_time))).max().expect("compactor checkpoint");
         assert_eq!(cp.num_seconds() as u64, checkpoint_lifetime().as_secs());
         db.close().await.unwrap();
         let db = open_db(&store, ShardId(0), None).await.unwrap();

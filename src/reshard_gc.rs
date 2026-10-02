@@ -283,6 +283,16 @@ impl ReshardGc {
             // the spec from the stored manifest: the compactor validates
             // against it, and the writer's view lags its results
             let admin = self.admin(id);
+            // never next to an active compaction: SlateDB promotes a
+            // submitted spec without checking it against claimed jobs, so
+            // ours (into the bottom run) could share a destination with a
+            // running one, and the worker's executor panics on two jobs for
+            // one destination (fixed in the fork on
+            // vlpds-0.17-submit-dest-guard; this narrows the race to the
+            // gap between this read and the submit until that lands)
+            if admin.read_compactions(None).await?.is_some_and(|cs| cs.recent_compactions().any(|c| c.active())) {
+                continue;
+            }
             let Some(latest) = admin.read_manifest(None).await? else { continue };
             let Some(spec) = rewrite_spec(&latest, kind == Kind::Full) else { continue };
             match admin.submit_compaction(spec).await {
