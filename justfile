@@ -85,6 +85,10 @@ obs-up:
 obs-down:
     docker compose -f bench/obs/docker-compose.yml down
 
+# Regenerate the vlpds Grafana dashboard: the bench copy and deploy/ansible's (--check: exit 1 if either is stale)
+dashboards *args:
+    python3 bench/obs/grafana/gen_dashboard.py {{args}}
+
 # CPU profile of a running vlpds (built with --features profiling): top functions by self and cumulative time
 profile host="127.0.0.1:2583" seconds="10" *args:
     bench/obs/profile.sh {{args}} {{host}} {{seconds}}

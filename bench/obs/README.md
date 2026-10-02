@@ -93,31 +93,64 @@ Notes:
 
 ## The dashboard
 
-Most rows are open by default. The proxy, SlateDB, MinIO and profile rows are
-collapsed, which keeps a 1 s refresh cheap. Choose 1 s in the refresh picker; the
-default is 5 s. `$instance` filters every query, and `$node` filters the
-flamegraph. Each step bench.py runs shows up as an orange region annotation
-(tag `vlpds-bench`).
+One dashboard (uid `vlpds`) serves the bench stack and the lab Grafana
+(prod and benchbox). The **Health** row at the top is always open and answers
+"is it healthy?" at a glance; every other row is collapsed (open the one you
+need, which also keeps a 1 s bench refresh cheap; pick 1 s in the refresh
+picker, the default is 10 s).
+
+- **Variables**: `cluster` (Alloy's remote_write adds it; the bench Prometheus
+  has none, which All still matches) and `node` (shows node ids; its values
+  are `instance` labels, so it works for the bench's `127.0.0.1:<port>` and
+  prod's node-id instances). Every query is scoped by both, except the alert
+  timeline (cluster only) and the Shards stat (whole cluster).
+- **Legends** name nodes by node id, joined from `vlpds_build_info`.
+- **Colours** are fixed for status classes (2xx green, 3xx blue, 4xx yellow,
+  429 orange, 5xx red) and bare quantiles (p50 green, p90 yellow, p99 orange,
+  p99.9 red). Dashed lines are the `ops/alerts.yml` thresholds.
+- **Descriptions** (the (i) on each panel) say what bad looks like and link
+  the alert's section in `ops/RUNBOOK.md`; the Runbook and Alert rules links
+  sit top right.
+- **Annotations**: restarts (purple, on), Vlpds paging alerts (red regions, off
+  by default) and each bench.py step (orange, tag `vlpds-bench`).
+- Rare-event panels hide all-zero series and say so ("none (good)") rather
+  than "No data". A labelled counter that is first created by its first event
+  (e.g. `vlpds_peer_takeovers_total{reason}`) is born at 1, so `rate()` never
+  sees that first event.
 
 | Row | What to look at |
 |---|---|
-| Overview | XRPC and write req/s, commits/s, commit p99, CPU cores, RSS; table of nodes with their git rev |
-| Writes | write req/s by method; write latency p50/p90/p99/p99.9; commit durable latency; commits/ops per s; coalescing (requests/commit, ops/commit, events/segment, msgs/worker batch); commit build CPU; rejected writes; commit CAR size |
-| Commit pipeline breakdown | `vlpds_commit_stage_seconds{stage}` stacked means and p50/p99 for `seal_wait` (oldest entry's enqueue to PUT start), `put`, `apply_lock`, `apply`, `ack`; sequencer queue, PUTs in flight, worker queues, watermark lag |
-| Log / segments | segments/s, bytes/s, segment size, events/segment, PUT latency quantiles, PUT attempts by result (`already_exists` = conditional-PUT conflict) and hedges, apply latency |
-| Firehose | events emitted and frames sent per s; emit delay (seq assigned to emitted); subscribers; merger queue, firehose ring and live ring bytes; spills, lagged peer streams, disconnects; merge batch size |
-| Repo workers | lookups by hit/miss/loading and hit ratio; cold loads by result (incl. `stale`), evictions, loads in flight; load latency; cached repos |
-| HTTP server | req/s by method (top 12) and status; p99 by method; in flight / awaiting head by HTTP version; connections (inbound open/accepted, outbound by role); catch-all for `vlpds_http_*` metrics added later |
-| Cluster | owned shards per node, lease events, forwards by the owner's status class, forward latency, control-plane object-store ops |
-| AppView proxy | proxied req/s by status and latency, fast-path cache results |
-| SlateDB | block cache hit rate by entry kind, DB requests, memtable bytes and L0 SSTs, flushes/backpressure/stalls, flush and compaction bytes, SlateDB's object-store requests and p99. These are summed over the node's shard DBs. |
-| MinIO | S3 req/s and TTFB p99 by API, traffic, errors/in flight, bucket usage |
-| Process / runtime | CPU cores by user/system, RSS vs jemalloc, tokio worker utilization (busy / workers), tasks, injection queue, OS threads |
+| Health (open) | Stats coloured at the alert thresholds: req/s, 5xx share (proxied excluded, as VlpdsHttp5xxHigh), 429 share, read / write / commit p99, firehose lag p99 and subscribers; nodes up/down, shards owned/unowned, worst lease renew/TTL, store errors/s and permit waits/s, restarts (all / worst node), fail-stops in 30 min, Vlpds alerts firing by severity. Then: alert timeline, req/s by status class, 5xx and 429 ratio, p99 read/write/commit, owned shards by node vs layout, lease renew/TTL and firehose lag by node, store failures, CPU and memory/limit by node, and a nodes table (id, instance, rev, up, uptime, owned shards, last exit) |
+| Writes and commit pipeline | write req/s by method; write and commit latency quantiles; commits and ops/s; coalescing; rejected/shed/abandoned/resent writes; `vlpds_commit_stage_seconds` stacked means and p99 by stage; sequencer queue, PUTs in flight, busiest worker queue; watermark lag by node; commit build CPU; commit CAR size |
+| Log, segments, retention | segments/s by node; raw vs stored bytes/s; segment size and events; PUT latency; PUT attempts by result (`already_exists` = conditional-PUT conflict), hedges, stall seals; apply and checkpoint latency; retention deletes, passes, dead logs and replay hold |
+| Firehose and sync exports | events/frames/backfill events per s; emit delay; subscribers by node and bytes sent; disconnects and refusals by reason; cursor backfills running/waiting and retries; backfill cache hit ratio; merger queue vs budget and rings; spills and lagged peer streams; getRepo exports streaming/waiting and how they ended |
+| Repo workers and caches | lookups by result; hit ratio by node; cold loads, evictions; load latency; repo cache share of its byte budget; lazy MST reads/fetches/fallbacks; in-memory cache fill and bytes; proxy fast-path cache |
+| HTTP and proxy | req/s and p99 by method (top 12); 5xx by method; in flight; connections; proxied req/s by status class and latency; upstream pool waits and read-after-write |
+| Auth and abuse | rate-limit rejections by limiter and by route; rate-limit config version; Argon2 shedding; proxy refusals (account cap); stalled bodies, accept errors, firehose per-IP refusals, shed/stalled exports |
+| Cluster: leases, ownership, failover | lease renewal round trip by node vs the 0.4 x TTL ceiling; lease validity left; renew errors and takeovers; lease events (incl. `history_full`); shard open time by kind; shards opened, segments replayed; exit state / feature levels table; format errors and signature faults |
+| Cluster: forwarding, control plane, resharding | forwards by owner status, latency, per node; control-plane requests, latency, timeouts/nudges/lone skips; resharding; retired-state GC; forced compactions |
+| Object store | permits in use / limit, permit waits and wait p99 per pool (log, state, ctl) and lane; requests by client and op; non-ok results; p99 by key component; bytes by client and direction |
+| SlateDB | block cache hit rate, DB requests, memtables and L0, flushes/backpressure/stalls, flush and compaction bytes, SlateDB's own store requests and error count (which includes not-found answers). Summed over each node's shard DBs |
+| Process and runtime | CPU by mode, RSS by node, jemalloc, tokio utilization and runtime lateness by node, tasks/injection queue/threads |
+| Key service, PLC directory, mail | KMS calls by result and latency, signing-key cache, PLC directory calls, outbound mail |
+| MinIO (bench only) | S3 req/s and TTFB p99 by API, traffic, errors/in flight, bucket usage. Empty outside the bench |
+| CPU profile | Pyroscope flamegraph for the selected nodes |
 
 Quantiles come from Prometheus histograms, so they are bucket-resolution
 estimates. The latency buckets go from 0.1 ms to 52 s in steps of ×2. Read p99.9
 over short windows with care.
 
-The dashboard JSON is generated: edit `grafana/gen_dashboard.py`, then run
-`python3 bench/obs/grafana/gen_dashboard.py`. Grafana reloads the file within 5 s.
-Edits made in the UI are allowed but get overwritten by the next file change.
+The dashboard JSON is generated, in two copies that differ only in datasource
+uids: `grafana/dashboards/vlpds.json` (this stack) and
+`deploy/ansible/roles/monitoring/files/dashboards/vlpds.json` (the lab
+Grafana; deploy it with `deploy/ansible/playbooks/grafana-dashboards.yml`).
+Edit `grafana/gen_dashboard.py`, then write both:
+
+```sh
+just dashboards          # python3 bench/obs/grafana/gen_dashboard.py
+just dashboards --check  # exit 1 if either copy is stale
+```
+
+`VLPDS_PROM_UID` / `VLPDS_PYRO_UID` (with `VLPDS_DASH_OUT`) render one copy
+for some other Grafana instead. This stack reloads the file within 5 s. Edits
+made in the UI are allowed but get overwritten by the next file change.
