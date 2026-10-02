@@ -1,7 +1,7 @@
 //! Log segment retention (DESIGN.md "Log retention").
 //!
 //! Node logs are both the WAL and the firehose history, so without this they
-//! grow forever (~3.5 KB per commit). A segment is deleted once
+//! grow forever. A segment is deleted once
 //!
 //! - no replay can need it: below its log's *replay floor* (live log: every
 //!   shard applying from it has a durable checkpoint past it; dead log: every
@@ -52,9 +52,8 @@ pub const RELIST_EVERY: Duration = Duration::from_secs(3600);
 pub struct Config {
     /// Firehose backfill window: segments younger than this are kept.
     pub window: Duration,
-    /// Time between passes.
     pub interval: Duration,
-    /// Objects deleted per pass at most (all logs together).
+    /// Per pass, all logs together.
     pub max_deletes: usize,
     /// A dead log pruned to its fence loses the fence (and so disappears
     /// from `log/`) once the fence is this old. None = fences stay forever.
@@ -76,16 +75,14 @@ pub struct Report {
     /// highest seq deleted by this node (including reports of dead logs it
     /// folded in when it deleted them)
     pub pruned_seq: i64,
-    /// The test feature level's field (`version::TEST_LEVEL`; DESIGN.md
-    /// "Migrations": `min_seg_format`): the lowest segment level among the
-    /// log's unpruned segments, as a lower bound (the level active when the
-    /// log started). Written only while that level is active.
+    /// The test feature level's field (DESIGN.md "Migrations"): a lower
+    /// bound on the segment level of the log's unpruned segments. Written
+    /// only while that level is active.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_seg_format: Option<u32>,
 }
 
 impl Report {
-    /// The report a log's owner writes at the active level.
     pub fn new(opened: BTreeMap<ShardId, u64>, pruned_seq: i64, log_level: u32) -> Report {
         Report { opened, pruned_seq, min_seg_format: crate::version::test_level_active().then_some(log_level) }
     }
@@ -97,31 +94,34 @@ fn report_path(store: &Store, log_id: &str) -> Path {
 
 /// Every retention report, by log id.
 pub async fn read_reports(store: &Store) -> anyhow::Result<HashMap<String, Report>> {
-    let prefix = Path::from(format!("{}/retain", store.prefix));
-    let names: Vec<String> = store
+    Ok(read_json_dir(store, "retain", |name| Some(name.to_string()), 16).await?.into_iter().collect())
+}
+
+/// Every JSON object directly under `{prefix}/{dir}/` whose name `key`
+/// accepts, read `concurrency` at a time (objects gone meanwhile skipped).
+async fn read_json_dir<K: Send, T: serde::de::DeserializeOwned>(store: &Store, dir: &str, key: impl Fn(&str) -> Option<K>, concurrency: usize) -> anyhow::Result<Vec<(K, T)>> {
+    let prefix = Path::from(format!("{}/{dir}", store.prefix));
+    let names: Vec<(K, Path)> = store
         .raw
         .list(Some(&prefix))
-        .filter_map(|m| async move { m.ok().and_then(|m| m.location.filename().map(String::from)) })
+        .filter_map(|m| {
+            let k = m.ok().and_then(|m| Some((key(m.location.filename()?)?, m.location)));
+            async move { k }
+        })
         .collect()
         .await;
-    let got: Vec<anyhow::Result<Option<(String, Report)>>> = futures::stream::iter(names)
-        .map(|log| async move {
-            match store.raw.get(&report_path(store, &log)).await {
-                Ok(r) => Ok(Some((log, serde_json::from_slice(&r.bytes().await?)?))),
+    let got: Vec<anyhow::Result<Option<(K, T)>>> = futures::stream::iter(names)
+        .map(|(k, path)| async move {
+            match store.raw.get(&path).await {
+                Ok(r) => Ok(Some((k, serde_json::from_slice(&r.bytes().await?)?))),
                 Err(object_store::Error::NotFound { .. }) => Ok(None),
                 Err(e) => Err(e.into()),
             }
         })
-        .buffer_unordered(16)
+        .buffer_unordered(concurrency)
         .collect()
         .await;
-    let mut out = HashMap::new();
-    for r in got {
-        if let Some((log, rep)) = r? {
-            out.insert(log, rep);
-        }
-    }
-    Ok(out)
+    got.into_iter().filter_map(Result::transpose).collect()
 }
 
 /// The retained floor: every event deleted from any log has seq <= this,
@@ -144,7 +144,7 @@ struct DeadLogs {
     unfenced: i64,
     needed: i64,
     pruning: i64,
-    /// pruned down to their fence (kept for `fence_retention`)
+    /// pruned down to their fence
     fenced: i64,
     /// objects below their logs' ends (fence or durable prefix)
     segments: u64,
@@ -172,14 +172,13 @@ pub struct Retention {
     cfg: Config,
     members: Membership,
     state: Mutex<State>,
-    /// The feature level active when our log started (its first segment's).
+    /// The feature level active when our log started.
     log_level: u32,
 }
 
 #[derive(Default)]
 struct State {
     pruned_seq: i64,
-    /// last report written
     written: Option<Report>,
     /// dead logs found fenced: log -> fence ordinal (permanent)
     fenced: HashMap<String, u64>,
@@ -188,8 +187,7 @@ struct State {
     retired: HashSet<String>,
     /// dead logs left after the last full pass over them (leader only)
     dead: Option<DeadLogs>,
-    /// What the last LIST of our own log says about the next one, and when
-    /// it ran.
+    /// What the last LIST of our own log says about the next one, and when.
     own_next: Option<(Due, std::time::Instant)>,
     /// What the last full dead-log scan says about the next one: the live
     /// logs it saw, when (if ever) a retired log's fence comes due, and
@@ -215,7 +213,6 @@ enum Due {
     Now,
 }
 
-/// A log object's ordinal, from its path.
 fn ordinal_of(p: &Path) -> Option<u64> {
     p.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse().ok())
 }
@@ -225,7 +222,6 @@ impl Retention {
         Arc::new(Retention { store, log, cfg, members, state: Mutex::default(), log_level: crate::version::active() })
     }
 
-    /// Runs a pass every `interval`, forever.
     pub fn spawn(self: &Arc<Self>) {
         metrics::init_retention_counters();
         let me = self.clone();
@@ -318,7 +314,6 @@ impl Retention {
         Ok(pass)
     }
 
-    /// Writes our report if it changed.
     async fn publish(&self) -> anyhow::Result<()> {
         let rep = Report::new(self.log.sinks.opened(), self.state.lock().pruned_seq, self.log_level);
         if self.state.lock().written.as_ref() == Some(&rep) {
@@ -466,10 +461,7 @@ impl Retention {
                     }
                 },
             };
-            if known.is_none() {
-                known = Some((read_assignments(&self.store).await?, read_reports(&self.store).await?));
-            }
-            let (assigns, reports) = known.as_ref().unwrap();
+            let (assigns, reports) = load_known(&self.store, &mut known).await?;
             if let Some(s) = needed_by(&x, assigns, reports) {
                 tracing::debug!(log = %x, shard = s.0, "dead log still needed for replay");
                 stats.needed += 1;
@@ -554,10 +546,7 @@ impl Retention {
         if only.last_modified >= cutoff {
             return Ok(FenceDue::At(only.last_modified + keep));
         }
-        if known.is_none() {
-            *known = Some((read_assignments(&self.store).await?, read_reports(&self.store).await?));
-        }
-        let (assigns, reports) = known.as_ref().unwrap();
+        let (assigns, reports) = load_known(&self.store, known).await?;
         if needed_by(x, assigns, reports).is_some() || assigns.values().any(|a| a.log_id.as_deref() == Some(x)) {
             return Ok(FenceDue::Held);
         }
@@ -587,36 +576,16 @@ enum FenceDue {
     Held,
 }
 
-/// Assignments (by shard id) and every log's report.
+/// Assignments (by shard id, retired shards' included) and every log's
+/// report, read once per pass when first needed.
 type Known = (BTreeMap<ShardId, Assignment>, HashMap<String, Report>);
 
-/// Every shard assignment, by shard id (retired shards' included).
-async fn read_assignments(store: &Store) -> anyhow::Result<BTreeMap<ShardId, Assignment>> {
-    let prefix = Path::from(format!("{}/assign", store.prefix));
-    let names: Vec<ShardId> = store
-        .raw
-        .list(Some(&prefix))
-        .filter_map(|m| async move { m.ok().and_then(|m| m.location.filename().and_then(ShardId::from_key)) })
-        .collect()
-        .await;
-    let mut out = BTreeMap::new();
-    let got: Vec<anyhow::Result<(ShardId, Option<Assignment>)>> = futures::stream::iter(names)
-        .map(|s| async move {
-            match store.raw.get(&Path::from(format!("{}/assign/{}", store.prefix, s.key()))).await {
-                Ok(r) => Ok((s, Some(serde_json::from_slice(&r.bytes().await?)?))),
-                Err(object_store::Error::NotFound { .. }) => Ok((s, None)),
-                Err(e) => Err(e.into()),
-            }
-        })
-        .buffer_unordered(32)
-        .collect()
-        .await;
-    for r in got {
-        if let (s, Some(a)) = r? {
-            out.insert(s, a);
-        }
+async fn load_known<'k>(store: &Store, known: &'k mut Option<Known>) -> anyhow::Result<&'k Known> {
+    if known.is_none() {
+        let assigns = read_json_dir(store, "assign", ShardId::from_key, 32).await?.into_iter().collect();
+        *known = Some((assigns, read_reports(store).await?));
     }
-    Ok(out)
+    Ok(known.as_ref().unwrap())
 }
 
 /// A shard whose replay may still read dead log `x`: its history has a span

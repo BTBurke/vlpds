@@ -1,37 +1,16 @@
 //! Per-repo log of recent record writes, for read-after-write on proxied
-//! AppView reads (src/xrpc/proxy/read_after_write.rs, DESIGN.md
-//! "Read-after-write").
+//! AppView reads (DESIGN.md "Read-after-write").
 //!
 //! The reference PDS answers "which of the requester's records were written
-//! after the AppView's `atproto-repo-rev`?" with an indexed SQL query per
-//! request (`record.repoRev > rev`, oldest 10). vlpds has no rev index (a
-//! record value carries its rev, so the answer is a scan of the repo's
-//! records), so the owner node keeps, per repo it has seen recently, what
-//! that query needs:
-//!
-//! - `head`: the repo's rev as of the last commit applied here (or read);
-//! - `base` and `recs`: every current record whose rev is above `base`
-//!   (path, rev, CID; the record bytes of posts and the profile, the only
-//!   ones munging reads), oldest first, at most [`MAX_RECS`] / [`MAX_BYTES`]
-//!   (older ones are dropped by raising `base`);
-//! - `old_exists`: whether the repo has records at or below `base` (the
-//!   reference's sanity check: an AppView rev older than *every* local record,
-//!   e.g. after a migration, gets no munging).
-//!
-//! A commit's durable ack extends its repo's entry ([`Commit::apply`]; an
-//! entry that missed a commit is restarted at that commit's `since`). An
-//! AppView rev at or above `head` (nearly every request) is answered from
-//! the entry with no store read; one at or above `base` from `recs`; below
-//! `base` (or no entry) the caller reads the store and [`fill`]s the entry.
-//! A read that finds more than [`MAX_RECS`] records above the AppView's rev
-//! (an AppView lagging behind a busy repo) keeps only the oldest of them
-//! while scanning, and its answer is kept with the entry for that rev until
-//! the repo changes ([`fill_lagging`]): an AppView that lags polls with the
-//! same rev, and each poll would otherwise scan the repo again.
-//! Entries are valid only in the partition epoch they were made in (another
-//! node may have written the repo since), and whole-repo changes (import,
-//! delete, creation) drop them ([`invalidate`]). Loads that raced a change
-//! are not cached (per-shard generations, as in the proxy's caches).
+//! after the AppView's `atproto-repo-rev`?" with an indexed SQL query; vlpds
+//! has no rev index, so the owner node keeps, per recently seen repo, the
+//! records above `base` (oldest first, bounded) and the repo's `head` rev.
+//! A rev at or above `head` (nearly every request) is answered with no
+//! store read; one at or above `base` from the entry; anything else reads
+//! the store and [`fill`]s the entry. A lagging AppView's answer is kept for
+//! its rev until the repo changes ([`fill_lagging`]), since it polls with the
+//! same rev. Entries are valid only in the partition epoch they were made in,
+//! and loads that raced a change are not cached (per-shard generations).
 
 use crate::cid::Cid;
 use bytes::Bytes;
@@ -41,11 +20,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-/// Records kept per repo above `base` (the reference reads at most 10).
+/// Records kept per repo above `base`.
 pub const MAX_RECS: usize = 32;
-/// Record bytes kept per repo.
 pub const MAX_BYTES: usize = 64 << 10;
-/// Records the reference returns per request (oldest first).
+/// Records the reference returns per request.
 pub const LIMIT: usize = 10;
 /// A full shard first drops entries idle this long.
 const IDLE: Duration = Duration::from_secs(600);
@@ -54,20 +32,17 @@ const SHARDS: usize = 64;
 pub const POST: &str = "app.bsky.feed.post";
 pub const PROFILE_PATH: &str = "app.bsky.actor.profile/self";
 
-/// One current record written after `base`.
 #[derive(Clone, Debug)]
 pub struct Rec {
     pub path: Arc<str>,
     pub rev: u64,
     pub cid: Cid,
-    /// DAG-CBOR record: posts and the profile only.
+    /// Posts and the profile only: the records munging reads.
     pub bytes: Option<Bytes>,
 }
 
-/// Data root of an empty repo.
 pub static EMPTY_ROOT: LazyLock<Cid> = LazyLock::new(|| crate::mst::Tree::new().root_cid().expect("empty tree root"));
 
-/// Whether munging reads this record's bytes.
 pub fn keeps_bytes(path: &str) -> bool {
     path == PROFILE_PATH || crate::worker::collection_of(path) == POST
 }
@@ -79,6 +54,8 @@ struct Entry {
     part: Part,
     head: u64,
     base: u64,
+    /// The reference's sanity check: an AppView rev older than *every*
+    /// local record (e.g. after a migration) gets no munging.
     old_exists: bool,
     /// ascending rev
     recs: Vec<Rec>,
@@ -123,12 +100,11 @@ impl Entry {
     }
 }
 
-/// What a repo wrote after an AppView rev, as far as the log knows.
 #[derive(Debug)]
 pub enum Since {
-    /// Nothing to merge (no records after it, or the sanity check failed).
+    /// No records after it, or the sanity check failed.
     Nothing,
-    /// The reference's answer: the oldest [`LIMIT`] records after it.
+    /// The oldest [`LIMIT`] records after it.
     Records(Vec<Rec>),
     /// Not known here: read the store.
     Unknown,
@@ -163,7 +139,7 @@ fn shard(did: &str) -> usize {
     (h.finish() as usize) % SHARDS
 }
 
-/// Makes room in a full shard: idle entries first, else all of it.
+/// Drops idle entries from a full shard, else all of it.
 fn make_room(m: &mut HashMap<Box<str>, Entry>) {
     let cap = crate::caches::cap(crate::caches::Cache::RecentWrites).div_ceil(SHARDS).max(1);
     if m.len() >= cap {
@@ -184,7 +160,6 @@ fn answer(recs: &[Rec], since: u64, old: bool) -> Since {
     Since::Records(recs[start..].iter().take(LIMIT).cloned().collect())
 }
 
-/// Records of `did` written after `since` (the AppView's rev), from the log.
 pub fn lookup(did: &str, part: Part, since: u64) -> Since {
     let i = shard(did);
     let mut m = LOG.shards[i].lock();
@@ -212,19 +187,17 @@ pub fn generation(did: &str) -> u64 {
     LOG.gens[shard(did)].load(Ordering::SeqCst)
 }
 
-/// What a store read found.
 pub struct Read {
-    /// The repo's rev (at least its head's when the read began).
+    /// At least the head's rev when the read began.
     pub head: u64,
     pub base: u64,
-    /// Some record at or below `base`.
     pub old_exists: bool,
     /// Every record above `base`, ascending.
     pub recs: Vec<Rec>,
 }
 
-/// Caches `read`, unless the repo changed since `gen` was taken. Returns
-/// the answer for `since`.
+/// Caches `read` unless the repo changed since `gen` was taken; returns the
+/// answer for `since`.
 pub fn fill(did: &str, part: Part, gen: u64, read: Read, since: u64) -> Since {
     let Read { head, base, old_exists, recs } = read;
     let out = if since >= head { Since::Nothing } else { answer(&recs, since, old_exists) };
@@ -245,11 +218,9 @@ pub fn fill(did: &str, part: Part, gen: u64, read: Read, since: u64) -> Since {
     out
 }
 
-/// Keeps `answer`, the reference's answer for `since` read from the store
-/// when more than [`MAX_RECS`] records were above it (`head`: the repo's
-/// rev as read), until the repo changes. Like [`fill`], skipped if the repo
-/// changed since `gen` was taken. An entry for the same head keeps its
-/// records; otherwise the entry restarts at `head` (nothing above it).
+/// Keeps `answer` for `since` (read when more than [`MAX_RECS`] records
+/// were above it) until the repo changes. An entry for the same head keeps
+/// its records; otherwise it restarts at `head`.
 pub fn fill_lagging(did: &str, part: Part, gen: u64, head: u64, since: u64, answer: Vec<Rec>) {
     let i = shard(did);
     let mut m = LOG.shards[i].lock();
@@ -271,7 +242,7 @@ pub fn fill_lagging(did: &str, part: Part, gen: u64, head: u64, since: u64, answ
     e.lagging = Some((since, answer));
 }
 
-/// Drops `did`'s entry (its records changed other than by a commit).
+/// For changes other than commits (import, delete, creation).
 pub fn invalidate(did: &str) {
     let i = shard(did);
     let mut m = LOG.shards[i].lock();
@@ -283,10 +254,8 @@ pub fn invalidate(did: &str) {
 pub struct Commit {
     pub did: Arc<str>,
     pub part: Part,
-    /// The previous head's rev (the commit's `since`).
     pub since: u64,
     pub rev: u64,
-    /// The repo had records before this commit.
     pub prev_nonempty: bool,
     /// None: too many to keep (the entry restarts above this commit).
     pub ops: Option<Vec<Op>>,
@@ -297,6 +266,8 @@ pub struct Commit {
 pub type Op = (Arc<str>, Option<(Cid, Option<Bytes>)>);
 
 impl Commit {
+    /// At the commit's durable ack. An entry that missed a commit restarts
+    /// at this one's `since`.
     pub fn apply(self) {
         let i = shard(&self.did);
         let mut m = LOG.shards[i].lock();

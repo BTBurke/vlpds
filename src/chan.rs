@@ -1,8 +1,7 @@
-//! The repo workers' request channel: unbounded MPSC, a mutex-guarded queue
-//! and a condition variable. An idle receiver parks right away (crossbeam's
-//! `recv` spins and yields first: ~1.6% of a node's CPU at saturation on
-//! benchbox, workers waking and idling between batches), and it takes a whole
-//! batch per lock (`recv_batch`) instead of one atomic hand-off per message.
+//! The repo workers' request channel: an unbounded MPSC queue under a mutex
+//! with a condition variable. An idle receiver parks right away (crossbeam's
+//! `recv` spins and yields first, which cost measurable CPU with workers
+//! idling between batches), and takes a whole batch per lock.
 
 use parking_lot::{Condvar, Mutex};
 use std::collections::VecDeque;
@@ -109,7 +108,6 @@ impl<T> Receiver<T> {
         Ok(())
     }
 
-    /// Messages queued.
     pub fn len(&self) -> usize {
         self.0.state.lock().queue.len()
     }
