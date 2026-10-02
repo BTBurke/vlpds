@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
+use crate::oauth::util::ct_eq;
 use sha2::Sha256;
 
 pub const STEP_SECS: u64 = 30;
@@ -133,10 +134,6 @@ pub fn verify_code(secret: &[u8], code: &str, now: u64, after_step: u64) -> Opti
         }
     }
     found
-}
-
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 pub fn generate_secret() -> Vec<u8> {

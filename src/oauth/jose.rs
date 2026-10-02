@@ -1,6 +1,5 @@
-//! JOSE pieces: ES256 (P-256) JWK handling, JWT signing/verification, RFC 7638
-//! thumbprints, DPoP proof verification (RFC 9449) and server-issued DPoP
-//! nonces.
+//! ES256 JWKs and JWTs, RFC 7638 thumbprints, DPoP proofs (RFC 9449) and
+//! server-issued DPoP nonces.
 
 use super::util::{
     b64u, b64u_decode, derive_secret, hmac_sha256, now_secs, sha256_b64u, Replay,
@@ -10,15 +9,14 @@ use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::EncodedPoint;
 use serde_json::{json, Value as J};
 
-/// Signing algorithms accepted for DPoP proofs and client assertions.
+/// For DPoP proofs and client assertions.
 pub const VERIFY_ALGS: [&str; 1] = ["ES256"];
 
-/// DPoP proof `iat` acceptance window: `maxTokenAge` 10 s plus a 180 s clock
-/// tolerance, as in the reference implementation.
+/// DPoP proof `iat` window, as in the reference.
 const DPOP_MAX_AGE: i64 = 10;
 const DPOP_CLOCK_TOLERANCE: i64 = 180;
 
-/// Parses an EC P-256 public JWK. Rejects private keys.
+/// Rejects private keys.
 pub fn jwk_to_key(jwk: &J) -> Result<VerifyingKey, String> {
     if jwk.get("kty").and_then(|v| v.as_str()) != Some("EC")
         || jwk.get("crv").and_then(|v| v.as_str()) != Some("P-256")
@@ -50,7 +48,7 @@ pub fn key_to_jwk(k: &VerifyingKey) -> J {
     json!({"kty": "EC", "crv": "P-256", "x": b64u(pt.x().unwrap()), "y": b64u(pt.y().unwrap())})
 }
 
-/// RFC 7638 SHA-256 thumbprint of an EC P-256 JWK.
+/// RFC 7638.
 pub fn jwk_thumbprint(jwk: &J) -> Result<String, String> {
     let k = jwk_to_key(jwk)?;
     let c = key_to_jwk(&k);
@@ -109,7 +107,6 @@ impl DecodedJwt {
         }
     }
 
-    /// An unsecured JWT (`alg: none`, empty signature part).
     pub fn is_unsecured(&self) -> bool {
         self.alg() == "none" && self.sig.is_empty()
     }
@@ -125,10 +122,8 @@ impl DecodedJwt {
     }
 }
 
-/// The server's access-token signing key (ES256). Derived deterministically
-/// from the configured server secret so every node signs/verifies with the
-/// same key without shared state; its public half is published at
-/// `/oauth/jwks`.
+/// Derived from the server secret so every node has the same key without
+/// shared state.
 pub struct ServerKey {
     pub sk: SigningKey,
     pub kid: String,
@@ -155,10 +150,8 @@ impl ServerKey {
         j
     }
 
-    /// An ES256 JWT. Hedged nonce (RFC 6979 with fresh additional data) and
-    /// verified against the public key before it is returned, as commit
-    /// signatures are (src/crypto.rs): a failure is recorded and retried
-    /// once; Err after two.
+    /// Hedged and verified before it is returned, as commit signatures are
+    /// (src/crypto.rs). Err: failed twice.
     pub fn sign(&self, typ: &str, payload: &J) -> Result<String, crate::crypto::SignatureFault> {
         use crate::crypto::{fault, record_fault, Purpose, SignatureFault};
         use p256::ecdsa::signature::RandomizedSigner;
@@ -184,7 +177,7 @@ impl ServerKey {
         Err(SignatureFault { purpose: Purpose::OAuthToken.as_str() })
     }
 
-    /// Verifies signature and `typ`; claims are checked by the caller.
+    /// Claims are the caller's to check.
     pub fn verify(&self, token: &str, typ: &str) -> Result<DecodedJwt, String> {
         let jwt = DecodedJwt::decode(token)?;
         if jwt.header.get("typ").and_then(|v| v.as_str()) != Some(typ) {
@@ -197,18 +190,14 @@ impl ServerKey {
     }
 }
 
-// ---------- DPoP nonces ----------
-
-/// Rotating, stateless DPoP nonces (as the reference `DpopNonce`): the nonce
-/// for time window `n` is HMAC(secret, n). Windows are 60 s and the previous,
-/// current and next nonces are accepted, so a nonce lives at most ~3 minutes
-/// (the spec caps it at 5). The secret is derived from the server secret, so
-/// all nodes issue and accept the same nonces.
+/// Stateless, as the reference `DpopNonce`: HMAC(secret, window). The
+/// previous, current and next windows are accepted, so a nonce lives at most
+/// ~3 minutes (the spec caps it at 5).
 pub struct DpopNonces {
     secret: [u8; 32],
 }
 
-pub const NONCE_ROTATION_SECS: i64 = 60;
+const NONCE_ROTATION_SECS: i64 = 60;
 
 impl DpopNonces {
     pub fn new(server_secret: &str) -> DpopNonces {
@@ -221,8 +210,7 @@ impl DpopNonces {
         b64u(hmac_sha256(&self.secret, &[&counter.to_be_bytes()]))
     }
 
-    /// The nonce clients should use next (the upcoming window's value, so it
-    /// stays valid for the longest time).
+    /// The upcoming window's, so it stays valid for the longest time.
     pub fn next(&self) -> String {
         self.compute(now_secs() / NONCE_ROTATION_SECS + 1)
     }
@@ -233,11 +221,9 @@ impl DpopNonces {
     }
 }
 
-// ---------- DPoP proofs ----------
-
 #[derive(Debug)]
 pub enum DpopError {
-    /// The client must retry with a (fresh) server nonce.
+    /// The client must retry with a fresh server nonce.
     UseNonce(String),
     Invalid(String),
 }
@@ -246,23 +232,19 @@ pub enum DpopError {
 pub struct DpopProof {
     pub jkt: String,
     pub jti: String,
-    pub htm: String,
-    pub htu: String,
-    /// Until when the proof could be replayed (its `jti` must stay claimed).
+    /// Until when the proof could be replayed.
     pub until: i64,
 }
 
 impl DpopProof {
-    /// The proof's single-use key, claimed at the owner of `routing`: the
-    /// access token's DID for resource requests (`ath` binds the proof to
-    /// that token), the key's [`super::util::jkt_routing`] at the AS.
+    /// `routing`: the access token's DID for resource requests (`ath` binds
+    /// the proof to that token), [`super::util::jkt_routing`] at the AS.
     pub fn replay(&self, routing: String) -> Replay {
         Replay { routing, key: format!("dpop:{}:{}", self.jkt, self.jti), until: self.until }
     }
 }
 
-/// Normalizes an absolute http(s) URL for `htu` comparison: scheme + host +
-/// port (default ports elided) + normalized path; no query or fragment.
+/// Origin + path: no query or fragment.
 pub fn normalize_htu(u: &str) -> Option<String> {
     let url = reqwest::Url::parse(u).ok()?;
     if !matches!(url.scheme(), "http" | "https")
@@ -275,10 +257,9 @@ pub fn normalize_htu(u: &str) -> Option<String> {
     Some(format!("{origin}{}", url.path()))
 }
 
-/// Verifies a DPoP proof (RFC 9449 §4.3) for a request with method `htm` to
-/// `expected_htu` (already normalized). `access_token` is Some for resource
-/// requests (`ath` required) and None at the authorization server (`ath`
-/// forbidden). Nonces are mandatory.
+/// RFC 9449 §4.3. `access_token`: Some for resource requests (`ath`
+/// required), None at the authorization server (`ath` forbidden). Replay
+/// protection is the caller's: claim [`DpopProof::replay`] at its owner.
 pub fn check_proof(
     proof: &str,
     htm: &str,
@@ -371,13 +352,9 @@ pub fn check_proof(
     }
     let jkt = jwk_thumbprint(jwk)
         .map_err(|e| DpopError::Invalid(format!("Failed to calculate jkt: {e}")))?;
-    // Replay protection (a proof may be used once within its validity
-    // window) is the caller's: claim `DpopProof::replay` at its owner.
     Ok(DpopProof {
         jkt,
         jti,
-        htm: htm.to_string(),
-        htu: htu_norm,
         until: now + DPOP_MAX_AGE + 2 * DPOP_CLOCK_TOLERANCE,
     })
 }

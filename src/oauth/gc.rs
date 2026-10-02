@@ -1,28 +1,10 @@
-//! Periodic cleanup of expired private rows (mostly OAuth) in the partitions
-//! this node owns:
-//! - `oauth:req:{id}` authorization (PAR) requests and codes past their
-//!   expiry; consumed requests (code-reuse tombstones) are kept
-//!   [`CONSUMED_REQUEST_RETENTION`] longer so a replayed code still revokes
-//!   the session it created;
-//! - `oauth:cc:{hash}` PKCE `code_challenge` reuse markers older than
-//!   [`CODE_CHALLENGE_REPLAY_TIMEFRAME`];
-//! - `oauth:dev:{id}` browser devices unseen for [`AUTHENTICATION_MAX_AGE`]
-//!   (every login on them has expired);
-//! - `{did}` / `oauth/ses/{id}` sessions past their client's session or
-//!   refresh-token lifetime;
-//! - `oauth/replay/{hash}` persisted single-use claims (DPoP proof, client
-//!   assertion and request-object `jti`s) past their `until`, and the
-//!   in-memory replay caches;
-//! - and, not OAuth but the same walk over every private row, `sec/rvk/`
-//!   session revocations of an account (deleted or not) once every token
-//!   they revoke has expired (`xrpc::revocation_expired`).
+//! Bounded, resumable sweep of expired private rows in the partitions this
+//! node owns: OAuth rows (mod.rs) and, sharing the walk, `sec/rvk/` session
+//! revocations once every token they revoke has expired.
 //!
-//! Each tick examines at most a fixed number of keys per partition and
-//! deletes at most a fixed number of rows, resuming from a per-partition
-//! cursor, so a large keyspace is swept over several ticks. Every candidate
-//! is re-read under the row's lock before it is deleted, so a row that was
-//! renewed in between (a re-claimed code challenge) survives. All the expiry
-//! conditions only become true with time, except a device's `last_seen_at`
+//! Every candidate is re-read under the row's lock and deleted on condition
+//! it is unchanged, so a row renewed in between survives. All expiry
+//! conditions only become true with time, except a device's `last_seen_at`,
 //! which a concurrent visit can bump; losing that race just starts a new
 //! device session.
 
@@ -37,14 +19,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// How long a consumed request is kept after its code expired.
-pub const CONSUMED_REQUEST_RETENTION: i64 = 7 * 86_400;
-/// Sweep period.
-pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-/// Keys examined per partition per tick.
-pub const SCAN_BUDGET: usize = 5_000;
-/// Rows deleted per tick (each is one log write).
-pub const DELETE_BUDGET: usize = 500;
+/// After its code expired, so a replayed code still revokes the session it
+/// created.
+const CONSUMED_REQUEST_RETENTION: i64 = 7 * 86_400;
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Per partition per tick.
+const SCAN_BUDGET: usize = 5_000;
+/// Per tick: each is one log write.
+const DELETE_BUDGET: usize = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -89,10 +71,9 @@ fn session_expired(s: &Session, now: i64) -> bool {
     now - s.created_at > session_lt || now - s.updated_at > refresh_lt
 }
 
-/// Whether the stored value is expired. Unparseable rows count as expired.
+/// Unparseable rows count as expired.
 fn expired(kind: Kind, routing: &str, name: &str, val: &[u8], now: i64) -> bool {
     match kind {
-        // past its window
         Kind::Replay => serde_json::from_slice::<i64>(val).map(|until| until <= now).unwrap_or(true),
         Kind::Revocation => {
             crate::xrpc::revocation_expired(routing, name, val, now.max(0) as u64).unwrap_or(false)
@@ -116,7 +97,7 @@ fn server_err(e: impl std::fmt::Display) -> OAuthError {
     OAuthError::server_error(&e.to_string())
 }
 
-/// The lock the row's writers take (see `store::lock` users).
+/// The lock the row's writers take.
 fn lock_key(kind: Kind, routing: &str, name: &str) -> String {
     match kind {
         Kind::Request => format!("req:{}", routing.trim_start_matches("oauth:req:")),
@@ -125,7 +106,6 @@ fn lock_key(kind: Kind, routing: &str, name: &str) -> String {
     }
 }
 
-/// Re-reads the row under its lock and deletes it if still expired.
 async fn delete_if_expired(
     app: &App,
     kind: Kind,
@@ -153,18 +133,14 @@ async fn delete_if_expired(
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SweepStats {
-    /// Keys examined.
     pub scanned: usize,
-    /// Rows deleted.
     pub removed: usize,
-    /// Expired replay-cache entries dropped.
-    pub replay_entries: usize,
-    /// Expired persisted single-use claims and session revocations deleted
-    /// (counted apart from `removed`; both count against the delete budget).
+    /// Persisted single-use claims and session revocations, counted apart
+    /// from `removed` (both count against the delete budget).
     pub claims_removed: usize,
 }
 
-/// Sweep state: where each partition's scan resumes.
+/// Where each partition's scan resumes.
 #[derive(Default)]
 pub struct Sweeper {
     cursors: HashMap<crate::slots::ShardId, Vec<u8>>,
@@ -175,8 +151,7 @@ impl Sweeper {
         Sweeper::default()
     }
 
-    /// One bounded pass: up to `scan_budget` keys per owned partition and
-    /// `delete_budget` deletions overall, judged at time `now`.
+    /// `scan_budget` is per partition, `delete_budget` overall.
     pub async fn tick(
         &mut self,
         app: &App,
@@ -184,10 +159,8 @@ impl Sweeper {
         scan_budget: usize,
         delete_budget: usize,
     ) -> Result<SweepStats, OAuthError> {
-        let mut st = SweepStats {
-            replay_entries: super::util::sweep_replays(app),
-            ..Default::default()
-        };
+        super::util::sweep_replays(app);
+        let mut st = SweepStats::default();
         let fam = crate::state::PRIVATE_FAMILY;
         for p in app.partitions.owned() {
             let start = self.cursors.remove(&p.id);
@@ -225,7 +198,6 @@ impl Sweeper {
     }
 }
 
-/// Background sweep of expired OAuth rows (every [`SWEEP_INTERVAL`]).
 pub fn spawn_gc(app: Arc<App>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut sweeper = Sweeper::new();

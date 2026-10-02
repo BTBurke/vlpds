@@ -1,98 +1,39 @@
-//! atproto OAuth authorization server building blocks. The HTTP surface
-//! (metadata, PAR, authorize UI, token, revoke, session management and DPoP
-//! verification of resource requests) lives in `xrpc/oauth.rs`.
+//! atproto OAuth authorization server building blocks; the HTTP surface is
+//! `xrpc/oauth.rs`.
 //!
-//! ## Keys and secrets
-//! Access tokens are ES256 JWTs signed with a P-256 key derived from the
-//! server secret (`Config::jwt_secret`); its public JWK is served at
-//! `/oauth/jwks`. The DPoP nonce secret, CSRF key and refresh-token MAC key
-//! are derived from the same secret. All nodes of a deployment share it, so
-//! any node can issue and verify tokens with no shared mutable state. Rotating
-//! `jwt_secret` invalidates every outstanding OAuth token.
-//!
-//! ## Durable state
-//! Everything persistent goes through the partition log via
-//! `App::put_private` (never SlateDB directly), so any node can read it once
-//! applied:
-//! - `oauth:req:{id}` / `oauth/req`: pending authorization (PAR) requests,
-//!   later the issued code; a consumed request is kept as a tombstone so code
-//!   reuse can revoke the session it created. The id is minted so that this
-//!   row lands on a partition of the node that ran PAR.
-//! - `oauth:cc:{hash}` / `oauth/cc`: PKCE `code_challenge` reuse index (24 h).
-//! - `oauth:dev:{id}` / `oauth/dev`: browser device sessions (account chooser).
-//! - `{did}` / `oauth/ses/{session id}`: OAuth sessions (one per grant),
-//!   listed by prefix scan for the session-management UI and XRPC.
-//! - `{did}` / `oauth/authz/{hash(client_id)}`: remembered consent.
+//! Access tokens are ES256 JWTs under a P-256 key derived from `jwt_secret`,
+//! as are the DPoP nonce, CSRF and refresh-token MAC keys, so every node can
+//! issue and verify with no shared mutable state (rotating `jwt_secret`
+//! invalidates every OAuth token). Durable rows go through `put_private`:
+//! - `oauth:req:{id}` / `oauth/req`: PAR requests, then the issued code; a
+//!   consumed one stays as a tombstone so code reuse can revoke its session.
+//!   The id is minted to land on a partition of the node that ran PAR.
+//! - `oauth:cc:{hash}` / `oauth/cc`: PKCE `code_challenge` reuse markers.
+//! - `oauth:dev:{id}` / `oauth/dev`: browser device sessions.
+//! - `{did}` / `oauth/ses/{id}`, `oauth/authz/{hash(client_id)}`: sessions
+//!   and remembered consent.
 //! - `oauth:lex:{nsid}` / `oauth/lex`: last good permission-set lexicons.
 //!
-//! Expired requests, code-challenge markers, idle devices and sessions past
-//! their lifetime are deleted by a periodic, bounded sweep (`gc.rs`).
-//!
-//! Lookups by token value need no index: refresh tokens and codes embed the
-//! routing information (DID + session id, request id) next to their secret.
-//!
-//! ## HA: which node does what
-//! Every row has a routing key (above) and so one owning node at a time.
-//! Reads and writes from other nodes go through `put_private` /
-//! `get_private` (forwarded to the owner), so any node *can* serve any
-//! step; what needs one node is single use. `crate::forward` routes
-//! `/oauth/*` by `xrpc::oauth::route_key` (stateless: the key comes from the
-//! request itself):
-//! - `/oauth/par`: the `login_hint` account's owner if there is one, else
-//!   the receiving node; either way the request id is minted local to the
-//!   node that runs it, so the flow tends to stay on one node.
-//! - `/oauth/authorize` (GET), `.../select`, `.../consent`: the request
-//!   row's owner (`request_uri` -> `oauth:req:{id}`).
-//! - `.../sign-in` and `/oauth/account/sign-in`: the account's owner, from
-//!   the identifier (handle / DID / email, resolved through the global
-//!   handle and email claims); the authenticator-code step names no account
-//!   and goes to the owner of the device's pending one. Per-account rate
-//!   limits, the TOTP lockout and the account record are then local.
-//! - `/oauth/token`: a code -> its request row's owner (codes embed the
-//!   request id); a refresh token -> its session's account owner (refresh
-//!   tokens embed the DID). `/oauth/revoke` likewise (access tokens by `sub`).
-//! - `/oauth/account` pages and the rest: any node (account records and
-//!   session lists are read from their owners).
+//! Refresh tokens and codes embed their routing key (DID + session id,
+//! request id), so lookups need no index and `crate::forward` can route
+//! `/oauth/*` statelessly (`xrpc::oauth::route_key`) to the row's owner.
 //!
 //! Single use, cluster-wide:
-//! - Code exchange and refresh rotation run only on the owner of the code's
-//!   request row / the session's account (`require_owner`; 503
-//!   `temporarily_unavailable` mid-handoff, so clients retry), under a lock
-//!   on that node (`store::lock`), so concurrent uses that hit different
-//!   nodes are serialized there: exactly one wins. What makes them correct
-//!   against revocations from any node is the write itself: a session is
-//!   written conditionally at its owner (`store::put_session_if`,
-//!   src/xrpc/cas.rs; DESIGN.md "Auth state under concurrency"), on the row
-//!   it read (refresh) or on the account's credential epoch of the
-//!   approving login (code exchange), and every other OAuth row write goes
-//!   through the same per-account lock, so a revoke-all (password change,
-//!   takedown) is never undone by a refresh or exchange in flight.
-//! - DPoP proof, client-assertion and request-object (JAR) `jti`s are claimed
-//!   at the owner of a routing key (`xrpc::internal::claim_replay_anywhere`):
-//!   a resource request's proof under the access token's DID (`ath` binds it
-//!   to that token, and the request was routed there, so this is normally
-//!   local), an authorization-server proof under its key (`oauth:jkt:{jkt}`),
-//!   assertions and request objects under the client (`oauth:client:{hash}`).
-//!   The owner's in-memory TTL sets (one per claim kind, bounded per routing
-//!   key; full, they evict instead of refusing: `util::ReplayCache`) settle
-//!   concurrent claims. Claims at the
-//!   authorization server (token endpoint and PAR proofs, client assertions,
-//!   request objects) are also persisted as `oauth/replay/{hash}` in that
-//!   partition (awaited before the claim counts) and a claim missing from
-//!   memory is checked there, so the owner after a failover or handoff,
-//!   starting with an empty set, still refuses a proof its predecessor
-//!   accepted. The rows are dropped by the GC once past their validity
-//!   window. PKCE `code_challenge` reuse: the durable 24 h marker plus a
-//!   short, memory-only claim at its owner for concurrent PARs.
-//! - Resource-request proofs are claimed in the owner's memory only, like
-//!   the reference's in-memory replay store: a durable claim would put a log
-//!   write (an S3 segment PUT) on every authenticated request, AppView
-//!   proxying included. Residual risk: right after a failover or handoff the
-//!   new owner starts with an empty set, so a proof captured from a request
-//!   the old owner served could be replayed once, within the proof's `iat`
-//!   window and only while its nonce is still accepted (nonce rotation
-//!   bounds it), and only together with the access token it is bound to
-//!   (`ath`), which itself stays revocable and short-lived.
+//! - Code exchange and refresh rotation run only on the owner of the row
+//!   (`require_owner`; 503 mid-handoff), under `store::lock`, and write the
+//!   session conditionally (`store::put_session_if`; DESIGN.md "Auth state
+//!   under concurrency"), so a revoke-all from any node is never undone by
+//!   an exchange or refresh in flight.
+//! - DPoP proof, client-assertion and request-object `jti`s are claimed at
+//!   the owner of a routing key (`xrpc::internal::claim_replay_anywhere`).
+//!   Authorization-server claims are also persisted (`oauth/replay/{hash}`)
+//!   before they count, so a new owner after a failover still refuses a
+//!   proof its predecessor accepted.
+//! - Resource-request proofs are claimed in memory only, like the
+//!   reference: a durable claim would put a log write on every authenticated
+//!   request. Residual risk: right after a failover, a captured proof could
+//!   be replayed once, within its `iat` window and nonce lifetime, and only
+//!   with the (short-lived, revocable) access token it is bound to.
 
 pub mod client;
 pub mod gc;
@@ -109,20 +50,14 @@ use axum::Json;
 
 pub use scopes::ScopeSet;
 
-/// Access tokens live 15 minutes (spec: < 30 min when individually
-/// revocable; ours are checked against the session store on every request).
+/// Spec: < 30 min when individually revocable, as ours are.
 pub const ACCESS_TOKEN_TTL: i64 = 15 * 60;
-/// PAR request_uri lifetime.
 pub const PAR_EXPIRES_IN: i64 = 5 * 60;
-/// Inactivity timeout while the user is on the authorization page, and the
-/// lifetime of an issued authorization code.
+/// On the authorization page, and an issued code's lifetime.
 pub const AUTHORIZATION_INACTIVITY_TIMEOUT: i64 = 5 * 60;
-/// A device login older than this must re-enter credentials.
 pub const AUTHENTICATION_MAX_AGE: i64 = 7 * 86_400;
-/// PKCE code_challenge values may not be reused within this window.
 pub const CODE_CHALLENGE_REPLAY_TIMEFRAME: i64 = 86_400;
 
-/// OAuth error response (`{"error", "error_description"}`).
 #[derive(Debug, Clone)]
 pub struct OAuthError {
     pub status: StatusCode,

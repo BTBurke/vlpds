@@ -1,5 +1,4 @@
-//! Durable OAuth objects, persisted through the partition log via
-//! `App::put_private` / `App::get_private` (see the key layout in mod.rs).
+//! Durable OAuth rows (key layout in mod.rs).
 
 use super::client::ClientAuth;
 use super::util::{b64u, b64u_decode, hmac_sha256, now_secs, random_id, sha256_b64u};
@@ -12,10 +11,9 @@ use serde::{Deserialize, Serialize};
 
 pub const REQUEST_URI_PREFIX: &str = "urn:ietf:params:oauth:request_uri:";
 
-/// Writes (Some) or deletes (None) an OAuth row. Through the owner's
-/// conditional-write lock (src/xrpc/cas.rs), with no condition: so a blind
-/// write (a session revoked, a request consumed) never slips between the
-/// check and the write of a conditional one ([`put_session_if`]).
+/// None deletes. Goes through the owner's conditional-write lock with no
+/// condition, so a blind write (a session revoked, a request consumed) never
+/// slips between the check and the write of a conditional one.
 pub(super) async fn put<T: Serialize>(
     app: &App,
     routing: &str,
@@ -27,8 +25,7 @@ pub(super) async fn put<T: Serialize>(
     })
 }
 
-/// [`put`] on condition that `conds` hold; Ok(false) = one didn't (nothing
-/// written).
+/// Ok(false): a condition failed and nothing was written.
 pub(super) async fn put_if<T: Serialize>(
     app: &App,
     routing: &str,
@@ -54,19 +51,14 @@ pub(super) async fn get<T: DeserializeOwned>(
     }
 }
 
-/// Striped process-local locks for read-modify-write sequences on one
-/// object (code exchange, refresh rotation). Held on the node owning the
-/// object's routing key, which is where those requests are routed (HA notes
-/// in mod.rs), so they serialize cluster-wide.
+/// Striped node-local locks for read-modify-writes of one object. Requests
+/// are routed to the object's owner, so they serialize cluster-wide.
 pub async fn lock(app: &App, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
     let h = super::util::sha256(key.as_bytes());
     let n = super::util::node_state(app);
     n.locks[h[0] as usize].clone().lock_owned().await
 }
 
-// ---------- authorization requests ----------
-
-/// Validated authorization request parameters (after PAR).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuthParams {
     pub client_id: String,
@@ -77,7 +69,6 @@ pub struct AuthParams {
     pub state: Option<String>,
     pub code_challenge: String,
     pub code_challenge_method: String,
-    /// "query" (default for code) | "fragment"
     #[serde(default)]
     pub response_mode: Option<String>,
     #[serde(default)]
@@ -105,13 +96,10 @@ pub struct RequestData {
     pub did: Option<String>,
     #[serde(default)]
     pub code_hash: Option<String>,
-    /// Set once the code was exchanged: the session it created (for reuse
-    /// detection).
+    /// The session the code created, kept for reuse detection.
     #[serde(default)]
     pub consumed: Option<(String, String)>,
-    /// The account's credential epoch (`crate::xrpc::auth_epoch`) of the
-    /// login that approved it: the code's session is created only while it
-    /// is still current, so a password change or takedown after the
+    /// Of the approving login: a password change or takedown after the
     /// approval voids the code.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auth_epoch: String,
@@ -125,9 +113,8 @@ pub fn new_request_id() -> String {
     random_id("req-", 16)
 }
 
-/// A request id whose row lands in a partition this node owns (like
-/// `App::mint_local_did`), so the PAR write is local and the rest of the
-/// flow, routed by the id, comes back here.
+/// Its row lands in a partition this node owns, so the PAR write is local
+/// and the rest of the flow, routed by the id, comes back here.
 pub fn new_local_request_id(app: &App) -> String {
     for _ in 0..1_000 {
         let id = new_request_id();
@@ -143,14 +130,13 @@ pub fn request_uri(id: &str) -> String {
     format!("{REQUEST_URI_PREFIX}{id}")
 }
 
+fn valid_id(id: &str, prefix: &str) -> bool {
+    id.starts_with(prefix) && id.len() < 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 pub fn request_id_from_uri(uri: &str) -> Option<&str> {
     let id = uri.strip_prefix(REQUEST_URI_PREFIX)?;
-    (id.starts_with("req-")
-        && id.len() < 64
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
-    .then_some(id)
+    valid_id(id, "req-").then_some(id)
 }
 
 pub async fn get_request(app: &App, id: &str) -> Result<Option<RequestData>, OAuthError> {
@@ -161,7 +147,7 @@ pub async fn put_request(app: &App, id: &str, r: Option<&RequestData>) -> Result
     put(app, &req_routing(id), "oauth/req", r).await
 }
 
-/// Authorization codes embed their request id: `cod-` + b64u(id bytes . secret).
+/// Codes embed their request id, so lookups need no index.
 pub fn new_code(request_id: &str) -> String {
     format!("cod-{}.{}", b64u(request_id.as_bytes()), random_id("", 32))
 }
@@ -177,9 +163,8 @@ pub fn hash_secret(s: &str) -> String {
     sha256_b64u(s.as_bytes())
 }
 
-/// Records a PKCE code_challenge; false if it was used in the last 24 h.
-/// PAR runs on any node: the durable marker covers earlier uses, and a
-/// single-use claim at the marker's owner settles concurrent ones.
+/// False if used in the last 24 h. The durable marker covers earlier uses,
+/// and a claim at the marker's owner settles concurrent ones.
 pub async fn claim_code_challenge(app: &App, challenge: &str) -> Result<bool, OAuthError> {
     let routing = format!("oauth:cc:{}", hash_secret(challenge));
     let now = now_secs();
@@ -188,7 +173,7 @@ pub async fn claim_code_challenge(app: &App, challenge: &str) -> Result<bool, OA
             return Ok(false);
         }
     }
-    // guards the window between the read above and the put (released after)
+    // guards the window between the read above and the put
     let key = format!("cc:{routing}");
     if !crate::xrpc::internal::claim_transient_anywhere(app, &routing, &key, now + 60).await? {
         return Ok(false);
@@ -198,8 +183,6 @@ pub async fn claim_code_challenge(app: &App, challenge: &str) -> Result<bool, OA
     r.map(|_| true)
 }
 
-// ---------- sessions ----------
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -207,18 +190,17 @@ pub struct Session {
     pub client_id: String,
     pub client_auth: ClientAuth,
     pub dpop_jkt: String,
-    /// Scope approved by the user (may contain `include:` scopes).
+    /// As approved: may contain `include:` scopes.
     pub scope: String,
-    /// Scope of the current access token (`include:` expanded).
+    /// `include:` expanded.
     pub token_scope: String,
     pub created_at: i64,
-    /// Last token issuance (refresh-token lifetime counts from here).
+    /// Last token issuance: the refresh-token lifetime counts from here.
     pub updated_at: i64,
-    /// Current access token expiry.
     pub expires_at: i64,
-    /// Current access token id (`jti`); older access tokens are rejected.
+    /// The current access token's `jti`; older access tokens are rejected.
     pub token_id: String,
-    /// Refresh token generation; tokens of older generations are replays.
+    /// Tokens of older generations are replays.
     pub refresh_gen: u64,
     pub refresh_salt: String,
     #[serde(default)]
@@ -235,7 +217,7 @@ pub async fn get_session(app: &App, did: &str, id: &str) -> Result<Option<Sessio
     get(app, did, &session_key(id)).await
 }
 
-/// A session and its stored bytes (the condition of its rewrite).
+/// The stored bytes are the condition of its rewrite.
 pub async fn get_session_raw(app: &App, did: &str, id: &str) -> Result<Option<(Session, Bytes)>, OAuthError> {
     match app.get_private(did, &session_key(id)).await? {
         None => Ok(None),
@@ -245,19 +227,15 @@ pub async fn get_session_raw(app: &App, did: &str, id: &str) -> Result<Option<(S
     }
 }
 
-/// What a session write is conditional on.
 pub enum SessionGuard {
-    /// A refresh: the row still holds these bytes (not revoked, not rotated
-    /// meanwhile).
+    /// A refresh: not revoked or rotated meanwhile.
     Row(Bytes),
-    /// A code exchange: no such row yet, and the account's credential epoch
-    /// is still the approving login's.
+    /// A code exchange: no such row yet, and the credential epoch is still
+    /// the approving login's.
     New { auth_epoch: String },
 }
 
-/// Writes `s` if `guard` holds, at the owner and serialized with every
-/// other write of the account's OAuth rows (src/xrpc/cas.rs). Ok(false) =
-/// it didn't (revoked or rotated meanwhile): nothing written.
+/// Ok(false): revoked or rotated meanwhile, nothing written.
 pub async fn put_session_if(app: &App, s: &Session, guard: SessionGuard) -> Result<bool, OAuthError> {
     let name = session_key(&s.id);
     let conds = match guard {
@@ -271,8 +249,6 @@ pub async fn delete_session(app: &App, did: &str, id: &str) -> Result<(), OAuthE
     put::<Session>(app, did, &session_key(id), None).await
 }
 
-/// All OAuth sessions of an account (prefix scan of its private keys, on
-/// its owner if that is another node).
 pub async fn list_sessions(app: &App, did: &str) -> Result<Vec<Session>, OAuthError> {
     let rows = crate::xrpc::internal::scan_private_anywhere(app, did, "oauth/ses/").await?;
     Ok(rows
@@ -281,34 +257,21 @@ pub async fn list_sessions(app: &App, did: &str) -> Result<Vec<Session>, OAuthEr
         .collect())
 }
 
-/// Deletes every OAuth session of `did` and replaces its credential epoch,
-/// in one conditional write at the owner (src/xrpc/cas.rs): its DPoP access
-/// tokens stop verifying (verify_dpop requires the live session), its
-/// refresh tokens are dead, and neither a refresh nor a code exchange
-/// racing this can bring a session back (both write conditionally:
-/// [`put_session_if`]); device logins and codes approved before it are void
-/// (`crate::xrpc::auth_epoch`). Used by takedowns, password change/reset,
-/// deletion and credential deletion. Returns how many sessions were revoked.
+/// Also replaces the credential epoch in the same write, so neither a
+/// refresh nor a code exchange racing this can bring a session back, and
+/// device logins and codes approved before it are void. Returns how many
+/// sessions were revoked.
 pub async fn revoke_all_sessions(app: &App, did: &str) -> Result<usize, OAuthError> {
     let ops = vec![crate::xrpc::new_auth_epoch_op(), Op::DeletePrefix { prefix: "oauth/ses/".into() }];
     let out = app.private_cas(did, Vec::new(), ops).await?;
     Ok(out.deleted.len())
 }
 
-/// Refresh tokens: `ref-{b64u(did)}.{session id}.{generation}.{mac}` where
-/// mac = HMAC(server refresh key, did | session | generation | session salt).
-/// Embedding the routing info avoids a token index; the per-session salt
-/// means tokens can't be minted from the server secret alone.
+/// `ref-{b64u(did)}.{session id}.{generation}.{mac}`: the routing info
+/// avoids a token index, and the per-session salt in the MAC means tokens
+/// can't be minted from the server secret alone.
 pub fn refresh_token(key: &[u8; 32], s: &Session) -> String {
-    let mac = hmac_sha256(
-        key,
-        &[
-            s.did.as_bytes(),
-            s.id.as_bytes(),
-            &s.refresh_gen.to_be_bytes(),
-            s.refresh_salt.as_bytes(),
-        ],
-    );
+    let mac = refresh_mac(key, s, s.refresh_gen);
     format!(
         "ref-{}.{}.{}.{}",
         b64u(s.did.as_bytes()),
@@ -316,6 +279,10 @@ pub fn refresh_token(key: &[u8; 32], s: &Session) -> String {
         s.refresh_gen,
         b64u(mac)
     )
+}
+
+fn refresh_mac(key: &[u8; 32], s: &Session, generation: u64) -> [u8; 32] {
+    hmac_sha256(key, &[s.did.as_bytes(), s.id.as_bytes(), &generation.to_be_bytes(), s.refresh_salt.as_bytes()])
 }
 
 pub struct ParsedRefresh {
@@ -343,30 +310,18 @@ pub fn parse_refresh_token(t: &str) -> Option<ParsedRefresh> {
 }
 
 impl ParsedRefresh {
-    /// Whether this token was genuinely issued for `s` (any generation).
+    /// Issued for `s`, any generation.
     pub fn authentic(&self, key: &[u8; 32], s: &Session) -> bool {
-        let mac = hmac_sha256(
-            key,
-            &[
-                s.did.as_bytes(),
-                s.id.as_bytes(),
-                &self.generation.to_be_bytes(),
-                s.refresh_salt.as_bytes(),
-            ],
-        );
-        super::util::ct_eq(&mac, &self.mac)
+        super::util::ct_eq(&refresh_mac(key, s, self.generation), &self.mac)
     }
 }
-
-// ---------- devices (browser sessions) ----------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeviceAccount {
     pub did: String,
     pub authenticated_at: i64,
-    /// The account's credential epoch at the password check
-    /// (`crate::xrpc::epoch_for_login`): the login counts only while it is
-    /// current (a password change or takedown signs the device out).
+    /// At the password check: a password change or takedown signs the
+    /// device out.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auth_epoch: String,
 }
@@ -383,11 +338,9 @@ pub struct Device {
     /// Password verified, second factor pending: (did, at).
     #[serde(default)]
     pub pending_2fa: Option<(String, i64)>,
-    /// Wrong codes against `pending_2fa`; past a few the password step must
-    /// be redone.
+    /// Past a few, the password step must be redone.
     #[serde(default)]
     pub pending_2fa_failures: u32,
-    /// Credential epoch of the `pending_2fa` password check.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pending_2fa_epoch: String,
 }
@@ -397,11 +350,7 @@ pub fn new_device_id() -> String {
 }
 
 pub fn valid_device_id(id: &str) -> bool {
-    id.starts_with("dev-")
-        && id.len() < 64
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    valid_id(id, "dev-")
 }
 
 pub async fn get_device(app: &App, id: &str) -> Result<Option<Device>, OAuthError> {
@@ -411,8 +360,6 @@ pub async fn get_device(app: &App, id: &str) -> Result<Option<Device>, OAuthErro
 pub async fn put_device(app: &App, d: &Device) -> Result<(), OAuthError> {
     put(app, &format!("oauth:dev:{}", d.id), "oauth/dev", Some(d)).await
 }
-
-// ---------- remembered consent ----------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Authorization {
@@ -436,8 +383,6 @@ pub async fn get_authorization(
 pub async fn put_authorization(app: &App, did: &str, a: &Authorization) -> Result<(), OAuthError> {
     put(app, did, &authz_key(&a.client_id), Some(a)).await
 }
-
-// ---------- lexicons ----------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredLexicon {
