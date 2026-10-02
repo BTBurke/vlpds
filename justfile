@@ -92,3 +92,30 @@ dashboards *args:
 # CPU profile of a running vlpds (built with --features profiling): top functions by self and cumulative time
 profile host="127.0.0.1:2583" seconds="10" *args:
     bench/obs/profile.sh {{args}} {{host}} {{seconds}}
+
+# Benchbox bench campaigns (bench/benchbox/README.md): unattended, packed into batch pipeline windows,
+# results in bench/results/<name>/ (SUMMARY.md).
+
+# ~20 min regression check of HEAD (or the given commits): 2 write grids, read sweep 1M/10M, methods, proxy, failover
+benchbox-quick *shas:
+    bench/benchbox/campaign.sh quick {{shas}}
+
+# ~45 min: the full single-box set (3 grids, all methods, 4-size read sweep, proxy, coldload x2, restarts, failover)
+benchbox-full *shas:
+    bench/benchbox/campaign.sh full {{shas}}
+
+# A/B the given commits (grid 10k/5k inj25 + methods sample each, parallel cached builds); ROUNDS=2 runs ABBA
+benchbox-bisect +shas:
+    bench/benchbox/campaign.sh bisect {{shas}}
+
+# Shard-count sweep for the cost model (16/32/64/256 shards, ~21 min per count)
+benchbox-cost *shas:
+    bench/benchbox/campaign.sh cost {{shas}}
+
+# Re-attach to a running campaign (stream its log, copy the results back)
+benchbox-attach name:
+    bench/benchbox/campaign.sh attach {{name}}
+
+# Running campaign, cached builds, population snapshots, batch guard
+benchbox-status:
+    bench/benchbox/campaign.sh status

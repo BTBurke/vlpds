@@ -130,6 +130,14 @@ enum Cmd {
         fill_concurrency: usize,
         #[arg(long, default_value = "")]
         json_out: String,
+        /// Fixed handles (sw<size>.vlpds.test): a repo an earlier --reuse run
+        /// filled is logged into and read as is instead of created and filled
+        /// again (bench/benchbox population snapshots).
+        #[arg(long)]
+        reuse: bool,
+        /// Create and fill the repos, skip the read benchmarks.
+        #[arg(long)]
+        fill_only: bool,
     },
     Fanout {
         #[arg(long, default_value_t = 10)]
@@ -368,8 +376,8 @@ fn main() -> anyhow::Result<()> {
                     .await
             }
             Cmd::CloneRepo { car, copies, concurrency, blobs_dir } => clone_repo(&args, car, *copies, *concurrency, blobs_dir).await,
-            Cmd::Sweep { sizes, concurrency, seconds, fill_concurrency, json_out } => {
-                sweep(&args, sizes, *concurrency, *seconds, *fill_concurrency, json_out).await
+            Cmd::Sweep { sizes, concurrency, seconds, fill_concurrency, json_out, reuse, fill_only } => {
+                sweep(&args, sizes, *concurrency, *seconds, *fill_concurrency, json_out, *reuse, *fill_only).await
             }
             Cmd::Bulk { start, count, batch, max_request_records, concurrency, admin_token, progress_file, dist } => {
                 let d = Dist::new(dist)?;
@@ -1699,115 +1707,157 @@ async fn verify(args: &Args, acked: &str) -> anyhow::Result<()> {
 
 // ---------------- repo-size sweep ----------------
 
-async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, fill_concurrency: usize, json_out: &str) -> anyhow::Result<()> {
+/// A sweep repo an earlier `sweep --reuse` filled: (did, its blobs' CIDs),
+/// or None if `sw<size>.vlpds.test` doesn't exist.
+async fn sweep_reuse(c: &reqwest::Client, h: &str, size: usize) -> anyhow::Result<Option<(String, Vec<(String, u64)>)>> {
+    let r = c
+        .post(format!("{h}/xrpc/com.atproto.server.createSession"))
+        .json(&json!({"identifier": format!("sw{size}.vlpds.test"), "password": "hunter2"}))
+        .send()
+        .await?;
+    if !r.status().is_success() {
+        return Ok(None);
+    }
+    let v: serde_json::Value = r.json().await?;
+    let did = v["did"].as_str().ok_or_else(|| anyhow::anyhow!("createSession: {v}"))?.to_string();
+    let mut blobs = Vec::new();
+    let mut cursor = String::new();
+    loop {
+        let mut u = format!("{h}/xrpc/com.atproto.sync.listBlobs?did={did}&limit=1000");
+        if !cursor.is_empty() {
+            u.push_str(&format!("&cursor={cursor}"));
+        }
+        let v: serde_json::Value = c.get(u).send().await?.json().await?;
+        let page = v["cids"].as_array().cloned().unwrap_or_default();
+        blobs.extend(page.iter().filter_map(|c| c.as_str()).map(|c| (c.to_string(), 0u64)));
+        match v["cursor"].as_str() {
+            Some(cur) if !page.is_empty() => cursor = cur.to_string(),
+            _ => break,
+        }
+    }
+    Ok(Some((did, blobs)))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, fill_concurrency: usize, json_out: &str, reuse: bool, fill_only: bool) -> anyhow::Result<()> {
     let c = client();
     let h = args.host.clone();
     let mut out = String::new();
     for &size in sizes {
-        // 1. account + fill
-        let handle = format!("sw{size}x{}.vlpds.test", rand::random::<u16>());
-        let r: serde_json::Value = c
-            .post(format!("{h}/xrpc/com.atproto.server.createAccount"))
-            .json(&json!({"handle": handle, "password": "hunter2", "email": format!("{}@example.com", handle.replace('.', "-"))}))
-            .send()
-            .await?
-            .json()
-            .await?;
-        let did = r["did"].as_str().ok_or_else(|| anyhow::anyhow!("createAccount: {r}"))?.to_string();
-        let token = r["accessJwt"].as_str().unwrap().to_string();
-        // 1b. blobs: one distinct small blob per 100 records (<= 100k), so
-        // listBlobs pages over a realistic blob index
-        let nblobs = (size / 100).min(100_000);
-        let t = Instant::now();
-        let blobs: Vec<(String, u64)> = futures::stream::iter(0..nblobs)
-            .map(|b| {
-                let (c, h, token) = (c.clone(), h.clone(), token.clone());
-                async move {
-                    let body = format!("sweep blob {b} {}", rand::random::<u64>()).into_bytes();
-                    let size = body.len() as u64;
-                    let v: serde_json::Value = c
-                        .post(format!("{h}/xrpc/com.atproto.repo.uploadBlob"))
-                        .bearer_auth(&token)
-                        .header("content-type", "image/jpeg")
-                        .body(body)
-                        .send()
-                        .await?
-                        .json()
-                        .await?;
-                    let cid = v["blob"]["ref"]["$link"].as_str().ok_or_else(|| anyhow::anyhow!("uploadBlob: {v}"))?.to_string();
-                    anyhow::Ok((cid, size))
-                }
-            })
-            .buffer_unordered(64)
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<anyhow::Result<_>>()?;
-        let blobs = Arc::new(blobs);
-        if nblobs > 0 {
-            eprintln!("  {nblobs} blobs uploaded in {:.1}s", t.elapsed().as_secs_f64());
-        }
         // deterministic, time-ordered TID rkeys so reads can sample the whole repo
         const BASE_US: u64 = 1_600_000_000_000_000;
         let rkey_of = |i: usize| vlpds::tid::Tid::from_parts(BASE_US + i as u64 * 1000, 0).to_string();
-        let t = Instant::now();
-        let filled = Arc::new(AtomicU64::new(0));
-        let batches = size.div_ceil(200);
-        {
-            let pf = filled.clone();
-            let progress = tokio::spawn(async move {
-                let t = Instant::now();
-                loop {
-                    tokio::time::sleep(Duration::from_secs(10)).await;
-                    let n = pf.load(Ordering::Relaxed);
-                    eprintln!("  fill {size}: {n} records ({:.0}/s)", n as f64 / t.elapsed().as_secs_f64());
-                }
-            });
-            futures::stream::iter(0..batches)
+        // 1. account + fill (--reuse: the repo an earlier --reuse run filled, if any)
+        let reused = if reuse { sweep_reuse(&c, &h, size).await? } else { None };
+        let (did, blobs, fill_secs) = if let Some((did, blobs)) = reused {
+            eprintln!("== repo of {size} records reused ({did}, {} blobs)", blobs.len());
+            (did, Arc::new(blobs), None)
+        } else {
+            let handle = if reuse { format!("sw{size}.vlpds.test") } else { format!("sw{size}x{}.vlpds.test", rand::random::<u16>()) };
+            let r: serde_json::Value = c
+                .post(format!("{h}/xrpc/com.atproto.server.createAccount"))
+                .json(&json!({"handle": handle, "password": "hunter2", "email": format!("{}@example.com", handle.replace('.', "-"))}))
+                .send()
+                .await?
+                .json()
+                .await?;
+            let did = r["did"].as_str().ok_or_else(|| anyhow::anyhow!("createAccount: {r}"))?.to_string();
+            let token = r["accessJwt"].as_str().unwrap().to_string();
+            // 1b. blobs: one distinct small blob per 100 records (<= 100k), so
+            // listBlobs pages over a realistic blob index
+            let nblobs = (size / 100).min(100_000);
+            let t = Instant::now();
+            let blobs: Vec<(String, u64)> = futures::stream::iter(0..nblobs)
                 .map(|b| {
-                    let (c, h, did, token, filled, blobs) = (c.clone(), h.clone(), did.clone(), token.clone(), filled.clone(), blobs.clone());
+                    let (c, h, token) = (c.clone(), h.clone(), token.clone());
                     async move {
-                        let n = (size - b * 200).min(200);
-                        let writes: Vec<_> = (0..n)
-                            .map(|j| {
-                                let i = b * 200 + j;
-                                let mut v = post_record(i as u64);
-                                if i % 100 == 0 && i / 100 < blobs.len() {
-                                    let (cid, sz) = &blobs[i / 100];
-                                    v["embed"] = json!({"$type": "app.bsky.embed.images", "images": [{"alt": "", "image": {"$type": "blob", "ref": {"$link": cid}, "mimeType": "image/jpeg", "size": sz}}]});
-                                }
-                                json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "rkey": rkey_of(i), "value": v})
-                            })
-                            .collect();
-                        let body = json!({"repo": did, "writes": writes});
-                        for attempt in 0..5 {
-                            let resp = c
-                                .post(format!("{h}/xrpc/com.atproto.repo.applyWrites"))
-                                .bearer_auth(&token)
-                                .json(&body)
-                                .send()
-                                .await?;
-                            if resp.status().is_success() {
-                                filled.fetch_add(n as u64, Ordering::Relaxed);
-                                return anyhow::Ok(());
-                            }
-                            if attempt == 4 {
-                                anyhow::bail!("fill failed: {}", resp.text().await?);
-                            }
-                            tokio::time::sleep(Duration::from_millis(200)).await;
-                        }
-                        Ok(())
+                        let body = format!("sweep blob {b} {}", rand::random::<u64>()).into_bytes();
+                        let size = body.len() as u64;
+                        let v: serde_json::Value = c
+                            .post(format!("{h}/xrpc/com.atproto.repo.uploadBlob"))
+                            .bearer_auth(&token)
+                            .header("content-type", "image/jpeg")
+                            .body(body)
+                            .send()
+                            .await?
+                            .json()
+                            .await?;
+                        let cid = v["blob"]["ref"]["$link"].as_str().ok_or_else(|| anyhow::anyhow!("uploadBlob: {v}"))?.to_string();
+                        anyhow::Ok((cid, size))
                     }
                 })
-                .buffer_unordered(fill_concurrency)
+                .buffer_unordered(64)
                 .collect::<Vec<_>>()
                 .await
                 .into_iter()
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            progress.abort();
+                .collect::<anyhow::Result<_>>()?;
+            let blobs = Arc::new(blobs);
+            if nblobs > 0 {
+                eprintln!("  {nblobs} blobs uploaded in {:.1}s", t.elapsed().as_secs_f64());
+            }
+            let t = Instant::now();
+            let filled = Arc::new(AtomicU64::new(0));
+            let batches = size.div_ceil(200);
+            {
+                let pf = filled.clone();
+                let progress = tokio::spawn(async move {
+                    let t = Instant::now();
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        let n = pf.load(Ordering::Relaxed);
+                        eprintln!("  fill {size}: {n} records ({:.0}/s)", n as f64 / t.elapsed().as_secs_f64());
+                    }
+                });
+                futures::stream::iter(0..batches)
+                    .map(|b| {
+                        let (c, h, did, token, filled, blobs) = (c.clone(), h.clone(), did.clone(), token.clone(), filled.clone(), blobs.clone());
+                        async move {
+                            let n = (size - b * 200).min(200);
+                            let writes: Vec<_> = (0..n)
+                                .map(|j| {
+                                    let i = b * 200 + j;
+                                    let mut v = post_record(i as u64);
+                                    if i % 100 == 0 && i / 100 < blobs.len() {
+                                        let (cid, sz) = &blobs[i / 100];
+                                        v["embed"] = json!({"$type": "app.bsky.embed.images", "images": [{"alt": "", "image": {"$type": "blob", "ref": {"$link": cid}, "mimeType": "image/jpeg", "size": sz}}]});
+                                    }
+                                    json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "rkey": rkey_of(i), "value": v})
+                                })
+                                .collect();
+                            let body = json!({"repo": did, "writes": writes});
+                            for attempt in 0..5 {
+                                let resp = c
+                                    .post(format!("{h}/xrpc/com.atproto.repo.applyWrites"))
+                                    .bearer_auth(&token)
+                                    .json(&body)
+                                    .send()
+                                    .await?;
+                                if resp.status().is_success() {
+                                    filled.fetch_add(n as u64, Ordering::Relaxed);
+                                    return anyhow::Ok(());
+                                }
+                                if attempt == 4 {
+                                    anyhow::bail!("fill failed: {}", resp.text().await?);
+                                }
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
+                            Ok(())
+                        }
+                    })
+                    .buffer_unordered(fill_concurrency)
+                    .collect::<Vec<_>>()
+                    .await
+                    .into_iter()
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                progress.abort();
+            }
+            let fill_secs = t.elapsed().as_secs_f64();
+            eprintln!("== repo of {size} records filled in {fill_secs:.1}s ({:.0} records/s)", size as f64 / fill_secs);
+            (did, blobs, Some(fill_secs))
+        };
+        if fill_only {
+            continue;
         }
-        let fill_secs = t.elapsed().as_secs_f64();
-        eprintln!("== repo of {size} records filled in {fill_secs:.1}s ({:.0} records/s)", size as f64 / fill_secs);
         // 2. sample rkeys uniformly over the repo, and record CIDs for getBlocks
         let rkeys: Vec<String> = (0..2000).map(|_| rkey_of(rand::thread_rng().gen_range(0..size))).collect();
         let mut cids = Vec::new();
@@ -1832,7 +1882,10 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
         };
         // 3. read methods, closed loop
         let methods = ["getRecord", "listRecords", "listRecordsDeep", "describeRepo", "getLatestCommit", "getRepoStatus", "sync.getRecord", "getBlocks10", "listBlobs", "listBlobsDeep"];
-        println!("\n### repo size {size}  (fill {:.0} rec/s)", size as f64 / fill_secs);
+        match fill_secs {
+            Some(f) => println!("\n### repo size {size}  (fill {:.0} rec/s)", size as f64 / f),
+            None => println!("\n### repo size {size}  (reused)"),
+        }
         println!("{:<18} {:>10} {:>9} {:>9} {:>9} {:>7}", "method", "ops/s", "p50 ms", "p99 ms", "max ms", "errors");
         for m in methods {
             let deadline = Instant::now() + Duration::from_secs(seconds);
@@ -1918,7 +1971,10 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
             out.push_str(&serde_json::to_string(&json!({"size": size, "method": "getRepo", "run": i, "bytes": bytes, "secs": secs, "ttfb_ms": ttfb * 1000.0}))?);
             out.push('\n');
         }
-        out.push_str(&serde_json::to_string(&json!({"size": size, "method": "_fill", "secs": fill_secs, "records_per_s": size as f64 / fill_secs}))?);
+        out.push_str(&serde_json::to_string(&match fill_secs {
+            Some(f) => json!({"size": size, "method": "_fill", "secs": f, "records_per_s": size as f64 / f}),
+            None => json!({"size": size, "method": "_fill", "reused": true}),
+        })?);
         out.push('\n');
         if !json_out.is_empty() {
             std::fs::write(json_out, &out)?;
