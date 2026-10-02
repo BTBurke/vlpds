@@ -9,10 +9,7 @@ async fn limited() -> TestServer {
 }
 
 fn num(r: &Resp, h: &str) -> i64 {
-    r.header(h)
-        .unwrap_or_else(|| panic!("missing {h}: {:?}", r.headers))
-        .parse()
-        .unwrap()
+    r.header(h).unwrap_or_else(|| panic!("missing {h}: {:?}", r.headers)).parse().unwrap()
 }
 
 fn create(coll: &str, rkey: String) -> J {
@@ -39,15 +36,7 @@ async fn headers_on_every_xrpc_response() {
     r3.client_err();
     assert_eq!(num(&r3, "ratelimit-remaining"), rem1 - 2);
     // browsers can read them (CORS)
-    let r = s
-        .xrpc
-        .send(
-            s.xrpc
-                .http
-                .get(format!("{}/xrpc/com.atproto.server.describeServer", s.url))
-                .header("origin", "https://example.com"),
-        )
-        .await;
+    let r = s.xrpc.send(s.xrpc.http.get(format!("{}/xrpc/com.atproto.server.describeServer", s.url)).header("origin", "https://example.com")).await;
     let expose = r.header("access-control-expose-headers").unwrap_or_default().to_ascii_lowercase();
     for h in ["ratelimit-limit", "ratelimit-remaining", "ratelimit-reset", "ratelimit-policy", "retry-after"] {
         assert!(expose.contains(h), "{h} not exposed: {expose}");
@@ -135,32 +124,20 @@ async fn repo_write_points_per_did() {
     // repo-write-hour: 5000 points; create=3, update=2, delete=1
     for batch in 0..8 {
         let writes: Vec<J> = (0..200).map(|i| create(coll, format!("b{batch}k{i}"))).collect();
-        s.xrpc
-            .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth())
-            .await
-            .ok(); // 600 points each -> 4800
+        s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok(); // 600 points each -> 4800
     }
     s.xrpc
         .post("com.atproto.repo.putRecord", &json!({"repo": a.did, "collection": coll, "rkey": "b0k0", "record": {"$type": coll, "i": 2}}), &a.auth())
         .await
         .ok(); // 4802
-    s.xrpc
-        .post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": coll, "rkey": "b0k1"}), &a.auth())
-        .await
-        .ok(); // 4803
+    s.xrpc.post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": coll, "rkey": "b0k1"}), &a.auth()).await.ok(); // 4803
     let writes: Vec<J> = (0..65).map(|i| create(coll, format!("c{i}"))).collect();
-    let r = s
-        .xrpc
-        .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth())
-        .await;
+    let r = s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await;
     r.ok(); // 4998
     assert_eq!(num(&r, "ratelimit-remaining"), 2, "tightest bucket is repo-write-hour: {:?}", r.headers);
     assert_eq!(r.header("ratelimit-policy").as_deref(), Some("5000;w=3600"));
     let before = s.latest_commit(&a.did).await;
-    let r = s
-        .xrpc
-        .post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": coll, "record": {"$type": coll}}), &a.auth())
-        .await; // 5001
+    let r = s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": coll, "record": {"$type": coll}}), &a.auth()).await; // 5001
     r.err(429, "RateLimitExceeded");
     assert!(r.header("retry-after").is_some());
     assert_eq!(s.latest_commit(&a.did).await, before, "a rate-limited write must not commit");
@@ -206,10 +183,7 @@ async fn global_ip_limit() {
     assert_eq!(r.status, 200, "{}", r.text());
     assert_eq!(num(&r, "ratelimit-limit"), 6000);
     // admin bypasses
-    s.xrpc
-        .get("com.atproto.admin.getAccountInfo", &[("did", &a.did)], &Auth::Admin)
-        .await
-        .ok();
+    s.xrpc.get("com.atproto.admin.getAccountInfo", &[("did", &a.did)], &Auth::Admin).await.ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

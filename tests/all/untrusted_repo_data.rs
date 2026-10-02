@@ -13,10 +13,7 @@ const DEPTH: usize = 200_000;
 /// key-less `{e: [], l: child}` nodes.
 fn deep_car(did: &str, kp: &Keypair, rpath: &str, depth: usize) -> Vec<u8> {
     let mut blocks: Vec<(Cid, Vec<u8>)> = Vec::new();
-    let rec =
-        Value::from_json(&json!({"$type": "com.atproto.lexicon.schema", "id": "com.example.deep"}))
-            .unwrap()
-            .to_cbor();
+    let rec = Value::from_json(&json!({"$type": "com.atproto.lexicon.schema", "id": "com.example.deep"})).unwrap().to_cbor();
     let rec_cid = Cid::dag_cbor(&rec);
     blocks.push((rec_cid, rec));
     let node = |l: Option<Cid>, key: Option<&str>| {
@@ -85,12 +82,9 @@ fn signed_car(did: &str, kp: &Keypair, data: Cid, blocks: &[(Cid, Vec<u8>)]) -> 
 /// tree it has (fan + 1)^levels leaves: fan 40, 4 levels is ~116M entries
 /// from ~18 KB, and a few more levels exhaust memory.
 fn dag_car(did: &str, kp: &Keypair, rpath: &str, fan: usize, levels: i32) -> Vec<u8> {
-    use vlpds::mst::{encode_node, height_for_key, Entry, Node};
     use std::sync::Arc;
-    let rec =
-        Value::from_json(&json!({"$type": "com.atproto.lexicon.schema", "id": "com.example.dag"}))
-            .unwrap()
-            .to_cbor();
+    use vlpds::mst::{Entry, Node, encode_node, height_for_key};
+    let rec = Value::from_json(&json!({"$type": "com.atproto.lexicon.schema", "id": "com.example.dag"})).unwrap().to_cbor();
     let rec_cid = Cid::dag_cbor(&rec);
     let mut blocks = vec![(rec_cid, rec)];
     assert_eq!(height_for_key(rpath.as_bytes()), 0, "{rpath} must be a leaf key");
@@ -153,10 +147,7 @@ async fn import_repo_with_dag_mst_is_rejected_fast() {
     // past the old loader's memory: (41)^6 leaves
     let car = dag_car(&a.did, &Keypair::generate(), "com.example.dag/0", 40, 6);
     let t = std::time::Instant::now();
-    let r = s
-        .xrpc
-        .post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &a.auth())
-        .await;
+    let r = s.xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &a.auth()).await;
     assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
     r.err(400, "InvalidRequest");
     assert!(r.text().contains("more than once"), "{}", r.text());
@@ -174,10 +165,7 @@ fn record_proof_with_deep_mst_is_an_error() {
     let (shallow, deep) = std::thread::Builder::new()
         .stack_size(2 << 20)
         .spawn(move || {
-            (
-                vlpds::oauth::lexicon::verify_record_proof(&shallow, did, &key, rpath),
-                vlpds::oauth::lexicon::verify_record_proof(&deep, did, &key, rpath),
-            )
+            (vlpds::oauth::lexicon::verify_record_proof(&shallow, did, &key, rpath), vlpds::oauth::lexicon::verify_record_proof(&deep, did, &key, rpath))
         })
         .unwrap()
         .join()
@@ -192,26 +180,10 @@ fn record_proof_with_deep_mst_is_an_error() {
 async fn import_repo_with_deep_mst_is_rejected() {
     let s = TestServer::spawn().await;
     let a = s.create_account("deep").await;
-    let car = deep_car(
-        &a.did,
-        &Keypair::generate(),
-        "com.example.deep/3l3qo2vuowo2b",
-        DEPTH,
-    );
-    let r = s
-        .xrpc
-        .post_bytes(
-            "com.atproto.repo.importRepo",
-            car,
-            "application/vnd.ipld.car",
-            &a.auth(),
-        )
-        .await;
+    let car = deep_car(&a.did, &Keypair::generate(), "com.example.deep/3l3qo2vuowo2b", DEPTH);
+    let r = s.xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &a.auth()).await;
     r.err(400, "InvalidRequest");
     assert!(r.text().contains("too deep"), "{}", r.text());
     // the server is still up
-    s.xrpc
-        .get("com.atproto.server.describeServer", &[], &Auth::None)
-        .await
-        .ok();
+    s.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok();
 }

@@ -316,9 +316,8 @@ async fn migration_out_to_another_pds() {
     let st = new.xrpc.get("com.atproto.server.checkAccountStatus", &[], &auth).await.ok();
     assert_eq!(st["validDid"], json!(true), "{st}");
     new.xrpc.post_empty("com.atproto.server.activateAccount", &auth).await.ok();
-    let frames = new_sub
-        .until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#account" && f.did() == Some(did.as_str()) && f.bool("active") == Some(true)))
-        .await;
+    let frames =
+        new_sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#account" && f.did() == Some(did.as_str()) && f.bool("active") == Some(true))).await;
     assert!(frames.iter().any(|f| f.kind() == "#identity" && f.did() == Some(did.as_str())), "#identity after submit");
     // the new PDS serves the directory's document
     let new_doc = new.xrpc.get("com.atproto.identity.resolveDid", &[("did", &did)], &Auth::None).await.ok()["didDoc"].clone();
@@ -326,9 +325,7 @@ async fn migration_out_to_another_pds() {
     // 5. the old PDS steps back; it no longer controls the DID
     let mut old_sub = old.subscribe_from_now().await;
     old.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &alice.auth()).await.ok();
-    let fr = old_sub
-        .until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#account" && f.did() == Some(did.as_str())))
-        .await;
+    let fr = old_sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#account" && f.did() == Some(did.as_str()))).await;
     let fr = fr.iter().find(|f| f.kind() == "#account").unwrap();
     assert_eq!((fr.bool("active"), fr.str("status")), (Some(false), Some("deactivated")));
     // its DID now resolves through the directory, not to the stale local
@@ -446,12 +443,8 @@ async fn rotation_key_rotation() {
     a.app.log.checkpoint_all().await;
     vlpds::server::shutdown(&a.app).await;
 
-    let b = node(PlcConfig {
-        rotation_key: Some(RotationKey::Key(k2.clone())),
-        old_rotation_keys: vec![RotationKey::Key(k1.clone())],
-        ..Default::default()
-    })
-    .await;
+    let b =
+        node(PlcConfig { rotation_key: Some(RotationKey::Key(k2.clone())), old_rotation_keys: vec![RotationKey::Key(k1.clone())], ..Default::default() }).await;
     let rotate = |dry: bool| {
         let x = b.xrpc.clone();
         async move { x.post("vlpds.admin.rotatePlcKeys", &json!({"dryRun": dry}), &Auth::Admin).await.ok() }

@@ -22,23 +22,14 @@ async fn revocations_of_deleted_accounts_are_collected_after_expiry() {
     // a: one session ended (a family revocation), then the account deleted
     // (revoke-all); b: two password changes (two revoke-all rows)
     let sess = s.create_session(&a.handle, PASSWORD).await.ok();
-    s.xrpc
-        .post_empty("com.atproto.server.deleteSession", &Auth::Bearer(sess["refreshJwt"].as_str().unwrap().into()))
-        .await
-        .ok();
+    s.xrpc.post_empty("com.atproto.server.deleteSession", &Auth::Bearer(sess["refreshJwt"].as_str().unwrap().into())).await.ok();
     s.xrpc.post_empty("com.atproto.server.requestAccountDelete", &a.auth()).await.ok();
     let token = s.mail_token(&a.email).await.expect("delete token");
-    s.xrpc
-        .post("com.atproto.server.deleteAccount", &json!({"did": a.did, "password": PASSWORD, "token": token}), &Auth::None)
-        .await
-        .ok();
+    s.xrpc.post("com.atproto.server.deleteAccount", &json!({"did": a.did, "password": PASSWORD, "token": token}), &Auth::None).await.ok();
     for _ in 0..2 {
         s.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": b.email}), &Auth::None).await.ok();
         let t = s.mail_token(&b.email).await.expect("reset token");
-        s.xrpc
-            .post("com.atproto.server.resetPassword", &json!({"token": t, "password": PASSWORD}), &Auth::None)
-            .await
-            .ok();
+        s.xrpc.post("com.atproto.server.resetPassword", &json!({"token": t, "password": PASSWORD}), &Auth::None).await.ok();
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
     let ra = revocation_rows(&s, &a.did).await;

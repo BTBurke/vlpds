@@ -7,11 +7,7 @@ use std::collections::HashMap;
 
 /// Checks the per-DID chain of #commit events and returns them in order.
 fn check_chain(frames: &[Frame], did: &str) -> Vec<CommitEvt> {
-    let commits: Vec<CommitEvt> = frames
-        .iter()
-        .filter_map(|f| f.commit())
-        .filter(|c| c.repo == did)
-        .collect();
+    let commits: Vec<CommitEvt> = frames.iter().filter_map(|f| f.commit()).filter(|c| c.repo == did).collect();
     let mut last_seq = i64::MIN;
     let mut prev: Option<(String, Cid)> = None; // (rev, data)
     for c in &commits {
@@ -21,29 +17,12 @@ fn check_chain(frames: &[Frame], did: &str) -> Vec<CommitEvt> {
         assert_eq!(obj.rev, c.rev);
         assert_eq!(obj.did, did);
         if let Some((rev, data)) = &prev {
-            assert_eq!(
-                c.since.as_deref(),
-                Some(rev.as_str()),
-                "since must be the previous rev (seq {})",
-                c.seq
-            );
-            assert_eq!(
-                c.prev_data,
-                Some(*data),
-                "prevData must be the previous data (seq {})",
-                c.seq
-            );
+            assert_eq!(c.since.as_deref(), Some(rev.as_str()), "since must be the previous rev (seq {})", c.seq);
+            assert_eq!(c.prev_data, Some(*data), "prevData must be the previous data (seq {})", c.seq);
             assert!(c.rev > *rev, "revs must increase");
         }
-        let inv = c
-            .invert()
-            .unwrap_or_else(|e| panic!("seq {} inversion: {e}", c.seq));
-        assert_eq!(
-            Some(inv),
-            c.prev_data,
-            "seq {}: inverted root != prevData",
-            c.seq
-        );
+        let inv = c.invert().unwrap_or_else(|e| panic!("seq {} inversion: {e}", c.seq));
+        assert_eq!(Some(inv), c.prev_data, "seq {}: inverted root != prevData", c.seq);
         prev = Some((c.rev.clone(), obj.data));
     }
     commits
@@ -103,10 +82,7 @@ async fn concurrent_record_writes_all_land() {
         if i % 4 == 3 {
             for res in j["results"].as_array().unwrap() {
                 let uri = res["uri"].as_str().unwrap();
-                expected.insert(
-                    uri.splitn(4, '/').nth(3).unwrap().to_string(),
-                    res["cid"].as_str().unwrap().to_string(),
-                );
+                expected.insert(uri.splitn(4, '/').nth(3).unwrap().to_string(), res["cid"].as_str().unwrap().to_string());
             }
         } else {
             let rr = RecordRef::from_json(&j);
@@ -139,27 +115,15 @@ async fn concurrent_record_writes_all_land() {
     let repo = s.get_repo(&a.did).await;
     repo.check_block_hashes().unwrap();
     repo.commit().verify(&key).unwrap();
-    let entries: HashMap<String, String> = repo
-        .entries()
-        .into_iter()
-        .map(|(p, c)| (p, c.to_string()))
-        .collect();
+    let entries: HashMap<String, String> = repo.entries().into_iter().map(|(p, c)| (p, c.to_string())).collect();
     assert_eq!(entries, expected);
     for (path, cid) in &expected {
-        assert!(
-            repo.blocks.contains_key(&Cid::parse(cid).unwrap()),
-            "record block for {path} missing from CAR"
-        );
+        assert!(repo.blocks.contains_key(&Cid::parse(cid).unwrap()), "record block for {path} missing from CAR");
     }
 
     // the firehose chain for this repo is intact and ends at the head
     let (head, rev) = s.latest_commit(&a.did).await;
-    let frames = sub
-        .until(FH_TIMEOUT, |fs| {
-            fs.iter()
-                .any(|f| f.commit().map(|c| c.commit == head).unwrap_or(false))
-        })
-        .await;
+    let frames = sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.commit().map(|c| c.commit == head).unwrap_or(false))).await;
     let commits = check_chain(&frames, &a.did);
     assert_eq!(commits.last().unwrap().rev, rev);
     for c in &commits {
@@ -173,11 +137,7 @@ async fn concurrent_record_writes_all_land() {
         }
     }
     for path in expected.keys() {
-        assert_eq!(
-            seen.get(path),
-            Some(&1),
-            "{path} must appear in exactly one #commit"
-        );
+        assert_eq!(seen.get(path), Some(&1), "{path} must appear in exactly one #commit");
     }
 }
 
@@ -239,15 +199,8 @@ async fn concurrent_swap_record_null_exactly_one_wins() {
             r.err(400, "InvalidSwap");
         }
     }
-    assert_eq!(
-        winners.len(),
-        1,
-        "exactly one swapRecord=null writer may win"
-    );
-    let g = s
-        .get_record(&a.did, "app.bsky.actor.profile", "self")
-        .await
-        .ok();
+    assert_eq!(winners.len(), 1, "exactly one swapRecord=null writer may win");
+    let g = s.get_record(&a.did, "app.bsky.actor.profile", "self").await.ok();
     assert_eq!(g["cid"], winners[0]);
 }
 
@@ -283,17 +236,8 @@ async fn concurrent_writes_across_repos() {
         heads.insert(a.did.clone(), s.latest_commit(&a.did).await.0);
         assert_eq!(s.get_repo(&a.did).await.entries().len(), 15);
     }
-    let frames = sub
-        .until(FH_TIMEOUT, |fs| {
-            heads.iter().all(|(d, h)| {
-                fs.iter().any(|f| {
-                    f.commit()
-                        .map(|c| &c.repo == d && c.commit == *h)
-                        .unwrap_or(false)
-                })
-            })
-        })
-        .await;
+    let frames =
+        sub.until(FH_TIMEOUT, |fs| heads.iter().all(|(d, h)| fs.iter().any(|f| f.commit().map(|c| &c.repo == d && c.commit == *h).unwrap_or(false)))).await;
     for a in &accts {
         let commits = check_chain(&frames, &a.did);
         let ops: usize = commits.iter().map(|c| c.ops.len()).sum();

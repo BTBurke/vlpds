@@ -6,22 +6,15 @@ use crate::common::*;
 use std::time::Duration;
 
 async fn update_handle(s: &TestServer, a: &TestAccount, handle: &str) -> Resp {
-    s.xrpc
-        .post("com.atproto.identity.updateHandle", &json!({"handle": handle}), &a.auth())
-        .await
+    s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": handle}), &a.auth()).await
 }
 
 async fn resolve(s: &TestServer, handle: &str) -> Resp {
-    s.xrpc
-        .get("com.atproto.identity.resolveHandle", &[("handle", handle)], &Auth::None)
-        .await
+    s.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", handle)], &Auth::None).await
 }
 
 async fn describe(s: &TestServer, did: &str) -> J {
-    s.xrpc
-        .get("com.atproto.repo.describeRepo", &[("repo", did)], &Auth::None)
-        .await
-        .ok()
+    s.xrpc.get("com.atproto.repo.describeRepo", &[("repo", did)], &Auth::None).await.ok()
 }
 
 /// handles.test.ts "does not resolve unknown handles", "allows a user to
@@ -60,12 +53,7 @@ async fn ref_updates_to_external_handle() {
     update_handle(&s, &a, &ext).await.ok();
     let d = describe(&s, &a.did).await;
     assert_eq!(d["handle"], json!(ext));
-    let aka: Vec<&str> = d["didDoc"]["alsoKnownAs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
+    let aka: Vec<&str> = d["didDoc"]["alsoKnownAs"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
     assert!(aka.contains(&format!("at://{ext}").as_str()), "{aka:?}");
 }
 
@@ -77,12 +65,7 @@ async fn ref_updates_to_external_handle() {
 async fn ref_unresolvable_external_handle_message() {
     let s = TestServer::spawn_with(|c| c.dev_mode = false).await;
     let a = s.create_account("alice").await;
-    let r = tokio::time::timeout(
-        Duration::from_secs(20),
-        update_handle(&s, &a, "noexist-vlpds-ref.example.com"),
-    )
-    .await
-    .expect("bounded");
+    let r = tokio::time::timeout(Duration::from_secs(20), update_handle(&s, &a, "noexist-vlpds-ref.example.com")).await.expect("bounded");
     r.err(400, "InvalidRequest");
     assert!(r.text().contains("External handle did not resolve to DID"), "{}", r.text());
     assert_eq!(describe(&s, &a.did).await["handle"], json!(a.handle));
@@ -110,13 +93,7 @@ async fn ref_handle_length_with_long_service_domain() {
         let s = &s;
         async move {
             let email = format!("{}@example.com", unique_name("e"));
-            s.xrpc
-                .post(
-                    "com.atproto.server.createAccount",
-                    &json!({"handle": handle, "password": "pw-123456", "email": email}),
-                    &Auth::None,
-                )
-                .await
+            s.xrpc.post("com.atproto.server.createAccount", &json!({"handle": handle, "password": "pw-123456", "email": email}), &Auth::None).await
         }
     };
     let r = try_create(format!("usernamepartover18c.{domain}")).await;
@@ -139,9 +116,7 @@ impl vlpds::handle_resolver::TxtResolver for StubTxt {
 
 impl StubTxt {
     fn set(&self, handle: &str, records: &[&str]) {
-        self.0
-            .lock()
-            .insert(format!("_atproto.{handle}."), records.iter().map(|r| r.to_string()).collect());
+        self.0.lock().insert(format!("_atproto.{handle}."), records.iter().map(|r| r.to_string()).collect());
     }
 }
 

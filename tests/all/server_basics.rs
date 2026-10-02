@@ -14,11 +14,7 @@ async fn unknown_xrpc_method_without_appview() {
     // no AppView configured: an unknown method is not implemented (not a 500)
     let s = TestServer::spawn().await;
     let r = s.xrpc.get("com.example.doesNotExist", &[], &Auth::None).await;
-    assert!(
-        r.status == 501 || r.status == 404 || r.status == 400,
-        "unknown XRPC method should be a clean 4xx/501, got {}",
-        r.text()
-    );
+    assert!(r.status == 501 || r.status == 404 || r.status == 400, "unknown XRPC method should be a clean 4xx/501, got {}", r.text());
     assert!(r.error_name().is_some(), "XRPC error envelope expected: {}", r.text());
 }
 
@@ -27,10 +23,7 @@ async fn limits_size_of_json_input() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
     let body = format!("\"{}\"", "x".repeat(150 * 1024));
-    let r = s
-        .xrpc
-        .post_bytes("com.atproto.identity.updateHandle", body.into_bytes(), "application/json", &a.auth())
-        .await;
+    let r = s.xrpc.post_bytes("com.atproto.identity.updateHandle", body.into_bytes(), "application/json", &a.auth()).await;
     assert_eq!(r.status, 413, "150 KiB JSON body to updateHandle: {}", r.text());
 }
 
@@ -51,14 +44,7 @@ async fn compresses_large_json_and_car_responses_only() {
         let x = s.xrpc.clone();
         async move { x.send(x.http.get(url).header("accept-encoding", "gzip")).await }
     };
-    let r = get(format!(
-        "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
-        s.url,
-        a.did,
-        p.collection(),
-        p.rkey()
-    ))
-    .await;
+    let r = get(format!("{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}", s.url, a.did, p.collection(), p.rkey())).await;
     assert_eq!(r.status, 200);
     assert_eq!(r.header("content-encoding").as_deref(), Some("gzip"), "large getRecord JSON not compressed");
 
@@ -83,10 +69,7 @@ async fn healthcheck() {
 async fn malformed_json_and_missing_params_are_400() {
     let s = TestServer::spawn().await;
     let a = s.create_account("bob").await;
-    let r = s
-        .xrpc
-        .post_bytes("com.atproto.repo.createRecord", b"{not json".to_vec(), "application/json", &a.auth())
-        .await;
+    let r = s.xrpc.post_bytes("com.atproto.repo.createRecord", b"{not json".to_vec(), "application/json", &a.auth()).await;
     assert_eq!(r.status, 400, "malformed JSON: {}", r.text());
     let r = s.xrpc.get("com.atproto.repo.getRecord", &[("repo", &a.did)], &Auth::None).await;
     assert_eq!(r.status, 400, "missing required params: {}", r.text());

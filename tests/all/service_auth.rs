@@ -2,8 +2,8 @@
 //! independent verification of the issued JWT: the ES256K signature must
 //! verify against the `#atproto` key in the account's DID document (what a
 //! receiving service does), and iss/aud/lxm/exp/iat/jti must be well formed.
-use base64::Engine;
 use crate::common::*;
+use base64::Engine;
 
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
@@ -42,13 +42,7 @@ async fn service_auth(s: &TestServer, auth: &Auth, q: &[(&str, &str)]) -> Resp {
 }
 
 async fn pds_did(s: &TestServer) -> String {
-    s.xrpc
-        .get("com.atproto.server.describeServer", &[], &Auth::None)
-        .await
-        .ok()["did"]
-        .as_str()
-        .unwrap()
-        .to_string()
+    s.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok()["did"].as_str().unwrap().to_string()
 }
 
 fn now() -> i64 {
@@ -105,11 +99,7 @@ async fn rejects_malformed_aud() {
     for aud in ["not-a-did".to_string(), "did:foo:bar".to_string(), format!("{pds}#")] {
         let r = service_auth(&s, &a.auth(), &[("aud", &aud), ("lxm", "com.atproto.server.describeServer")]).await;
         r.err(400, "InvalidRequest");
-        assert!(
-            r.json["message"].as_str().unwrap_or("").contains("aud must be a valid atproto DID or did#serviceId reference"),
-            "aud {aud}: {}",
-            r.text()
-        );
+        assert!(r.json["message"].as_str().unwrap_or("").contains("aud must be a valid atproto DID or did#serviceId reference"), "aud {aud}: {}", r.text());
     }
 }
 
@@ -177,11 +167,7 @@ async fn token_and_commit_key_track_signing_key_rotation() {
     let pds = pds_did(&s).await;
     let old = s.signing_key(&a.did).await;
     let mut sub = s.subscribe(None).await;
-    let r = s
-        .xrpc
-        .post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin)
-        .await
-        .ok();
+    let r = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.ok();
     let new_did_key = r["signingKey"].as_str().expect("signingKey in response").to_string();
     let new = decode_did_key_k256(&new_did_key).unwrap();
     let cur = s.signing_key(&a.did).await;
@@ -200,8 +186,6 @@ async fn token_and_commit_key_track_signing_key_rotation() {
     repo.commit().verify(&cur).expect("commit after rotation must be signed with the new key");
 
     // relays learn about the key change via #identity
-    let (frames, ok) = sub
-        .try_until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.did() == Some(a.did.as_str()) && f.kind() == "#identity"))
-        .await;
+    let (frames, ok) = sub.try_until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.did() == Some(a.did.as_str()) && f.kind() == "#identity")).await;
     assert!(ok, "no #identity event after signing key rotation; got {:?}", frames.iter().map(|f| f.kind().to_string()).collect::<Vec<_>>());
 }

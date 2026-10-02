@@ -4,8 +4,8 @@
 //! admin sendEmail goes to the moderation mailer when one is configured,
 //! else the main one; transient (4xx) failures are retried, permanent (5xx)
 //! ones are not; a full queue drops instead of blocking the request path.
-use base64::Engine;
 use crate::common::*;
+use base64::Engine;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
-use vlpds::mail::{SharedMailer, SmtpConfig, SmtpMailer, MAIL_MESSAGES, MAIL_RETRIES};
+use vlpds::mail::{MAIL_MESSAGES, MAIL_RETRIES, SharedMailer, SmtpConfig, SmtpMailer};
 use vlpds::xrpc::{Mail, Mailer};
 
 #[derive(Debug)]
@@ -99,10 +99,7 @@ async fn fake_smtp(mail_from_replies: &[&str]) -> (SocketAddr, mpsc::UnboundedRe
 }
 
 fn cfg(addr: SocketAddr) -> SmtpConfig {
-    SmtpConfig {
-        backoff: vec![Duration::from_millis(20); 3],
-        ..SmtpConfig::new(format!("smtp://{addr}"), "vlpds <noreply@vlpds.test>")
-    }
+    SmtpConfig { backoff: vec![Duration::from_millis(20); 3], ..SmtpConfig::new(format!("smtp://{addr}"), "vlpds <noreply@vlpds.test>") }
 }
 
 fn mail(purpose: &str, to: &str) -> Mail {
@@ -132,10 +129,7 @@ async fn password_reset_is_mailed_over_smtp() {
     let s = TestServer::spawn_with(|c| c.mailer = Some(SharedMailer(Arc::new(mailer)))).await;
     let a = s.create_account("smtp").await;
 
-    s.xrpc
-        .post("com.atproto.server.requestPasswordReset", &json!({"email": a.email}), &Auth::None)
-        .await
-        .ok();
+    s.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": a.email}), &Auth::None).await.ok();
     let m = loop {
         let m = next(&mut rx).await;
         if m.data.contains("Password Reset Requested") {
@@ -160,10 +154,7 @@ async fn password_reset_is_mailed_over_smtp() {
     assert!(html.contains("<title>Reset password</title>"), "{html}");
     assert!(html.contains(&format!(">@<!-- -->{}<!-- -->.</span>", a.handle)), "{html}");
     // and it resets the password
-    s.xrpc
-        .post("com.atproto.server.resetPassword", &json!({"token": token, "password": "a-new-password-1"}), &Auth::None)
-        .await
-        .ok();
+    s.xrpc.post("com.atproto.server.resetPassword", &json!({"token": token, "password": "a-new-password-1"}), &Auth::None).await.ok();
 }
 
 /// (content-type, decoded body) of each part of a multipart message as the
@@ -232,11 +223,7 @@ const MOD_HTML: &str = "<p>Hello &amp; welcome</p><p>Your post was <b>removed</b
 async fn admin_send(s: &TestServer, did: &str, subject: &str) {
     let r = s
         .xrpc
-        .post(
-            "com.atproto.admin.sendEmail",
-            &json!({"recipientDid": did, "content": MOD_HTML, "subject": subject, "senderDid": "did:plc:admin"}),
-            &Auth::Admin,
-        )
+        .post("com.atproto.admin.sendEmail", &json!({"recipientDid": did, "content": MOD_HTML, "subject": subject, "senderDid": "did:plc:admin"}), &Auth::Admin)
         .await
         .ok();
     assert_eq!(r["sent"], json!(true));
@@ -275,10 +262,7 @@ async fn admin_send_email_uses_the_moderation_mailer() {
     assert!(none_with_subject(&mut main_rx, "A note from the moderators", Duration::from_millis(500)).await);
 
     // account mail still goes through the main mailer
-    s.xrpc
-        .post("com.atproto.server.requestPasswordReset", &json!({"email": a.email}), &Auth::None)
-        .await
-        .ok();
+    s.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": a.email}), &Auth::None).await.ok();
     let m = next_with_subject(&mut main_rx, "Password Reset Requested").await;
     assert_eq!(m.from, "noreply@vlpds.test");
     assert!(none_with_subject(&mut mod_rx, "Password Reset Requested", Duration::from_millis(500)).await);

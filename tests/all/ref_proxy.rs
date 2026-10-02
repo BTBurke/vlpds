@@ -49,18 +49,13 @@ async fn handle(up: Arc<Upstream>, base: String, req: Request) -> Response {
                 {"id": "#dead", "type": "TestAtprotoService", "serviceEndpoint": "http://127.0.0.1:1"},
             ],
         });
-        return Response::builder()
-            .header("content-type", "application/json")
-            .body(Body::from(doc.to_string()))
-            .unwrap();
+        return Response::builder().header("content-type", "application/json").body(Body::from(doc.to_string())).unwrap();
     }
     up.seen.lock().push(req.uri().to_string());
     let ok = |s: &'static str| json_resp(200).body(Body::from(s)).unwrap();
     match path.as_str() {
         "/xrpc/com.example.ok" => ok(r#"{"foo":"ok"}"#),
-        "/xrpc/com.example.error" => json_resp(500)
-            .body(Body::from(r#"{"error":"FooBar","message":"My message"}"#))
-            .unwrap(),
+        "/xrpc/com.example.error" => json_resp(500).body(Body::from(r#"{"error":"FooBar","message":"My message"}"#)).unwrap(),
         // headers after 50 ms, then the body a byte every 10 ms
         "/xrpc/com.example.slow" => {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -97,11 +92,7 @@ async fn handle(up: Arc<Upstream>, base: String, req: Request) -> Response {
             if let Some(rev) = rev {
                 b = b.header("atproto-repo-rev", rev);
             }
-            if gz {
-                b.header("content-encoding", "gzip").body(Body::from(gzip(&raw))).unwrap()
-            } else {
-                b.body(Body::from(raw)).unwrap()
-            }
+            if gz { b.header("content-encoding", "gzip").body(Body::from(gzip(&raw))).unwrap() } else { b.body(Body::from(raw)).unwrap() }
         }
         "/xrpc/app.bsky.feed.getTimeline" => {
             let (rev, body) = up.timeline.lock().clone();
@@ -138,10 +129,7 @@ impl Upstream {
 }
 
 fn get(s: &TestServer, a: &TestAccount, nsid_and_query: &str) -> reqwest::RequestBuilder {
-    s.xrpc
-        .http
-        .get(format!("{}/xrpc/{nsid_and_query}", s.url))
-        .header("authorization", format!("Bearer {}", a.access))
+    s.xrpc.http.get(format!("{}/xrpc/{nsid_and_query}", s.url)).header("authorization", format!("Bearer {}", a.access))
 }
 
 async fn send(s: &TestServer, rb: reqwest::RequestBuilder) -> Resp {
@@ -194,11 +182,7 @@ async fn ref_proxy_upstream_unavailable() {
     let (up, s) = setup().await;
     let a = s.create_account("rpdead").await;
     let r = send(&s, get(&s, &a, "com.example.ok").header("atproto-proxy", format!("{}#dead", up.did))).await;
-    assert_eq!(
-        (r.status, r.error_name(), r.json["message"].as_str()),
-        (502, Some("UpstreamFailure"), Some("Upstream service unreachable")),
-        "{r:?}"
-    );
+    assert_eq!((r.status, r.error_name(), r.json["message"].as_str()), (502, Some("UpstreamFailure"), Some("Upstream service unreachable")), "{r:?}");
 }
 
 /// reference proxy-catchall.test.ts "successfully proxies requests",
@@ -318,10 +302,7 @@ async fn ref_read_after_write_encoding_negotiation() {
     assert_eq!(r.header("content-encoding").as_deref(), Some("gzip"));
 
     let r = tl(Some("invalid, *;q=0")).await;
-    assert_eq!(
-        (r.status, r.json["message"].as_str()),
-        (406, Some("this service does not support any of the requested encodings"))
-    );
+    assert_eq!((r.status, r.json["message"].as_str()), (406, Some("this service does not support any of the requested encodings")));
     let r = tl(Some(";q=1")).await;
     assert_eq!((r.status, r.json["message"].as_str()), (400, Some("Invalid accept-encoding: \";q=1\"")));
 }

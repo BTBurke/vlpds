@@ -7,7 +7,7 @@
 //! twice nor lost. Two in-process nodes on one in-memory object store.
 
 use crate::common::*;
-use crate::ha_auth::{as_post, balanced, csrf_of, node, owner_of, Browser, Client, PUBLIC};
+use crate::ha_auth::{Browser, Client, PUBLIC, as_post, balanced, csrf_of, node, owner_of};
 use std::sync::Arc;
 
 /// Holds requests of `did` reaching pause point `point` until released.
@@ -51,10 +51,7 @@ impl Gate {
 /// An admin password change (to the same password, so the tests' logins
 /// keep working: the revocation is what matters).
 async fn change_password(s: &TestServer, did: &str) {
-    s.xrpc
-        .post("com.atproto.admin.updateAccountPassword", &json!({"did": did, "password": PASSWORD}), &Auth::Admin)
-        .await
-        .ok();
+    s.xrpc.post("com.atproto.admin.updateAccountPassword", &json!({"did": did, "password": PASSWORD}), &Auth::Admin).await.ok();
 }
 
 async fn take_down(s: &TestServer, did: &str) {
@@ -195,10 +192,7 @@ async fn legacy_refresh_and_login_racing_a_password_change_fail() {
     let mut gate = Gate::new(&acct.did, "legacy_login");
     let (r, ()) = tokio::join!(b.create_session(&acct.handle, PASSWORD), async {
         gate.reached().await;
-        b.xrpc
-            .post("com.atproto.admin.updateAccountPassword", &json!({"did": acct.did, "password": "the-third-password"}), &Auth::Admin)
-            .await
-            .ok();
+        b.xrpc.post("com.atproto.admin.updateAccountPassword", &json!({"did": acct.did, "password": "the-third-password"}), &Auth::Admin).await.ok();
         gate.release();
     });
     r.err_status(401);

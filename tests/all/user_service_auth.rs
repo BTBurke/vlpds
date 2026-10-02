@@ -24,10 +24,7 @@ fn mp4(n: usize, seed: u8) -> Vec<u8> {
 }
 
 async fn pds_did(s: &TestServer) -> String {
-    s.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok()["did"]
-        .as_str()
-        .unwrap()
-        .to_string()
+    s.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok()["did"].as_str().unwrap().to_string()
 }
 
 fn now() -> i64 {
@@ -112,12 +109,7 @@ async fn bad_user_service_tokens_are_refused_with_the_reference_errors() {
 
     // a token for another method
     let t = service_token(&s, &a, &pds, Some("com.atproto.repo.createRecord"), None).await;
-    assert_err(
-        &upload(&s, &t, body()).await,
-        401,
-        "BadJwtLexiconMethod",
-        "bad jwt lexicon method (\"lxm\"). must match: com.atproto.repo.uploadBlob",
-    );
+    assert_err(&upload(&s, &t, body()).await, 401, "BadJwtLexiconMethod", "bad jwt lexicon method (\"lxm\"). must match: com.atproto.repo.uploadBlob");
 
     // addressed elsewhere: another service, or this PDS's service id (the
     // reference compares `aud` to the bare service DID exactly)
@@ -148,10 +140,7 @@ async fn bad_user_service_tokens_are_refused_with_the_reference_errors() {
     // signed with a key the account no longer has
     let old = service_token(&s, &a, &pds, Some(UPLOAD), None).await;
     upload(&s, &old, body()).await.ok();
-    s.xrpc
-        .post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin)
-        .await
-        .ok();
+    s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.ok();
     assert_err(&upload(&s, &old, body()).await, 401, "BadJwtSignature", "jwt signature does not match jwt issuer");
     let new = service_token(&s, &a, &pds, Some(UPLOAD), None).await;
     upload(&s, &new, body()).await.ok();
@@ -254,7 +243,11 @@ async fn user_service_auth_is_refused_on_every_other_method() {
         ("com.atproto.server.updateEmail", true, json!({"email": "x@example.com"})),
         ("com.atproto.identity.updateHandle", true, json!({"handle": "other.test"})),
         ("com.atproto.identity.getRecommendedDidCredentials", false, J::Null),
-        ("com.atproto.moderation.createReport", true, json!({"reasonType": "com.atproto.moderation.defs#reasonSpam", "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": a.did}})),
+        (
+            "com.atproto.moderation.createReport",
+            true,
+            json!({"reasonType": "com.atproto.moderation.defs#reasonSpam", "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": a.did}}),
+        ),
         ("com.atproto.admin.getAccountInfo", false, J::Null),
         ("app.bsky.actor.getPreferences", false, J::Null),
         ("app.bsky.actor.putPreferences", true, json!({"preferences": []})),
@@ -263,23 +256,12 @@ async fn user_service_auth_is_refused_on_every_other_method() {
         ("com.atproto.server.createAccount", true, json!({"handle": "x.vlpds.test"})),
     ];
     for (m, procedure, body) in methods {
-        let own = s
-            .xrpc
-            .get("com.atproto.server.getServiceAuth", &[("aud", &pds), ("lxm", m)], &a.auth())
-            .await;
+        let own = s.xrpc.get("com.atproto.server.getServiceAuth", &[("aud", &pds), ("lxm", m)], &a.auth()).await;
         let tok = if own.is_ok() { own.json["token"].as_str().unwrap().to_string() } else { upload_tok.clone() };
         for tok in [tok, upload_tok.clone()] {
             let auth = Auth::Bearer(tok);
-            let r = if procedure {
-                s.xrpc.post(m, &body, &auth).await
-            } else {
-                s.xrpc.get(m, &[], &auth).await
-            };
-            assert!(
-                matches!(r.status, 400 | 401 | 403),
-                "{m} accepted a user service token: {}",
-                r.text()
-            );
+            let r = if procedure { s.xrpc.post(m, &body, &auth).await } else { s.xrpc.get(m, &[], &auth).await };
+            assert!(matches!(r.status, 400 | 401 | 403), "{m} accepted a user service token: {}", r.text());
             // createAccount takes service auth itself (migration in), and
             // refuses a token for another method with lxm mismatch
             let want: &[&str] = if m == "com.atproto.server.createAccount" {
@@ -301,10 +283,10 @@ async fn user_service_auth_is_refused_on_every_other_method() {
 /// (passes it through) and uploads the result to the user's PDS with that
 /// token, answering a completed job with the blob.
 async fn stub_video_service(pds_url: String) -> String {
+    use axum::Json;
     use axum::extract::{Query, State};
     use axum::http::HeaderMap;
     use axum::routing::{get, post};
-    use axum::Json;
     use std::collections::HashMap;
     async fn upload_video(
         State(pds): State<String>,

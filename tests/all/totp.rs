@@ -124,11 +124,7 @@ async fn login_requires_totp_once_enabled() {
     // wrong password with a valid factor still fails as a password error
     let r = s
         .xrpc
-        .post(
-            "com.atproto.server.createSession",
-            &json!({"identifier": a.handle, "password": "nope", "authFactorToken": recovery[0]}),
-            &Auth::None,
-        )
+        .post("com.atproto.server.createSession", &json!({"identifier": a.handle, "password": "nope", "authFactorToken": recovery[0]}), &Auth::None)
         .await;
     r.err(401, "AuthenticationRequired");
 
@@ -153,10 +149,7 @@ async fn app_password_login_bypasses_totp() {
     // ...but an app-password session cannot manage TOTP
     let app_auth = Auth::Bearer(j["accessJwt"].as_str().unwrap().into());
     s.xrpc.post_empty("vlpds.server.setupTotp", &app_auth).await.client_err();
-    s.xrpc
-        .post("vlpds.server.disableTotp", &json!({"password": a.password, "code": "000000"}), &app_auth)
-        .await
-        .client_err();
+    s.xrpc.post("vlpds.server.disableTotp", &json!({"password": a.password, "code": "000000"}), &app_auth).await.client_err();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -169,16 +162,10 @@ async fn disable_totp() {
     r.client_err();
     // missing / wrong code
     s.xrpc.post("vlpds.server.disableTotp", &json!({"password": a.password}), &a.auth()).await.client_err();
-    s.xrpc
-        .post("vlpds.server.disableTotp", &json!({"password": a.password, "code": "000000"}), &a.auth())
-        .await
-        .client_err();
+    s.xrpc.post("vlpds.server.disableTotp", &json!({"password": a.password, "code": "000000"}), &a.auth()).await.client_err();
     assert_eq!(status(&s, &a).await["enabled"], json!(true));
     // valid recovery code disables
-    s.xrpc
-        .post("vlpds.server.disableTotp", &json!({"password": a.password, "recoveryCode": recovery[1]}), &a.auth())
-        .await
-        .ok();
+    s.xrpc.post("vlpds.server.disableTotp", &json!({"password": a.password, "recoveryCode": recovery[1]}), &a.auth()).await.ok();
     assert_eq!(status(&s, &a).await["enabled"], json!(false));
     login(&s, &a, None).await.ok();
     // can be enabled again with a fresh secret

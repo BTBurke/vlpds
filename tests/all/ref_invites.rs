@@ -19,10 +19,7 @@ async fn invite(s: &TestServer, uses: u32, for_account: Option<&str>) -> String 
     if let Some(d) = for_account {
         body["forAccount"] = json!(d);
     }
-    let code = s.xrpc.post("com.atproto.server.createInviteCode", &body, &Auth::Admin).await.ok()["code"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let code = s.xrpc.post("com.atproto.server.createInviteCode", &body, &Auth::Admin).await.ok()["code"].as_str().unwrap().to_string();
     // distinct createdAt values, so the recency order is unambiguous
     tokio::time::sleep(Duration::from_millis(3)).await;
     code
@@ -33,11 +30,7 @@ async fn signup(s: &TestServer, prefix: &str, code: &str) -> TestAccount {
     let email = format!("{}@example.com", handle.replace('.', "-"));
     let j = s
         .xrpc
-        .post(
-            "com.atproto.server.createAccount",
-            &json!({"handle": handle, "email": email, "password": PASSWORD, "inviteCode": code}),
-            &Auth::None,
-        )
+        .post("com.atproto.server.createAccount", &json!({"handle": handle, "email": email, "password": PASSWORD, "inviteCode": code}), &Auth::None)
         .await
         .ok();
     TestAccount {
@@ -58,10 +51,7 @@ async fn fixture() -> Fixture {
     let carol = signup(&s, "carol", &admin_code).await;
     let alice_codes = [invite(&s, 1, Some(&alice.did)).await, invite(&s, 1, Some(&alice.did)).await];
     invite(&s, 5, Some(&alice.did)).await;
-    s.xrpc
-        .post("com.atproto.admin.disableInviteCodes", &json!({"codes": [admin_code], "accounts": [bob.did]}), &Auth::Admin)
-        .await
-        .ok();
+    s.xrpc.post("com.atproto.admin.disableInviteCodes", &json!({"codes": [admin_code], "accounts": [bob.did]}), &Auth::Admin).await.ok();
     for c in &alice_codes {
         signup(&s, "invitee", c).await;
     }
@@ -161,12 +151,7 @@ async fn hydrates_invites_into_get_account_info() {
     assert_eq!(invites.len(), 3, "alice's codes: {v}");
     assert!(invites.iter().all(|c| c["forAccount"] == json!(f.alice.did)));
     // getAccountInfos hydrates the same way
-    let vs = f
-        .s
-        .xrpc
-        .get_multi("com.atproto.admin.getAccountInfos", &[("dids", f.alice.did.clone())], &Auth::Admin)
-        .await
-        .ok();
+    let vs = f.s.xrpc.get_multi("com.atproto.admin.getAccountInfos", &[("dids", f.alice.did.clone())], &Auth::Admin).await.ok();
     let v2 = &vs["infos"][0];
     assert_eq!(v2["invitedBy"]["code"], json!(f.admin_code), "{vs}");
     assert_eq!(v2["invites"].as_array().map(|a| a.len()), Some(3));
@@ -194,33 +179,18 @@ async fn disables_and_reenables_account_invites() {
     };
     assert_eq!(mine(&f.s).await.ok()["codes"].as_array().map(|a| a.len()), Some(1));
 
-    f.s.xrpc
-        .post("com.atproto.admin.disableAccountInvites", &json!({"account": carol.did, "note": "spam"}), &Auth::Admin)
-        .await
-        .ok();
+    f.s.xrpc.post("com.atproto.admin.disableAccountInvites", &json!({"account": carol.did, "note": "spam"}), &Auth::Admin).await.ok();
     assert_eq!(info(&f.s, carol.did.clone()).await["invitesDisabled"], json!(true));
     assert_eq!(mine(&f.s).await.ok()["codes"], json!([]), "no usable codes while disabled");
 
-    f.s.xrpc
-        .post("com.atproto.admin.enableAccountInvites", &json!({"account": carol.did, "note": "ok now"}), &Auth::Admin)
-        .await
-        .ok();
+    f.s.xrpc.post("com.atproto.admin.enableAccountInvites", &json!({"account": carol.did, "note": "ok now"}), &Auth::Admin).await.ok();
     assert_eq!(info(&f.s, carol.did.clone()).await["invitesDisabled"], json!(false));
-    f.s.xrpc
-        .post("com.atproto.admin.disableAccountInvites", &json!({"account": carol.did}), &Auth::Admin)
-        .await
-        .ok();
+    f.s.xrpc.post("com.atproto.admin.disableAccountInvites", &json!({"account": carol.did}), &Auth::Admin).await.ok();
     assert_eq!(info(&f.s, carol.did.clone()).await["invitesDisabled"], json!(true));
-    f.s.xrpc
-        .post("com.atproto.admin.enableAccountInvites", &json!({"account": carol.did}), &Auth::Admin)
-        .await
-        .ok();
+    f.s.xrpc.post("com.atproto.admin.enableAccountInvites", &json!({"account": carol.did}), &Auth::Admin).await.ok();
     assert_eq!(info(&f.s, carol.did.clone()).await["invitesDisabled"], json!(false));
     let codes = mine(&f.s).await.ok();
     assert_eq!(codes["codes"][0]["code"], json!(gifted), "codes usable again after re-enabling: {codes}");
     // both are admin-only
-    f.s.xrpc
-        .post("com.atproto.admin.disableAccountInvites", &json!({"account": carol.did}), &carol.auth())
-        .await
-        .client_err();
+    f.s.xrpc.post("com.atproto.admin.disableAccountInvites", &json!({"account": carol.did}), &carol.auth()).await.client_err();
 }

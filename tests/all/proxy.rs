@@ -5,11 +5,11 @@ use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use k256::ecdsa::signature::Verifier;
 use parking_lot::Mutex;
-use serde_json::{json, Value as J};
+use serde_json::{Value as J, json};
 use std::sync::Arc;
 use vlpds::server::{self, Config};
 
@@ -34,11 +34,7 @@ struct Fake {
 
 impl Fake {
     fn last(&self) -> Seen {
-        self.seen
-            .lock()
-            .last()
-            .cloned()
-            .expect("fake upstream saw no request")
+        self.seen.lock().last().cloned().expect("fake upstream saw no request")
     }
     fn count(&self) -> usize {
         self.seen.lock().len()
@@ -58,25 +54,16 @@ async fn fake_handler(State(f): State<Fake>, req: Request) -> Response {
         }))
         .into_response();
     }
-    f.seen.lock().push(Seen {
-        method: parts.method.to_string(),
-        uri: parts.uri.to_string(),
-        headers: parts.headers.clone(),
-        body: body.clone(),
-    });
-    let json_err =
-        |status: u16, v: J| (StatusCode::from_u16(status).unwrap(), axum::Json(v)).into_response();
+    f.seen.lock().push(Seen { method: parts.method.to_string(), uri: parts.uri.to_string(), headers: parts.headers.clone(), body: body.clone() });
+    let json_err = |status: u16, v: J| (StatusCode::from_u16(status).unwrap(), axum::Json(v)).into_response();
     match path.as_str() {
         "/xrpc/app.bsky.test.err400" => {
             let mut r = json_err(400, json!({"error": "CustomErr", "message": "boom"}));
             r.headers_mut().insert("retry-after", "7".parse().unwrap());
-            r.headers_mut()
-                .insert("x-internal", "nope".parse().unwrap());
+            r.headers_mut().insert("x-internal", "nope".parse().unwrap());
             r
         }
-        "/xrpc/app.bsky.test.err500" => {
-            json_err(500, json!({"error": "Oops", "message": "upstream broke"}))
-        }
+        "/xrpc/app.bsky.test.err500" => json_err(500, json!({"error": "Oops", "message": "upstream broke"})),
         "/xrpc/app.bsky.test.err404plain" => (StatusCode::NOT_FOUND, "not here").into_response(),
         "/xrpc/app.bsky.test.err400gzip" => {
             use std::io::Write;
@@ -86,11 +73,7 @@ async fn fake_handler(State(f): State<Fake>, req: Request) -> Response {
             (StatusCode::BAD_REQUEST, [("content-type", "application/json"), ("content-encoding", "gzip")], gz).into_response()
         }
         "/xrpc/app.bsky.test.echo" => {
-            let ct = parts
-                .headers
-                .get("content-type")
-                .cloned()
-                .unwrap_or("application/octet-stream".parse().unwrap());
+            let ct = parts.headers.get("content-type").cloned().unwrap_or("application/octet-stream".parse().unwrap());
             ([("content-type", ct)], body).into_response()
         }
         "/xrpc/com.atproto.moderation.createReport" => {
@@ -102,10 +85,8 @@ async fn fake_handler(State(f): State<Fake>, req: Request) -> Response {
         }
         _ => {
             let mut r = axum::Json(json!({"feed": [], "path": path})).into_response();
-            r.headers_mut()
-                .insert("atproto-repo-rev", "3abc".parse().unwrap());
-            r.headers_mut()
-                .insert("content-language", "en".parse().unwrap());
+            r.headers_mut().insert("atproto-repo-rev", "3abc".parse().unwrap());
+            r.headers_mut().insert("content-language", "en".parse().unwrap());
             r.headers_mut().insert("x-secret", "leak".parse().unwrap());
             r.headers_mut().insert("set-cookie", "a=b".parse().unwrap());
             r
@@ -120,9 +101,7 @@ async fn spawn_fake() -> (Fake, String) {
     let base = format!("http://{addr}");
     *fake.base.lock() = base.clone();
     *fake.did.lock() = format!("did:web:127.0.0.1%3A{}", addr.port());
-    let router = axum::Router::new()
-        .fallback(fake_handler)
-        .with_state(fake.clone());
+    let router = axum::Router::new().fallback(fake_handler).with_state(fake.clone());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     (fake, base)
 }
@@ -148,12 +127,7 @@ async fn spawn_env(dev_mode: bool) -> Env {
         ..Default::default()
     };
     server::spawn(cfg, listener, None).await.unwrap();
-    Env {
-        url: format!("http://{addr}"),
-        http: reqwest::Client::new(),
-        appview,
-        reports,
-    }
+    Env { url: format!("http://{addr}"), http: reqwest::Client::new(), appview, reports }
 }
 
 struct User {
@@ -170,17 +144,9 @@ impl Env {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            r.status(),
-            200,
-            "createAccount: {}",
-            r.text().await.unwrap()
-        );
+        assert_eq!(r.status(), 200, "createAccount: {}", r.text().await.unwrap());
         let v: J = r.json().await.unwrap();
-        User {
-            did: v["did"].as_str().unwrap().into(),
-            jwt: v["accessJwt"].as_str().unwrap().into(),
-        }
+        User { did: v["did"].as_str().unwrap().into(), jwt: v["accessJwt"].as_str().unwrap().into() }
     }
 
     fn get(&self, user: Option<&User>, nsid_and_query: &str) -> reqwest::RequestBuilder {
@@ -192,27 +158,14 @@ impl Env {
     }
 
     fn post(&self, user: &User, nsid: &str) -> reqwest::RequestBuilder {
-        self.http
-            .post(format!("{}/xrpc/{nsid}", self.url))
-            .bearer_auth(&user.jwt)
+        self.http.post(format!("{}/xrpc/{nsid}", self.url)).bearer_auth(&user.jwt)
     }
 
     /// The account's atproto verification key, from describeRepo's didDoc.
     async fn signing_key(&self, did: &str) -> k256::ecdsa::VerifyingKey {
-        let v: J = self
-            .get(None, &format!("com.atproto.repo.describeRepo?repo={did}"))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let mb = v["didDoc"]["verificationMethod"][0]["publicKeyMultibase"]
-            .as_str()
-            .unwrap();
-        let raw = bs58::decode(mb.strip_prefix('z').unwrap())
-            .into_vec()
-            .unwrap();
+        let v: J = self.get(None, &format!("com.atproto.repo.describeRepo?repo={did}")).send().await.unwrap().json().await.unwrap();
+        let mb = v["didDoc"]["verificationMethod"][0]["publicKeyMultibase"].as_str().unwrap();
+        let raw = bs58::decode(mb.strip_prefix('z').unwrap()).into_vec().unwrap();
         assert_eq!(&raw[..2], &[0xe7, 0x01], "secp256k1-pub multicodec");
         k256::ecdsa::VerifyingKey::from_sec1_bytes(&raw[2..]).unwrap()
     }
@@ -220,11 +173,7 @@ impl Env {
 
 /// Verifies the forwarded service-auth JWT and returns its claims.
 fn verify_service_jwt(headers: &HeaderMap, key: &k256::ecdsa::VerifyingKey) -> J {
-    let auth = headers
-        .get("authorization")
-        .expect("authorization forwarded")
-        .to_str()
-        .unwrap();
+    let auth = headers.get("authorization").expect("authorization forwarded").to_str().unwrap();
     let tok = auth.strip_prefix("Bearer ").expect("bearer token");
     let (signing_input, sig) = tok.rsplit_once('.').unwrap();
     let (h, p) = signing_input.split_once('.').unwrap();
@@ -232,8 +181,7 @@ fn verify_service_jwt(headers: &HeaderMap, key: &k256::ecdsa::VerifyingKey) -> J
     assert_eq!(header["alg"], "ES256K");
     let sig = k256::ecdsa::Signature::from_slice(&B64.decode(sig).unwrap()).unwrap();
     assert!(sig.normalize_s().is_none(), "signature must be low-S");
-    key.verify(signing_input.as_bytes(), &sig)
-        .expect("service JWT signature verifies with the repo key");
+    key.verify(signing_input.as_bytes(), &sig).expect("service JWT signature verifies with the repo key");
     let claims: J = serde_json::from_slice(&B64.decode(p).unwrap()).unwrap();
     let now = chrono::Utc::now().timestamp();
     let exp = claims["exp"].as_i64().unwrap();
@@ -266,27 +214,15 @@ async fn proxies_to_default_appview_with_service_auth_and_header_rules() {
     assert_eq!(r.status(), 200);
     assert_eq!(r.headers().get("atproto-repo-rev").unwrap(), "3abc");
     assert_eq!(r.headers().get("content-language").unwrap(), "en");
-    assert!(r
-        .headers()
-        .get("content-type")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .starts_with("application/json"));
-    assert!(
-        r.headers().get("x-secret").is_none(),
-        "non-allow-listed response header leaked"
-    );
+    assert!(r.headers().get("content-type").unwrap().to_str().unwrap().starts_with("application/json"));
+    assert!(r.headers().get("x-secret").is_none(), "non-allow-listed response header leaked");
     assert!(r.headers().get("set-cookie").is_none());
     let body: J = r.json().await.unwrap();
     assert_eq!(body["path"], "/xrpc/app.bsky.feed.getTimeline");
 
     let seen = env.appview.last();
     assert_eq!(seen.method, "GET");
-    assert_eq!(
-        seen.uri,
-        "/xrpc/app.bsky.feed.getTimeline?limit=5&cursor=abc"
-    );
+    assert_eq!(seen.uri, "/xrpc/app.bsky.feed.getTimeline?limit=5&cursor=abc");
     let h = &seen.headers;
     assert_eq!(h.get("accept-language").unwrap(), "en, fr");
     assert_eq!(h.get("atproto-accept-labelers").unwrap(), "did:plc:labeler");
@@ -302,17 +238,9 @@ async fn proxies_to_default_appview_with_service_auth_and_header_rules() {
     assert_eq!(claims["lxm"], "app.bsky.feed.getTimeline");
 
     // Explicit header naming the configured AppView goes to the same place.
-    let r = env
-        .get(Some(&alice), "app.bsky.actor.getProfile?actor=x")
-        .header("atproto-proxy", format!("{APPVIEW_DID}#bsky_appview"))
-        .send()
-        .await
-        .unwrap();
+    let r = env.get(Some(&alice), "app.bsky.actor.getProfile?actor=x").header("atproto-proxy", format!("{APPVIEW_DID}#bsky_appview")).send().await.unwrap();
     assert_eq!(r.status(), 200);
-    assert_eq!(
-        env.appview.last().uri,
-        "/xrpc/app.bsky.actor.getProfile?actor=x"
-    );
+    assert_eq!(env.appview.last().uri, "/xrpc/app.bsky.actor.getProfile?actor=x");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -329,17 +257,11 @@ async fn streams_post_bodies() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    assert_eq!(
-        r.headers().get("content-type").unwrap(),
-        "application/x-test"
-    );
+    assert_eq!(r.headers().get("content-type").unwrap(), "application/x-test");
     assert_eq!(r.bytes().await.unwrap().as_ref(), payload.as_slice());
     let seen = env.appview.last();
     assert_eq!(seen.method, "POST");
-    assert_eq!(
-        seen.headers.get("content-type").unwrap(),
-        "application/x-test"
-    );
+    assert_eq!(seen.headers.get("content-type").unwrap(), "application/x-test");
     assert_eq!(seen.headers.get("accept-encoding").unwrap(), "gzip");
     assert_eq!(seen.body.len(), payload.len());
 
@@ -368,46 +290,21 @@ async fn maps_upstream_errors() {
     let env = spawn_env(true).await;
     let u = env.create_account("carol").await;
 
-    let r = env
-        .get(Some(&u), "app.bsky.test.err400")
-        .send()
-        .await
-        .unwrap();
+    let r = env.get(Some(&u), "app.bsky.test.err400").send().await.unwrap();
     assert_eq!(r.headers().get("retry-after").unwrap(), "7");
     assert!(r.headers().get("x-internal").is_none());
     let (s, b) = err_of(r).await;
-    assert_eq!(
-        (s, b["error"].as_str(), b["message"].as_str()),
-        (400, Some("CustomErr"), Some("boom"))
-    );
+    assert_eq!((s, b["error"].as_str(), b["message"].as_str()), (400, Some("CustomErr"), Some("boom")));
 
-    let (s, b) = err_of(
-        env.get(Some(&u), "app.bsky.test.err500")
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(
-        (s, b["error"].as_str(), b["message"].as_str()),
-        (502, Some("Oops"), Some("upstream broke"))
-    );
+    let (s, b) = err_of(env.get(Some(&u), "app.bsky.test.err500").send().await.unwrap()).await;
+    assert_eq!((s, b["error"].as_str(), b["message"].as_str()), (502, Some("Oops"), Some("upstream broke")));
 
     // a compressed error body is decoded for its error name
     let (s, b) = err_of(env.get(Some(&u), "app.bsky.test.err400gzip").send().await.unwrap()).await;
     assert_eq!((s, b["error"].as_str(), b["message"].as_str()), (400, Some("CustomGz"), Some("zipped boom")));
 
-    let (s, b) = err_of(
-        env.get(Some(&u), "app.bsky.test.err404plain")
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(
-        (s, b["error"].as_str(), b["message"].as_str()),
-        (404, Some("XRPCNotSupported"), Some("XRPC Not Supported"))
-    );
+    let (s, b) = err_of(env.get(Some(&u), "app.bsky.test.err404plain").send().await.unwrap()).await;
+    assert_eq!((s, b["error"].as_str(), b["message"].as_str()), (404, Some("XRPCNotSupported"), Some("XRPC Not Supported")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -415,17 +312,11 @@ async fn unreachable_upstream_is_502() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     // Port 1 on loopback: connection refused.
-    let cfg = Config {
-        appview: Some(("http://127.0.0.1:1".into(), APPVIEW_DID.into())),
-        dev_mode: true,
-        ..Default::default()
-    };
+    let cfg = Config { appview: Some(("http://127.0.0.1:1".into(), APPVIEW_DID.into())), dev_mode: true, ..Default::default() };
     server::spawn(cfg, listener, None).await.unwrap();
     let http = reqwest::Client::new();
     let v: J = http
-        .post(format!(
-            "http://{addr}/xrpc/com.atproto.server.createAccount"
-        ))
+        .post(format!("http://{addr}/xrpc/com.atproto.server.createAccount"))
         .json(&json!({"handle": "dave.vlpds.test", "password": "pw", "email": "dave@example.com"}))
         .send()
         .await
@@ -433,12 +324,7 @@ async fn unreachable_upstream_is_502() {
         .json()
         .await
         .unwrap();
-    let r = http
-        .get(format!("http://{addr}/xrpc/app.bsky.feed.getTimeline"))
-        .bearer_auth(v["accessJwt"].as_str().unwrap())
-        .send()
-        .await
-        .unwrap();
+    let r = http.get(format!("http://{addr}/xrpc/app.bsky.feed.getTimeline")).bearer_auth(v["accessJwt"].as_str().unwrap()).send().await.unwrap();
     let (s, b) = err_of(r).await;
     assert_eq!((s, b["error"].as_str()), (502, Some("UpstreamFailure")));
 }
@@ -449,37 +335,13 @@ async fn target_selection_and_rejections() {
     let u = env.create_account("erin").await;
 
     // Unauthenticated.
-    let (s, b) = err_of(
-        env.get(None, "app.bsky.feed.getTimeline")
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(
-        (s, b["error"].as_str()),
-        (401, Some("AuthenticationRequired"))
-    );
+    let (s, b) = err_of(env.get(None, "app.bsky.feed.getTimeline").send().await.unwrap()).await;
+    assert_eq!((s, b["error"].as_str()), (401, Some("AuthenticationRequired")));
     // Not a proxied namespace.
-    let (s, b) = err_of(
-        env.get(Some(&u), "com.example.foo.bar")
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(
-        (s, b["error"].as_str()),
-        (501, Some("MethodNotImplemented"))
-    );
+    let (s, b) = err_of(env.get(Some(&u), "com.example.foo.bar").send().await.unwrap()).await;
+    assert_eq!((s, b["error"].as_str()), (501, Some("MethodNotImplemented")));
     // Chat needs an explicit atproto-proxy header.
-    let (s, b) = err_of(
-        env.get(Some(&u), "chat.bsky.convo.listConvos")
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
+    let (s, b) = err_of(env.get(Some(&u), "chat.bsky.convo.listConvos").send().await.unwrap()).await;
     assert_eq!((s, b["error"].as_str()), (400, Some("InvalidRequest")));
     // Protected account-management methods are never proxied. They are
     // implemented locally, and like the reference the local route wins over
@@ -490,74 +352,32 @@ async fn target_selection_and_rejections() {
     // in that catchall. Clients that set atproto-proxy on every request
     // (e.g. getSession) keep working.
     let seen = env.appview.count();
-    let r = env
-        .get(Some(&u), "com.atproto.server.listAppPasswords")
-        .header("atproto-proxy", format!("{APPVIEW_DID}#bsky_appview"))
-        .send()
-        .await
-        .unwrap();
+    let r = env.get(Some(&u), "com.atproto.server.listAppPasswords").header("atproto-proxy", format!("{APPVIEW_DID}#bsky_appview")).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let b: J = r.json().await.unwrap();
     assert!(b["passwords"].is_array(), "{b}");
     assert_eq!(env.appview.count(), seen, "protected method must not reach the upstream");
     // Malformed headers.
-    for bad in [
-        "did:web:x",
-        "#svc",
-        "did:web:x#",
-        "did:web:x#a#b",
-        "did:web:x #a",
-    ] {
-        let (s, b) = err_of(
-            env.get(Some(&u), "app.bsky.feed.getTimeline")
-                .header("atproto-proxy", bad)
-                .send()
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(
-            (s, b["error"].as_str()),
-            (400, Some("InvalidRequest")),
-            "{bad}"
-        );
+    for bad in ["did:web:x", "#svc", "did:web:x#", "did:web:x#a#b", "did:web:x #a"] {
+        let (s, b) = err_of(env.get(Some(&u), "app.bsky.feed.getTimeline").header("atproto-proxy", bad).send().await.unwrap()).await;
+        assert_eq!((s, b["error"].as_str()), (400, Some("InvalidRequest")), "{bad}");
     }
     // Unresolvable DID.
-    let (s, b) = err_of(
-        env.get(Some(&u), "app.bsky.feed.getTimeline")
-            .header(
-                "atproto-proxy",
-                "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa#bsky_appview",
-            )
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(
-        (s, b["message"].as_str()),
-        (400, Some("could not resolve proxy did"))
-    );
+    let (s, b) =
+        err_of(env.get(Some(&u), "app.bsky.feed.getTimeline").header("atproto-proxy", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa#bsky_appview").send().await.unwrap())
+            .await;
+    assert_eq!((s, b["message"].as_str()), (400, Some("could not resolve proxy did")));
     assert_eq!(env.appview.count(), 0);
 
     // did:web target resolved via /.well-known/did.json (dev mode allows http + loopback).
     let key = env.signing_key(&u.did).await;
     let other_did = env.reports.did.lock().clone();
-    let r = env
-        .get(Some(&u), "chat.bsky.convo.listConvos?limit=1")
-        .header("atproto-proxy", format!("{other_did}#other_svc"))
-        .send()
-        .await
-        .unwrap();
+    let r = env.get(Some(&u), "chat.bsky.convo.listConvos?limit=1").header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let seen = env.reports.last();
     assert_eq!(seen.uri, "/xrpc/chat.bsky.convo.listConvos?limit=1");
     let claims = verify_service_jwt(&seen.headers, &key);
-    assert_eq!(
-        claims["aud"],
-        other_did.as_str(),
-        "token aud is the bare DID"
-    );
+    assert_eq!(claims["aud"], other_did.as_str(), "token aud is the bare DID");
     assert_eq!(claims["lxm"], "chat.bsky.convo.listConvos");
     // NSIDs are case-insensitive here as in the method lists: a chat
     // method in any case needs the header...
@@ -589,26 +409,13 @@ async fn target_selection_and_rejections() {
     let app_pw = User { did: u.did.clone(), jwt: session["accessJwt"].as_str().unwrap().to_string() };
     let before = env.reports.seen.lock().len();
     for lxm in ["chat.bsky.convo.addReaction", "CHAT.bsky.convo.addReaction", "Chat.Bsky.Convo.AddReaction"] {
-        let (s, _) = err_of(
-            env.get(Some(&app_pw), lxm).header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap(),
-        )
-        .await;
+        let (s, _) = err_of(env.get(Some(&app_pw), lxm).header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap()).await;
         assert!((400..500).contains(&s), "{lxm}: {s}");
     }
     assert_eq!(env.reports.seen.lock().len(), before, "an app password reached a chat method");
     // Unknown service id in a resolvable document.
-    let (s, b) = err_of(
-        env.get(Some(&u), "chat.bsky.convo.listConvos")
-            .header("atproto-proxy", format!("{other_did}#nope"))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(
-        (s, b["message"].as_str()),
-        (400, Some("could not resolve proxy did service url"))
-    );
+    let (s, b) = err_of(env.get(Some(&u), "chat.bsky.convo.listConvos").header("atproto-proxy", format!("{other_did}#nope")).send().await.unwrap()).await;
+    assert_eq!((s, b["message"].as_str()), (400, Some("could not resolve proxy did service url")));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -617,36 +424,15 @@ async fn ssrf_guard_outside_dev_mode() {
     let u = env.create_account("frank").await;
     // A local account's #atproto_pds endpoint is plain http on loopback:
     // refused before connecting.
-    let (s, b) = err_of(
-        env.get(Some(&u), "app.bsky.feed.getTimeline")
-            .header("atproto-proxy", format!("{}#atproto_pds", u.did))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
+    let (s, b) = err_of(env.get(Some(&u), "app.bsky.feed.getTimeline").header("atproto-proxy", format!("{}#atproto_pds", u.did)).send().await.unwrap()).await;
     assert_eq!((s, b["error"].as_str()), (502, Some("UpstreamFailure")));
     // did:web on an IP literal is fetched over https (and loopback is refused).
     let other_did = env.reports.did.lock().clone();
-    let (s, _) = err_of(
-        env.get(Some(&u), "app.bsky.feed.getTimeline")
-            .header("atproto-proxy", format!("{other_did}#other_svc"))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
+    let (s, _) = err_of(env.get(Some(&u), "app.bsky.feed.getTimeline").header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap()).await;
     assert_eq!(s, 400);
     assert_eq!(env.reports.count(), 0);
     // The operator-configured AppView is trusted even on loopback.
-    assert_eq!(
-        env.get(Some(&u), "app.bsky.feed.getTimeline")
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        200
-    );
+    assert_eq!(env.get(Some(&u), "app.bsky.feed.getTimeline").send().await.unwrap().status(), 200);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -654,15 +440,7 @@ async fn preferences_round_trip_and_validation() {
     let env = spawn_env(true).await;
     let u = env.create_account("gina").await;
 
-    let get = || async {
-        env.get(Some(&u), "app.bsky.actor.getPreferences")
-            .send()
-            .await
-            .unwrap()
-            .json::<J>()
-            .await
-            .unwrap()
-    };
+    let get = || async { env.get(Some(&u), "app.bsky.actor.getPreferences").send().await.unwrap().json::<J>().await.unwrap() };
     assert_eq!(get().await, json!({"preferences": []}));
 
     let prefs = json!([
@@ -671,12 +449,7 @@ async fn preferences_round_trip_and_validation() {
         {"$type": "app.bsky.actor.defs#personalDetailsPref", "birthDate": "2000-01-01T00:00:00.000Z"},
         {"$type": "app.bsky.actor.defs#declaredAgePref", "isOverAge13": false},
     ]);
-    let r = env
-        .post(&u, "app.bsky.actor.putPreferences")
-        .json(&json!({"preferences": prefs}))
-        .send()
-        .await
-        .unwrap();
+    let r = env.post(&u, "app.bsky.actor.putPreferences").json(&json!({"preferences": prefs})).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let got = get().await["preferences"].as_array().unwrap().clone();
     let types: Vec<&str> = got.iter().map(|p| p["$type"].as_str().unwrap()).collect();
@@ -690,74 +463,36 @@ async fn preferences_round_trip_and_validation() {
         ]
     );
     assert_eq!(got[1], prefs[1]);
-    assert_eq!(
-        got[3],
-        json!({"$type": "app.bsky.actor.defs#declaredAgePref", "isOverAge13": true, "isOverAge16": true, "isOverAge18": true})
-    );
+    assert_eq!(got[3], json!({"$type": "app.bsky.actor.defs#declaredAgePref", "isOverAge13": true, "isOverAge16": true, "isOverAge18": true}));
 
     // Replace: the namespace is overwritten as a whole.
-    let r = env.post(&u, "app.bsky.actor.putPreferences").json(&json!({"preferences": [{"$type": "app.bsky.actor.defs#adultContentPref", "enabled": false}]})).send().await.unwrap();
+    let r = env
+        .post(&u, "app.bsky.actor.putPreferences")
+        .json(&json!({"preferences": [{"$type": "app.bsky.actor.defs#adultContentPref", "enabled": false}]}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
-    assert_eq!(
-        get().await,
-        json!({"preferences": [{"$type": "app.bsky.actor.defs#adultContentPref", "enabled": false}]})
-    );
+    assert_eq!(get().await, json!({"preferences": [{"$type": "app.bsky.actor.defs#adultContentPref", "enabled": false}]}));
 
     for (body, msg) in [
-        (
-            json!({"preferences": [{"enabled": true}]}),
-            "Preference is missing a $type",
-        ),
-        (
-            json!({"preferences": [{"$type": "com.example.pref"}]}),
-            "Some preferences are not in the app.bsky namespace",
-        ),
-        (
-            json!({"preferences": [{"$type": "app.bskyx.pref"}]}),
-            "Some preferences are not in the app.bsky namespace",
-        ),
-        (
-            json!({"nope": []}),
-            "Input must have the property \"preferences\"",
-        ),
+        (json!({"preferences": [{"enabled": true}]}), "Preference is missing a $type"),
+        (json!({"preferences": [{"$type": "com.example.pref"}]}), "Some preferences are not in the app.bsky namespace"),
+        (json!({"preferences": [{"$type": "app.bskyx.pref"}]}), "Some preferences are not in the app.bsky namespace"),
+        (json!({"nope": []}), "Input must have the property \"preferences\""),
     ] {
-        let (s, b) = err_of(
-            env.post(&u, "app.bsky.actor.putPreferences")
-                .json(&body)
-                .send()
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(
-            (s, b["error"].as_str(), b["message"].as_str()),
-            (400, Some("InvalidRequest"), Some(msg)),
-            "{body}"
-        );
+        let (s, b) = err_of(env.post(&u, "app.bsky.actor.putPreferences").json(&body).send().await.unwrap()).await;
+        assert_eq!((s, b["error"].as_str(), b["message"].as_str()), (400, Some("InvalidRequest"), Some(msg)), "{body}");
     }
     // Failed writes changed nothing; the AppView was never called.
     assert_eq!(get().await["preferences"].as_array().unwrap().len(), 1);
     assert_eq!(env.appview.count(), 0);
     // Preferences are per-account.
     let other = env.create_account("hank").await;
-    let v: J = env
-        .get(Some(&other), "app.bsky.actor.getPreferences")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let v: J = env.get(Some(&other), "app.bsky.actor.getPreferences").send().await.unwrap().json().await.unwrap();
     assert_eq!(v, json!({"preferences": []}));
     // Auth required.
-    assert_eq!(
-        env.get(None, "app.bsky.actor.getPreferences")
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        401
-    );
+    assert_eq!(env.get(None, "app.bsky.actor.getPreferences").send().await.unwrap().status(), 401);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -765,12 +500,7 @@ async fn preferences_for_another_appview_are_proxied() {
     let env = spawn_env(true).await;
     let u = env.create_account("ivy").await;
     let other_did = env.reports.did.lock().clone();
-    let r = env
-        .get(Some(&u), "app.bsky.actor.getPreferences")
-        .header("atproto-proxy", format!("{other_did}#other_svc"))
-        .send()
-        .await
-        .unwrap();
+    let r = env.get(Some(&u), "app.bsky.actor.getPreferences").header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let seen = env.reports.last();
     assert_eq!(seen.uri, "/xrpc/app.bsky.actor.getPreferences");
@@ -783,13 +513,9 @@ async fn create_report_goes_to_report_service() {
     let env = spawn_env(true).await;
     let u = env.create_account("jack").await;
     let key = env.signing_key(&u.did).await;
-    let report = json!({"reasonType": "com.atproto.moderation.defs#reasonSpam", "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:spammer"}});
-    let r = env
-        .post(&u, "com.atproto.moderation.createReport")
-        .json(&report)
-        .send()
-        .await
-        .unwrap();
+    let report =
+        json!({"reasonType": "com.atproto.moderation.defs#reasonSpam", "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:spammer"}});
+    let r = env.post(&u, "com.atproto.moderation.createReport").json(&report).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let v: J = r.json().await.unwrap();
     assert_eq!(v["id"], 42);
@@ -803,14 +529,7 @@ async fn create_report_goes_to_report_service() {
     assert_eq!(claims["lxm"], "com.atproto.moderation.createReport");
     assert_eq!(env.appview.count(), 0);
 
-    let (s, _) = err_of(
-        env.post(&u, "com.atproto.moderation.createReport")
-            .json(&json!({"subject": {}}))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
+    let (s, _) = err_of(env.post(&u, "com.atproto.moderation.createReport").json(&json!({"subject": {}})).send().await.unwrap()).await;
     assert_eq!(s, 400);
 }
 
@@ -871,13 +590,8 @@ async fn get_record_for_unhosted_repo_goes_to_appview() {
     }
     // a local repo is served locally, misses included
     let n = env.appview.count();
-    let (s, e) = err_of(
-        env.get(None, &format!("com.atproto.repo.getRecord?repo={}&collection=app.bsky.actor.profile&rkey=self", u.did))
-            .send()
-            .await
-            .unwrap(),
-    )
-    .await;
+    let (s, e) =
+        err_of(env.get(None, &format!("com.atproto.repo.getRecord?repo={}&collection=app.bsky.actor.profile&rkey=self", u.did)).send().await.unwrap()).await;
     assert_eq!((s, e["error"].as_str()), (400, Some("RecordNotFound")));
     assert_eq!(env.appview.count(), n);
 }

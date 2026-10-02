@@ -56,28 +56,11 @@ async fn ref_account_deactivation_over_oauth() {
     let ap_password = ap.json::<J>().await.unwrap()["password"].as_str().unwrap().to_string();
     let r = xrpc_dpop(&s, &skey, &scoped, "POST", "com.atproto.server.deactivateAccount", Some(json!({}))).await;
     assert_eq!(r.status, 200, "{}", r.body);
-    let status: J = s
-        .http
-        .get(format!("{}/xrpc/com.atproto.sync.getRepoStatus?did={}", s.base, acct.did))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let status: J = s.http.get(format!("{}/xrpc/com.atproto.sync.getRepoStatus?did={}", s.base, acct.did)).send().await.unwrap().json().await.unwrap();
     assert_eq!(status, json!({"did": acct.did, "active": false, "status": "deactivated"}));
 
     // revokes app passwords on OAuth deactivation
-    let list: J = s
-        .http
-        .get(format!("{}/xrpc/com.atproto.server.listAppPasswords", s.base))
-        .bearer_auth(&acct.jwt)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let list: J = s.http.get(format!("{}/xrpc/com.atproto.server.listAppPasswords", s.base)).bearer_auth(&acct.jwt).send().await.unwrap().json().await.unwrap();
     assert_eq!(list["passwords"], json!([]), "{list}");
     let login = s
         .http
@@ -94,13 +77,7 @@ async fn ref_account_deactivation_over_oauth() {
     let r = xrpc_dpop(&s, &ukey, &unscoped, "GET", "com.atproto.server.getSession", None).await;
     assert_eq!(r.status, 401, "{}", r.body);
     // the password session is kept (the reference deletes only OAuth/app-password credentials)
-    let r = s
-        .http
-        .get(format!("{}/xrpc/com.atproto.server.getSession", s.base))
-        .bearer_auth(&acct.jwt)
-        .send()
-        .await
-        .unwrap();
+    let r = s.http.get(format!("{}/xrpc/com.atproto.server.getSession", s.base)).bearer_auth(&acct.jwt).send().await.unwrap();
     assert_eq!(r.status(), 200);
 }
 
@@ -120,25 +97,9 @@ async fn ref_password_session_deactivation_keeps_credentials() {
         .await
         .unwrap();
     assert_eq!(ap.status(), 200);
-    let r = s
-        .http
-        .post(format!("{}/xrpc/com.atproto.server.deactivateAccount", s.base))
-        .bearer_auth(&acct.jwt)
-        .json(&json!({}))
-        .send()
-        .await
-        .unwrap();
+    let r = s.http.post(format!("{}/xrpc/com.atproto.server.deactivateAccount", s.base)).bearer_auth(&acct.jwt).json(&json!({})).send().await.unwrap();
     assert_eq!(r.status(), 200);
-    let list: J = s
-        .http
-        .get(format!("{}/xrpc/com.atproto.server.listAppPasswords", s.base))
-        .bearer_auth(&acct.jwt)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let list: J = s.http.get(format!("{}/xrpc/com.atproto.server.listAppPasswords", s.base)).bearer_auth(&acct.jwt).send().await.unwrap().json().await.unwrap();
     assert_eq!(list["passwords"].as_array().map(Vec::len), Some(1), "{list}");
     let r = xrpc_dpop(&s, &key, &tok, "GET", "com.atproto.server.getSession", None).await;
     assert_eq!(r.status, 200, "{}", r.body);
@@ -161,9 +122,7 @@ async fn ref_oauth_sign_in_errors_are_indistinguishable() {
         let mut b = Browser::default();
         let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1", s.base)).await;
         let csrf = csrf_of(&html);
-        let (st, h, _) = b
-            .post(&s, "/oauth/account/sign-in", &[("csrf", &csrf), ("identifier", ident), ("password", "wrong-password")])
-            .await;
+        let (st, h, _) = b.post(&s, "/oauth/account/sign-in", &[("csrf", &csrf), ("identifier", ident), ("password", "wrong-password")]).await;
         outcomes.push((st, h.get("location").map(|v| v.to_str().unwrap().to_string())));
     }
     assert_eq!(outcomes[0], outcomes[1]);

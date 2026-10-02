@@ -12,12 +12,7 @@ async fn takendown_account_blobs_are_served_to_owner_and_admin_only() {
     let bob = s.create_account("bob").await;
     let mut bytes = PNG_1X1.to_vec();
     bytes.extend_from_slice(unique_name("blob").as_bytes());
-    let blob = s
-        .xrpc
-        .post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "image/png", &carol.auth())
-        .await
-        .ok()["blob"]
-        .clone();
+    let blob = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "image/png", &carol.auth()).await.ok()["blob"].clone();
     s.create_record(
         &carol,
         "app.bsky.feed.post",
@@ -27,10 +22,7 @@ async fn takendown_account_blobs_are_served_to_owner_and_admin_only() {
     .await;
     let cid = blob["ref"]["$link"].as_str().unwrap().to_string();
     let subject = json!({"$type": "com.atproto.admin.defs#repoRef", "did": carol.did});
-    s.xrpc
-        .post("com.atproto.admin.updateSubjectStatus", &json!({"subject": subject, "takedown": {"applied": true}}), &Auth::Admin)
-        .await
-        .ok();
+    s.xrpc.post("com.atproto.admin.updateSubjectStatus", &json!({"subject": subject, "takedown": {"applied": true}}), &Auth::Admin).await.ok();
     let q = [("did", carol.did.as_str()), ("cid", cid.as_str())];
     s.xrpc.get("com.atproto.sync.getBlob", &q, &Auth::None).await.err(400, "RepoTakendown");
     s.xrpc.get("com.atproto.sync.getBlob", &q, &bob.auth()).await.err(400, "RepoTakendown");
@@ -41,10 +33,7 @@ async fn takendown_account_blobs_are_served_to_owner_and_admin_only() {
     let r = s.xrpc.get("com.atproto.sync.getBlob", &q, &Auth::Admin).await;
     assert_eq!(r.status, 200, "admin getBlob: {}", r.text());
 
-    s.xrpc
-        .post("com.atproto.admin.updateSubjectStatus", &json!({"subject": subject, "takedown": {"applied": false}}), &Auth::Admin)
-        .await
-        .ok();
+    s.xrpc.post("com.atproto.admin.updateSubjectStatus", &json!({"subject": subject, "takedown": {"applied": false}}), &Auth::Admin).await.ok();
     let r = s.xrpc.get("com.atproto.sync.getBlob", &q, &Auth::None).await;
     assert_eq!(r.status, 200, "public getBlob after the takedown is lifted: {}", r.text());
 }

@@ -54,11 +54,7 @@ async fn create(s: &TestServer, a: &TestAccount, i: usize) -> Resp {
 
 async fn update(s: &TestServer, config: J, if_version: u64) -> Resp {
     s.xrpc
-        .post(
-            "vlpds.admin.updateRateLimits",
-            &json!({"config": config, "ifVersion": if_version, "actor": "it-test", "note": "integration"}),
-            &Auth::Admin,
-        )
+        .post("vlpds.admin.updateRateLimits", &json!({"config": config, "ifVersion": if_version, "actor": "it-test", "note": "integration"}), &Auth::Admin)
         .await
 }
 
@@ -207,9 +203,7 @@ async fn late_joiner_loads_the_stored_config() {
     let a = node("rlj-a", &store).await;
     update(&a, json!({"limiters": {"global-ip": {"points": 77}}}), 0).await.ok();
     let b = node("rlj-b", &store).await;
-    eventually(Duration::from_secs(5), || async { (b.app.ratelimit.policy().version == 1).then_some(()) })
-        .await
-        .expect("late joiner picked up v1");
+    eventually(Duration::from_secs(5), || async { (b.app.ratelimit.policy().version == 1).then_some(()) }).await.expect("late joiner picked up v1");
     let r = b.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await;
     assert_eq!(limit_header(&r), Some(77));
 }

@@ -5,8 +5,8 @@
 //! tests/REFERENCE_COVERAGE.md.
 
 use crate::common::*;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 
 fn jti(tok: &str) -> String {
     let p = tok.split('.').nth(1).unwrap();
@@ -40,10 +40,7 @@ async fn ref_refresh_token_revoked_after_grace_period() {
     s.app
         .put_private(
             &a.did,
-            vec![vlpds::segment::Mutation {
-                key: vlpds::state::private_key(&a.did, &name).into(),
-                val: Some(serde_json::to_vec(&st).unwrap().into()),
-            }],
+            vec![vlpds::segment::Mutation { key: vlpds::state::private_key(&a.did, &name).into(), val: Some(serde_json::to_vec(&st).unwrap().into()) }],
         )
         .await
         .unwrap_or_else(|e| panic!("put_private: {}", e.message));
@@ -64,11 +61,7 @@ async fn ref_refresh_error_messages() {
 }
 
 async fn app_session(s: &TestServer, a: &TestAccount, name: &str, privileged: bool) -> (String, Auth, String) {
-    let pw = s
-        .xrpc
-        .post("com.atproto.server.createAppPassword", &json!({"name": name, "privileged": privileged}), &a.auth())
-        .await
-        .ok()["password"]
+    let pw = s.xrpc.post("com.atproto.server.createAppPassword", &json!({"name": name, "privileged": privileged}), &a.auth()).await.ok()["password"]
         .as_str()
         .unwrap()
         .to_string();
@@ -100,10 +93,13 @@ async fn ref_app_password_error_messages() {
         .xrpc
         .http
         .get(format!("{}/xrpc/chat.bsky.convo.listConvos", s.url))
-        .header("authorization", match &app {
-            Auth::Bearer(t) => format!("Bearer {t}"),
-            _ => unreachable!(),
-        })
+        .header(
+            "authorization",
+            match &app {
+                Auth::Bearer(t) => format!("Bearer {t}"),
+                _ => unreachable!(),
+            },
+        )
         .header("atproto-proxy", "did:web:appview.test#bsky_appview");
     let r = s.xrpc.send(rb).await;
     assert_err_msg(&r, 400, "InvalidToken", "Bad token method");
@@ -113,11 +109,7 @@ async fn ref_app_password_error_messages() {
     for lxm in ["com.atproto.server.createAccount", "com.atproto.server.createaccount"] {
         let r = s.xrpc.get("com.atproto.server.getServiceAuth", &[("aud", pds.as_str()), ("lxm", lxm)], &app).await;
         r.err(400, "InvalidRequest");
-        assert!(
-            r.json["message"].as_str().unwrap().contains("insufficient access to request a service auth token for the following method"),
-            "{}",
-            r.text()
-        );
+        assert!(r.json["message"].as_str().unwrap().contains("insufficient access to request a service auth token for the following method"), "{}", r.text());
     }
 
     // no longer allows session refresh / creation after revocation
