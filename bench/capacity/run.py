@@ -13,7 +13,7 @@ Phases of `all` (each skipped when state.json says it's done):
   up -> populate (chunked, resumable) -> settle -> stairs (each rate once;
   stops at saturation) -> kill (kill -9 one node mid-run, restart) -> report
   -> down. `cleanup` deletes the MinIO prefix + .trash, caches, containers and
-  the state. `all --cleanup` cleans up at the end.
+  the state, after gzipping the node logs into <out>/node-logs. `all --cleanup` cleans up at the end.
 
 Nodes: --mode native (processes) or docker (one container per node:
 --network host, --ipc host, --log-driver none (logs to a bind-mounted file),
@@ -37,6 +37,7 @@ flags for every node), GRAFANA_URL (annotations; "" = off).
 """
 import argparse
 import base64
+import gzip
 import hashlib
 import hmac
 import json
@@ -884,7 +885,20 @@ def phase_report(cfg, st):
 
 # ---------------------------------------------------------------- cleanup
 
+def save_node_logs(cfg):
+    """Gzip every node's server.log into <out>/node-logs/ so cleanup deletes only data."""
+    dest = os.path.join(cfg.out, "node-logs")
+    for i in range(cfg.nodes):
+        src = os.path.join(cfg.state_dir, f"n{i+1}", "server.log")
+        if os.path.getsize(src) if os.path.exists(src) else 0:
+            os.makedirs(dest, exist_ok=True)
+            with open(src, "rb") as f, gzip.open(os.path.join(dest, f"n{i+1}.log.gz"), "wb") as g:
+                shutil.copyfileobj(f, g)
+            log(f"cleanup: saved n{i+1} log to {dest}")
+
+
 def phase_cleanup(cfg):
+    save_node_logs(cfg)
     for i in range(cfg.nodes):
         subprocess.run(["docker", "rm", "-f", f"vlpds-cap-{cfg.name}-n{i+1}"], capture_output=True)
     t = time.time()
