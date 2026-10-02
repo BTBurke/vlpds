@@ -753,7 +753,7 @@ async fn run_sequencer(
                 }
                 Some(Err(e)) => {
                     tracing::error!(%log_id, "segment upload task failed: {e}; exiting");
-                    std::process::exit(2);
+                    crate::lifecycle::fail_stop(2, "segment_upload");
                 }
                 None => {}
             },
@@ -779,7 +779,7 @@ async fn run_sequencer(
             if let Some(ok) = &lease_ok {
                 if !ok() {
                     tracing::error!(%log_id, "node lease lapsed before segment PUT: fail-stop");
-                    std::process::exit(5);
+                    crate::lifecycle::fail_stop(5, "lease_lapsed");
                 }
             }
             let o = std::mem::replace(&mut open, Open::new(&log_id));
@@ -902,11 +902,11 @@ async fn upload(store: &Store, log_id: &str, ordinal: u64, data: Bytes, hedge_af
                 }
                 Conflict::Fenced => {
                     tracing::error!(log_id, ordinal, "our log was fenced by a successor: fail-stop");
-                    std::process::exit(3);
+                    crate::lifecycle::fail_stop(3, "fenced");
                 }
                 Conflict::Other => {
                     tracing::error!(log_id, ordinal, "segment ordinal taken by another writer: fail-stop");
-                    std::process::exit(3);
+                    crate::lifecycle::fail_stop(3, "ordinal_taken");
                 }
                 Conflict::Missing => {
                     // S3 answers 409 (mapped to AlreadyExists) on conditional
@@ -1019,7 +1019,7 @@ async fn run_finalizer(
         for (shard, r) in futures::future::join_all(writes).await {
             if let Err(e) = r {
                 tracing::error!(shard, "state apply failed: {e}; exiting");
-                std::process::exit(4);
+                crate::lifecycle::fail_stop(4, "state_apply");
             }
         }
         let _ = STATS.apply_us.lock().record(t.elapsed().as_micros().max(1) as u64);
@@ -1034,7 +1034,7 @@ async fn run_finalizer(
         if let Some(ok) = &lease_ok {
             if !ok() {
                 tracing::error!(%log_id, "node lease lapsed before ack: fail-stop");
-                std::process::exit(5);
+                crate::lifecycle::fail_stop(5, "lease_lapsed");
             }
         }
         wm.set_durable(s.last_seq);

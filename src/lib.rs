@@ -9,6 +9,7 @@ pub mod crypto;
 pub mod did_resolver;
 pub mod events;
 pub mod lexicon;
+pub mod lifecycle;
 pub mod mail;
 pub mod firehose;
 pub mod forward;

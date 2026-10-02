@@ -339,7 +339,7 @@ impl Cluster {
                 // fail-stops; everything it acked is before the fence and gets
                 // replayed by whoever takes its shards (us).
                 if l.log_id != c.log_id {
-                    c.fence(&l.log_id).await?;
+                    c.fence_dead(&l.log_id, "restart").await?;
                 }
                 c.lease.write().renewals = l.renewals;
                 PutMode::Update(UpdateVersion { e_tag: etag, version: None })
@@ -367,7 +367,30 @@ impl Cluster {
         }
         c.ensure_layout().await?;
         c.bounded.store(true, Ordering::Release);
-        Ok(Arc::new(c))
+        let c = Arc::new(c);
+        // lease validity left, computed at each scrape
+        let (weak, node_id) = (Arc::downgrade(&c), c.cfg.node_id.clone());
+        crate::metrics::on_render(move || match weak.upgrade() {
+            Some(c) => {
+                crate::metrics::LEASE_VALIDITY.with_label_values(&[node_id.as_str()]).set(c.lease_validity_secs());
+                true
+            }
+            None => {
+                let _ = crate::metrics::LEASE_VALIDITY.remove_label_values(&[node_id.as_str()]);
+                false
+            }
+        });
+        Ok(c)
+    }
+
+    /// Seconds until our lease validity ends (negative: lapsed that long ago).
+    pub fn lease_validity_secs(&self) -> f64 {
+        let (until, now) = (*self.valid_until.read(), Instant::now());
+        if until >= now {
+            (until - now).as_secs_f64()
+        } else {
+            -(now - until).as_secs_f64()
+        }
     }
 
     /// Reads the layout, creating the uniform one of `cfg.shards` if this
@@ -380,6 +403,8 @@ impl Cluster {
                 if l.shards.len() != self.cfg.shards as usize && l.version == 1 {
                     tracing::warn!(configured = self.cfg.shards, layout = l.shards.len(), "--shards differs from this prefix's layout: the layout wins");
                 }
+                crate::metrics::LAYOUT_SHARDS.set(l.shards.len() as i64);
+                crate::metrics::LAYOUT_VERSION.set(l.version as i64);
                 *self.layout.write() = (Arc::new(l), etag);
                 return Ok(());
             }
@@ -387,6 +412,8 @@ impl Cluster {
             match self.put_json(&path, &l, PutMode::Create).await {
                 Ok(etag) => {
                     tracing::info!(shards = self.cfg.shards, "created the shard layout (v1, uniform)");
+                    crate::metrics::LAYOUT_SHARDS.set(l.shards.len() as i64);
+                    crate::metrics::LAYOUT_VERSION.set(l.version as i64);
                     *self.layout.write() = (Arc::new(l), etag);
                     return Ok(());
                 }
@@ -548,7 +575,9 @@ impl Cluster {
         let mut l = self.lease.read().clone();
         l.expires_ms = self.wall_ms() + self.cfg.ttl.as_millis() as u64;
         l.renewals += 1;
-        let etag = self.put_json_unbounded(&self.path(&format!("nodes/{}", self.cfg.node_id)), &l, mode).await?;
+        let put = self.put_json_unbounded(&self.path(&format!("nodes/{}", self.cfg.node_id)), &l, mode).await;
+        crate::metrics::LEASE_RENEW_SECONDS.observe(sent.elapsed().as_secs_f64());
+        let etag = put?;
         *self.lease_etag.write() = etag;
         *self.lease.write() = l;
         self.expires_local_ms.store(now_ms() + self.cfg.ttl.as_millis() as u64, Ordering::Release);
@@ -621,6 +650,18 @@ impl Cluster {
     /// and the fence cuts them off). Returns that ordinal (the log's final
     /// end) and the last seq in the log before it.
     pub async fn fence(&self, log_id: &str) -> anyhow::Result<(u64, i64)> {
+        self.fence_inner(log_id, None).await
+    }
+
+    /// [`Cluster::fence`] of an incarnation that ended without fencing its
+    /// own log (a dead peer's, or our own previous one's: `reason`); counts
+    /// `vlpds_peer_takeovers_total{reason}` when this call writes the fence
+    /// (one count per dead incarnation cluster-wide: a fence is a create-only PUT).
+    async fn fence_dead(&self, log_id: &str, reason: &str) -> anyhow::Result<(u64, i64)> {
+        self.fence_inner(log_id, Some(reason)).await
+    }
+
+    async fn fence_inner(&self, log_id: &str, takeover: Option<&str>) -> anyhow::Result<(u64, i64)> {
         if let Some(f) = self.fenced.read().get(log_id) {
             return Ok(*f);
         }
@@ -639,7 +680,11 @@ impl Cluster {
                 // next attempt's scan (or collides with it: conflict path)
                 let put = self.store.raw.put_opts(&path, PutPayload::from_bytes(crate::segment::fence_object(&self.cfg.node_id)), PutOptions { mode: PutMode::Create, ..Default::default() });
                 match self.bounded("fence", put).await {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        if let Some(reason) = takeover {
+                            crate::metrics::PEER_TAKEOVERS.with_label_values(&[reason]).inc();
+                        }
+                    }
                     Err(e) if is_conflict(&e) => {
                         // a zombie got a segment in, or another node fenced first
                         self.count("get");
@@ -893,6 +938,7 @@ impl Cluster {
         // release shards they just took (unowned until our lease expires once
         // more). Seen with a SIGSTOP zombie waking (bench/ha zombie-short).
         if !self.lease_valid() {
+            crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&["lapsed"]).inc();
             tracing::error!("node lease lapsed before renewal: fail-stop");
             host.lost();
             return;
@@ -902,10 +948,15 @@ impl Cluster {
         if let Err(e) = self.write_lease(PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
             match e.downcast_ref::<object_store::Error>() {
                 Some(oe) if is_conflict(oe) => {
+                    crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&["conflict"]).inc();
                     tracing::error!("node lease lost (CAS conflict)");
                     host.lost();
                 }
-                _ => tracing::warn!("node lease renew error (will retry): {e:#}"),
+                oe => {
+                    let kind = if oe.is_some_and(crate::objstats::is_timeout) { "timeout" } else { "error" };
+                    crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&[kind]).inc();
+                    tracing::warn!("node lease renew error (will retry): {e:#}");
+                }
             }
         }
     }
@@ -1068,6 +1119,7 @@ impl Cluster {
         if changed {
             tracing::info!(version = l.version, shards = l.shards.len(), "installed shard layout");
             crate::metrics::LAYOUT_VERSION.set(l.version as i64);
+            crate::metrics::LAYOUT_SHARDS.set(l.shards.len() as i64);
         }
         let l = Arc::new(l);
         *cur = (l.clone(), etag);
@@ -1293,7 +1345,7 @@ impl Cluster {
                     // orphaned (dead owner, or our own previous incarnation):
                     // fence its log first so the span end is final
                     let Some(log) = cur.log_id.clone().or_else(|| dead_logs.get(o).cloned()) else { continue };
-                    let (end, last_seq) = self.fence(&log).await?;
+                    let (end, last_seq) = self.fence_dead(&log, if stale_self { "restart" } else { "peer" }).await?;
                     seq_floor = seq_floor.max(last_seq);
                     if let Some(last) = history.last_mut() {
                         if last.end.is_none() {
@@ -1685,6 +1737,38 @@ mod tests {
         let mut data = b.header(log_id, ord);
         data.extend_from_slice(&b.body);
         PutPayload::from(data)
+    }
+
+    /// Renewals are timed, validity is exported, a lost CAS is counted, and
+    /// a restart that fences its previous (unfenced) incarnation counts a
+    /// takeover. Counters are process-wide: checked for growth.
+    #[tokio::test]
+    async fn lease_metrics() {
+        let m = &crate::metrics::LEASE_RENEW_ERRORS;
+        let store = Store::memory(None);
+        let (h, hd) = host();
+        let id = format!("lease-metrics-{}", crate::tid::now_micros());
+        let restarts0 = crate::metrics::PEER_TAKEOVERS.with_label_values(&["restart"]).get();
+        let a = Cluster::join(cfg(&id), store.clone()).await.unwrap();
+        let (timed0, conflicts0) = (crate::metrics::LEASE_RENEW_SECONDS.get_sample_count(), m.with_label_values(&["conflict"]).get());
+        a.renew(&hd).await;
+        assert!(crate::metrics::LEASE_RENEW_SECONDS.get_sample_count() > timed0);
+        let v = a.lease_validity_secs();
+        assert!(v > 0.0 && v <= 0.5, "TTL - skew = 500 ms after the send: {v}");
+        crate::metrics::render();
+        assert!(crate::metrics::LEASE_VALIDITY.with_label_values(&[id.as_str()]).get() > 0.0, "exported at render");
+        // someone else rewrites our lease: the next renewal loses its CAS
+        store.raw.put(&a.path(&format!("nodes/{id}")), PutPayload::from_static(b"{}")).await.unwrap();
+        a.renew(&hd).await;
+        assert_eq!(h.lost.load(Ordering::SeqCst), 1);
+        assert!(m.with_label_values(&["conflict"]).get() > conflicts0);
+        // a restart with the same id (its predecessor never fenced its log)
+        store.raw.delete(&a.path(&format!("nodes/{id}"))).await.unwrap();
+        let lease = NodeLease { node_id: id.clone(), log_id: a.log_id.clone(), addr: String::new(), writer: 0, expires_ms: 0, renewals: 1, next_ordinal: 0, draining: false };
+        a.put_json(&a.path(&format!("nodes/{id}")), &lease, PutMode::Overwrite).await.unwrap();
+        let b = Cluster::join(cfg(&id), store.clone()).await.unwrap();
+        assert!(b.fenced_logs().contains_key(&a.log_id));
+        assert!(crate::metrics::PEER_TAKEOVERS.with_label_values(&["restart"]).get() > restarts0);
     }
 
     /// With K PUTs in flight a crash leaves holes: 0..=2 durable, 3 never

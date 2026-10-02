@@ -158,6 +158,12 @@ struct Args {
     /// Local disk cache for SlateDB SSTs (empty = disabled).
     #[arg(long, env = "VLPDS_CACHE_DIR", default_value = "")]
     cache_dir: String,
+    /// Local file where a fail-stop records its reason and exit code, read
+    /// by the next start for `vlpds_last_exit_reason_info` (lifecycle.rs).
+    /// Default: `vlpds-exit-<node-id>.json` in --cache-dir; empty with no
+    /// cache dir = not kept (the next start reports reason "none").
+    #[arg(long, env = "VLPDS_EXIT_STATE_FILE", default_value = "")]
+    exit_state_file: String,
     /// In-memory SST block cache shared by every shard DB on this node (MiB;
     /// the meta/index cache gets a quarter of this on top).
     #[arg(long, env = "VLPDS_BLOCK_CACHE_MB", default_value_t = 4096)]
@@ -469,6 +475,12 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     raise_nofile_limit();
     let node_id = args.node_id.clone().unwrap_or_else(|| "single".into());
+    let exit_state = match (args.exit_state_file.as_str(), args.cache_dir.as_str()) {
+        ("", "") => None,
+        ("", dir) => Some(std::path::Path::new(dir).join(format!("vlpds-exit-{node_id}.json"))),
+        (f, _) => Some(std::path::PathBuf::from(f)),
+    };
+    vlpds::lifecycle::init(exit_state);
     let rev = vlpds::profiling::git_rev();
     vlpds::metrics::BUILD_INFO
         .with_label_values(&[node_id.as_str(), rev.as_str(), if vlpds::profiling::ENABLED { "1" } else { "0" }])
@@ -484,7 +496,12 @@ fn main() -> anyhow::Result<()> {
         .worker_threads(io_threads)
         .enable_all()
         .build()?;
-    rt.block_on(run(args))
+    let r = rt.block_on(run(args));
+    match &r {
+        Ok(()) => vlpds::lifecycle::record_exit(0, "clean"),
+        Err(_) => vlpds::lifecycle::record_exit(1, "error"),
+    }
+    r
 }
 
 /// A secret flag's value; the well-known dev default only in dev mode (an

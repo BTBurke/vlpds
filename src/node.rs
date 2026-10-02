@@ -170,6 +170,7 @@ impl ShardHost for Node {
         let opened_ms = started.elapsed().as_millis() as u64;
         // 2. one batched replay of previous owners' log tails
         let plan: Vec<(u16, &slatedb::Db, &[Span])> = ready.iter().map(|(s, _, h, db)| (*s, db.as_ref(), h.as_slice())).collect();
+        let replay_started = Instant::now();
         let replayed = match nodelog::replay_many(&self.store, &plan).await {
             Ok(r) => r,
             Err(e) => {
@@ -177,9 +178,14 @@ impl ShardHost for Node {
                 for (s, ..) in ready {
                     results.push((s, Err(anyhow::anyhow!("replay failed: {msg}"))));
                 }
+                crate::metrics::SHARDS_OPENED.with_label_values(&["error"]).inc_by(results.len() as u64);
                 return results;
             }
         };
+        if replayed > 0 {
+            crate::metrics::REPLAYED_SEGMENTS.inc_by(replayed);
+            crate::metrics::REPLAY_SECONDS.observe(replay_started.elapsed().as_secs_f64());
+        }
         let replayed_ms = started.elapsed().as_millis() as u64;
         // 3. make replayed state durable, then serve (nothing to flush after
         //    a handback: the releaser checkpointed, so nothing was replayed)
@@ -222,6 +228,10 @@ impl ShardHost for Node {
             results.push((shard, Ok(())));
         }
         crate::metrics::OWNED_PARTITIONS.set(self.table.owned().len() as i64);
+        let ok = results.iter().filter(|(_, r)| r.is_ok()).count() as u64;
+        crate::metrics::SHARDS_OPENED.with_label_values(&["ok"]).inc_by(ok);
+        crate::metrics::SHARDS_OPENED.with_label_values(&["error"]).inc_by(results.len() as u64 - ok);
+        crate::metrics::SHARD_OPEN_SECONDS.with_label_values(&[if replayed > 0 { "replay" } else { "clean" }]).observe(started.elapsed().as_secs_f64());
         tracing::info!(shards = n, segments_replayed = replayed, opened_ms, replayed_ms, elapsed_ms = started.elapsed().as_millis() as u64, "shards opened");
         // 4. warm the shards' recently written repos (served
         //    already; loads in the background)
@@ -364,7 +374,7 @@ impl ShardHost for Node {
         }
         crate::metrics::LEASE_EVENTS.with_label_values(&["lost"]).inc();
         tracing::error!("node lease lost unexpectedly: fail-stop");
-        std::process::exit(5);
+        crate::lifecycle::fail_stop(5, "lease_lost");
     }
 
     fn on_membership(&self) {

@@ -112,6 +112,25 @@ pub struct Membership {
     pub leader: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
+/// Dead logs left after a pass over all of them (the dead-log gauges).
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct DeadLogs {
+    unfenced: i64,
+    needed: i64,
+    pruning: i64,
+    /// objects below their logs' ends (fence or durable prefix)
+    segments: u64,
+}
+
+impl DeadLogs {
+    fn export(&self) {
+        for (state, n) in [("unfenced", self.unfenced), ("needed", self.needed), ("pruning", self.pruning)] {
+            metrics::RETENTION_DEAD_LOGS.with_label_values(&[state]).set(n);
+        }
+        metrics::RETENTION_DEAD_SEGMENTS.set(self.segments as i64);
+    }
+}
+
 /// Objects and bytes one pass deleted.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub struct Pass {
@@ -136,6 +155,8 @@ struct State {
     fenced: HashMap<String, u64>,
     /// dead logs pruned down to their fence (and report deleted)
     retired: HashSet<String>,
+    /// dead logs left after the last full pass over them (leader only)
+    dead: Option<DeadLogs>,
 }
 
 /// A log object's ordinal, from its path.
@@ -157,7 +178,10 @@ impl Retention {
             tick.tick().await; // the first tick is immediate: skip it
             loop {
                 tick.tick().await;
-                match me.pass().await {
+                let started = std::time::Instant::now();
+                let r = me.pass().await;
+                metrics::RETENTION_PASS_SECONDS.observe(started.elapsed().as_secs_f64());
+                match r {
                     Ok(p) => {
                         metrics::RETENTION_TICKS.with_label_values(&["ok"]).inc();
                         if p.objects > 0 {
@@ -187,7 +211,10 @@ impl Retention {
         pass.objects += n.objects;
         pass.bytes += n.bytes;
         self.publish().await?;
-        if budget > 0 && (self.members.leader)() {
+        if !(self.members.leader)() {
+            // another node prunes (and reports) dead logs
+            DeadLogs::default().export();
+        } else if budget > 0 {
             let n = self.prune_dead(cutoff, &mut budget).await?;
             pass.objects += n.objects;
             pass.bytes += n.bytes;
@@ -282,9 +309,15 @@ impl Retention {
         };
         let mut pass = Pass::default();
         let mut known: Option<Known> = None;
+        let mut stats = DeadLogs::default();
+        // objects left below `end` in log `x` (one LIST page)
+        let held = |x: String, end: u64| async move {
+            anyhow::Ok(end.saturating_sub(crate::backfill::first_ordinal(&self.store, &x).await?.unwrap_or(end)))
+        };
         for x in dead {
             if *budget == 0 {
-                break;
+                // stopped early: the gauges keep the last full count
+                return Ok(pass);
             }
             let cached = self.state.lock().fenced.get(&x).copied();
             let fence = match cached {
@@ -292,7 +325,11 @@ impl Retention {
                 None => match nodelog::first_free(&self.store, &x).await? {
                     // not fenced: its owner may be alive but unseen (joining),
                     // or dead with its shards not taken yet
-                    (_, false) => continue,
+                    (end, false) => {
+                        stats.unfenced += 1;
+                        stats.segments += held(x.clone(), end).await?;
+                        continue;
+                    }
                     (f, true) => {
                         self.state.lock().fenced.insert(x.clone(), f);
                         f
@@ -305,18 +342,26 @@ impl Retention {
             let (assigns, reports) = known.as_ref().unwrap();
             if let Some(s) = needed_by(&x, assigns, reports) {
                 tracing::debug!(log = %x, shard = s, "dead log still needed for replay");
+                stats.needed += 1;
+                stats.segments += held(x.clone(), fence).await?;
                 continue;
             }
             let n = self.prune(&x, fence, cutoff, budget, "dead").await?;
             pass.objects += n.objects;
             pass.bytes += n.bytes;
             // everything below the fence gone: retire it
-            if crate::backfill::first_ordinal(&self.store, &x).await? == Some(fence) {
+            let first = crate::backfill::first_ordinal(&self.store, &x).await?;
+            if first == Some(fence) {
                 let n = self.retire(&x, fence, cutoff, budget).await?;
                 pass.objects += n.objects;
                 pass.bytes += n.bytes;
+            } else {
+                stats.pruning += 1;
+                stats.segments += fence.saturating_sub(first.unwrap_or(fence));
             }
         }
+        stats.export();
+        self.state.lock().dead = Some(stats);
         Ok(pass)
     }
 
@@ -565,9 +610,12 @@ mod tests {
         store.raw.put(&report_path(&store, "D"), PutPayload::from(serde_json::to_vec(&rep).unwrap())).await.unwrap();
         put_assign(&store, 0, vec![Span { log_id: "D".into(), epoch: 1, start: 0, end: Some(4) }, Span { log_id: "B".into(), epoch: 2, start: 0, end: None }]).await;
         let r = Retention::new(store.clone(), log.clone(), cfg(Duration::ZERO), members(&["B"], true));
+        let dead = |r: &Retention| r.state.lock().dead.unwrap();
         assert_eq!(r.pass().await.unwrap(), Pass::default(), "not fenced: left alone");
+        assert_eq!(dead(&r), DeadLogs { unfenced: 1, segments: 4, ..Default::default() }, "its durable prefix 0..4 is held");
         store.raw.put(&segment_path(&store, "D", 4), PutPayload::from_bytes(fence_object("B"))).await.unwrap();
         assert_eq!(r.pass().await.unwrap(), Pass::default(), "fenced, but B hasn't opened shard 0 yet");
+        assert_eq!(dead(&r), DeadLogs { needed: 1, segments: 4, ..Default::default() });
         assert_eq!(ordinals(&store, "D").await, vec![0, 1, 2, 3, 4, 5]);
         // not the leader: never touches dead logs
         let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, 0, None).await.unwrap());
@@ -576,6 +624,7 @@ mod tests {
         assert_eq!(follower.pass().await.unwrap(), Pass::default());
         let p = r.pass().await.unwrap();
         assert_eq!(p.objects, 5, "segments 0..4 and the garbage at 5");
+        assert_eq!(dead(&r), DeadLogs::default(), "retired: nothing held");
         assert_eq!(ordinals(&store, "D").await, vec![4], "the fence stays");
         assert!(!read_reports(&store).await.unwrap().contains_key("D"), "its report is gone");
         assert!(retained_floor(&store).await.unwrap() >= 103, "the deleted seqs are covered");

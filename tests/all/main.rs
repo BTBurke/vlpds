@@ -61,6 +61,7 @@ mod migration;
 mod moderation;
 mod mst_lazy;
 mod oauth;
+mod ops_metrics;
 mod oauth_replay_durable;
 mod preferences;
 mod proxy;

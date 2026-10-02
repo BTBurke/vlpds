@@ -240,6 +240,41 @@ ts("Forward latency (to owner's response head)", quantiles("vlpds_forward_second
 ts("Control-plane object-store requests/s", [rate("vlpds_cluster_store_requests_total", by="op")], "short", w=12)
 ts("Forwards/s per node", [t(f"sum by (instance) (rate(vlpds_forwards_total{{{I}}}{RI}))", "{{instance}}")], "short", w=12)
 
+# ---------------------------------------------------------------- leases / takeovers
+row("Leases, takeovers, replay")
+ts("Lease renewal round trip", [t(f"histogram_quantile({q}, sum by (le, instance) (rate(vlpds_lease_renew_seconds_bucket{{{I}}}{RI})))", f"{n} {{{{instance}}}}")
+                                for q, n in ((0.5, "p50"), (0.99, "p99"))] +
+   [t("vector(4)", "fail-stop ceiling (0.4 x TTL)")], "s", w=8,
+   desc="One CAS PUT of nodes/{node_id} every TTL/5. Validity ends TTL - skew after a renewal's send time, so a round trip over 0.4 x TTL "
+        "(4 s at the default 10 s TTL) lapses the lease and the node fail-stops (exit 5). The ceiling line assumes the default TTL.")
+ts("Lease validity left", [t(f"vlpds_lease_validity_seconds{{{I}}}", "{{node_id}}")], "s", w=8,
+   desc="Seconds until each node's own lease validity ends, computed at scrape: normally TTL - skew minus up to one renew interval (6-8 s by default); "
+        "a sawtooth dipping toward 0 = renewals overdue")
+ts("Renew errors, takeovers, fail-stops", [rate("vlpds_lease_renew_errors_total", by="kind", legend="renew {{kind}}"),
+                                         rate("vlpds_peer_takeovers_total", by="reason", legend="takeover {{reason}}"),
+                                         t(f"changes(vlpds_process_start_time_seconds{{{I}}}[1m]) > 0", "restart {{instance}}")], "short", w=8,
+   desc="takeover peer: a dead peer's log fenced before taking its shards; restart: our own previous incarnation's at startup. "
+        "vlpds_last_exit_reason_info on a restarted node says why its previous process ended.")
+ts("Shard opens by kind (time to serve)", [t(f"histogram_quantile(0.99, sum by (le, kind) (rate(vlpds_shard_open_seconds_bucket{{{I}}}{RI})))", "p99 {{kind}}"),
+                                           t(f"histogram_quantile(0.99, sum by (le) (rate(vlpds_recovery_replay_seconds_bucket{{{I}}}{RI})))", "p99 replay step")], "s", w=8,
+   desc="replay: the batch replayed a dead owner's log tail (takeover after a crash); clean: nothing to replay (handback)")
+ts("Shards opened / segments replayed per s", [rate("vlpds_shards_opened_total", by="result", legend="opened {{result}}"),
+                                               rate("vlpds_recovery_replayed_segments_total", legend="segments replayed")], "short", w=8)
+ts("Layout shards / owned", [t(f"max(vlpds_shard_layout_shards{{{I}}})", "layout shards"), t(f"sum(vlpds_owned_partitions{{{I}}})", "owned (sum)")], "short", w=8)
+
+# ---------------------------------------------------------------- object store (vlpds clients)
+row("Object store (vlpds clients: control plane, log, retention, SlateDB)")
+ts("Requests/s by result", [t(f'sum by (result) (rate(vlpds_object_store_requests_total{{{I}, result!="ok"}}{RI})) > 0', "{{result}}")], "reqps", w=8,
+   desc="Non-ok results: not_found / precondition are normal answers (misses, lost CAS races); timeout / error failed; cancelled = the caller gave up")
+ts("p99 latency by component", [t(f"histogram_quantile(0.99, sum by (le, component) (rate(vlpds_object_store_request_seconds_bucket{{{I}}}{RI}))) > 0", "{{component}}")], "s", w=8,
+   desc="To the response head (GET), first page (LIST); deletes are not timed")
+ts("Control-plane p50 / p99 by op", [t(f'histogram_quantile({q}, sum by (le, op) (rate(vlpds_object_store_request_seconds_bucket{{{I}, component=~"ctl_.*"}}{RI}))) > 0', f"{n} {{{{op}}}}")
+                                    for q, n in ((0.5, "p50"), (0.99, "p99"))], "s", w=8)
+ts("Requests/s by component", [t(f"sum by (component) (rate(vlpds_object_store_requests_total{{{I}}}{RI})) > 0", "{{component}}")], "reqps", w=12)
+ts("Retention pass time, dead logs", [t(f"histogram_quantile(0.99, sum by (le) (rate(vlpds_retention_pass_seconds_bucket{{{I}}}[5m])))", "pass p99"),
+                                      t(f"sum by (state) (vlpds_retention_dead_logs{{{I}}})", "dead logs {{state}}")], "short", w=12,
+   overrides=[{"matcher": {"id": "byName", "options": "pass p99"}, "properties": [{"id": "unit", "value": "s"}, {"id": "custom.axisPlacement", "value": "right"}]}])
+
 # ---------------------------------------------------------------- proxy
 row("AppView proxy", collapsed=True)
 ts("Proxied requests/s by status", [rate("vlpds_http_requests_total", f'{I}, method=~"{PROXY_METHODS}"', "status")], "reqps")

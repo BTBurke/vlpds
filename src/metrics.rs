@@ -76,7 +76,7 @@ lazy!(APPLY_DURATION: Histogram = register_histogram!("vlpds_state_apply_seconds
 lazy!(COMMIT_LATENCY: Histogram = register_histogram!("vlpds_commit_durable_seconds", "Commit enqueue -> durable+applied+acked", latency_buckets()));
 lazy!(WATERMARK_LAG: IntGaugeVec = register_int_gauge_vec!("vlpds_watermark_lag_microseconds", "now - partition watermark", &["partition"]));
 lazy!(LAST_SEQ: IntGaugeVec = register_int_gauge_vec!("vlpds_partition_durable_seq", "Last durable seq per partition", &["partition"]));
-lazy!(REPLAYED_SEGMENTS: IntCounter = register_int_counter!("vlpds_recovery_replayed_segments_total", "Log segments replayed at startup"));
+lazy!(REPLAYED_SEGMENTS: IntCounter = register_int_counter!("vlpds_recovery_replayed_segments_total", "Log segments replayed when opening shards (previous owners' log tails after a crash or takeover)"));
 
 // ---- firehose ----
 lazy!(FIREHOSE_EVENTS: IntCounter = register_int_counter!("vlpds_firehose_events_total", "Events emitted by the merger"));
@@ -115,7 +115,7 @@ lazy!(FORWARDED: IntCounter = register_int_counter!("vlpds_requests_forwarded_to
 lazy!(WRITE_RETRIES: IntCounterVec = register_int_counter_vec!("vlpds_write_retries_total", "Repo writes the entry node resent after a not-applied 503, by reason (loading: RepoLoading; moved: ShardMoved)", &["reason"]));
 lazy!(OWNED_PARTITIONS: IntGauge = register_int_gauge!("vlpds_owned_partitions", "Partitions this node owns"));
 lazy!(LEASE_EVENTS: IntCounterVec = register_int_counter_vec!("vlpds_lease_events_total", "Partition lease transitions", &["event"]));
-lazy!(OBJ_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_object_store_requests_total", "Object-store requests that reached the store, by billable op (put, put_create, put_cas, get, get_range, head, list pages, delete, delete_batch, copy, mpu_*), key component and client pool (objstats.rs)", &["op", "component", "client"]));
+lazy!(OBJ_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_object_store_requests_total", "Object-store requests sent to the store, by billable op (put, put_create, put_cas, get, get_range, head, list pages, delete, delete_batch, copy, mpu_*), key component, client pool and result (ok, not_found, precondition, timeout, error, cancelled: the caller dropped it unanswered) (objstats.rs)", &["op", "component", "client", "result"]));
 lazy!(OBJ_BYTES: IntCounterVec = register_int_counter_vec!("vlpds_object_store_bytes_total", "Object-store payload bytes by direction (up, down), key component and client pool", &["dir", "component", "client"]));
 lazy!(CLUSTER_STORE_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_cluster_store_requests_total", "Control-plane object-store requests (leases, assignments, writer claims, fences) by op", &["op"]));
 lazy!(CLUSTER_NUDGES: IntCounterVec = register_int_counter_vec!("vlpds_cluster_nudges_total", "Early control-plane steps asked of peers after a release (sent, failed) or by peers (received)", &["dir"]));
@@ -146,6 +146,34 @@ lazy!(TOKIO_TASKS: IntGauge = register_int_gauge!("vlpds_tokio_alive_tasks", "To
 lazy!(TOKIO_GLOBAL_QUEUE: IntGauge = register_int_gauge!("vlpds_tokio_global_queue_depth", "Tasks in the tokio injection queue"));
 lazy!(TOKIO_BUSY: Gauge = register_gauge!("vlpds_tokio_busy_seconds_total", "Busy time summed over tokio workers (rate / workers = utilization)"));
 
+// ---- leases, fail-stops, takeovers (ops/RUNBOOK.md) ----
+lazy!(LEASE_RENEW_SECONDS: Histogram = register_histogram!("vlpds_lease_renew_seconds", "Node lease renewal round trip (the CAS PUT of nodes/{node_id}), answered or failed. Validity ends TTL - skew after a renewal's send time, so round trips over 0.4 x TTL (4 s at the default TTL) open a gap and the node fail-stops", exponential_buckets(0.001, 2.0, 14).unwrap()));
+lazy!(LEASE_RENEW_ERRORS: IntCounterVec = register_int_counter_vec!("vlpds_lease_renew_errors_total", "Failed node lease renewals by kind: timeout / error (retried next interval), conflict (someone rewrote our lease: fail-stop), lapsed (validity ended before the renewal: fail-stop)", &["kind"]));
+lazy!(LEASE_VALIDITY: GaugeVec = register_gauge_vec!("vlpds_lease_validity_seconds", "Seconds until this node's own lease validity ends (TTL - skew after the send time of its last successful renewal), computed at scrape. Normally between TTL - skew - one renew interval and TTL - skew; negative = lapsed", &["node_id"]));
+lazy!(PEER_TAKEOVERS: IntCounterVec = register_int_counter_vec!("vlpds_peer_takeovers_total", "Log incarnations this node fenced because they ended without fencing themselves (crash, kill, fail-stop, partition): peer = a dead peer's log, before taking its shards; restart = our own previous incarnation's, at startup. A graceful stop fences its own log and is not counted", &["reason"]));
+lazy!(PROCESS_START: Gauge = register_gauge!("vlpds_process_start_time_seconds", "Start time of this process since the Unix epoch, in seconds"));
+lazy!(PROCESS_START_STD: Gauge = register_gauge!("process_start_time_seconds", "Start time of the process since unix epoch in seconds."));
+lazy!(LAST_EXIT: IntGaugeVec = register_int_gauge_vec!("vlpds_last_exit_reason_info", "1, labeled with how the previous process using this exit-state file ended (lifecycle.rs): a fail-stop reason with its exit code, clean, error, crash (no exit recorded: SIGKILL, OOM kill, abort, host loss) or none (first run, or no exit-state file)", &["reason", "code"]));
+lazy!(LAST_EXIT_TIME: Gauge = register_gauge!("vlpds_last_exit_time_seconds", "When the previous process recorded its exit (Unix seconds; 0 if unknown)"));
+
+// ---- shard opens / replay ----
+lazy!(SHARDS_OPENED: IntCounterVec = register_int_counter_vec!("vlpds_shards_opened_total", "Shard opens (acquire, adopt, takeover, reshard children) by result", &["result"]));
+lazy!(SHARD_OPEN_SECONDS: HistogramVec = register_histogram_vec!("vlpds_shard_open_seconds", "One batch of shard opens until served (SlateDB open + log replay + flush), by kind: replay (it replayed segments: a takeover after a crash) or clean (nothing to replay: a handback)", &["kind"], exponential_buckets(0.01, 2.0, 14).unwrap()));
+lazy!(REPLAY_SECONDS: Histogram = register_histogram!("vlpds_recovery_replay_seconds", "Replay step of a shard-open batch that replayed at least one segment (previous owners' log tails)", exponential_buckets(0.01, 2.0, 14).unwrap()));
+lazy!(LAYOUT_SHARDS: IntGauge = register_int_gauge!("vlpds_shard_layout_shards", "Shards in the layout this node routes by (changes with each split/merge)"));
+
+// ---- capacity ----
+lazy!(MEMORY_LIMIT: IntGauge = register_int_gauge!("vlpds_memory_limit_bytes", "Memory this process may use: physical RAM, or the cgroup limit when lower (caches.rs; absent if neither is readable)"));
+lazy!(REPO_CACHE_CAPACITY: IntGauge = register_int_gauge!("vlpds_repo_cache_capacity_bytes", "Byte budget of the repo workers' caches, all workers together (--repo-cache-mb); compare with sum(vlpds_repo_cache_bytes)"));
+
+// ---- object-store latency (objstats.rs) ----
+lazy!(OBJ_DURATION: HistogramVec = register_histogram_vec!("vlpds_object_store_request_seconds", "Object-store request latency by op and key component (objstats.rs), answered requests only: to the response head for GETs, to the first page for LISTs; deletes are not timed", &["op", "component"], latency_buckets()));
+
+// ---- retention ----
+lazy!(RETENTION_PASS_SECONDS: Histogram = register_histogram!("vlpds_retention_pass_seconds", "One log retention pass, ok or failed", exponential_buckets(0.01, 2.0, 14).unwrap()));
+lazy!(RETENTION_DEAD_SEGMENTS: IntGauge = register_int_gauge!("vlpds_retention_dead_log_segments", "Log objects left below the end of dead (writer gone) logs, as of the last pass that checked them all; only the dead-log pruner (owner of slot 0's shard) reports non-zero"));
+lazy!(RETENTION_DEAD_LOGS: IntGaugeVec = register_int_gauge_vec!("vlpds_retention_dead_logs", "Dead logs by state as of the last pass that checked them all: unfenced (no successor fenced it yet), needed (a shard's replay may still read it), pruning (segments inside the window, or deleting)", &["state"]));
+
 /// Increments a gauge until dropped (in-flight counts that survive cancellation).
 pub struct InflightGuard(&'static IntGauge);
 
@@ -174,7 +202,20 @@ pub fn observe_forward(status: u16, start: std::time::Instant) {
     FORWARDS.with_label_values(&[class]).inc();
 }
 
+type Refresher = Box<dyn Fn() -> bool + Send + Sync>;
+
+/// Gauges computed at scrape time (lease validity left); see [`on_render`].
+static REFRESHERS: LazyLock<parking_lot::Mutex<Vec<Refresher>>> = LazyLock::new(Default::default);
+
+/// Runs `f` before every render while it returns true (false: its source
+/// is gone, drop it).
+pub fn on_render(f: impl Fn() -> bool + Send + Sync + 'static) {
+    REFRESHERS.lock().push(Box::new(f));
+}
+
 pub fn render() -> String {
+    REFRESHERS.lock().retain(|f| f());
+    crate::lifecycle::refresh_metrics();
     refresh_jemalloc();
     refresh_process();
     refresh_tokio();

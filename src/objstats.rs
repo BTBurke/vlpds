@@ -4,11 +4,16 @@
 //! once (SlateDB's retries and hedged segment PUTs included; SlateDB's
 //! disk-cache hits never get here). This is what an S3/GCS/R2 bill counts.
 //!
-//! Exported as `vlpds_object_store_requests_total{op,component,client}`
+//! Exported as `vlpds_object_store_requests_total{op,component,client,result}`
 //! and `vlpds_object_store_bytes_total{dir,component,client}` (dir = up |
 //! down). `client` is the connection pool (`log`: segment PUTs, fences,
 //! retention, replay and firehose reads; `state`: SlateDB, control plane,
-//! blobs). Who inside
+//! blobs). `result` is `ok`, `not_found`, `precondition` (If-Match /
+//! If-None-Match failed), `timeout`, `error`, or `cancelled` (the caller
+//! dropped the request unanswered: a control-plane deadline, a lost hedge);
+//! a request is counted when it is answered (or dropped).
+//! `vlpds_object_store_request_seconds{op,component}` times answered
+//! requests (to the response head; LISTs to their first page). Who inside
 //! SlateDB issued a request (db / gc / compactor) is in SlateDB's own
 //! `slatedb_object_store_request_count_total{component}`.
 //!
@@ -105,13 +110,69 @@ pub fn counted(inner: Arc<dyn ObjectStore>, prefix: &str, client: &'static str) 
     Arc::new(Counting { inner, prefix: prefix.trim_end_matches('/').to_string(), client, latency: Latency::from_env(client) })
 }
 
-fn req(op: &str, comp: &str, client: &str) {
-    crate::metrics::OBJ_REQUESTS.with_label_values(&[op, comp, client]).inc();
+fn count(op: &str, comp: &str, client: &str, result: &str) {
+    crate::metrics::OBJ_REQUESTS.with_label_values(&[op, comp, client, result]).inc();
 }
 
 fn bytes(dir: &str, comp: &str, client: &str, n: u64) {
     if n > 0 {
         crate::metrics::OBJ_BYTES.with_label_values(&[dir, comp, client]).inc_by(n);
+    }
+}
+
+/// The `result` label of a failed request.
+pub fn result_label(e: &object_store::Error) -> &'static str {
+    use object_store::Error as E;
+    match e {
+        E::NotFound { .. } => "not_found",
+        E::Precondition { .. } | E::AlreadyExists { .. } | E::NotModified { .. } => "precondition",
+        e if is_timeout(e) => "timeout",
+        _ => "error",
+    }
+}
+
+/// Whether a store error is a timeout (the HTTP client's, or a deadline of
+/// ours), from its message chain. Not "timeout" alone: object_store's retry
+/// errors print their `retry_timeout` setting whatever the cause.
+pub fn is_timeout(e: &object_store::Error) -> bool {
+    let mut cur: Option<&dyn std::error::Error> = Some(e);
+    while let Some(x) = cur {
+        if x.to_string().to_ascii_lowercase().contains("timed out") {
+            return true;
+        }
+        cur = x.source();
+    }
+    false
+}
+
+/// One request in flight: counted with its result (and timed) once
+/// answered, or counted `cancelled` if dropped unanswered (a caller's
+/// deadline, a lost hedge).
+struct Req {
+    op: &'static str,
+    comp: &'static str,
+    client: &'static str,
+    start: std::time::Instant,
+    done: bool,
+}
+
+impl Req {
+    fn new(op: &'static str, comp: &'static str, client: &'static str) -> Req {
+        Req { op, comp, client, start: std::time::Instant::now(), done: false }
+    }
+
+    fn finish<T>(mut self, r: &Result<T>) {
+        self.done = true;
+        count(self.op, self.comp, self.client, r.as_ref().map_or_else(result_label, |_| "ok"));
+        crate::metrics::OBJ_DURATION.with_label_values(&[self.op, self.comp]).observe(self.start.elapsed().as_secs_f64());
+    }
+}
+
+impl Drop for Req {
+    fn drop(&mut self) {
+        if !self.done {
+            count(self.op, self.comp, self.client, "cancelled");
+        }
     }
 }
 
@@ -132,17 +193,28 @@ impl Counting {
         component(&self.prefix, p.as_ref())
     }
 
-    /// Counts a listing: one request up front, one more per 1,000 keys
-    /// (S3/GCS/R2 page size).
-    fn count_list(&self, comp: &'static str, s: BoxStream<'static, Result<ObjectMeta>>) -> BoxStream<'static, Result<ObjectMeta>> {
+    /// Counts a listing: one request answered with the first page (timed
+    /// to it), one more per 1,000 keys (S3/GCS/R2 page size), and a failed
+    /// one for an error mid-listing.
+    fn count_list(&self, comp: &'static str, mut s: BoxStream<'static, Result<ObjectMeta>>) -> BoxStream<'static, Result<ObjectMeta>> {
         let client = self.client;
-        req("list", comp, client);
+        let mut first = Some(Req::new("list", comp, client));
         let mut n = 0u64;
-        s.inspect(move |_| {
-            n += 1;
-            if n.is_multiple_of(1000) {
-                req("list", comp, client);
+        futures::stream::poll_fn(move |cx| {
+            let item = futures::ready!(s.poll_next_unpin(cx));
+            match (&item, first.take()) {
+                (Some(r), Some(req)) => req.finish(r),
+                (None, Some(req)) => req.finish(&Ok(())),
+                (Some(Err(e)), None) => count("list", comp, client, result_label(e)),
+                _ => {}
             }
+            if let Some(Ok(_)) = &item {
+                n += 1;
+                if n.is_multiple_of(1000) {
+                    count("list", comp, client, "ok");
+                }
+            }
+            std::task::Poll::Ready(item)
         })
         .boxed()
     }
@@ -163,18 +235,21 @@ impl ObjectStore for Counting {
             PutMode::Create => "put_create",
             PutMode::Update(_) => "put_cas",
         };
-        req(op, comp, self.client);
+        let req = Req::new(op, comp, self.client);
         bytes("up", comp, self.client, payload.content_length() as u64);
         self.write_delay().await;
-        self.inner.put_opts(location, payload, opts).await
+        let r = self.inner.put_opts(location, payload, opts).await;
+        req.finish(&r);
+        r
     }
 
     async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> Result<Box<dyn MultipartUpload>> {
         let comp = self.comp(location);
-        req("mpu_create", comp, self.client);
+        let req = Req::new("mpu_create", comp, self.client);
         self.write_delay().await;
-        let inner = self.inner.put_multipart_opts(location, opts).await?;
-        Ok(Box::new(CountingUpload { inner, comp, client: self.client }))
+        let r = self.inner.put_multipart_opts(location, opts).await;
+        req.finish(&r);
+        Ok(Box::new(CountingUpload { inner: r?, comp, client: self.client }))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
@@ -186,32 +261,46 @@ impl ObjectStore for Counting {
         } else {
             "get"
         };
-        req(op, comp, self.client);
+        let req = Req::new(op, comp, self.client);
         let head = options.head;
         self.read_delay().await;
-        let r = self.inner.get_opts(location, options).await?;
+        let r = self.inner.get_opts(location, options).await;
+        req.finish(&r);
+        let r = r?;
         if !head {
             bytes("down", comp, self.client, r.range.end - r.range.start);
         }
         Ok(r)
     }
 
+    /// `delete_batch` is counted when sent (result `ok`: a bulk request's
+    /// outcome is per object); `delete` per object with its result.
     fn delete_stream(&self, locations: BoxStream<'static, Result<Path>>) -> BoxStream<'static, Result<Path>> {
         let (prefix, client) = (self.prefix.clone(), self.client);
+        // an error may not name its key: count it under the last one sent
+        let last = Arc::new(parking_lot::Mutex::new("other"));
+        let sent = last.clone();
         let mut n = 0u64;
         let locations = locations
             .inspect(move |p| {
                 if let Ok(p) = p {
                     let comp = component(&prefix, p.as_ref());
+                    *sent.lock() = comp;
                     if n.is_multiple_of(1000) {
-                        req("delete_batch", comp, client);
+                        count("delete_batch", comp, client, "ok");
                     }
                     n += 1;
-                    req("delete", comp, client);
                 }
             })
             .boxed();
-        self.inner.delete_stream(locations)
+        let prefix = self.prefix.clone();
+        self.inner
+            .delete_stream(locations)
+            .inspect(move |r| match r {
+                Ok(p) => count("delete", component(&prefix, p.as_ref()), client, "ok"),
+                Err(e) => count("delete", *last.lock(), client, result_label(e)),
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
@@ -226,15 +315,19 @@ impl ObjectStore for Counting {
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         let comp = prefix.map_or("other", |p| self.comp(p));
-        req("list", comp, self.client);
+        let req = Req::new("list", comp, self.client);
         self.read_delay().await;
-        self.inner.list_with_delimiter(prefix).await
+        let r = self.inner.list_with_delimiter(prefix).await;
+        req.finish(&r);
+        r
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-        req("copy", self.comp(to), self.client);
+        let req = Req::new("copy", self.comp(to), self.client);
         self.write_delay().await;
-        self.inner.copy_opts(from, to, options).await
+        let r = self.inner.copy_opts(from, to, options).await;
+        req.finish(&r);
+        r
     }
 }
 
@@ -248,19 +341,28 @@ struct CountingUpload {
 #[async_trait]
 impl MultipartUpload for CountingUpload {
     fn put_part(&mut self, data: PutPayload) -> UploadPart {
-        req("mpu_part", self.comp, self.client);
+        let req = Req::new("mpu_part", self.comp, self.client);
         bytes("up", self.comp, self.client, data.content_length() as u64);
-        self.inner.put_part(data)
+        let part = self.inner.put_part(data);
+        Box::pin(async move {
+            let r = part.await;
+            req.finish(&r);
+            r
+        })
     }
 
     async fn complete(&mut self) -> Result<PutResult> {
-        req("mpu_complete", self.comp, self.client);
-        self.inner.complete().await
+        let req = Req::new("mpu_complete", self.comp, self.client);
+        let r = self.inner.complete().await;
+        req.finish(&r);
+        r
     }
 
     async fn abort(&mut self) -> Result<()> {
-        req("mpu_abort", self.comp, self.client);
-        self.inner.abort().await
+        let req = Req::new("mpu_abort", self.comp, self.client);
+        let r = self.inner.abort().await;
+        req.finish(&r);
+        r
     }
 }
 
@@ -280,19 +382,63 @@ mod tests {
         assert_eq!(component("vlpds", "vlpds/state/005/gc/manifest.boundary"), "state_gc_boundary");
     }
 
+    fn n(op: &str, comp: &str, result: &str) -> u64 {
+        crate::metrics::OBJ_REQUESTS.with_label_values(&[op, comp, "state", result]).get()
+    }
+
+    fn timed(op: &str, comp: &str) -> u64 {
+        crate::metrics::OBJ_DURATION.with_label_values(&[op, comp]).get_sample_count()
+    }
+
     #[tokio::test]
     async fn counts_ops() {
         let s = counted(Arc::new(object_store::memory::InMemory::new()), "objstats-test", "state");
         let p = Path::from("objstats-test/retain/x");
-        let n = |op: &str| crate::metrics::OBJ_REQUESTS.with_label_values(&[op, "retention_report", "state"]).get();
-        let (put0, get0, list0, del0) = (n("put_create"), n("get_range"), n("list"), n("delete"));
+        let c = "retention_report";
+        let (put0, get0, list0, del0, t0) = (n("put_create", c, "ok"), n("get_range", c, "ok"), n("list", c, "ok"), n("delete", c, "ok"), timed("get_range", c));
         s.put_opts(&p, PutPayload::from_static(b"hello"), PutMode::Create.into()).await.unwrap();
         s.get_range(&p, 0..2).await.unwrap();
         let _: Vec<_> = s.list(Some(&Path::from("objstats-test/retain"))).collect().await;
         s.delete(&p).await.unwrap();
-        assert_eq!(n("put_create") - put0, 1);
-        assert_eq!(n("get_range") - get0, 1);
-        assert_eq!(n("list") - list0, 1);
-        assert_eq!(n("delete") - del0, 1);
+        assert_eq!(n("put_create", c, "ok") - put0, 1);
+        assert_eq!(n("get_range", c, "ok") - get0, 1);
+        assert_eq!(n("list", c, "ok") - list0, 1);
+        assert_eq!(n("delete", c, "ok") - del0, 1);
+        assert_eq!(timed("get_range", c) - t0, 1, "answered requests are timed");
+    }
+
+    #[tokio::test]
+    async fn results_by_kind() {
+        let s = counted(Arc::new(object_store::memory::InMemory::new()), "objstats-res", "state");
+        let p = Path::from("objstats-res/assign/001");
+        let c = "ctl_assign";
+        let (nf0, pre0, empty0) = (n("get", c, "not_found"), n("put_create", c, "precondition"), n("list", "ctl_lease", "ok"));
+        assert!(matches!(s.get(&p).await, Err(object_store::Error::NotFound { .. })));
+        s.put_opts(&p, PutPayload::from_static(b"a"), PutMode::Create.into()).await.unwrap();
+        assert!(s.put_opts(&p, PutPayload::from_static(b"b"), PutMode::Create.into()).await.is_err());
+        // an empty listing is still one answered request
+        let _: Vec<_> = s.list(Some(&Path::from("objstats-res/nodes"))).collect().await;
+        assert_eq!(n("get", c, "not_found") - nf0, 1);
+        assert_eq!(n("put_create", c, "precondition") - pre0, 1);
+        assert_eq!(n("list", "ctl_lease", "ok") - empty0, 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_requests_count_as_cancelled() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let slow = Counting { inner, prefix: "objstats-cancel".into(), client: "state", latency: Some(Latency { read_ms: 60_000.0, write_ms: 60_000.0, sigma: 0.0 }) };
+        let p = Path::from("objstats-cancel/writers/007");
+        let (c0, t0) = (n("get", "ctl_writer", "cancelled"), timed("get", "ctl_writer"));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), slow.get(&p)).await.is_err());
+        assert_eq!(n("get", "ctl_writer", "cancelled") - c0, 1);
+        assert_eq!(timed("get", "ctl_writer"), t0, "cancelled requests are not timed");
+    }
+
+    #[test]
+    fn timeouts_from_the_message_chain() {
+        let t = object_store::Error::Generic { store: "S3", source: "error sending request: operation timed out".into() };
+        assert_eq!(result_label(&t), "timeout");
+        let other = object_store::Error::Generic { store: "S3", source: "Error after 10 retries, retry_timeout: 180s, source: 503 SlowDown".into() };
+        assert_eq!(result_label(&other), "error");
     }
 }

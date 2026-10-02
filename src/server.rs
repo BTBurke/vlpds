@@ -244,6 +244,10 @@ impl Default for Config {
 pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let (caps, budget) = crate::caches::resolve(cfg.cache_budget_bytes, &cfg.cache_entries);
     crate::caches::apply(&caps);
+    if let Some(m) = crate::caches::memory_bytes() {
+        crate::metrics::MEMORY_LIMIT.set(m as i64);
+    }
+    crate::metrics::REPO_CACHE_CAPACITY.set(cfg.repo_cache_bytes as i64);
     tracing::info!(
         budget_mb = budget >> 20,
         memory_mb = crate::caches::memory_bytes().map(|m| m >> 20),

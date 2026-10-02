@@ -11,10 +11,9 @@
 #   real cluster's nodes, or VlpdsNodeDown fires for every idle bench port.
 # - One cluster per Prometheus. With several, add a cluster label to the
 #   targets and to every `sum(...)` / `count(...)` below (`by (cluster)`).
-# - The recording rules in group vlpds-constants hold the two numbers no
-#   metric exports (see RUNBOOK.md "Metric gaps"): the shard count
-#   (--shards, default 64; changes with every online split/merge) and the
-#   per-node memory limit used for the RSS alerts.
+# - The lease alerts assume the default --lease-ttl-ms 10000 (renew every
+#   2 s, validity TTL - skew = 8 s, renewal ceiling 4 s). Scale their
+#   thresholds with the TTL.
 #
 # Thresholds: the design numbers are ~40-50 ms p50 / ~150 ms p99 commit ack
 # on S3 Standard, ~25 ms segment PUTs, hedging after 100 ms, a 3 s forward
@@ -23,16 +22,16 @@
 # marked "guess" and should be tuned against a week of production data.
 
 groups:
-  - name: vlpds-constants
+  - name: vlpds-derived
     rules:
-      # Expected number of shards in the layout (--shards when the prefix was
-      # created, +1 per split, -1 per merge). `vlpds admin layout` prints it.
-      - record: vlpds:expected_shards
-        expr: vector(64)
-      # Memory available to one vlpds process (host RAM or cgroup limit).
-      # DESIGN.md "Initial deployment sizing": 64 GB owner nodes.
-      - record: vlpds:memory_limit_bytes
-        expr: vector(64 * 1024 * 1024 * 1024)
+      # Shards in the layout, as the nodes report it (vlpds_shard_layout_shards
+      # follows every split/merge). The live nodes' max; with none up, each
+      # node's last value from the past hour, so VlpdsShardsUnowned still
+      # fires when the whole cluster is down.
+      - record: vlpds:layout_shards
+        expr: >-
+          max(vlpds_shard_layout_shards{job="vlpds"})
+            or max(last_over_time(vlpds_shard_layout_shards{job="vlpds"}[1h]))
 
   # ---------------------------------------------------------------------------
   # Node liveness and fail-stops
@@ -53,30 +52,54 @@ groups:
             second loss may overload the rest.
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsnodedown"
 
-      # The process exits on purpose (fail-stop) when its lease lapses, its
-      # log is fenced, a shard is reassigned under it, a close fails or a
-      # segment upload / state apply fails (exit codes 2-5). The
-      # lease_events_total{event="lost"} increment happens right before
-      # exit(5) and is almost never scraped, so restarts are detected by the
-      # process CPU-time gauge going backwards.
+      # A new process: its start time changed. Expected during a deploy.
       - alert: VlpdsNodeRestarted
-        expr: resets(vlpds_process_cpu_seconds_total{job="vlpds",mode="user"}[15m]) > 0
+        expr: changes(vlpds_process_start_time_seconds{job="vlpds"}[15m]) > 0
         labels:
           severity: ticket
         annotations:
           summary: "vlpds node {{ $labels.instance }} restarted (fail-stop, crash, OOM or deploy)"
           description: >-
-            The process CPU counter reset in the last 15 minutes. Check the
-            previous incarnation's exit code and last error log line.
+            The process start time changed in the last 15 minutes.
+            vlpds_last_exit_reason_info says how the previous process ended.
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsnoderestarted"
 
+      # The process exits on purpose (fail-stop) when its lease lapses, its
+      # log is fenced, or a segment upload / state apply fails (exit codes
+      # 2-5). It records why in its exit-state file (--exit-state-file, by
+      # default in --cache-dir) and the next process exports it while it runs.
+      # crash = the previous process recorded no exit (SIGKILL, OOM, abort).
+      # Only reported for 30 minutes after the restart.
+      - alert: VlpdsNodeFailStopped
+        expr: >-
+          vlpds_last_exit_reason_info{job="vlpds",reason!~"clean|none"} == 1
+          and on (instance) (time() - vlpds_process_start_time_seconds{job="vlpds"}) < 1800
+        labels:
+          severity: ticket
+        annotations:
+          summary: "vlpds node {{ $labels.instance }}'s previous process ended with {{ $labels.reason }} (exit code {{ $labels.code }})"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsnodefailstopped"
+
       - alert: VlpdsNodeCrashLooping
-        expr: resets(vlpds_process_cpu_seconds_total{job="vlpds",mode="user"}[1h]) >= 3
+        expr: changes(vlpds_process_start_time_seconds{job="vlpds"}[1h]) >= 3
         labels:
           severity: page
         annotations:
           summary: "vlpds node {{ $labels.instance }} restarted {{ $value }} times in an hour"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsnodecrashlooping"
+
+      # A node fenced the log of an incarnation that ended without fencing it
+      # itself (crash, kill -9, OOM, fail-stop, partition): reason="peer" for
+      # a dead peer's (counted on the survivor, so it survives a node that
+      # never comes back), "restart" for its own previous one at startup. A
+      # graceful stop fences its own log and is never counted.
+      - alert: VlpdsUncleanNodeExit
+        expr: sum by (reason) (increase(vlpds_peer_takeovers_total{job="vlpds"}[15m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value | printf \"%.0f\" }} node incarnation(s) ended uncleanly and were fenced ({{ $labels.reason }}) in the last 15 minutes"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsuncleannodeexit"
 
       # A node saw a peer miss a renewal and its port refuse connections:
       # the peer's process is gone (kill -9, crash, OOM) and its shards are
@@ -108,12 +131,12 @@ groups:
       # probe) or ~12 s (TTL + skew) plus replay. 2 minutes is far past that
       # (design). `or vector(0)` keeps it firing when every node is down.
       - alert: VlpdsShardsUnowned
-        expr: (sum(vlpds_owned_partitions{job="vlpds"}) or vector(0)) < vlpds:expected_shards
+        expr: (sum(vlpds_owned_partitions{job="vlpds"}) or vector(0)) < vlpds:layout_shards
         for: 2m
         labels:
           severity: page
         annotations:
-          summary: "Only {{ $value }} shards are owned by a live node (expected {{ with query \"vlpds:expected_shards\" }}{{ . | first | value }}{{ end }})"
+          summary: "Only {{ $value }} shards are owned by a live node (layout has {{ with query \"vlpds:layout_shards\" }}{{ . | first | value }}{{ end }})"
           description: >-
             Writes and getRecord-style reads for repos in the missing shards
             fail (503 PartitionUnavailable / ShardMoved resends time out).
@@ -121,9 +144,9 @@ groups:
 
       # Safety does not depend on this (fencing + CAS assignments), but two
       # nodes both reporting a shard for 5 minutes means a zombie that has not
-      # fail-stopped, or vlpds:expected_shards is stale after a split.
+      # fail-stopped (or nodes disagree on the layout mid split/merge).
       - alert: VlpdsShardsOverOwned
-        expr: sum(vlpds_owned_partitions{job="vlpds"}) > vlpds:expected_shards
+        expr: sum(vlpds_owned_partitions{job="vlpds"}) > vlpds:layout_shards
         for: 5m
         labels:
           severity: ticket
@@ -134,7 +157,7 @@ groups:
       # A full rolling deploy moves every shard about twice (out to peers and
       # back). Four opens per shard per hour is more than any deploy (guess).
       - alert: VlpdsOwnershipFlapping
-        expr: sum(increase(vlpds_lease_events_total{job="vlpds",event="opened"}[1h])) > 4 * vlpds:expected_shards
+        expr: sum(increase(vlpds_lease_events_total{job="vlpds",event="opened"}[1h])) > 4 * vlpds:layout_shards
         labels:
           severity: ticket
         annotations:
@@ -147,13 +170,89 @@ groups:
       - alert: VlpdsOwnershipImbalanced
         expr: >-
           max(vlpds_owned_partitions{job="vlpds"})
-            > 1.5 * scalar(vlpds:expected_shards) / count(up{job="vlpds"} == 1)
+            > 1.5 * scalar(vlpds:layout_shards) / count(up{job="vlpds"} == 1)
         for: 30m
         labels:
           severity: ticket
         annotations:
           summary: "A vlpds node owns {{ $value }} shards, over 1.5x the fair share"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsownershipimbalanced"
+
+      # Shards whose SlateDB open or replay failed (released for another
+      # node or a later step to retry).
+      - alert: VlpdsShardOpenErrors
+        expr: sum by (instance) (increase(vlpds_shards_opened_total{job="vlpds",result="error"}[15m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} failed to open {{ $value | printf \"%.0f\" }} shard(s) in the last 15 minutes"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsshardopenerrors"
+
+      # A batch of shard opens that replayed a dead owner's log tail took over
+      # 20 s (the 20.48 s bucket) before serving. Checkpoints every 10 s keep
+      # replay to seconds normally (guess).
+      - alert: VlpdsTakeoverReplaySlow
+        expr: >-
+          sum by (instance) (increase(vlpds_shard_open_seconds_count{job="vlpds",kind="replay"}[1h]))
+            - sum by (instance) (increase(vlpds_shard_open_seconds_bucket{job="vlpds",kind="replay",le="20.48"}[1h])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "A takeover on {{ $labels.instance }} took over 20 s (open + replay) before serving its shards"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdstakeoverreplayslow"
+
+  # ---------------------------------------------------------------------------
+  # Node leases (defaults: renew every 2 s, validity 8 s after a renewal's
+  # send time, fail-stop once a renewal round trip exceeds 0.4 x TTL = 4 s)
+  # ---------------------------------------------------------------------------
+  - name: vlpds-leases
+    rules:
+      # Any renewal over 2 s (the 2.048 s bucket): half the 4 s ceiling past
+      # which the node's validity lapses and it fail-stops (design). With a
+      # cluster-wide brownout every node stops.
+      - alert: VlpdsLeaseRenewalNearCeiling
+        expr: >-
+          sum by (instance) (increase(vlpds_lease_renew_seconds_count{job="vlpds"}[5m]))
+            - sum by (instance) (increase(vlpds_lease_renew_seconds_bucket{job="vlpds",le="2.048"}[5m])) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | printf \"%.0f\" }} lease renewal(s) took over 2 s in 5 minutes (fail-stop at 4 s)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewalnearceiling"
+
+      # A renewal is one small CAS PUT (~25-50 ms on S3). p99 over 500 ms for
+      # 10 minutes is store or network trouble building up (guess).
+      - alert: VlpdsLeaseRenewalSlow
+        expr: >-
+          histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_lease_renew_seconds_bucket{job="vlpds"}[5m]))) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Lease renewal p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }} (fail-stop ceiling 4 s)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewalslow"
+
+      # Renewals that failed with an error or a client timeout (retried at
+      # the next 2 s tick; conflict and lapsed fail-stop and show up as
+      # restarts instead).
+      - alert: VlpdsLeaseRenewErrors
+        expr: sum by (instance, kind) (increase(vlpds_lease_renew_errors_total{job="vlpds",kind=~"timeout|error"}[5m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | printf \"%.0f\" }} lease renewal(s) failed ({{ $labels.kind }}) in 5 minutes"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewerrors"
+
+      # Validity left normally stays between 6 and 8 s (renewed every 2 s).
+      # Under 4 s at a scrape means renewals are 2+ s overdue: the node is
+      # within seconds of a fail-stop (design).
+      - alert: VlpdsLeaseValidityLow
+        expr: min_over_time(vlpds_lease_validity_seconds{job="vlpds"}[5m]) < 4
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} ({{ $labels.node_id }}) had only {{ $value | humanizeDuration }} of lease validity left"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleasevaliditylow"
 
   # ---------------------------------------------------------------------------
   # Write path (commit log)
@@ -396,8 +495,8 @@ groups:
     rules:
       # Control-plane calls (leases' peers LIST, assignments, fences) given
       # up at min(TTL, 5 s). Lease renewals are not bounded and not counted
-      # here, but a store slow enough to time these out is past the 4 s
-      # renewal ceiling, where nodes fail-stop.
+      # here (see the vlpds-leases group), but a store slow enough to time
+      # these out is past the 4 s renewal ceiling, where nodes fail-stop.
       - alert: VlpdsControlPlaneTimeouts
         expr: sum by (instance, op) (increase(vlpds_cluster_store_timeouts_total{job="vlpds"}[5m])) > 0
         labels:
@@ -415,6 +514,34 @@ groups:
         annotations:
           summary: "{{ $value }} vlpds nodes are timing out object-store control-plane calls: cluster-wide fail-stop risk"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorebrownout"
+
+      # vlpds' own object-store clients (objstats.rs: every request, SlateDB's
+      # included, by key component): failed or timed-out requests. Covers
+      # what SlateDB's metrics don't: control plane (ctl_*), log segment
+      # reads (replay, backfill, follower catch-up), retention reports and
+      # deletes. not_found / precondition are normal answers; cancelled is a
+      # caller giving up (see VlpdsControlPlaneTimeouts). 1/s (guess).
+      - alert: VlpdsObjectStoreRequestErrors
+        expr: sum by (instance, component) (rate(vlpds_object_store_requests_total{job="vlpds",result=~"error|timeout"}[5m])) > 1
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | humanize }} failed object-store requests/s on {{ $labels.component }}"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorerequesterrors"
+
+      # Control-plane requests (leases, assignments, writer claims) are small
+      # GET/PUT/LISTs: ~10-50 ms. p99 over 1 s is a quarter of the renewal
+      # ceiling and slows every takeover step (guess).
+      - alert: VlpdsControlPlaneLatencyHigh
+        expr: >-
+          histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_object_store_request_seconds_bucket{job="vlpds",component=~"ctl_.*"}[5m]))) > 1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Control-plane object-store p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }}"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscontrolplanelatencyhigh"
 
       # SlateDB's own instrumented store (feature slatedb-metrics, on by
       # default): every SlateDB request, success or error, by component
@@ -507,13 +634,27 @@ groups:
           summary: "{{ $labels.instance }} has run no log retention pass in 15+ minutes"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsretentionnotrunning"
 
+      # A dead log that no successor has fenced holds back every node's
+      # merged firehose (followers drain a log only up to its fence) and its
+      # segments are never pruned. Takeover fences within seconds; a joiner
+      # whose lease peers haven't seen yet also counts for a moment. Reported
+      # by the dead-log pruner only (owner of slot 0's shard). 30 m (guess).
+      - alert: VlpdsDeadLogUnfenced
+        expr: sum(vlpds_retention_dead_logs{job="vlpds",state="unfenced"}) > 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} dead node log(s) have gone unfenced for 30+ minutes"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsdeadlogunfenced"
+
   # ---------------------------------------------------------------------------
   # Memory, caches, runtime
   # ---------------------------------------------------------------------------
   - name: vlpds-resources
     rules:
       - alert: VlpdsMemoryHigh
-        expr: vlpds_process_resident_bytes{job="vlpds"} > on () group_left 0.85 * vlpds:memory_limit_bytes
+        expr: vlpds_process_resident_bytes{job="vlpds"} > 0.85 * vlpds_memory_limit_bytes{job="vlpds"}
         for: 10m
         labels:
           severity: ticket
@@ -522,7 +663,7 @@ groups:
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsmemoryhigh"
 
       - alert: VlpdsMemoryCritical
-        expr: vlpds_process_resident_bytes{job="vlpds"} > on () group_left 0.95 * vlpds:memory_limit_bytes
+        expr: vlpds_process_resident_bytes{job="vlpds"} > 0.95 * vlpds_memory_limit_bytes{job="vlpds"}
         for: 2m
         labels:
           severity: page
