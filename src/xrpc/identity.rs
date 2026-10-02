@@ -68,9 +68,9 @@ async fn well_known_atproto_did(State(app): AppState, headers: HeaderMap) -> Res
     }
 }
 
-/// The DID document of a local account (also used by describeRepo).
-pub(super) fn did_doc(app: &App, acct: &Account) -> XResult<J> {
-    Ok(json!({
+/// The DID document this PDS generates for an account it hosts.
+pub(super) fn did_doc(app: &App, acct: &Account) -> J {
+    json!({
         "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1", "https://w3id.org/security/suites/secp256k1-2019/v1"],
         "id": acct.did,
         "alsoKnownAs": [format!("at://{}", acct.handle)],
@@ -81,7 +81,38 @@ pub(super) fn did_doc(app: &App, acct: &Account) -> XResult<J> {
             "publicKeyMultibase": acct.signing_pubkey,
         }],
         "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": app.public_url}],
-    }))
+    })
+}
+
+/// Whether the document generated here is the account's current one. While
+/// an account is active here it is (every change of a registered DID goes
+/// through this PDS). A deactivated account may have migrated away (the
+/// reference flow ends with deactivateAccount on the old PDS) or not have
+/// arrived yet (migration in): its DID resolves through the directory /
+/// did:web, as the reference resolves every DID. Unregistered local DIDs
+/// (`--plc-mode unregistered`) have no other document.
+pub(crate) fn serves_local_doc(app: &App, acct: &Account) -> bool {
+    let deactivated = acct.extra.get("deactivatedAt").is_some_and(|v| !v.is_null());
+    let resolvable = app.plc.is_some() || super::server::has_external_did(acct);
+    !acct.signing_pubkey.is_empty() && !(deactivated && resolvable)
+}
+
+/// The current DID document of an account hosted here: ours
+/// ([`serves_local_doc`]), else resolved (cached; the cache is invalidated
+/// when the account is deactivated).
+pub(crate) async fn account_did_doc(app: &App, acct: &Account) -> Result<Arc<J>, crate::did_resolver::ResolveError> {
+    if serves_local_doc(app, acct) {
+        return Ok(Arc::new(did_doc(app, acct)));
+    }
+    app.did_resolver.resolve(&acct.did).await
+}
+
+fn resolve_error(e: crate::did_resolver::ResolveError) -> XrpcError {
+    use crate::did_resolver::ResolveError as E;
+    match e {
+        E::NotFound(did) | E::BadDid(did) => XrpcError::bad("DidNotFound", format!("DID not found: {did}")),
+        E::Failed(..) => XrpcError { status: StatusCode::BAD_GATEWAY, error: "UpstreamFailure".into(), message: e.to_string() },
+    }
 }
 
 #[derive(Deserialize)]
@@ -113,9 +144,8 @@ async fn resolve_handle(State(app): AppState, Query(q): Query<HandleQ>) -> XResu
     }
 }
 
-/// Local accounts only (their documents are generated here; with PLC
-/// registration on, the same document the directory serves for an account
-/// hosted here). Anything else is DidNotFound.
+/// Local accounts only (documents per [`account_did_doc`]). Anything else is
+/// DidNotFound.
 async fn local_account(app: &App, did: &str) -> XResult<Account> {
     match app.account(did).await {
         Ok(a) => Ok(a),
@@ -140,7 +170,8 @@ async fn resolve_did(State(app): AppState, Query(q): Query<DidQ>) -> XResult<Jso
         ));
     }
     let acct = local_account(&app, &q.did).await?;
-    Ok(Json(json!({"didDoc": did_doc(&app, &acct)?})))
+    let doc = account_did_doc(&app, &acct).await.map_err(resolve_error)?;
+    Ok(Json(json!({"didDoc": doc})))
 }
 
 /// identifier (handle or DID) -> (did, handle, didDoc). The handle is
@@ -174,7 +205,8 @@ async fn identity_info(app: &App, identifier: &str) -> XResult<(Account, J)> {
         Some(d) if d == acct.did => acct.handle.clone(),
         _ => "handle.invalid".to_string(),
     };
-    let info = json!({"did": acct.did, "handle": handle, "didDoc": did_doc(app, &acct)?});
+    let doc = account_did_doc(app, &acct).await.map_err(resolve_error)?;
+    let info = json!({"did": acct.did, "handle": handle, "didDoc": doc});
     Ok((acct, info))
 }
 

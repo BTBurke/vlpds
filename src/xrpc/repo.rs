@@ -825,12 +825,15 @@ async fn list_collections(app: &App, did: &str) -> XResult<Vec<String>> {
 async fn describe_repo(State(app): AppState, Query(q): Query<RepoQ>) -> XResult<Json<J>> {
     let did = app.resolve_repo(&q.repo).await?;
     let acct = super::sync::assert_available(&app, &did, None).await?;
+    let did_doc = super::identity::account_did_doc(&app, &acct)
+        .await
+        .map_err(|e| XrpcError::bad("InvalidRequest", format!("Could not resolve DID: {e}")))?;
     let handle_is_correct =
         app.resolve_handle(&acct.handle).await?.as_deref() == Some(acct.did.as_str());
     Ok(Json(json!({
         "handle": if handle_is_correct { acct.handle.as_str() } else { "handle.invalid" },
         "did": acct.did,
-        "didDoc": super::identity::did_doc(&app, &acct)?,
+        "didDoc": did_doc,
         "collections": list_collections(&app, &did).await?,
         "handleIsCorrect": handle_is_correct,
     })))

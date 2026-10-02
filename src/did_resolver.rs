@@ -3,8 +3,8 @@
 //! for outbound requests to user-controlled endpoints (the guarded client
 //! itself is [`crate::http::guarded`]).
 //!
-//! DIDs hosted on this PDS are resolved by the caller without the network
-//! (see `xrpc::proxy::resolve_did`).
+//! DIDs of accounts active on this PDS are resolved by the caller without
+//! the network (see `xrpc::identity::account_did_doc`).
 
 use parking_lot::Mutex;
 use serde_json::Value as J;

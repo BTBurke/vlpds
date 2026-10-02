@@ -257,34 +257,17 @@ async fn parse_proxy_header<'a>(app: &'a App, proxy_to: &str) -> XResult<Target<
     })
 }
 
-/// DID document for `did`: built locally for accounts hosted here, otherwise
+/// DID document for `did`: for accounts hosted here per
+/// `identity::account_did_doc` (built locally while active), otherwise
 /// resolved over the network (cached).
 pub async fn resolve_did(app: &App, did: &str) -> Result<Arc<J>, did_resolver::ResolveError> {
     if !did.starts_with("did:") {
         return Err(did_resolver::ResolveError::BadDid(did.into()));
     }
     if let Ok(acct) = app.account(did).await {
-        if let Some(doc) = local_did_doc(app, &acct) {
-            return Ok(Arc::new(doc));
-        }
+        return super::identity::account_did_doc(app, &acct).await;
     }
     app.did_resolver.resolve(did).await
-}
-
-fn local_did_doc(app: &App, acct: &Account) -> Option<J> {
-    (!acct.signing_pubkey.is_empty()).then_some(())?;
-    Some(json!({
-        "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
-        "id": acct.did,
-        "alsoKnownAs": [format!("at://{}", acct.handle)],
-        "verificationMethod": [{
-            "id": format!("{}#atproto", acct.did),
-            "type": "Multikey",
-            "controller": acct.did,
-            "publicKeyMultibase": acct.signing_pubkey,
-        }],
-        "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": app.public_url}],
-    }))
 }
 
 // Forwarding

@@ -258,7 +258,9 @@ async fn issuer_key(app: &App, iss: &str, fresh: bool) -> XResult<String> {
     let key_id = if service == "atproto_labeler" { "atproto_label" } else { "atproto" };
     if key_id == "atproto" {
         if let Ok(a) = app.account(did).await {
-            return Ok(a.signing_pubkey);
+            if super::identity::serves_local_doc(app, &a) {
+                return Ok(a.signing_pubkey);
+            }
         }
     }
     if fresh {

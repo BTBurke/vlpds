@@ -2429,11 +2429,35 @@ mode. For e2e against a real directory, point `--plc-url` at a local
 did-method-plc server (plain http is accepted, with a warning outside dev
 mode); in-process tests use `plc::mock::MockPlc`, never plc.directory.
 
-**Not done / differences.** Resolution endpoints (`resolveDid`,
-`resolveIdentity`) still serve the locally generated document for accounts
-hosted here (identical to the directory's while the account is here); a
-migrated-away account's stale document is served here until it is deleted.
-No `PDS_PLC_ROTATION_KEY_KMS_KEY_ID` (a KMS-resident signing key): the key
+**DID documents of hosted accounts** (`identity::account_did_doc`:
+`resolveDid`, `resolveIdentity`, `describeRepo`, `getSession` /
+`createSession` / `refreshSession`, proxy targets, service-auth issuer
+keys). The reference resolves every DID through the directory (cached).
+Here an account *active* here gets the locally generated document, which
+is the directory's (every change of the DID goes through this PDS) and
+costs no network round trip. A **deactivated** account's DID resolves
+through the directory (or did:web) like any other: the reference
+migration-out flow ends with deactivateAccount on the old PDS (the old PDS
+never sees the op that moves the DID: `submitPlcOperation` here and in
+the reference refuses an `atproto_pds` that isn't this PDS; the new PDS
+submits it), and a migrating-in account isn't pointed here yet.
+Deactivation invalidates the node's DID cache entry and emits `#account`
+(`active: false, status: deactivated`, as the reference; the new PDS
+emits `#identity` on submit and `#account` on activation). After
+migration: resolveDid/resolveIdentity/getSession return the directory's
+document, describeRepo is `RepoDeactivated`, writes are 401
+`AccountDeactivated`, activateAccount is refused (directory `/data` check).
+`--plc-mode unregistered` DIDs (nowhere else to resolve) always get the
+local document; a failed resolution is `DidNotFound` / 502
+`UpstreamFailure` (resolveDid), `InvalidRequest` (describeRepo) or an
+omitted `didDoc` (sessions, reference `safeResolveDidDoc`).
+
+**Not done / differences.** An account that migrates away but is left
+*active* here keeps the local (stale) document until it is deactivated
+or deleted (the reference would serve the directory's after its cache
+TTL); other nodes' DID caches (10 min TTL) aren't invalidated on
+deactivation (they hold an entry only if they resolved the DID while it
+was not active here). No `PDS_PLC_ROTATION_KEY_KMS_KEY_ID` (a KMS-resident signing key): the key
 is KMS-*wrapped* instead. signPlcOperation refuses a requested field of the
 wrong shape instead of signing it (the reference casts it unchecked). The
 mock directory has no rate limits or export.

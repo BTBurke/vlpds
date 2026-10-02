@@ -1220,15 +1220,16 @@ fn refresh_claims(
     Ok(c)
 }
 
-fn session_info(app: &App, a: &Account, include_email: bool) -> J {
+async fn session_info(app: &App, a: &Account, include_email: bool) -> J {
     let (active, status) = account_status(a);
     let mut out = json!({
         "did": a.did,
         "handle": a.handle,
         "active": active,
     });
-    if let Ok(doc) = super::identity::did_doc(app, a) {
-        out["didDoc"] = doc;
+    // reference safeResolveDidDoc: omitted when it doesn't resolve
+    if let Ok(doc) = super::identity::account_did_doc(app, a).await {
+        out["didDoc"] = (*doc).clone();
     }
     if let Some(s) = status {
         out["status"] = json!(s);
@@ -1316,7 +1317,7 @@ async fn account_did_doc(app: &App, a: &Account) -> Option<J> {
         app.did_resolver.invalidate(&a.did);
         return app.did_resolver.resolve(&a.did).await.ok().map(|d| (*d).clone());
     }
-    super::identity::did_doc(app, a).ok()
+    Some(super::identity::did_doc(app, a))
 }
 
 /// Account creation (createAccount, which then starts a session, and the
@@ -1665,7 +1666,7 @@ async fn create_session(
     }
     let (access, refresh) =
         create_session_tokens_scoped(&app, &acct.did, app_pass, soft_deleted).await?;
-    let mut out = session_info(&app, &acct, true);
+    let mut out = session_info(&app, &acct, true).await;
     out["accessJwt"] = json!(access);
     out["refreshJwt"] = json!(refresh);
     Ok(Json(out))
@@ -1679,7 +1680,7 @@ async fn get_session(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>
         .map_err(|_| invalid_request(format!("Could not find user info for account: {did}")))?;
     let include_email =
         !matches!(creds, Credentials::OAuth { .. }) || creds.allows_account("email", "read");
-    Ok(Json(session_info(&app, &acct, include_email)))
+    Ok(Json(session_info(&app, &acct, include_email).await))
 }
 
 async fn refresh_session(State(app): AppState, headers: HeaderMap) -> XResult<Json<J>> {
@@ -1718,7 +1719,7 @@ async fn refresh_session(State(app): AppState, headers: HeaderMap) -> XResult<Js
     }
     app.put_private(&did, muts).await?;
     let (access, refresh) = issue_pair(&app, &did, &st.family, &next, &st.app_password);
-    let mut out = session_info(&app, &acct, true);
+    let mut out = session_info(&app, &acct, true).await;
     out["accessJwt"] = json!(access);
     out["refreshJwt"] = json!(refresh);
     Ok(Json(out))
@@ -1894,6 +1895,11 @@ pub(super) async fn set_deactivated(
         Ok(())
     })
     .await
+    .inspect(|_| {
+        // a deactivated account's DID resolves through the directory from
+        // now on (identity::serves_local_doc): not from a stale cache entry
+        app.did_resolver.invalidate(did);
+    })
 }
 
 async fn deactivate_account(

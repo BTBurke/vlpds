@@ -181,28 +181,40 @@ async fn admin_listings_scatter_gather_across_nodes() {
     let rb = a.xrpc.http.get(format!("{}/internal/v1/admin/searchAccounts", b.url));
     assert_eq!(a.xrpc.send(rb).await.status, 401);
 
-    // a "live" peer that never answers: reported, not silently dropped
+    // a "live" peer that never answers: reported, not silently dropped. Its
+    // lease keeps renewing for the rest of the test: a lease that goes quiet
+    // for 1.5 renew intervals at an address refusing connections is presumed
+    // dead (and dropped from the peers) within ~150 ms, which under load
+    // could happen between the two listings below.
     let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = format!("http://{}", dead.local_addr().unwrap());
     drop(dead);
-    let lease = vlpds::cluster::NodeLease {
-        node_id: "adm-ghost".into(),
-        log_id: "adm-ghost.0".into(),
-        addr: dead_addr,
-        writer: 254,
-        expires_ms: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() + 60_000) as u64,
-        renewals: 1,
-        next_ordinal: 0,
-        draining: false,
-    };
-    store
-        .put(&object_store::path::Path::from("vlpds/nodes/adm-ghost"), serde_json::to_vec(&lease).unwrap().into())
-        .await
-        .unwrap();
+    let ghost_store = store.clone();
+    let ghost = tokio::spawn(async move {
+        for renewals in 1u64.. {
+            let lease = vlpds::cluster::NodeLease {
+                node_id: "adm-ghost".into(),
+                log_id: "adm-ghost.0".into(),
+                addr: dead_addr.clone(),
+                writer: 254,
+                expires_ms: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() + 60_000) as u64,
+                renewals,
+                next_ordinal: 0,
+                draining: false,
+            };
+            ghost_store
+                .put(&object_store::path::Path::from("vlpds/nodes/adm-ghost"), serde_json::to_vec(&lease).unwrap().into())
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+    let reports_ghost = |r: &J| r["unreachableNodes"].as_array().is_some_and(|v| v.iter().any(|n| n == "adm-ghost"));
+    // each node reports it once its membership step has seen the lease
     let mut seen = None;
     for _ in 0..100 {
         let r = a.xrpc.get("com.atproto.admin.searchAccounts", &[("email", &prefix)], &Auth::Admin).await.ok();
-        if r["unreachableNodes"].as_array().is_some_and(|v| v.iter().any(|n| n == "adm-ghost")) {
+        if reports_ghost(&r) {
             seen = Some(r);
             break;
         }
@@ -210,8 +222,16 @@ async fn admin_listings_scatter_gather_across_nodes() {
     }
     let r = seen.expect("unreachable peer reported");
     assert!(r["accounts"].is_array(), "partial results still returned: {r}");
-    let r = b.xrpc.get("com.atproto.admin.getInviteCodes", &[], &Auth::Admin).await.ok();
-    assert!(r["unreachableNodes"].as_array().is_some_and(|v| v.iter().any(|n| n == "adm-ghost")), "{r}");
+    let mut last = J::Null;
+    for _ in 0..100 {
+        last = b.xrpc.get("com.atproto.admin.getInviteCodes", &[], &Auth::Admin).await.ok();
+        if reports_ghost(&last) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    ghost.abort();
+    assert!(reports_ghost(&last), "{last}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

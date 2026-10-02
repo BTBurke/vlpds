@@ -305,7 +305,8 @@ async fn migration_out_to_another_pds() {
     let mut body = rec.clone();
     body["token"] = json!(tok);
     let op = old.xrpc.post("com.atproto.identity.signPlcOperation", &body, &alice.auth()).await.ok()["operation"].clone();
-    // 4. the new PDS submits it and activates
+    // 4. the new PDS submits it (#identity) and activates (#account)
+    let mut new_sub = new.subscribe_from_now().await;
     new.xrpc.post("com.atproto.identity.submitPlcOperation", &json!({"operation": op}), &auth).await.ok();
     let data = plc.data(&did).unwrap();
     assert_eq!(data["services"]["atproto_pds"]["endpoint"], json!(new.url));
@@ -314,8 +315,45 @@ async fn migration_out_to_another_pds() {
     let st = new.xrpc.get("com.atproto.server.checkAccountStatus", &[], &auth).await.ok();
     assert_eq!(st["validDid"], json!(true), "{st}");
     new.xrpc.post_empty("com.atproto.server.activateAccount", &auth).await.ok();
+    let frames = new_sub
+        .until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#account" && f.did() == Some(did.as_str()) && f.bool("active") == Some(true)))
+        .await;
+    assert!(frames.iter().any(|f| f.kind() == "#identity" && f.did() == Some(did.as_str())), "#identity after submit");
+    // the new PDS serves the directory's document
+    let new_doc = new.xrpc.get("com.atproto.identity.resolveDid", &[("did", &did)], &Auth::None).await.ok()["didDoc"].clone();
+    assert_eq!(new_doc["service"][0]["serviceEndpoint"], json!(new.url));
     // 5. the old PDS steps back; it no longer controls the DID
+    let mut old_sub = old.subscribe_from_now().await;
     old.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &alice.auth()).await.ok();
+    let fr = old_sub
+        .until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#account" && f.did() == Some(did.as_str())))
+        .await;
+    let fr = fr.iter().find(|f| f.kind() == "#account").unwrap();
+    assert_eq!((fr.bool("active"), fr.str("status")), (Some(false), Some("deactivated")));
+    // its DID now resolves through the directory, not to the stale local
+    // document (which still names the old PDS, key and handle)
+    let served = vlpds::plc::format_did_doc(&plc.data(&did).unwrap());
+    let same_doc = |doc: &J| {
+        for k in ["id", "alsoKnownAs", "verificationMethod", "service"] {
+            assert_eq!(doc[k], served[k], "{k}: {doc}");
+        }
+    };
+    same_doc(&old.xrpc.get("com.atproto.identity.resolveDid", &[("did", &did)], &Auth::None).await.ok()["didDoc"]);
+    let ident = old.xrpc.get("com.atproto.identity.resolveIdentity", &[("identifier", &did)], &Auth::None).await.ok();
+    same_doc(&ident["didDoc"]);
+    assert_eq!(ident["didDoc"]["service"][0]["serviceEndpoint"], json!(new.url));
+    let sess = old.xrpc.get("com.atproto.server.getSession", &[], &alice.auth()).await.ok();
+    assert_eq!((&sess["active"], &sess["status"]), (&json!(false), &json!("deactivated")), "{sess}");
+    same_doc(&sess["didDoc"]);
+    // describeRepo of a deactivated repo is refused (reference assertRepoAvailability)
+    old.xrpc.get("com.atproto.repo.describeRepo", &[("repo", &did)], &Auth::None).await.err(400, "RepoDeactivated");
+    let desc = new.xrpc.get("com.atproto.repo.describeRepo", &[("repo", &did)], &Auth::None).await.ok();
+    same_doc(&desc["didDoc"]);
+    // writes are refused (reference checkDeactivated)
+    old.xrpc
+        .post("com.atproto.repo.createRecord", &json!({"repo": did, "collection": "app.bsky.feed.post", "record": {"$type": "app.bsky.feed.post", "text": "stale", "createdAt": "2026-01-01T00:00:00Z"}}), &alice.auth())
+        .await
+        .err(401, "AccountDeactivated");
     let st = old.xrpc.get("com.atproto.server.checkAccountStatus", &[], &alice.auth()).await.ok();
     assert_eq!(st["validDid"], json!(false), "{st}");
     old.xrpc.post_empty("com.atproto.server.activateAccount", &alice.auth()).await.err(400, "InvalidRequest");
