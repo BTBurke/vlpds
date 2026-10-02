@@ -238,6 +238,13 @@ struct Args {
     /// Moderation service for createReport: "<url>,<service did>".
     #[arg(long, env = "VLPDS_REPORT_SERVICE")]
     report_service: Option<String>,
+    /// Image URLs in read-after-write views of the requester's own records
+    /// (reference PDS_BSKY_APP_VIEW_CDN_URL_PATTERN), with three `%s`:
+    /// preset (avatar, banner, feed_thumbnail, feed_fullsize), DID, blob CID,
+    /// e.g. "https://cdn.bsky.app/img/%s/plain/%s/%s@jpeg". Unset: this
+    /// PDS's getBlob URL.
+    #[arg(long, env = "VLPDS_BSKY_APP_VIEW_CDN_URL_PATTERN")]
+    bsky_app_view_cdn_url_pattern: Option<String>,
     /// Relays to send requestCrawl to at startup (comma-separated hostnames/urls).
     #[arg(long, env = "VLPDS_CRAWLERS", value_delimiter = ',')]
     crawlers: Vec<String>,
@@ -727,6 +734,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         cache_dir: (!args.cache_dir.is_empty()).then(|| std::path::PathBuf::from(&args.cache_dir)),
         appview: url_did(&args.appview)?,
         report_service: url_did(&args.report_service)?,
+        appview_cdn_url_pattern: args.bsky_app_view_cdn_url_pattern.clone().filter(|p| !p.is_empty()),
         crawlers: args.crawlers.clone(),
         dev_mode: args.dev_mode,
         kek: kek_config(&args)?,

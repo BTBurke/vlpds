@@ -4520,6 +4520,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossbeam-channel",
+ "flate2",
  "futures",
  "hdrhistogram",
  "hex",

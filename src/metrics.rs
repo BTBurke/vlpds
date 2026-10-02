@@ -105,6 +105,7 @@ lazy!(RETENTION_TICKS: IntCounterVec = register_int_counter_vec!("vlpds_retentio
 
 // ---- proxy ----
 lazy!(PROXY_CACHE: IntCounterVec = register_int_counter_vec!("vlpds_proxy_cache_total", "Proxy fast-path cache lookups", &["result"]));
+lazy!(READ_AFTER_WRITE: IntCounterVec = register_int_counter_vec!("vlpds_proxy_read_after_write_total", "Proxied reads with an AppView rev: how the requester's records since it were found (log_nothing, log_records, store_read) and what was returned (munged, unchanged, failed)", &["result"]));
 
 // ---- in-memory caches (caches.rs) ----
 lazy!(CACHE_ENTRIES: IntGaugeVec = register_int_gauge_vec!("vlpds_cache_entries", "Entries held per in-memory cache", &["cache"]));

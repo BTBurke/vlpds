@@ -154,6 +154,11 @@ enum Cmd {
         /// (the PDS passes it through without looking inside).
         #[arg(long, default_value = "")]
         content_encoding: String,
+        /// Send this `atproto-repo-rev` (a TID), as a real AppView does on
+        /// the methods with read-after-write; e.g. 7zzzzzzzzzzzz (after
+        /// every repo's head: nothing to merge). Empty: no header.
+        #[arg(long, default_value = "")]
+        repo_rev: String,
     },
     /// Closed-loop proxied reads (app.bsky.* via the default AppView) from a
     /// window of `active` bulk accounts (self-minted access tokens).
@@ -355,8 +360,8 @@ fn main() -> anyhow::Result<()> {
                 json_out,
             } => fanout(&args, *subscribers, *seconds, *cursor, json_out).await,
             Cmd::Verify { acked } => verify(&args, acked).await,
-            Cmd::StubAppview { listen, body_bytes, content_encoding } => {
-                stub_appview(listen, *body_bytes, content_encoding).await
+            Cmd::StubAppview { listen, body_bytes, content_encoding, repo_rev } => {
+                stub_appview(listen, *body_bytes, content_encoding, repo_rev).await
             }
             Cmd::Proxy { active, concurrency, seconds, path, connections, jwt_secret, service_did, accept_encoding, json_out } => {
                 proxy_bench(&args, *active, *concurrency, *seconds, path, *connections, jwt_secret, service_did, accept_encoding, json_out)
@@ -2107,7 +2112,7 @@ async fn clone_repo(args: &Args, car_path: &str, copies: usize, concurrency: usi
 
 // ---------------- proxy fast path ----------------
 
-async fn stub_appview(listen: &str, body_bytes: usize, content_encoding: &str) -> anyhow::Result<()> {
+async fn stub_appview(listen: &str, body_bytes: usize, content_encoding: &str, repo_rev: &str) -> anyhow::Result<()> {
     let body = if content_encoding.is_empty() {
         let pad = "x".repeat(body_bytes.saturating_sub(32));
         bytes::Bytes::from(format!("{{\"feed\":[],\"cursor\":\"{pad}\"}}"))
@@ -2115,12 +2120,16 @@ async fn stub_appview(listen: &str, body_bytes: usize, content_encoding: &str) -
         bytes::Bytes::from((0..body_bytes).map(|i| (i * 131 + 7) as u8).collect::<Vec<u8>>())
     };
     let ce = (!content_encoding.is_empty()).then(|| axum::http::HeaderValue::from_str(content_encoding)).transpose()?;
+    let rev = (!repo_rev.is_empty()).then(|| axum::http::HeaderValue::from_str(repo_rev)).transpose()?;
     let app = axum::Router::new().fallback(move || {
-        let (body, ce) = (body.clone(), ce.clone());
+        let (body, ce, rev) = (body.clone(), ce.clone(), rev.clone());
         async move {
             let mut r = axum::response::IntoResponse::into_response(([(axum::http::header::CONTENT_TYPE, "application/json")], body));
             if let Some(ce) = ce {
                 r.headers_mut().insert(axum::http::header::CONTENT_ENCODING, ce);
+            }
+            if let Some(rev) = rev {
+                r.headers_mut().insert("atproto-repo-rev", rev);
             }
             r
         }

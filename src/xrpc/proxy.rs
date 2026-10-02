@@ -33,6 +33,10 @@ const GET_PREFERENCES: &str = "app.bsky.actor.getPreferences";
 const PUT_PREFERENCES: &str = "app.bsky.actor.putPreferences";
 const CREATE_REPORT: &str = "com.atproto.moderation.createReport";
 const APPEAL_ACTIONED_SUBJECT: &str = "tools.ozone.inbox.appealActionedSubject";
+const GET_FEED: &str = "app.bsky.feed.getFeed";
+const GET_FEED_SKELETON: &str = "app.bsky.feed.getFeedSkeleton";
+
+mod read_after_write;
 
 /// TS proxy defaults: headersTimeout 10s, bodyTimeout 30s, maxResponseSize 10MB.
 const HEADERS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -301,7 +305,7 @@ fn upstream_failure(message: &str) -> XrpcError {
 }
 
 /// Request headers passed to the upstream service (TS allow-list).
-fn forward_headers(src: &HeaderMap, with_body: bool, authorization: Option<&str>) -> HeaderMap {
+fn forward_headers(src: &HeaderMap, with_body: bool, authorization: Option<&str>, accept_encoding: Option<header::HeaderValue>) -> HeaderMap {
     const ACCEPT_LANGUAGE: header::HeaderName = header::ACCEPT_LANGUAGE;
     const ACCEPT_LABELERS: header::HeaderName = header::HeaderName::from_static("atproto-accept-labelers");
     const BSKY_TOPICS: header::HeaderName = header::HeaderName::from_static("x-bsky-topics");
@@ -311,7 +315,7 @@ fn forward_headers(src: &HeaderMap, with_body: bool, authorization: Option<&str>
             out.append(name.clone(), v.clone());
         }
     };
-    let ae = src.get(header::ACCEPT_ENCODING).cloned();
+    let ae = accept_encoding.or_else(|| src.get(header::ACCEPT_ENCODING).cloned());
     out.insert(header::ACCEPT_ENCODING, ae.unwrap_or(header::HeaderValue::from_static("identity")));
     copy(&mut out, &ACCEPT_LANGUAGE);
     copy(&mut out, &ACCEPT_LABELERS);
@@ -382,55 +386,69 @@ fn response_type_str(status: u16) -> Option<&'static str> {
     })
 }
 
-/// Re-raises an upstream error response (TS PipethroughUpstreamError):
+/// An upstream error response, re-raised (TS PipethroughUpstreamError):
 /// status passes through except 500 -> 502; error/message come from the
 /// upstream JSON body when present; only the forwardable headers are kept.
-async fn upstream_error(resp: axum::http::response::Parts, body: Body) -> Response {
-    let upstream_status = resp.status.as_u16();
-    let status = if upstream_status == 500 {
-        502
-    } else {
-        upstream_status
-    };
-    let mut fwd = HeaderMap::new();
-    for name in RES_HEADERS_TO_FORWARD {
-        if let Some(v) = resp.headers.get(&name) {
-            fwd.insert(name, v.clone());
-        }
-    }
-    let json_body = resp
-        .headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(is_json_content_type);
-    let encoded = resp
-        .headers
-        .get(header::CONTENT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|e| !e.trim().is_empty() && !e.trim().eq_ignore_ascii_case("identity"));
-    let (mut error, mut message) = (None, None);
-    if json_body && !encoded {
-        let buf = axum::body::to_bytes(body, usize::MAX).await;
-        if let Ok(buf) = buf {
-            if let Ok(v) = serde_json::from_slice::<J>(&buf) {
-                error = v.get("error").and_then(|e| e.as_str()).map(String::from);
-                message = v.get("message").and_then(|e| e.as_str()).map(String::from);
+struct UpstreamError {
+    status: u16,
+    headers: HeaderMap,
+    error: Option<String>,
+    message: Option<String>,
+}
+
+impl UpstreamError {
+    async fn read(resp: axum::http::response::Parts, body: Body) -> UpstreamError {
+        let upstream_status = resp.status.as_u16();
+        let status = if upstream_status == 500 { 502 } else { upstream_status };
+        let mut headers = HeaderMap::new();
+        for name in RES_HEADERS_TO_FORWARD {
+            if let Some(v) = resp.headers.get(&name) {
+                headers.insert(name, v.clone());
             }
         }
+        let json_body = resp
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(is_json_content_type);
+        let encoded = resp
+            .headers
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|e| !e.trim().is_empty() && !e.trim().eq_ignore_ascii_case("identity"));
+        let (mut error, mut message) = (None, None);
+        if json_body && !encoded {
+            let buf = axum::body::to_bytes(body, usize::MAX).await;
+            if let Ok(buf) = buf {
+                if let Ok(v) = serde_json::from_slice::<J>(&buf) {
+                    error = v.get("error").and_then(|e| e.as_str()).map(String::from);
+                    message = v.get("message").and_then(|e| e.as_str()).map(String::from);
+                }
+            }
+        }
+        UpstreamError { status, headers, error, message }
     }
-    let error = error.or_else(|| response_type_name(status).map(String::from));
-    let message = message
-        .filter(|m| !m.is_empty())
-        .or_else(|| response_type_str(status).map(String::from));
-    let mut body = serde_json::Map::new();
-    if let Some(e) = error {
-        body.insert("error".into(), J::String(e));
+
+    fn into_response(self) -> Response {
+        let error = self.error.or_else(|| response_type_name(self.status).map(String::from));
+        let message = self
+            .message
+            .filter(|m| !m.is_empty())
+            .or_else(|| response_type_str(self.status).map(String::from));
+        let mut body = serde_json::Map::new();
+        if let Some(e) = error {
+            body.insert("error".into(), J::String(e));
+        }
+        if let Some(m) = message {
+            body.insert("message".into(), J::String(m));
+        }
+        let code = StatusCode::from_u16(self.status).unwrap_or(StatusCode::BAD_GATEWAY);
+        (code, self.headers, Json(J::Object(body))).into_response()
     }
-    if let Some(m) = message {
-        body.insert("message".into(), J::String(m));
-    }
-    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-    (code, fwd, Json(J::Object(body))).into_response()
+}
+
+async fn upstream_error(resp: axum::http::response::Parts, body: Body) -> Response {
+    UpstreamError::read(resp, body).await.into_response()
 }
 
 struct Forward<'a> {
@@ -441,7 +459,14 @@ struct Forward<'a> {
     body: Option<Body>,
     /// Service-auth issuer; None forwards without credentials.
     iss: Option<&'a str>,
+    /// Method named in the service-auth token.
     lxm: &'a str,
+    /// Service-auth audience other than the target's DID (getFeed: the
+    /// feed generator's).
+    aud: Option<&'a str>,
+    /// Accept-Encoding sent instead of the client's (read-after-write asks
+    /// only for encodings it can decode).
+    accept_encoding: Option<header::HeaderValue>,
 }
 
 // ---- fast path caches ------------------------------------------------------
@@ -758,6 +783,35 @@ where
 /// there is an issuer, whose account `acct` is) and streams the response
 /// back.
 async fn forward(app: &App, target: &Target<'_>, f: Forward<'_>, acct: Option<&CachedAcct>) -> XResult<Response> {
+    let (parts, body) = send(app, target, f, acct).await?;
+    if parts.status.as_u16() >= 400 {
+        return Ok(upstream_error(parts, body).await);
+    }
+    Ok(passthrough(parts, body))
+}
+
+/// A successful upstream response, streamed through with its allow-listed
+/// headers.
+fn passthrough(parts: axum::http::response::Parts, body: Body) -> Response {
+    let mut out = Response::new(body);
+    *out.status_mut() = parts.status;
+    let headers = out.headers_mut();
+    for name in RES_HEADERS {
+        for v in parts.headers.get_all(&name) {
+            headers.append(name.clone(), v.clone());
+        }
+    }
+    out
+}
+
+/// Sends the request (see [`forward`]); the upstream response head and
+/// body, whatever its status.
+async fn send(
+    app: &App,
+    target: &Target<'_>,
+    f: Forward<'_>,
+    acct: Option<&CachedAcct>,
+) -> XResult<(axum::http::response::Parts, Body)> {
     let authorization = match f.iss {
         Some(iss) => {
             let fetched;
@@ -769,7 +823,7 @@ async fn forward(app: &App, target: &Target<'_>, f: Forward<'_>, acct: Option<&C
                 }
             };
             // Phase 1 of service-auth updates: the outbound JWT aud is the bare DID.
-            Some(service_jwt(acct, iss, &target.did, f.lxm)?)
+            Some(service_jwt(acct, iss, f.aud.unwrap_or(&target.did), f.lxm)?)
         }
         None => None,
     };
@@ -784,7 +838,7 @@ async fn forward(app: &App, target: &Target<'_>, f: Forward<'_>, acct: Option<&C
     }
     let ep = endpoint(&target.url)?;
     let with_body = f.body.is_some();
-    let headers = forward_headers(f.headers, with_body, authorization.as_deref());
+    let headers = forward_headers(f.headers, with_body, authorization.as_deref(), f.accept_encoding);
     let sent = match ep.h1.as_ref().filter(|_| target.trusted) {
         // operator-configured plain-HTTP upstream: the HTTP/1.1 fast path
         Some(authority) => {
@@ -821,25 +875,10 @@ async fn forward(app: &App, target: &Target<'_>, f: Forward<'_>, acct: Option<&C
             }
         }
     };
-    let (parts, body) = match sent {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(endpoint = %target.url, path = f.path_and_query, "proxy upstream error: {e}");
-            return Err(upstream_failure("Upstream service unreachable"));
-        }
-    };
-    if parts.status.as_u16() >= 400 {
-        return Ok(upstream_error(parts, body).await);
-    }
-    let mut out = Response::new(body);
-    *out.status_mut() = parts.status;
-    let headers = out.headers_mut();
-    for name in RES_HEADERS {
-        for v in parts.headers.get_all(&name) {
-            headers.append(name.clone(), v.clone());
-        }
-    }
-    Ok(out)
+    sent.map_err(|e| {
+        tracing::warn!(endpoint = %target.url, path = f.path_and_query, "proxy upstream error: {e}");
+        upstream_failure("Upstream service unreachable")
+    })
 }
 
 /// Unauthenticated pipethrough of a GET to the `atproto-proxy` target or the
@@ -868,6 +907,8 @@ pub(super) async fn pipethrough_unauthed(
             body: None,
             iss: None,
             lxm,
+            aud: None,
+            accept_encoding: None,
         },
         None,
     )
@@ -898,6 +939,73 @@ fn user_did(creds: &Credentials) -> XResult<&str> {
     creds
         .did()
         .ok_or_else(|| XrpcError::auth("user credentials required"))
+}
+
+/// GET `lxm` with `params` from the configured AppView, as `iss` (a
+/// service-auth token) or unauthenticated; the JSON body (identity-encoded)
+/// or the upstream's error.
+async fn appview_json(app: &App, lxm: &str, params: &[(&str, &str)], iss: Option<(&str, &CachedAcct)>) -> XResult<J> {
+    let target = configured(&app.config.appview, "bsky_appview")
+        .ok_or_else(|| XrpcError::bad("InvalidRequest", format!("No service configured for {lxm}")))?;
+    let url = reqwest::Url::parse_with_params(&format!("http://x/xrpc/{lxm}"), params)
+        .map_err(|_| XrpcError::bad("InvalidRequest", "invalid xrpc path"))?;
+    let pq = match url.query() {
+        Some(q) => format!("{}?{q}", url.path()),
+        None => url.path().to_string(),
+    };
+    let headers = HeaderMap::new();
+    let f = Forward {
+        method: Method::GET,
+        path_and_query: &pq,
+        headers: &headers,
+        body: None,
+        iss: iss.map(|(d, _)| d),
+        lxm,
+        aud: None,
+        accept_encoding: None,
+    };
+    let (parts, body) = send(app, &target, f, iss.map(|(_, a)| a)).await?;
+    if parts.status.as_u16() >= 400 {
+        let e = UpstreamError::read(parts, body).await;
+        return Err(XrpcError {
+            status: StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY),
+            message: e.message.or_else(|| response_type_str(e.status).map(String::from)).unwrap_or_default(),
+            error: e.error.or_else(|| response_type_name(e.status).map(String::from)).unwrap_or_default(),
+        });
+    }
+    let buf = axum::body::to_bytes(body, usize::MAX).await.map_err(|e| upstream_failure(&e.to_string()))?;
+    serde_json::from_slice(&buf).map_err(|_| upstream_failure("invalid upstream response"))
+}
+
+/// Feed generator DIDs by feed URI (getFeed), for a minute.
+static FEED_DIDS: std::sync::LazyLock<TtlCache<String, Arc<str>>> =
+    std::sync::LazyLock::new(|| TtlCache::new(crate::caches::Cache::DidDocs));
+const FEED_DID_TTL: Duration = Duration::from_secs(60);
+
+/// The DID of the feed generator getFeed's `feed` names, from its record
+/// on the AppView (reference api/app/bsky/feed/getFeed.ts).
+async fn feed_generator_did(app: &App, pq: &str) -> XResult<Arc<str>> {
+    let url = reqwest::Url::parse(&format!("http://x{pq}")).map_err(|_| XrpcError::bad("InvalidRequest", "invalid xrpc path"))?;
+    let feed = url
+        .query_pairs()
+        .find(|(k, _)| k == "feed")
+        .map(|(_, v)| v.into_owned())
+        .ok_or_else(|| XrpcError::bad("InvalidRequest", "Params must have the property \"feed\""))?;
+    if let Some(d) = FEED_DIDS.get(feed.as_str(), FEED_DID_TTL) {
+        return Ok(d);
+    }
+    let bad = || XrpcError::bad("InvalidRequest", "Invalid feed: must be an at-uri");
+    let rest = feed.strip_prefix("at://").ok_or_else(bad)?;
+    let mut parts = rest.splitn(3, '/');
+    let (repo, collection, rkey) = (parts.next().ok_or_else(bad)?, parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    let rec = appview_json(app, "com.atproto.repo.getRecord", &[("repo", repo), ("collection", collection), ("rkey", rkey)], None).await?;
+    let did: Arc<str> = rec
+        .pointer("/value/did")
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| XrpcError::bad("UnknownFeed", "could not resolve feed did"))?
+        .into();
+    FEED_DIDS.put(feed, did.clone(), FEED_DID_TTL);
+    Ok(did)
 }
 
 /// Router fallback: catch-all proxy for XRPC methods not served locally.
@@ -971,20 +1079,32 @@ async fn proxy_request(app: &App, req: Request) -> XResult<Response> {
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or(parts.uri.path());
-    forward(
-        app,
-        &target,
-        Forward {
-            method,
-            path_and_query: pq,
-            headers: &parts.headers,
-            body,
-            iss: Some(did),
-            lxm: &lxm,
-        },
-        Some(&acct),
-    )
-    .await
+    let mut fwd = Forward {
+        method,
+        path_and_query: pq,
+        headers: &parts.headers,
+        body,
+        iss: Some(did),
+        lxm: &lxm,
+        aud: None,
+        accept_encoding: None,
+    };
+    // the AppView methods the reference serves itself (only with an
+    // AppView configured, like the reference)
+    let feed_did;
+    if fwd.method == Method::GET && app.config.appview.is_some() {
+        if lxm == GET_FEED {
+            // the token is for the feed generator, which the AppView calls
+            // with it
+            creds.require(creds.allows_rpc(GET_FEED_SKELETON, &target.scope_aud()))?;
+            feed_did = feed_generator_did(app, pq).await?;
+            fwd.aud = Some(&feed_did);
+            fwd.lxm = GET_FEED_SKELETON;
+        } else if let Some(kind) = read_after_write::Kind::of(&lxm) {
+            return read_after_write::proxy(app, &target, fwd, &acct, kind).await;
+        }
+    }
+    forward(app, &target, fwd, Some(&acct)).await
 }
 
 // app.bsky.actor.{get,put}Preferences
@@ -1080,6 +1200,8 @@ async fn get_preferences(
                 body: None,
                 iss: Some(&did),
                 lxm: GET_PREFERENCES,
+                aud: None,
+                accept_encoding: None,
             },
             None,
         )
@@ -1122,6 +1244,8 @@ async fn put_preferences(
             body: Some(Body::from(body)),
             iss: Some(&did),
             lxm: PUT_PREFERENCES,
+            aud: None,
+            accept_encoding: None,
         };
         return forward(&app, &target, fwd, None).await;
     }
@@ -1269,6 +1393,8 @@ async fn create_report(
             body: Some(Body::from(body)),
             iss: Some(&did),
             lxm: CREATE_REPORT,
+            aud: None,
+            accept_encoding: None,
         },
         Some(&acct),
     )

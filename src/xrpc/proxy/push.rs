@@ -73,6 +73,8 @@ async fn push(app: &App, creds: &Credentials, lxm: &'static str, body: &[u8]) ->
             body: Some(Body::from(body)),
             iss: Some(&did),
             lxm,
+            aud: None,
+            accept_encoding: None,
         },
         Some(&acct),
     )

@@ -70,6 +70,7 @@ mod proxy;
 mod push;
 mod proxy_fast_path;
 mod races;
+mod read_after_write;
 mod rebalance_handback;
 mod rate_limit_config;
 mod rate_limits;

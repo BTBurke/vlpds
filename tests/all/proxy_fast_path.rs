@@ -157,7 +157,8 @@ async fn upstream_connections_are_reused() {
 
 /// Compressed AppView responses pass through as they are: same bytes, same
 /// Content-Encoding and Content-Length (no decode/re-encode, no buffering),
-/// and the client's Accept-Encoding reaches the upstream.
+/// and the client's Accept-Encoding reaches the upstream (for methods with
+/// read-after-write, only its decodable codings: tests/all/read_after_write.rs).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn compressed_responses_pass_through() {
     // not valid gzip on purpose: the PDS must not look inside
@@ -182,7 +183,7 @@ async fn compressed_responses_pass_through() {
     .await;
     let a = s.create_account("gzipper").await;
     let r = reqwest::Client::new()
-        .get(format!("{}/xrpc/app.bsky.actor.getProfile?actor=x", s.url))
+        .get(format!("{}/xrpc/app.bsky.feed.getLikes?uri=x", s.url))
         .header("authorization", format!("Bearer {}", a.access))
         .header("accept-encoding", "gzip, br")
         .send()

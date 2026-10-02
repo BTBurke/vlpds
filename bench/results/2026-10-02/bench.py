@@ -12,7 +12,8 @@ into the experiment's .jsonl file next to this script.
 
 proxy env: PROXY_TOTAL (bulk accounts, 1000000), PROXY_IO_THREADS (cores),
 PROXY_STUB_THREADS / PROXY_LG_THREADS (cores/4, min 4 / 6), PROXY_CONNECTIONS
-(loadgen h2 connections, 64), PROXY_SECS (15), PROFILE_PROXY ("active:conc,...").
+(loadgen h2 connections, 64), PROXY_SECS (15), PROFILE_PROXY ("active:conc,..."),
+PROXY_STUB_REV (the stub's atproto-repo-rev, e.g. 7zzzzzzzzzzzz; read-after-write lookups).
 """
 import json
 import os
@@ -669,7 +670,8 @@ def cmd_proxy(actives, concs, total=int(os.environ.get("PROXY_TOTAL", "1000000")
     lgt = os.environ.get("PROXY_LG_THREADS", str(max(6, cores // 4)))
     conns = os.environ.get("PROXY_CONNECTIONS", "64")
     secs = os.environ.get("PROXY_SECS", "15")
-    stub = subprocess.Popen([LOADGEN, "--threads", stub_t, "stub-appview", "--listen", "127.0.0.1:2700", "--body-bytes", str(body)],
+    stub = subprocess.Popen([LOADGEN, "--threads", stub_t, "stub-appview", "--listen", "127.0.0.1:2700", "--body-bytes", str(body)]
+                            + (["--repo-rev", os.environ["PROXY_STUB_REV"]] if os.environ.get("PROXY_STUB_REV") else []),
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     args = ["--appview", "http://127.0.0.1:2700,did:web:stub.test"] + list(extra)
     if "--io-threads" not in args + os.environ.get("VLPDS_EXTRA", "").split():

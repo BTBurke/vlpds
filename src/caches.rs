@@ -44,9 +44,11 @@ pub enum Cache {
     /// Unwrapped repo signing keys (secrets.rs): a miss is a KEK unwrap
     /// (a Cloud KMS round trip in production).
     SigningKeys,
+    /// Per-repo recent writes for proxied read-after-write (recent_writes.rs).
+    RecentWrites,
 }
 
-const N: usize = 10;
+const N: usize = 11;
 
 impl Cache {
     pub const ALL: [Cache; N] = [
@@ -60,6 +62,7 @@ impl Cache {
         Cache::PermissionSets,
         Cache::SecurityControls,
         Cache::SigningKeys,
+        Cache::RecentWrites,
     ];
 
     pub fn name(self) -> &'static str {
@@ -74,6 +77,7 @@ impl Cache {
             Cache::PermissionSets => "permission_sets",
             Cache::SecurityControls => "security_controls",
             Cache::SigningKeys => "signing_keys",
+            Cache::RecentWrites => "recent_writes",
         }
     }
 
@@ -99,6 +103,9 @@ impl Cache {
             Cache::SecurityControls => 256,
             // DID + public multibase + Arc<Keypair> + LRU links
             Cache::SigningKeys => 256,
+            // DID + head/base revs; most entries hold no records (a repo
+            // read through the proxy), a writer's up to 32 (posts ~1 KiB)
+            Cache::RecentWrites => 512,
         }
     }
 
@@ -106,7 +113,7 @@ impl Cache {
     fn weight(self) -> u64 {
         match self {
             Cache::SessionTokens => 25,
-            Cache::OAuthTokens => 25,
+            Cache::OAuthTokens => 21,
             Cache::ProxyAccounts => 15,
             Cache::ProxyJwts => 10,
             Cache::DidDocs => 10,
@@ -115,6 +122,7 @@ impl Cache {
             Cache::PermissionSets => 1,
             Cache::SecurityControls => 6,
             Cache::SigningKeys => 4,
+            Cache::RecentWrites => 4,
         }
     }
 

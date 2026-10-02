@@ -29,6 +29,7 @@ pub mod plc;
 pub mod reshard;
 pub mod profiling;
 pub mod ratelimit;
+pub mod recent_writes;
 pub mod remote;
 pub mod retention;
 pub mod secrets;

@@ -1094,6 +1094,7 @@ impl Worker {
         let pending = Arc::new(AtomicU32::new(1));
         let reply = req.reply;
         let h2 = head.clone();
+        let h2_did = req.did.clone();
         // a new repo's whole tree is in flight until this applies
         let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let a2 = applied.clone();
@@ -1103,6 +1104,9 @@ impl Worker {
             muts,
             ack: Some(Box::new(move |r| {
                 a2.store(true, Ordering::Release);
+                if r.is_ok() {
+                    crate::recent_writes::invalidate(&h2_did);
+                }
                 let _ = reply.send(
                     r.map(|_| h2)
                         .map_err(|e| WriteError::Internal(e.to_string())),
@@ -1822,7 +1826,8 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
     }
     let rev = tid::next_rev(Some(st.head.rev), clock_id);
     let rev_s = rev.to_string();
-    let since_s = st.head.rev.to_string();
+    let since_rev = st.head.rev;
+    let since_s = since_rev.to_string();
     // process_with refuses writes to a repo without its key
     let key = st.key.as_deref().ok_or_else(|| anyhow::anyhow!("signing key unavailable"))?;
     let (commit, commit_block) = match sign_commit(&st.did, &rev_s, &data, key) {
@@ -1856,9 +1861,18 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
     // rest (collection index, blob refs); the segment stores only `extra`
     let mut extra = Vec::new();
     let mut written: HashSet<Cid> = HashSet::new();
+    // what read-after-write needs (crate::recent_writes), applied at the ack
+    let mut recent = Some(Vec::new());
     for (path, (prev, new)) in &batch.ops {
         if prev == new {
             continue; // net no-op (e.g. created then deleted, or identical update)
+        }
+        match recent.as_mut() {
+            Some(r) if r.len() < crate::recent_writes::MAX_RECS => {
+                let bytes = new.filter(|_| crate::recent_writes::keeps_bytes(path)).map(|c| Bytes::copy_from_slice(&batch.records[&c]));
+                r.push((Arc::<str>::from(path.as_str()), new.map(|c| (c, bytes))));
+            }
+            _ => recent = None,
         }
         let action = match (prev, new) {
             (None, Some(_)) => "create",
@@ -1965,6 +1979,14 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
 
     let waiters = batch.waiters;
     let (view, snap) = (st.view.clone(), st.durable_view());
+    let recent = crate::recent_writes::Commit {
+        did: st.did.clone(),
+        part: (st.partition.id, st.partition.epoch),
+        since: since_rev.0,
+        rev: rev.0,
+        prev_nonempty: prev_data != *crate::recent_writes::EMPTY_ROOT,
+        ops: recent,
+    };
     let entry = LogEntry {
         shard: st.partition.id,
         frames: vec![frame],
@@ -1972,6 +1994,8 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
         ack: Some(Box::new(move |r| {
             if r.is_ok() {
                 *view.write() = snap;
+                // before the replies: the writer's next read sees it
+                recent.apply();
             }
             applied.store(true, Ordering::Release);
             for (reply, results) in waiters {
@@ -2316,6 +2340,9 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
                 // applied (acks follow the state apply): drop cached copies
                 // of the account (status, signing key)
                 crate::xrpc::proxy::account_changed(&did);
+                if whole_tree {
+                    crate::recent_writes::invalidate(&did);
+                }
                 inner(r)
             })
         }),

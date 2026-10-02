@@ -70,6 +70,11 @@ pub struct Config {
     pub appview: Option<(String, String)>,
     /// Moderation service for createReport (url, service DID).
     pub report_service: Option<(String, String)>,
+    /// Image URLs in read-after-write views: a printf-style pattern with
+    /// three `%s` (preset such as `avatar`, DID, blob CID), like the
+    /// reference's PDS_BSKY_APP_VIEW_CDN_URL_PATTERN. None: the PDS's own
+    /// `com.atproto.sync.getBlob` URL.
+    pub appview_cdn_url_pattern: Option<String>,
     /// Relays to notify (requestCrawl) at startup.
     pub crawlers: Vec<String>,
     /// Dev mode: email/password-reset tokens are returned/logged instead of mailed.
@@ -226,6 +231,7 @@ impl Default for Config {
             cache_dir: None,
             appview: None,
             report_service: None,
+            appview_cdn_url_pattern: None,
             crawlers: Vec::new(),
             dev_mode: true,
             kek: Default::default(),

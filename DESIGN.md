@@ -368,7 +368,7 @@ load it should stay flat (a rising rate means pool churn).
 |---|---|---|
 | peer | forwarding, internal calls | h2c prior knowledge; 4 MiB stream / 64 MiB conn windows; PING every 10 s (also idle), dead after 5 s; TCP keepalive 30 s; nodelay; connect 1 s; `--peer-connections` (default 4) connections per peer, round-robin |
 | public | PLC, requestCrawl, Cloud KMS (5 s per call) | h2 by ALPN on https, HTTP/1.1 on http with 1,024 idle per host; idle close 60 s; h2 PING 20 s / 10 s; TCP keepalive; connect 5 s, read 30 s |
-| proxy | configured AppView / report service | `http://`: hyper HTTP/1.1 connections, one pool per host with a slot per IO thread: a connection goes back to the slot of the thread that finished its body, a request takes from its own slot, else from another slot, else connects; at most 1,024 connections per host (idle + busy; past that a request waits for one, `vlpds_http_client_pool_waits_total`); idle close 60 s, retry once if a reused connection was closed before the request went out; `https://`: public's settings as one client per IO thread. No read timeout: the proxy arms a 10 s head deadline and a 30 s body-idle timer only while the upstream makes it wait. Responses stream through unbuffered; compressed ones as the upstream encoded them (Content-Encoding/-Length kept, never decoded or re-compressed; the client's Accept-Encoding is forwarded); a client that goes away mid-body closes the upstream connection. CORS preflights are answered locally (no auth, no upstream) |
+| proxy | configured AppView / report service | `http://`: hyper HTTP/1.1 connections, one pool per host with a slot per IO thread: a connection goes back to the slot of the thread that finished its body, a request takes from its own slot, else from another slot, else connects; at most 1,024 connections per host (idle + busy; past that a request waits for one, `vlpds_http_client_pool_waits_total`); idle close 60 s, retry once if a reused connection was closed before the request went out; `https://`: public's settings as one client per IO thread. No read timeout: the proxy arms a 10 s head deadline and a 30 s body-idle timer only while the upstream makes it wait. Responses stream through unbuffered; compressed ones as the upstream encoded them (Content-Encoding/-Length kept, never decoded or re-compressed; the client's Accept-Encoding is forwarded, for the read-after-write methods only its decodable codings: §8); a client that goes away mid-body closes the upstream connection. CORS preflights are answered locally (no auth, no upstream) |
 | guarded | user-derived URLs: did:web, handle `.well-known`, OAuth client metadata, lexicons, DID-doc service endpoints | public's settings, 32 idle per host, plus a resolver that drops non-public addresses (outside dev mode); pair with `check_outbound_url` |
 | S3 (object_store) | log and state stores (separate pools) | HTTP/1.1 only, 256 idle per host, idle close 15 s (S3 closes at ~20 s), connect 2 s, 30 s total |
 
@@ -408,6 +408,83 @@ benchbox's `TcpExtListenOverflows` grew 16 -> 1683 over one bench session
 (1000 firehose subscribers connecting at once, proxy runs at 1024 in
 flight). `ss -ltn` shows the effective queue (Send-Q) per listener;
 `netstat -Lan` on macOS.
+
+### 8. Read-after-write on proxied reads
+(`src/xrpc/proxy/read_after_write.rs`, `src/recent_writes.rs`; reference
+`packages/pds/src/read-after-write`, `api/app/bsky/{actor,feed}`.) The
+AppView indexes a write seconds after it is made, so a user who just posted
+or edited their profile would not see it. Like the reference, the proxy
+merges the requester's own records written after the AppView's indexed rev
+(its `atproto-repo-rev` response header) into exactly the methods the
+reference munges, when an AppView is configured:
+
+| Method | Merge (reference parity) |
+|---|---|
+| actor.getProfile | the local profile record over the view when it is the requester's (`displayName`, `description`, `avatar`, `banner`; fields the record lacks are removed) |
+| actor.getProfiles | the same, on the requester's entry |
+| feed.getActorLikes | the profile over the requester's post authors (no likes are inserted) |
+| feed.getAuthorFeed | only the requester's own feed (first item theirs, or their repost): profile over authors, then new posts inserted by `indexedAt` (newer than the page's last item) |
+| feed.getTimeline | new posts inserted by `indexedAt`; cursors untouched |
+| feed.getPostThread | new replies placed under their parent anywhere in the tree (first among its replies); an upstream `NotFound` for the requester's own unindexed post (DID or handle URI) is answered with a thread built locally, its parents fetched from the AppView (`depth=0`, the request's `parentHeight`) |
+
+Views are built as the reference's `LocalViewer`: PostViews with zero
+counts, the author from the account handle and current profile record,
+embeds as `images#view` / `external#view` / `record#view` (post, feed
+generator and list embeds are looked up on the AppView as the requester:
+getPosts, getFeedGenerator, getList) / `recordWithMedia#view`. Image URLs
+use `--bsky-app-view-cdn-url-pattern` (reference
+PDS_BSKY_APP_VIEW_CDN_URL_PATTERN, `util.format` with preset, DID, CID),
+else this PDS's `com.atproto.sync.getBlob` URL. A munged response is
+`application/json; charset=utf-8` with `Atproto-Upstream-Lag` (ms since the
+oldest merged post/profile write) and, like the reference's, without the
+upstream's other headers; the server's compression layer encodes it per the
+client's Accept-Encoding. Which records count is the reference's
+`getRecordsSinceRev`: the oldest 10 records (any collection) with a rev
+above the AppView's, and none at all when no record is at or below it (an
+AppView rev older than every record: a migrated or brand-new repo). Any
+count above zero re-serializes the response, as in the reference.
+
+**Finding the records cheaply.** The reference runs an indexed SQL query
+per request; vlpds has no rev index (each record value carries its rev, so
+the answer is a scan of the repo's records). The owner node keeps a
+per-repo *recent-writes log* instead (`recent_writes.rs`, 64 mutex shards,
+entries capped by the cache budget as `recent_writes`): the head rev, a
+`base` rev, and every current record above `base` (path, rev, CID, and the
+CBOR of posts and the profile), at most 32 records / 64 KiB, older commits
+dropped by raising `base`. A commit's durable ack extends its repo's entry
+before the writer is answered (an entry that missed a commit restarts at
+that commit's `since`); imports, deletes and creations drop it; entries are
+valid only in the partition epoch they were made in. A request then costs:
+
+- AppView rev >= head (nearly every request): one shard lookup, nothing
+  read, the response streams through untouched (compressed or not, the same
+  zero-copy path as any proxied call);
+- base <= rev < head: the records come from the entry, no store read;
+- no entry, or rev < base: one point read of `h/{did}` (rev >= head: the
+  entry is created empty) or, when the AppView lags behind, one scan of the
+  repo's records for revs above it, which fills the entry so later requests
+  hit it. Loads that raced a commit are not cached (per-shard generations).
+
+Only a response with records to merge is buffered (10 MiB bound on the
+wire and decoded), decoded (gzip, deflate, zstd), parsed and re-serialized;
+for these methods the client's Accept-Encoding is narrowed to codings vlpds
+can decode (`br` dropped, `*` = gzip/deflate; the reference negotiates its
+own list for the same reason). Unparseable or unexpected upstream JSON is
+returned as received. Metric: `vlpds_proxy_read_after_write_total{result}`
+(log_nothing, log_records, store_read; munged, unchanged, failed).
+Measured cost on the no-merge path (laptop, shared and loaded ~30-40, 6
+IO threads, release builds, stub AppView sending `atproto-repo-rev`, 20k
+active repos, getTimeline 2 KiB bodies, 64 in flight, 8 interleaved 10 s
+rounds per arm): median 43.2 µs CPU per proxied request before (1e48efd)
+vs 43.6 µs after (range 38.6-47.0 vs 41.1-44.4): no difference above the
+noise; ~38-40k req/s both. The first round after start read each repo's
+head once (20,006 store reads), every later request was a log hit.
+
+Also from the reference's `api/app/bsky/feed`: **getFeed** is proxied with
+a service-auth token for the feed generator (aud = the `did` of the
+generator record, fetched from the AppView's `com.atproto.repo.getRecord`
+and cached a minute; lxm = getFeedSkeleton, which the caller's scope must
+also allow), so the AppView can call the generator as the user.
 
 ## Sync 1.1 checklist
 - Commit object v3, `prev: null`, `rev` = per-repo monotonic TID, signed.
