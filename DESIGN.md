@@ -3055,7 +3055,7 @@ reference, which trusts its records table. The sequencer-recovery scripts
 have no counterpart (no single sequencer DB; see "Backups and restore").
 `pdsadmin update` is a deploy concern.
 
-## Rolling upgrades and format versioning (design; phase 1 built)
+## Rolling upgrades and format versioning (design; phases 1-2 built)
 
 **Before levels:** formats changed outright (`VLSEG05` replaced `VLSEG04`;
 VLSEG06 widened shard ids), nothing was migrated, and mixed versions in one
@@ -3074,9 +3074,23 @@ cluster finalize`); lease and hello fields; the tolerance fixes;
 getClusterStatus `version` + the console's Cluster banner and Build
 column; the metrics, alerts and runbook procedure; golden fixtures
 `testdata/formats/L1/` with their MANIFEST guard. Deviations from the text
-below are marked **(built: ...)**. Not built yet: the two-build HA
-scenarios and the level-gating test (step 6), `cluster lower`, and
-everything under "Later".
+below are marked **(built: ...)**.
+
+**Built (phase 2, step 6):** a **test-only feature level** (cargo feature
+`test-level`, never in a release image; `version::TEST_LEVEL` = the newest
+real level + 1, today 2) that changes two on-bucket formats the way a real
+level would: segments get the magic `VLSEGT1` and one more header field
+(a body checksum, verified on parse), and `retain/` reports gain
+`min_seg_format`. With it: the level-gating test
+(`tests/level_gating.rs`), the two-build HA scenarios (`bench/ha/upgrade.sh`
++ hactl `upgrade-*`), the remaining fixtures (`p/` rows, session JWTs, a
+SlateDB directory), `cluster lower` for wire-only levels, and the CI gate
+`just upgrade-ci`. One writer change came out of it: phase 1 picked the
+segment magic at seal time, but once a level changes the header length,
+the header room `SegmentBuilder::for_log` reserves and the frame offsets
+the live ring slices by depend on it, so a builder now captures the active
+level when it is made (a segment is homogeneous; a raise or lower takes
+effect at the next segment). Not built yet: everything under "Later".
 
 ### Inventory: what is persisted or on the wire, and how it's versioned
 
@@ -3140,7 +3154,12 @@ old node silently rewrites a new node's objects.
   + finalize). It is manual (`vlpds admin cluster finalize`), never
   automatic at startup. Before it, rollback = redeploy the old build;
   after it, rollback = forward-fix. A non-`persistent` level may be
-  lowered again (`cluster lower`); a persistent one never.
+  lowered again (`cluster lower`); a persistent one never. **(built:
+  `Cluster::lower_level`, `vlpds.admin.setFeatureLevel {level, lower:
+  true}`, `vlpds admin cluster lower --level N`: only past non-persistent
+  levels (`version::check_lower`), never while a raise `target` is set,
+  and only if every live lease's window contains the lower level; nodes
+  switch at their next segment.)**
 - **Upgrade one release window at a time.** A new build may start only if
   `active >= its MIN_LEVEL` and `active <= its MAX_LEVEL`. Skipping
   releases is fine whenever that holds; a build only raises `MIN_LEVEL`
@@ -3312,12 +3331,33 @@ active level and is restored only by a build whose window contains it).
   control object (lease, assignment, layout with an op, writer claim,
   `retain/` report, rate-limit doc, `cluster/version`), a `vw1` blob under
   a fixed KEK, firehose frames (commit, identity, account, sync, error) and
-  both log-stream messages; not yet `p/` rows, a session JWT or a SlateDB
-  directory.)**
+  both log-stream messages. Phase 2 added private `p/` rows
+  (`private/rows.json`: 21 row kinds, from sessions, app passwords, email
+  tokens, `sec/` revocations and takedowns, invites, reset tokens and
+  reserved keys to the email-2FA lockout, preferences, TOTP and every
+  OAuth row, built from the real row types by `vlpds::xrpc::private_rows`
+  and decoded by `check_private_row`), a session JWT pair
+  (`auth/session.jwt`: signature, claims and header checked, not expiry)
+  and a tiny SlateDB directory written by the pinned rev (`slatedb/`,
+  ~4 KB: opened, read back and written under the current build;
+  compaction is not exercised, its polling knob is process-wide).
+  Fixtures random by construction are recorded once; blessing a released
+  level only adds MANIFEST entries. The test level's fixtures are
+  `testdata/formats/Ltest`, never released and not in the MANIFEST.)**
 - **Level-gating test** (in-process, cheap): an `HaCluster` at
   `active = MAX_LEVEL - 1` runs the full write/handoff/split suite and
   asserts every object it wrote matches the previous level's fixture
-  encodings (no new-level bytes before finalize).
+  encodings (no new-level bytes before finalize). **(built:
+  `tests/level_gating.rs`, its own test binary because the active level is
+  process-wide: `cargo test --features test-level --test level_gating`.
+  Three in-process nodes of the test-level build on a prefix at level 1
+  write, split a shard, hand shards off and back, and then every object in
+  the bucket is classified: segments by magic and header layout, control
+  objects by their fields against the level-1 fixtures, unknown object
+  families fail. Then it finalizes and checks the switch: new segments and
+  reports in the test level's formats, a node restart replaying logs that
+  hold both, every acked write readable and on every node's firehose once,
+  in order. The same binary runs `formats::` against L1 and Ltest.)**
 - **Two-build tests** (`bench/ha/hactl.py`, new scenarios; build the
   previous release tag into `target/prev/` once per CI run):
   `rolling-upgrade` (3 old nodes under loadgen + firehose audit, upgrade
@@ -3325,14 +3365,39 @@ active level and is restored only by a build whose window contains it).
   every node), `rolling-rollback` (upgrade 2 of 3, roll both back),
   `old-node-refused` (after finalize, an old image exits 7 without
   touching data), and `raise-race` (start an old node concurrently with
-  finalize; either the raise aborts or the node exits 7).
+  finalize; either the raise aborts or the node exits 7). **(built:
+  `bench/ha/upgrade.sh` builds into `target/upgrade/` the previous release
+  (`VLPDS_PREV_REV`, else the newest `vlpds-v*` tag in HEAD, else the
+  pinned `a9d1df7`, the first build with levels: an older one ignores
+  `cluster/version` and can't be refused), cached per rev, and this tree
+  plain and with `--features test-level`, then runs hactl `upgrade-rolling`,
+  `upgrade-rolling-l1` (the real release path, no format change: finalize
+  to 2 is refused), `upgrade-rollback` (also: finalize is refused while an
+  old node is live), `upgrade-old-refused` (an extra old node and a node
+  rolled back after finalize both exit 7; the extra one leaves no lease,
+  writer claim or log) and `upgrade-raise-race`, each on native processes
+  under loadgen + prober + sync 1.1 checker + firehose audits, judged like
+  every hactl scenario plus: the bucket has no test-level segment before
+  the finalize and some after it, refusals exited 7, no other crash.
+  Results: bench/ha/RESULTS.md "Two-build upgrade scenarios".)**
 - **Release checklist**: the release's level table, fixtures, and the
   previous tag's `rolling-upgrade` run green.
+- **CI** (built): `just upgrade-ci` = `cargo test --test all formats::`
+  (fixtures + MANIFEST freeze), `cargo test --features test-level --test
+  level_gating`, and `bench/ha/upgrade.sh --minio upgrade-rolling` on a
+  throwaway MinIO container (needs Docker, Go and the `vlpds-minio:local`
+  image; ~10 min cold, most of it the three builds). On the self-hosted
+  runners (`runs-on: [self-hosted, lab]`, as the Go services' builds):
+  a workflow on `packages/vlpds/**` pushes/PRs with `actions/checkout@v4`
+  (`fetch-depth: 0`, so the previous release rev and tags exist), the
+  Rust toolchain from `rust-toolchain.toml`, `actions/setup-go@v5`, and
+  one step `cd packages/vlpds && just upgrade-ci`; keep `target/upgrade`
+  between runs (a runner-local `CARGO_TARGET_DIR`) so the previous build
+  is cached, and upload `bench/ha/out/` as an artifact.
 
 ### Implementation plan
 
-**Before the first production data (≈ 9–10 days):** steps 1-5 are built;
-6 is TODO.md.
+**Before the first production data (≈ 9–10 days):** steps 1-6 are built.
 1. **Baseline (0.5 d).** Land the pending breaking changes (VLSEG06 shard
    ids, anything else queued) the old way, then declare **level 1** = the
    formats in production on day one, and record its fixtures.

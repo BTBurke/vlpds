@@ -16,8 +16,10 @@
 //! the manifest entries of a level that has none yet (or isn't released).
 //! The wrapped secret is random (its nonce): blessing writes it only when missing.
 //!
-//! Not covered yet (TODO.md): private `p/` rows (sessions, OAuth, TOTP),
-//! session JWTs, and a SlateDB directory written by the pinned slatedb rev.
+//! Built with the `test-level` feature (tests/level_gating.rs includes this
+//! module), `MAX_LEVEL` is the test-only level and its fixtures live in
+//! `testdata/formats/Ltest` (never released, so never in the MANIFEST):
+//! `VLPDS_BLESS=1 cargo test --features test-level --test level_gating formats::`.
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
@@ -33,7 +35,11 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/formats")
 }
 
+/// `L{n}`; the test-only level's are `Ltest` (they move up with it).
 fn level_dir(level: u32) -> PathBuf {
+    if level == version::TEST_LEVEL {
+        return root().join("Ltest");
+    }
     root().join(format!("L{level}"))
 }
 
@@ -243,7 +249,7 @@ fn layout() -> vlpds::slots::Layout {
 }
 
 fn report() -> vlpds::retention::Report {
-    vlpds::retention::Report { opened: [(ShardId(3), 7), (ShardId(70_000), 1)].into(), pruned_seq: 255_000 }
+    vlpds::retention::Report::new([(ShardId(3), 7), (ShardId(70_000), 1)].into(), 255_000, 1)
 }
 
 fn ratelimits() -> Vec<u8> {
@@ -316,6 +322,7 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("control/cluster_version.json", compact(&cluster_version())),
         ("stream/batch.bin", vlpds::remote::encode_batch(&batch).to_vec()),
         ("stream/watermark.bin", vlpds::remote::encode_watermark(1003 << 8).to_vec()),
+        ("private/rows.json", private_rows()),
     ];
     v.extend(frames());
     v
@@ -326,6 +333,148 @@ const SECRET_FIXTURE: &str = "secrets/vw1.txt";
 fn secrets() -> vlpds::secrets::Secrets {
     let k = vlpds::secrets::KekBytes::new(KEK);
     vlpds::secrets::Secrets::new(vec![Arc::new(vlpds::secrets::LocalKek::new(&k))], 1).unwrap()
+}
+
+/// Every private (`p/`) row kind, from the lib's fixed-value builders
+/// (`vlpds::xrpc::private_rows`): `[{routing, name, value}]`, values UTF-8.
+fn private_rows() -> Vec<u8> {
+    let rows: Vec<serde_json::Value> = vlpds::xrpc::private_rows::private_row_fixtures(DID)
+        .into_iter()
+        .map(|(routing, name, v)| serde_json::json!({"routing": routing, "name": name, "value": String::from_utf8(v).expect("private row values are UTF-8")}))
+        .collect();
+    pretty(&rows)
+}
+
+/// Session JWTs (access, refresh; one per line): random (their iat/exp), so
+/// recorded once.
+const JWT_FIXTURE: &str = "auth/session.jwt";
+const JWT_SECRET: &str = "fixture-jwt-secret";
+const JWT_AUD: &str = "did:web:fixture.test";
+const JWT_FAMILY: &str = "0006439b2a1c0000aabbccddeeff0011";
+const JWT_REFRESH_ID: &str = "00112233445566778899aabbccddeeff0011223344556600";
+
+fn jwts() -> String {
+    let j = vlpds::auth::Jwt::new(JWT_SECRET, JWT_AUD);
+    let access = j.issue_with_jti(DID, "com.atproto.access", 2 * 3600, "at+jwt", Some(JWT_FAMILY));
+    let refresh = j.issue_with_jti(DID, "com.atproto.refresh", 90 * 86400, "refresh+jwt", Some(JWT_REFRESH_ID));
+    format!("{access}\n{refresh}\n")
+}
+
+/// A shard's SlateDB directory written by the pinned slatedb rev
+/// (`slatedb/` + paths under the DB root): random (ULIDs, timestamps), so
+/// recorded once.
+const SLATEDB_DIR: &str = "slatedb/";
+
+/// The keys the SlateDB fixture holds after its writes (two flushes: two L0
+/// SSTs, the second deleting a key of the first).
+fn slatedb_rows() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    let h = head();
+    vec![
+        (vlpds::state::head_key(DID), Some(h.encode().to_vec())),
+        (vlpds::state::record_key(DID, "app.bsky.feed.post/1"), Some(vlpds::state::record_value(&h.data, h.rev.0, b"\xa1aa\x01").to_vec())),
+        (vlpds::state::collection_key("app.bsky.feed.post", DID), Some(Vec::new())),
+        (vlpds::state::record_key(DID, "app.bsky.feed.post/2"), None),
+    ]
+}
+
+fn slatedb_store(prefix: &str) -> (vlpds::store::Store, Arc<object_store::memory::InMemory>) {
+    let mem = Arc::new(object_store::memory::InMemory::new());
+    (vlpds::store::Store { raw: mem.clone(), prefix: prefix.into(), latency: None }, mem)
+}
+
+/// Writes a tiny shard DB the way a node opens one (`partition::open_db`)
+/// and snapshots its objects into `dir/slatedb/`.
+async fn record_slatedb(dir: &std::path::Path) {
+    use futures::StreamExt;
+    use object_store::{ObjectStore, ObjectStoreExt};
+    let (store, mem) = slatedb_store("fx");
+    let db = vlpds::partition::open_db(&store, ShardId(0), None).await.unwrap();
+    let rows = slatedb_rows();
+    db.put(&rows[3].0, b"deleted later").await.unwrap();
+    db.put(&rows[0].0, rows[0].1.as_ref().unwrap()).await.unwrap();
+    db.flush().await.unwrap();
+    for (k, v) in &rows[1..] {
+        match v {
+            Some(v) => db.put(k, v).await.unwrap(),
+            None => db.delete(k).await.unwrap(),
+        };
+    }
+    db.flush().await.unwrap();
+    db.close().await.unwrap();
+    let root = vlpds::partition::db_path(&store, ShardId(0));
+    let objs: Vec<_> = mem.list(Some(&object_store::path::Path::from(root.as_str()))).map(|m| m.unwrap().location).collect().await;
+    for p in objs {
+        let rel = p.as_ref().strip_prefix(&format!("{root}/")).unwrap().to_string();
+        let b = mem.get(&p).await.unwrap().bytes().await.unwrap();
+        let f = dir.join(SLATEDB_DIR).join(&rel);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(&f, &b).unwrap();
+    }
+}
+
+/// Opens the SlateDB fixture with this build: the keys read back, and a new
+/// write over the old manifest and SSTs reopens.
+async fn check_slatedb(level: u32) {
+    use object_store::ObjectStoreExt;
+    let dir = level_dir(level);
+    let names: Vec<String> = files(&dir).into_iter().filter(|f| f.starts_with(SLATEDB_DIR)).collect();
+    assert!(names.iter().any(|f| f.ends_with(".manifest")), "L{level}: SlateDB fixture has no manifest: {names:?}");
+    let (store, mem) = slatedb_store("fx2");
+    let root = vlpds::partition::db_path(&store, ShardId(0));
+    for n in &names {
+        let rel = n.strip_prefix(SLATEDB_DIR).unwrap();
+        let b = std::fs::read(dir.join(n)).unwrap();
+        mem.put(&object_store::path::Path::from(format!("{root}/{rel}")), b.into()).await.unwrap();
+    }
+    let db = vlpds::partition::open_db(&store, ShardId(0), None).await.unwrap_or_else(|e| panic!("L{level}: SlateDB fixture doesn't open: {e:#}"));
+    for (k, v) in slatedb_rows() {
+        assert_eq!(db.get(&k).await.unwrap().map(|b| b.to_vec()), v, "L{level}: SlateDB fixture key {}", hex::encode(&k));
+    }
+    db.put(b"new", b"write").await.unwrap();
+    db.flush().await.unwrap();
+    db.close().await.unwrap();
+    let db = vlpds::partition::open_db(&store, ShardId(0), None).await.unwrap();
+    assert_eq!(db.get(b"new").await.unwrap().as_deref(), Some(&b"write"[..]));
+    assert_eq!(db.get(vlpds::state::head_key(DID)).await.unwrap().map(|b| b.to_vec()), slatedb_rows()[0].1);
+    db.close().await.unwrap();
+}
+
+/// Records the fixtures that are random by construction (wrapped secret,
+/// JWTs, SlateDB directory) where missing.
+async fn record_once(dir: &std::path::Path) {
+    let p = dir.join(SECRET_FIXTURE);
+    if !p.exists() {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let blob = secrets().wrap(vlpds::secrets::Purpose::SigningKey, DID, SECRET).await.unwrap();
+        std::fs::write(&p, format!("{blob}\n")).unwrap();
+    }
+    let p = dir.join(JWT_FIXTURE);
+    if !p.exists() {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, jwts()).unwrap();
+    }
+    if !dir.join(SLATEDB_DIR).exists() {
+        record_slatedb(dir).await;
+    }
+}
+
+fn check_jwts(name: &str, b: &[u8]) {
+    use base64::Engine;
+    let j = vlpds::auth::Jwt::new(JWT_SECRET, JWT_AUD);
+    let text = std::str::from_utf8(b).unwrap();
+    let toks: Vec<&str> = text.lines().collect();
+    assert_eq!(toks.len(), 2, "{name}: access and refresh");
+    for (tok, (typ, scope, jti)) in toks.iter().zip([("at+jwt", "com.atproto.access", JWT_FAMILY), ("refresh+jwt", "com.atproto.refresh", JWT_REFRESH_ID)]) {
+        let c = j.verify_signature(tok).unwrap_or_else(|| panic!("{name}: {typ} doesn't verify"));
+        assert_eq!((c.scope.as_str(), c.sub.as_str(), c.aud.as_str(), c.jti.as_deref()), (scope, DID, JWT_AUD, Some(jti)), "{name}");
+        assert!(c.exp > c.iat, "{name}");
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut parts = tok.split('.');
+        let header: serde_json::Value = serde_json::from_slice(&b64.decode(parts.next().unwrap()).unwrap()).unwrap();
+        assert_eq!((header["alg"].as_str(), header["typ"].as_str()), (Some("HS256"), Some(typ)), "{name}");
+        // the claims re-encode to the signed payload (no field dropped)
+        assert_eq!(b64.encode(serde_json::to_vec(&c).unwrap()), parts.next().unwrap(), "{name}: claims re-encode");
+    }
 }
 
 fn files(dir: &std::path::Path) -> Vec<String> {
@@ -349,7 +498,9 @@ fn files(dir: &std::path::Path) -> Vec<String> {
 
 #[tokio::test]
 async fn writers_reproduce_the_max_level_fixtures() {
-    assert_eq!(version::active(), version::MAX_LEVEL, "this binary's clusters run the build's max level");
+    // writers emit the active level (process-wide): the build's max here
+    let _level = crate::common::ACTIVE_LEVEL.lock().await;
+    version::set_active(version::MAX_LEVEL);
     let dir = level_dir(version::MAX_LEVEL);
     let written = written();
     if bless() {
@@ -361,20 +512,18 @@ async fn writers_reproduce_the_max_level_fixtures() {
                 eprintln!("blessed {}", p.display());
             }
         }
-        let p = dir.join(SECRET_FIXTURE);
-        if !p.exists() {
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            let blob = secrets().wrap(vlpds::secrets::Purpose::SigningKey, DID, SECRET).await.unwrap();
-            std::fs::write(&p, format!("{blob}\n")).unwrap();
-        }
+        record_once(&dir).await;
     }
     for (name, bytes) in &written {
         let got = std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e} (VLPDS_BLESS=1 to record)"));
         assert!(got == *bytes, "{name}: this build writes different bytes than L{} records: a format change needs a new level", version::MAX_LEVEL);
     }
-    let mut expected: Vec<String> = written.iter().map(|(n, _)| n.to_string()).chain([SECRET_FIXTURE.to_string()]).collect();
+    // plus the fixtures recorded once (random by construction)
+    let mut expected: Vec<String> = written.iter().map(|(n, _)| n.to_string()).chain([SECRET_FIXTURE.to_string(), JWT_FIXTURE.to_string()]).collect();
     expected.sort();
-    assert_eq!(files(&dir), expected, "fixture files of L{}", version::MAX_LEVEL);
+    let got: Vec<String> = files(&dir).into_iter().filter(|f| !f.starts_with(SLATEDB_DIR)).collect();
+    assert_eq!(got, expected, "fixture files of L{}", version::MAX_LEVEL);
+    assert!(files(&dir).iter().any(|f| f.starts_with(SLATEDB_DIR)), "L{}: no SlateDB fixture (VLPDS_BLESS=1 to record)", version::MAX_LEVEL);
 }
 
 fn cbor_reencode(name: &str, b: &[u8]) {
@@ -400,8 +549,9 @@ async fn check(level: u32, name: &str, b: &[u8]) {
         "segment/plain.seg" => {
             let (h, _) = segment::parse_header(b).unwrap().unwrap();
             assert_eq!((h.level, h.codec, h.ordinal, h.prefix_end, h.count), (level, segment::CODEC_NONE, 5, 4, 3));
+            assert_eq!(h.checksum.is_some(), level == version::TEST_LEVEL, "only the test level's header has a checksum");
             let LogObject::Segment(h, entries) = segment::parse(Bytes::copy_from_slice(b), true, None).unwrap() else { panic!("{name}") };
-            let mut sb = SegmentBuilder::for_log(&h.log_id);
+            let mut sb = SegmentBuilder::for_log_at(&h.log_id, level);
             for e in &entries {
                 let frame = e.frame.clone();
                 sb.push_derived(e.seq, e.shard, e.epoch, |o| o.extend_from_slice(&frame), &e.muts, e.derived);
@@ -489,7 +639,8 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             json_reencode::<serde_json::Value>(name, b);
         }
         "control/retain_report.json" => {
-            json_reencode::<vlpds::retention::Report>(name, b);
+            let r = json_reencode::<vlpds::retention::Report>(name, b);
+            assert_eq!(r.min_seg_format.is_some(), level == version::TEST_LEVEL, "min_seg_format is the test level's field");
         }
         "control/ratelimits.json" => {
             let d = vlpds::ratelimit::config::parse(b).unwrap();
@@ -516,6 +667,20 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             assert_eq!(format!("{}.{}.{}\n", parts[0], parts[1], parts[2]).as_bytes(), b);
         }
         n if n.starts_with("firehose/") => cbor_reencode(n, b),
+        "private/rows.json" => {
+            let rows: Vec<serde_json::Value> = serde_json::from_slice(b).unwrap();
+            assert!(pretty(&rows) == b, "{name}: re-encode differs");
+            let mut kinds = std::collections::BTreeSet::new();
+            for r in &rows {
+                let (routing, n, v) = (r["routing"].as_str().unwrap(), r["name"].as_str().unwrap(), r["value"].as_str().unwrap());
+                let kind = vlpds::xrpc::private_rows::check_private_row(routing, n, v.as_bytes()).unwrap_or_else(|e| panic!("L{level}/{name}: {routing} {n}: {e:#}"));
+                kinds.insert(kind);
+            }
+            assert!(kinds.len() >= 20, "L{level}/{name}: only {} row kinds: {kinds:?}", kinds.len());
+        }
+        JWT_FIXTURE => check_jwts(name, b),
+        // checked as a whole: check_slatedb
+        n if n.starts_with(SLATEDB_DIR) => {}
         n => panic!("L{level}/{n}: no reader check for this fixture"),
     }
 }
@@ -530,6 +695,7 @@ async fn fixtures_decode_and_reencode() {
             let b = std::fs::read(dir.join(&name)).unwrap();
             check(level, &name, &b).await;
         }
+        check_slatedb(level).await;
     }
 }
 
@@ -555,11 +721,18 @@ fn hashes(level: u32) -> BTreeMap<String, String> {
 fn manifest_freezes_released_levels() {
     let mut m = manifest();
     if bless() {
-        for level in 1..=version::MAX_LEVEL {
+        // the test-only level is never recorded
+        for level in (1..=version::MAX_LEVEL).filter(|l| *l != version::TEST_LEVEL) {
             let recorded = m.keys().any(|k| k.starts_with(&format!("L{level}/")));
             if level > version::RELEASED || !recorded {
                 m.retain(|k, _| !k.starts_with(&format!("L{level}/")));
                 m.extend(hashes(level));
+            } else {
+                // a released level: fixtures recorded later (formats it
+                // already had) are added; existing entries never change
+                for (k, h) in hashes(level) {
+                    m.entry(k).or_insert(h);
+                }
             }
         }
         let mut out = String::from("# sha256 of every fixture of a recorded feature level (tests/all/formats.rs).\n# A released level's entries never change: a format change is a new level.\n");

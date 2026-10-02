@@ -176,12 +176,13 @@ class Node:
         self.env = env or {}
         self.proc = None
         self.exits = []  # (time, returncode)
+        self.bin = None  # this node's vlpds binary (two-build scenarios); None = VLPDS
         self.s3 = Proxy("http", f"127.0.0.1:{BASE_PORT + 2300 + idx}", S3, f"127.0.0.1:{BASE_PORT + 2500 + idx}", os.path.join(outdir, f"{self.id}.s3proxy.log"))
         self.peer = Proxy("tcp", f"127.0.0.1:{BASE_PORT + 200 + idx}", f"127.0.0.1:{self.port}", f"127.0.0.1:{BASE_PORT + 400 + idx}", os.path.join(outdir, f"{self.id}.peerproxy.log"))
         self.advertise = f"http://127.0.0.1:{BASE_PORT + 200 + idx}"
 
     def start(self):
-        args = [VLPDS] + NODE_ARGS.format(
+        args = [self.bin or VLPDS] + NODE_ARGS.format(
             listen=f"127.0.0.1:{self.port}", url=self.url, advertise=self.advertise,
             s3=f"http://127.0.0.1:{BASE_PORT + 2300 + self.idx}", prefix=self.prefix, id=self.id,
             ttl_ms=TTL_MS, partitions=PARTITIONS).split() + self.extra
@@ -849,12 +850,15 @@ def teardown(ctx):
 
 
 def run_load_scenario(ctx, n_nodes, duration, actions, checker_on=0, expect_final=None, per_node=30, rate=RATE,
-                      extra_checkers=None, start_nodes=None, node_extra=None, node_env=None, probes=None, replay=True):
+                      extra_checkers=None, start_nodes=None, node_extra=None, node_env=None, probes=None, replay=True,
+                      node_bins=None):
     """Generic shape: cluster up -> accounts -> checker + probes + load on all
     nodes -> `actions` [(at_s, fn(ctx))] -> drain -> verify -> results.
     `replay=False` skips the post-hoc replay from before the run (with a short
     --log-retention it is OutdatedCursor by design; such scenarios check it)."""
     nodes = make_cluster(ctx, n_nodes, start=False, extra=node_extra, env=node_env)
+    for nd, b in zip(nodes, node_bins or []):
+        nd.bin = b
     for nd in nodes[: (start_nodes or n_nodes)]:
         nd.start()
     wait_ready(nodes[: (start_nodes or n_nodes)])
@@ -1533,15 +1537,19 @@ def parse_log_object(b):
     import struct
     if b[:8] == b"VLFENCE\n":
         return {"kind": "fence", "by": b[8:].decode(errors="replace")}
-    if b[:8] != b"VLSEG06\n":
+    if b[:8] not in (b"VLSEG06\n", b"VLSEGT1\n"):
         return {"kind": "unknown"}
     o = 8
     (n,) = struct.unpack_from(">H", b, o)
     o += 2
     log_id = b[o:o + n].decode()
     o += n
-    ordinal, prefix_end, first_seq, last_seq, count, codec, body_len = struct.unpack_from(">QQqqIBI", b, o)
-    o += 41
+    if b[:8] == b"VLSEGT1\n":  # the test feature level: + checksum u64 before codec
+        ordinal, prefix_end, first_seq, last_seq, count, _sum, codec, body_len = struct.unpack_from(">QQqqIQBI", b, o)
+        o += 49
+    else:
+        ordinal, prefix_end, first_seq, last_seq, count, codec, body_len = struct.unpack_from(">QQqqIBI", b, o)
+        o += 41
     if codec == 1:  # zstd body behind the uncompressed header
         b = b[:o] + _zstd_decompress(b[o:], body_len)
     seqs = []
@@ -2232,6 +2240,289 @@ def s_ctr_skew_large(ctx):
 @containers({"n2": "+2.5s", "n3": "-2.5s"})
 def s_ctr_skew_steady(ctx):
     return run_load_scenario(ctx, 3, 30, [])
+
+
+# ---- two builds: rolling upgrade / rollback / refusal (DESIGN.md "Rolling
+# upgrades and format versioning", ops/RUNBOOK.md "Rolling upgrade, finalize,
+# rollback"). bench/ha/upgrade.sh builds the binaries: the previous release
+# (VLPDS_PREV_REV, see there) and the current tree, plain and with the
+# test-only feature level (cargo feature test-level: MAX_LEVEL = 2, new
+# segment magic VLSEGT1 + a retain/ report field), so finalize changes formats.
+
+UPGRADE_DIR = os.environ.get("VLPDS_UPGRADE_DIR", os.path.join(PKG, "target", "upgrade"))
+OLD_BIN = os.environ.get("VLPDS_HA_OLD_BIN", os.path.join(UPGRADE_DIR, "prev", "vlpds"))
+NEW_BIN = os.environ.get("VLPDS_HA_NEW_BIN", os.path.join(UPGRADE_DIR, "new", "vlpds"))
+NEW_TL_BIN = os.environ.get("VLPDS_HA_NEW_TL_BIN", os.path.join(UPGRADE_DIR, "new-tl", "vlpds"))
+SEG_MAGICS = {b"VLSEG06\n": "VLSEG06", b"VLSEGT1\n": "VLSEGT1", b"VLFENCE\n": "fence"}
+
+
+def segment_magics(prefix):
+    """{magic name: count} over every log object of `prefix` (8-byte range GETs)."""
+    out = {}
+    for k in s3_list(f"{prefix}/log/"):
+        st, b = s3_req("GET", k, headers={"range": "bytes=0-7"})
+        if st not in (200, 206):
+            continue  # pruned meanwhile
+        name = SEG_MAGICS.get(b[:8], repr(b[:8]))
+        out[name] = out.get(name, 0) + 1
+    return out
+
+
+def node_objects(prefix, node_id):
+    """Objects a node writes when it joins: its lease, writer claims naming it, its logs."""
+    objs = [k for k in s3_list(f"{prefix}/nodes/") if k.endswith(f"/{node_id}")]
+    objs += [k for k in s3_list(f"{prefix}/log/") if k.split("/log/", 1)[1].startswith(f"{node_id}.")]
+    for k in s3_list(f"{prefix}/writers/"):
+        b = s3_get(k) or b""
+        if f'"node_id":"{node_id}"'.encode() in b:
+            objs.append(k)
+    return objs
+
+
+def cluster_version(ctx, via=None):
+    """getClusterStatus `version` from `via` (else the first live node);
+    its `binary` is that node's build."""
+    for n in ([via] if via else ctx.nodes):
+        if n.alive():
+            try:
+                _, raw = http("GET", n.url + "/xrpc/vlpds.admin.getClusterStatus", headers={"authorization": admin_basic()}, timeout=5)
+                return json.loads(raw).get("version")
+            except Exception:
+                continue
+    return None
+
+
+def admin_basic():
+    import base64
+    return "Basic " + base64.b64encode(f"admin:{ADMIN}".encode()).decode()
+
+
+def swap_build(idx, bin_path, label, refuse=False):
+    """Rolling step: SIGTERM node idx (graceful handoff), start it on `bin_path`.
+    With `refuse` the new build must exit 7 (incompatible_level) by itself
+    within 20 s; the node is then left down."""
+    def f(ctx):
+        n = ctx.nodes[idx]
+        t = ctx.mark(f"SIGTERM {n.id} -> {label}")
+        if n.alive():
+            n.signal(signal.SIGTERM)
+            n.wait_exit(30)
+        n.bin = bin_path
+        n.start()
+        if refuse:
+            n.wait_exit(20)
+            ctx.mark(f"{n.id} on {label} exited rc={n.exit_codes()[-1:]} after {time.time() - t:.1f}s")
+            ctx.ret.setdefault("refusals", []).append({"node": n.id, "build": label, "rc": n.exit_codes()[-1:]})
+            return "fault"
+        wait_ready([n], timeout=60)
+        ctx.mark(f"{n.id} up on {label} after {time.time() - t:.1f}s")
+        return "fault"
+    return f
+
+
+def finalize(idx, expect, level=None):
+    """POST setFeatureLevel through node idx (level: default that node's build max). `expect`:
+    the HTTP status it must get (200, or 409 IncompatibleNodes). Also records
+    the segment magics in the bucket right before the raise."""
+    def f(ctx):
+        n = ctx.nodes[idx]
+        ctx.ret.setdefault("magics_before_finalize", segment_magics(ctx.prefix))
+        lv = level or (cluster_version(ctx, n) or {}).get("binary", {}).get("max")
+        try:
+            r = admin_post(n, "vlpds.admin.setFeatureLevel", {"level": lv}, timeout=30)
+            code, body = 200, r
+        except urllib.error.HTTPError as e:
+            code, body = e.code, e.read()[:300].decode(errors="replace")
+        ctx.mark(f"finalize level {lv} via {n.id}: {code} {body}")
+        ctx.ret.setdefault("finalize", []).append({"level": lv, "status": code, "expect": expect, "body": body})
+        return None
+    return f
+
+
+def start_extra(idx, bin_path, label):
+    """Starts node idx (not part of the initial cluster) on `bin_path`; it must
+    exit 7 by itself (an old build after finalize) within 20 s."""
+    return swap_build(idx, bin_path, label, refuse=True)
+
+
+def upgrade_checks(ctx, res, finalized, new_formats):
+    """Two-build invariants on top of `judge`: finalize outcomes as expected;
+    segments in the test level's format only after a finalize (and then some);
+    refused nodes exited 7 and left nothing in the bucket."""
+    fails = []
+    for f in ctx.ret.get("finalize", []):
+        if f["status"] != f["expect"]:
+            fails.append(f"finalize to {f['level']}: {f['status']}, expected {f['expect']}")
+    before = ctx.ret.get("magics_before_finalize") or {}
+    res["magics_before_finalize"] = before
+    res["magics_end"] = end = segment_magics(ctx.prefix)
+    if before.get("VLSEGT1"):
+        fails.append(f"test-level segments before finalize: {before}")
+    if new_formats and not end.get("VLSEGT1"):
+        fails.append(f"no test-level segments after finalize: {end}")
+    if not new_formats and end.get("VLSEGT1"):
+        fails.append(f"test-level segments without a finalize: {end}")
+    if set(end) - {"VLSEG06", "VLSEGT1", "fence"}:
+        fails.append(f"unknown log objects: {end}")
+    for r in ctx.ret.get("refusals", []):
+        if r["rc"] != [7]:
+            fails.append(f"{r['node']} on {r['build']} exited {r['rc']}, expected [7] (incompatible_level)")
+    res["refusals"] = ctx.ret.get("refusals", [])
+    res["cluster_version"] = v = cluster_version(ctx)
+    if v and finalized is not None and v.get("active") != finalized:
+        fails.append(f"active level {v.get('active')}, expected {finalized}")
+    for nid in ctx.ret.get("refused_ids", []):
+        left = node_objects(ctx.prefix, nid)
+        if left:
+            fails.append(f"refused node {nid} left objects: {left[:5]}")
+    # a node that crashed (not a refusal, not a graceful exit) fails the run
+    refused = {r["node"] for r in ctx.ret.get("refusals", [])}
+    for nid, codes in (res.get("exit_codes") or {}).items():
+        bad = [c for c in codes if c not in (0, 7) or (c == 7 and nid not in refused)]
+        if bad:
+            fails.append(f"{nid} exited {codes}")
+    if fails:
+        res.setdefault("k_fail", []).extend(fails)
+    log(f"  upgrade: finalize={ctx.ret.get('finalize')} magics before={before} end={end} refusals={res['refusals']} "
+        f"version={(v or {}).get('active')} fails={fails}")
+    return res
+
+
+def upgrade_ctx(ctx):
+    ctx.ret = {}
+    for b in (OLD_BIN, NEW_TL_BIN):
+        if not os.path.exists(b):
+            raise RuntimeError(f"{b} missing: run bench/ha/upgrade.sh (builds the previous and current releases)")
+
+
+@scenario("upgrade-rolling",
+          "[two builds] 3 old nodes under load; replace them one by one (SIGTERM) with the new build (test feature "
+          "level 2); finalize; every acked write readable, checker + firehose complete, new segment format only after finalize")
+def s_upgrade_rolling(ctx):
+    upgrade_ctx(ctx)
+    acts = [(8, swap_build(1, NEW_TL_BIN, "new")), (8.01, audit_from_start(1)),
+            (18, swap_build(2, NEW_TL_BIN, "new")), (18.01, audit_from_start(2)),
+            (27, checker_with_cursor(1, back_s=20)),
+            (28, swap_build(0, NEW_TL_BIN, "new")), (28.01, audit_from_start(0)),
+            (36, finalize(1, 200))]
+    res = run_load_scenario(ctx, 3, 50, acts, node_bins=[OLD_BIN] * 3)
+    return upgrade_checks(ctx, res, finalized=2, new_formats=True)
+
+
+@scenario("upgrade-rolling-l1",
+          "[two builds] the real release path: 3 old nodes under load, replaced one by one with the current build "
+          "(no format change between them: level 1 both); finalize to 2 is refused (no build runs it)")
+def s_upgrade_rolling_l1(ctx):
+    upgrade_ctx(ctx)
+    acts = [(8, swap_build(1, NEW_BIN, "new")), (8.01, audit_from_start(1)),
+            (18, swap_build(2, NEW_BIN, "new")), (18.01, audit_from_start(2)),
+            (27, checker_with_cursor(1, back_s=20)),
+            (28, swap_build(0, NEW_BIN, "new")), (28.01, audit_from_start(0)),
+            (36, finalize(1, 400, level=2))]
+    res = run_load_scenario(ctx, 3, 45, acts, node_bins=[OLD_BIN] * 3)
+    return upgrade_checks(ctx, res, finalized=1, new_formats=False)
+
+
+@scenario("upgrade-rollback",
+          "[two builds] 3 old nodes under load; upgrade 2 of 3 to the new build (test level 2); finalize is refused "
+          "(an old node is live); roll both back to the old build; nothing in the new format ever written")
+def s_upgrade_rollback(ctx):
+    upgrade_ctx(ctx)
+    acts = [(8, swap_build(1, NEW_TL_BIN, "new")), (8.01, audit_from_start(1)),
+            (17, swap_build(2, NEW_TL_BIN, "new")), (17.01, audit_from_start(2)),
+            (25, finalize(1, 409)),
+            (28, swap_build(2, OLD_BIN, "old (rollback)")), (28.01, audit_from_start(2)),
+            (36, swap_build(1, OLD_BIN, "old (rollback)")), (36.01, audit_from_start(1)),
+            (38, checker_with_cursor(2, back_s=25))]
+    res = run_load_scenario(ctx, 3, 50, acts, node_bins=[OLD_BIN] * 3)
+    return upgrade_checks(ctx, res, finalized=1, new_formats=False)
+
+
+@scenario("upgrade-old-refused",
+          "[two builds] old cluster upgraded node by node to the new build (test level 2) and finalized under load; "
+          "then an extra old node (n4) and n2 rolled back to the old build both exit 7 without writing anything; "
+          "n2 comes back on the new build; the cluster is unaffected")
+def s_upgrade_old_refused(ctx):
+    upgrade_ctx(ctx)
+    ctx.ret["refused_ids"] = ["n4"]
+    acts = [(5, swap_build(1, NEW_TL_BIN, "new")), (11, swap_build(2, NEW_TL_BIN, "new")),
+            (17, swap_build(0, NEW_TL_BIN, "new")), (17.01, audit_from_start(0)),
+            (23, finalize(1, 200)),
+            (27, start_extra(3, OLD_BIN, "old")),
+            (31, swap_build(1, OLD_BIN, "old (rollback after finalize)", refuse=True)),
+            (36, swap_build(1, NEW_TL_BIN, "new")), (36.01, audit_from_start(1)),
+            (38, checker_with_cursor(1, back_s=20))]
+    res = run_load_scenario(ctx, 4, 50, acts, start_nodes=3, expect_final=3, node_bins=[OLD_BIN] * 4)
+    return upgrade_checks(ctx, res, finalized=2, new_formats=True)
+
+
+def raise_race(old_idx, via_idx, delay_s):
+    """Starts an old build on node old_idx and, `delay_s` later (inside its
+    startup gate / lease write), finalizes through via_idx. Never both: the
+    raise succeeds and the old node exits 7, or the raise gets 409 and the
+    old node runs (then it is stopped and the raise retried)."""
+    def f(ctx):
+        n, via = ctx.nodes[old_idx], ctx.nodes[via_idx]
+        lv = (cluster_version(ctx, via) or {}).get("binary", {}).get("max")
+        ctx.ret.setdefault("magics_before_finalize", segment_magics(ctx.prefix))
+        n.bin = OLD_BIN
+        out = {}
+
+        def raise_():
+            time.sleep(max(delay_s, 0))
+            try:
+                admin_post(via, "vlpds.admin.setFeatureLevel", {"level": lv}, timeout=30)
+                out["raise"] = 200
+            except urllib.error.HTTPError as e:
+                out["raise"] = e.code
+                out["body"] = e.read()[:300].decode(errors="replace")
+        t = threading.Thread(target=raise_)
+        ctx.mark(f"start old {n.id} and finalize level {lv} via {via.id} {delay_s * 1000:.0f} ms later")
+        if delay_s < 0:  # the raise first, the old node |delay| into it
+            t.start()
+            time.sleep(-delay_s)
+            n.start()
+        else:
+            n.start()
+            t.start()
+        t.join(40)
+        # the old node either refuses (exit 7) by itself or keeps running
+        end = time.time() + 10
+        while time.time() < end and n.alive():
+            time.sleep(0.2)
+        up = n.alive()
+        ctx.mark(f"raise -> {out.get('raise')} {out.get('body', '')}; old {n.id} {'running' if up else f'exited {n.exit_codes()}'}")
+        race = {"raise": out.get("raise"), "old_running": up, "old_exits": n.exit_codes()}
+        ok = (out.get("raise") == 200 and not up and n.exit_codes()[-1:] == [7]) or (out.get("raise") == 409 and up)
+        race["ok"] = ok
+        ctx.ret["race"] = race
+        if up:
+            # the raise aborted: the old node leaves (graceful), then it goes through
+            n.signal(signal.SIGTERM)
+            n.wait_exit(30)
+            ctx.ret.setdefault("finalize", []).append({"level": lv, "status": out.get("raise"), "expect": 409, "body": out.get("body")})
+            return finalize(via_idx, 200)(ctx)
+        ctx.ret.setdefault("finalize", []).append({"level": lv, "status": out.get("raise"), "expect": 200})
+        ctx.ret.setdefault("refusals", []).append({"node": n.id, "build": "old (race)", "rc": n.exit_codes()[-1:]})
+        return "fault"
+    return f
+
+
+@scenario("upgrade-raise-race",
+          "[two builds] old cluster upgraded to the new build (test level 2), still at level 1, under load; an old node starts while a "
+          "finalize runs: either the raise aborts (409) and the old node runs, or the old node exits 7; never both")
+def s_upgrade_raise_race(ctx):
+    upgrade_ctx(ctx)
+    delay = float(os.environ.get("VLPDS_HA_RACE_DELAY_MS", str(random.Random().choice([-50, -5, 20, 150])))) / 1000
+    # an old cluster (level 1) upgraded node by node, then the race
+    acts = [(5, swap_build(1, NEW_TL_BIN, "new")), (10, swap_build(2, NEW_TL_BIN, "new")),
+            (15, swap_build(0, NEW_TL_BIN, "new")), (15.01, audit_from_start(0)),
+            (22, raise_race(3, 1, delay))]
+    res = run_load_scenario(ctx, 4, 40, acts, start_nodes=3, expect_final=3, node_bins=[OLD_BIN] * 4)
+    res["race"] = ctx.ret.get("race")
+    if not (res["race"] or {}).get("ok"):
+        res.setdefault("k_fail", []).append(f"raise race: {res['race']}")
+    return upgrade_checks(ctx, res, finalized=2, new_formats=True)
 
 
 def run_one(name, run_id):

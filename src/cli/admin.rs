@@ -2,7 +2,7 @@
 //! (account list/create/delete/takedown/untakedown/reset-password,
 //! create-invite-code, request-crawl) and its packages/pds/src/scripts
 //! (publish-identity, rotate-keys, rebuild-repo), plus the vlpds-only
-//! cluster operations (cluster-status, cluster finalize, rotate-plc-keys,
+//! cluster operations (cluster-status, cluster finalize/lower, rotate-plc-keys,
 //! rewrap-secrets, check-repo). Each is admin XRPC against any node (`--url`, Basic
 //! `admin:<token>`); DID-keyed calls are routed to the repo's owner by
 //! the node, per-node maintenance (rotate-plc-keys, rewrap-secrets) is sent
@@ -121,6 +121,18 @@ pub enum ClusterCmd {
         /// The level (default: the active level + 1).
         #[arg(long)]
         level: Option<u32>,
+        /// Don't ask for confirmation.
+        #[arg(long, short)]
+        yes: bool,
+    },
+    /// Lower the cluster's feature level (vlpds.admin.setFeatureLevel with
+    /// `lower`): only past levels that gate wire behavior, never past a
+    /// persistent one (it wrote formats older builds can't read), and only
+    /// when every live node can run the lower level.
+    Lower {
+        /// The level to go back to.
+        #[arg(long)]
+        level: u32,
         /// Don't ask for confirmation.
         #[arg(long, short)]
         yes: bool,
@@ -446,6 +458,19 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
             if let Some(h) = r["history"].as_array().and_then(|h| h.last()) {
                 writeln!(out, "Since        : {} by {}", s(&h["at"]), s(&h["by"]))?;
             }
+            Ok(())
+        }
+        Cmd::Cluster(ClusterCmd::Lower { level, yes }) => {
+            let st = c.get("vlpds.admin.getClusterStatus", &[]).await?;
+            let active = st["version"]["active"].as_u64().context("getClusterStatus has no active feature level")? as u32;
+            if level < active && !yes && !confirm(&format!("Lower the cluster from feature level {active} to {level}? Writers switch back at their next segment"))? {
+                bail!("aborted");
+            }
+            let r = c.post("vlpds.admin.setFeatureLevel", &json!({"level": level, "lower": true})).await?;
+            if opts.json {
+                return pretty(out, &r);
+            }
+            writeln!(out, "Feature level: {} (was {active})", s(&r["active"]))?;
             Ok(())
         }
     }

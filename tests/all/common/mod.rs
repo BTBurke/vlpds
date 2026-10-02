@@ -26,6 +26,10 @@ pub const PASSWORD: &str = "hunter2-password";
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Held by tests that set or depend on the process-wide active feature
+/// level (`vlpds::version::active`, what writers emit).
+pub static ACTIVE_LEVEL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Unique, valid handle label (lowercase alnum), e.g. "alice3k9x".
 /// A unique name that still fits one 18-character handle label: the
 /// counter and random suffix are base-36, and a long prefix is cut so the

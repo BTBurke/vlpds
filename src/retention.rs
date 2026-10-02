@@ -72,6 +72,19 @@ pub struct Report {
     /// highest seq deleted by this node (including reports of dead logs it
     /// folded in when it deleted them)
     pub pruned_seq: i64,
+    /// The test feature level's field (`version::TEST_LEVEL`; DESIGN.md
+    /// "Migrations": `min_seg_format`): the lowest segment level among the
+    /// log's unpruned segments, as a lower bound (the level active when the
+    /// log started). Written only while that level is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_seg_format: Option<u32>,
+}
+
+impl Report {
+    /// The report a log's owner writes at the active level.
+    pub fn new(opened: BTreeMap<ShardId, u64>, pruned_seq: i64, log_level: u32) -> Report {
+        Report { opened, pruned_seq, min_seg_format: crate::version::test_level_active().then_some(log_level) }
+    }
 }
 
 fn report_path(store: &Store, log_id: &str) -> Path {
@@ -155,6 +168,8 @@ pub struct Retention {
     cfg: Config,
     members: Membership,
     state: Mutex<State>,
+    /// The feature level active when our log started (its first segment's).
+    log_level: u32,
 }
 
 #[derive(Default)]
@@ -178,7 +193,7 @@ fn ordinal_of(p: &Path) -> Option<u64> {
 
 impl Retention {
     pub fn new(store: Store, log: Arc<NodeLog>, cfg: Config, members: Membership) -> Arc<Retention> {
-        Arc::new(Retention { store, log, cfg, members, state: Mutex::default() })
+        Arc::new(Retention { store, log, cfg, members, state: Mutex::default(), log_level: crate::version::active() })
     }
 
     /// Runs a pass every `interval`, forever.
@@ -236,7 +251,7 @@ impl Retention {
 
     /// Writes our report if it changed.
     async fn publish(&self) -> anyhow::Result<()> {
-        let rep = Report { opened: self.log.sinks.opened(), pruned_seq: self.state.lock().pruned_seq };
+        let rep = Report::new(self.log.sinks.opened(), self.state.lock().pruned_seq, self.log_level);
         if self.state.lock().written.as_ref() == Some(&rep) {
             return Ok(());
         }
@@ -662,7 +677,7 @@ mod tests {
             put_seg(&store, "D", ord, ord, ShardId(0), 1, 100 + ord as i64).await;
         }
         put_seg(&store, "D", 5, 4, ShardId(0), 1, 105).await; // sealed while 4 was in flight
-        let rep = Report { opened: [(ShardId(0), 1)].into(), pruned_seq: 42 };
+        let rep = Report { opened: [(ShardId(0), 1)].into(), pruned_seq: 42, ..Default::default() };
         store.raw.put(&report_path(&store, "D"), PutPayload::from(serde_json::to_vec(&rep).unwrap())).await.unwrap();
         put_assign(&store, ShardId(0), vec![Span { log_id: "D".into(), epoch: 1, start: 0, end: Some(4) }, Span { log_id: "B".into(), epoch: 2, start: 0, end: None }]).await;
         let r = Retention::new(store.clone(), log.clone(), cfg(Duration::ZERO), members(&["B"], true));
@@ -717,11 +732,11 @@ mod tests {
         // a frozen split parent whose last span is in X never needs X again
         assigns.insert(ShardId(9), Assignment { frozen: Some(1), ..a(vec![sp("X", 2)]) });
         let mut reports = HashMap::new();
-        reports.insert("Y".to_string(), Report { opened: [(ShardId(0), 2)].into(), pruned_seq: 0 });
+        reports.insert("Y".to_string(), Report { opened: [(ShardId(0), 2)].into(), pruned_seq: 0, ..Default::default() });
         assert_eq!(needed_by("X", &assigns, &reports), Some(ShardId(3)), "X holds shard 3's last span");
-        reports.insert("Z".to_string(), Report { opened: [(ShardId(3), 5)].into(), pruned_seq: 0 });
+        reports.insert("Z".to_string(), Report { opened: [(ShardId(3), 5)].into(), pruned_seq: 0, ..Default::default() });
         assert_eq!(needed_by("X", &assigns, &reports), Some(ShardId(3)), "Z opened it before X's second span");
-        reports.insert("W".to_string(), Report { opened: [(ShardId(3), 7)].into(), pruned_seq: 0 });
+        reports.insert("W".to_string(), Report { opened: [(ShardId(3), 7)].into(), pruned_seq: 0, ..Default::default() });
         assert_eq!(needed_by("X", &assigns, &reports), None);
         assert_eq!(needed_by("Q", &assigns, &HashMap::new()), None);
     }

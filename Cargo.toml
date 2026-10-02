@@ -21,6 +21,12 @@ mimalloc = ["dep:mimalloc"]
 profiling = ["dep:pyroscope", "dep:prost", "dep:inferno"]
 # SlateDB's own stats (block cache hits, memtable, L0, flushes) in /metrics
 slatedb-metrics = ["dep:slatedb-common"]
+# TEST ONLY, never in a release image: adds the test feature level
+# (src/version.rs TEST_LEVEL = newest real level + 1), which changes the
+# segment magic/header and a retain/ report field, so rolling upgrades are
+# exercised with a real format change (tests/level_gating.rs, bench/ha
+# upgrade-* scenarios, `just upgrade-ci`).
+test-level = []
 
 [dependencies]
 # zstd/lz4: SST block compression (--sst-compression, default zstd)
@@ -97,6 +103,13 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 [[test]]
 name = "all"
 path = "tests/all/main.rs"
+
+# Rolling upgrades with the test feature level: its own binary (the active
+# level is process-wide), so `cargo test --features test-level --test level_gating`
+[[test]]
+name = "level_gating"
+path = "tests/level_gating.rs"
+required-features = ["test-level"]
 
 # slatedb 0.17.0 (upstream c1e36fc) plus one fix, on the fork branch
 # vlpds-0.17-union-l0-view-ids (pending an upstream report): a union clone (a

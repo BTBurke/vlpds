@@ -3118,6 +3118,79 @@ async fn get_totp_status(State(app): AppState, Auth(creds): Auth) -> XResult<Jso
     Ok(Json(out))
 }
 
+/// This module's private rows with fixed values (golden fixtures,
+/// `super::private_rows`); the `json!` rows repeat their writers' shapes.
+pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
+    use super::private_rows::enc;
+    let fam = "0006439b2a1c0000aabbccddeeff0011";
+    let st = RefreshState {
+        family: fam.into(),
+        exp: 1_797_776_000,
+        app_password: Some(AppPassRef { name: "ci".into(), privileged: true }),
+        created_at: 1_790_000_000,
+        next_id: Some("00112233445566778899aabbccddeeff0011223344556677".into()),
+    };
+    let hash = "4f1c0de0".repeat(8);
+    let et = EmailToken { token_hash: "ab".repeat(32), requested_at: 1_790_000_000_000 };
+    let before: u64 = 1_790_000_000_000_000;
+    let digest = "cd".repeat(32);
+    let did_key = "did:key:zQ3shfixture";
+    let r = |name: String, v: Vec<u8>| (did.to_string(), name, v);
+    vec![
+        r("sess/00112233445566778899aabbccddeeff0011223344556600".into(), enc(&st)),
+        r("apppass/ci".into(), enc(&json!({"name": "ci", "createdAt": "2026-10-01T00:00:00.000Z", "privileged": true, "hash": hash}))),
+        r(format!("apphash/{hash}"), b"ci".to_vec()),
+        r("etok/update_email".into(), enc(&et)),
+        r(format!("{REVOKED_ALL}{before:016x}"), enc(&json!({"before": before, "exp": 1_790_007_200u64}))),
+        r(format!("{REVOKED_FAMILY}{fam}"), enc(&json!({"exp": 1_790_007_200u64}))),
+        r(
+            format!("{TAKEDOWN}rec/app.bsky.feed.post/3l3qo2vutsw2b"),
+            enc(&json!({"uri": format!("at://{did}/app.bsky.feed.post/3l3qo2vutsw2b"), "did": did, "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm", "ref": "mod-1"})),
+        ),
+        r(format!("{TAKEDOWN}blob/bafkreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"), enc(&json!({"did": did, "cid": "bafkreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm", "ref": null}))),
+        (format!("_reset:{digest}"), "t".into(), did.as_bytes().to_vec()),
+        (reserved_routing(did_key), "k".into(), enc(&json!({"key": "vw1.kid.cmVzZXJ2ZWQ", "did": did, "createdAt": "2026-10-01T00:00:00.000Z"}))),
+        (reserved_routing(did), "k".into(), enc(&json!({"signingKey": did_key, "createdAt": "2026-10-01T00:00:00.000Z"}))),
+    ]
+}
+
+/// Decodes one of this module's private rows as its readers do (None: not
+/// one of them).
+pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow::Result<&'static str>> {
+    use super::private_rows::{json_row, typed_row, utf8_row};
+    if routing.starts_with("_reset:") && name == "t" {
+        return Some(utf8_row("reset token", val));
+    }
+    if routing.starts_with("_reserved:") && name == "k" {
+        let fields: &[(&str, char)] = if routing.starts_with("_reserved:did:key:") { &[("key", 's'), ("createdAt", 's')] } else { &[("signingKey", 's'), ("createdAt", 's')] };
+        return Some(json_row("reserved signing key", val, fields));
+    }
+    if !routing.starts_with("did:") {
+        return None;
+    }
+    Some(if name.starts_with("sess/") {
+        typed_row::<RefreshState>("session", val)
+    } else if name.starts_with("apppass/") {
+        json_row("app password", val, &[("name", 's'), ("createdAt", 's'), ("privileged", 'b'), ("hash", 's')])
+    } else if name.starts_with("apphash/") {
+        utf8_row("app password hash", val)
+    } else if name.starts_with("etok/") {
+        typed_row::<EmailToken>("email token", val)
+    } else if name.starts_with(REVOKED_ALL) || name.starts_with(REVOKED_FAMILY) {
+        let fields: &[(&str, char)] = if name.starts_with(REVOKED_ALL) { &[("before", 'u'), ("exp", 'u')] } else { &[("exp", 'u')] };
+        json_row("session revocation", val, fields).and_then(|k| {
+            anyhow::ensure!(revocation_expired(routing, name, val, 0) == Some(false), "the revocation GC can't read it");
+            Ok(k)
+        })
+    } else if name.starts_with(&format!("{TAKEDOWN}rec/")) {
+        json_row("record takedown", val, &[("uri", 's'), ("did", 's'), ("cid", 's')])
+    } else if name.starts_with(&format!("{TAKEDOWN}blob/")) {
+        json_row("blob takedown", val, &[("did", 's'), ("cid", 's')])
+    } else {
+        return None;
+    })
+}
+
 #[cfg(test)]
 mod invite_interval_tests {
     use super::super::admin::{InviteCode, InviteUse};

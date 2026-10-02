@@ -36,6 +36,12 @@ pub struct Mutation {
 // zstd level 1 in segments of 256 KiB and up (DESIGN.md "Log compression").
 // VLSEG06 widened the entry's shard tag to 32 bits (`slots::ShardId`).
 //
+// The test feature level (cargo feature `test-level`, `version::TEST_LEVEL`,
+// never in a release build) writes "VLSEGT1\n" with one more header field,
+// `checksum u64` (sha256(uncompressed body)[..8]) between count and codec,
+// so codec and body_len stay the header's last 5 bytes. A builder writes
+// the level that was active when it was made: segments are homogeneous.
+//
 // mut_count with its top bit set: bits 0-15 count the muts stored, bits
 // 16-30 the muts *derived* from the #commit frame, which come first (see
 // `derive_commit_muts`). A commit's record and head values repeat the record
@@ -97,6 +103,9 @@ pub struct SegHeader {
     /// Feature level of the segment's magic (its entry layout and how its
     /// derived muts are derived).
     pub level: u32,
+    /// The test feature level's header field (`version::TEST_LEVEL`): the
+    /// first 8 bytes of sha256(uncompressed body), checked by [`parse`].
+    pub checksum: Option<u64>,
 }
 
 pub struct SegEntry {
@@ -122,6 +131,10 @@ pub struct SegmentBuilder {
     pub count: u32,
     /// Bytes reserved at the start of `body` for the header (`for_log`).
     header_room: usize,
+    /// The feature level the segment is written at: the active level when
+    /// the builder was made, so a segment is homogeneous and a level change
+    /// takes effect at the next segment (the header length depends on it).
+    level: u32,
 }
 
 impl Default for SegmentBuilder {
@@ -132,17 +145,28 @@ impl Default for SegmentBuilder {
 
 impl SegmentBuilder {
     pub fn new() -> Self {
-        SegmentBuilder { body: Vec::with_capacity(1 << 20), first_seq: 0, last_seq: 0, count: 0, header_room: 0 }
+        SegmentBuilder { body: Vec::with_capacity(1 << 20), first_seq: 0, last_seq: 0, count: 0, header_room: 0, level: crate::version::active() }
     }
 
     /// A builder whose body starts with room for `log_id`'s header, so
     /// `seal` writes it in place instead of copying the body behind it.
     /// Entry ranges from `push` are then offsets into the sealed object.
     pub fn for_log(log_id: &str) -> Self {
-        let room = header_len(log_id);
+        Self::for_log_at(log_id, crate::version::active())
+    }
+
+    /// [`for_log`](Self::for_log) writing the formats of `level` (golden
+    /// fixtures of an older level; writers use the active one).
+    pub fn for_log_at(log_id: &str, level: u32) -> Self {
+        let room = header_len(log_id, level);
         let mut body = Vec::with_capacity(1 << 20);
         body.resize(room, 0);
-        SegmentBuilder { body, first_seq: 0, last_seq: 0, count: 0, header_room: room }
+        SegmentBuilder { body, first_seq: 0, last_seq: 0, count: 0, header_room: room, level }
+    }
+
+    /// The feature level this segment is written at.
+    pub fn level(&self) -> u32 {
+        self.level
     }
 
     pub fn is_empty(&self) -> bool {
@@ -235,8 +259,8 @@ impl SegmentBuilder {
     /// so add the header length to address the full object.
     pub fn sealed_header(&self, log_id: &str, ordinal: u64, prefix_end: u64) -> Vec<u8> {
         debug_assert!(prefix_end <= ordinal);
-        let mut h = Vec::with_capacity(header_len(log_id));
-        h.put_slice(crate::version::segment_magic(crate::version::active()));
+        let mut h = Vec::with_capacity(header_len(log_id, self.level));
+        h.put_slice(crate::version::segment_magic(self.level));
         h.put_u16(log_id.len() as u16);
         h.put_slice(log_id.as_bytes());
         h.put_u64(ordinal);
@@ -244,17 +268,36 @@ impl SegmentBuilder {
         h.put_i64(self.first_seq);
         h.put_i64(self.last_seq);
         h.put_u32(self.count);
+        if has_checksum(self.level) {
+            h.put_u64(body_checksum(&self.body[self.header_room..]));
+        }
         h.put_u8(CODEC_NONE);
         h.put_u32((self.body.len() - self.header_room) as u32);
         h
     }
 }
 
-/// Header bytes after the log id.
+/// Header bytes after the log id (level 1).
 const HEADER_TAIL: usize = 41;
 
-fn header_len(log_id: &str) -> usize {
-    MAGIC.len() + 2 + log_id.len() + HEADER_TAIL
+/// Whether segments of `level` carry the test level's body checksum (between
+/// `count` and `codec`, so codec and body_len stay the header's last 5 bytes).
+fn has_checksum(level: u32) -> bool {
+    cfg!(feature = "test-level") && level >= crate::version::TEST_LEVEL
+}
+
+fn header_tail(level: u32) -> usize {
+    HEADER_TAIL + if has_checksum(level) { 8 } else { 0 }
+}
+
+fn header_len(log_id: &str, level: u32) -> usize {
+    MAGIC.len() + 2 + log_id.len() + header_tail(level)
+}
+
+/// The test level's segment checksum: sha256(body)[..8].
+fn body_checksum(body: &[u8]) -> u64 {
+    use sha2::Digest;
+    u64::from_be_bytes(sha2::Sha256::digest(body)[..8].try_into().unwrap())
 }
 
 thread_local! {
@@ -348,8 +391,11 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<Option<(SegHeader, usize)>> {
     };
     let idlen = u16::from_be_bytes(data[8..10].try_into()?) as usize;
     let pos = 10 + idlen;
-    anyhow::ensure!(data.len() >= pos + HEADER_TAIL, "truncated segment header");
+    let tail = header_tail(level);
+    anyhow::ensure!(data.len() >= pos + tail, "truncated segment header");
     let rd8 = |p: usize| -> [u8; 8] { data[p..p + 8].try_into().unwrap() };
+    // the test level's checksum sits between count and codec
+    let (checksum, c) = if has_checksum(level) { (Some(u64::from_be_bytes(rd8(pos + 36))), pos + 44) } else { (None, pos + 36) };
     let h = SegHeader {
         log_id: String::from_utf8(data[10..pos].to_vec())?,
         ordinal: u64::from_be_bytes(rd8(pos)),
@@ -357,12 +403,13 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<Option<(SegHeader, usize)>> {
         first_seq: i64::from_be_bytes(rd8(pos + 16)),
         last_seq: i64::from_be_bytes(rd8(pos + 24)),
         count: u32::from_be_bytes(data[pos + 32..pos + 36].try_into()?),
-        codec: data[pos + 36],
-        body_len: u32::from_be_bytes(data[pos + 37..pos + 41].try_into()?),
+        codec: data[c],
+        body_len: u32::from_be_bytes(data[c + 1..c + 5].try_into()?),
         level,
+        checksum,
     };
     anyhow::ensure!(h.prefix_end <= h.ordinal, "segment {} has prefix_end {} past it", h.ordinal, h.prefix_end);
-    Ok(Some((h, pos + HEADER_TAIL)))
+    Ok(Some((h, pos + tail)))
 }
 
 /// Parses a stored log object (segment or fence), decompressing it if
@@ -374,6 +421,9 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<ShardId>) -> anyhow::Re
     let Some((h, mut pos)) = parse_header(&data)? else {
         return Ok(LogObject::Fence { by: String::from_utf8_lossy(&data[8..]).into_owned() });
     };
+    if let Some(sum) = h.checksum {
+        anyhow::ensure!(body_checksum(&data[pos..]) == sum, "segment {} of {}: body checksum mismatch", h.ordinal, h.log_id);
+    }
     let need = |pos: usize, n: usize| -> anyhow::Result<()> {
         anyhow::ensure!(pos + n <= data.len(), "truncated segment");
         Ok(())
@@ -520,7 +570,7 @@ mod tests {
         obj.extend_from_slice(&b.body);
         let LogObject::Segment(h, all) = parse(Bytes::from(obj.clone()), true, None).unwrap() else { panic!() };
         assert_eq!((h.log_id.as_str(), h.ordinal, h.prefix_end, h.first_seq, h.last_seq, h.count), ("node-a.1", 42, 39, 10, 12, 3));
-        let (hh, len) = parse_header(&obj[..60]).unwrap().unwrap();
+        let (hh, len) = parse_header(&obj[..80]).unwrap().unwrap();
         assert_eq!((hh.ordinal, hh.prefix_end, len), (42, 39, b.header("node-a.1", 42).len()));
         assert!(parse_header(&fence_object("node-b")).unwrap().is_none());
         assert_eq!(all.len(), 3);
@@ -577,8 +627,9 @@ mod tests {
             let mut b = if in_place { SegmentBuilder::for_log("L") } else { SegmentBuilder::new() };
             let r = b.push_derived(5, ShardId(1), 2, |o| frame.finish(5, o), &all, derived.len());
             b.push(6, ShardId(1), 2, |o| o.extend_from_slice(b"plain"), &all[..1]);
+            let level = b.level();
             let obj = b.seal("L", 9, 9);
-            let off = if in_place { 0 } else { header_len("L") };
+            let off = if in_place { 0 } else { header_len("L", level) };
             assert_eq!(&obj[r.start + off..r.end + off], &bytes[..]);
             let LogObject::Segment(h, entries) = parse(Bytes::from(obj.clone()), true, None).unwrap() else { panic!() };
             assert_eq!((h.ordinal, h.count), (9, 2));
@@ -610,9 +661,9 @@ mod tests {
         let stored = compress(&sealed, 1).unwrap().expect("compressible");
         assert!(stored.len() * 3 < sealed.len(), "{} -> {}", sealed.len(), stored.len());
         // header-only read of the stored object
-        let (h, hl) = parse_header(&stored[..64]).unwrap().unwrap();
+        let (h, hl) = parse_header(&stored[..80]).unwrap().unwrap();
         assert_eq!((h.ordinal, h.prefix_end, h.first_seq, h.last_seq, h.count, h.codec), (5, 3, 1000, 1199, 200, CODEC_ZSTD));
-        assert_eq!((h.body_len as usize, hl), (sealed.len() - hl, header_len("node-a.7")));
+        assert_eq!((h.body_len as usize, hl), (sealed.len() - hl, header_len("node-a.7", h.level)));
         let decoded = decode(Bytes::from(stored.clone())).unwrap();
         assert_eq!(&decoded[..], &sealed[..]);
         let LogObject::Segment(h2, entries) = parse(Bytes::from(stored), true, Some(ShardId(70_001))).unwrap() else { panic!() };

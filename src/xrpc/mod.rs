@@ -10,6 +10,8 @@ pub mod internal;
 pub mod authn;
 pub mod blobs;
 mod identity;
+#[doc(hidden)]
+pub mod private_rows;
 pub mod key_rotation;
 pub mod oauth;
 pub(crate) mod proxy;

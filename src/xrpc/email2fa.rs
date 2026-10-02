@@ -48,6 +48,16 @@ struct Lockout {
     locked_until: u64,
 }
 
+/// The lockout row with fixed values (golden fixtures, `super::private_rows`).
+pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
+    vec![(did.into(), LOCKOUT_NAME.into(), super::private_rows::enc(&Lockout { failures: 3, locked_until: 1_790_000_300 }))]
+}
+
+/// Decodes the lockout row (None: not it).
+pub(super) fn check_row(_routing: &str, name: &str, val: &[u8]) -> Option<anyhow::Result<&'static str>> {
+    (name == LOCKOUT_NAME).then(|| super::private_rows::typed_row::<Lockout>("email 2fa lockout", val))
+}
+
 /// The factor a failed second-factor check asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Factor {

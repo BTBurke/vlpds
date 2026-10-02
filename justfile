@@ -30,6 +30,18 @@ seed accounts="3" records="200":
 test *args:
     cargo test {{args}}
 
+# Two-build HA scenarios (bench/ha/upgrade.sh: builds the previous release + this tree, plain and
+# with the test feature level, then runs hactl.py upgrade-*). `--minio` first = throwaway MinIO container
+upgrade-ha *args:
+    bench/ha/upgrade.sh {{args}}
+
+# Rolling-upgrade CI gate (DESIGN.md "Tests and CI"): format fixtures + MANIFEST freeze, the
+# level-gating test with the test feature level, and one two-build scenario on a throwaway MinIO
+upgrade-ci scenario="upgrade-rolling":
+    cargo test --test all formats::
+    cargo test --features test-level --test level_gating
+    VLPDS_HA_S3=127.0.0.1:9260 bench/ha/upgrade.sh --minio {{scenario}}
+
 # Local MinIO (build/docker-compose.yml) on :9000 (console :9001), with the `vlpds` bucket created
 minio:
     docker compose -f build/docker-compose.yml up -d --build --wait minio

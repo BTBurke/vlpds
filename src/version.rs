@@ -36,9 +36,9 @@ pub struct Level {
     pub segment_magic: Option<&'static [u8; 8]>,
 }
 
-/// Every level this build knows, oldest first. Level 1 is the baseline:
-/// the formats in production on day one, recorded in testdata/formats/L1.
-pub const LEVELS: &[Level] = &[Level {
+/// Level 1, the baseline: the formats in production on day one, recorded
+/// in testdata/formats/L1.
+const BASELINE: Level = Level {
     level: 1,
     name: "baseline",
     description: "VLSEG06 log segments (32-bit shard tags, zstd bodies, derived #commit muts), \
@@ -46,15 +46,76 @@ pub const LEVELS: &[Level] = &[Level {
                   JSON control objects, vw1 wrapped secrets, log stream messages 0 (batch) and 1 (watermark)",
     persistent: true,
     segment_magic: Some(b"VLSEG06\n"),
-}];
+};
+
+/// The newest level that ships (real formats only).
+pub const REAL_MAX: u32 = 1;
+
+/// The **test-only** level, one past the newest real one. It exists only in
+/// builds with the `test-level` cargo feature (never a release image) and
+/// changes two on-bucket formats the way a real level would, so
+/// mixed-version behavior (gating, raise, rollback, refusals) runs between
+/// real builds (tests/level_gating.rs, the bench/ha `upgrade-*` scenarios):
+/// - segments get the magic [`TEST_SEGMENT_MAGIC`] and one more header
+///   field, a checksum of the body (`crate::segment`), verified on parse;
+/// - `retain/{log_id}` reports gain `min_seg_format`
+///   (`crate::retention::Report`).
+///
+/// Its fixtures are `testdata/formats/Ltest` (never released, not in the
+/// MANIFEST). When a real level is added it moves up with [`REAL_MAX`].
+pub const TEST_LEVEL: u32 = REAL_MAX + 1;
+/// The test level's segment magic.
+pub const TEST_SEGMENT_MAGIC: &[u8; 8] = b"VLSEGT1\n";
+
+#[cfg(feature = "test-level")]
+const TEST: Level = Level {
+    level: TEST_LEVEL,
+    name: "test",
+    description: "TEST ONLY (cargo feature test-level): VLSEGT1 segments (header + body checksum), \
+                  retain/ reports with min_seg_format",
+    persistent: true,
+    segment_magic: Some(TEST_SEGMENT_MAGIC),
+};
+
+/// Every level this build knows, oldest first.
+#[cfg(not(feature = "test-level"))]
+pub const LEVELS: &[Level] = &[BASELINE];
+#[cfg(feature = "test-level")]
+pub const LEVELS: &[Level] = &[BASELINE, TEST];
 
 /// Lowest level this build can run (and read data of).
 pub const MIN_LEVEL: u32 = 1;
 /// Highest level this build can run.
-pub const MAX_LEVEL: u32 = 1;
+pub const MAX_LEVEL: u32 = if cfg!(feature = "test-level") { TEST_LEVEL } else { REAL_MAX };
 /// Highest level that has shipped: its fixtures (testdata/formats/L{n})
 /// are frozen by testdata/formats/MANIFEST.
 pub const RELEASED: u32 = 1;
+
+/// Whether writers at the active level emit the test level's formats
+/// (always false without the `test-level` feature).
+pub fn test_level_active() -> bool {
+    cfg!(feature = "test-level") && active() >= TEST_LEVEL
+}
+
+/// Whether the cluster may go from `active` down to `to` (`cluster
+/// lower`): only below the active level, and only past levels of `table`
+/// that put no new bytes in the bucket (a persistent level is never
+/// lowered: a node at `to` couldn't read what it wrote). Err = why not.
+pub fn check_lower(table: &[Level], active: u32, to: u32) -> Result<(), String> {
+    if to == 0 || to >= active {
+        return Err(format!("level {to} is not below the active level {active}"));
+    }
+    for l in to + 1..=active {
+        match table.iter().find(|x| x.level == l) {
+            None => return Err(format!("level {l} is unknown to this build")),
+            Some(x) if x.persistent => {
+                return Err(format!("level {l} ({}) is persistent: it wrote new formats to the bucket, so it is never lowered", x.name));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
 
 /// Level assumed for a lease or object written before levels existed.
 pub fn legacy_level() -> u32 {
@@ -194,6 +255,9 @@ pub fn format_error(format: &'static str) {
 
 /// Exports this build's window and every format error counter at 0.
 pub fn init_metrics() {
+    if cfg!(feature = "test-level") {
+        tracing::warn!(test_level = TEST_LEVEL, "TEST BUILD: the test-only feature level is compiled in (cargo feature test-level); never run it in production");
+    }
     crate::metrics::FEATURE_LEVEL.with_label_values(&["binary_min"]).set(MIN_LEVEL as i64);
     crate::metrics::FEATURE_LEVEL.with_label_values(&["binary_max"]).set(MAX_LEVEL as i64);
     for f in FORMATS {
@@ -240,7 +304,12 @@ mod tests {
         }
         const { assert!(MIN_LEVEL >= 1 && MIN_LEVEL <= MAX_LEVEL && RELEASED <= MAX_LEVEL) };
         assert_eq!(MAX_LEVEL as usize, LEVELS.len());
-        assert_eq!(segment_magic(MAX_LEVEL), crate::segment::MAGIC);
+        assert_eq!(segment_magic(REAL_MAX), crate::segment::MAGIC);
+        if cfg!(feature = "test-level") {
+            assert_eq!((MAX_LEVEL, segment_magic(MAX_LEVEL), segment_level(TEST_SEGMENT_MAGIC)), (TEST_LEVEL, TEST_SEGMENT_MAGIC, Some(TEST_LEVEL)));
+        } else {
+            assert_eq!((MAX_LEVEL, segment_level(TEST_SEGMENT_MAGIC)), (REAL_MAX, None), "the test level is not in this build");
+        }
         // a level above every table entry writes the newest magic
         assert_eq!(segment_magic(MAX_LEVEL + 5), segment_magic(MAX_LEVEL));
         assert_eq!(segment_level(b"VLSEG06\n"), Some(1));
@@ -257,6 +326,21 @@ mod tests {
         assert!(w.check(&v(3, None)).unwrap_err().contains("outside"));
         assert!(w.check(&v(1, Some(3))).unwrap_err().contains("raising"));
         assert!(Window { min: 2, max: 3 }.check(&v(1, None)).is_err(), "can no longer read level 1");
+    }
+
+    #[test]
+    fn only_wire_levels_are_lowered() {
+        let l = |level, persistent| Level { level, name: "x", description: "", persistent, segment_magic: None };
+        let table = [l(1, true), l(2, false), l(3, false), l(4, true)];
+        assert!(check_lower(&table, 3, 1).is_ok(), "2 and 3 only gate wire behavior");
+        assert!(check_lower(&table, 3, 2).is_ok());
+        assert!(check_lower(&table, 4, 3).unwrap_err().contains("persistent"));
+        assert!(check_lower(&table, 4, 1).unwrap_err().contains("persistent"));
+        assert!(check_lower(&table, 2, 2).unwrap_err().contains("not below"));
+        assert!(check_lower(&table, 2, 0).is_err());
+        assert!(check_lower(&table, 6, 4).unwrap_err().contains("unknown"));
+        // this build's own table: nothing below level 1; the test level is persistent
+        assert!(check_lower(LEVELS, MAX_LEVEL, MAX_LEVEL - 1).is_err());
     }
 
     /// A newer build's fields survive an older node's read-modify-write.

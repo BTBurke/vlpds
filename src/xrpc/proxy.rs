@@ -1127,6 +1127,27 @@ fn has_access_full(creds: &Credentials) -> bool {
     matches!(creds, Credentials::Session { .. })
 }
 
+/// The preferences row with fixed values (golden fixtures, `super::private_rows`).
+pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
+    let prefs = json!([
+        {"$type": "app.bsky.actor.defs#adultContentPref", "enabled": false},
+        {"$type": "app.bsky.actor.defs#savedFeedsPrefV2", "items": [{"id": "3l3qo2vutsw2b", "type": "timeline", "value": "following", "pinned": true}]},
+        {"$type": PERSONAL_DETAILS_PREF, "birthDate": "1990-01-01T00:00:00.000Z"},
+    ]);
+    vec![(did.into(), PREFS_KEY.into(), super::private_rows::enc(&prefs))]
+}
+
+/// Decodes the preferences row as `load_prefs` does (None: not it): an
+/// array of objects, each with a `$type`.
+pub(super) fn check_row(_routing: &str, name: &str, val: &[u8]) -> Option<anyhow::Result<&'static str>> {
+    (name == PREFS_KEY).then(|| {
+        let prefs: Vec<J> = serde_json::from_slice(val)?;
+        anyhow::ensure!(prefs.iter().all(|p| pref_type(p).is_some()), "a preference without $type");
+        anyhow::ensure!(serde_json::to_vec(&prefs)? == val, "preferences re-encode differently");
+        Ok("preferences")
+    })
+}
+
 fn pref_type(p: &J) -> Option<&str> {
     p.get("$type").and_then(|t| t.as_str())
 }

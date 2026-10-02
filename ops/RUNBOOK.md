@@ -67,7 +67,7 @@ it is marked **(unverified)**.
 | Liveness | `GET /xrpc/_health` -> `{"version":"vlpds"}` |
 | Metrics | `GET /metrics` (Prometheus text) |
 | Cluster view (admin) | `GET /xrpc/vlpds.admin.getClusterStatus` with `Authorization: Basic base64(admin:$VLPDS_ADMIN_TOKEN)`. Returns `node`, `log`, `logDurableOrdinal`, `owned` (shard ids), `shards`, `table` (owner per shard in slot order, `null` = unowned), `layout` (`version`, `shards`, `op` = split/merge in progress), `leaseValid`, `leaseExpiresMs`, `fencedLogs`, `firehose.{lastEmitted,minWatermark,sources[{log,watermark,local}]}`, `version` (feature levels: `active`, `target` while a raise runs, `history`, this build's `binary.{min,max,rev}`, `mixedBuilds`, `revs`, `finalizable`, `finalizedAt`; see [Rolling upgrade](#rolling-upgrade-finalize-rollback)), and `nodes[]` with each peer's `reachable`, `leaseValid`, `logDurableOrdinal`, `owned` count, `writer`, `expiresMs`, `rev`, `minLevel`, `maxLevel`, `seenLevel` (peers fetched with a 1.5 s timeout). |
-| Feature level raise (admin) | `POST /xrpc/vlpds.admin.setFeatureLevel {"level": N}` (CLI `vlpds admin cluster finalize`): 200 with the new `cluster/version`; 409 `IncompatibleNodes` names live nodes whose build can't run N (nothing changed); 400 below the active level or past the asked node's build. |
+| Feature level raise (admin) | `POST /xrpc/vlpds.admin.setFeatureLevel {"level": N}` (CLI `vlpds admin cluster finalize`): 200 with the new `cluster/version`; 409 `IncompatibleNodes` names live nodes whose build can't run N (nothing changed); 400 below the active level or past the asked node's build. With `"lower": true` (CLI `vlpds admin cluster lower`) it lowers instead: 400 past a persistent level or during a raise, 409 while a live node can't run N. |
 | Cluster view (node-to-node) | `GET /internal/v1/cluster` with header `x-vlpds-internal: $VLPDS_INTERNAL_TOKEN`: this node's `owned`, `table`, `layout`, `peers`, `lease_valid`, `log_durable_ordinal`, `firehose_last_emitted`, `firehose_min_watermark`. |
 | Operator console | `/admin` (Cluster page polls getClusterStatus), `/admin/metrics` (live metrics). |
 | Shard layout | `vlpds admin layout --url http://<node>:2583` (`VLPDS_ADMIN_TOKEN` env), or `GET /xrpc/vlpds.admin.getShardLayout`. Also `shard-split`, `shard-merge`, `reshard-abort` (abort only before the flip). |
@@ -158,6 +158,7 @@ refuse without `--yes`.
 | `sequencer-recovery`, `recovery-repair-repos`, `rotate-keys-recovery` | (none) | no single sequencer DB to replay: durability is the log + SlateDB per shard (DESIGN "Backups and restore") |
 | (none) | `vlpds admin cluster-status` (or `cluster status`) | `vlpds.admin.getClusterStatus`: this node, layout, unowned shards, firehose, feature level (and the finalize/mixed-builds banner), a row per node (`*` = the one asked) with its rev and level window |
 | (none) | `vlpds admin cluster finalize [--level N] [--yes]` | `vlpds.admin.setFeatureLevel` (default N = active + 1; asks first): [Rolling upgrade](#rolling-upgrade-finalize-rollback) |
+| (none) | `vlpds admin cluster lower --level N [--yes]` | `vlpds.admin.setFeatureLevel {"level": N, "lower": true}`: only past wire-only (non-persistent) levels: [Rolling upgrade](#rolling-upgrade-finalize-rollback) |
 | (none) | `vlpds admin layout`, `shard-split`, `shard-merge`, `reshard-abort` | [Shard split / merge](#shard-split--merge) |
 
 Per-DID batches (`publish-identity`, `rotate-keys`) run one DID at a time,
@@ -1325,14 +1326,27 @@ the same procedure. Nothing to clean up: no byte of level L+1 exists.
 
 **Rollback after finalize:** not possible by redeploy (the old build exits 7
 `incompatible_level` at startup, before touching data: VlpdsIncompatibleNode).
-Ship B' = B + fix. A level that only gates wire behavior (non-persistent) could
-be lowered again; `cluster lower` is not built yet (TODO.md), and a persistent
-level is never lowered (restore from a backup taken at the old level instead).
+Ship B' = B + fix. A persistent level is never lowered (restore from a backup
+taken at the old level instead). A level that only gates wire behavior
+(non-persistent; the release notes say which) can be lowered when its new
+wire behavior is the bug: `vlpds admin cluster lower --level L` (asks; `--yes`
+off a terminal; `vlpds.admin.setFeatureLevel {"level": L, "lower": true}`).
+It refuses (400) to go past a persistent level or while a raise `target` is
+set, and (409 `IncompatibleNodes`) while a live node's build can't run L.
+Nodes pick up the lower level within one lease TTL and switch at their next
+segment; then the old build can be redeployed.
 
 Feature levels never change by themselves: a node never raises the level at
-startup, and finalize is the only writer of `cluster/version` after its
-creation (a fresh prefix starts at its first node's max level; a prefix from
-before levels existed at 1).
+startup, and finalize (or `cluster lower`) is the only writer of
+`cluster/version` after its creation (a fresh prefix starts at its first
+node's max level; a prefix from before levels existed at 1).
+
+**Before a release** with a new level: `just upgrade-ci` (fixtures and the
+MANIFEST freeze, the level-gating test, and the two-build `upgrade-rolling`
+scenario against the previous release; `just upgrade-ha` runs every
+`upgrade-*` scenario: rollback, old-node refusal, raise race). The test
+builds use the test-only feature level (cargo feature `test-level`); never
+deploy such a build (it logs `TEST BUILD` at startup).
 
 ### Replacing a dead host
 

@@ -257,6 +257,35 @@ fn invite_routing(code: &str) -> String {
     format!("_invite:{code}")
 }
 
+/// Invite rows with fixed values (golden fixtures, `super::private_rows`).
+pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
+    let code = "pds-test-abcde-fghij";
+    let inv = InviteCode {
+        code: code.into(),
+        available: 2,
+        disabled: false,
+        for_account: did.into(),
+        created_by: "admin".into(),
+        created_at: "2026-10-01T00:00:00.000Z".into(),
+        uses: vec![InviteUse { used_by: "did:plc:invitee000000000000000".into(), used_at: "2026-10-01T00:01:00.000Z".into() }],
+    };
+    vec![
+        (invite_routing(code), "c".into(), super::private_rows::enc(&inv)),
+        (did.into(), format!("invite/{code}"), Vec::new()),
+    ]
+}
+
+/// Decodes an invite row (None: not one).
+pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow::Result<&'static str>> {
+    if routing.starts_with("_invite:") && name == "c" {
+        return Some(super::private_rows::typed_row::<InviteCode>("invite code", val));
+    }
+    if name.starts_with("invite/") {
+        return Some(if val.is_empty() { Ok("invite code index") } else { Err(anyhow::anyhow!("invite index row with a value")) });
+    }
+    None
+}
+
 /// `{hostname with . -> -}-xxxxx-xxxxx`
 pub(super) fn gen_invite_code(app: &App) -> String {
     let host = app

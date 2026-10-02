@@ -352,8 +352,9 @@ pub enum FinalizeError {
     /// The request can't be done (level not above the active one, not in
     /// this node's window, no version object).
     Invalid(String),
-    /// Live nodes whose builds can't run the level: (node id, rev, max level).
-    Incompatible { level: u32, nodes: Vec<(String, String, u32)> },
+    /// Live nodes whose builds can't run the level: (node id, rev, min
+    /// level, max level).
+    Incompatible { level: u32, nodes: Vec<(String, String, u32, u32)> },
     /// The object store failed or the object changed under us: retry.
     Store(anyhow::Error),
 }
@@ -363,7 +364,7 @@ impl std::fmt::Display for FinalizeError {
         match self {
             FinalizeError::Invalid(m) => write!(f, "{m}"),
             FinalizeError::Incompatible { level, nodes } => {
-                let list: Vec<String> = nodes.iter().map(|(n, rev, max)| format!("{n} (rev {rev}, max level {max})")).collect();
+                let list: Vec<String> = nodes.iter().map(|(n, rev, min, max)| format!("{n} (rev {rev}, levels {min}..={max})")).collect();
                 write!(f, "nodes that can't run level {level}: {}", list.join(", "))
             }
             FinalizeError::Store(e) => write!(f, "{e:#}"),
@@ -691,7 +692,7 @@ impl Cluster {
         };
         tracing::info!(level, by, "feature level raise: target written");
         // 2. every live lease, listed after the target landed
-        let offenders = match self.leases_below(level).await {
+        let offenders = match self.leases_unable(level).await {
             Ok(o) => o,
             Err(e) => {
                 let _ = self.clear_target(level).await;
@@ -746,22 +747,64 @@ impl Cluster {
         anyhow::bail!("{} kept changing", version::OBJECT)
     }
 
-    /// Leases (one LIST, a GET each) whose build can't run `level`: (node
-    /// id, rev, max level). Only a lease whose log we fenced (its node is
-    /// dead and taken over) is ignored; an unreadable one counts as unable.
-    async fn leases_below(&self, level: u32) -> anyhow::Result<Vec<(String, String, u32)>> {
+    /// Leases (one LIST, a GET each) whose build can't run `level` (it is
+    /// outside their window): (node id, rev, min level, max level). Only a
+    /// lease whose log we fenced (its node is dead and taken over) is
+    /// ignored; an unreadable one counts as unable.
+    async fn leases_unable(&self, level: u32) -> anyhow::Result<Vec<(String, String, u32, u32)>> {
         let mut out = Vec::new();
         for (id, _) in self.list("nodes").await? {
             let got = self.get_json::<serde_json::Value>(&self.path(&format!("nodes/{id}"))).await?;
             let Some((v, _)) = got else { continue };
             match serde_json::from_value::<NodeLease>(v) {
                 Ok(l) if self.fenced.read().contains_key(&l.log_id) => {}
-                Ok(l) if l.max_level >= level => {}
-                Ok(l) => out.push((id, l.rev, l.max_level)),
-                Err(_) => out.push((id, "?".into(), 0)),
+                Ok(l) if (l.min_level..=l.max_level).contains(&level) => {}
+                Ok(l) => out.push((id, l.rev, l.min_level, l.max_level)),
+                Err(_) => out.push((id, "?".into(), 0, 0)),
             }
         }
         Ok(out)
+    }
+
+    /// Lowers the cluster's feature level to `level` (`vlpds admin cluster
+    /// lower`): only past levels that put no new bytes in the bucket
+    /// (`version::check_lower`), never while a raise is in progress, and
+    /// only if every live node's build can run `level` (a node whose
+    /// `MIN_LEVEL` is above it would fail-stop at its next observation).
+    /// Running nodes switch at their next segment.
+    pub async fn lower_level(&self, level: u32, by: &str) -> Result<ClusterVersion, FinalizeError> {
+        self.lower_level_with(version::LEVELS, level, by).await
+    }
+
+    /// [`lower_level`](Self::lower_level) against a level table (tests pose
+    /// as builds with wire-only levels).
+    pub(crate) async fn lower_level_with(&self, table: &[version::Level], level: u32, by: &str) -> Result<ClusterVersion, FinalizeError> {
+        let path = self.path(version::OBJECT);
+        let Some((cur, etag)) = self.read_version().await? else {
+            return Err(FinalizeError::Invalid(format!("{} is missing", version::OBJECT)));
+        };
+        if level == cur.active {
+            return Ok(cur);
+        }
+        if let Some(t) = cur.target {
+            return Err(FinalizeError::Invalid(format!("a raise to level {t} is in progress (clear it with `cluster finalize --level {}`)", cur.active)));
+        }
+        version::check_lower(table, cur.active, level).map_err(FinalizeError::Invalid)?;
+        let offenders = self.leases_unable(level).await?;
+        if !offenders.is_empty() {
+            return Err(FinalizeError::Incompatible { level, nodes: offenders });
+        }
+        let mut next = cur.clone();
+        next.active = level;
+        next.history.push(version::Change::new(level, by));
+        match self.put_json(&path, &next, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
+            Ok(_) => {}
+            Err(e) if is_conflict(&e) => return Err(FinalizeError::Store(anyhow::anyhow!("{} changed concurrently: retry", version::OBJECT))),
+            Err(e) => return Err(FinalizeError::Store(e.into())),
+        }
+        tracing::warn!(from = cur.active, level, by, "cluster feature level lowered");
+        self.observed_version(next.clone());
+        Ok(next)
     }
 
     /// Enables the split policy hook (reshard.rs).
@@ -2820,6 +2863,33 @@ mod tests {
         assert!(new.finalize_level(2, "op").await.is_err());
         new.fence(&old.log_id).await.unwrap();
         assert_eq!(new.finalize_level(2, "op").await.unwrap().active, 2);
+        version::set_active(1);
+    }
+
+    /// `cluster lower`: only past wire-only levels, never during a raise,
+    /// only when every live node can run the lower level; this build's own
+    /// table (level 1 persistent, and the test level) lowers nothing.
+    #[tokio::test]
+    async fn lower_only_wire_levels_every_node_can_run() {
+        let l = |level, persistent| version::Level { level, name: "x", description: "", persistent, segment_magic: None };
+        let table = [l(1, true), l(2, false), l(3, false)];
+        let store = Store::memory(None);
+        put_version(&store, 3, None).await;
+        let a = join(levels("low-a", 1, 3), store.clone()).await.unwrap();
+        let b = join(levels("low-b", 2, 3), store.clone()).await.unwrap();
+        match a.lower_level_with(&table, 1, "op").await {
+            Err(FinalizeError::Incompatible { level: 1, nodes }) => assert_eq!(nodes.iter().map(|n| (n.0.as_str(), n.2)).collect::<Vec<_>>(), [("low-b", 2)]),
+            r => panic!("{r:?}"),
+        }
+        let v = a.lower_level_with(&table, 2, "op").await.unwrap();
+        assert_eq!((v.active, v.history.last().unwrap().level, v.history.len()), (2, 2, 2));
+        assert_eq!(b.lower_level_with(&table, 2, "op").await.unwrap().active, 2, "already there");
+        assert!(matches!(a.lower_level_with(&table, 3, "op").await, Err(FinalizeError::Invalid(_))), "lowering never raises");
+        assert!(matches!(a.lower_level(1, "op").await, Err(FinalizeError::Invalid(m)) if m.contains("unknown") || m.contains("persistent")));
+        let persistent = [l(1, true), l(2, true)];
+        assert!(matches!(a.lower_level_with(&persistent, 1, "op").await, Err(FinalizeError::Invalid(m)) if m.contains("persistent")));
+        put_version(&store, 2, Some(3)).await;
+        assert!(matches!(a.lower_level_with(&table, 1, "op").await, Err(FinalizeError::Invalid(m)) if m.contains("in progress")));
         version::set_active(1);
     }
 

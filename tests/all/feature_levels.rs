@@ -98,6 +98,13 @@ async fn cluster_status_shows_levels_and_a_raise_waits_for_every_node() {
     let (r, out) = admin(&a.url, &["cluster", "finalize", "--level", "1", "--yes"]).await;
     r.unwrap();
     assert!(out.contains("Feature level: 1 (was 1)"), "{out}");
+    // `cluster lower`: to the active level is a no-op; past it (or past a
+    // persistent level) it is refused
+    let (r, out) = admin(&a.url, &["cluster", "lower", "--level", "1", "--yes"]).await;
+    r.unwrap();
+    assert!(out.contains("Feature level: 1 (was 1)"), "{out}");
+    a.xrpc.post("vlpds.admin.setFeatureLevel", &json!({"level": 0, "lower": true}), &Auth::Admin).await.err(400, "InvalidRequest");
+    a.xrpc.post("vlpds.admin.setFeatureLevel", &json!({"level": 2, "lower": true}), &Auth::Admin).await.err(400, "InvalidRequest");
     let (r, _) = admin(&b.url, &["cluster", "finalize", "--yes"]).await;
     let e = format!("{:#}", r.unwrap_err());
     assert!(e.contains("IncompatibleNodes") && e.contains("fl-a"), "{e}");

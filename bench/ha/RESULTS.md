@@ -79,6 +79,32 @@ These are as before:
 6. **Availability:** probe outage windows. A probe is bad if it failed or took more than 2 s.
 7. **Exit codes:** these are recorded, and expected codes are checked where a scenario sets them.
 
+## Two-build upgrade scenarios (`upgrade-*`, 2026-10-02): rolling upgrades phase 2
+
+DESIGN.md "Rolling upgrades and format versioning". `bench/ha/upgrade.sh [--minio] [scenario...]` builds into
+`target/upgrade/` the **previous release** (`VLPDS_PREV_REV`, else the newest `vlpds-v*` tag, else the pinned
+`a9d1df7`, the first build with feature levels; cached per rev) and **this tree**, plain (`new`, levels 1..=1) and with
+the test-only feature level (`new-tl`, `--features test-level`, levels 1..=2: segment magic `VLSEGT1` with a body
+checksum, `retain/` reports with `min_seg_format`). Native processes, 3 nodes, 64 shards, TTL 3 s, 150 writes/s per
+node + probes, checker on n1, on a throwaway MinIO container (`--minio`, tmpfs). Besides `judge`, each run checks the
+finalize responses, the segment magics in the bucket right before the finalize and at the end (8-byte range GETs over
+`log/`), that refused nodes exited 7 (and an extra refused node left no lease, writer claim or log), and that no node
+exited otherwise. Previous = a9d1df7, current = a9d1df7 + this change (uncommitted tree).
+
+| Scenario | Verdict | Acked / lost | Checker | Bucket before finalize → end | Notes |
+|---|---|---|---|---|---|
+| `upgrade-rolling` (old ×3 → new-tl one by one at 8/18/28 s, finalize at 36 s) | PASS | 38,185 / 0 | PASS (+ cursor checker) | VLSEG06 3041 → VLSEG06 3765 + VLSEGT1 1077 | finalize 200 (active 2); replay + live audits complete, histories agree; probe outage 0.9 s total |
+| `upgrade-rolling-l1` (old ×3 → new, the real release path) | PASS | 34,244 / 0 | PASS | VLSEG06 only | finalize to 2: 400 "this node runs levels 1..=1" |
+| `upgrade-rollback` (2 of 3 → new-tl, finalize, both back to old) | PASS | 38,213 / 0 | PASS | VLSEG06 only | finalize 409 `IncompatibleNodes` naming n1 (old, live) |
+| `upgrade-old-refused` (all → new-tl, finalize; extra old n4; n2 → old; n2 → new-tl) | PASS | 37,385 / 0 | PASS | VLSEG06 1743 → + VLSEGT1 2312 | n4 exit 7 at its startup gate ("cluster level 2 is outside this build's levels 1..=1"), no objects left; n2 on old exit 7 in 0.8 s, back on new-tl fine |
+| `upgrade-raise-race`, old n4 started 300 ms / 20 ms before the finalize | PASS ×2 | 30,456 / 0, 30,910 / 0 | PASS | → + VLSEGT1 | raise 409 (n4's lease was listed), n4 kept running; then n4 stopped and the finalize went through |
+| `upgrade-raise-race`, finalize started 5 ms before old n4 | PASS | 30,680 / 0 | PASS | → + VLSEGT1 1348 | raise 200, n4 exit 7 |
+
+One run each (the race delay is random from {-50, -5, 20, 150} ms unless `VLPDS_HA_RACE_DELAY_MS` is set). The first
+`upgrade-rollback` run failed in the harness, not the product: the finalize asked the first live node (an old build)
+for the target level and so requested level 1; the finalize now asks the node it is sent through. The old build reported
+`rev unknown` (built from a `git archive`, no `.git`); `upgrade.sh` now sets `VLPDS_GIT_REV` for it. Wall time: ~2 min per scenario; the three cold builds ~15 min.
+
 ## Log retention under kill -9 (`ret1`–`ret3`): fa0975c, `retention-kill9`
 
 New scenario `retention-kill9`: 3 nodes with `--log-retention 45s`
