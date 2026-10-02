@@ -1,0 +1,12 @@
+{
+ "restart_sigterm": {
+  "lease_ttl_ms": 10000,
+  "health_after_s": 0.65,
+  "first_write_after_s": 0.76
+ },
+ "restart_sigkill": {
+  "lease_ttl_ms": 10000,
+  "health_after_s": 2.51,
+  "first_write_after_s": 10.69
+ }
+}

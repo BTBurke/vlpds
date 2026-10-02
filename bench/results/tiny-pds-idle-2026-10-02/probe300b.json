@@ -1,0 +1,14 @@
+{
+ "restart_sigterm": {
+  "lease_ttl_ms": 300000,
+  "health_after_s": 0.83,
+  "first_write_after_s": 0.85,
+  "last_error_before": null
+ },
+ "restart_sigkill": {
+  "lease_ttl_ms": 300000,
+  "health_after_s": 60.68,
+  "first_write_after_s": 281.37,
+  "last_error_before": "POST http://127.0.0.1:2707/xrpc/com.atproto.repo.createRecord: 503 b'{\"error\":\"ShardMoved\",\"message\":\"repo load failed: partition not owned by this node\"}'"
+ }
+}

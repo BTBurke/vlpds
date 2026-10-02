@@ -1,0 +1,36 @@
+{
+ "getRepo": {
+  "n": 10,
+  "secs": 10.0,
+  "delta": {
+   "B|get|other": 1.0,
+   "B|get|state_compactions": 1.0,
+   "B|get|state_gc_boundary": 2.0,
+   "B|get|state_manifest": 1.0
+  }
+ },
+ "getBlob": {
+  "n": 10,
+  "secs": 10.0,
+  "delta": {
+   "B|get|blob": 10.0,
+   "B|get|other": 1.0,
+   "B|get|state_gc_boundary": 1.0,
+   "B|get|state_manifest": 1.0
+  }
+ },
+ "baseline (sleep)": {
+  "n": 10,
+  "secs": 10.1,
+  "delta": {
+   "A|list|log_segment": 2.0,
+   "A|list|ctl_assign": 1.0,
+   "A|list|ctl_lease": 1.0,
+   "A|put_cas|ctl_lease": 1.0,
+   "B|get|other": 1.0,
+   "B|get|state_compactions": 1.0,
+   "B|get|state_gc_boundary": 3.0,
+   "B|get|state_manifest": 2.0
+  }
+ }
+}
