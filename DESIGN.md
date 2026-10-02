@@ -2007,6 +2007,79 @@ the full-tree mode is removed).
   At the 100× planet-scale target (~200k commits/s) it would be ~0.6 GB/s
   of extra memtable writes and should be built then.
 
+### Write path outside the commit builder (Oct 2026)
+Profiled (macOS `sample`, busy samples of the whole process) on a laptop
+node at saturation (`vlpds --memory`, 2,000 repos created in-process, one
+loadgen create per commit). Shares of node CPU, before → after:
+
+| | before | after |
+|---|---:|---:|
+| `Worker::settle` (recharging the repo after each commit) | 6.3–8.1% | 1.5% |
+| idle repo workers in crossbeam `recv` (spin + yield) | 2.4% | 0.1% |
+| log finalizer (apply + acks, one task per node) | 3.9% | 2.3% (+1.9% on `view-drop`) |
+| SlateDB memtable inserts (`KVTable::put`) | 5.0% | 5.0–6.9% (unchanged code) |
+
+- **Recharge.** The worker charged a repo its loaded paths by walking all
+  of them after every commit (`mst_lazy::heap_bytes`): O(loaded nodes),
+  up to ~1 MiB of nodes for a repo created or written in-process. It now
+  keeps a `HeapMemo` per repo: the tree it last measured (holding it
+  freezes every node in it, since nodes change only through
+  `Arc::make_mut`) and each interior node's subtree bytes by address, so
+  a new version is walked only down to the subtrees it shares with the
+  last one, and the old version's dropped nodes are walked once to forget
+  them. Exact (tests debug-assert it against the full walk on every
+  settle); reset when paths unload, so it never pins unloaded nodes. Its
+  map is ~16–32 B per loaded interior node, not charged.
+- **Worker channel.** `crate::chan`: a mutex-guarded queue and condvar.
+  An idle worker parks at once (crossbeam's `recv` spun and yielded
+  first) and takes its whole batch under one lock.
+- **Durable-view swap.** The ack moves the old view out of the cell and
+  queues it for the `view-drop` thread, which frees every 5 ms (a
+  wake-up per view cost more than the free); the finalizer's ack stage
+  went from ~160 to ~82 µs per segment (medians, saturation). A first
+  version woke the thread per view: `bench_commit_cpu` +4 µs/commit.
+- **Apply.** The finalizer moves keys and values into the `WriteBatch`
+  (`put_bytes`) instead of copying both; `M/` node values are made
+  exact-size first (the memtable now keeps the allocation).
+- **Commit builder.** `Cid` feeds 16 digest bytes and the codec to the
+  map's hasher instead of all 33 bytes plus a length (SipHash over the
+  whole CID was ~2% of the builder; 7.0 -> 3.0 ns per hash). Still
+  HashDoS-resistant: every `Cid`-keyed map hashes with a per-process
+  random key (std `RandomState`, or the seeded hashbrown default in
+  `lru`), and a full collision needs 128 equal digest bits. Keys take
+  the slot of the last DID from a per-thread cache (a SHA-256 per key before); the
+  `C/` index probe at flush is skipped when the batch's net puts (or no
+  records before and none put) settle it; no `format!` in `Need::of` /
+  `Write::path`.
+- **Memtable inserts: not changed.** The cost is `crossbeam_skiplist`
+  `search_position` (key compares and epoch loads) inside SlateDB's
+  writer task. Shorter or prefix-compressed keys would change the SST
+  format (keys are the on-bucket format), sorted batches don't help (the
+  `WriteBatch` is already a `BTreeMap`; each insert still searches from
+  the head), and the fork has no insert-with-hint; partitioning by
+  SlateDB's segment prefix extractor changes the manifest/SST layout. Left
+  for a SlateDB-side change.
+
+Measured on a shared laptop (load 25–65 on 14 cores), base and new
+binaries interleaved, 6 rounds each, median [range]:
+
+| | before | after |
+|---|---:|---:|
+| node CPU µs/commit at saturation, set 1 | 174.9 [164–196] | 178.4 [167–184] |
+| node CPU µs/commit at saturation, set 2 (lower load; new lower in 6/6 pairs) | 172.4 [166–180] | 165.9 [161–172] |
+| node CPU µs/commit at 15k/s offered | 307.9 [272–335] | 275.4 [268–329] |
+| commits/s at saturation (sets 1, 2) | 38.1k / 47.7k | 36.4k / 44.6k (noise: loadgen + HTTP bound) |
+| `bench_commit_cpu` post 20 / 5000 records | 39.2 / 40.5 | 40.1 / 39.1 |
+| `bench_commit_cpu` like / follow | 49.4 / 45.4 | 45.5 / 43.0 |
+
+The laptop's whole-node µs/commit is ~1.8× benchbox's ~96 µs (load from
+other jobs); the profile shares above are the more reliable measure: ~7%
+of node CPU removed (recharge and the recv spin) and ~1.6% moved off the
+finalizer. `bench_commit_cpu` (thread CPU of the commit builder plus the
+ack, which it runs inline) moves within its noise for posts; like and
+follow gain ~2–4 µs, partly because its ack now frees the old path on
+another thread (production's finalizer never ran on the worker thread).
+
 ## Backlinks (`src/backlinks.rs`)
 
 Reference parity: the reference's createRecord deletes the repo's earlier

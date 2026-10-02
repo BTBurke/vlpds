@@ -371,19 +371,97 @@ enum Mode {
 /// vectors, key allocations and cached blocks (same accounting for full and
 /// lazy trees, so the two compare; not allocator-exact).
 pub fn heap_bytes(n: &Node) -> usize {
+    let mut b = own_heap_bytes(n);
+    for e in &n.entries {
+        if let Entry::Child { node: Some(c), .. } = e {
+            b += heap_bytes(c);
+        }
+    }
+    b
+}
+
+/// [`heap_bytes`] of the node alone (its loaded children not counted).
+fn own_heap_bytes(n: &Node) -> usize {
     const ARC: usize = 16;
     let mut b = ARC + std::mem::size_of::<Node>() + n.entries.capacity() * std::mem::size_of::<Entry>();
     if let Some(bytes) = &n.bytes {
         b += ARC + bytes.len();
     }
     for e in &n.entries {
-        match e {
-            Entry::Value { key, .. } => b += (ARC + key.len()).next_multiple_of(16),
-            Entry::Child { node: Some(c), .. } => b += heap_bytes(c),
-            Entry::Child { node: None, .. } => {}
+        if let Entry::Value { key, .. } = e {
+            b += (ARC + key.len()).next_multiple_of(16);
         }
     }
     b
+}
+
+/// [`heap_bytes`] of successive versions of one tree, walking only what
+/// changed since the last call: the repo worker recharges a repo after
+/// every commit, and a full walk of its loaded paths (up to ~1 MiB of
+/// nodes) per commit was 6-8% of a node's CPU at saturation.
+///
+/// It keeps the tree it last measured (`root`) and the subtree size of
+/// each of its interior nodes by address. Holding `root` freezes every
+/// node reachable from it (nodes are `Arc`-shared and only mutated through
+/// `Arc::make_mut`, which copies a node held twice, and so every node on
+/// the way down to it), so an address found in `sub` is an unchanged,
+/// live subtree. A new version is walked down to the nodes it shares with
+/// the old one; the old version's nodes the new one dropped are walked
+/// once more to forget them. Drop the memo (`HeapMemo::default()`) when
+/// unloading, or it keeps the unloaded nodes alive.
+#[derive(Default)]
+pub struct HeapMemo {
+    root: Option<Arc<Node>>,
+    total: usize,
+    sub: HashMap<usize, usize>,
+}
+
+impl HeapMemo {
+    /// `heap_bytes(root)`.
+    pub fn heap_bytes(&mut self, root: &Arc<Node>) -> usize {
+        if self.root.as_ref().is_some_and(|r| Arc::ptr_eq(r, root)) {
+            return self.total;
+        }
+        fn walk(n: &Arc<Node>, sub: &HashMap<usize, usize>, fresh: &mut Vec<(usize, usize)>, kept: &mut HashSet<usize>) -> usize {
+            let at = Arc::as_ptr(n) as usize;
+            if let Some(&b) = sub.get(&at) {
+                kept.insert(at);
+                return b;
+            }
+            let mut b = own_heap_bytes(n);
+            for e in &n.entries {
+                if let Entry::Child { node: Some(c), .. } = e {
+                    b += walk(c, sub, fresh, kept);
+                }
+            }
+            if n.height > 0 {
+                fresh.push((at, b));
+            }
+            b
+        }
+        // the old version's nodes outside the subtrees the new one kept
+        fn forget(n: &Arc<Node>, kept: &HashSet<usize>, sub: &mut HashMap<usize, usize>) {
+            let at = Arc::as_ptr(n) as usize;
+            if kept.contains(&at) {
+                return;
+            }
+            sub.remove(&at);
+            for e in &n.entries {
+                if let Entry::Child { node: Some(c), .. } = e {
+                    forget(c, kept, sub);
+                }
+            }
+        }
+        let (mut fresh, mut kept) = (Vec::new(), HashSet::new());
+        let total = walk(root, &self.sub, &mut fresh, &mut kept);
+        if let Some(old) = self.root.take() {
+            forget(&old, &kept, &mut self.sub);
+        }
+        self.sub.extend(fresh);
+        self.root = Some(root.clone());
+        self.total = total;
+        total
+    }
 }
 
 /// Blocks of the loaded (written) nodes of `n`'s subtree whose CIDs are in

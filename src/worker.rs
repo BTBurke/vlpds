@@ -19,7 +19,7 @@ use crate::state::{self, Head};
 use crate::stats::STATS;
 use crate::tid::{self, Tid};
 use bytes::Bytes;
-use crossbeam_channel::{Receiver, Sender};
+use crate::chan::{Receiver, Sender};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use prometheus::IntCounter;
@@ -99,7 +99,11 @@ impl Write {
                 collection, rkey, ..
             } => (collection, rkey),
         };
-        format!("{c}/{r}")
+        let mut p = String::with_capacity(c.len() + 1 + r.len());
+        p.push_str(c);
+        p.push('/');
+        p.push_str(r);
+        p
     }
 }
 
@@ -359,6 +363,9 @@ pub struct RepoState {
     pub nodes: crate::mst::SharedNodeIndex,
     /// Approximate heap charged to the worker's cache ([`repo_bytes`]).
     pub charge: usize,
+    /// The tree's heap bytes as last charged, re-walked only where it
+    /// changed (`Worker::settle`); reset when paths are unloaded.
+    pub heap: crate::mst_lazy::HeapMemo,
     /// The backlink index entries of commits in flight, and those read for
     /// the requests about to run (crate::backlinks::Cache).
     pub backlinks: crate::backlinks::Cache,
@@ -378,6 +385,29 @@ pub struct RepoState {
 impl RepoState {
     fn durable_view(&self) -> Arc<DurableView> {
         Arc::new(DurableView { head: self.head.clone(), tree: self.mst.tree.clone(), nodes: self.nodes.clone() })
+    }
+}
+
+/// Drops a replaced durable view on the `view-drop` thread when this is its
+/// last reference: freeing the old tree's replaced path (its nodes, entry
+/// vectors and key refcounts) was ~3.6% of a node's write CPU (benchbox) on
+/// the log finalizer, the one task that applies and acks every segment in
+/// order. The thread collects every 5 ms rather than being woken per view
+/// (a wake-up per commit cost more than the free).
+fn retire_view(v: Arc<DurableView>) {
+    static RETIRED: parking_lot::Mutex<Vec<Arc<DurableView>>> = parking_lot::const_mutex(Vec::new());
+    static DROPPER: LazyLock<bool> = LazyLock::new(|| {
+        let run = || loop {
+            std::thread::sleep(Duration::from_millis(5));
+            let views = std::mem::take(&mut *RETIRED.lock());
+            drop(views);
+        };
+        std::thread::Builder::new().name("view-drop".into()).spawn(run).is_ok()
+    });
+    // a reader may hold it (then its drop frees it), or the thread failed
+    // to start: drop it here
+    if Arc::strong_count(&v) == 1 && *DROPPER {
+        RETIRED.lock().push(v);
     }
 }
 
@@ -488,7 +518,7 @@ pub fn spawn_with_secrets(
     let mut senders = Vec::with_capacity(n);
     let mut receivers = Vec::with_capacity(n);
     for _ in 0..n {
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crate::chan::unbounded();
         senders.push(tx);
         receivers.push(rx);
     }
@@ -570,27 +600,14 @@ impl Worker {
     fn run(mut self, rx: Receiver<WorkerMsg>) {
         let mut msgs = Vec::with_capacity(8192);
         loop {
-            let first = if self.draining.is_empty() {
-                match rx.recv() {
-                    Ok(m) => m,
-                    Err(_) => break,
+            let timeout = (!self.draining.is_empty()).then(|| Duration::from_millis(5));
+            match rx.recv_batch(&mut msgs, 8192, timeout) {
+                Ok(()) => {}
+                Err(crate::chan::RecvError::Timeout) => {
+                    self.release_drained();
+                    continue;
                 }
-            } else {
-                match rx.recv_timeout(Duration::from_millis(5)) {
-                    Ok(m) => m,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                        self.release_drained();
-                        continue;
-                    }
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                }
-            };
-            msgs.push(first);
-            while msgs.len() < 8192 {
-                match rx.try_recv() {
-                    Ok(m) => msgs.push(m),
-                    Err(_) => break,
-                }
+                Err(crate::chan::RecvError::Disconnected) => break,
             }
             metrics::WORKER_BATCH.observe(msgs.len() as f64);
             metrics::WORKER_QUEUE
@@ -958,7 +975,8 @@ impl Worker {
             return; // charged as loaded until it is unloaded (`evict`)
         }
         let Some(st) = self.cache.peek_mut(did) else { return };
-        let charge = repo_bytes(st);
+        let charge = REPO_BASE_BYTES + st.heap.heap_bytes(&st.mst.tree.root) + st.blob_refs.len() * 96 + st.backlinks.heap_bytes();
+        debug_assert_eq!(charge, repo_bytes(st));
         if charge > LAZY_REPO_MAX_BYTES {
             self.big.insert(did.clone());
         }
@@ -1219,6 +1237,7 @@ impl Worker {
             view,
             nodes,
             charge: 0,
+            heap: Default::default(),
             backlinks,
             fetching: false,
             backfill: false,
@@ -1266,9 +1285,9 @@ impl Need {
                         n.blobs |= !matches!(w, Write::Create { .. });
                         n.backlinks(w);
                         let p = w.path();
-                        let probe = format!("{}/", collection_of(&p)).into_bytes();
-                        if !n.probes.contains(&probe) {
-                            n.probes.push(probe);
+                        let coll = collection_of(&p).as_bytes();
+                        if !n.probes.iter().any(|q| q.strip_suffix(b"/") == Some(coll)) {
+                            n.probes.push([coll, b"/"].concat());
                         }
                         n.keys.push(p.into_bytes());
                     }
@@ -1412,6 +1431,7 @@ fn unload_settled(st: &mut RepoState) -> bool {
         }
     }
     st.mst.unload_except(&keep);
+    st.heap = Default::default();
     metrics::LAZY_MST_UNLOADS.inc();
     st.charge = repo_bytes(st);
     true
@@ -1439,6 +1459,7 @@ fn track_inflight_with(st: &mut RepoState, nodes: Option<HashSet<Cid>>, done: Ar
 fn unload_repo(st: &mut RepoState) {
     st.inflight.clear();
     st.mst.unload(0);
+    st.heap = Default::default();
     // durable too now: read again when next needed
     st.blob_refs = HashMap::new();
     st.blob_refs_loaded = false;
@@ -1729,6 +1750,7 @@ fn finish_load(
         view,
         nodes,
         charge: 0,
+        heap: Default::default(),
         backlinks: Default::default(),
         fetching: false,
         backfill: false,
@@ -2104,7 +2126,11 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
     // has keys
     let mut coll_muts = Vec::new();
     for (coll, had) in &batch.colls {
-        let has = st.mst.has_prefix(format!("{coll}/").as_bytes(), src)?;
+        // a record left in it (the batch's net puts) or none before and
+        // none put settle it without a walk; only deletes from a collection
+        // that had records need the probe
+        let put = batch.ops.iter().any(|(path, (_, new))| new.is_some() && collection_of(path) == coll);
+        let has = put || (*had && st.mst.has_prefix(format!("{coll}/").as_bytes(), src)?);
         if has != *had {
             coll_muts.push(Mutation { key: state::collection_key(coll, &st.did).into(), val: has.then(Bytes::new) });
         }
@@ -2243,7 +2269,9 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
     // commit's (derived from its CAR at replay: `persisted_blocks`, the debug
     // check below), delete the replaced ones
     for (c, b) in std::mem::take(&mut persist.puts) {
-        muts.push(Mutation { key: state::mst_node_key(&st.did, &c).into(), val: Some(Bytes::from(b)) });
+        // exact-size: the memtable keeps the value's allocation (the
+        // finalizer moves it in), and encode buffers are sized generously
+        muts.push(Mutation { key: state::mst_node_key(&st.did, &c).into(), val: Some(Bytes::from(b.into_boxed_slice())) });
     }
     for c in &persist.deletes {
         extra.push(Mutation { key: state::mst_node_key(&st.did, c).into(), val: None });
@@ -2311,7 +2339,8 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
         muts,
         ack: Some(Box::new(move |r| {
             if r.is_ok() {
-                *view.write() = snap;
+                let old = std::mem::replace(&mut *view.write(), snap);
+                retire_view(old);
                 // before the replies: the writer's next read sees it
                 recent.apply();
             }
@@ -3115,7 +3144,7 @@ mod tests {
         let (full, root) = charges(400);
         assert!(full > 3 * root, "{full} vs {root}");
         let limits = CacheLimits { entries: 100, bytes: full + root + root / 2, ..CacheLimits::from(0) };
-        let (me, _me_rx) = crossbeam_channel::unbounded();
+        let (me, _me_rx) = crate::chan::unbounded();
         let mut w = Worker::new(0, me, Arc::new(|_: &str| None), tokio::runtime::Handle::current(), limits, Secrets::dev(), Default::default());
         let put = |w: &mut Worker, (did, st): (Arc<str>, RepoState)| {
             w.cache_put(did.clone(), st);

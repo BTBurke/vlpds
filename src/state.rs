@@ -34,11 +34,28 @@ pub fn slot_prefix(slot: u16) -> [u8; SLOT_PREFIX_LEN] {
     [SLOT_TAG, a, b]
 }
 
+/// `slots::slot_of`, remembering the last DID per thread: a commit builds
+/// ~10 keys of one repo, and the slot is a SHA-256 of the DID.
+fn slot_cached(routing: &str) -> u16 {
+    thread_local! {
+        static LAST: std::cell::RefCell<(String, u16)> = const { std::cell::RefCell::new((String::new(), 0)) };
+    }
+    LAST.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0.is_empty() || c.0 != routing {
+            c.1 = crate::slots::slot_of(routing);
+            c.0.clear();
+            c.0.push_str(routing);
+        }
+        c.1
+    })
+}
+
 /// `0x01 ‖ slot(routing) ‖ fam ‖ parts...`
 fn keyed(routing: &str, fam: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     let len = SLOT_PREFIX_LEN + fam.len() + parts.iter().map(|p| p.len()).sum::<usize>();
     let mut k = Vec::with_capacity(len);
-    k.extend_from_slice(&slot_prefix(crate::slots::slot_of(routing)));
+    k.extend_from_slice(&slot_prefix(slot_cached(routing)));
     k.extend_from_slice(fam);
     for p in parts {
         k.extend_from_slice(p);

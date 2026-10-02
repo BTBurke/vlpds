@@ -987,7 +987,7 @@ async fn run_finalizer(
     durable_ordinal: Arc<AtomicU64>,
 ) {
     let mut expect = 0u64;
-    while let Some(s) = rx.recv().await {
+    while let Some(mut s) = rx.recv().await {
         // The sequencer hands segments over in ordinal order: everything this
         // does (apply, live ring, merger, watermark, acks) covers a gap-free
         // prefix of the log.
@@ -999,8 +999,8 @@ async fn run_finalizer(
         // than the repo views published by these acks.
         let mut guards = Vec::new();
         let mut targets = Vec::new();
-        for (shard, muts) in &s.muts {
-            match sinks.get(*shard) {
+        for (shard, muts) in std::mem::take(&mut s.muts) {
+            match sinks.get(shard) {
                 Some(sink) => {
                     guards.push(sink.apply_lock.clone().write_owned().await);
                     targets.push((sink, muts));
@@ -1013,16 +1013,18 @@ async fn run_finalizer(
         // Shards are independent DBs: apply them concurrently, so one shard
         // stalled on memtable backpressure doesn't serialize the rest (a
         // segment touches up to every owned shard).
-        let writes = targets.iter().map(|(sink, muts)| {
+        let writes = targets.into_iter().map(|(sink, muts)| {
             let mut wb = WriteBatch::new();
-            for m in muts.iter() {
-                match &m.val {
-                    Some(v) => wb.put(&m.key, v),
+            let n = muts.len();
+            // moved in: `put` would copy every key and value
+            for m in muts {
+                match m.val {
+                    Some(v) => wb.put_bytes(m.key, v),
                     None => wb.delete(&m.key),
                 }
             }
             wb.put(META_APPLIED, encode_marker(&log_id, s.ordinal));
-            sink.applied.fetch_add(muts.len() as u64, Ordering::Relaxed);
+            sink.applied.fetch_add(n as u64, Ordering::Relaxed);
             async move { (sink.id, sink.db.write(wb).await) }
         });
         for (shard, r) in futures::future::join_all(writes).await {

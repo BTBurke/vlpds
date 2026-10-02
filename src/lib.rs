@@ -5,6 +5,7 @@ pub mod car;
 pub mod cli;
 pub mod caches;
 pub mod cbor;
+pub mod chan;
 pub mod cid;
 pub mod cluster;
 pub mod crypto;

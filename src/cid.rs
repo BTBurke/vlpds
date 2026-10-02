@@ -8,10 +8,28 @@ use std::fmt;
 pub const CODEC_DAG_CBOR: u8 = 0x71;
 pub const CODEC_RAW: u8 = 0x55;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Cid {
     pub codec: u8,
     pub digest: [u8; 32],
+}
+
+/// Feeds 16 bytes of the digest (a SHA-256) and the codec to the map's
+/// hasher, not all 33 bytes plus a length: the commit path keys several
+/// maps and sets by CID per commit, and SipHash over the whole CID was ~2%
+/// of a commit's CPU (7.0 -> 3.0 ns per hash under `RandomState`). Still
+/// HashDoS-resistant: this only chooses the hasher's *input*; every map
+/// keyed by `Cid` hashes it with a per-process random key (std
+/// `RandomState`'s SipHash-1-3, or hashbrown's seeded default in `lru`), so
+/// bucket bits can't be predicted, and two CIDs collide outright only if
+/// 128 bits of their digests match (~2^64 SHA-256s per pair). Equal CIDs
+/// hash equal.
+impl std::hash::Hash for Cid {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let [a, b] = [&self.digest[..8], &self.digest[8..16]].map(|w| u64::from_le_bytes(w.try_into().expect("8 bytes")));
+        state.write_u64(a ^ self.codec as u64);
+        state.write_u64(b);
+    }
 }
 
 /// Binary CID length: version(1) + codec(1) + mh code(1) + mh len(1) + digest(32).
