@@ -370,6 +370,13 @@ pub(super) fn valid_email(e: &str) -> bool {
             .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
+/// createAccount / updateEmail: well formed and not a disposable domain
+/// (reference `isEmailValid(email) && !isDisposableEmail(email)`; both
+/// refusals are "This email address is not supported, ...").
+pub(super) fn email_supported(e: &str) -> bool {
+    valid_email(e) && !crate::email_policy::is_disposable_email(e)
+}
+
 fn user_did(creds: &Credentials) -> XResult<String> {
     creds
         .did()
@@ -384,7 +391,7 @@ fn full_access(creds: &Credentials) -> XResult<String> {
         Credentials::Session { did } | Credentials::Takendown { did } => Ok(did.clone()),
         Credentials::AppPassword { .. } => Err(bad_scope()),
         Credentials::OAuth { .. } => Err(oauth_forbidden()),
-        Credentials::Admin => Err(auth_required("user credentials required")),
+        Credentials::Admin | Credentials::ModService { .. } => Err(auth_required("user credentials required")),
     }
 }
 
@@ -395,7 +402,7 @@ fn standard_no_oauth(creds: &Credentials) -> XResult<String> {
         | Credentials::AppPassword { did, .. }
         | Credentials::Takendown { did } => Ok(did.clone()),
         Credentials::OAuth { .. } => Err(oauth_forbidden()),
-        Credentials::Admin => Err(auth_required("user credentials required")),
+        Credentials::Admin | Credentials::ModService { .. } => Err(auth_required("user credentials required")),
     }
 }
 
@@ -1393,7 +1400,7 @@ pub(super) async fn create_account_inner(
         None => return Err(invalid_request("Email is required")),
         Some(e) => {
             let e = e.to_ascii_lowercase();
-            if !valid_email(&e) {
+            if !email_supported(&e) {
                 return Err(invalid_request(
                     "This email address is not supported, please use a different email.",
                 ));
@@ -2511,7 +2518,7 @@ async fn update_email(
         }
         // disabling while changing the address: the change clears it
     }
-    if !valid_email(&email) {
+    if !email_supported(&email) {
         return Err(invalid_request(
             "This email address is not supported, please use a different email.",
         ));
@@ -2676,8 +2683,81 @@ async fn create_invite_codes(
 #[serde(rename_all = "camelCase")]
 struct AccountInviteCodesQ {
     include_used: Option<bool>,
-    #[allow(dead_code)]
     create_available: Option<bool>,
+}
+
+fn rfc3339_ms(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp_millis())
+}
+
+/// How many invite codes an account has earned and not yet been given, and
+/// its routine-code total once they are created: the reference's
+/// `calculateCodesToCreate`, unchanged. One code per `interval_ms` of account
+/// age (only the age after `epoch_ms` when the account predates it), minus
+/// the codes it created since the epoch, and at most 5 unused routine codes
+/// at a time. Admin-gifted codes don't count. May be <= 0 (nothing to create).
+pub(super) fn codes_to_create(
+    now_ms: i64,
+    created_at_ms: i64,
+    codes: &[super::admin::InviteCode],
+    epoch_ms: i64,
+    interval_ms: i64,
+) -> (i64, i64) {
+    let interval_ms = interval_ms.max(1);
+    let routine: Vec<_> = codes.iter().filter(|c| c.created_by != "admin").collect();
+    let unused = routine
+        .iter()
+        .filter(|c| !c.disabled && c.available > c.uses.len() as i64)
+        .count() as i64;
+    let lifespan = now_ms - created_at_ms;
+    let could_create = if created_at_ms >= epoch_ms {
+        lifespan.div_euclid(interval_ms)
+    } else {
+        lifespan.div_euclid(interval_ms) - (epoch_ms - created_at_ms).div_euclid(interval_ms)
+    };
+    let epoch_codes = routine
+        .iter()
+        .filter(|c| rfc3339_ms(&c.created_at).is_some_and(|t| t > epoch_ms))
+        .count() as i64;
+    let to_create = (5 - unused).min(could_create - epoch_codes);
+    (to_create, routine.len() as i64 + to_create)
+}
+
+/// With `--invite-interval` (and invites required), creates the codes
+/// `did` has earned ([`codes_to_create`]), disabled if the account's invites
+/// are; returns all its codes. Serialized per account on this node; a
+/// concurrent creation elsewhere is caught afterwards, as the reference does
+/// (`DuplicateCreate`).
+async fn create_earned_invites(
+    app: &App,
+    acct: &Account,
+    codes: Vec<super::admin::InviteCode>,
+) -> XResult<Vec<super::admin::InviteCode>> {
+    let Some(interval) = app.config.invite_interval.filter(|_| app.config.invite_required) else {
+        return Ok(codes);
+    };
+    let did = acct.did.as_str();
+    let e = ext(app);
+    let _g = e.lock(&format!("invites-earned:{did}")).await;
+    let codes = super::admin::account_invites(app, did).await?;
+    let created_at = rfc3339_ms(&acct.created_at).unwrap_or(0);
+    let now = (crate::tid::now_micros() / 1000) as i64;
+    let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(i64::MAX);
+    let (n, total) = codes_to_create(now, created_at, &codes, app.config.invite_epoch_ms, interval_ms);
+    if n <= 0 {
+        return Ok(codes);
+    }
+    let new: Vec<String> = (0..n).map(|_| super::admin::gen_invite_code(app)).collect();
+    let disabled = acct.extra.get("invitesDisabled").and_then(|v| v.as_bool()).unwrap_or(false);
+    super::admin::create_invites_by(app, did, &new, 1, disabled, did).await?;
+    let after = super::admin::account_invites(app, did).await?;
+    if after.iter().filter(|c| c.created_by != "admin").count() as i64 > total {
+        return Err(XrpcError::bad(
+            "DuplicateCreate",
+            "attempted to create additional codes in another request",
+        ));
+    }
+    Ok(after)
 }
 
 async fn get_account_invite_codes(
@@ -2694,8 +2774,11 @@ async fn get_account_invite_codes(
         return Err(takedown_error());
     }
     let include_used = q.include_used.unwrap_or(true);
-    let codes: Vec<J> = super::admin::account_invites(&app, &did)
-        .await?
+    let mut codes = super::admin::account_invites(&app, &did).await?;
+    if q.create_available.unwrap_or(true) {
+        codes = create_earned_invites(&app, &acct, codes).await?;
+    }
+    let codes: Vec<J> = codes
         .into_iter()
         .filter(|c| !c.disabled && (include_used || (c.uses.len() as i64) < c.available))
         .map(|c| serde_json::to_value(c).unwrap())
@@ -3029,4 +3112,86 @@ async fn get_totp_status(State(app): AppState, Auth(creds): Auth) -> XResult<Jso
         out["enabledAt"] = json!(at);
     }
     Ok(Json(out))
+}
+
+#[cfg(test)]
+mod invite_interval_tests {
+    use super::super::admin::{InviteCode, InviteUse};
+    use super::codes_to_create;
+
+    const DAY: i64 = 86_400_000;
+    const NOW: i64 = 1_800_000_000_000;
+
+    fn iso(ms: i64) -> String {
+        chrono::DateTime::from_timestamp_millis(ms).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    fn used() -> InviteUse {
+        InviteUse { used_by: "did:example:test".into(), used_at: iso(NOW) }
+    }
+
+    fn code(by: &str, at_ms: i64) -> InviteCode {
+        InviteCode {
+            code: format!("c-{at_ms}-{}", rand::random::<u32>()),
+            available: 1,
+            disabled: false,
+            for_account: "did:plc:a".into(),
+            created_by: by.into(),
+            created_at: iso(at_ms),
+            uses: vec![],
+        }
+    }
+
+    /// invite-codes.test.ts (interval 1 day, epoch 3 days ago): "allow users
+    /// to get available user invites"
+    #[test]
+    fn earns_one_code_per_interval() {
+        let epoch = NOW - 3 * DAY;
+        // a new account: nothing yet
+        assert_eq!(codes_to_create(NOW, NOW - 1000, &[], epoch, DAY).0, 0);
+        // made 2 days ago: 2 codes
+        assert_eq!(codes_to_create(NOW, NOW - 2 * DAY, &[], epoch, DAY), (2, 2));
+        // both used: no more
+        let mut got = [code("did:plc:a", NOW), code("did:plc:a", NOW)];
+        got.iter_mut().for_each(|c| c.uses.push(used()));
+        assert!(codes_to_create(NOW, NOW - 2 * DAY, &got, epoch, DAY).0 <= 0);
+    }
+
+    /// "admin gifted codes to not impact a users available codes"
+    #[test]
+    fn admin_codes_do_not_count() {
+        let admin: Vec<_> = (0..3).map(|i| code("admin", NOW - i)).collect();
+        assert_eq!(codes_to_create(NOW, NOW - 2 * DAY, &admin, NOW - 3 * DAY, DAY), (2, 2));
+    }
+
+    /// "creates invites based on epoch"
+    #[test]
+    fn counts_only_age_since_the_epoch() {
+        let epoch = NOW - 3 * DAY;
+        // 2 codes taken while the account looked 2 days old
+        let mut codes: Vec<_> = (0..2).map(|i| code("did:plc:a", NOW - 1000 + i)).collect();
+        // it turns out ~10 days old: the 3-day epoch caps it at 3
+        let created = NOW - (10.01 * DAY as f64) as i64;
+        assert_eq!(codes_to_create(NOW, created, &codes, epoch, DAY), (1, 3));
+        codes.push(code("did:plc:a", NOW - 500));
+        codes.iter_mut().for_each(|c| c.uses.push(used()));
+        assert!(codes_to_create(NOW, created, &codes, epoch, DAY).0 <= 0);
+        // 10 unused codes from before the epoch: over the 5-unused cap
+        let mut padded = codes.clone();
+        padded.extend((0..10).map(|i| code("did:plc:a", NOW - 5 * DAY + i)));
+        assert!(codes_to_create(NOW, created, &padded, epoch, DAY).0 <= 0);
+        // ...and once they are used, the epoch's 3 are still spent
+        padded.iter_mut().filter(|c| c.uses.is_empty()).for_each(|c| c.uses.push(used()));
+        assert!(codes_to_create(NOW, created, &padded, epoch, DAY).0 <= 0);
+    }
+
+    /// At most 5 unused routine codes; disabled ones aren't "unused".
+    #[test]
+    fn caps_unused_codes_at_five() {
+        assert_eq!(codes_to_create(NOW, NOW - 100 * DAY, &[], 0, DAY), (5, 5));
+        let mut four: Vec<_> = (0..4).map(|i| code("did:plc:a", NOW - DAY + i)).collect();
+        assert_eq!(codes_to_create(NOW, NOW - 100 * DAY, &four, 0, DAY).0, 1);
+        four.iter_mut().for_each(|c| c.disabled = true);
+        assert_eq!(codes_to_create(NOW, NOW - 100 * DAY, &four, 0, DAY).0, 5);
+    }
 }

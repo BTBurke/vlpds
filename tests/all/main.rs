@@ -100,6 +100,7 @@ mod ref_auth;
 mod ref_ssrf;
 mod ref_invites;
 mod ref_moderation;
+mod ref_moderator_auth;
 mod ref_plc;
 mod ref_sync;
 mod ref_handles;

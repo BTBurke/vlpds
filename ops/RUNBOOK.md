@@ -1254,6 +1254,48 @@ the `mail not sent` / `mail dropped` warnings (they log the recipient and
 purpose, never the token). `purpose="admin"` is moderation mail. Dev mode
 keeps every mail, with its HTML, in `vlpds.admin.getDevMail`.
 
+### Moderation service, earned invites, external handles
+
+Every node needs the same flags. As for email, an unset flag falls back to the
+reference PDS's variable:
+
+| Flag | Env | Reference env | Notes |
+|---|---|---|---|
+| `--mod-service-did` | `VLPDS_MOD_SERVICE_DID` | `PDS_MOD_SERVICE_DID` | the Ozone DID allowed to call the moderator admin methods with a service JWT; unset: admin Basic auth only |
+| `--invite-interval-ms` | `VLPDS_INVITE_INTERVAL_MS` | `PDS_INVITE_INTERVAL` | with `--invite-required`: one earned code per this much account age (at most 5 unused); unset: none |
+| `--invite-epoch-ms` | `VLPDS_INVITE_EPOCH_MS` | `PDS_INVITE_EPOCH` | Unix ms; only account age after it earns codes (default 0) |
+
+- **Ozone gets 401 `UntrustedIss` "Untrusted issuer"** on admin calls: the
+  token's `iss` is not `--mod-service-did` (or `<did>#atproto_labeler`), or the
+  flag is unset on the node that answered. `BadJwtSignature` "jwt signature does
+  not match jwt issuer": the key in Ozone's DID document (`#atproto`, or
+  `#atproto_label` for the labeler issuer) is not the one it signs with; vlpds
+  re-resolves the document once before refusing, so a just-rotated key
+  works. `BadJwtAudience`: Ozone addressed the token to another DID, not this
+  PDS's `--service-did`. Ozone can call getAccountInfo(s),
+  get/updateSubjectStatus, sendEmail, getInviteCodes, disableInviteCodes,
+  enable/disableAccountInvites and read any account's preferences
+  (`app.bsky.actor.getPreferences?did=`); everything else (deleteAccount,
+  updateAccountEmail/Handle/Password/SigningKey, createInviteCode(s), the
+  `vlpds.admin.*` methods) stays admin Basic auth only.
+- **Earned invites**: to stop new codes being earned, unset
+  `--invite-interval-ms` (rolling restart); codes already created stay. To cut
+  one account off, `com.atproto.admin.disableAccountInvites` (its codes are
+  disabled, and codes it earns afterwards are created disabled). Changing
+  `--invite-epoch-ms` to now restarts everyone's earning from zero.
+- **External handles**: updateHandle to a domain outside `--handle-domain`
+  needs a DNS TXT record `_atproto.<handle>` = `did=<the account's DID>` or
+  `https://<handle>/.well-known/atproto-did` serving the DID. Both are tried
+  at once with a 3 s deadline each, through the host's resolver
+  (`/etc/resolv.conf`): "External handle did not resolve to DID" for a handle
+  the user swears is set up usually means the node's resolver can't reach
+  the zone (check `dig TXT _atproto.<handle>` from the node) or more than one
+  `did=` record exists. Dev mode skips the check.
+- **Disposable email** domains are refused at createAccount and updateEmail
+  ("This email address is not supported, please use a different email."), as
+  in the reference. The list is compiled in
+  (`src/email_policy/disposable_email_domains.txt`); updating it is a release.
+
 ### A user locked out by a second factor
 
 Two factors exist (DESIGN "Email second factor"): the reference's email code

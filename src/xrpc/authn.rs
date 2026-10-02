@@ -3,6 +3,8 @@
 //!   Bearer <jwt>  -> legacy session / app-password tokens   (server.rs)
 //!   DPoP <token>  -> OAuth access tokens bound to a DPoP key (oauth.rs)
 //!   Basic admin:<token> -> admin
+//!   Bearer <service jwt> on a moderator method -> the moderation service
+//!     (`--mod-service-did`; [`MODERATOR_METHODS`])
 //! and yields `Credentials`, whose `allows_*` methods are the single place
 //! permission checks happen (OAuth scopes, app-password restrictions).
 
@@ -35,7 +37,35 @@ pub enum Credentials {
     Takendown {
         did: String,
     },
+    /// A service JWT from the configured moderation service
+    /// (`--mod-service-did`), on one of [`MODERATOR_METHODS`] (or
+    /// getPreferences, for any account's preferences). `iss` is the token's
+    /// issuer (the DID, or `DID#atproto_labeler`). Grants nothing else.
+    ModService {
+        iss: String,
+    },
 }
+
+/// Admin methods the moderation service may call with service auth (the
+/// reference's `authVerifier.moderator`): a Bearer token on these is only
+/// ever a moderation-service JWT. The other admin methods (deleteAccount,
+/// updateAccountEmail/Handle/Password, createInviteCode(s), ...) take admin
+/// Basic auth only (`adminToken`).
+pub const MODERATOR_METHODS: &[&str] = &[
+    "com.atproto.admin.disableAccountInvites",
+    "com.atproto.admin.disableInviteCodes",
+    "com.atproto.admin.enableAccountInvites",
+    "com.atproto.admin.getAccountInfo",
+    "com.atproto.admin.getAccountInfos",
+    "com.atproto.admin.getInviteCodes",
+    "com.atproto.admin.getSubjectStatus",
+    "com.atproto.admin.sendEmail",
+    "com.atproto.admin.updateSubjectStatus",
+];
+
+/// The reference's `authorizationOrModService`: user auth, or the
+/// moderation service reading an account's preferences (`?did=`).
+const MOD_SERVICE_OR_USER_METHODS: &[&str] = &["app.bsky.actor.getPreferences"];
 
 /// Methods that accept the `com.atproto.takendown` scope (the reference's
 /// `additional: [AuthScope.Takendown]`).
@@ -59,7 +89,7 @@ impl Credentials {
             | Credentials::AppPassword { did, .. }
             | Credentials::OAuth { did, .. }
             | Credentials::Takendown { did } => Some(did),
-            Credentials::Admin => None,
+            Credentials::Admin | Credentials::ModService { .. } => None,
         }
     }
 
@@ -67,7 +97,7 @@ impl Credentials {
     pub fn allows_repo(&self, collection: &str, action: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_repo(collection, action),
-            Credentials::Takendown { .. } => false,
+            Credentials::Takendown { .. } | Credentials::ModService { .. } => false,
             _ => true,
         }
     }
@@ -79,6 +109,7 @@ impl Credentials {
             Credentials::AppPassword { privileged, .. } => {
                 *privileged || !lxm.starts_with("chat.bsky.")
             }
+            Credentials::ModService { .. } => false,
             _ => true,
         }
     }
@@ -86,7 +117,7 @@ impl Credentials {
     pub fn allows_blob(&self, mime: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_blob(mime),
-            Credentials::Takendown { .. } => false,
+            Credentials::Takendown { .. } | Credentials::ModService { .. } => false,
             _ => true,
         }
     }
@@ -97,7 +128,7 @@ impl Credentials {
             Credentials::OAuth { scopes, .. } => scopes.allows_account(attr, action),
             // app passwords can't manage the account (see server.rs for specifics)
             Credentials::AppPassword { .. } => action == "read",
-            Credentials::Takendown { .. } => false,
+            Credentials::Takendown { .. } | Credentials::ModService { .. } => false,
             _ => true,
         }
     }
@@ -106,7 +137,7 @@ impl Credentials {
     pub fn allows_identity(&self, attr: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_identity(attr),
-            Credentials::AppPassword { .. } | Credentials::Takendown { .. } => false,
+            Credentials::AppPassword { .. } | Credentials::Takendown { .. } | Credentials::ModService { .. } => false,
             _ => true,
         }
     }
@@ -180,12 +211,15 @@ pub async fn authenticate(app: &App, parts: &Parts) -> XResult<Credentials> {
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| XrpcError::auth("Authentication Required"))?;
     if let Some(tok) = h.strip_prefix("Bearer ") {
+        let nsid = parts.uri.path().strip_prefix("/xrpc/").unwrap_or("");
+        if MODERATOR_METHODS.contains(&nsid)
+            || (MOD_SERVICE_OR_USER_METHODS.contains(&nsid) && is_mod_service_token(app, tok))
+        {
+            return verify_mod_service(app, tok.trim(), nsid).await;
+        }
         let creds = super::server::verify_bearer(app, tok).await?;
-        if matches!(creds, Credentials::Takendown { .. }) {
-            let nsid = parts.uri.path().strip_prefix("/xrpc/").unwrap_or("");
-            if !TAKENDOWN_METHODS.contains(&nsid) {
-                return Err(XrpcError::bad("InvalidToken", "Bad token scope"));
-            }
+        if matches!(creds, Credentials::Takendown { .. }) && !TAKENDOWN_METHODS.contains(&nsid) {
+            return Err(XrpcError::bad("InvalidToken", "Bad token scope"));
         }
         return Ok(creds);
     }
@@ -199,6 +233,38 @@ pub async fn authenticate(app: &App, parts: &Parts) -> XResult<Credentials> {
         return Err(XrpcError::auth("invalid admin credentials"));
     }
     Err(XrpcError::auth("unsupported authorization scheme"))
+}
+
+/// The reference's `authVerifier.modService`: a service JWT for `nsid`
+/// issued by the configured moderation service (its DID, or
+/// `DID#atproto_labeler` signed with the `#atproto_label` key). No
+/// moderation service configured, or another issuer: 401 UntrustedIss
+/// "Untrusted issuer".
+async fn verify_mod_service(app: &App, tok: &str, nsid: &str) -> XResult<Credentials> {
+    let Some(m) = app.config.mod_service_did.as_deref() else {
+        return Err(service_auth_err("UntrustedIss", "Untrusted issuer"));
+    };
+    let trusted = [m.to_string(), format!("{m}#atproto_labeler")];
+    let sa = verify_service_jwt_from(app, tok, Some(nsid), Some(&trusted)).await?;
+    Ok(Credentials::ModService { iss: sa.iss })
+}
+
+/// Is `tok` (unverified) a JWT issued by the configured moderation service?
+/// Only routes getPreferences between user and moderation-service auth; the
+/// token is then verified as such.
+fn is_mod_service_token(app: &App, tok: &str) -> bool {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+    use base64::Engine;
+    let Some(m) = app.config.mod_service_did.as_deref() else {
+        return false;
+    };
+    let iss = tok
+        .split('.')
+        .nth(1)
+        .and_then(|p| B64.decode(p).ok())
+        .and_then(|b| serde_json::from_slice::<J>(&b).ok())
+        .and_then(|c| c["iss"].as_str().map(String::from));
+    iss.is_some_and(|i| i.split('#').next() == Some(m))
 }
 
 /// OAuth access tokens verified by the server's ES256 key: signature and
@@ -339,6 +405,18 @@ async fn issuer_key(app: &App, iss: &str, fresh: bool) -> XResult<String> {
 /// (BadJwt, JwtExpired, BadJwtAudience, BadJwtLexiconMethod, BadJwtIss,
 /// BadJwtSignature).
 pub async fn verify_service_jwt(app: &App, token: &str, lxm: Option<&str>) -> XResult<ServiceAuth> {
+    verify_service_jwt_from(app, token, lxm, None).await
+}
+
+/// [`verify_service_jwt`], accepting only the issuers in `trusted` (when
+/// given; exact `iss`, fragment included): any other is 401 UntrustedIss
+/// "Untrusted issuer", checked before the issuer's key is resolved.
+pub async fn verify_service_jwt_from(
+    app: &App,
+    token: &str,
+    lxm: Option<&str>,
+    trusted: Option<&[String]>,
+) -> XResult<ServiceAuth> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
     use base64::Engine;
     let parts: Vec<&str> = token.split('.').collect();
@@ -385,6 +463,9 @@ pub async fn verify_service_jwt(app: &App, token: &str, lxm: Option<&str>) -> XR
     };
     if !did_ok {
         return Err(service_auth_err("BadJwtIss", "jwt iss is not a valid did"));
+    }
+    if trusted.is_some_and(|t| !t.iter().any(|x| x == iss)) {
+        return Err(service_auth_err("UntrustedIss", "Untrusted issuer"));
     }
     let msg = format!("{h}.{p}");
     let sig = B64.decode(s).map_err(|_| service_auth_err("BadJwtSignature", "could not verify jwt signature"))?;

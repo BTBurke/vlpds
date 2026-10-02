@@ -18,16 +18,16 @@ Status values:
 | | Cases |
 |---|---:|
 | covered | 295 |
-| ported | 65 |
+| ported | 74 |
 | N/A | 64 |
 | divergent | 7 |
-| GAP (left) | 14 |
+| GAP (left) | 5 |
 | **total** | **445** |
 
 Some rows marked `ported` or `covered` also carry a partial divergence that the row explains, for example "ported + divergent".
 
 New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref_handles`, `ref_invites`,
-`ref_moderation`, `ref_plc`, `ref_proxy`, `ref_repo`, `ref_ssrf`, `ref_sync`, plus `oauth::ref_oauth`.
+`ref_moderation`, `ref_moderator_auth`, `ref_plc`, `ref_proxy`, `ref_repo`, `ref_ssrf`, `ref_sync`, plus `oauth::ref_oauth`.
 
 ## Product fixes made by this pass
 
@@ -51,6 +51,15 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
    the new `--privacy-policy-url`, `--terms-of-service-url` and `--contact-email-address` flags, which fall back to the reference's
    `PDS_*` variables.
 8. **createAccount "Email already taken"** echoes the address as the user typed it.
+9. **Moderation-service auth on admin methods** (`--mod-service-did`, `src/xrpc/authn.rs` `MODERATOR_METHODS`): Ozone calls
+   the reference's `authVerifier.moderator` methods, and reads any account's getPreferences, with a service JWT; the
+   admin-token-only methods still take Basic auth only. Errors are the reference's (`UntrustedIss` "Untrusted issuer", ...).
+10. **Earned invite codes** (`--invite-interval-ms`, `--invite-epoch-ms`): getAccountInviteCodes creates codes with the
+    reference's `calculateCodesToCreate`.
+11. **Disposable email blocklist** (`src/email_policy.rs`, the reference's `disposable-email-domains-js` list) on createAccount
+    and updateEmail.
+12. **DNS TXT handle proof** (`src/handle_resolver.rs`): `_atproto.<handle>` TXT alongside `/.well-known/atproto-did`, in the
+    reference HandleResolver's order and timeouts.
 
 ## Notable divergences
 
@@ -64,13 +73,14 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
   refuses.
 - **Proxy target defaults.** vlpds needs an explicit `atproto-proxy` for `chat.bsky.*` and answers 501 for namespaces other than
   `app.bsky`/`tools.ozone`. The reference sends everything without a header to the AppView, and the listed `tools.ozone.*` methods
-  to its `modService`. vlpds sends `tools.ozone.*` to the AppView, because it has no separate mod-service config.
+  to its `modService`. vlpds sends `tools.ozone.*` to the AppView: `--mod-service-did` is used for inbound auth only (no
+  `modServiceUrl` routing).
 - **Unresolvable proxy DIDs** (`did:foo#bar`) are 400 "could not resolve proxy did". The reference's resolver throws, which surfaces
   as a 500.
 - **Stricter session requirements.** `revokeAppPassword` and `identity.updateHandle` need a full session; the reference accepts an
   app-password session.
-- **disable/enableAccountInvites** act on the account's existing codes. The reference flips a flag that gates interval-generated
-  codes, which vlpds doesn't have.
+- **disable/enableAccountInvites** act on the account's existing codes as well as the flag. The reference only flips the flag,
+  which marks interval-generated codes disabled when they are created (vlpds does that too).
 - **OAuth UI** has no forgot-password step and no deactivate button. Those are the XRPC flows, and the pages are English only.
 - **Legacy blob refs** are refused everywhere. The reference upgrades them on profile updates as a temporary hack.
 
@@ -80,10 +90,6 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
 |---|---|---|
 | Signing-key rotation doesn't re-sign the head. `admin.updateAccountSigningKey` emits `#identity` only. The served head stays signed by the old key until the next write, so a relay that verifies `getRepo` against the new DID doc fails. The reference writes an empty commit with the new key and emits `#sync`. | recovery "rotates keys for users" | Needs a worker `AccountOp` (worker.rs, owned by other lanes). Test `ref_account::ref_signing_key_rotation_resigns_the_repo` is `#[ignore]`d with a GAP reason. |
 | Duplicate likes/reposts/follows/blocks are not pruned. The reference's createRecord deletes the account's earlier record with the same subject in the same commit (`getBacklinkConflicts`). | crud "prevents duplicate likes/reposts/follows/blocks" (4) | Needs a backlink index across apply, import, reshard and migration. Test `ref_repo::ref_prevents_duplicate_backlinks` is `#[ignore]`d. |
-| Moderation-service service auth on admin methods. vlpds has no `modServiceDid`, so admin methods accept only admin Basic auth. | moderator-auth (4) | New config option plus a `require_admin` branch using the existing `verify_service_jwt`. |
-| Periodic user invite codes (`inviteInterval`/`inviteEpoch`) | invite-codes (2), invites-admin (1) | A feature vlpds doesn't implement. The reference default (interval unset) behaves like vlpds. |
-| Disposable-email domain blocklist | account "fails on disallowed emails", email-confirmation "badly formatted email" | Needs a vendored domain list. Malformed addresses are already rejected with the reference message. |
-| DNS TXT handle verification | handles "allows updating to a dns handles" (partly ported) | vlpds verifies only `https://<handle>/.well-known/atproto-did`. |
 
 ---
 
@@ -136,7 +142,7 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
 | serves the accounts system config | ported | `account::serves_the_accounts_system_config`; blobUploadLimit/links/contact: `ref_account::ref_describe_server_links_contact_and_blob_limit` (product fix) |
 | fails on invalid handles | covered | `account::fails_on_invalid_handles`; message check in `ref_account::ref_create_account_error_messages` |
 | email validation > succeeds on allowed emails | covered | every `create_account` fixture (`account::creates_an_account_with_plc_shaped_did_and_did_doc`) |
-| email validation > fails on disallowed emails | GAP | vlpds rejects malformed addresses ("This email address is not supported…") but has no disposable-domain blocklist (reference: `disposable-email-domains-js`); left: needs a vendored domain list |
+| email validation > fails on disallowed emails | ported | `ref_account::ref_fails_on_disallowed_emails` (the reference's `disposable-email-domains-js` list, vendored: `src/email_policy.rs`) |
 | creates an account | covered | `account::creates_an_account_with_plc_shaped_did_and_did_doc` |
 | generates a properly formatted PLC DID | covered | `plc::create_account_registers_the_genesis_op` (DID = hash of genesis op; handle, signing key, PDS endpoint) |
 | allows a custom set recovery key | covered | `plc::server_recovery_key_is_ahead_of_the_rotation_key` ([recoveryKey, server recovery key, rotation key]), `plc::create_account_registers_the_genesis_op` |
@@ -308,7 +314,7 @@ Puppeteer tests of the reference's browser account-manager UI (`@atproto/oauth-p
 | disallows email update without token when verified | covered | `email_flows::email_confirmation_and_update_flow` (TokenRequired) |
 | requests email update | covered | `email_flows::email_confirmation_and_update_flow`; subject "Email Update Requested" and HTML "Update your email" in `ref_auth::ref_email_confirmation_and_update_mails` |
 | fails email update with a bad token | covered | `email_flows::email_confirmation_and_update_flow` |
-| fails email update with a badly formatted email | GAP | The reference's case is a *disposable* domain (`bad-email@disposeamail.com`, rejected through the `disposable-email-domains-js` list). vlpds has no disposable-domain blocklist and accepts it. The same message for a syntactically invalid address is asserted in `ref_auth::ref_email_confirmation_and_update_mails`. Adding the list is a product decision (a dependency or a vendored list of ~100k domains), not a small fix |
+| fails email update with a badly formatted email | ported | `ref_auth::ref_email_confirmation_and_update_mails` (`bad-email@disposeamail.com`, and a malformed address) |
 | fails email update with in-use email | covered | `email_flows::email_confirmation_and_update_flow`; exact message in `ref_auth::ref_email_confirmation_and_update_mails` |
 | updates email | covered | `email_flows::email_confirmation_and_update_flow` |
 
@@ -326,10 +332,10 @@ Puppeteer tests of the reference's browser account-manager UI (`@atproto/oauth-p
 
 | case | status | vlpds |
 |---|---|---|
-| allows service auth requests from the configured appview did | GAP | vlpds has no `modServiceDid`: the admin methods (`require_admin` in src/xrpc/admin.rs) accept only admin Basic auth. The reference also accepts a service JWT from the configured moderation service (`authVerifier.moderator`/`modService`) on admin.getSubjectStatus/updateSubjectStatus/getAccountInfo(s)/sendEmail/getInviteCodes/(enable,disable)AccountInvites/disableInviteCodes and app.bsky.actor.getPreferences. An Ozone instance can't act on this PDS with service auth. Needs a config option and a verifier branch (`verify_service_jwt` already exists); left as a feature gap |
-| does not allow requests from another did | GAP | as above (reference: 401 UntrustedIss "Untrusted issuer") |
-| does not allow requests with a bad signature | GAP | as above ("jwt signature does not match jwt issuer"; vlpds's `verify_service_jwt` already produces this message for other callers) |
-| does not allow requests with a bad aud | GAP | as above ("jwt audience does not match service did"; same) |
+| allows service auth requests from the configured appview did | ported | `ref_moderator_auth::ref_allows_the_configured_mod_service` (`--mod-service-did`; also the other moderator methods, a `#atproto_labeler` issuer, and admin Basic auth still working). Extra: `mod_service_is_limited_to_moderator_methods` (wrong lxm; admin-token-only methods refuse it), `unconfigured_mod_service_is_untrusted`, `mod_service_reads_preferences` (getPreferences `?did=`) |
+| does not allow requests from another did | ported | `ref_moderator_auth::ref_refuses_another_did` (401 UntrustedIss "Untrusted issuer") |
+| does not allow requests with a bad signature | ported | `ref_moderator_auth::ref_refuses_a_bad_signature` ("jwt signature does not match jwt issuer") |
+| does not allow requests with a bad aud | ported | `ref_moderator_auth::ref_refuses_a_bad_aud` ("jwt audience does not match service did") |
 
 ### rate-limits.test.ts
 
@@ -521,8 +527,8 @@ Note: vlpds deletes blob bytes in a GC sweep with a grace period (`blob_deletes:
 | validates input through lexicon schema | covered | `handles::validates_input_handle_syntax` |
 | applies PDS specific handle length constraints | covered | `handles::applies_pds_length_constraints` |
 | disallows reserved handles | covered | `handles::disallows_reserved_handles` |
-| allows updating to a dns handles | ported (partial) | `ref_handles::ref_updates_to_external_handle`: the update path (account + DID doc). The reference proves the handle with a mocked DNS TXT record; vlpds verifies only `https://{handle}/.well-known/atproto-did` (no DNS resolver dependency) and skips the proof in dev mode. DNS TXT verification is a GAP |
-| does not allow updating to an invalid dns handle | ported | `ref_handles::ref_unresolvable_external_handle_message` (non-dev mode) |
+| allows updating to a dns handles | ported | `ref_handles::ref_updates_to_dns_handle_with_txt_proof` (a stub DNS TXT `_atproto` record, dev mode off, as the reference's mocked DNS), `ref_handles::ref_updates_to_external_handle` (dev mode, no proof) |
+| does not allow updating to an invalid dns handle | ported | `ref_handles::ref_refuses_invalid_dns_handles` (TXT naming another DID, none, several `did=` records), `ref_handles::ref_unresolvable_external_handle_message` (real DNS, non-dev mode) |
 | allows admin overrules of service domains | covered | `handles::admin_overrides_handles` |
 | allows admin override of reserved domains | covered | `handles::admin_overrides_handles` |
 | requires admin auth | covered | `handles::admin_update_requires_admin_auth`; error name in `ref_handles::ref_admin_update_handle_auth_message` |
@@ -662,16 +668,16 @@ Note: vlpds deletes blob bytes in a GC sweep with a grace period (`blob_deletes:
 | fails on invite code from takendown account | covered | `invite_codes::fails_on_invite_code_from_takendown_account` |
 | fails on used up invite code | covered | `invite_codes::fails_on_used_up_invite_code` |
 | handles racing invite code uses | covered | `invite_codes::handles_racing_invite_code_uses` |
-| allow users to get available user invites | GAP | Needs periodic user invite codes (`inviteInterval`/`inviteEpoch`), which vlpds does not implement: getAccountInviteCodes never generates codes. The reference test also backdates `actor.createdAt` in SQL. Left as a feature gap. The reference default (`inviteInterval` unset) behaves like vlpds |
-| admin gifted codes to not impact a users available codes | covered (partial) | `invite_codes::admin_gifted_codes_are_listed_for_the_account` (the 3 admin codes). The 2 self-generated codes depend on the same `inviteInterval` gap |
-| creates invites based on epoch | GAP | Same `inviteInterval`/`inviteEpoch` feature gap (it also inserts invite rows in SQL) |
+| allow users to get available user invites | ported | `invite_codes::ref_earns_invite_codes_on_an_interval` (`--invite-interval-ms` 2 s, waited out, in place of backdating `actor.createdAt` in SQL); the reference's exact day/epoch arithmetic in `xrpc::server::invite_interval_tests::earns_one_code_per_interval` (lib) |
+| admin gifted codes to not impact a users available codes | covered | `invite_codes::ref_earns_invite_codes_on_an_interval` (3 admin + 2 earned), `invite_codes::admin_gifted_codes_are_listed_for_the_account`, `invite_interval_tests::admin_codes_do_not_count` |
+| creates invites based on epoch | ported | `xrpc::server::invite_interval_tests::counts_only_age_since_the_epoch` (lib): the reference's backdated account and SQL-inserted codes, as inputs to `codes_to_create` (its `calculateCodesToCreate`) |
 | prevents use of disabled codes | covered | `invite_codes::prevents_use_of_disabled_codes` |
 | does not allow disabling all admin codes | covered | `invite_codes::does_not_allow_disabling_all_admin_codes` |
 | creates many invite codes | covered | `invite_codes::creates_many_invite_codes` |
 
 ### invites-admin.test.ts
 
-These are adapted: alice's own codes are admin-gifted, because vlpds has no `inviteInterval`.
+These are adapted: alice's own codes are admin-gifted rather than interval-earned (the interval cases are in invite-codes above).
 
 | case | status | vlpds |
 |---|---|---|
@@ -682,7 +688,7 @@ These are adapted: alice's own codes are admin-gifted, because vlpds has no `inv
 | hydrates invites into admin.getAccountInfo | ported | `ref_invites::hydrates_invites_into_get_account_info` (also checks getAccountInfos) |
 | disables an account from getting additional invite codes | ported | `ref_invites::disables_and_reenables_account_invites` (`invitesDisabled` flag; no usable codes while disabled) |
 | allows setting reason when enabling and disabling invite codes | ported | `ref_invites::disables_and_reenables_account_invites` (the `note` is accepted) |
-| creates codes in the background but disables them | GAP | Interval-generated codes (`inviteInterval`) are not implemented; the reference test also reads SQL. Divergent mechanism: vlpds's disableAccountInvites disables the account's existing codes, while the reference only sets the flag that marks newly generated codes disabled |
+| creates codes in the background but disables them | ported | `invite_codes::ref_creates_disabled_codes_for_a_disabled_account` (interval 1 ms; the 5 codes read through admin.getInviteCodes instead of SQL) |
 | re-enables an accounts invites | ported + divergent | `ref_invites::disables_and_reenables_account_invites`. vlpds re-enables the account's existing codes. The reference only clears the flag and then generates fresh codes, so codes an admin disabled by account through disableInviteCodes would stay disabled there but be re-enabled by vlpds |
 
 ## Proxying (tests/proxied)

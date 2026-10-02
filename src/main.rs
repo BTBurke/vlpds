@@ -380,6 +380,23 @@ struct Args {
     /// Require an invite code for createAccount.
     #[arg(long, env = "VLPDS_INVITE_REQUIRED")]
     invite_required: bool,
+    /// With --invite-required: each account earns one invite code per this
+    /// many milliseconds of account age (at most 5 unused at a time),
+    /// created when it calls getAccountInviteCodes (falls back to the
+    /// reference's PDS_INVITE_INTERVAL). Unset: accounts never earn codes.
+    #[arg(long, env = "VLPDS_INVITE_INTERVAL_MS")]
+    invite_interval_ms: Option<String>,
+    /// Earned invite codes count only account age after this Unix time in
+    /// milliseconds (falls back to PDS_INVITE_EPOCH; default 0).
+    #[arg(long, env = "VLPDS_INVITE_EPOCH_MS")]
+    invite_epoch_ms: Option<String>,
+    /// The moderation service (Ozone) DID allowed to call the moderator admin
+    /// methods (getAccountInfo(s), get/updateSubjectStatus, sendEmail,
+    /// getInviteCodes, disableInviteCodes, enable/disableAccountInvites) and
+    /// read any account's getPreferences with a service JWT (falls back to
+    /// the reference's PDS_MOD_SERVICE_DID). Unset: admin Basic auth only.
+    #[arg(long, env = "VLPDS_MOD_SERVICE_DID")]
+    mod_service_did: Option<String>,
     /// Resolve the lexicons of record types without a bundled schema (DNS
     /// `_lexicon` TXT -> DID -> com.atproto.lexicon.schema record) and
     /// validate those records too, instead of reporting them "unknown".
@@ -779,6 +796,18 @@ async fn run(args: Args) -> anyhow::Result<()> {
         plc_url: args.plc_url.clone(),
         plc: plc_config(&args)?,
         invite_required: args.invite_required,
+        invite_interval: flag_or_env(&args.invite_interval_ms, "PDS_INVITE_INTERVAL")
+            .map(|v| v.parse::<u64>().map(Duration::from_millis))
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("invite interval (ms): {e}"))?
+            .filter(|d| !d.is_zero()),
+        invite_epoch_ms: flag_or_env(&args.invite_epoch_ms, "PDS_INVITE_EPOCH")
+            .map(|v| v.parse::<i64>())
+            .transpose()
+            .map_err(|e| anyhow::anyhow!("invite epoch (ms): {e}"))?
+            .unwrap_or(0),
+        mod_service_did: flag_or_env(&args.mod_service_did, "PDS_MOD_SERVICE_DID"),
+        txt_resolver: None,
         rate_limits_enabled: !args.no_rate_limits,
         resolve_lexicons: args
             .resolve_lexicons

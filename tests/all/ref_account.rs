@@ -84,6 +84,29 @@ async fn ref_create_account_error_messages() {
     assert_eq!(msg(&r), format!("Handle already taken: {handle}"));
 }
 
+/// account.test.ts "email validation > fails on disallowed emails": a
+/// disposable domain (the reference's `disposable-email-domains-js` list,
+/// vendored in src/email_policy) is refused with the not-supported message,
+/// case-insensitively; a subdomain of a listed domain is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ref_fails_on_disallowed_emails() {
+    let s = TestServer::spawn().await;
+    let create = |email: &str| {
+        let (x, email) = (s.xrpc.clone(), email.to_string());
+        async move {
+            let handle = format!("{}.{HANDLE_DOMAIN}", unique_name("bad-email"));
+            x.post("com.atproto.server.createAccount", &json!({"handle": handle, "email": email, "password": "asdf"}), &Auth::None)
+                .await
+        }
+    };
+    for email in ["bad-email@disposeamail.com", "Bad-Email@DisposeAMail.com", "x@mailinator.com"] {
+        let r = create(email).await;
+        r.err(400, "InvalidRequest");
+        assert_eq!(r.json["message"], json!("This email address is not supported, please use a different email."), "{email}");
+    }
+    create(&format!("{}@sub.disposeamail.com", unique_name("ok"))).await.ok();
+}
+
 /// "can reset account password" (the mail) and "allows only unexpired
 /// password reset tokens".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

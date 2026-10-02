@@ -1167,6 +1167,12 @@ async fn get_preferences(
     headers: HeaderMap,
     uri: Uri,
 ) -> XResult<Response> {
+    // the moderation service reads any account's preferences (reference
+    // authorizationOrModService; the undocumented `did` parameter), here only
+    if let Credentials::ModService { .. } = creds {
+        let did = mod_service_prefs_did(&app, &headers, &uri)?;
+        return Ok(Json(json!({"preferences": visible_prefs(&app, &did, true).await?})).into_response());
+    }
     let did = user_did(&creds)?.to_string();
     if let Some(target) = prefs_target(&app, &creds, &headers, GET_PREFERENCES).await? {
         let pq = uri
@@ -1191,7 +1197,28 @@ async fn get_preferences(
         .await;
     }
     let full = has_access_full(&creds);
-    let mut prefs = load_prefs(&app, &did).await?;
+    Ok(Json(json!({"preferences": visible_prefs(&app, &did, full).await?})).into_response())
+}
+
+/// getPreferences by the moderation service: the account from `?did=`, and
+/// never proxied to another AppView (reference: "Moderator requests cannot
+/// be proxied to other app views").
+fn mod_service_prefs_did(app: &App, headers: &HeaderMap, uri: &Uri) -> XResult<String> {
+    if proxy_header(headers)?.is_some_and(|h| h != local_prefs_aud(app)) {
+        return Err(XrpcError::bad("InvalidRequest", "Moderator requests cannot be proxied to other app views"));
+    }
+    let did = reqwest::Url::parse(&format!("http://x/?{}", uri.query().unwrap_or("")))
+        .ok()
+        .and_then(|u| u.query_pairs().find(|(k, _)| k == "did").map(|(_, v)| v.into_owned()))
+        .filter(|d| super::syntax::valid_did(d))
+        .ok_or_else(|| XrpcError::bad("InvalidRequest", "Invalid or missing did parameter"))?;
+    Ok(did)
+}
+
+/// `did`'s app.bsky preferences as getPreferences returns them (with the
+/// derived declared-age pref; personalDetailsPref only with `full`).
+async fn visible_prefs(app: &App, did: &str, full: bool) -> XResult<Vec<J>> {
+    let mut prefs = load_prefs(app, did).await?;
     let birth = prefs
         .iter()
         .find(|p| pref_type(p) == Some(PERSONAL_DETAILS_PREF))
@@ -1204,7 +1231,7 @@ async fn get_preferences(
         prefs.push(json!({"$type": DECLARED_AGE_PREF, "isOverAge13": over(13), "isOverAge16": over(16), "isOverAge18": over(18)}));
     }
     prefs.retain(|p| pref_type(p).is_some_and(|t| pref_allowed(t, full)));
-    Ok(Json(json!({"preferences": prefs})).into_response())
+    Ok(prefs)
 }
 
 async fn put_preferences(

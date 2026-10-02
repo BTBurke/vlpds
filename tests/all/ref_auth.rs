@@ -164,6 +164,9 @@ async fn ref_email_confirmation_and_update_mails() {
     // a malformed address: the reference's "not supported" message
     let r = s.xrpc.post("com.atproto.server.updateEmail", &json!({"email": "not an email", "token": tok}), &alice.auth()).await;
     assert_err_msg(&r, 400, "InvalidRequest", "This email address is not supported, please use a different email.");
+    // "fails email update with a badly formatted email": a disposable domain
+    let r = s.xrpc.post("com.atproto.server.updateEmail", &json!({"email": "bad-email@disposeamail.com", "token": tok}), &alice.auth()).await;
+    assert_err_msg(&r, 400, "InvalidRequest", "This email address is not supported, please use a different email.");
 }
 
 /// rate-limits.test.ts: "rate limits by ip" (resetPassword: 50 per 5

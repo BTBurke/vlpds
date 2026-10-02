@@ -109,6 +109,20 @@ pub struct Config {
     pub plc: crate::plc::PlcConfig,
     /// createAccount requires an invite code (describeServer inviteCodeRequired).
     pub invite_required: bool,
+    /// With `invite_required`: each account earns one invite code per this
+    /// interval of account age (reference PDS_INVITE_INTERVAL), created by
+    /// getAccountInviteCodes. None = accounts never earn codes.
+    pub invite_interval: Option<Duration>,
+    /// Earned codes count only account age after this instant, in Unix ms
+    /// (reference PDS_INVITE_EPOCH; 0 = from account creation).
+    pub invite_epoch_ms: i64,
+    /// The moderation service (Ozone) DID trusted to call the moderator
+    /// admin methods with service auth (reference PDS_MOD_SERVICE_DID;
+    /// `xrpc::authn::MODERATOR_METHODS`). None = admin Basic auth only.
+    pub mod_service_did: Option<String>,
+    /// DNS TXT lookups for external handle proofs (`_atproto.<handle>`).
+    /// None = the system resolver (src/handle_resolver.rs); tests inject a stub.
+    pub txt_resolver: Option<crate::handle_resolver::TxtResolverRef>,
     /// Membership settings (node id, advertised URL, lease timing). None =
     /// single-node defaults (node id "single", addr = public_url).
     pub cluster: Option<ClusterConfig>,
@@ -253,6 +267,10 @@ impl Default for Config {
             plc_url: crate::plc::DEFAULT_PLC_URL.into(),
             plc: Default::default(),
             invite_required: false,
+            invite_interval: None,
+            invite_epoch_ms: 0,
+            mod_service_did: None,
+            txt_resolver: None,
             rate_limits_enabled: true,
             trusted_proxies: Vec::new(),
             peer_connections: crate::http::DEFAULT_PEER_CONNECTIONS,

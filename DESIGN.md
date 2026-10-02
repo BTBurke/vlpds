@@ -2394,6 +2394,60 @@ differential run against the JS implementation over 200k generated strings
 matched (`handle_policy::tests::slurs_corpus_differential`, ignored; needs a
 corpus file).
 
+## Moderation service auth, earned invites, disposable email, DNS handles
+
+Four reference PDS features, ported with the reference's behaviour and
+messages (tests: `ref_moderator_auth`, `invite_codes::ref_*`,
+`ref_account::ref_fails_on_disallowed_emails`, `ref_handles::ref_*dns*`).
+
+- **Moderation service** (`--mod-service-did`, reference `modServiceDid`;
+  `src/xrpc/authn.rs`). On the reference's `authVerifier.moderator` methods
+  (`MODERATOR_METHODS`: getAccountInfo(s), get/updateSubjectStatus,
+  sendEmail, getInviteCodes, disableInviteCodes, enable/disableAccountInvites)
+  a Bearer token is only ever a service JWT from that DID (or
+  `<did>#atproto_labeler`, keyed by `#atproto_label`): checked by the
+  existing inbound verifier (`verify_service_jwt_from`: exp, aud = our
+  service DID, lxm = the method, issuer allow-list before key resolution,
+  signature with one fresh-document retry). Another issuer, or no flag, is
+  401 `UntrustedIss` "Untrusted issuer". The result is
+  `Credentials::ModService`, which `require_moderator` accepts and every
+  user-permission check refuses; `require_admin` (the reference's
+  `adminToken`: deleteAccount, updateAccount*, createInviteCode(s),
+  `vlpds.admin.*`) still takes Basic auth only. getPreferences is the
+  reference's `authorizationOrModService`: a Bearer token whose (unverified)
+  `iss` is the moderation service is verified as one and reads the `did`
+  parameter's preferences, personalDetailsPref included, never proxied.
+  Not ported: the reference's entryway DID as an accepted `aud`, and routing
+  `tools.ozone.*` to `modServiceUrl` (vlpds still sends those to the AppView).
+- **Earned invite codes** (`--invite-interval-ms` / `--invite-epoch-ms`,
+  reference `inviteInterval` / `inviteEpoch`, only with invites required).
+  getAccountInviteCodes (`createAvailable`, default true) creates the codes
+  the reference's `calculateCodesToCreate` allows, unchanged: one per
+  interval of account age (only age after the epoch for older accounts),
+  minus routine codes created since the epoch, at most 5 unused routine
+  codes; admin-gifted codes don't count. They are single-use, `createdBy` =
+  the account, and created disabled when its invites are disabled. Creation
+  is serialized per account on the node, and a concurrent creation on
+  another node is caught afterwards (400 `DuplicateCreate`), as in the
+  reference. Unlike the reference, enable/disableAccountInvites also flip the
+  account's existing codes (unchanged vlpds behaviour).
+- **Disposable email** (`src/email_policy.rs`): the reference's
+  `disposable-email-domains-js` list (v1.26.0, 8,883 domains, CC0), vendored
+  as a text file; exact match on the part after the last `@`, case-folded.
+  createAccount (and OAuth sign-up, which goes through it) and updateEmail
+  refuse it with "This email address is not supported, please use a
+  different email."; admin updateAccountEmail doesn't check it (as the
+  reference).
+- **DNS TXT handles** (`src/handle_resolver.rs`): updateHandle to an external
+  domain resolves it as the reference's `HandleResolver`: `_atproto.<handle>`
+  TXT and `/.well-known/atproto-did` in parallel, the DNS answer (exactly
+  one `did=` record) winning, else the HTTPS one (a `did:` first line), 3 s
+  each. Lookups go to the system resolver only, for the fully qualified name
+  (no search domains), considering at most 32 records of 4 KiB; the HTTPS
+  fetch stays SSRF-guarded and size-capped. `server::Config::txt_resolver`
+  injects a stub for tests. The reference's backup nameservers are not
+  ported. Dev mode still skips the proof.
+
 ## Push registration (`src/xrpc/proxy/push.rs`)
 
 `app.bsky.notification.{registerPush,unregisterPush}` name their service in
@@ -2925,8 +2979,4 @@ notable ones:
 These known gaps are tracked in that file and are not deliberate:
 
 - signing-key rotation writes no re-signed commit and emits no `#sync`;
-- duplicate backlinks (likes, reposts, follows, blocks) are not pruned;
-- admin methods have no mod-service service auth;
-- there are no interval invite codes;
-- there is no disposable-email blocklist;
-- there is no DNS TXT handle proof.
+- duplicate backlinks (likes, reposts, follows, blocks) are not pruned.

@@ -251,9 +251,10 @@ struct UpdateHandleIn {
 
 /// Checks a requested handle: a single label under our handle domain
 /// (3-18 chars, like the reference), or an external domain that proves
-/// control with `https://{handle}/.well-known/atproto-did`. In dev mode the
-/// external proof is skipped. (DNS TXT `_atproto` verification isn't
-/// implemented: no DNS resolver dependency.)
+/// control with a DNS TXT `_atproto.{handle}` record (`did=<DID>`) or
+/// `https://{handle}/.well-known/atproto-did`, resolved as the reference's
+/// HandleResolver does (crate::handle_resolver). In dev mode the external
+/// proof is skipped.
 pub(super) async fn check_new_handle(app: &App, handle: &str, did: &str) -> XResult<()> {
     // syntax + disallowed TLDs, then the slur filter (reference order)
     super::server::normalize_handle(handle)?;
@@ -266,7 +267,9 @@ pub(super) async fn check_new_handle(app: &App, handle: &str, did: &str) -> XRes
     if app.config.dev_mode {
         return Ok(());
     }
-    let resolved = well_known_did(handle, false).await.ok();
+    let txt = crate::handle_resolver::resolver(app.config.txt_resolver.as_ref());
+    let http = async { well_known_did(handle, false).await.ok() };
+    let resolved = crate::handle_resolver::resolve(txt.as_ref(), handle, http).await;
     if resolved.as_deref() != Some(did) {
         return Err(XrpcError::bad(
             "InvalidRequest",
@@ -278,8 +281,8 @@ pub(super) async fn check_new_handle(app: &App, handle: &str, did: &str) -> XRes
 
 /// The DID served at `https://{handle}/.well-known/atproto-did`, fetched with
 /// the SSRF-guarded client (outside dev mode a handle resolving to a private
-/// or loopback address is refused before connecting), a 5 s deadline and a
-/// small body cap.
+/// or loopback address is refused before connecting), the reference's 3 s
+/// deadline and a small body cap.
 async fn well_known_did(handle: &str, dev_mode: bool) -> Result<String, String> {
     use futures::StreamExt;
     const MAX_BYTES: usize = 2048;
@@ -300,7 +303,7 @@ async fn well_known_did(handle: &str, dev_mode: bool) -> Result<String, String> 
         let body = String::from_utf8_lossy(&buf);
         Ok(body.lines().next().unwrap_or("").trim().to_string())
     };
-    tokio::time::timeout(std::time::Duration::from_secs(5), fetch)
+    tokio::time::timeout(crate::handle_resolver::TIMEOUT, fetch)
         .await
         .map_err(|_| "timed out".to_string())?
 }
@@ -458,7 +461,7 @@ fn plc_signer(creds: &Credentials) -> XResult<String> {
             error: "InvalidToken".into(),
             message: "Bad token scope".into(),
         }),
-        Credentials::Admin => Err(XrpcError::auth("user credentials required")),
+        Credentials::Admin | Credentials::ModService { .. } => Err(XrpcError::auth("user credentials required")),
     }
 }
 

@@ -171,6 +171,17 @@ async fn abort_reshard(State(app): AppState, Auth(creds): Auth) -> XResult<Json<
     Ok(Json(json!({"aborted": op, "layout": layout_json(&app)?})))
 }
 
+/// The reference's `authVerifier.moderator`: admin Basic auth, or a service
+/// JWT from the configured moderation service (`--mod-service-did`; verified
+/// in `authn::authenticate` for [`super::authn::MODERATOR_METHODS`]).
+pub(super) fn require_moderator(creds: &Credentials) -> XResult<()> {
+    match creds {
+        Credentials::ModService { .. } => Ok(()),
+        _ => require_admin(creds),
+    }
+}
+
+/// Admin Basic auth only (the reference's `authVerifier.adminToken`).
 pub(super) fn require_admin(creds: &Credentials) -> XResult<()> {
     match creds {
         Credentials::Admin => Ok(()),
@@ -270,12 +281,26 @@ async fn put_invite(app: &App, inv: &InviteCode) -> XResult<()> {
         .await
 }
 
+/// Admin-created codes for `account` (a DID or "admin").
 pub(super) async fn create_invites(
     app: &App,
     account: &str,
     codes: &[String],
     use_count: i64,
     disabled: bool,
+) -> XResult<()> {
+    create_invites_by(app, account, codes, use_count, disabled, "admin").await
+}
+
+/// Codes for `account` created by `created_by` ("admin", or the account
+/// itself for codes earned with `--invite-interval`).
+pub(super) async fn create_invites_by(
+    app: &App,
+    account: &str,
+    codes: &[String],
+    use_count: i64,
+    disabled: bool,
+    created_by: &str,
 ) -> XResult<()> {
     let now = crate::events::now_rfc3339();
     for code in codes {
@@ -284,7 +309,7 @@ pub(super) async fn create_invites(
             available: use_count,
             disabled,
             for_account: account.to_string(),
-            created_by: "admin".into(),
+            created_by: created_by.into(),
             created_at: now.clone(),
             uses: Vec::new(),
         };
@@ -495,7 +520,7 @@ async fn get_account_info(
     Auth(creds): Auth,
     Query(q): Query<DidQ>,
 ) -> XResult<Json<J>> {
-    require_admin(&creds)?;
+    require_moderator(&creds)?;
     let a = app
         .account(&q.did)
         .await
@@ -508,7 +533,7 @@ async fn get_account_infos(
     Auth(creds): Auth,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> XResult<Json<J>> {
-    require_admin(&creds)?;
+    require_moderator(&creds)?;
     let mut infos = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (k, did) in query_pairs(raw.as_deref().unwrap_or("")) {
@@ -881,7 +906,7 @@ async fn update_subject_status(
     Auth(creds): Auth,
     Json(inp): Json<UpdateSubjectStatusIn>,
 ) -> XResult<Json<J>> {
-    require_admin(&creds)?;
+    require_moderator(&creds)?;
     if inp.takedown.as_ref().is_some_and(|t| t.applied)
         && inp.deactivated.as_ref().is_some_and(|d| !d.applied)
     {
@@ -958,7 +983,7 @@ async fn get_subject_status(
     Auth(creds): Auth,
     Query(q): Query<SubjectStatusQ>,
 ) -> XResult<Json<J>> {
-    require_admin(&creds)?;
+    require_moderator(&creds)?;
     let body = if let Some(blob) = &q.blob {
         let did = q
             .did
@@ -1065,7 +1090,7 @@ async fn disable_account_invites(
     Auth(creds): Auth,
     Json(inp): Json<AccountIn>,
 ) -> XResult<StatusCode> {
-    require_admin(&creds)?;
+    require_moderator(&creds)?;
     set_account_invites_disabled(&app, &inp.account, true).await?;
     Ok(StatusCode::OK)
 }
@@ -1075,7 +1100,7 @@ async fn enable_account_invites(
     Auth(creds): Auth,
     Json(inp): Json<AccountIn>,
 ) -> XResult<StatusCode> {
-    require_admin(&creds)?;
+    require_moderator(&creds)?;
     set_account_invites_disabled(&app, &inp.account, false).await?;
     Ok(StatusCode::OK)
 }
@@ -1093,7 +1118,7 @@ async fn disable_invite_codes(
     Auth(creds): Auth,
     Json(inp): Json<DisableCodesIn>,
 ) -> XResult<StatusCode> {
-    require_admin(&creds)?;
+    require_moderator(&creds)?;
     if inp.accounts.iter().any(|a| a == "admin") {
         return Err(invalid_request("cannot disable admin invite codes"));
     }
@@ -1190,7 +1215,7 @@ async fn get_invite_codes(
     Auth(creds): Auth,
     Query(q): Query<InviteCodesQ>,
 ) -> XResult<Json<J>> {
-    require_admin(&creds)?;
+    require_moderator(&creds)?;
     let (usage, limit, _) = q.parsed()?;
     let (codes, owned) = invite_codes_local(&app, &q).await?;
     let mut all: Vec<(InviteKey, InviteCode)> = codes.into_iter().map(|c| (InviteKey::of(usage, &c), c)).collect();
@@ -1238,7 +1263,7 @@ async fn send_email(
     Auth(creds): Auth,
     Json(inp): Json<SendEmailIn>,
 ) -> XResult<Json<J>> {
-    require_admin(&creds)?;
+    require_moderator(&creds)?;
     let a = app
         .account(&inp.recipient_did)
         .await

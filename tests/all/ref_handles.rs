@@ -49,10 +49,9 @@ async fn ref_handle_error_messages() {
 }
 
 /// handles.test.ts "allows updating to a dns handles": an external-domain
-/// handle is accepted and lands in the account and the DID document. The
-/// reference proves it with a mocked DNS TXT record; vlpds's dev mode skips
-/// the external proof (DNS TXT verification is not implemented, see
-/// REFERENCE_COVERAGE.md), so this checks the update path only.
+/// handle is accepted and lands in the account and the DID document. Dev
+/// mode skips the external proof, so this checks the update path only; the
+/// DNS TXT proof is `ref_updates_to_dns_handle_with_txt_proof`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ref_updates_to_external_handle() {
     let s = TestServer::spawn().await;
@@ -125,4 +124,71 @@ async fn ref_handle_length_with_long_service_domain() {
     assert!(r.text().contains("Handle too long"), "{}", r.text());
     let ok = try_create(format!("u23456789012345678.{domain}")).await;
     assert!(ok.is_ok(), "{}", ok.text());
+}
+
+/// A stub DNS: TXT records by fully qualified name; anything else NXDOMAIN.
+#[derive(Default)]
+struct StubTxt(parking_lot::Mutex<std::collections::HashMap<String, Vec<String>>>);
+
+impl vlpds::handle_resolver::TxtResolver for StubTxt {
+    fn txt<'a>(&'a self, name: &'a str) -> futures::future::BoxFuture<'a, Result<Vec<String>, String>> {
+        let got = self.0.lock().get(name).cloned();
+        Box::pin(async move { got.ok_or_else(|| "NXDOMAIN".to_string()) })
+    }
+}
+
+impl StubTxt {
+    fn set(&self, handle: &str, records: &[&str]) {
+        self.0
+            .lock()
+            .insert(format!("_atproto.{handle}."), records.iter().map(|r| r.to_string()).collect());
+    }
+}
+
+/// A server that verifies external handles (dev mode off) against `dns`.
+async fn dns_server(dns: &std::sync::Arc<StubTxt>) -> TestServer {
+    let r = vlpds::handle_resolver::TxtResolverRef(dns.clone());
+    TestServer::spawn_with(move |c| {
+        c.dev_mode = false;
+        c.txt_resolver = Some(r);
+    })
+    .await
+}
+
+/// handles.test.ts "allows updating to a dns handles", with the proof: the
+/// handle's `_atproto` TXT record names the account's DID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ref_updates_to_dns_handle_with_txt_proof() {
+    let dns = std::sync::Arc::new(StubTxt::default());
+    let s = dns_server(&dns).await;
+    let a = s.create_account("alice").await;
+    let ext = format!("{}.external", unique_name("alice"));
+    dns.set(&ext, &["v=spf1 -all", &format!("did={}", a.did)]);
+    update_handle(&s, &a, &ext).await.ok();
+    let d = describe(&s, &a.did).await;
+    assert_eq!(d["handle"], json!(ext));
+    let aka = d["didDoc"]["alsoKnownAs"].as_array().unwrap();
+    assert!(aka.contains(&json!(format!("at://{ext}"))), "{aka:?}");
+}
+
+/// handles.test.ts "does not allow updating to an invalid dns handle": a TXT
+/// record naming another DID, none at all, or several `did=` records (the
+/// reference's parseDnsResult wants exactly one) don't prove the handle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ref_refuses_invalid_dns_handles() {
+    let dns = std::sync::Arc::new(StubTxt::default());
+    let s = dns_server(&dns).await;
+    let a = s.create_account("alice").await;
+    let b = s.create_account("bob").await;
+    let other = format!("{}.external", unique_name("bob"));
+    dns.set(&other, &[&format!("did={}", b.did)]);
+    let several = format!("{}.external", unique_name("multi"));
+    dns.set(&several, &[&format!("did={}", a.did), &format!("did={}", b.did)]);
+    let missing = format!("{}.external", unique_name("noexist"));
+    for h in [&other, &several, &missing] {
+        let r = tokio::time::timeout(Duration::from_secs(20), update_handle(&s, &a, h)).await.expect("bounded");
+        r.err(400, "InvalidRequest");
+        assert!(r.text().contains("External handle did not resolve to DID"), "{h}: {}", r.text());
+    }
+    assert_eq!(describe(&s, &a.did).await["handle"], json!(a.handle));
 }

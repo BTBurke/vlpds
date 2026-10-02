@@ -208,3 +208,97 @@ async fn get_invite_codes_validates_limit() {
     }
     s.xrpc.get("com.atproto.admin.getInviteCodes", &[("limit", "500")], &Auth::Admin).await.ok();
 }
+
+// ---------------------------------------------------------------------------
+// periodic invite codes (`invite_interval`; reference inviteInterval /
+// inviteEpoch). The reference cases backdate `actor.createdAt` in SQL; here
+// the interval is short and the test waits it out. The epoch arithmetic
+// with backdated accounts is unit-tested next to `codes_to_create`
+// (src/xrpc/server.rs).
+// ---------------------------------------------------------------------------
+
+async fn account_codes(s: &TestServer, a: &TestAccount, q: &[(&str, &str)]) -> Vec<J> {
+    s.xrpc.get("com.atproto.server.getAccountInviteCodes", q, &a.auth()).await.ok()["codes"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// "allow users to get available user invites" and "admin gifted codes to
+/// not impact a users available codes" (interval 2 s for 1 day).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ref_earns_invite_codes_on_an_interval() {
+    let s = TestServer::spawn_with(|c| {
+        c.invite_required = true;
+        c.invite_interval = Some(std::time::Duration::from_secs(2));
+    })
+    .await;
+    let acct = signup_ok(&s, &create_invite(&s, 1, None).await).await;
+    // no codes yet
+    assert_eq!(account_codes(&s, &acct, &[]).await.len(), 0);
+    for _ in 0..3 {
+        create_invite(&s, 1, Some(&acct.did)).await;
+    }
+    // two intervals old
+    tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
+    // createAvailable=false only lists
+    assert_eq!(account_codes(&s, &acct, &[("createAvailable", "false")]).await.len(), 3);
+    let codes = account_codes(&s, &acct, &[]).await;
+    assert_eq!(codes.len(), 5, "{codes:?}");
+    let mine: Vec<&J> = codes.iter().filter(|c| c["createdBy"] == json!(acct.did)).collect();
+    assert_eq!(mine.len(), 2, "{codes:?}");
+    assert_eq!(codes.iter().filter(|c| c["createdBy"] == json!("admin")).count(), 3);
+    for c in &mine {
+        assert_eq!(c["available"], json!(1));
+        assert_eq!(c["forAccount"], json!(acct.did));
+        assert_eq!(c["disabled"], json!(false));
+    }
+    // use both earned codes: no more are earned, they are listed as used
+    for c in &mine {
+        signup_ok(&s, c["code"].as_str().unwrap()).await;
+    }
+    let after = account_codes(&s, &acct, &[]).await;
+    assert_eq!(after.iter().filter(|c| c["createdBy"] == json!(acct.did)).count(), 2, "{after:?}");
+    let unused = account_codes(&s, &acct, &[("includeUsed", "false")]).await;
+    assert_eq!(unused.len(), 3, "the admin codes: {unused:?}");
+}
+
+/// Without invites required, an interval earns nothing (reference: codes
+/// are created only when `invites.required`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invite_interval_needs_invites_required() {
+    let s = TestServer::spawn_with(|c| c.invite_interval = Some(std::time::Duration::from_millis(1))).await;
+    let acct = s.create_account("noinv").await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(account_codes(&s, &acct, &[]).await.len(), 0);
+}
+
+/// invites-admin.test.ts "creates codes in the background but disables
+/// them" (interval 1 ms): an account whose invites are disabled still gets
+/// its 5 codes, created disabled, so getAccountInviteCodes lists none; once
+/// re-enabled ("re-enables an accounts invites") it has codes again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ref_creates_disabled_codes_for_a_disabled_account() {
+    let s = TestServer::spawn_with(|c| {
+        c.invite_required = true;
+        c.invite_interval = Some(std::time::Duration::from_millis(1));
+    })
+    .await;
+    let carol = signup_ok(&s, &create_invite(&s, 1, None).await).await;
+    s.xrpc.post("com.atproto.admin.disableAccountInvites", &json!({"account": carol.did}), &Auth::Admin).await.ok();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(account_codes(&s, &carol, &[]).await.len(), 0);
+    let all = s.xrpc.get("com.atproto.admin.getInviteCodes", &[("limit", "500")], &Auth::Admin).await.ok();
+    let hers: Vec<&J> = all["codes"].as_array().unwrap().iter().filter(|c| c["forAccount"] == json!(carol.did)).collect();
+    assert_eq!(hers.len(), 5, "{all}");
+    assert!(hers.iter().all(|c| c["disabled"] == json!(true) && c["createdBy"] == json!(carol.did)), "{hers:?}");
+    // vlpds's enableAccountInvites re-enables the account's codes (the
+    // reference only clears the flag and earns fresh ones): 5 unused, the cap
+    s.xrpc.post("com.atproto.admin.enableAccountInvites", &json!({"account": carol.did}), &Auth::Admin).await.ok();
+    let info = s.xrpc.get("com.atproto.admin.getAccountInfo", &[("did", &carol.did)], &Auth::Admin).await.ok();
+    assert_eq!(info["invitesDisabled"], json!(false));
+    let codes = account_codes(&s, &carol, &[]).await;
+    assert!(!codes.is_empty());
+    assert!(codes.iter().all(|c| c["disabled"] == json!(false)), "{codes:?}");
+    assert_eq!(account_codes(&s, &carol, &[("includeUsed", "false")]).await.len(), 5, "at most 5 unused");
+}
