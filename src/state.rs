@@ -16,6 +16,7 @@
 //! b/{did}\0{cid}\0{path}  -> empty (blob references)
 //! p/{routing}\0{name}     -> private per-account state (slot of the routing key)
 //! L/{did}                 -> record count u64 (large repos: preloaded on shard open)
+//! M/{did}\0{cid digest}   -> MST node block, height >= 1 (`--lazy-mst`; DESIGN.md "Partial MSTs")
 
 use crate::cid::{Cid, CID_BYTES_LEN};
 use crate::tid::Tid;
@@ -125,6 +126,21 @@ pub fn large_repo_key(did: &str) -> Vec<u8> {
 }
 
 pub const LARGE_REPO_FAMILY: &[u8] = b"L/";
+
+/// A persisted interior MST node of `did`'s current tree (lazy MSTs): the
+/// node block, keyed by its CID's digest (every node is dag-cbor sha-256).
+/// Written and deleted in the commit's state batch, so `M/{did}` holds
+/// exactly the interior nodes of the tree at `h/{did}`'s data root.
+pub fn mst_node_key(did: &str, cid: &Cid) -> Vec<u8> {
+    keyed(did, MST_NODE_FAMILY, &[did.as_bytes(), b"\0", &cid.digest])
+}
+
+/// Where `did`'s persisted MST nodes start (one contiguous range).
+pub fn mst_node_prefix(did: &str) -> Vec<u8> {
+    keyed(did, MST_NODE_FAMILY, &[did.as_bytes(), b"\0"])
+}
+
+pub const MST_NODE_FAMILY: &[u8] = b"M/";
 
 pub fn record_prefix(did: &str) -> Vec<u8> {
     keyed(did, b"R/", &[did.as_bytes(), b"\0"])

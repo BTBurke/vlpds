@@ -54,6 +54,11 @@ lazy!(REPO_CACHE_BYTES: IntGaugeVec = register_int_gauge_vec!("vlpds_repo_cache_
 lazy!(PINNED_REPOS: IntGaugeVec = register_int_gauge_vec!("vlpds_repo_cache_pinned", "Large repos pinned in a worker's cache (not evicted by the LRU)", &["worker"]));
 lazy!(REPO_LOAD_BY_SIZE: HistogramVec = register_histogram_vec!("vlpds_repo_load_by_size_seconds", "Cold repo load latency by repo size (records)", &["records"], latency_buckets()));
 lazy!(REPO_PRELOADS: IntCounterVec = register_int_counter_vec!("vlpds_repo_preloads_total", "Repo preloads after a shard open, by kind (large: L/ index; recent: recently written) and result", &["kind", "result"]));
+lazy!(LAZY_MST_READS: IntCounterVec = register_int_counter_vec!("vlpds_lazy_mst_reads_total", "Lazy MST store reads by kind (node: M/ point read; leaf: R/ range scan), outside a prefetch", &["kind"]));
+lazy!(LAZY_MST_PREFETCH_BYTES: Histogram = register_histogram!("vlpds_lazy_mst_prefetch_bytes", "Bytes of a repo's M/ range read ahead by one scan on a lazy cold open", exponential_buckets(1024.0, 4.0, 10).unwrap()));
+lazy!(LAZY_MST_FETCHES: IntCounterVec = register_int_counter_vec!("vlpds_lazy_mst_fetches_total", "Path loads a repo worker handed to the blocking pool before applying writes (lazy MSTs), by result", &["result"]));
+lazy!(LAZY_MST_FALLBACKS: IntCounterVec = register_int_counter_vec!("vlpds_lazy_mst_fallbacks_total", "Lazy MST opens rebuilt from all of the repo's records, by reason (missing: no persisted root; invalid: a node or rebuilt subtree didn't match its link)", &["reason"]));
+lazy!(LAZY_MST_UNLOADS: IntCounter = register_int_counter!("vlpds_lazy_mst_unloads_total", "Repos whose loaded MST paths were dropped (back to the root) to keep the worker's path cache in its byte budget"));
 lazy!(WRITES_ABANDONED: IntCounter = register_int_counter!("vlpds_writes_abandoned_total", "Forwarded writes answered 503 RepoLoading before their worker started them (never applied; the forwarding node retries)"));
 
 // ---- partitions / log ----
@@ -215,6 +220,14 @@ fn refresh_tokio() {
     TOKIO_TASKS.set(m.num_alive_tasks() as i64);
     TOKIO_GLOBAL_QUEUE.set(m.global_queue_depth() as i64);
     TOKIO_BUSY.set((0..n).map(|w| m.worker_total_busy_duration(w).as_secs_f64()).sum());
+}
+
+/// Resident set size of this process (benchmarks), if the platform reports it.
+pub fn resident_bytes() -> Option<u64> {
+    #[cfg(all(any(target_os = "macos", target_os = "linux"), target_pointer_width = "64"))]
+    return sys::rss_threads().map(|(rss, _)| rss);
+    #[allow(unreachable_code)]
+    None
 }
 
 fn refresh_process() {

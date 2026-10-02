@@ -28,6 +28,13 @@ pub enum MstError {
     Invalid(&'static str),
     #[error("invalid MST key")]
     InvalidKey,
+    /// A partial tree needs a node it may not read now (a lazy tree's
+    /// no-I/O pass: the caller loads it asynchronously and retries).
+    #[error("MST node not loaded")]
+    NotLoaded,
+    /// Reading persisted nodes or records failed (lazy trees).
+    #[error("MST store read failed: {0}")]
+    Store(String),
 }
 
 type Result<T> = std::result::Result<T, MstError>;
@@ -1327,6 +1334,11 @@ impl Tree {
         }
     }
 
+    /// The root node's block (the tree must be written).
+    pub fn root_block(&self) -> Result<(Cid, Vec<u8>)> {
+        Ok((self.root.cid.ok_or(MstError::Invalid("unwritten node"))?, self.root.block()?.into_owned()))
+    }
+
     /// Node blocks on the path from the root to `key` (inclusion or exclusion
     /// proof). The path follows key order down to the node holding `key` or
     /// to the bottom, like the reference's `cidsForPath`: verifiers search by
@@ -1378,6 +1390,13 @@ impl NodeIndex {
         tree.node_refs(&mut map)?;
         let live = map.len();
         Ok(NodeIndex { map, from: rev, to: rev, live })
+    }
+
+    /// An index of the given nodes at `rev` (a lazy repo's: built from a
+    /// streamed walk of the whole tree).
+    pub fn from_refs(map: HashMap<Cid, NodeRef>, rev: u64) -> NodeIndex {
+        let live = map.len();
+        NodeIndex { map, from: rev, to: rev, live }
     }
 
     pub fn covers(&self, rev: u64) -> bool {

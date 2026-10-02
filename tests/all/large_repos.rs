@@ -17,6 +17,9 @@ async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, pin: u64) ->
         c.memory_store = Some(store);
         c.shards = SHARDS;
         c.pin_repo_records = pin;
+        // pinning and L/ preloads are the full-tree mode's (a lazy repo
+        // opens with one read whatever its size)
+        c.lazy_mst = false;
         // only the large-repo preload (recent repos: tests/all/cold_start.rs)
         c.preload_recent = 0;
         c.cluster = Some(vlpds::cluster::ClusterConfig {

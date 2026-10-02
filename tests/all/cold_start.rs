@@ -156,7 +156,8 @@ async fn recent_repos_preloaded_after_restart() {
         let info = eventually(Duration::from_secs(10), || async { cache_info(&b, &did).await })
             .await
             .unwrap_or_else(|| panic!("repo {i} not preloaded"));
-        assert!(!info.large && info.records == 2, "{info:?}");
+        // a lazy repo doesn't count its records (its tree isn't loaded)
+        assert!(!info.large && (info.records == 2 || vlpds::server::default_lazy_mst()), "{info:?}");
     }
     for i in 10..30 {
         assert!(cache_info(&b, &bulk_did(i)).await.is_none(), "only written repos are preloaded");

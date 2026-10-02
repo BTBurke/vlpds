@@ -9,6 +9,8 @@ use crate::crypto::Keypair;
 use crate::events::{self, RepoOp};
 use crate::metrics;
 use crate::mst::Tree;
+use crate::mst_lazy::{LazyTree, Source};
+use crate::mst_store::{DbSource, ScanSource};
 use crate::partition::{LogEntry, Partition};
 use crate::segment::Mutation;
 use crate::state::{self, Head};
@@ -235,12 +237,19 @@ pub enum WorkerMsg {
     Preload { did: Arc<str>, large: bool, done: oneshot::Sender<bool> },
     /// What the worker holds for a repo (None = not cached).
     CacheInfo { did: Arc<str>, reply: oneshot::Sender<Option<CachedRepo>> },
+    /// The paths a lazy repo's queued requests visit, loaded on the
+    /// blocking pool (see `Worker::start_fetch`): the tree to continue
+    /// with, or why it failed.
+    Fetched { did: Arc<str>, res: Result<Box<LazyTree>, crate::mst::MstError> },
 }
 
 /// A cached repo, as [`WorkerMsg::CacheInfo`] reports it.
 #[derive(Clone, Debug)]
 pub struct CachedRepo {
+    /// Records (full-tree mode; a lazy repo doesn't count them: 0).
     pub records: u64,
+    /// MST nodes loaded (a lazy repo: its loaded paths).
+    pub loaded_nodes: usize,
     /// Pinned as a large repo.
     pub large: bool,
     /// Bytes charged to the cache budget.
@@ -252,9 +261,14 @@ pub struct CachedRepo {
 /// commit that could still be lost.
 pub struct DurableView {
     pub head: Head,
+    /// The tree at `head`. Lazy (`lazy`): only partly loaded; readers load
+    /// the rest from a SlateDB snapshot taken with the view (`M/` and `R/`
+    /// as of this head, see `App::repo_view`) into a private copy.
     pub tree: Tree,
-    /// The repo's MST node index (getBlocks), shared with the worker.
+    /// The repo's MST node index (getBlocks), shared with the worker
+    /// (full-tree mode only).
     pub nodes: crate::mst::SharedNodeIndex,
+    pub lazy: bool,
 }
 
 pub type ViewCell = Arc<parking_lot::RwLock<Arc<DurableView>>>;
@@ -267,12 +281,15 @@ pub struct SnapshotReq {
 pub struct RepoState {
     pub did: Arc<str>,
     pub partition: Arc<Partition>,
-    pub tree: Tree,
+    /// The repo's MST: fully loaded (full-tree mode), or loaded along the
+    /// paths recent operations visited (`--lazy-mst`).
+    pub mst: LazyTree,
     pub head: Head,
     pub key: Arc<Keypair>,
     pub pending: Arc<AtomicU32>,
     pub account: state::Account,
-    /// Records per collection (drives the C/{collection}\0{did} index).
+    /// Records per collection (drives the C/{collection}\0{did} index;
+    /// full-tree mode: a lazy repo probes its tree for `coll/` keys instead).
     pub collections: HashMap<String, u32>,
     /// Blob refs per record path (drives the b/{did}\0{blob}\0{path} index).
     pub blob_refs: HashMap<String, Vec<Cid>>,
@@ -282,11 +299,22 @@ pub struct RepoState {
     pub large: bool,
     /// Approximate heap charged to the worker's cache ([`repo_bytes`]).
     pub charge: usize,
+    /// A lazy repo whose paths are being loaded off the worker thread
+    /// (its requests wait in `Worker::loading`; see `Worker::start_fetch`).
+    pub fetching: bool,
+    /// A lazy repo rebuilt from its records on open: its interior nodes
+    /// are written to `M/` once it is cached (self-healing).
+    pub backfill: bool,
+    /// A lazy repo's log entries in flight that wrote MST state, oldest
+    /// first: (applied, the nodes the commit wrote; None = the whole tree,
+    /// an import, account delete, creation or backfill). Paths of a repo
+    /// with commits in flight are unloaded only outside these sets.
+    pub inflight: std::collections::VecDeque<(Arc<std::sync::atomic::AtomicBool>, Option<HashSet<Cid>>)>,
 }
 
 impl RepoState {
     fn durable_view(&self) -> Arc<DurableView> {
-        Arc::new(DurableView { head: self.head.clone(), tree: self.tree.clone(), nodes: self.nodes.clone() })
+        Arc::new(DurableView { head: self.head.clone(), tree: self.mst.tree.clone(), nodes: self.nodes.clone(), lazy: self.mst.is_lazy() })
     }
 
     /// Records in the repo (from the per-collection counts).
@@ -301,10 +329,17 @@ pub const MST_BYTES_PER_RECORD: usize = 240;
 /// Per-repo overhead outside the tree (account, key, head, views, maps).
 const REPO_BASE_BYTES: usize = 2048;
 
-/// Approximate heap of a cached repo: what the cache budget counts.
+/// Approximate heap of a cached repo: what the cache budget counts. A lazy
+/// repo is charged its loaded paths (`mst_lazy::heap_bytes`).
 pub fn repo_bytes(st: &RepoState, records: u64) -> usize {
-    REPO_BASE_BYTES + records as usize * MST_BYTES_PER_RECORD + st.blob_refs.len() * 96
+    let tree = if st.mst.is_lazy() { st.mst.heap_bytes() } else { records as usize * MST_BYTES_PER_RECORD };
+    REPO_BASE_BYTES + tree + st.blob_refs.len() * 96
 }
+
+/// A lazy repo charged more than this is unloaded (back to its root) as soon
+/// as nothing of it is in flight, whatever the budget: a fully loaded tree
+/// (a new import, a rebuild) mustn't be walked for its charge every commit.
+const LAZY_REPO_MAX_BYTES: usize = 1 << 20;
 
 /// Repo cache limits, per worker.
 #[derive(Clone, Copy, Debug)]
@@ -317,22 +352,38 @@ pub struct CacheLimits {
     /// the LRU, indexed under `L/` and preloaded when their shard opens
     /// (a 5M-record repo is ~1.2 GB of heap and ~8 s of cold load). They
     /// stay pinned until they drop below half of it. 0 = pin nothing.
+    /// Full-tree mode only: a lazy repo opens with one read whatever its size.
     pub pin_records: u64,
+    /// Lazy MSTs (`--lazy-mst`, DESIGN.md "Partial MSTs"): repos keep only
+    /// the paths operations visit, interior nodes are persisted under `M/`,
+    /// and `bytes` bounds the loaded paths of the worker's repos.
+    pub lazy: bool,
+    /// Lazy cold open: read up to this much of the repo's `M/` range with one
+    /// scan (`--lazy-mst-prefetch-kb`; 0 = point reads only).
+    pub prefetch_bytes: usize,
+    /// Tests: unload every idle lazy repo's paths after each pass.
+    pub unload_idle: bool,
 }
 
 pub const DEFAULT_PIN_RECORDS: u64 = 500_000;
+/// One read-ahead window: the whole `M/` range of repos up to ~35k records
+/// (28 B/record; the average active repo's ~0.5 MB). Larger caps measured
+/// no better (a 1M-record repo's 28 MB range costs more round trips than
+/// its path's point reads; tests/all/mst_lazy.rs `bench_cold_write`).
+pub const DEFAULT_PREFETCH_BYTES: usize = 1 << 20;
 
 impl From<usize> for CacheLimits {
     fn from(entries: usize) -> CacheLimits {
-        CacheLimits { entries, bytes: 0, pin_records: DEFAULT_PIN_RECORDS }
+        CacheLimits { entries, bytes: 0, pin_records: DEFAULT_PIN_RECORDS, lazy: false, prefetch_bytes: DEFAULT_PREFETCH_BYTES, unload_idle: false }
     }
 }
 
-fn new_view(head: &Head, tree: &Tree, nodes: &crate::mst::SharedNodeIndex) -> ViewCell {
+fn new_view(head: &Head, mst: &LazyTree, nodes: &crate::mst::SharedNodeIndex) -> ViewCell {
     Arc::new(parking_lot::RwLock::new(Arc::new(DurableView {
         head: head.clone(),
-        tree: tree.clone(),
+        tree: mst.tree.clone(),
         nodes: nodes.clone(),
+        lazy: mst.is_lazy(),
     })))
 }
 
@@ -419,6 +470,8 @@ struct Worker {
     clock_id: u64,
     /// Got [`WorkerMsg::Shutdown`]: exit after this batch.
     stop: bool,
+    /// Lazy repos charged over [`LAZY_REPO_MAX_BYTES`]: unloaded once idle.
+    big: HashSet<Arc<str>>,
 }
 
 impl Worker {
@@ -444,6 +497,7 @@ impl Worker {
             draining: HashMap::new(),
             clock_id: rand::random::<u64>() & 0x3ff,
             stop: false,
+            big: HashSet::new(),
         }
     }
 
@@ -531,8 +585,26 @@ impl Worker {
                     }
                     continue;
                 };
+                // a lazy repo's requests may visit paths it hasn't loaded:
+                // load them on the blocking pool first, not on this thread
+                let reqs = match lazy_needs(st, reqs) {
+                    Ok(reqs) => reqs,
+                    Err((reqs, Some(need))) => {
+                        self.start_fetch(did, reqs, need);
+                        continue;
+                    }
+                    Err((reqs, None)) => {
+                        tracing::error!(%did, "lazy MST walk failed, evicting repo");
+                        self.loading.insert(did.clone(), reqs);
+                        self.discard(did.clone());
+                        if !self.draining.contains_key(&did) {
+                            self.reload_buffered(&did);
+                        }
+                        continue;
+                    }
+                };
                 let wrote = reqs.iter().any(|q| matches!(q, Queued::Write(_)));
-                if let Err(e) = process(st, reqs, self.clock_id) {
+                if let Err(e) = process(st, reqs, self.clock_id, &self.rt) {
                     // MST errors mean in-memory state can't be trusted: drop it and
                     // reload from durable state, once nothing is in flight.
                     tracing::error!(%did, "commit failed, evicting repo: {e:#}");
@@ -604,7 +676,10 @@ impl Worker {
                                 metrics::REPO_LOADS.with_label_values(&["ok"]).inc();
                                 // preloaded from the L/ index: the key exists
                                 // (settle deletes it if it's stale)
-                                st.large |= preloaded_large;
+                                st.large |= preloaded_large && !self.limits.lazy;
+                                if st.backfill {
+                                    backfill_nodes(&mut st);
+                                }
                                 self.cache_put(did.clone(), st);
                                 self.settle(&did);
                                 order.push(did.clone());
@@ -629,7 +704,43 @@ impl Worker {
                     WorkerMsg::CreateRepo(req) => self.create_repo(req),
                     WorkerMsg::Shutdown => self.stop = true,
                     WorkerMsg::CacheInfo { did, reply } => {
-                        let _ = reply.send(self.cache.peek(&did).map(|st| CachedRepo { records: st.records(), large: st.large, charge: st.charge }));
+                        let _ = reply.send(self.cache.peek(&did).map(|st| CachedRepo {
+                            records: st.records(),
+                            loaded_nodes: crate::mst_lazy::loaded_nodes(&st.mst.tree.root),
+                            large: st.large,
+                            charge: st.charge,
+                        }));
+                    }
+                    WorkerMsg::Fetched { did, res } => {
+                        let buffered = self.loading.remove(&did).unwrap_or_default();
+                        match (self.cache.peek_mut(&did), res) {
+                            (Some(st), Ok(mst)) if st.fetching => {
+                                metrics::LAZY_MST_FETCHES.with_label_values(&["ok"]).inc();
+                                st.fetching = false;
+                                st.mst = *mst;
+                                order.push(did.clone());
+                                groups.insert(did, buffered);
+                            }
+                            (cached, res) => {
+                                // failed (a node or rebuilt leaf didn't match
+                                // its link, or the store failed), or dropped
+                                // meanwhile: reload from durable state once
+                                // nothing is in flight (the open falls back
+                                // to a rebuild from the records)
+                                if let Err(e) = &res {
+                                    tracing::error!(%did, "lazy MST fetch failed, evicting repo: {e}");
+                                    metrics::LAZY_MST_FETCHES.with_label_values(&["error"]).inc();
+                                }
+                                if let Some(st) = cached {
+                                    st.fetching = false;
+                                }
+                                self.loading.insert(did.clone(), buffered);
+                                self.discard(did.clone());
+                                if !self.draining.contains_key(&did) {
+                                    self.reload_buffered(&did);
+                                }
+                            }
+                        }
                     }
                     WorkerMsg::Preload { did, large, done } => {
                         if self.cache.contains(&did) || self.loading.contains_key(&did) || self.draining.contains_key(&did) {
@@ -700,13 +811,21 @@ impl Worker {
 
     fn start_load(&mut self, req: Queued) {
         let did = req.did().clone();
+        let need = self.limits.lazy.then(|| Need::of(std::slice::from_ref(&req)));
         self.loading.insert(did.clone(), vec![req]);
-        self.spawn_load(did);
+        self.spawn_load_with(did, need);
     }
 
     /// Loads `did` in the background (its `loading` entry is set); the
     /// result comes back as [`WorkerMsg::Loaded`].
     fn spawn_load(&mut self, did: Arc<str>) {
+        self.spawn_load_with(did, None)
+    }
+
+    /// [`spawn_load`](Self::spawn_load); a lazy open also loads what `need`
+    /// (the first request's) visits.
+    fn spawn_load_with(&mut self, did: Arc<str>, need: Option<Need>) {
+        let opts = LoadOpts { lazy: self.limits.lazy, prefetch_bytes: self.limits.prefetch_bytes, need };
         metrics::LOADING_REPOS.inc();
         let me = self.me.clone();
         let Some(partition) = (self.partitions)(&did) else {
@@ -718,7 +837,7 @@ impl Worker {
         };
         self.rt.spawn(async move {
             let t = Instant::now();
-            let res = load_repo(partition, did.clone()).await;
+            let res = load_repo_with(partition, did.clone(), opts).await;
             let _ = STATS
                 .load_us
                 .lock()
@@ -759,11 +878,18 @@ impl Worker {
     /// size. Crossing the threshold also writes or deletes its `L/` index
     /// key (a private-state log entry), so the next owner preloads it.
     fn settle(&mut self, did: &Arc<str>) {
-        let pin = self.limits.pin_records;
+        // lazy repos open with one read whatever their size: nothing to pin
+        let pin = if self.limits.lazy { 0 } else { self.limits.pin_records };
+        if self.big.contains(did) {
+            return; // charged as a whole tree until it is unloaded (`evict`)
+        }
         let Some(st) = self.cache.peek_mut(did) else { return };
         let records = st.records();
         let large = pin > 0 && records >= if st.large { pin / 2 } else { pin };
         let charge = repo_bytes(st, records);
+        if st.mst.is_lazy() && charge > LAZY_REPO_MAX_BYTES {
+            self.big.insert(did.clone());
+        }
         let (was_large, was_charge) = (st.large, st.charge);
         if charge == was_charge && large == was_large {
             return;
@@ -800,6 +926,9 @@ impl Worker {
     /// entry or byte budget. Pinned (large) repos and repos with commits in
     /// flight (durable state lags memory) are skipped.
     fn evict(&mut self) {
+        if self.limits.lazy {
+            self.unload_paths();
+        }
         let over = |n: usize, b: usize, l: &CacheLimits| n > l.entries || (l.bytes > 0 && b > l.bytes);
         let (mut n, mut b) = (self.cache.len() - self.pinned, self.bytes - self.pinned_bytes);
         if !over(n, b, &self.limits) {
@@ -810,7 +939,7 @@ impl Worker {
             if !over(n, b, &self.limits) || scanned > self.pinned + 1024 {
                 break;
             }
-            if st.large || st.pending.load(Ordering::Acquire) > 0 {
+            if st.large || st.fetching || st.pending.load(Ordering::Acquire) > 0 {
                 continue;
             }
             n -= 1;
@@ -821,6 +950,76 @@ impl Worker {
             self.cache_pop(&did);
             metrics::REPO_EVICTIONS.inc();
         }
+    }
+
+    /// Loads what `reqs` of a cached lazy repo visit on the blocking pool
+    /// (the paths of their keys and neighbours, the collection probes, or
+    /// the whole tree for an account delete / repo import), so the worker
+    /// thread never waits on the store. The repo's requests wait in
+    /// `loading` meanwhile, so its tree doesn't change; the loaded copy
+    /// replaces it on [`WorkerMsg::Fetched`] and the requests run then.
+    fn start_fetch(&mut self, did: Arc<str>, reqs: Vec<Queued>, need: Need) {
+        let Some(st) = self.cache.peek_mut(&did) else {
+            self.loading.insert(did.clone(), reqs);
+            self.reload_buffered(&did);
+            return;
+        };
+        st.fetching = true;
+        let mut mst = st.mst.clone();
+        let db = st.partition.db.clone();
+        let (rt, me, d) = (self.rt.clone(), self.me.clone(), did.clone());
+        self.loading.insert(did, reqs);
+        self.rt.spawn_blocking(move || {
+            let res = need.load(&mut mst, &*db, &d, &rt).map(|_| Box::new(mst));
+            let _ = me.send(WorkerMsg::Fetched { did: d, res });
+        });
+    }
+
+    /// The path cache of lazy repos: drops the loaded paths (back to the
+    /// root) of repos over [`LAZY_REPO_MAX_BYTES`], then of the least
+    /// recently used ones while the worker is over its byte budget. Only
+    /// repos with nothing in flight: their loaded nodes are then all in
+    /// durable state (`M/`, `R/`), so any can be read back, and the delete
+    /// check of a commit's persistence diff only needs the nodes its own
+    /// walks loaded.
+    fn unload_paths(&mut self) {
+        let idle = |st: &RepoState| st.pending.load(Ordering::Acquire) == 0 && !st.fetching && st.view.read().head.rev == st.head.rev;
+        let big: Vec<Arc<str>> = self.big.iter().cloned().collect();
+        for did in big {
+            let Some(st) = self.cache.peek_mut(&did) else {
+                self.big.remove(&did);
+                continue;
+            };
+            let was = st.charge;
+            if idle(st) {
+                unload_repo(st);
+            } else if !st.fetching && !unload_settled(st) {
+                continue; // a whole-tree entry in flight: wait for it
+            }
+            self.bytes = self.bytes - was + st.charge;
+            if st.charge <= LAZY_REPO_MAX_BYTES {
+                self.big.remove(&did);
+            }
+        }
+        let all = self.limits.unload_idle;
+        if !all && (self.limits.bytes == 0 || self.bytes - self.pinned_bytes <= self.limits.bytes) {
+            return;
+        }
+        let mut b = self.bytes - self.pinned_bytes;
+        let mut freed = 0;
+        for (scanned, (_, st)) in self.cache.iter_mut().rev().enumerate() {
+            if !all && (b <= self.limits.bytes || scanned > 4096) {
+                break;
+            }
+            if !idle(st) || crate::mst_lazy::loaded_nodes(&st.mst.tree.root) <= 1 {
+                continue;
+            }
+            let was = st.charge;
+            unload_repo(st);
+            b -= was - st.charge.min(was);
+            freed += was - st.charge.min(was);
+        }
+        self.bytes -= freed;
     }
 
     fn create_repo(&mut self, req: CreateRepoReq) {
@@ -857,6 +1056,7 @@ impl Worker {
                 return;
             }
         };
+        let lazy = self.limits.lazy;
         let rev = tid::next_rev(None, self.clock_id);
         let (commit, commit_block) = sign_commit(&req.did, &rev.to_string(), &data, &req.key);
         let head = Head {
@@ -905,6 +1105,9 @@ impl Worker {
                 });
             }
         }
+        if lazy {
+            replace_nodes_mutations(&req.did, HashMap::new(), &tree, &mut muts);
+        }
         muts.extend([
             Mutation {
                 key: state::account_key(&req.did).into(),
@@ -922,11 +1125,15 @@ impl Worker {
         let pending = Arc::new(AtomicU32::new(1));
         let reply = req.reply;
         let h2 = head.clone();
+        // a new lazy repo's whole tree is in flight until this applies
+        let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let a2 = applied.clone();
         let entry = LogEntry {
             shard: partition.id,
             frames,
             muts,
             ack: Some(Box::new(move |r| {
+                a2.store(true, Ordering::Release);
                 let _ = reply.send(
                     r.map(|_| h2)
                         .map_err(|e| WriteError::Internal(e.to_string())),
@@ -942,11 +1149,15 @@ impl Worker {
                 .or_insert(0) += 1;
         }
         let nodes = crate::mst::SharedNodeIndex::default();
-        let view = new_view(&head, &tree, &nodes);
+        let mst = if lazy { LazyTree::loaded(tree, 1) } else { LazyTree::full(tree) };
+        let view = new_view(&head, &mst, &nodes);
+        if lazy {
+            collections.clear();
+        }
         let st = RepoState {
             did: req.did.clone(),
             partition: partition.clone(),
-            tree,
+            mst,
             head,
             key: req.key,
             pending,
@@ -957,6 +1168,9 @@ impl Worker {
             nodes,
             large: false,
             charge: 0,
+            fetching: false,
+            backfill: false,
+            inflight: if lazy { [(applied, None)].into() } else { Default::default() },
         };
         let did = req.did.clone();
         self.cache_put(req.did, st);
@@ -965,6 +1179,165 @@ impl Worker {
         }
         self.settle(&did);
     }
+}
+
+/// What a lazy repo's queued requests visit: the keys they write (their
+/// paths and neighbours'), the collections they write (`coll/` probes for
+/// the collection index), or everything (an account delete or import).
+#[derive(Clone, Debug, Default)]
+pub struct Need {
+    keys: Vec<Vec<u8>>,
+    probes: Vec<Vec<u8>>,
+    all: bool,
+}
+
+impl Need {
+    fn of(reqs: &[Queued]) -> Need {
+        let mut n = Need::default();
+        for q in reqs {
+            match q {
+                Queued::Write(r) => {
+                    for w in &r.writes {
+                        let p = w.path();
+                        let probe = format!("{}/", collection_of(&p)).into_bytes();
+                        if !n.probes.contains(&probe) {
+                            n.probes.push(probe);
+                        }
+                        n.keys.push(p.into_bytes());
+                    }
+                }
+                Queued::Account(AccountReq { op: AccountOp::ReplaceRepo { .. } | AccountOp::Delete, .. }) => n.all = true,
+                Queued::Account(_) | Queued::Snapshot(_) => {}
+            }
+        }
+        n
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.probes.is_empty() && !self.all
+    }
+
+    /// Loads it into `mst` from `db` (blocking: the blocking pool only).
+    /// A persisted node found missing is an error too (the subtree was
+    /// rebuilt from records, but `M/` lacks it): the repo is then reopened,
+    /// which rebuilds the tree and backfills `M/`.
+    fn load<R: slatedb::DbReadOps + Sync + ?Sized>(&self, mst: &mut LazyTree, db: &R, did: &str, rt: &tokio::runtime::Handle) -> Result<(), crate::mst::MstError> {
+        let fallbacks = mst.stats.fallbacks;
+        if self.all && !mst.fully_loaded() {
+            // one forward scan of the records serves every unloaded leaf
+            let scan = ScanSource::open(db, did, DbSource::new(db, did, rt), rt)?;
+            mst.load_all(&scan)?;
+        }
+        let keys: Vec<&[u8]> = self.keys.iter().map(|k| &k[..]).collect();
+        let probes: Vec<&[u8]> = self.probes.iter().map(|k| &k[..]).collect();
+        mst.fetch(&keys, &probes, &DbSource::new(db, did, rt))?;
+        match mst.stats.fallbacks > fallbacks {
+            true => Err(crate::mst::MstError::Invalid("persisted MST nodes missing")),
+            false => Ok(()),
+        }
+    }
+}
+
+/// Whether a lazy repo's `reqs` run on its loaded paths alone: `Ok` (they
+/// do, or the repo isn't lazy), else what to load first (`Some`), or None
+/// if the walk failed (a node or leaf that doesn't match its link: the
+/// repo is reloaded).
+fn lazy_needs(st: &mut RepoState, reqs: Vec<Queued>) -> Result<Vec<Queued>, (Vec<Queued>, Option<Need>)> {
+    if !st.mst.is_lazy() {
+        return Ok(reqs);
+    }
+    let need = Need::of(&reqs);
+    if need.is_empty() {
+        return Ok(reqs);
+    }
+    if need.all && !st.mst.fully_loaded() {
+        return Err((reqs, Some(need)));
+    }
+    let keys: Vec<&[u8]> = need.keys.iter().map(|k| &k[..]).collect();
+    let probes: Vec<&[u8]> = need.probes.iter().map(|k| &k[..]).collect();
+    match st.mst.fetch(&keys, &probes, &crate::mst_store::CachedOnly) {
+        Ok(()) => Ok(reqs),
+        Err(crate::mst::MstError::NotLoaded) => Err((reqs, Some(need))),
+        Err(e) => {
+            tracing::error!(did = %st.did, "lazy MST walk failed: {e}");
+            Err((reqs, None))
+        }
+    }
+}
+
+/// Drops the loaded paths of a lazy repo with commits in flight, except the
+/// nodes those commits wrote (their state isn't applied yet). False if one
+/// of them replaces the whole tree. Recharges the repo.
+fn unload_settled(st: &mut RepoState) -> bool {
+    while st.inflight.front().is_some_and(|(done, _)| done.load(Ordering::Acquire)) {
+        st.inflight.pop_front();
+    }
+    let mut keep = HashSet::new();
+    for (_, nodes) in &st.inflight {
+        match nodes {
+            Some(n) => keep.extend(n.iter().copied()),
+            None => return false,
+        }
+    }
+    st.mst.unload_except(&keep);
+    metrics::LAZY_MST_UNLOADS.inc();
+    let records = st.records();
+    st.charge = repo_bytes(st, records);
+    true
+}
+
+/// Marks a lazy repo's log entry that writes MST state as in flight (see
+/// `RepoState::inflight`); the returned flag is set once it is applied.
+fn track_inflight(st: &mut RepoState, nodes: Option<HashSet<Cid>>) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+    if !st.mst.is_lazy() {
+        return None;
+    }
+    while st.inflight.front().is_some_and(|(done, _)| done.load(Ordering::Acquire)) {
+        st.inflight.pop_front();
+    }
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    st.inflight.push_back((done.clone(), nodes));
+    Some(done)
+}
+
+/// Drops a lazy repo's loaded paths (nothing of it in flight) and
+/// republishes its durable view without them (the view, at the same head,
+/// shares the nodes).
+fn unload_repo(st: &mut RepoState) {
+    st.inflight.clear();
+    st.mst.unload(0);
+    *st.view.write() = st.durable_view();
+    metrics::LAZY_MST_UNLOADS.inc();
+    let records = st.records();
+    st.charge = repo_bytes(st, records);
+}
+
+/// Writes the interior nodes of a lazy repo rebuilt from its records on open
+/// (its `M/` nodes were missing or wrong) through the log, so the next open
+/// reads them (replay included).
+fn backfill_nodes(st: &mut RepoState) {
+    st.backfill = false;
+    let mut muts = Vec::new();
+    replace_nodes_mutations(&st.did, HashMap::new(), &st.mst.tree, &mut muts);
+    if muts.is_empty() {
+        return;
+    }
+    let applied = track_inflight(st, None);
+    let ack: Option<crate::partition::AckFn> = applied.map(|a| -> crate::partition::AckFn { Box::new(move |_| a.store(true, Ordering::Release)) });
+    let entry = LogEntry { shard: st.partition.id, frames: Vec::new(), muts, ack, pending: Some(st.pending.clone()), enqueued: Instant::now() };
+    if let Err(e) = send_entry(st, entry) {
+        tracing::warn!(did = %st.did, "MST node backfill not logged: {e}");
+    }
+}
+
+/// How a cold open loads a repo.
+#[derive(Clone, Debug, Default)]
+pub struct LoadOpts {
+    /// Open the MST lazily (`--lazy-mst`): its root, plus what `need` visits.
+    pub lazy: bool,
+    /// Read up to this much of the repo's `M/` range with one scan first.
+    pub prefetch_bytes: usize,
+    pub need: Option<Need>,
 }
 
 /// Large-repo preloads in flight per node: each is a full repo scan (a 1M-
@@ -1065,9 +1438,18 @@ pub fn sign_commit(did: &str, rev: &str, data: &Cid, key: &Keypair) -> (Cid, Byt
     (Cid::dag_cbor(&signed), Bytes::from(signed))
 }
 
+/// Loads a repo with a fully loaded tree (the full-tree mode).
 pub async fn load_repo(
     partition: Arc<Partition>,
     did: Arc<str>,
+) -> anyhow::Result<Option<RepoState>> {
+    load_repo_with(partition, did, LoadOpts::default()).await
+}
+
+pub async fn load_repo_with(
+    partition: Arc<Partition>,
+    did: Arc<str>,
+    opts: LoadOpts,
 ) -> anyhow::Result<Option<RepoState>> {
     let db = &partition.db;
     let Some(hv) = db.get(state::head_key(&did)).await? else {
@@ -1080,20 +1462,65 @@ pub async fn load_repo(
         .ok_or_else(|| anyhow::anyhow!("head without account"))?;
     let acct: state::Account = serde_json::from_slice(&av)?;
     let key = Keypair::from_bytes(&hex::decode(&acct.signing_key)?)?;
-    let tree = load_tree(db, &did).await?;
     let mut collections: HashMap<String, u32> = HashMap::new();
-    tree.walk(&mut |k, _| {
-        if let Ok(path) = std::str::from_utf8(k) {
-            *collections
-                .entry(collection_of(path).to_string())
-                .or_insert(0) += 1;
-        }
-    });
+    let (mst, backfill) = if opts.lazy {
+        open_lazy(&partition, &did, &head, &opts).await?
+    } else {
+        let tree = load_tree(db, &did).await?;
+        tree.walk(&mut |k, _| {
+            if let Ok(path) = std::str::from_utf8(k) {
+                *collections
+                    .entry(collection_of(path).to_string())
+                    .or_insert(0) += 1;
+            }
+        });
+        (LazyTree::full(tree), false)
+    };
     let blob_refs = load_blob_refs(db, &did).await?;
-    let mut st = finish_load(partition.clone(), did, tree, head, key, acct)?;
+    let mut st = finish_load(partition.clone(), did, mst, head, key, acct)?;
     st.collections = collections;
     st.blob_refs = blob_refs;
+    st.backfill = backfill;
     Ok(Some(st))
+}
+
+/// Opens a repo's MST lazily: its `M/` range read ahead with one scan (up to
+/// `opts.prefetch_bytes`), the root, and the paths `opts.need` visits. A
+/// root that isn't persisted is a small repo (a leaf root, rebuilt from its
+/// few records) or one whose nodes are missing; a node or rebuilt leaf
+/// that doesn't match its link means `M/` is wrong. Both rebuild the whole
+/// tree from the records (no commit of the repo is in flight during a cold
+/// open, so `R/` is at the head), and the caller backfills `M/` (the bool).
+async fn open_lazy(partition: &Arc<Partition>, did: &Arc<str>, head: &Head, opts: &LoadOpts) -> anyhow::Result<(LazyTree, bool)> {
+    let _permit = LOAD_PERMITS.acquire().await?;
+    let (pre, _) = crate::mst_store::prefetch(&*partition.db, did, opts.prefetch_bytes).await?;
+    let (db, did, root, need) = (partition.db.clone(), did.clone(), head.data, opts.need.clone().unwrap_or_default());
+    let rt = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<(LazyTree, bool)> {
+        let src = DbSource::new(&*db, &did, &rt).with_prefetched(Some(&pre));
+        let opened = LazyTree::open(root, 1, &src).and_then(|mut t| {
+            need.load(&mut t, &*db, &did, &rt)?;
+            Ok(t)
+        });
+        let err = match opened {
+            Ok(t) if t.stats.node_reads == 0 && t.tree.root.height >= 1 => "missing",
+            Ok(t) => return Ok((t, false)),
+            Err(crate::mst::MstError::Store(e)) => anyhow::bail!("lazy MST open: {e}"),
+            Err(crate::mst::MstError::Invalid("persisted MST nodes missing")) => "missing_node",
+            Err(e) => {
+                tracing::warn!(%did, "lazy MST open failed ({e}): rebuilding from records");
+                "invalid"
+            }
+        };
+        metrics::LAZY_MST_FALLBACKS.with_label_values(&[err]).inc();
+        let mut recs = Vec::new();
+        src.records(None, None, &mut recs)?;
+        let mut t = LazyTree::loaded(crate::mst_lazy::build_tree(&recs)?, 1);
+        let r = t.tree.root_cid()?;
+        anyhow::ensure!(r == root, "MST rebuilt from records {r} != head data {root}");
+        Ok((t, true))
+    })
+    .await?
 }
 
 async fn load_blob_refs(db: &slatedb::Db, did: &str) -> anyhow::Result<HashMap<String, Vec<Cid>>> {
@@ -1147,23 +1574,23 @@ pub async fn load_tree(db: &slatedb::Db, did: &str) -> anyhow::Result<Tree> {
 fn finish_load(
     partition: Arc<Partition>,
     did: Arc<str>,
-    mut tree: Tree,
+    mut mst: LazyTree,
     head: Head,
     key: Keypair,
     account: state::Account,
 ) -> anyhow::Result<RepoState> {
-    let root = tree.root_cid()?;
+    let root = mst.tree.root_cid()?;
     anyhow::ensure!(
         root == head.data,
         "rebuilt MST root {root} != head data {}",
         head.data
     );
     let nodes = crate::mst::SharedNodeIndex::default();
-    let view = new_view(&head, &tree, &nodes);
+    let view = new_view(&head, &mst, &nodes);
     Ok(RepoState {
         did,
         partition,
-        tree,
+        mst,
         head,
         key: Arc::new(key),
         pending: Arc::new(AtomicU32::new(0)),
@@ -1174,6 +1601,9 @@ fn finish_load(
         nodes,
         large: false,
         charge: 0,
+        fetching: false,
+        backfill: false,
+        inflight: Default::default(),
     })
 }
 
@@ -1205,6 +1635,9 @@ struct Batch {
     /// Blob refs of each path's latest value in this batch.
     blobs: HashMap<String, Vec<Cid>>,
     waiters: Vec<(WriteReply, Vec<WriteOutcome>)>,
+    /// Lazy repos: whether each collection the batch writes had records
+    /// before it (the `C/` index changes where that differs after it).
+    colls: BTreeMap<String, bool>,
 }
 
 impl Batch {
@@ -1215,6 +1648,7 @@ impl Batch {
             record_bytes: 0,
             blobs: HashMap::new(),
             waiters: Vec::new(),
+            colls: BTreeMap::new(),
         }
     }
     fn is_empty(&self) -> bool {
@@ -1232,7 +1666,20 @@ fn valid_path_part(s: &str) -> bool {
 }
 
 /// Coalesces a repo's queued write requests into as few commits as possible.
-fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Result<()> {
+fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, rt: &tokio::runtime::Handle) -> anyhow::Result<()> {
+    // a lazy repo's paths were loaded before (`lazy_needs`); the source
+    // reads only if an op still finds one missing (rare: metered)
+    let (part, did) = (st.partition.clone(), st.did.clone());
+    let db_src = DbSource::new(&*part.db, &did, rt);
+    let r = process_with(st, reqs, clock_id, &db_src);
+    if db_src.reads.get() > 0 {
+        // the fetch before missed something: reads on the worker thread
+        metrics::LAZY_MST_FETCHES.with_label_values(&["inline"]).inc_by(db_src.reads.get());
+    }
+    r
+}
+
+fn process_with(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, src: &dyn Source) -> anyhow::Result<()> {
     let mut batch = Batch::new();
     for q in reqs {
         let req = match q {
@@ -1248,9 +1695,9 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Resu
             }
             Queued::Account(a) => {
                 if !batch.is_empty() {
-                    flush(st, std::mem::replace(&mut batch, Batch::new()), clock_id)?;
+                    flush(st, std::mem::replace(&mut batch, Batch::new()), clock_id, src)?;
                 }
-                apply_account(st, a, clock_id)?;
+                apply_account(st, a, clock_id, src)?;
                 continue;
             }
         };
@@ -1269,7 +1716,7 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Resu
         if let Some(sc) = req.swap_commit {
             // swapCommit must be evaluated against a real commit boundary
             if !batch.is_empty() {
-                flush(st, std::mem::replace(&mut batch, Batch::new()), clock_id)?;
+                flush(st, std::mem::replace(&mut batch, Batch::new()), clock_id, src)?;
             }
             if sc != st.head.commit {
                 let _ = req.reply.send(Err(WriteError::InvalidSwap(format!(
@@ -1294,9 +1741,9 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Resu
             && (batch.ops.len() + new_paths > MAX_COMMIT_OPS
                 || batch.record_bytes + incoming_bytes > MAX_COMMIT_RECORD_BYTES)
         {
-            flush(st, std::mem::replace(&mut batch, Batch::new()), clock_id)?;
+            flush(st, std::mem::replace(&mut batch, Batch::new()), clock_id, src)?;
         }
-        match validate(st, &req.writes, &paths) {
+        match validate(st, &req.writes, &paths, src) {
             Ok(()) => {}
             Err(e) => {
                 let _ = req.reply.send(Err(e));
@@ -1305,6 +1752,11 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Resu
         }
         let mut outcomes = Vec::with_capacity(req.writes.len());
         for (w, path) in req.writes.into_iter().zip(paths) {
+            if st.mst.is_lazy() && !batch.colls.contains_key(collection_of(&path)) {
+                let coll = collection_of(&path);
+                let had = st.mst.has_prefix(format!("{coll}/").as_bytes(), src)?;
+                batch.colls.insert(coll.to_string(), had);
+            }
             match w {
                 Write::Create {
                     cid, bytes, blobs, ..
@@ -1312,7 +1764,7 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Resu
                 | Write::Update {
                     cid, bytes, blobs, ..
                 } => {
-                    let prev = st.tree.insert(path.as_bytes(), cid)?;
+                    let prev = st.mst.insert(path.as_bytes(), cid, src)?;
                     batch.ops.entry(path.clone()).or_insert((prev, None)).1 = Some(cid);
                     batch.blobs.insert(path.clone(), blobs);
                     batch.record_bytes += bytes.len();
@@ -1324,7 +1776,7 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Resu
                     });
                 }
                 Write::Delete { .. } => {
-                    let prev = st.tree.remove(path.as_bytes())?;
+                    let prev = st.mst.remove(path.as_bytes(), src)?;
                     if prev.is_some() {
                         batch.blobs.remove(&path);
                         batch.ops.entry(path).or_insert((prev, None)).1 = None;
@@ -1336,14 +1788,14 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Resu
         batch.waiters.push((req.reply, outcomes));
     }
     if !batch.is_empty() {
-        flush(st, batch, clock_id)?;
+        flush(st, batch, clock_id, src)?;
     }
     Ok(())
 }
 
 /// Checks a request against the current tree (including earlier writes in
 /// the batch) without mutating anything, so applyWrites stays atomic.
-fn validate(st: &RepoState, writes: &[Write], paths: &[String]) -> Result<(), WriteError> {
+fn validate(st: &mut RepoState, writes: &[Write], paths: &[String], src: &dyn Source) -> Result<(), WriteError> {
     let mut overlay: HashMap<&str, Option<Cid>> = HashMap::new();
     for (w, path) in writes.iter().zip(paths) {
         let (coll, rkey) = match w {
@@ -1365,8 +1817,8 @@ fn validate(st: &RepoState, writes: &[Write], paths: &[String]) -> Result<(), Wr
         let cur = match overlay.get(path.as_str()) {
             Some(v) => *v,
             None => st
-                .tree
-                .get(path.as_bytes())
+                .mst
+                .get(path.as_bytes(), src)
                 .map_err(|e| WriteError::Internal(e.to_string()))?,
         };
         let check_swap = |swap: &Option<Option<Cid>>| -> Result<(), WriteError> {
@@ -1412,23 +1864,35 @@ fn validate(st: &RepoState, writes: &[Write], paths: &[String]) -> Result<(), Wr
 }
 
 /// Builds, signs and enqueues one commit for the batch.
-fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> {
+fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> anyhow::Result<()> {
     let build_start = Instant::now();
     let mut mst_blocks = Vec::with_capacity(16);
     let prev_data = st.head.data;
-    // once getBlocks has asked for node blocks, report where written nodes sit
+    let lazy = st.mst.is_lazy();
+    // the collection index of a lazy repo: whether each written collection
+    // still (or now) has keys
+    let mut coll_muts = Vec::new();
+    for (coll, had) in &batch.colls {
+        let has = st.mst.has_prefix(format!("{coll}/").as_bytes(), src)?;
+        if has != *had {
+            coll_muts.push(Mutation { key: state::collection_key(coll, &st.did).into(), val: has.then(Bytes::new) });
+        }
+    }
+    // once getBlocks has asked for node blocks, report where written nodes
+    // sit (a lazy repo's interior nodes come from `M/`, its leaves this way)
     let mut node_refs = st.nodes.lock().wanted.then(Vec::new);
-    let data = match &mut node_refs {
-        Some(refs) => st.tree.write_diff_blocks_with_refs(&mut mst_blocks, refs)?,
-        None => st.tree.write_diff_blocks(&mut mst_blocks)?,
-    };
+    let (data, persist) = st.mst.write_diff_blocks_with_refs(&mut mst_blocks, node_refs.as_mut())?;
     // A batch that nets to no change (e.g. deleting a missing record) leaves no
     // dirty nodes; the commit's CAR must still carry the root node so it can be
     // loaded and verified.
+    let mut persist = persist;
     if !mst_blocks.iter().any(|(c, _)| *c == data) {
-        if let Some(root) = st.tree.proof_blocks(b"_")?.into_iter().next() {
-            mst_blocks.push(root);
+        let root = st.mst.tree.root_block()?;
+        // replay derives a put of it from the CAR (an interior root)
+        if lazy && st.mst.tree.root.height >= st.mst.persist_min() && !st.mst.tree.root.entries.is_empty() {
+            persist.puts.push(root.clone());
         }
+        mst_blocks.push(root);
     }
     let rev = tid::next_rev(Some(st.head.rev), clock_id);
     let rev_s = rev.to_string();
@@ -1506,6 +1970,18 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
         key: state::head_key(&st.did).into(),
         val: Some(head.encode()),
     });
+    if lazy {
+        // `M/` holds exactly the interior nodes of the tree at `h/`: put the
+        // commit's (derived from its CAR at replay: `persisted_blocks`, the
+        // debug check below), delete the replaced ones
+        for (c, b) in std::mem::take(&mut persist.puts) {
+            muts.push(Mutation { key: state::mst_node_key(&st.did, &c).into(), val: Some(Bytes::from(b)) });
+        }
+        for c in &persist.deletes {
+            extra.push(Mutation { key: state::mst_node_key(&st.did, c).into(), val: None });
+        }
+        extra.append(&mut coll_muts);
+    }
     let derived = muts.len();
     muts.append(&mut extra);
 
@@ -1525,7 +2001,7 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
     {
         let mut f = Vec::new();
         frame.finish(0, &mut f);
-        let d = crate::segment::derive_commit_muts(&f).expect("derive commit muts");
+        let d = crate::segment::derive_commit_muts_n(&f, derived).expect("derive commit muts");
         assert!(
             d.len() == derived && d.iter().zip(&muts).all(|(a, b)| a.key == b.key && a.val == b.val),
             "muts derived from the #commit frame differ from the commit's"
@@ -1550,6 +2026,7 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
     }
     st.head = head;
     st.pending.fetch_add(1, Ordering::AcqRel);
+    let applied = track_inflight(st, Some(mst_blocks.iter().map(|(c, _)| *c).collect()));
 
     let waiters = batch.waiters;
     let (view, snap) = (st.view.clone(), st.durable_view());
@@ -1560,6 +2037,9 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64) -> anyhow::Result<()> 
         ack: Some(Box::new(move |r| {
             if r.is_ok() {
                 *view.write() = snap;
+            }
+            if let Some(a) = applied {
+                a.store(true, Ordering::Release);
             }
             for (reply, results) in waiters {
                 let _ = reply.send(match &r {
@@ -1600,7 +2080,9 @@ fn index_mutations(
     muts: &mut Vec<Mutation>,
 ) {
     let coll = collection_of(path);
-    if !existed && exists {
+    if st.mst.is_lazy() {
+        // a lazy repo's collection index changes at flush (`Batch::colls`)
+    } else if !existed && exists {
         let n = st.collections.entry(coll.to_string()).or_insert(0);
         *n += 1;
         if *n == 1 {
@@ -1663,10 +2145,17 @@ fn head_ack(
     })
 }
 
-/// Mutations deleting every record (and its index entries) currently in the repo.
-fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>) {
+/// Mutations deleting every record (and its index entries) currently in the
+/// repo. A lazy repo loads the rest of its tree for it (the fetch before
+/// the op normally did) and returns its persisted (interior) nodes, whose
+/// `M/` keys the caller deletes or keeps.
+fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>, src: &dyn Source) -> anyhow::Result<HashMap<Cid, Arc<[u8]>>> {
+    if !st.mst.fully_loaded() {
+        st.mst.load_all(src)?;
+    }
     let did = st.did.clone();
-    st.tree.walk(&mut |k, cid| {
+    let mut colls = std::collections::BTreeSet::new();
+    st.mst.tree.walk(&mut |k, cid| {
         if let Ok(path) = std::str::from_utf8(k) {
             muts.push(Mutation {
                 key: state::record_key(&did, path).into(),
@@ -1676,9 +2165,12 @@ fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>) {
                 key: state::record_cid_key(&did, &cid, path).into(),
                 val: None,
             });
+            if !colls.contains(collection_of(path)) {
+                colls.insert(collection_of(path).to_string());
+            }
         }
     });
-    for coll in st.collections.keys() {
+    for coll in &colls {
         muts.push(Mutation {
             key: state::collection_key(coll, &did).into(),
             val: None,
@@ -1694,6 +2186,19 @@ fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>) {
     }
     st.collections.clear();
     st.blob_refs.clear();
+    Ok(if st.mst.is_lazy() { crate::mst_lazy::persisted_nodes(&st.mst.tree, st.mst.persist_min()) } else { HashMap::new() })
+}
+
+/// `M/` mutations replacing a lazy repo's persisted nodes `old` by those of
+/// the (written, fully loaded) `tree`.
+fn replace_nodes_mutations(did: &str, old: HashMap<Cid, Arc<[u8]>>, tree: &Tree, muts: &mut Vec<Mutation>) {
+    let new = crate::mst_lazy::persisted_nodes(tree, 1);
+    for c in old.keys().filter(|c| !new.contains_key(c)) {
+        muts.push(Mutation { key: state::mst_node_key(did, c).into(), val: None });
+    }
+    for (c, b) in new {
+        muts.push(Mutation { key: state::mst_node_key(did, &c).into(), val: Some(Bytes::copy_from_slice(&b)) });
+    }
 }
 
 /// Runs `mutate` on a copy of the current account: Some(next) = persist it,
@@ -1706,10 +2211,11 @@ fn mutate_account(st: &RepoState, mutate: AccountMutation) -> Result<Option<stat
     Ok(mutate(&mut next)?.then_some(next))
 }
 
-fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::Result<()> {
+fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn Source) -> anyhow::Result<()> {
     let time = events::now_rfc3339();
     let mut frames = Vec::new();
     let mut muts = Vec::new();
+    let whole_tree = matches!(req.op, AccountOp::ReplaceRepo { .. } | AccountOp::Delete);
     match req.op {
         AccountOp::Update {
             mutate,
@@ -1794,10 +2300,15 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
                     .send(Err(WriteError::RepoInactive(status.clone())));
                 return Ok(());
             }
-            clear_repo_mutations(st, &mut muts);
+            let old_nodes = clear_repo_mutations(st, &mut muts, src)?;
+            let lazy = st.mst.is_lazy();
             let rev = tid::next_rev(Some(st.head.rev), clock_id);
             let mut tree = Tree::new();
+            let mut colls = HashSet::new();
             for (path, cid, bytes, blobs) in &records {
+                if lazy && colls.insert(collection_of(path)) {
+                    muts.push(Mutation { key: state::collection_key(collection_of(path), &st.did).into(), val: Some(Bytes::new()) });
+                }
                 tree.insert_no_proof(path.as_bytes(), *cid)?;
                 muts.push(Mutation {
                     key: state::record_key(&st.did, path).into(),
@@ -1810,6 +2321,9 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
                 index_mutations(st, rev.0, path, false, true, Some(blobs), &mut muts);
             }
             let data = tree.root_cid()?;
+            if lazy {
+                replace_nodes_mutations(&st.did, old_nodes, &tree, &mut muts);
+            }
             let (commit, commit_block) = sign_commit(&st.did, &rev.to_string(), &data, &st.key);
             // a deactivated account (mid-migration) is announced with #sync
             // when activated (reference importRepo sequences nothing)
@@ -1824,7 +2338,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
                     &time,
                 ));
             }
-            st.tree = tree;
+            st.mst = if lazy { LazyTree::loaded(tree, 1) } else { LazyTree::full(tree) };
             st.head = Head {
                 commit,
                 data,
@@ -1837,8 +2351,11 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
             });
         }
         AccountOp::Delete => {
-            clear_repo_mutations(st, &mut muts);
-            st.tree = Tree::new();
+            let old_nodes = clear_repo_mutations(st, &mut muts, src)?;
+            for c in old_nodes.keys() {
+                muts.push(Mutation { key: state::mst_node_key(&st.did, c).into(), val: None });
+            }
+            st.mst = if st.mst.is_lazy() { LazyTree::loaded(Tree::new(), 1) } else { LazyTree::full(Tree::new()) };
             muts.push(Mutation {
                 key: state::head_key(&st.did).into(),
                 val: None,
@@ -1860,6 +2377,10 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
             st.account.status = Some("deleted".into());
         }
     }
+    let applied = match whole_tree {
+        true => track_inflight(st, None),
+        false => None,
+    };
     let entry = LogEntry {
         shard: st.partition.id,
         frames,
@@ -1871,6 +2392,9 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64) -> anyhow::
             Box::new(move |r| {
                 if r.is_ok() {
                     *view.write() = snap;
+                }
+                if let Some(a) = applied {
+                    a.store(true, Ordering::Release);
                 }
                 // applied (acks follow the state apply): drop cached copies
                 // of the account (status, signing key)
@@ -2044,14 +2568,14 @@ mod tests {
                 "did": &*did, "handle": "t.test", "signing_key": hex::encode(key.to_bytes()), "password_hash": "", "created_at": "",
             }))
             .unwrap();
-            let mut st = finish_load(part.clone(), did.clone(), tree, head, key, acct).unwrap();
+            let mut st = finish_load(part.clone(), did.clone(), LazyTree::full(tree), head, key, acct).unwrap();
             if records > 0 {
                 st.collections.insert("c.x".into(), records);
             }
             (did, st)
         };
         let small_bytes = REPO_BASE_BYTES + 10 * MST_BYTES_PER_RECORD;
-        let limits = CacheLimits { entries: 100, bytes: 3 * small_bytes, pin_records: 50 };
+        let limits = CacheLimits { entries: 100, bytes: 3 * small_bytes, pin_records: 50, ..CacheLimits::from(0) };
         let (me, _rx) = crossbeam_channel::unbounded();
         let mut w = Worker::new(0, me, Arc::new(|_: &str| None), tokio::runtime::Handle::current(), limits);
         let big = repo("big", 60);
@@ -2131,11 +2655,21 @@ mod tests {
     /// CPU per commit of the worker's commit path (validate, MST insert,
     /// diff blocks + node refs, sign, CAR, #commit frame, mutations) plus
     /// its ack (durable view swap), one createRecord per commit, on repos
-    /// of 20 / 5000 TID-keyed posts. Measurement only:
+    /// of 20 / 5000 TID-keyed posts, in both MST modes (lazy: the no-I/O
+    /// fetch pass, the neighbour walks, `M/` puts/deletes and collection
+    /// probes, on a tree whose paths are loaded), with the state bytes
+    /// (keys + values written to SlateDB) and the segment bytes (frame +
+    /// stored muts) per commit. Measurement only:
     /// `cargo test --release --lib bench_commit_cpu -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn bench_commit_cpu() {
+        for lazy in [false, true] {
+            bench_commit_cpu_mode(lazy);
+        }
+    }
+
+    fn bench_commit_cpu_mode(lazy: bool) {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         let (part, mut rx) = rt.block_on(async {
             let store = crate::store::Store::memory(None);
@@ -2164,18 +2698,28 @@ mod tests {
                 "did": &*did, "handle": "t.test", "signing_key": hex::encode(key.to_bytes()), "password_hash": "", "created_at": "",
             }))
             .unwrap();
-            let mut st = finish_load(part.clone(), did.clone(), tree, head, key, acct).unwrap();
-            st.collections.insert("app.bsky.feed.post".into(), records as u32);
-            st.nodes.lock().wanted = true;
+            let mst = if lazy { LazyTree::loaded(tree, 1) } else { LazyTree::full(tree) };
+            let mut st = finish_load(part.clone(), did.clone(), mst, head, key, acct).unwrap();
+            if !lazy {
+                st.collections.insert("app.bsky.feed.post".into(), records as u32);
+                st.nodes.lock().wanted = true;
+            }
             let mut next = records;
+            let (mut state_bytes, mut seg_bytes, mut commits) = (0usize, 0usize, 0usize);
             let mut one = |st: &mut RepoState| {
                 let rkey = tid(next);
                 next += 1;
                 let bytes = Bytes::from(format!("{{\"$type\":\"app.bsky.feed.post\",\"text\":\"post {rkey} {}\",\"createdAt\":\"2026-10-01T00:00:00.000Z\"}}", "x".repeat(120)));
                 let (reply, _rx) = oneshot::channel();
                 let w = Write::Create { collection: "app.bsky.feed.post".into(), rkey, cid: Cid::dag_cbor(&bytes), bytes, blobs: Vec::new() };
-                process(st, vec![Queued::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None })], 7).unwrap();
+                let reqs = vec![Queued::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None })];
+                let Ok(reqs) = lazy_needs(st, reqs) else { panic!("paths not loaded") };
+                process(st, reqs, 7, rt.handle()).unwrap();
                 while let Ok(e) = rx.try_recv() {
+                    commits += 1;
+                    state_bytes += e.muts.iter().map(|m| m.key.len() + m.val.as_ref().map_or(0, |v| v.len())).sum::<usize>();
+                    let derived = e.frames.first().map_or(0, |f| f.derived_muts);
+                    seg_bytes += e.frames.iter().map(|f| f.len_hint()).sum::<usize>() + e.muts[derived..].iter().map(|m| 6 + m.key.len() + m.val.as_ref().map_or(0, |v| v.len())).sum::<usize>();
                     settle(e);
                 }
             };
@@ -2193,7 +2737,12 @@ mod tests {
                 }
                 best = best.min((thread_cpu() - t) / n as f64 * 1e6);
             }
-            println!("bench_commit_cpu records={records}: {best:.2} us/commit (thread CPU, best of {rounds})");
+            println!(
+                "bench_commit_cpu {} records={records}: {best:.2} us/commit (thread CPU, best of {rounds}); {} state B/commit, {} segment B/commit",
+                if lazy { "lazy" } else { "full" },
+                state_bytes / commits.max(1),
+                seg_bytes / commits.max(1)
+            );
         }
     }
 }

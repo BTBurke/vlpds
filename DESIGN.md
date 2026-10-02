@@ -67,6 +67,12 @@ uploading, ack both in order), and **no per-commit MST storage churn**.
   - every write in the batch is acked with the shared commit cid/rev.
 
 ### 2. MST is derived state, not stored
+> **The default is now lazy MSTs (`--lazy-mst`, "Partial MSTs" below):**
+> interior nodes (height >= 1) are also persisted, under `M/`, in each
+> commit's state batch, and the worker holds only the paths writes visit.
+> This section describes the full-tree mode (`--lazy-mst=false`), which
+> stays for comparison; leaves are still derived from `R/` in both.
+
 The MST is fully determined by the set of `(key, record CID)` pairs. So:
 - Only **records** are persisted (`R/{did}/{collection}/{rkey}` → cid + bytes).
 - On cold load: range-scan the repo's records (contiguous in the LSM, usually 1–2
@@ -157,8 +163,12 @@ swappable.
     first 8 bytes of the CID's digest). Written in the same batch as the `R/` key,
     one per path (a CID can sit at several). A lookup prefix-scans
     `c/{did}\0{cid8}` on the snapshot and checks each path's record CID.
-  - `a/{did}`, `n/{handle}` → account; `k/{did}` → signing key (plaintext in the
-    prototype; KMS-wrapped later)
+  - `M/{did}\0{cid digest}` → MST node block (lazy MSTs): exactly the
+    interior nodes of the tree at `h/{did}`'s data root, put and deleted in
+    the commit's batch (puts derived from the #commit CAR at replay).
+  - `a/{did}`, `n/{handle}` → account. The account row carries the repo
+    signing key (`Account::signing_key`, plaintext in the prototype;
+    KMS-wrapped later), so account rows in log segments carry it too.
   - `meta/applied_seq`
 - Reads (`getRecord`, `listRecords`, `describeRepo`) → SlateDB (memtable → block
   cache → local disk cache → S3).
@@ -1110,64 +1120,94 @@ SlateDB state, XRPC and OAuth are unchanged.
 
 ## Initial deployment sizing: Bluesky scale with headroom
 
-Baseline today: **~50 M accounts, ~1.5 M accounts writing per day, 500–2,000
-commits/s at daily peak.**
-Design headroom: **100× write activity** (→ ~200k commits/s peak) and
-**20× general activity** (→ ~1 B accounts, ~30 M daily writers, 20× reads,
-proxy traffic and concurrently active repos).
+Measured load (ClickHouse, 2026-09-24..30; bench/results/cost-model-2026-10-02
+"Inputs"): **334 commits/s on average, ~420/s in the peak hour, ~900/s in
+minute bursts** (each record op counted as one commit). **56 M** repos are
+hosted on Bluesky's PDSes, holding **23.9 B** records at 154 B/record of
+zstd SST state (bench/results/storage-2026-10-02). Proxied AppView traffic
+is an assumption: **20k req/s** fleet-wide. One user's session on a
+production PDS averaged ~5 KB per proxied response (compressed), so that is
+~0.8 Gbit/s each direction. Headroom is planned at **10×**; 100× writes are
+priced in the cost model (8 nodes / 1,024 shards) and designed for in
+"Planet scale".
 
-| Dimension | Today | With headroom | Basis |
+| Dimension | Today | 10× | Basis |
 |---|---|---|---|
-| Accounts | 50 M | 1 B | 20× |
-| Commits/s (peak) | 0.5–2k | 200k | 100× |
-| Concurrently active repos | ~50k | ~1 M | 20× |
-| Proxy + read req/s | ~50–100k | 1–2 M | 20× |
-| Firehose events/s | ~2k (~3 MB/s) | 200k (~300 MB/s per subscriber) | 100× |
-| Repo state in S3 | ~15 TB | ~300 TB | ~300 KB avg repo |
+| Repos | 56 M | ~560 M | PLC DIDs on `*.bsky.network` |
+| Commits/s | 334 avg, ~420 peak hour, ~900 burst | 3.3k / 4.2k / 9k | `repo_records` ops/day |
+| Proxied req/s | 20k (assumed) | 200k | |
+| Proxy bandwidth, each direction | ~0.8 Gbit/s | ~8 Gbit/s | ~5 KB per response |
+| One full firehose subscriber | ~12 Mbit/s | ~120 Mbit/s | ~4.5 KB frame per commit |
+| Repo state (zstd SSTs) | 3.7 TB live (+25% replaced SSTs), +~4 GB/day | +~40 GB/day | 154 B/record + 323 B/repo |
+| Log, 72 h retention | ~234 GB | ~2.3 TB | 5,370 B/commit, ~2.7 KB stored |
 
-### Owner (write) nodes
-- **Throughput.** Measured ~75k commits/s on 6 cores of an M4 Pro, which is
-  roughly 12k commits/s per core including HTTP.
-  - Today's 2k/s needs well under one core; HA alone sets the minimum at
-    **3 nodes**.
-  - At 100× (200k/s) that's ~17 cores of commit work. With 50% headroom and
-    the loss of one node, plan **5–6 × 16 vCPU / 64 GB** (e.g. c7g/m7g.4xlarge).
-- **Memory.** About 1 M active repos at 20× × ~150 KB of in-memory MST is
-  ~150 GB cluster-wide, ~25–30 GB per node at 6 nodes. A more compact node
-  representation could cut this 2–3×.
-- **Shards.** 65,536 hash slots grouped into **256 shards** (~200k accounts
-  per shard today, ~4 M at 1 B accounts). That's ~85 shards per node today
-  and ~40 at 6 nodes, which leaves enough granularity to rebalance and to
-  split shards up to the planet-scale design.
+### CPU
+| Unit | Cost | Today | 10× |
+|---|---|---|---|
+| Commit (whole node: HTTP, MST, signing, log, apply) | ~96 µs | 0.03 cores (0.09 at bursts) | 0.3 (0.9) |
+| Proxied request | ~50 µs | ~1 core | ~10 |
+| Login (Argon2) | ~20 ms | ~1.2 (5 M logins/day, assumed) | ~12 |
+| **Busy cores, fleet-wide** | | **~3** | **~25** |
 
-### Log and storage
-- **Per-node log is needed early, for cost.**
-  - With per-shard logs, PUT rate ≈ min(write rate, shards / PUT latency).
-    At today's 2k commits/s nearly every commit is its own PUT: ~2k PUT/s
-    ≈ **$26k/month**. At 100× it's ~10k PUT/s ≈ $130k/month.
-  - A per-node log costs ~nodes × 40 PUT/s = ~120–240 PUT/s ≈ **$1.5–3k/month**
-    at any write rate, and gives larger segments.
-- **S3 Standard for everything** (log, SlateDB state, blobs; no S3 Express).
-  It survives an AZ loss: ~40–50 ms p50 commit ack, ~150 ms p99 (measured with
-  an S3-like latency model).
-- **SlateDB state** sits on S3 Standard with each node's NVMe as the SST
-  disk cache.
-- **Log retention** is ~72 h for firehose backfill: ~1.5 TB today, ~150 TB at
-  100× before compression, about half that stored (`src/retention.rs`,
-  "Log retention" and "Log compression" above). Single-record commits
-  take ~2.3–3.3 KB of segment (repos of 300–500 records; the MST path nodes
-  in the CAR dominate): the record and head values aren't stored twice, they
-  are rebuilt from the commit's CAR at replay (`segment::derive_commit_muts`).
+Logins and proxying set the CPU, not commits. Sizing rule: after losing
+one node, the survivors stay under ~60% CPU, i.e.
+(nodes − 1) × cores × 0.6 ≥ busy cores.
+
+### Nodes
+- **Today: 3 × (6–8 cores, 32 GB, ~1 TB NVMe, 3–10 Gbit/s)**, e.g. OVH
+  Advance-1 (EPYC 4244P, 6 cores, $147/mo). Two nodes would suffice for HA:
+  leases and assignments are CAS on object-store objects, with no quorum.
+  The third is for the 60% rule and growth. **Add a fourth node at ~2.4×
+  today's load** (~7 busy cores = 2 survivors × 6 cores × 60%).
+- **At 10× (~25 busy cores): 3 × 24 cores / 128 GB, or ~8 Advance-1**
+  (7 survivors × 6 cores × 60% ≈ 25).
+- **Memory.** 32 GB requires partial MSTs ("Partial MSTs") and a
+  `--repo-cache-mb` well below its 16 GB default (the block cache adds
+  4 GB + a quarter for metadata by default). Full trees at ~240 B/record
+  don't fit: one hour of real writers is ~850 GB of trees. With partial
+  MSTs, a day's writers' paths are ~5 GB per node today and ~50–75 GB at
+  10× on 3 nodes (hence 128 GB). The persisted interior nodes (`M/`,
+  +28 B/record) are ~220 GB per node's share at 3 nodes; they live in the
+  object store, and the NVMe disk cache holds the hot part.
+- **Network.** Proxying is ~0.27 Gbit/s per node each direction today, and
+  ~2.7 Gbit/s at 10× on 3 nodes (~1 Gbit/s on 8). Each full firehose
+  subscriber adds ~12 Mbit/s (~120 at 10×).
+- **Shards.** 65,536 hash slots in **256 shards** (~220k repos each).
+  Shard count drives the object-store bill (polling, GC and checkpoint
+  flushes are per shard), so keep 256 and split hot or large shards online.
+
+### Object store
+- **~$2.5k/mo on S3 (~$2.2k on R2, ~$2.5k on GCS)** at 3 nodes / 256
+  shards with the latency-neutral defaults (10 s manifest poll, 30 s
+  compactor polls, idle checkpoints skipped), in-region
+  (bench/results/cost-model-2026-10-02, "Defaults changed"). Requests
+  dominate: segment PUTs (~27/s per node at any load up to ~20k
+  commits/s/node), checkpoint flushes plus compaction, and polling.
+  Storage (~4.9 TB: state, replaced SSTs, 72 h of log) is ~$110/mo.
+  8 nodes / 1,024 shards would be ~$7.2k. Off-cloud nodes (OVH) with S3 or
+  GCS also pay egress for every state GET past the disk cache, every log
+  read by a peer, and relay backfill: not modeled. R2 charges no egress.
+- **S3 Standard for everything** (log, state, blobs; no S3 Express): it
+  survives an AZ loss at ~40–50 ms p50 / ~150 ms p99 commit ack (S3-like
+  latency model). Each node's NVMe is SlateDB's SST disk cache.
+- **Log retention** of 72 h for firehose backfill: ~234 GB today, ~2.3 TB
+  at 10× ("Log retention", "Log compression"). A real single-record commit
+  is ~5,370 B of segment, ~2.7 KB after zstd; the MST proof blocks in its
+  CAR dominate. Record and head values aren't stored twice: they are
+  rebuilt from the CAR at replay (`segment::derive_commit_muts`).
+- Blobs (~350 TB, ~$7.8k/mo on S3) are priced separately in the cost model.
 
 ### Separate tiers
 None. Full nodes serve proxying and the firehose; see "Read replicas and
 fan-out nodes: not planned" for when that would change.
 
-### Must happen before any production data
-- **Switch hashing to fixed 65,536 slots → shard map.** `hash % P` can never
-  be changed later without rewriting every partition.
-- **Per-node log + node leases + shard-assignment map**, for PUT cost and
-  lease overhead (see "Planet scale").
+### Before production data
+Fixed slots with a shard map, the per-node log, node leases and
+assignments are done ("HA"). Still open:
+- Signing keys KMS-wrapped (§4; plaintext today).
+- ~~Partial MSTs wired in (required by 32 GB nodes).~~ Done: `--lazy-mst`,
+  on by default ("Partial MSTs", "As built").
+- Backups ("Backups and restore").
 
 ## Read replicas and fan-out nodes: not planned
 
@@ -1183,7 +1223,7 @@ serves ~25 full subscribers at 20x and ~5 at 100x). Before adding either,
 prefer a DID-aware load balancer (removes the extra proxy hop) and more full
 nodes.
 
-## Partial MSTs (design + prototype; not wired in)
+## Partial MSTs (`--lazy-mst`, on by default)
 
 **Problem.** Section 2 keeps the whole tree of every cached repo in memory and
 rebuilds it from `R/` on a cold load. Real writers in one hour (~188k repos)
@@ -1384,3 +1424,299 @@ derived, and every loaded node is verified against its parent's link.
    preloads, and add the small-repo `M/` prefix prefetch.
 5. Only if the write volume matters at the 100x target: checkpoint-window
    write-back with an `m/{did}` marker.
+
+### As built (`--lazy-mst`, default on since Oct 2026)
+`--lazy-mst=false` keeps the full-tree mode (section 2) for comparison. The
+suite runs in each mode: `VLPDS_LAZY_MST=0|1|2` (2 = lazy with every idle
+repo's paths dropped after each worker pass, so every operation walks from
+the root through the store).
+
+- **Stage 1: `M/` write-through.** `state::mst_node_key` =
+  `0x01 ‖ slot ‖ M/{did}\0{cid digest}` (slot-prefixed, so splits and merges
+  carry it with the shard's range). A commit's puts are its CAR's MST blocks
+  of height >= 1 (`mst_lazy::persisted_blocks`, found from the data root
+  through the links the CAR carries, so proof-only neighbours are re-put,
+  idempotently); they are *derived* muts: replay rebuilds them from the
+  #commit frame (`segment::derive_commit_muts_n`: an entry deriving more
+  muts than the base set derives the node puts too, so the mode is a
+  property of the entry, not of the replaying node). The deletes (the
+  replaced nodes, from `LazyTree::write_diff_blocks`) are stored muts.
+  Repo creation with genesis records, `importRepo` (`ReplaceRepo`) and
+  account deletion write or clear the whole set. A repo whose `M/` is
+  missing or wrong (a store from the full-tree mode, a bug) is rebuilt from
+  `R/` on open and backfilled through the log
+  (`vlpds_lazy_mst_fallbacks_total{reason}`).
+- **Stage 2: lazy worker.** `RepoState::mst` is a `LazyTree`. A cold open
+  reads the repo's whole `M/` range with one scan (up to
+  `--lazy-mst-prefetch-kb`, 1 MiB: repos up to ~35k records), the root, and
+  the paths of the first request's keys, on the blocking pool. Before a
+  repo's queued requests run, a no-I/O pass walks their keys, neighbours
+  and collection probes; anything unloaded is loaded on the blocking pool
+  (`Worker::start_fetch`, the requests wait in `loading`, the tree is
+  swapped in on `Fetched`), so the worker thread never waits on the store
+  (`vlpds_lazy_mst_fetches_total{result="inline"}` counts reads it still had
+  to do: 0 in every test). The collection index uses `coll/` probes (does
+  any key start with it, before and after the batch) instead of per-repo
+  counts. A walk that finds a node or leaf not matching its link fails the
+  repo, which reopens from durable state (rebuilding from `R/` if needed).
+- **Stage 3: readers.** `DurableView` carries the (partial) tree; readers
+  pair it with the SlateDB snapshot `App::repo_view` takes under the apply
+  lock, so `M/` and `R/` there are exactly the view's version. getRecord
+  proofs walk asynchronously (`mst_store::proof_blocks`), never touching the
+  shared tree. getRepo streams from the snapshot (`mst_lazy::export_blocks`:
+  the `M/` range read ahead, leaves rebuilt from one forward `R/` scan, one
+  path in memory). getBlocks: loaded nodes, `M/` point reads (interior),
+  record CIDs as before, then leaves via the repo's `NodeIndex` (built once
+  by a streamed walk, advanced by the worker per commit, as in the full
+  mode; a miss in an index covering the view is final), each found by a
+  proof walk to its key. Loaded nodes are kept process-wide by CID
+  (`mst_store::NODE_CACHE`, `--lazy-mst-node-cache-mb`, 256 MiB): nodes are
+  content-addressed, so an entry is valid in any version that links it.
+- **Stage 4: path cache.** A lazy repo is charged `REPO_BASE + heap of its
+  loaded nodes`; `--repo-cache-mb` bounds that per worker. Over budget, the
+  least recently used idle repos (nothing in flight: every loaded node is
+  then in `M/`/`R/`) drop back to their root, and their view is
+  republished unloaded. A repo over 1 MiB (an import, a rebuild, a repo
+  written without pause) drops everything but the nodes its in-flight
+  commits wrote (`RepoState::inflight`; their state isn't applied yet, and
+  every node above a changed one changed too), all of it once idle; so a
+  repo that is never idle stays bounded (tested: ~1 MiB peak under 32
+  concurrent writers over 12k records). Pinning and `L/` preloads are off in lazy
+  mode (kept for the full-tree mode); recent-repo preloads remain (now an
+  `M/` prefetch).
+- **Stage 5: not needed.** See the measurements: at 10× today's load (3.3k
+  commits/s, 9k bursts) the extra state writes are ~11 MB/s cluster-wide
+  (~30 MB/s in bursts) into memtables, far from a SlateDB limit, so the
+  checkpoint-window write-back with an `m/{did}` marker stays a design.
+
+### Measured, lazy vs full trees (Oct 2026, M4 Pro, dev-release, in-process)
+`tests/all/mst_lazy.rs` `bench_*` and `worker::tests::bench_commit_cpu`
+(commands in their doc comments).
+
+| | full trees | lazy |
+|---|---|---|
+| Node memory, 20k repos (Zipf, 1M at rank 1: 10.5M records), one write each | 2.56 GB of trees (charged), RSS +1.66 GB | 155 MB of paths + 96 MB node cache, RSS +0.96 GB |
+| Those 20k cold writes, 64 at a time | 6.8 s, p50 9.7 ms, p99 126 ms | 5.5 s, p50 16.7 ms, p99 33.7 ms |
+| Cold write (median of 3), every GET +20 ms, empty caches: 1k / 10k / 100k / 1M records | 108 / 97 / 191 / 1,147 ms | 108 / 110 / 114 / 460 ms |
+| ... without the `M/` prefetch | | 149 / 259 / 367 / 468 ms |
+| Commit CPU (worker thread, warm paths) | 16.0 µs | 19.8 µs (+3.7: neighbour walks, no-I/O pass, `coll/` probes, delete check) |
+| State bytes / commit (into SlateDB) | 650 B | 3.3–3.5 KB (+`M/` puts) |
+| Segment bytes / commit (stored) | 3.36–3.51 KB | 3.74–3.95 KB (+~12%: `M/` deletes) |
+| sync.getRecord, 100k-record repo, 32 clients | 80.5k/s | 77.7k/s |
+| getBlocks: interior node / record / leaf | 95.8k / 62.3k / 43.9k/s | 82.6k / 57.6k / 21.5k/s |
+| getRepo, 100k records (22.5 MB), 4 clients | 47 /s | 16 /s |
+
+- The RSS rows include the writes' own state, which in these runs lives
+  in the in-memory object store and memtables (5x more state bytes per
+  commit for lazy), and freed buffers the allocator keeps; the charged
+  tree and path bytes are the MST memory proper (the full run's RSS grew
+  ~160 B/record, under the 240 B/record charge measured with jemalloc).
+- A cold write's fixed reads (head, account, blob refs) set a ~100 ms
+  floor in both modes; past it the full mode grows with the repo (a 1M
+  repo is 44+ GETs of `R/` and ~1 s of rebuild) and lazy doesn't, up to
+  the repos whose `M/` range outgrows the prefetch. The prefetch matters:
+  without it a cold write is 7-11 dependent node reads. 512 KiB, 1 MiB and
+  4 MiB caps measured the same up to 100k records; a 1M-record repo's 28 MB
+  range isn't worth reading ahead (its path's point reads cost as much);
+  1 MiB is the default. Production reads hit the NVMe disk cache first.
+  (GET counts per write were too noisy here to quote: background
+  compaction and polls share the state client.)
+- getRepo is ~3x slower than walking a resident full tree: leaves are
+  rebuilt (key hashes, encode, CID) from a forward `R/` scan, and the
+  records need a second scan (the CAR puts every node before any record,
+  as the full mode does: the bytes are identical). The full mode only gets
+  its speed for repos it already holds in memory.
+- Leaf getBlocks is an index lookup plus a proof walk to the leaf's key.
+- **Stage 5 decision.** At 10× today's load (3.3k commits/s average, ~9k
+  bursts) the extra state writes are ~10 MB/s cluster-wide (~30 MB/s in
+  bursts) into memtables, and the extra stored segment bytes ~1.3 MB/s:
+  nothing near a limit, so the checkpoint-window write-back stays a design.
+  At the 100× planet-scale target (~200k commits/s) it would be ~0.6 GB/s
+  of extra memtable writes and should be built then.
+
+## Backups and restore (design, not implemented)
+
+**Today there are none.** Durability is the object store's (S3 Standard:
+multi-AZ, 11 nines against hardware loss). Nothing protects against a
+*logical* loss: a delete, an overwrite, a bad write, or losing the bucket,
+account or region. Everything durable sits under one prefix of one bucket:
+
+| Prefix | What | Churn |
+|---|---|---|
+| `log/{log_id}/{ordinal}.seg`, fences | WAL + firehose: frames and state mutations | ~27 new objects/s per node; deleted after 72 h |
+| `state/{id}/` | one SlateDB per shard: SSTs, manifests, compactions, `gc/` | L0 flush per shard per 10 s; compaction replaces SSTs; GC deletes them ~1 h after replacement |
+| `nodes/`, `assign/` (+ `assign/layout`), `writers/`, `retain/` | leases, ownership + span history, layout, writer ids, retention reports | CAS-overwritten (a lease every 2 s) |
+| `handle/`, `email/` | uniqueness claims (conditional PUTs) | per account change |
+| `blob/`, `blob-gc/`, `blob-tmp/` | blobs (~350 TB at Bluesky scale) | ~1 M uploads/day; GC moves, then deletes |
+
+### Threats
+1. **Bucket deleted, or credentials misused** (leaked node or operator
+   keys, a compromised account). Anything that can delete objects can
+   delete everything.
+2. **A bad build** writes corrupt state (wrong mutations applied), or a bad
+   log (bad commits, already sent to relays), or deletes too much (a GC or
+   retention bug removing live SSTs or segments still needed for replay).
+3. **An operator deletes objects** by hand (wrong prefix, a cleanup script).
+4. **Region loss**: S3 Standard survives an AZ, not a region.
+
+### Options and how they interact with vlpds
+
+**S3 bucket versioning + noncurrent-version expiration.** Every overwrite
+or delete keeps the old version, so deletes become undoable. vlpds's own
+semantics don't change: conditional writes (`If-None-Match`, `If-Match`)
+apply to the current version, and a delete just adds a delete marker.
+- *Extra storage* = bytes deleted or overwritten per day × the
+  noncurrent window. Today: log segments ~78 GB/day (28.9 M commits ×
+  2.7 KB), replaced SSTs ~58 GB/day (assumption: the cost model's ~2 KB
+  of SST rewritten per commit; at bench scale, size-tiered rewrites of a
+  shard's largest run (~15 GB at 256 shards) don't show up, and each one
+  adds its size), manifests and compaction files ~20 GB/day (~80 KB/s per
+  node measured in the cost-model runs). About **160 GB/day: ~1.1 TB
+  (~$26/mo on S3) for 7 days, ~4.8 TB (~$110/mo) for 30**. The ~4× write
+  amplification of a bulk import adds ~3× the imported state for the
+  window. Lease renewals add ~130k tiny versions per day: negligible bytes.
+- *Delete markers.* Retention deletes each log from its head, so ~2.3 M
+  delete markers per node per day pile up just ahead of the live
+  segments until their noncurrent versions expire. S3 LISTs slow down
+  when they scan long runs of delete markers. Retention's paged LIST and
+  SlateDB GC's LISTs should start from a known key (start-after), and the
+  lifecycle needs `ExpiredObjectDeleteMarker`. Not measured.
+- *Providers.* GCS object versioning is equivalent, and GCS soft delete
+  (7 days) is a cheaper undelete: if this layer is wanted on GCS, keep it
+  on, against §4's "disable soft delete" (~$22/mo for 7 days). R2 has no
+  object versioning (assumption, verify); its bucket locks would make
+  SlateDB GC and retention deletes fail. On R2 only the off-site copies
+  below protect.
+
+**Object Lock** (needs versioning). Locked versions can't be deleted
+before their retention date, in compliance mode not even by the root user,
+and a bucket holding locked versions can't be deleted. A 7-day default
+retention on the primary bucket costs the same bytes as 7 days of
+versioning and turns threats 1 and 3 into "recoverable within 7 days".
+vlpds's deletes still work (they add markers), but with default retention
+S3 requires a checksum header on every PUT: object_store's S3 client has
+to be configured to send one (`with_checksum_algorithm`). Not tested with
+conditional PUTs. Locks also make a mistakenly written secret impossible
+to purge.
+
+**Cross-region / cross-account replication (CRR).** Asynchronous, per
+object, unordered: a replica can hold a manifest before the SSTs it names,
+`assign/{s}` at epoch e + 1 before epoch e's last segments, or a fence
+before the segments under it. So the replica is crash-consistent only at
+a cut T before which every source version has replicated (replication
+metrics / S3 RTC, plus the assumption that `Last-Modified` follows
+causality across objects). Delete markers replicate only if enabled, and
+version deletes never do. The cost is per replicated object version:
+segments (~82/s), SSTs, manifests and compaction files (~70/s) and leases
+come to ~150 PUTs/s, **~$1.9k/mo of requests** plus ~$100 of transfer,
+almost doubling today's bill. A `state/`-only filter is still ~$0.9k.
+Today's small segments (one PUT per round trip) make CRR a poor fit for
+log and state. It fits blobs: large, immutable, ~1 M a day.
+
+**SlateDB checkpoints and clones** (`slatedb::admin`). A *named*
+checkpoint (`Admin::create_detached_checkpoint` with
+`CheckpointOptions { name, lifetime }`, or `Db::create_checkpoint` on the
+owner, which flushes first) pins one manifest's SSTs against GC until it
+expires. It is O(manifest) and costs only the replaced SSTs it keeps
+alive (~58 GB/day × lifetime). vlpds today creates none of its own: the
+only checkpoints are the compactor's 1 h read guards (§4). A clone
+(`create_clone_builder_from_source`, as `partition::clone_db` uses for
+splits and merges) accepts `CloneSourceSpec::checkpoint`, so a shard can be
+restored as a new shard id from any live checkpoint in O(manifest). Two
+limits: a checkpoint lives in the same bucket and only references SSTs, so
+it protects against threat 2 but not against 1, 3 or 4. And a clone
+references the source's SSTs in the same store ("external SSTs"), so it
+can't move data to another bucket.
+
+**Each SlateDB state is a consistent snapshot of its shard.** The applied
+marker `meta/applied2 = (log, ordinal)` is written in the same `WriteBatch`
+as that segment's mutations (`nodelog.rs`), so any manifest, and any
+checkpoint of one, holds whole segments up to its marker. Replaying the
+shard's spans from the marker (`assign/{s}` history) rolls it forward, as
+crash recovery already does.
+
+**Logical export** (`com.atproto.sync.getRepo` CAR per account, plus
+`listBlobs`/`getBlob`). This is the format-independent last resort: it
+survives a SlateDB or segment-format bug, and every atproto PDS can
+import it. ~8 TB uncompressed for 23.9 B records (assumption: ~330 B of CAR
+per record, record block + MST share), ~3 TB zstd, ~$3/mo per copy in
+Glacier Deep Archive. Export throughput is unmeasured. CARs omit
+everything that isn't the repo: signing keys, password hashes, email,
+preferences, OAuth sessions, invites, takedown status. Those need an
+encrypted dump of the account rows (`a/`, `p/`) alongside.
+
+### A consistent point-in-time restore of the whole cluster
+A cut is a firehose seq S: the restored cluster holds exactly the entries
+with seq ≤ S of every log, which is what subscribers saw through S (the
+merge order). It needs:
+1. **Per shard, a state at a marker at or before S**: a named checkpoint,
+   or a copy of one manifest and its SSTs (including external SSTs of a
+   clone's parents).
+2. **Every log entry from each shard's marker through S**: the logs
+   (retained or archived) plus the `assign/` span histories that say
+   which logs and ordinals belong to the shard. Entries carry seqs, so
+   replay stops at S.
+3. **The layout the snapshots belong to.** A reshard between snapshot and
+   cut means replaying the parents and re-running the clone. Simpler:
+   snapshot right after every flip, so a restore never spans one.
+4. **Global objects rebuilt, not restored as of S.** `handle/` and
+   `email/` are rebuilt from the restored `a/`/`n/` rows. `nodes/`,
+   `retain/` and `writers/` start fresh (new log ids, the old logs fenced).
+   `assign/` is rewritten with `seq_floor` above the highest seq ever
+   emitted, not S, so seqs never go backwards for subscribers.
+5. **Blobs: a superset is enough.** They are content-addressed. Undelete
+   anything referenced, and blob GC reclaims the rest.
+6. **Tell relays.** They saw commits after S that no longer exist. For
+   each repo with entries after S in the old logs, emit a sync 1.1 `#sync`
+   with the restored head, so relays resync instead of rejecting the next
+   commit's `prevData`. New commits get later revs (TIDs) anyway. Writes
+   after S are lost: that is the point when S is just before a bad build.
+   If the bad build's *stored mutations* are wrong but its frames are
+   right, replay with a fixed build can re-derive records and heads from
+   the CARs (`derive_commit_muts`); other mutations can't be.
+
+Restore into a **new prefix** (the old one stays untouched until it's
+verified), cloning each shard from its checkpoint. Retiring the old prefix
+then needs the same `external_dbs` check as retired reshard parents. Blobs
+can't follow the prefix without a copy of ~350 TB, so the blob prefix has
+to be configurable separately (code). Tooling needed: named checkpoints, a
+`restore --cut S` that clones, replays to S and rebuilds the indexes, an
+archiver, and the off-site copy job.
+
+### Recommended plan
+| Layer | Protects against | RPO | RTO | $/mo (S3) |
+|---|---|---|---|---|
+| 1. Versioning, 7-day noncurrent expiry, Object Lock governance 7 d; the app role has no `s3:DeleteObjectVersion`, bucket-policy or lifecycle permissions | operator deletes, app-credential misuse, GC/retention bugs | 0 | hours (remove delete markers, restore versions) | ~$26 |
+| 2. Named SlateDB checkpoint per shard every 6 h, kept 8 d; `--log-retention 8d` | bad build: roll back to any S in the last 8 days, replaying good entries | 0 up to the cut | ~30–60 min (clone 256 shards in seconds, replay ≤ 6 h of log, rebuild handle/email indexes) | ~$20 |
+| 3. Off-site: a separate AWS account in another region, Object Lock compliance 30 d, S3 Standard-IA. Daily incremental copy of each shard's checkpoint (SST names are unique and immutable, so only new SSTs are copied, manifest last) + `assign/`; the log archived per node every minute (one object of concatenated segments, written by the owner after they're durable) | bucket or account loss, leaked admin credentials, region loss | ~1–2 min (archive lag) | ~1–2 h: clone from the copy inside the backup bucket, replay ≤ 24 h of archive, rebuild indexes, move DNS | ~$180 |
+| 4. Blobs: CRR to the backup account (Glacier IR) | same, for blobs | minutes | serving from the replica needs code | ~$2.4k |
+| 5. Logical export: CARs + encrypted account dump, monthly, Deep Archive | format bugs, leaving vlpds | 1 month | days | ~$5 |
+
+Layer 3's ~$180: ~7.8 TB stored (3.7 TB live state, 30 days of SST
+churn, 30 days of log archive) ≈ $100, ~140 GB/day of cross-region
+transfer ≈ $85, a few thousand PUTs a day. The 3.7 TB seed is ~$75
+once. Layers 1–3 and 5 add **~$230/mo, ~9% of the ~$2.5k object-store
+bill.** Blobs dominate. Layer 4 is ~$1.4k of storage (350 TB), ~$600 of
+replication PUTs (30 M/mo) and ~$400 of transfer. Packing a day's new blobs
+into a few large objects (code) brings it to ~$1.8k on Glacier IR or ~$0.75k
+on Deep Archive (12–48 h restores). Without layer 4, blobs are lost on
+account or region loss; it is a separate decision. Prices are list prices
+from memory (IA $0.0125/GB and $0.01/1k PUT, Glacier IR $0.004/GB and
+$0.02/1k PUT, Deep Archive $0.00099/GB and $0.05/1k PUT, inter-region
+$0.02/GB): verify before relying on them. Restore times assume
+server-side clones and replay at bench rates; none of it is measured.
+
+### Signing keys
+Every account's secp256k1 signing key is plaintext in its account row
+(`Account::signing_key` in `a/{did}`; §4 calls it `k/{did}`), along with its
+argon2 password hash. Account rows reach the log as mutations, so they are
+in segments too. **Every noncurrent version, checkpoint, log archive,
+replica and account dump is therefore a copy of every account's signing
+key** until keys are KMS-wrapped. Anyone who can read a backup can sign
+commits as any user, and a 30-day compliance lock means a leaked key stays
+in the backups for 30 days whatever happens to the live copy. Until
+wrapping: SSE-KMS with a key owned by the backup account, reads only
+through a break-glass role, access logging. After wrapping, backups hold
+only wrapped keys, but the KMS key becomes part of the backup: lose it
+and no restored account can sign, so every account would need a PLC
+rotation. It needs its own multi-region replica and deletion protection.

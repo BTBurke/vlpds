@@ -121,6 +121,14 @@ pub fn set_block_cache_bytes(n: u64) {
     BLOCK_CACHE_BYTES.store(n.max(64 << 20), std::sync::atomic::Ordering::Relaxed);
 }
 
+static CACHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Benchmarks: DBs opened from now on don't see what the shared cache holds
+/// for earlier opens of the same path (a restart starts cold).
+pub fn bump_cache_epoch() {
+    CACHE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn shared_db_cache() -> Arc<dyn slatedb::db_cache::DbCache> {
     use slatedb::db_cache::{foyer::{FoyerCache, FoyerCacheOptions}, SplitCache};
     static CACHE: std::sync::OnceLock<Arc<dyn slatedb::db_cache::DbCache>> = std::sync::OnceLock::new();
@@ -420,6 +428,7 @@ pub async fn open_db(
         use std::hash::{Hash, Hasher};
         let mut h = std::hash::DefaultHasher::new();
         path.hash(&mut h);
+        CACHE_EPOCH.load(std::sync::atomic::Ordering::Relaxed).hash(&mut h);
         h.finish()
     };
     let codec = settings.compression_codec;

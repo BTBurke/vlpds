@@ -1874,9 +1874,32 @@ async fn assert_valid_did_doc(app: &App, a: &Account) -> XResult<()> {
 async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let did = user_did(&creds)?;
     let acct = app.account(&did).await?;
-    let (view, _) = app.repo_view(&did).await?;
+    let (view, snap) = app.repo_view(&did).await?;
     let mut nodes = HashMap::new();
-    view.tree.node_refs(&mut nodes).map_err(XrpcError::from_err)?;
+    if view.lazy {
+        // the whole tree, streamed from the snapshot (`M/` + one `R/` scan)
+        let (did, root) = (did.clone(), view.head.data);
+        nodes = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            let mut nodes = HashMap::new();
+            let scan = crate::mst_store::ScanSource::open(&*snap, &did, crate::mst_store::DbSource::new(&*snap, &did, &rt), &rt)?;
+            crate::mst_lazy::export_blocks(root, 1, &scan, &mut |c, b| {
+                // as node_refs: the empty tree's root isn't counted
+                if crate::mst::decode_node(b, c).is_ok_and(|n| !n.entries.is_empty()) {
+                    nodes.insert(c, ());
+                }
+            })?;
+            Ok::<_, crate::mst::MstError>(nodes)
+        })
+        .await
+        .map_err(XrpcError::from_err)?
+        .map_err(XrpcError::from_err)?
+        .into_iter()
+        .map(|(c, ())| (c, (Arc::from(&b""[..]), 0)))
+        .collect();
+    } else {
+        view.tree.node_refs(&mut nodes).map_err(XrpcError::from_err)?;
+    }
     let p = app.partition(&did)?;
     let prefix = state::record_prefix(&did);
     let mut iter =

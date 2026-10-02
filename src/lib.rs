@@ -15,6 +15,7 @@ pub mod http;
 pub mod metrics;
 pub mod mst;
 pub mod mst_lazy;
+pub mod mst_store;
 pub mod node;
 pub mod nodelog;
 pub mod oauth;

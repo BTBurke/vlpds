@@ -373,8 +373,7 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<u16>) -> anyhow::Result
         let keep = shard.is_none_or(|s| s == sh);
         let mut muts = Vec::new();
         if derived > 0 && with_muts && keep {
-            muts = derive_commit_muts(&frame)?;
-            anyhow::ensure!(muts.len() == derived, "segment entry {seq}: {} muts derived from its frame, {derived} expected", muts.len());
+            muts = derive_commit_muts_n(&frame, derived).map_err(|e| anyhow::anyhow!("segment entry {seq}: {e:#}"))?;
         }
         for _ in 0..nm {
             need(pos, 2)?;
@@ -410,6 +409,22 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<u16>) -> anyhow::Result
 /// the head (`h/`). Exactly what the repo worker writes for a commit, in
 /// the same order; the worker checks the two agree (debug builds).
 pub fn derive_commit_muts(frame: &[u8]) -> anyhow::Result<Vec<Mutation>> {
+    derive(frame, None)
+}
+
+/// The `n` muts an entry derives from its #commit frame: those of
+/// [`derive_commit_muts`], followed (when `n` is larger: a commit of a lazy
+/// MST node) by the `M/` puts of the commit's interior MST nodes
+/// (`mst_lazy::persisted_blocks`, in CAR order). So whether a commit
+/// persisted its nodes is a property of the entry, not of the node
+/// replaying it.
+pub fn derive_commit_muts_n(frame: &[u8], n: usize) -> anyhow::Result<Vec<Mutation>> {
+    let muts = derive(frame, Some(n))?;
+    anyhow::ensure!(muts.len() == n, "{} muts derived from the #commit frame, {n} expected", muts.len());
+    Ok(muts)
+}
+
+fn derive(frame: &[u8], want: Option<usize>) -> anyhow::Result<Vec<Mutation>> {
     // borrowed decoding: the frame's strings and the CAR stay in `frame`
     // (replay runs this for every #commit it applies)
     use crate::cbor::ValueRef as Value;
@@ -450,6 +465,11 @@ pub fn derive_commit_muts(frame: &[u8]) -> anyhow::Result<Vec<Mutation>> {
     let data = link(Value::decode(commit_block)?.get("data")).ok_or_else(|| anyhow::anyhow!("commit block without data"))?;
     let head = state::Head { commit, data, rev, commit_block: Bytes::copy_from_slice(commit_block) };
     muts.push(Mutation { key: state::head_key(did).into(), val: Some(head.encode()) });
+    if want.is_some_and(|n| n > muts.len()) {
+        for (c, b) in crate::mst_lazy::persisted_blocks(&data, &blocks, 1)? {
+            muts.push(Mutation { key: state::mst_node_key(did, &c).into(), val: Some(Bytes::copy_from_slice(b)) });
+        }
+    }
     Ok(muts)
 }
 

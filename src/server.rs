@@ -34,8 +34,23 @@ pub struct Config {
     /// across workers; 0 = bounded by count only).
     pub repo_cache_bytes: usize,
     /// Repos with at least this many records stay cached and are preloaded
-    /// on shard open (0 = none; see worker::CacheLimits).
+    /// on shard open (0 = none; see worker::CacheLimits). Full-tree mode only.
     pub pin_repo_records: u64,
+    /// Lazy MSTs (`--lazy-mst`, DESIGN.md "Partial MSTs"): repos keep only
+    /// the MST paths operations visit, interior nodes persist under `M/`,
+    /// and `repo_cache_bytes` bounds the loaded paths. Default
+    /// [`default_lazy_mst`].
+    pub lazy_mst: bool,
+    /// Lazy cold open: up to this much of a repo's `M/` range is read with
+    /// one scan (`--lazy-mst-prefetch-kb`).
+    pub lazy_mst_prefetch_bytes: usize,
+    /// Tests: drop every idle lazy repo's loaded paths after each worker
+    /// pass, so every write and read walks from the root through the store
+    /// (`VLPDS_LAZY_MST=2`).
+    pub lazy_mst_unload_idle: bool,
+    /// Lazy MSTs: bytes of loaded nodes kept process-wide for readers and
+    /// fetches (`--lazy-mst-node-cache-mb`; `mst_store::NodeCache`).
+    pub lazy_mst_node_cache_bytes: usize,
     pub max_segment_bytes: usize,
     /// Segment PUTs in flight per node log (DESIGN.md "Pipelined segment PUTs").
     pub log_inflight: usize,
@@ -129,6 +144,19 @@ pub struct Config {
     pub retry_unapplied_writes: bool,
 }
 
+/// The MST mode by default: `VLPDS_LAZY_MST` (0/1/false/true; 2 = lazy with
+/// [`Config::lazy_mst_unload_idle`]) if set (the suite runs in each mode
+/// with it), else [`DEFAULT_LAZY_MST`].
+pub fn default_lazy_mst() -> bool {
+    match std::env::var("VLPDS_LAZY_MST").ok().as_deref() {
+        Some("0" | "false") => false,
+        Some("1" | "2" | "true") => true,
+        _ => DEFAULT_LAZY_MST,
+    }
+}
+
+pub const DEFAULT_LAZY_MST: bool = true;
+
 /// Well-known secrets: only accepted with `dev_mode` (see [`Config::check_secrets`]).
 pub const DEV_JWT_SECRET: &str = "dev-secret-change-me";
 pub const DEV_ADMIN_TOKEN: &str = "dev-admin-token";
@@ -183,6 +211,10 @@ impl Default for Config {
             cache_per_worker: 10_000,
             repo_cache_bytes: 4 << 30,
             pin_repo_records: crate::worker::DEFAULT_PIN_RECORDS,
+            lazy_mst: default_lazy_mst(),
+            lazy_mst_prefetch_bytes: crate::worker::DEFAULT_PREFETCH_BYTES,
+            lazy_mst_unload_idle: std::env::var("VLPDS_LAZY_MST").is_ok_and(|v| v == "2"),
+            lazy_mst_node_cache_bytes: crate::mst_store::DEFAULT_NODE_CACHE_BYTES,
             max_segment_bytes: 8 << 20,
             log_inflight: crate::nodelog::DEFAULT_LOG_INFLIGHT,
             live_ring_bytes: crate::nodelog::DEFAULT_LIVE_RING_BYTES,
@@ -259,7 +291,11 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let table = crate::partitions::PartitionTable::new(n);
     let lookup_parts = table.clone();
     let lookup: worker::PartitionLookup = Arc::new(move |did: &str| lookup_parts.for_key(did));
-    let limits = worker::CacheLimits { entries: cfg.cache_per_worker, bytes: cfg.repo_cache_bytes / cfg.workers.max(1), pin_records: cfg.pin_repo_records };
+    let limits = worker::CacheLimits { entries: cfg.cache_per_worker, bytes: cfg.repo_cache_bytes / cfg.workers.max(1), pin_records: cfg.pin_repo_records, lazy: cfg.lazy_mst, prefetch_bytes: cfg.lazy_mst_prefetch_bytes, unload_idle: cfg.lazy_mst_unload_idle };
+    if cfg.lazy_mst {
+        crate::mst_store::NODE_CACHE.set_bytes(cfg.lazy_mst_node_cache_bytes);
+    }
+    tracing::info!(lazy_mst = cfg.lazy_mst, "MST mode: {}", if cfg.lazy_mst { "lazy (partial trees, M/ persisted)" } else { "full trees" });
     let workers = worker::spawn(cfg.workers, limits, lookup, tokio::runtime::Handle::current());
 
     let mut cc = cfg.cluster.clone().unwrap_or_else(|| ClusterConfig { node_id: "single".into(), addr: cfg.public_url.clone(), ..Default::default() });
