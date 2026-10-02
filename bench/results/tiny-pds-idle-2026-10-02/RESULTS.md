@@ -450,7 +450,8 @@ Remaining idle Class A in gaidle1 (0.116 A/s):
     WAL task and the WAL-fence task, which defaults to `dry_run`. vlpds runs with `wal_enabled: false`
     (`partition.rs`), so both list an empty directory. Setting `wal_options` and `wal_fence_options`
     to `None` in `partition::gc_options` would drop them. Not changed here: it needs a check that
-    SlateDB writes no WAL object at open/fence with the WAL off.
+    SlateDB writes no WAL object at open/fence with the WAL off. (It does: every open writes a 0-byte
+    WAL fence, so the directory is not empty. See the next follow-up.)
   - **The rest runs at SlateDB's default 10-min interval per directory.** There is no vlpds flag for
     it, but `GarbageCollectorDirectoryOptions::interval` could be raised in `partition::gc_options`.
     The cost is that superseded manifests, `.compactions` files and replaced SSTs linger longer. Even
@@ -462,3 +463,82 @@ Remaining idle Class A in gaidle1 (0.116 A/s):
 Run files are `gbidle1` and `gaidle1` (`*.jsonl.gz`, `*.log`). `analyze.py --matrix gbidle1 gaidle1`
 prints the component table. The scratch dirs, both builds' target dirs and the MinIO container were
 deleted.
+
+## Follow-up: the WAL GC LISTs stay (SlateDB writes a WAL fence per open)
+
+The previous section proposed setting `wal_options` and `wal_fence_options` to `None` in
+`partition::gc_options`, provided SlateDB writes no WAL object with the WAL off. **It does, so the
+change was not made.** Source: the `jazware/slatedb` fork at `f2461431` (the rev in `Cargo.toml`).
+
+- **Every `Db` open writes a 0-byte WAL fence, even with `wal_enabled: false`.**
+  - `DbBuilder::build` (`db/builder.rs`) always runs `WriterFencer::fence` (`fence.rs`).
+  - The fencer calls `SlateDbWalWriterInit::fence_and_init` (`wal/slatedb/writer_init.rs`).
+  - That makes an unconditional `WalTableStore::write_wal_fence(empty_wal_id)` call: a
+    `PutMode::Create` of an empty object at `wal/<id>.sst`. This is how a new writer fences an old
+    one.
+  - `wal_enabled` is only checked afterwards: the builder closes the WAL writer it just started and
+    swaps in a `DisabledWalObserver`.
+  - Closing an empty WAL writer writes nothing (`freeze_current_wal` returns early on an empty buffer).
+- **Nothing else writes a WAL object with the WAL off.**
+  - Non-empty WAL SSTs come only from `SlateDbWalWriter`, which is closed at open.
+  - Checkpoints write manifests only.
+  - Clones (`clone.rs` → `SlateDbWalAdmin::clone_wal`) copy the source's WAL ids in
+    `(replay_after_wal_id, next_wal_sst_id)`. A memtable flush moves `replay_after_wal_id` past the
+    fences, so a closed vlpds source has an empty range and the child gets no `wal/` objects. The
+    child writes its own fence when it is first opened.
+- **Probe** (a throwaway unit test, not committed). Open, put and close shard 0 three times, then
+  open, put, flush and close, then clone shard 1 from it. Result: `state/0000000000/wal/` holds four
+  0-byte objects, `00000000000000000001.sst` to `…04.sst`. The manifest has
+  `replay_after_wal_id: 4` and `next_wal_sst_id: 5`. Shard 1 (cloned, never opened) has no `wal/`
+  objects.
+- **What the two GC tasks do with these objects:**
+  - The regular WAL task (`wal_options`) only deletes objects with `size > 0`
+    (`wal/slatedb/gc.rs`, `WalGcMode::Regular`). With the WAL off there are none, so its LIST can
+    never find anything.
+  - The fence task (`wal_fence_options`) only targets the `size == 0` fences. Its SlateDB default is
+    `dry_run: true` (`GarbageCollectorOptions::default`), so it only logs what it would delete.
+  - **So today the fences are never deleted.** Each shard keeps one 0-byte object per open: every
+    restart, takeover and reshard child's first open. That costs nothing in storage (0 bytes), but
+    the count grows and every open LISTs `wal/` from `replay_after_wal_id`
+    (`next_wal_sst_id` → `last_seen_wal_id`).
+- **Why the change is still deferred.** Setting both options to `None` would drop the two LISTs
+  without changing what gets deleted, because neither task deletes anything today. But it would make
+  the leak permanent. The alternative is to turn on fence GC for real (`dry_run: false`) with a
+  `min_age` longer than any writer's lifetime, which SlateDB's docs require (see the
+  `wal_fence_options` doc on the fence-deletion race). That keeps one LIST per pass and cleans the
+  fences up. Either option is a policy call left to the owner.
+
+**Re-measured idle at the current head (`2ddee22`) with the tiny profile's flags** (`widle1`). Same
+runner and window as the earlier follow-ups: `--shards 1 --lease-ttl-ms 60000
+--slatedb-manifest-poll 60s` (the ansible tiny profile), a 5-min warmup, then a 30-min window.
+MinIO ran in its own tmpfs container on 127.0.0.1:9463, removed afterwards. This is the first
+measurement of the full tiny profile since the lone-node and reshard-GC changes. `gaidle1` used the
+10 s default manifest poll.
+
+| component | gaidle1 (10 s poll) | **widle1 (tiny: 60 s poll)** |
+|---|---|---|
+| ctl_lease | 0.100 / 0 | 0.100 / 0 |
+| ctl_assign | 0.0033 / 0.0178 | 0.0033 / 0.0178 |
+| ctl_version | 0 / 0.0139 | 0 / 0.0139 |
+| state_manifest | 0.0033 / 0.152 | 0.0033 / **0.0683** |
+| state_compactions | 0.0028 / 0.0689 | 0.0028 / 0.0689 |
+| state_gc_boundary | 0.0011 / 0.220 | 0.0011 / **0.137** |
+| state_sst | 0.0017 / 0 | 0.0017 / 0 |
+| state_wal (the two `LIST wal/`) | 0.0033 / 0 | 0.0033 / 0 |
+| other (rate-limit poll) | 0 / 0.100 | 0 / 0.100 |
+| **total** | **0.116 / 0.572** | **0.116 / 0.406** |
+
+| run | Class A /mo | Class B /mo | R2 $/mo | S3 $/mo |
+|---|---|---|---|---|
+| **widle1 (tiny profile, idle)** | **0.304 M** | **1.07 M** | **$0.00** | **$1.95** |
+| widle1 + 200 commits/day (+7.56 A, +28 B each) + 2 GB stored | 0.350 M | 1.24 M | $0.00 | $2.29 |
+
+- **Idle Class A is 0.116 A/s, the same as `gaidle1`.** The manifest poll moves only Class B,
+  0.572 → 0.406 B/s (−29%).
+- **On R2 the tiny profile is free up to ~3,000 commits/day** ((1 M − 0.304 M) / 7.56 A per commit
+  / 30.4 days). Class B (1.07 M of 10 M) has room to spare.
+- **The two `LIST wal/` are 2.9% of idle Class A** (0.0033 A/s, 8.7 k A/mo per shard, ~$0.04/mo on
+  S3).
+
+Run files are `widle1.jsonl.gz` and `widle1.log`. `analyze.py --matrix gaidle1 widle1` prints the
+component table. The MinIO container, the node scratch dir and the build's target dir were deleted.
