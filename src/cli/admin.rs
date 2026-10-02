@@ -1,14 +1,8 @@
-//! `vlpds admin ...` operator commands: the reference PDS's `pdsadmin`
-//! (account list/create/delete/takedown/untakedown/reset-password,
-//! create-invite-code, request-crawl) and its packages/pds/src/scripts
-//! (publish-identity, rotate-keys, rebuild-repo), plus the vlpds-only
-//! cluster operations (cluster status/finalize/lower, rotate-plc-keys,
-//! rewrap-secrets, check-repo). Each is admin XRPC against any node (`--url`, Basic
-//! `admin:<token>`); DID-keyed calls are routed to the repo's owner by
-//! the node, per-node maintenance (rotate-plc-keys, rewrap-secrets) goes to
-//! every node `getClusterStatus` lists, through the `--url` node, which
-//! relays it over peer mTLS (`forward::NODE_HEADER`). Human output by default,
-//! `--json` for the raw results. ops/RUNBOOK.md "Admin CLI" maps pdsadmin
+//! `vlpds admin ...`: the reference PDS's `pdsadmin` and its
+//! packages/pds/src/scripts, plus vlpds-only cluster operations, as admin
+//! XRPC against any node. Per-node maintenance goes to every node
+//! `getClusterStatus` lists, relayed by the `--url` node over peer mTLS
+//! (`forward::NODE_HEADER`). ops/RUNBOOK.md "Admin CLI" maps pdsadmin
 //! commands to these.
 
 use anyhow::{bail, Context, Result};
@@ -17,13 +11,11 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Where and how to reach the node.
 pub struct Opts {
-    /// Any node of the cluster (base URL).
+    /// Any node of the cluster.
     pub url: String,
-    /// The admin token (`VLPDS_ADMIN_TOKEN`).
     pub token: String,
-    /// Print the raw JSON results instead of tables.
+    /// Raw JSON results instead of tables.
     pub json: bool,
 }
 
@@ -183,16 +175,15 @@ pub enum AccountCmd {
     Info { did: String },
 }
 
-/// Admin XRPC client of one node.
 #[derive(Clone)]
-pub struct Client {
+struct Client {
     http: reqwest::Client,
     base: String,
     token: String,
 }
 
 impl Client {
-    pub fn new(url: &str, token: &str) -> Client {
+    fn new(url: &str, token: &str) -> Client {
         Client { http: reqwest::Client::new(), base: url.trim_end_matches('/').to_string(), token: token.to_string() }
     }
 
@@ -200,15 +191,15 @@ impl Client {
         format!("{}/xrpc/{nsid}", self.base)
     }
 
-    pub async fn get(&self, nsid: &str, query: &[(&str, &str)]) -> Result<J> {
+    async fn get(&self, nsid: &str, query: &[(&str, &str)]) -> Result<J> {
         self.send(nsid, self.http.get(self.url(nsid)).query(query), true).await
     }
 
-    pub async fn post(&self, nsid: &str, body: &J) -> Result<J> {
+    async fn post(&self, nsid: &str, body: &J) -> Result<J> {
         self.send(nsid, self.http.post(self.url(nsid)).json(body), true).await
     }
 
-    /// [`Client::post`] for node `node`, relayed by this one.
+    /// Relayed by this node.
     async fn post_to_node(&self, node: &str, nsid: &str, body: &J) -> Result<J> {
         let rb = self.http.post(self.url(nsid)).header(crate::forward::NODE_HEADER, node).json(body);
         self.send(nsid, rb, true).await.with_context(|| format!("node {node}"))
@@ -236,8 +227,8 @@ impl Client {
     }
 }
 
-/// A password like pdsadmin's (24 chars, alphanumeric).
-pub fn generate_password() -> String {
+/// Like pdsadmin's.
+fn generate_password() -> String {
     use rand::Rng;
     rand::thread_rng().sample_iter(&rand::distributions::Alphanumeric).take(24).map(char::from).collect()
 }
@@ -249,7 +240,7 @@ fn check_did(did: &str) -> Result<()> {
     Ok(())
 }
 
-/// `dids` plus the non-empty, non-`#` lines of `file`, all checked.
+/// `dids` plus the non-empty, non-`#` lines of `file`.
 fn did_list(mut dids: Vec<String>, file: Option<&PathBuf>) -> Result<Vec<String>> {
     if let Some(f) = file {
         let s = std::fs::read_to_string(f).with_context(|| format!("reading {}", f.display()))?;
@@ -275,8 +266,7 @@ fn confirm(prompt: &str) -> Result<bool> {
     Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
-/// Left-aligned columns, two spaces apart.
-pub fn table(rows: &[Vec<String>]) -> String {
+fn table(rows: &[Vec<String>]) -> String {
     let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let widths: Vec<usize> = (0..cols).map(|i| rows.iter().filter_map(|r| r.get(i)).map(|c| c.chars().count()).max().unwrap_or(0)).collect();
     let mut out = String::new();
@@ -308,8 +298,8 @@ fn pretty(out: &mut dyn Write, j: &J) -> Result<()> {
     Ok(())
 }
 
-/// Runs one command, writing its output to `out`. Errors (an XRPC error,
-/// a failed item of a batch, a repo check with problems) mean exit 1.
+/// An error (including a failed item of a batch, or a repo check with
+/// problems) means exit 1.
 pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
     let c = Client::new(&opts.url, &opts.token);
     match cmd {
@@ -440,8 +430,7 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
             write_cluster(out, &r)
         }
         Cmd::Cluster(ClusterCmd::Finalize { level, yes }) => {
-            let st = c.get("vlpds.admin.getClusterStatus", &[]).await?;
-            let active = st["version"]["active"].as_u64().context("getClusterStatus has no active feature level")? as u32;
+            let (st, active) = active_level(&c).await?;
             let level = level.unwrap_or(active + 1);
             if level > active && !yes {
                 let nodes: Vec<String> = st["nodes"].as_array().into_iter().flatten().map(|n| format!("{} (max {})", s(&n["node"]), s(&n["maxLevel"]))).collect();
@@ -461,8 +450,7 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
             Ok(())
         }
         Cmd::Cluster(ClusterCmd::Lower { level, yes }) => {
-            let st = c.get("vlpds.admin.getClusterStatus", &[]).await?;
-            let active = st["version"]["active"].as_u64().context("getClusterStatus has no active feature level")? as u32;
+            let (_, active) = active_level(&c).await?;
             if level < active && !yes && !confirm(&format!("Lower the cluster from feature level {active} to {level}? Writers switch back at their next segment"))? {
                 bail!("aborted");
             }
@@ -474,6 +462,12 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn active_level(c: &Client) -> Result<(J, u32)> {
+    let st = c.get("vlpds.admin.getClusterStatus", &[]).await?;
+    let active = st["version"]["active"].as_u64().context("getClusterStatus has no active feature level")? as u32;
+    Ok((st, active))
 }
 
 async fn account(c: &Client, cmd: AccountCmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
@@ -601,8 +595,7 @@ fn done(out: &mut dyn Write, opts: &Opts, j: J, human: &str) -> Result<()> {
     Ok(())
 }
 
-/// Runs `f` for each DID in turn (a failure doesn't stop the rest, as the
-/// reference scripts), then fails if any did.
+/// A failure doesn't stop the rest, as in the reference scripts.
 async fn per_did<F, Fut>(dids: &[String], opts: &Opts, out: &mut dyn Write, f: F) -> Result<()>
 where
     F: Fn(String) -> Fut,
@@ -635,8 +628,7 @@ where
     Ok(())
 }
 
-/// Every node of the cluster (getClusterStatus `nodes`) with its peer
-/// address, or None for `c`'s node alone (a single node).
+/// (name, addr, node id to relay to; None: `c`'s node alone).
 async fn cluster_nodes(c: &Client) -> Result<Vec<(String, String, Option<String>)>> {
     let r = c.get("vlpds.admin.getClusterStatus", &[]).await?;
     let nodes: Vec<(String, String, Option<String>)> = r["nodes"]
@@ -657,8 +649,7 @@ async fn cluster_nodes(c: &Client) -> Result<Vec<(String, String, Option<String>
     Ok(nodes)
 }
 
-/// Sends a per-node maintenance call to every node (relayed by `c`'s; or
-/// `--node-only`), then a table of `cols` per node and the totals.
+/// Prints a table of `cols` per node and the totals.
 async fn per_node(c: &Client, node_only: bool, opts: &Opts, out: &mut dyn Write, nsid: &str, body: J, cols: &[&str]) -> Result<()> {
     let nodes = if node_only { vec![("this node".to_string(), c.base.clone(), None)] } else { cluster_nodes(c).await? };
     let (mut results, mut failed) = (Vec::new(), 0usize);

@@ -535,7 +535,6 @@ async fn run(
     if active > 0 {
         accts.truncate(active);
     }
-    // refresh tokens (2h expiry)
     accts = futures::stream::iter(accts)
         .map(|a| {
             let c = c.clone();
@@ -606,7 +605,6 @@ async fn run(
     let end = start + Duration::from_secs(warmup + duration);
     let measure_from = start + Duration::from_secs(warmup);
     st.measure_from.set(measure_from).ok();
-    // reporter
     {
         let st = st.clone();
         tokio::spawn(async move {
@@ -763,7 +761,6 @@ async fn run(
     for g in gens {
         g.await?;
     }
-    // drain
     let drain_deadline = Instant::now() + Duration::from_secs(30);
     while st.inflight.load(Ordering::Relaxed) > 0 && Instant::now() < drain_deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1205,7 +1202,6 @@ async fn bulk(
     Ok(())
 }
 
-/// `loadgen dist`: the population `bulk` would create, without a server.
 fn dist_report(start: u64, count: u64, d: &Dist, batch: u64, max_records: u64, per_repo: f64, per_record: f64) -> anyhow::Result<()> {
     let t = Instant::now();
     let mut total = 0u64;
@@ -1247,7 +1243,6 @@ fn dist_report(start: u64, count: u64, d: &Dist, batch: u64, max_records: u64, p
     Ok(())
 }
 
-// ---------------- per-method benchmark ----------------
 
 fn method_keys() -> Vec<&'static str> {
     vec![
@@ -1295,7 +1290,6 @@ async fn methods(
     let c = client();
     let mut accts: Vec<Acct> = serde_json::from_slice(&std::fs::read(&args.accounts_file)?)?;
     accts.truncate(2000);
-    // fresh tokens + refresh tokens
     let sessions: Vec<(Acct, String)> = futures::stream::iter(accts)
         .map(|a| {
             let c = c.clone();
@@ -1323,7 +1317,6 @@ async fn methods(
         .collect::<Result<_, _>>()?;
     let refresh: Vec<String> = sessions.iter().map(|s| s.1.clone()).collect();
     let accts: Vec<Acct> = sessions.into_iter().map(|s| s.0).collect();
-    // sample existing rkeys
     let rkeys: Vec<Vec<String>> = futures::stream::iter(accts.iter().cloned())
         .map(|a| {
             let c = c.clone();
@@ -1349,7 +1342,6 @@ async fn methods(
         .await
         .into_iter()
         .collect::<Result<_, _>>()?;
-    // a few 64KiB blobs for getBlob
     let mut blob64k = Vec::new();
     for a in accts.iter().take(50) {
         let body: Vec<u8> = (0..65536).map(|_| rand::random::<u8>()).collect();
@@ -1546,7 +1538,6 @@ async fn call(ctx: &Ctx, c: &reqwest::Client, key: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------------- firehose fan-out ----------------
 
 async fn fanout(
     args: &Args,
@@ -1705,7 +1696,6 @@ async fn verify(args: &Args, acked: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------------- repo-size sweep ----------------
 
 /// A sweep repo an earlier `sweep --reuse` filled: (did, its blobs' CIDs),
 /// or None if `sw<size>.vlpds.test` doesn't exist.
@@ -1747,7 +1737,6 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
         // deterministic, time-ordered TID rkeys so reads can sample the whole repo
         const BASE_US: u64 = 1_600_000_000_000_000;
         let rkey_of = |i: usize| vlpds::tid::Tid::from_parts(BASE_US + i as u64 * 1000, 0).to_string();
-        // 1. account + fill (--reuse: the repo an earlier --reuse run filled, if any)
         let reused = if reuse { sweep_reuse(&c, &h, size).await? } else { None };
         let (did, blobs, fill_secs) = if let Some((did, blobs)) = reused {
             eprintln!("== repo of {size} records reused ({did}, {} blobs)", blobs.len());
@@ -1763,8 +1752,8 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
                 .await?;
             let did = r["did"].as_str().ok_or_else(|| anyhow::anyhow!("createAccount: {r}"))?.to_string();
             let token = r["accessJwt"].as_str().unwrap().to_string();
-            // 1b. blobs: one distinct small blob per 100 records (<= 100k), so
-            // listBlobs pages over a realistic blob index
+            // one distinct blob per 100 records, so listBlobs pages over a
+            // realistic blob index
             let nblobs = (size / 100).min(100_000);
             let t = Instant::now();
             let blobs: Vec<(String, u64)> = futures::stream::iter(0..nblobs)
@@ -1858,7 +1847,6 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
         if fill_only {
             continue;
         }
-        // 2. sample rkeys uniformly over the repo, and record CIDs for getBlocks
         let rkeys: Vec<String> = (0..2000).map(|_| rkey_of(rand::thread_rng().gen_range(0..size))).collect();
         let mut cids = Vec::new();
         for rk in rkeys.iter().take(200) {
@@ -1880,7 +1868,6 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
             b.sort();
             b.get(b.len() / 2).copied().unwrap_or_default().into()
         };
-        // 3. read methods, closed loop
         let methods = ["getRecord", "listRecords", "listRecordsDeep", "describeRepo", "getLatestCommit", "getRepoStatus", "sync.getRecord", "getBlocks10", "listBlobs", "listBlobsDeep"];
         match fill_secs {
             Some(f) => println!("\n### repo size {size}  (fill {:.0} rec/s)", size as f64 / f),
@@ -1955,7 +1942,6 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
                 "p50_ms": q(0.5), "p90_ms": q(0.9), "p99_ms": q(0.99), "max_ms": hh.max() as f64 / 1000.0, "errors": e}))?);
             out.push('\n');
         }
-        // 4. full export (getRepo): a few sequential runs, measure time and throughput
         let runs = if size >= 1_000_000 { 2 } else { 5 };
         for i in 0..runs {
             let t = Instant::now();
@@ -1983,7 +1969,6 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
     Ok(())
 }
 
-// ---------------- clone a real repo ----------------
 
 fn collect_blob_links(v: &serde_json::Value, out: &mut Vec<(String, String)>) {
     match v {
@@ -2072,7 +2057,6 @@ async fn clone_repo(args: &Args, car_path: &str, copies: usize, concurrency: usi
             .await?;
         let did = r["did"].as_str().ok_or_else(|| anyhow::anyhow!("createAccount: {r}"))?.to_string();
         let token = r["accessJwt"].as_str().unwrap().to_string();
-        // stand-in blobs
         let blob_map: std::collections::HashMap<String, (String, u64)> = futures::stream::iter(blob_links.clone())
             .map(|(old, mime)| {
                 let (c, h, token) = (c.clone(), h.clone(), token.clone());
@@ -2166,7 +2150,6 @@ async fn clone_repo(args: &Args, car_path: &str, copies: usize, concurrency: usi
     Ok(())
 }
 
-// ---------------- proxy fast path ----------------
 
 async fn stub_appview(listen: &str, body_bytes: usize, content_encoding: &str, repo_rev: &str) -> anyhow::Result<()> {
     let body = if content_encoding.is_empty() {
