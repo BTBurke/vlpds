@@ -175,6 +175,11 @@ impl OAuthError {
 
 impl From<crate::xrpc::XrpcError> for OAuthError {
     fn from(e: crate::xrpc::XrpcError) -> OAuthError {
+        // transient 503s (shard moving, Argon2 shed, KMS down) stay
+        // retryable: RFC 6749 temporarily_unavailable, not server_error
+        if e.status == StatusCode::SERVICE_UNAVAILABLE {
+            return OAuthError::new(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable", &e.message);
+        }
         OAuthError::server_error(&e.message)
     }
 }
@@ -188,6 +193,9 @@ impl IntoResponse for OAuthError {
             .into_response();
         r.headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        if self.status == StatusCode::SERVICE_UNAVAILABLE {
+            r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
         r
     }
 }

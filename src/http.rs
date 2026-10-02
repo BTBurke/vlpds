@@ -632,6 +632,7 @@ pub mod stall {
         }
         if n > 0 {
             STALLED.fetch_add(n as u64, Ordering::Relaxed);
+            crate::metrics::HTTP_STALLED_BODIES.inc_by(n as u64);
             tracing::info!("dropped {n} upstream response bodies whose clients stopped reading");
         }
         n

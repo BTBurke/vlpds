@@ -893,6 +893,15 @@ fn error_page(app: &App, status: StatusCode, title: &str, msg: &str) -> Response
     html(app, status, ui::error(title, msg), &[], None)
 }
 
+/// Shown on a 503 from the sign-in/sign-up forms (password hashing shed).
+const BUSY_MESSAGE: &str = "The server is busy. Please try again in a moment.";
+
+/// Adds `Retry-After: 1` (a transient 503 page).
+fn with_retry_after(mut r: Response) -> Response {
+    r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    r
+}
+
 /// Builds the redirect back to the client (RFC 6749 §4.1.2 + RFC 9207 `iss`)
 /// in the request's response mode: query (default), fragment, or form_post
 /// (an auto-submitting form page).
@@ -1519,8 +1528,15 @@ async fn sign_in(
         if ident.contains('@') && acct.email.as_deref() != Some(ident.as_str()) {
             return invalid();
         }
-        if !state::verify_password_hash(&acct.password_hash, &password).await {
-            return invalid();
+        // 503 temporarily_unavailable (+ Retry-After) rather than queue
+        // behind a login flood (the form handlers render a 503 page)
+        match state::try_verify_password_hash(&acct.password_hash, &password).await {
+            Ok(true) => {}
+            Ok(false) => return invalid(),
+            Err(busy) => {
+                crate::metrics::ARGON2_SHED.inc();
+                return Err(unavailable(&busy.to_string()));
+            }
         }
         if acct.status.is_some() {
             return Ok(SignIn::Failed(ident, LoginError::Inactive));
@@ -1628,6 +1644,10 @@ async fn authorize_sign_in(State(app): AppState, headers: HeaderMap, body: AxByt
         Ok(SignIn::Failed(ident, e)) => {
             login_page(&app, &flow, &ident, Some(e.message()), false, e.status())
         }
+        Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {
+            let ident = f.get("identifier").map(|s| s.trim().to_string()).unwrap_or_default();
+            with_retry_after(login_page(&app, &flow, &ident, Some(BUSY_MESSAGE), false, e.status))
+        }
         Err(e) => error_page(
             &app,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1699,6 +1719,10 @@ async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxByt
     };
     let acct = match super::server::create_account_inner(&app, inp, None).await {
         Ok(a) => a,
+        // Argon2 saturated (or another transient 503): retryable
+        Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {
+            return with_retry_after(signup_page(&app, &flow, &v, Some(BUSY_MESSAGE), e.status))
+        }
         Err(e) if e.status.is_server_error() => {
             return error_page(&app, StatusCode::INTERNAL_SERVER_ERROR, "Sign-up failed", &e.message)
         }
@@ -2427,6 +2451,9 @@ async fn account_sign_in(State(app): AppState, headers: HeaderMap, body: AxBytes
         )),
         Ok(SignIn::Failed(_, e)) => {
             redirect_to(&format!("/oauth/account?add=1&error={}", e.code()))
+        }
+        Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {
+            with_retry_after(error_page(&app, e.status, "Sign-in failed", BUSY_MESSAGE))
         }
         Err(e) => error_page(
             &app,

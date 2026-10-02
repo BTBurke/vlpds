@@ -221,6 +221,15 @@ pub const KEY_UNAVAILABLE: &str = "KeyUnavailable";
 /// (src/crypto.rs): nothing was emitted, retry.
 pub const SIGNATURE_FAULT: &str = "SignatureFault";
 
+/// Every Argon2 permit stayed busy (a login/sign-up flood): shed with 503
+/// `Overloaded` + Retry-After rather than queue behind the flood.
+impl From<crate::state::Argon2Busy> for XrpcError {
+    fn from(e: crate::state::Argon2Busy) -> XrpcError {
+        crate::metrics::ARGON2_SHED.inc();
+        XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: "Overloaded".into(), message: e.to_string() }
+    }
+}
+
 impl From<crate::crypto::SignatureFault> for XrpcError {
     fn from(e: crate::crypto::SignatureFault) -> XrpcError {
         XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: SIGNATURE_FAULT.into(), message: e.to_string() }

@@ -35,6 +35,9 @@ lazy!(HTTP_SERVER_ACCEPT_ERRORS: IntCounter = register_int_counter!("vlpds_http_
 lazy!(HTTP_SERVER_ACTIVE: IntGaugeVec = register_int_gauge_vec!("vlpds_http_server_active_requests", "Inbound requests (h2: streams) awaiting their response head, by HTTP version", &["version"]));
 lazy!(RATE_LIMITED: IntCounter = register_int_counter!("vlpds_rate_limited_total", "Requests rejected with 429 RateLimitExceeded"));
 lazy!(WRITES_SHED: IntCounter = register_int_counter!("vlpds_writes_shed_total", "Write requests rejected by admission control (503)"));
+lazy!(ARGON2_SHED: IntCounter = register_int_counter!("vlpds_argon2_shed_total", "Password checks/hashes (createSession, createAccount, OAuth sign-in, password changes) answered 503 Overloaded: every Argon2 permit stayed busy for 2 s"));
+lazy!(PROXY_REJECTED: IntCounterVec = register_int_counter_vec!("vlpds_proxy_rejected_total", "Proxied (AppView/service) requests refused before forwarding, by reason (account_cap: 429 at 64 in flight for one account on its owner)", &["reason"]));
+lazy!(HTTP_STALLED_BODIES: IntCounter = register_int_counter!("vlpds_http_stalled_bodies_total", "Proxied/forwarded response bodies dropped because the client stopped reading for 30 s (write-progress deadline, src/http.rs stall)"));
 
 // ---- repo workers ----
 lazy!(COMMITS: IntCounter = register_int_counter!("vlpds_commits_total", "Commits built"));

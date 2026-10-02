@@ -1328,8 +1328,10 @@ async fn subscribe_repos(State(app): AppState, Query(q): Query<SubQ>, req: axum:
             return XrpcError::bad("InvalidRequest", "shard must be k/n with 0 <= k < n <= 65536").into_response();
         }
     };
-    let peer = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip());
-    let client = crate::ratelimit::client_ip(req.headers(), peer, &app.ratelimit.trusted);
+    // the rate limiter's client address (a peer-forwarded request's
+    // vouched-for client, not the forwarding node), so the per-IP cap and
+    // the rate limits count the same client
+    let client = crate::ratelimit::request_client_ip(req.headers(), req.extensions(), &app.ratelimit.trusted);
     app.firehose.upgrade(req, q.cursor, shard, client)
 }
 

@@ -1015,6 +1015,7 @@ fn admit(did: &str) -> XResult<InFlight> {
     let mut m = InFlight::shard(h).lock();
     let n = m.entry(h).or_insert(0);
     if *n >= MAX_IN_FLIGHT_PER_ACCOUNT {
+        crate::metrics::PROXY_REJECTED.with_label_values(&["account_cap"]).inc();
         return Err(xerr(
             StatusCode::TOO_MANY_REQUESTS,
             "RateLimitExceeded",

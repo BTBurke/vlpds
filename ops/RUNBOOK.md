@@ -83,6 +83,10 @@ it is marked **(unverified)**.
 it). `/internal/*` is on the app port and peers use cleartext h2c with the
 internal token: keep node-to-node traffic on a private network and block
 `/internal/` at the edge (the Ansible Caddy does; DESIGN.md "HTTP").
+`--peer-listen`, when set, serves the same routes as `--listen` (XRPC,
+OAuth, `/internal/*`; `/metrics` and `/debug/pprof` only where `--listen`
+has them, i.e. with `--metrics-listen app` or `--dev-mode`), with the peer
+HTTP/2 settings: keep it on the private network and out of the edge proxy.
 Production refuses the MinIO default S3 credentials, and
 `vlpds.admin.bulkCreate` needs `--dev-mode` or `--allow-bulk-create`.
 
@@ -151,7 +155,10 @@ its own log, so it never counts): that survives a node that never comes back.
 
 Not flags: a subscriber that takes no bytes for 30 s outside the live path
 (backfill, pongs) is dropped (`vlpds_firehose_disconnects_total{reason="write_stalled"}`);
-Argon2 runs at most one per core (16 max) at once, the rest queue; accept
+Argon2 runs at most one per core (16 max) at once; request-path password
+checks and hashes wait up to 2 s for a turn, then answer 503 `Overloaded`
+(`vlpds_argon2_shed_total`, [VlpdsPasswordHashingShed](#vlpdspasswordhashingshed)),
+admin password changes wait; accept
 errors are retried every 50 ms (`vlpds_http_server_accept_errors_total`,
 log `accept failed (retrying)`: usually out of file descriptors).
 
@@ -697,6 +704,40 @@ without it a latency blip snowballs into connection storms.
 
 **Do:** find why writes are slow (commit latency, cold loads) or add capacity.
 Raising the limit only helps if the node has headroom.
+
+### VlpdsPasswordHashingShed
+
+**Means:** password checks and hashes on request paths (createSession,
+createAccount, OAuth sign-in/sign-up, resetPassword, deleteAccount,
+disableTotp) answered 503 `Overloaded` + `Retry-After: 1` (the OAuth forms: a
+503 page) because every Argon2 permit (one per core, at most 16; ~20 ms of CPU
+and 19 MiB each) stayed busy for 2 s. Shedding keeps a login flood from
+queueing without bound; admin password changes still wait their turn.
+Counter: `vlpds_argon2_shed_total`.
+
+**Confirm:** `rate(vlpds_http_requests_total{method="com.atproto.server.createSession"}[5m])`
+by status; `vlpds_rate_limited_total` (rate limits are checked before any
+hashing, so a flood from few IPs or identifiers should be 429s, not 503s); host
+CPU.
+
+**Do:** a flood spread over many IPs: tighten the sign-in rate limits or block
+upstream. Legitimate load: more cores (the permit count follows them, up to 16)
+or nodes.
+
+### VlpdsProxyAccountCapSustained
+
+**Means:** proxied (AppView/service) requests for one account refused 429
+`RateLimitExceeded` at 64 in flight on its owner node
+(`vlpds_proxy_rejected_total{reason="account_cap"}`). A slot is held until the
+response body is done, so a slow upstream or a client that stops reading
+holds slots too; bodies whose client stopped reading for 30 s are dropped and
+counted in `vlpds_http_stalled_bodies_total` (proxied and forwarded responses).
+
+**Confirm:** the access log for the account sending the requests; upstream
+latency; whether `vlpds_http_stalled_bodies_total` grows alongside.
+
+**Do:** a misbehaving client: rate limit or take it down per policy. A slow
+upstream: follow the upstream's health; nothing to tune here.
 
 ### VlpdsWriteInternalErrors
 

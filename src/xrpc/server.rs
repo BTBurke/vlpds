@@ -366,11 +366,13 @@ fn account_status(a: &Account) -> (bool, Option<String>) {
     (a.status.is_none(), a.status.clone())
 }
 
-pub(super) async fn verify_password(a: &Account, password: &str) -> bool {
+/// Checks an account password on a request path: 503 `Overloaded` (+
+/// Retry-After) instead of queueing when every Argon2 permit stays busy.
+pub(super) async fn verify_password(a: &Account, password: &str) -> XResult<bool> {
     if password.len() > OLD_PASSWORD_MAX_LENGTH || a.password_hash.is_empty() {
-        return false;
+        return Ok(false);
     }
-    state::verify_password_hash(&a.password_hash, password).await
+    Ok(state::try_verify_password_hash(&a.password_hash, password).await?)
 }
 
 pub(super) fn valid_email(e: &str) -> bool {
@@ -1599,10 +1601,15 @@ pub(super) async fn create_account_inner(
     let (h, e, password_hash, wrapped) = tokio::join!(
         claim_handle(app, &handle, &did),
         claim_email(app, &email, &did),
-        state::hash_password(&password),
+        state::try_hash_password(&password),
         app.secrets.wrap_signing_key(&did, &key)
     );
     let (h_ok, e_ok) = (matches!(h, Ok(true)), matches!(e, Ok(true)));
+    let wrapped = match &password_hash {
+        Ok(_) => wrapped.map_err(XrpcError::from),
+        // Argon2 saturated: 503 Overloaded, the claims released below
+        Err(_) => Err(XrpcError::from(state::Argon2Busy)),
+    };
     let (wrapped_signing_key, signing_pubkey) = match wrapped {
         Ok(w) => w,
         Err(err) => {
@@ -1654,7 +1661,7 @@ pub(super) async fn create_account_inner(
         email: Some(email.clone()),
         ..Default::default()
     };
-    acct.password_hash = password_hash;
+    acct.password_hash = password_hash.expect("checked with the signing key");
     set_extra(&mut acct, "totpEnabled", json!(false));
     if let Some(code) = &invite {
         set_extra(&mut acct, "invitedBy", json!(code));
@@ -1866,7 +1873,7 @@ async fn create_session(
     crate::ratelimit::check(&[&crate::ratelimit::SIGN_IN_ACCOUNT], &acct.did, 1)?;
     let soft_deleted = is_takendown_account(&acct);
     let mut app_pass = None;
-    if !verify_password(&acct, &inp.password).await {
+    if !verify_password(&acct, &inp.password).await? {
         // takendown/suspended accounts cannot log in with an app password
         if soft_deleted {
             return Err(invalid());
@@ -2426,7 +2433,7 @@ async fn delete_account(
         .account(&inp.did)
         .await
         .map_err(|_| invalid_request("account not found"))?;
-    if !verify_password(&acct, &inp.password).await {
+    if !verify_password(&acct, &inp.password).await? {
         return Err(auth_required("Invalid did or password"));
     }
     assert_email_token(&app, &acct.did, "delete_account", &inp.token).await?;
@@ -2800,8 +2807,15 @@ pub async fn reset_token_did(app: &App, token: &str) -> XResult<Option<String>> 
 }
 
 /// Sets a new password and revokes every session, OAuth grants included.
+/// Waits for an Argon2 permit (admin updateAccountPassword); request paths
+/// hash with [`state::try_hash_password`] and call
+/// [`change_password_hashed`].
 pub(super) async fn change_password(app: &App, did: &str, password: &str) -> XResult<()> {
-    let hash = state::hash_password(password).await;
+    change_password_hashed(app, did, state::hash_password(password).await).await
+}
+
+/// [`change_password`] with the new password already hashed.
+pub(super) async fn change_password_hashed(app: &App, did: &str, hash: String) -> XResult<()> {
     update_account(app, did, false, false, move |a| {
         a.password_hash = hash.clone();
         Ok(())
@@ -2827,7 +2841,9 @@ async fn reset_password(
         .await?
         .ok_or_else(|| invalid_token("Token is invalid"))?;
     assert_email_token(&app, &did, "reset_password", &token).await?;
-    change_password(&app, &did, &inp.password).await?;
+    // shed (503, token still valid) rather than queue behind a login flood
+    let hash = state::try_hash_password(&inp.password).await?;
+    change_password_hashed(&app, &did, hash).await?;
     app.put_private(&routing, vec![pmut(&routing, "t", None)])
         .await?;
     Ok(StatusCode::OK)
@@ -3309,7 +3325,7 @@ async fn disable_totp(
 ) -> XResult<StatusCode> {
     let did = session_only(&creds)?;
     let acct = app.account(&did).await?;
-    if !verify_password(&acct, &inp.password).await {
+    if !verify_password(&acct, &inp.password).await? {
         return Err(auth_required("Invalid password"));
     }
     'cas: {

@@ -424,6 +424,30 @@ groups:
           summary: "{{ $labels.instance }} is rejecting {{ $value | humanize }} writes/s with 503 Overloaded (--max-inflight-writes)"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdswritesshed"
 
+      # Logins/sign-ups/password changes answered 503 Overloaded because every
+      # Argon2 permit (one per core, at most 16) stayed busy for 2 s: a login
+      # flood, or too little CPU for the sign-in rate. 0.5/s for 10m (guess).
+      - alert: VlpdsPasswordHashingShed
+        expr: sum by (instance) (rate(vlpds_argon2_shed_total{job="vlpds"}[5m])) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} is shedding {{ $value | humanize }} password checks/s with 503 Overloaded (Argon2 saturated)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdspasswordhashingshed"
+
+      # Proxied requests refused 429 at 64 in flight for one account on its
+      # owner. One client misbehaving trips it briefly; sustained for 30m
+      # it's a stuck or abusive client, or a slow upstream (guess).
+      - alert: VlpdsProxyAccountCapSustained
+        expr: sum by (instance) (rate(vlpds_proxy_rejected_total{job="vlpds",reason="account_cap"}[5m])) > 1
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} is refusing {{ $value | humanize }} proxied requests/s at the per-account in-flight cap"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsproxyaccountcapsustained"
+
       - alert: VlpdsWriteInternalErrors
         expr: sum by (instance, kind) (rate(vlpds_write_errors_total{job="vlpds",kind=~"internal|unavailable"}[5m])) > 0.5
         for: 10m

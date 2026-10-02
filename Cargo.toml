@@ -107,6 +107,12 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 name = "all"
 path = "tests/all/main.rs"
 
+# Argon2 overload shedding: its own binary because it saturates the
+# process-wide Argon2 permits (every other login in the process would shed)
+[[test]]
+name = "argon2_shed"
+path = "tests/argon2_shed.rs"
+
 # Rolling upgrades with the test feature level: its own binary (the active
 # level is process-wide), so `cargo test --features test-level --test level_gating`
 [[test]]

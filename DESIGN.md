@@ -1907,10 +1907,12 @@ priced in the cost model (8 nodes / 1,024 shards) and designed for in
 
 Logins and proxying set the CPU, not commits. Argon2 runs at most one
 hash or verification per core (at most 16) at once, process-wide
-(`state::ARGON2_PERMITS`); the rest wait their turn, so a login flood
-costs queueing, not 19 MiB and a blocking-pool thread per request. The
-`try_` variants shed with `Argon2Busy` after 2 s for handlers that answer
-503 instead. Sizing rule: after losing
+(`state::ARGON2_PERMITS`), so a login flood costs queueing, not 19 MiB
+and a blocking-pool thread per request. Request paths (createSession,
+createAccount, OAuth sign-in/sign-up, resetPassword, deleteAccount,
+disableTotp) use the `try_` variants: they wait at most 2 s for a turn,
+then answer 503 `Overloaded` + Retry-After (`vlpds_argon2_shed_total`);
+admin password changes wait. Sizing rule: after losing
 one node, the survivors stay under ~60% CPU, i.e.
 (nodes − 1) × cores × 0.6 ≥ busy cores.
 

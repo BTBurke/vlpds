@@ -417,6 +417,13 @@ async fn argon2_permit(wait: Option<std::time::Duration>) -> Result<tokio::sync:
     Ok(p.expect("the Argon2 semaphore is never closed"))
 }
 
+/// Takes every Argon2 permit until the guard drops: a saturated pool, for
+/// tests of the `try_` variants' shedding (tests/argon2_shed.rs).
+#[doc(hidden)]
+pub async fn hold_all_argon2_permits() -> tokio::sync::SemaphorePermit<'static> {
+    ARGON2_PERMITS.acquire_many(*ARGON2_POOL_MAX as u32).await.expect("the Argon2 semaphore is never closed")
+}
+
 /// Argon2id (OWASP baseline: m=19 MiB, t=2, p=1) PHC string. ~20 ms of CPU,
 /// so it runs on the blocking pool, at most [`ARGON2_PERMITS`] at once
 /// (waits for a turn).
