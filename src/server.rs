@@ -1,5 +1,4 @@
-//! Server assembly: storage, node log, cluster membership, shards, firehose,
-//! workers, HTTP. Used by the binary and by in-process integration tests.
+//! Server assembly, used by the binary and by in-process integration tests.
 //! A single node is simply a one-node cluster.
 
 use crate::cluster::{Cluster, ClusterConfig, ShardHost};
@@ -19,231 +18,133 @@ pub struct Config {
     pub service_did: String,
     pub jwt_secret: String,
     pub admin_token: String,
-    /// Shared node-to-node secret (`x-vlpds-internal`); distinct from the
-    /// admin token so a leaked node credential isn't an admin credential.
+    /// Distinct from the admin token so a leaked node credential isn't an
+    /// admin credential.
     pub internal_token: String,
-    /// None = in-memory object store (tests/dev).
+    /// None: in-memory object store.
     pub s3: Option<S3Config>,
     pub prefix: String,
     /// (median ms, lognormal sigma) injected on segment PUTs.
     pub inject_latency: Option<(f64, f64)>,
-    /// Object-store requests in flight on the state client (SlateDB, blobs,
-    /// account indexes; `--store-inflight`). See `objlimit`.
     pub store_inflight: usize,
-    /// ... on the log client's reads (replay, backfill, followers,
-    /// retention; `--log-store-inflight`); its segment PUTs have their own
-    /// lane (`objlimit::log_write_permits`).
     pub log_store_inflight: usize,
-    /// Shards (slot ranges) in the keyspace; fixed per bucket prefix.
+    /// The initial layout of a new prefix; the stored layout wins after.
     pub shards: u32,
     pub workers: usize,
     pub cache_per_worker: usize,
-    /// Approximate heap budget of the node's cached repos and their loaded
-    /// MST paths (DESIGN.md "Partial MSTs"; split across workers; 0 =
-    /// bounded by count only).
+    /// 0: bounded by count only.
     pub repo_cache_bytes: usize,
-    /// Cold open: up to this much of a repo's `M/` range is read with one
-    /// scan (`--lazy-mst-prefetch-kb`).
     pub lazy_mst_prefetch_bytes: usize,
-    /// Tests: drop every idle repo's loaded paths after each worker pass,
-    /// so every write and read walks from the root through the store.
-    /// Default: `VLPDS_LAZY_MST_UNLOAD_IDLE=1` (runs the suite that way).
+    /// Tests: drop every idle repo's loaded paths after each worker pass, so
+    /// every write and read walks from the root through the store.
     pub lazy_mst_unload_idle: bool,
-    /// Bytes of loaded MST nodes kept process-wide for readers and fetches
-    /// (`--lazy-mst-node-cache-mb`; `mst_store::NodeCache`).
     pub lazy_mst_node_cache_bytes: usize,
     pub max_segment_bytes: usize,
-    /// Segment PUTs in flight per node log (DESIGN.md "Pipelined segment PUTs").
     pub log_inflight: usize,
-    /// Byte budget of the node log's live ring (sealed segments for peer
-    /// followers and the merger; a follower behind it catches up from S3).
     pub live_ring_bytes: usize,
-    /// Byte budget of the firehose merger's per-log queues; a log over it is
-    /// read back from S3 instead.
     pub firehose_merge_queue_bytes: usize,
     pub firehose_ring_bytes: usize,
-    /// Threads of the process-wide firehose runtime that serves
-    /// subscribeRepos connections (0 = serve them on the request runtime).
+    /// 0: serve subscribeRepos on the request runtime.
     pub firehose_threads: usize,
-    /// A live subscriber this many bytes behind the head gets ConsumerTooSlow.
     pub firehose_max_lag_bytes: usize,
-    /// Cursor backfill: S3 read-ahead per subscriber, and the segment cache
-    /// shared by subscribers replaying the same range.
     pub backfill_readahead_bytes: usize,
     pub backfill_cache_bytes: usize,
-    /// Cursor backfills running at once (more wait their turn): with
-    /// `backfill_readahead_bytes` each, the process-wide read-ahead bound.
     pub firehose_max_backfills: usize,
-    /// subscribeRepos connections per client IP (IPv6: per /64); 0 = no cap.
+    /// 0: no cap.
     pub firehose_max_per_ip: usize,
     pub hedge_after: Duration,
     pub max_inflight_writes: usize,
-    /// Reads queued at the repo workers (repo views for getRepo, getRecord,
-    /// getBlocks, ...) before shedding with 503: each holds its slot until
-    /// its worker answers, so a slow repo load can't queue them unbounded.
     pub max_queued_reads: usize,
-    /// getRepo / getCheckout exports streaming at once; more wait up to 10 s
-    /// for a slot, then get 503.
     pub max_exports: usize,
-    /// An export whose client reads nothing for this long is ended.
     pub export_stall: Duration,
-    /// Connections open at once per listener (0 = no cap).
+    /// Per listener; 0: no cap.
     pub max_connections: usize,
     pub cache_dir: Option<std::path::PathBuf>,
-    /// The SST disk cache budget of this node (`--disk-cache-mb`), split
-    /// over the layout's shards; None = SlateDB's 16 GiB per shard.
+    /// Split over the layout's shards. None: SlateDB's 16 GiB per shard.
     pub disk_cache_bytes: Option<u64>,
-    /// An explicit per-shard disk cache cap (`--disk-cache-shard-mb`).
     pub disk_cache_shard_bytes: Option<u64>,
-    /// Default AppView for proxied app.bsky.* / chat.bsky.* (url, service DID).
+    /// (url, service DID)
     pub appview: Option<(String, String)>,
-    /// Moderation service for createReport (url, service DID).
+    /// (url, service DID)
     pub report_service: Option<(String, String)>,
-    /// Image URLs in read-after-write views: a printf-style pattern with
-    /// three `%s` (preset such as `avatar`, DID, blob CID), like the
-    /// reference's PDS_BSKY_APP_VIEW_CDN_URL_PATTERN. None: the PDS's own
-    /// `com.atproto.sync.getBlob` URL.
+    /// None: the PDS's own getBlob URL.
     pub appview_cdn_url_pattern: Option<String>,
-    /// Relays to notify (requestCrawl) at startup.
     pub crawlers: Vec<String>,
-    /// Dev mode: email/password-reset tokens are returned/logged instead of mailed.
     pub dev_mode: bool,
-    /// vlpds.admin.bulkCreate (synthetic benchmark accounts) outside dev
-    /// mode (`--allow-bulk-create`).
     pub allow_bulk_create: bool,
-    /// Key-encryption keys for secrets at rest (src/secrets.rs; `--kek-file`,
-    /// `--gcp-kms-key`). Empty: the dev KEK, dev mode only.
+    /// Empty: the dev KEK, dev mode only.
     pub kek: crate::secrets::KekConfig,
-    /// This node's outbound email (`--email-smtp-url`, crate::mail). None:
-    /// the process-wide mailer (logs only, unless `xrpc::set_mailer`).
+    /// None: the process-wide mailer (logs only, unless `xrpc::set_mailer`).
     pub mailer: Option<crate::mail::SharedMailer>,
-    /// admin sendEmail's mailer (`--moderation-email-smtp-url`). None: the
-    /// main mailer above.
+    /// None: `mailer`.
     pub moderation_mailer: Option<crate::mail::SharedMailer>,
-    /// Email branding (`--email-brand-name` etc., crate::mail::Branding).
     pub email_branding: crate::mail::Branding,
-    /// Max uploadBlob size in bytes (also describeServer's blobUploadLimit).
     pub max_blob_size: u64,
-    /// describeServer `links.privacyPolicy` / `links.termsOfService` /
-    /// `contact.email` (reference PDS_PRIVACY_POLICY_URL,
-    /// PDS_TERMS_OF_SERVICE_URL, PDS_CONTACT_EMAIL_ADDRESS).
     pub privacy_policy_url: Option<String>,
     pub terms_of_service_url: Option<String>,
     pub contact_email_address: Option<String>,
-    /// Unreferenced blobs older than this are deleted by the blob GC.
     pub blob_gc_grace: Duration,
-    /// Period of the account / repo / disk-cache count behind the operator
-    /// dashboard's totals (`xrpc::spawn_account_stats`); zero = off.
+    /// Zero: off.
     pub account_stats_interval: Duration,
-    /// PLC directory: resolves did:plc documents and, with PLC registration
-    /// on (`plc`), receives new accounts' genesis ops and their updates.
     pub plc_url: String,
-    /// PLC registration: mode and the server rotation key (src/plc;
-    /// DESIGN.md "PLC identity"). Default: registration off (no rotation
-    /// key), which only dev mode accepts (`check_secrets`).
+    /// Default: registration off, which only dev mode accepts.
     pub plc: crate::plc::PlcConfig,
-    /// createAccount requires an invite code (describeServer inviteCodeRequired).
     pub invite_required: bool,
-    /// With `invite_required`: each account earns one invite code per this
-    /// interval of account age (reference PDS_INVITE_INTERVAL), created by
-    /// getAccountInviteCodes. None = accounts never earn codes.
+    /// None: accounts never earn codes.
     pub invite_interval: Option<Duration>,
-    /// Earned codes count only account age after this instant, in Unix ms
-    /// (reference PDS_INVITE_EPOCH; 0 = from account creation).
+    /// 0: from account creation.
     pub invite_epoch_ms: i64,
-    /// The moderation service (Ozone) DID trusted to call the moderator
-    /// admin methods with service auth (reference PDS_MOD_SERVICE_DID;
-    /// `xrpc::authn::MODERATOR_METHODS`). None = admin Basic auth only.
+    /// None: admin Basic auth only.
     pub mod_service_did: Option<String>,
-    /// DNS TXT lookups for external handle proofs (`_atproto.<handle>`).
-    /// None = the system resolver (src/handle_resolver.rs); tests inject a stub.
+    /// None: the system resolver; tests inject a stub.
     pub txt_resolver: Option<crate::handle_resolver::TxtResolverRef>,
-    /// Membership settings (node id, advertised URL, lease timing). None =
-    /// single-node defaults (node id "single", addr = public_url).
+    /// None: node id "single", addr = public_url.
     pub cluster: Option<ClusterConfig>,
-    /// Reference rate limits (src/ratelimit.rs). Benchmarks turn this off.
     pub rate_limits_enabled: bool,
-    /// Proxies (IPs / CIDRs) whose X-Forwarded-For is trusted for the
-    /// rate-limit client IP. Empty = always the TCP peer (or, on a request a
-    /// peer forwarded, the client address it vouched for).
     pub trusted_proxies: Vec<String>,
-    /// h2 connections to each peer node (crate::http::PeerClient).
     pub peer_connections: usize,
-    /// Peer mTLS (`--peer-tls-dir`, crate::peer_tls), the only node-to-node
-    /// transport: the peer client presents this node's certificate, and the
-    /// peer listener ([`spawn_peer_listener`]) serves [`router`] (with
-    /// `/internal/*`) over it; the cluster address must be `https://`.
-    /// None = a lone node: no peer listener, no `/internal/*`, and peer
-    /// calls fail (`PeerClient::lone`).
+    /// None: a lone node, with no peer listener, no `/internal/*`, and peer
+    /// calls that fail.
     pub peer_tls: Option<Arc<crate::peer_tls::PeerTls>>,
-    /// `x-ratelimit-bypass` header value that skips rate limits (reference
-    /// PDS_RATE_LIMIT_BYPASS_KEY).
     pub rate_limit_bypass_key: Option<String>,
-    /// Opt-in dynamic lexicon resolution for record validation
-    /// (src/lexicon.rs): record types without a bundled schema are resolved
-    /// over the network and validated; a write waits at most this long for a
-    /// resolution (else `validationStatus: "unknown"`). None = off.
+    /// How long a write waits for a lexicon resolution. None: off.
     pub resolve_lexicons: Option<Duration>,
-    /// Largest CAR importRepo accepts (reference PDS_MAX_REPO_IMPORT_SIZE).
     /// The CAR is parsed in memory and the import is one log entry, so this
-    /// bounds both (DESIGN.md "Partial MSTs", untrusted block sets).
+    /// bounds both.
     pub max_import_bytes: usize,
-    /// With `s3: None`: share this in-memory object store instead of a fresh
-    /// one, so several in-process nodes form one cluster (tests; may be
-    /// wrapped, e.g. in a `ThrottledStore` for object-store latency).
+    /// With `s3: None`: share this store so several in-process nodes form
+    /// one cluster (tests).
     pub memory_store: Option<Arc<dyn object_store::ObjectStore>>,
-    /// Serve /metrics and /debug/pprof on a separate listener (the binary's
-    /// `--metrics-listen`) and not on the app port. None = on the app port.
+    /// Serve /metrics and /debug/pprof there instead of the app port.
     pub metrics_listen: Option<String>,
-    /// Log segment retention (src/retention.rs; `--log-retention`). None = keep
-    /// every segment forever.
+    /// None: keep every segment forever.
     pub log_retention: Option<crate::retention::Config>,
-    /// Memory budget of the in-memory caches (verified tokens, proxy
-    /// accounts, DID documents, ...; src/caches.rs), split between them by
-    /// weight. None = 10% of physical RAM or the cgroup limit.
+    /// None: 10% of physical RAM or the cgroup limit.
     pub cache_budget_bytes: Option<u64>,
-    /// Entry caps overriding the budget's, per cache.
     pub cache_entries: Vec<(crate::caches::Cache, usize)>,
-    /// Automatic shard splits (src/reshard.rs; off by default).
     pub reshard_policy: crate::reshard::Policy,
-    /// Retired split/merge state GC and forced detach (src/reshard_gc.rs).
-    /// None = keep retired parents' state forever.
+    /// None: keep retired parents' state forever.
     pub reshard_gc: Option<crate::reshard_gc::Config>,
-    /// Every shard is checkpointed once per this (bounds a successor's
-    /// replay; `--checkpoint-every`).
     pub checkpoint_every: Duration,
-    /// Spread the checkpoints over the interval, one shard at a time, instead
-    /// of all shards back to back (`--checkpoint-stagger`).
     pub checkpoint_stagger: bool,
-    /// Recently written repos tracked per shard and preloaded by its next
-    /// owner (`--preload-recent`; 0 = off).
+    /// 0: off.
     pub preload_recent: usize,
-    /// A forwarded write not started within this (its repo still loading)
-    /// is answered 503 `RepoLoading` and retried by the forwarding node
-    /// (`--forwarded-write-start-ms`; None = wait for it).
+    /// None: wait for the write to start.
     pub forwarded_write_start: Option<Duration>,
-    /// The node a client called resends its repo writes answered "not
-    /// applied" (RepoLoading, ShardMoved) for up to 20 s
-    /// (`--retry-unapplied-writes`; crate::forward).
     pub retry_unapplied_writes: bool,
 }
 
-
-/// Well-known secrets: only accepted with `dev_mode` (see [`Config::check_secrets`]).
-/// The MinIO default S3 access/secret key (the CLI default): refused
-/// outside dev mode.
+/// Well-known secrets, accepted only with `dev_mode`.
 pub const DEV_S3_CREDENTIAL: &str = "minioadmin";
 pub const DEV_JWT_SECRET: &str = "dev-secret-change-me";
 pub const DEV_ADMIN_TOKEN: &str = "dev-admin-token";
 pub const DEV_INTERNAL_TOKEN: &str = "dev-internal-token";
-/// Minimum length of each secret outside dev mode.
-pub const MIN_SECRET_LEN: usize = 32;
+const MIN_SECRET_LEN: usize = 32;
 
 impl Config {
-    /// Startup check (the binary calls it; in-process tests may skip it):
-    /// secrets are never empty, and outside dev mode they must be set,
-    /// not the dev defaults, at least [`MIN_SECRET_LEN`] bytes, and
-    /// pairwise distinct.
+    /// The binary calls it; in-process tests may skip it. Secrets are never
+    /// empty, and outside dev mode they must be real, at least
+    /// [`MIN_SECRET_LEN`] bytes, and pairwise distinct.
     pub fn check_secrets(&self) -> anyhow::Result<()> {
         let secrets = [
             ("VLPDS_JWT_SECRET", &self.jwt_secret, DEV_JWT_SECRET),
@@ -365,8 +266,6 @@ impl Default for Config {
     }
 }
 
-/// Opens storage, joins the cluster, starts the node log, acquires shards,
-/// and starts the firehose merger and repo workers.
 pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let (caps, budget) = crate::caches::resolve(cfg.cache_budget_bytes, &cfg.cache_entries);
     crate::caches::apply(&caps);
@@ -380,11 +279,9 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         full_mb = caps.total_bytes() >> 20,
         "cache caps: {caps}"
     );
-    // Separate clients (connection pools) for the commit log, the control
-    // plane, and everything else, each with bounded requests in flight
-    // (objlimit.rs): a takeover's burst queues for permits instead of
-    // opening a connection per request (it once took the host's every
-    // ephemeral port, and the lease renewals failed with the rest).
+    // Separate connection pools for the commit log, the control plane and
+    // everything else, each bounded (objlimit.rs), so a takeover's burst
+    // can't starve lease renewals or exhaust ephemeral ports.
     use crate::objlimit::{Limits, Reserve};
     let log_limits = Limits::new(cfg.log_store_inflight).with_reserved(Reserve::Writes, crate::objlimit::log_write_permits(cfg.log_inflight));
     let state_limits = Limits::new(cfg.store_inflight);
@@ -464,7 +361,6 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         });
-        // bound how much of our log a successor replays after a crash (~10 s)
         log.spawn_checkpoints(cfg.checkpoint_every, cfg.checkpoint_stagger);
     }
     let http = match &cfg.peer_tls {
@@ -481,8 +377,6 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
                 cluster.cfg.addr
             );
             let http = crate::http::PeerClient::new(cfg.peer_connections, t.clone());
-            // which node(s) each peer origin should present: whoever a
-            // lease or the routing table puts there
             let c = cluster.clone();
             http.set_registry(Arc::new(move |origin: &str| {
                 let at = |addr: &str| crate::http::split_origin(addr.trim_end_matches('/')).0 == origin;
@@ -578,7 +472,6 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     }))
 }
 
-/// Background reporters (log line, watermark lag gauges, runtime stall detector).
 pub fn spawn_reporters(app: &Arc<xrpc::App>) {
     stats::spawn_reporter(Duration::from_secs(5));
     let parts = app.partitions.clone();
@@ -597,11 +490,8 @@ pub fn spawn_reporters(app: &Arc<xrpc::App>) {
     stats::spawn_stall_detector();
 }
 
-/// Builds the app and serves it in background tasks: [`public_router`] on
-/// `public` (clients), and, on a node with peers (`cfg.peer_tls`), the full
-/// [`router`] over mTLS on `peer` ([`spawn_peer_listener`]); a lone node
-/// has no `peer`. Returns the app and the public address (tests bind
-/// 127.0.0.1:0).
+/// Builds the app and serves it in background tasks. Returns the public
+/// address (tests bind 127.0.0.1:0).
 pub async fn spawn(
     cfg: Config,
     public: tokio::net::TcpListener,
@@ -621,20 +511,21 @@ pub async fn spawn(
         }
     });
     if let Some(m) = &app.config.metrics_listen {
-        let l = tokio::net::TcpListener::bind(m).await?;
-        let r = metrics_router(&app);
-        tokio::spawn(async move {
-            if let Err(e) = serve(l, r).await {
-                tracing::error!("metrics server exited: {e:#}");
-            }
-        });
+        spawn_metrics_listener(&app, tokio::net::TcpListener::bind(m).await?);
     }
     Ok((app, addr))
 }
 
-/// Serves the peer listener in a background task: the full [`router`]
-/// (`/internal/*`, forwarded requests) over mTLS (client certificates of
-/// the cluster CA required), with the peer HTTP/2 profile.
+pub fn spawn_metrics_listener(app: &Arc<xrpc::App>, listener: tokio::net::TcpListener) {
+    let r = metrics_router(app);
+    tokio::spawn(async move {
+        if let Err(e) = serve(listener, r).await {
+            tracing::error!("metrics server exited: {e:#}");
+        }
+    });
+}
+
+/// The full [`router`] over mTLS, with the peer HTTP/2 profile.
 pub fn spawn_peer_listener(app: &Arc<xrpc::App>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
     let tls = app.config.peer_tls.as_ref().ok_or_else(|| anyhow::anyhow!("a peer listener needs peer TLS"))?;
     let opts = ServeOptions { h2: H2Profile::Peer, max_connections: app.config.max_connections, tls: Some(tls.server_config()) };
@@ -647,15 +538,12 @@ pub fn spawn_peer_listener(app: &Arc<xrpc::App>, listener: tokio::net::TcpListen
     Ok(())
 }
 
-/// Request headers only peers may send: on [`public_router`] they are
-/// stripped, so a client's copy means nothing.
-pub const PEER_ONLY_HEADERS: [&str; 3] = [crate::forward::FORWARDED_HEADER, "x-vlpds-internal", crate::ratelimit::CLIENT_IP_HEADER];
+/// Stripped on [`public_router`], so a client's copy means nothing.
+const PEER_ONLY_HEADERS: [&str; 3] = [crate::forward::FORWARDED_HEADER, "x-vlpds-internal", crate::ratelimit::CLIENT_IP_HEADER];
 
-/// The client-facing listener's (`--listen`) router: [`router`] without
-/// `/internal/*` (404), and with the peer-only headers dropped before
-/// anything reads them: a forwarded marker is served as the client request
-/// it is (routed, rate-limited), and `x-vlpds-internal` doesn't skip rate
-/// limits. Peers reach the rest on the peer listener only.
+/// [`router`] without `/internal/*`, and with the peer-only headers dropped
+/// before anything reads them: a forwarded marker is served as the client
+/// request it is, and `x-vlpds-internal` doesn't skip rate limits.
 pub fn public_router(app: &Arc<xrpc::App>) -> axum::Router {
     router(app).layer(axum::middleware::from_fn(|mut req: axum::extract::Request, next: axum::middleware::Next| async move {
         let p = req.uri().path();
@@ -669,12 +557,9 @@ pub fn public_router(app: &Arc<xrpc::App>) -> axum::Router {
     }))
 }
 
-/// Paths served only by [`metrics_router`] when `metrics_listen` is set.
 const METRICS_PATHS: [&str; 2] = ["/metrics", "/debug/pprof/"];
 
-/// The peer listener's router (and, through [`public_router`], the app
-/// port's): XRPC, OAuth, web UI and /internal, with cluster forwarding; /metrics and /debug/pprof too unless `metrics_listen` moves
-/// them to [`metrics_router`].
+/// The peer listener's router, and the base of [`public_router`].
 pub fn router(app: &Arc<xrpc::App>) -> axum::Router {
     let r = with_forwarding(app, xrpc::router(app.clone()));
     if app.config.metrics_listen.is_none() {
@@ -689,8 +574,6 @@ pub fn router(app: &Arc<xrpc::App>) -> axum::Router {
     }))
 }
 
-/// The `--metrics-listen` router: Prometheus /metrics, and the on-demand CPU
-/// profiler (/debug/pprof/profile, admin token; `--features profiling`).
 pub fn metrics_router(app: &Arc<xrpc::App>) -> axum::Router {
     axum::Router::new()
         .route("/metrics", axum::routing::get(|| async { crate::metrics::render() }))
@@ -698,30 +581,20 @@ pub fn metrics_router(app: &Arc<xrpc::App>) -> axum::Router {
         .with_state(app.clone())
 }
 
-/// HTTP/2 settings profile of a listener (DESIGN.md "HTTP").
+/// DESIGN.md "HTTP".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum H2Profile {
-    /// Node-to-node forwarding (`--peer-listen`): 4 MiB stream / 64 MiB
-    /// connection windows, 1,024 streams.
     Peer,
-    /// Clients (`--listen`): 1 MiB
-    /// stream / 8 MiB connection windows, 256 streams. What one connection
-    /// can make the server buffer, and how many requests it can start at
-    /// once, scale with these.
+    /// Smaller: what one client connection can make the server buffer, and
+    /// how many requests it can start at once, scale with these.
     Public,
 }
 
-/// How a listener is served.
 #[derive(Clone, Debug)]
 pub struct ServeOptions {
     pub h2: H2Profile,
-    /// Most connections open at once; at the cap the listener stops
-    /// accepting (new connections wait in the kernel's accept queue) until
-    /// one closes. 0 = no cap.
+    /// At the cap new connections wait in the kernel's accept queue. 0: no cap.
     pub max_connections: usize,
-    /// Serve TLS (peer mTLS: `PeerTls::server_config`, client certs
-    /// required; ALPN h2 / http/1.1). The handshake runs on the
-    /// connection's task, bounded by `peer_tls::HANDSHAKE_TIMEOUT`.
     pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
@@ -731,11 +604,9 @@ impl Default for ServeOptions {
     }
 }
 
-/// Default `--max-connections` (per listener).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 50_000;
 
-/// What `serve` accepts connections from: a TCP listener (tests inject
-/// failing ones).
+/// Tests inject failing listeners.
 pub trait Accept: Send + 'static {
     fn poll_accept(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>>;
 }
@@ -746,20 +617,18 @@ impl Accept for tokio::net::TcpListener {
     }
 }
 
-/// [`serve_with`] with the peer profile and the default connection cap.
 pub async fn serve(listener: tokio::net::TcpListener, router: axum::Router) -> anyhow::Result<()> {
     serve_with(listener, router, ServeOptions::default()).await
 }
 
-/// HTTP/1.1 + HTTP/2 server (cleartext, or TLS with [`ServeOptions::tls`]). axum::serve doesn't expose HTTP/2 settings,
-/// and hyper's default 64KB connection window chops request bodies on busy
-/// connections into tiny DATA frames, which trips h2's small-frame flood guard.
-/// Settings and their reasons: DESIGN.md "HTTP".
+/// Not axum::serve: it doesn't expose HTTP/2 settings, and hyper's default
+/// 64KB connection window chops request bodies on busy connections into
+/// tiny DATA frames, which trips h2's small-frame flood guard (DESIGN.md
+/// "HTTP").
 ///
-/// Runs until the process ends: an accept error (EMFILE, ENFILE, ENOBUFS,
-/// a connection reset while queued) is logged and retried after a short
-/// pause, as axum::serve does, instead of ending the server (and with it
-/// the process, without a graceful handoff).
+/// An accept error (EMFILE and the like) is retried after a short pause, as
+/// axum::serve does, instead of ending the server and the process without
+/// a graceful handoff.
 pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: ServeOptions) -> anyhow::Result<()> {
     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
     use hyper_util::server::conn::auto::Builder;
@@ -819,7 +688,6 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
         };
         let _ = sock.set_nodelay(true);
         crate::metrics::HTTP_SERVER_CONNECTIONS.inc();
-        // peer address for rate limiting (axum ConnectInfo)
         let (acceptor, builder) = (acceptor.clone(), builder.clone());
         let svc = TowerToHyperService::new(Track {
             inner: tower::ServiceExt::map_request(router.clone(), move |mut req: axum::http::Request<hyper::body::Incoming>| {
@@ -862,7 +730,6 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
     }
 }
 
-/// Pause after a failed accept.
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
 
 #[derive(Clone)]
@@ -871,8 +738,7 @@ struct ActiveRequests {
     h2: prometheus::IntGauge,
 }
 
-/// Counts requests (h2: streams) until their response head
-/// (`vlpds_http_server_active_requests`).
+/// Counts requests (h2: streams) until their response head.
 #[derive(Clone)]
 struct Track<S> {
     inner: S,
@@ -934,8 +800,7 @@ impl crate::forward::Router for ClusterRouter {
     }
 }
 
-/// In cluster mode, proxies requests for DIDs owned by other nodes.
-pub fn with_forwarding(app: &Arc<xrpc::App>, router: axum::Router) -> axum::Router {
+fn with_forwarding(app: &Arc<xrpc::App>, router: axum::Router) -> axum::Router {
     if app.cluster.is_none() {
         return router;
     }
@@ -947,9 +812,8 @@ pub fn with_forwarding(app: &Arc<xrpc::App>, router: axum::Router) -> axum::Rout
     }))
 }
 
-/// Graceful shutdown: hand every shard back (drain, checkpoint, release) and
-/// drop the node lease, so successors take over immediately instead of
-/// waiting out the lease TTL.
+/// Hands every shard back and drops the node lease, so successors take over
+/// immediately instead of waiting out the lease TTL.
 pub async fn shutdown(app: &Arc<xrpc::App>) {
     if let Some(c) = &app.cluster {
         let host: Arc<dyn ShardHost> = app.node.clone();
@@ -958,13 +822,10 @@ pub async fn shutdown(app: &Arc<xrpc::App>) {
             // Our lease stays (renewals stopped): peers presume us dead and
             // fence our log, as does our own restart (it reads our lease).
             tracing::error!("{e:#}: exiting nonzero without dropping our lease (peers or our restart fence the log)");
-            crate::lifecycle::fail_stop(SHUTDOWN_FENCE_EXIT_CODE, "shutdown_fence");
+            crate::lifecycle::fail_stop(8, "shutdown_fence");
         }
     }
 }
-
-/// Exit code of a graceful shutdown that could not fence its own log.
-pub const SHUTDOWN_FENCE_EXIT_CODE: i32 = 8;
 
 #[cfg(test)]
 mod tests {

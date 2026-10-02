@@ -120,8 +120,7 @@ struct Args {
     #[arg(long, env = "VLPDS_WORKERS")]
     workers: Option<usize>,
     /// Tokio threads (HTTP, JSON/CBOR, sequencers, storage IO). Default: the
-    /// available cores (cgroup/affinity aware); fewer pinned the proxy-heavy
-    /// benchbox bench at 600% CPU with 6 (16 threads: 155k -> 204k req/s).
+    /// available cores (cgroup/affinity aware); fewer cap proxy-heavy load.
     #[arg(long, env = "VLPDS_IO_THREADS")]
     io_threads: Option<usize>,
     /// Cached repos per worker.
@@ -581,7 +580,6 @@ fn url_did(v: &Option<String>) -> anyhow::Result<Option<(String, String)>> {
         .transpose()
 }
 
-/// Fractional MiB to bytes (at least `min`).
 fn mib(v: f64, min: usize) -> usize {
     ((v * (1u64 << 20) as f64) as usize).max(min)
 }
@@ -594,10 +592,9 @@ fn default_workers() -> usize {
     (cores() / 2).max(1)
 }
 
-/// Raises the soft open-files limit to the hard limit: every client, peer and
-/// S3 connection is a descriptor, and Linux's default soft limit of 1024
-/// broke benchbox runs. (macOS caps it at kern.maxfilesperproc.) No libc
-/// dependency, as in metrics.rs: rlim_t is 64-bit on both targets.
+/// Every client, peer and S3 connection is a descriptor, and Linux's default
+/// soft limit of 1024 is far too low. macOS caps it at kern.maxfilesperproc.
+/// No libc dependency, as in metrics.rs: rlim_t is 64-bit on both targets.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn raise_nofile_limit() {
     #[repr(C)]
@@ -646,9 +643,6 @@ fn raise_nofile_limit() {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn raise_nofile_limit() {}
 
-/// `vlpds admin <command>`: operator commands against a running node
-/// (shard layout here; accounts, identity, repos, secrets, cluster status in
-/// `vlpds::cli::admin`).
 #[derive(Parser)]
 #[command(name = "vlpds admin", about = "Operator commands against a running vlpds node (pdsadmin equivalents, shard layout)")]
 struct AdminArgs {
@@ -695,7 +689,7 @@ enum AdminCmd {
     Ops(vlpds::cli::admin::Cmd),
 }
 
-/// `vlpds admin tls ...` (ops/RUNBOOK.md "Peer TLS").
+/// ops/RUNBOOK.md "Peer TLS".
 #[derive(clap::Subcommand)]
 enum TlsCmd {
     /// Create a cluster CA (ECDSA P-256): <out>/ca.crt and <out>/ca.key
@@ -824,8 +818,6 @@ fn main() -> anyhow::Result<()> {
     }
     let args = Args::parse();
     init_logging(args.log_format)?;
-    // a panic in a critical thread or task (repo worker, node log
-    // sequencer/finalizer, firehose merger) fail-stops (exit 9)
     vlpds::lifecycle::install_panic_hook();
     raise_nofile_limit();
     let node_id = args.node_id.clone().unwrap_or_else(|| "single".into());
@@ -858,7 +850,6 @@ fn main() -> anyhow::Result<()> {
     r
 }
 
-/// `--log-format`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum LogFormat {
     /// Human-readable lines; ANSI colour only when stderr is a terminal and
@@ -884,10 +875,7 @@ fn init_logging(format: LogFormat) -> anyhow::Result<()> {
     r.map_err(|e| anyhow::anyhow!("logging: {e}"))
 }
 
-/// A secret flag's value; the well-known dev default only in dev mode (an
-/// unset secret outside dev mode is refused by `Config::check_secrets`).
-/// Where /metrics and /debug/pprof are served (None = the app port): see
-/// `--metrics-listen`.
+/// None: on the app port.
 fn metrics_listen(args: &Args) -> Option<String> {
     match args.metrics_listen.as_deref() {
         Some("app") => None,
@@ -897,6 +885,7 @@ fn metrics_listen(args: &Args) -> Option<String> {
     }
 }
 
+/// An unset secret outside dev mode is refused by `Config::check_secrets`.
 fn secret(v: &Option<String>, dev_mode: bool, dev_default: &str) -> String {
     match v {
         Some(v) => v.clone(),
@@ -905,7 +894,6 @@ fn secret(v: &Option<String>, dev_mode: bool, dev_default: &str) -> String {
     }
 }
 
-/// The PLC flags as a [`vlpds::plc::PlcConfig`].
 fn plc_config(args: &Args) -> anyhow::Result<vlpds::plc::PlcConfig> {
     use vlpds::plc::RotationKey;
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
@@ -925,8 +913,6 @@ fn plc_config(args: &Args) -> anyhow::Result<vlpds::plc::PlcConfig> {
     })
 }
 
-/// `--wrap-plc-rotation-key`: stdin (hex, or empty for a new key) -> the
-/// key wrapped under the configured KEK on stdout.
 async fn wrap_plc_rotation_key(args: &Args) -> anyhow::Result<()> {
     let kek = kek_config(args)?;
     kek.check(args.dev_mode)?;
@@ -944,7 +930,6 @@ async fn wrap_plc_rotation_key(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The KEK flags as a [`vlpds::secrets::KekConfig`].
 fn kek_config(args: &Args) -> anyhow::Result<vlpds::secrets::KekConfig> {
     use vlpds::secrets::KekBytes;
     let local = match (&args.kek_file, &args.kek) {
@@ -1011,8 +996,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
             ..Default::default()
         }),
     };
-    // node-to-node exposure (DESIGN.md "Exposure"): peers talk mTLS on the
-    // peer listener; a lone node has neither (clap: the flags come together)
     let node_id = args.node_id.clone().unwrap_or_else(|| "single".into());
     let advertise_url = args.advertise_url.clone().unwrap_or_else(|| args.public_url.clone());
     let peer_tls = match &args.peer_tls_dir {
@@ -1067,7 +1050,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
         workers: args.workers.unwrap_or_else(default_workers).max(1),
         cache_per_worker: args.cache_per_worker,
         repo_cache_bytes: args.repo_cache_mb << 20,
-
         lazy_mst_prefetch_bytes: (args.lazy_mst_prefetch_kb << 10) as usize,
         lazy_mst_unload_idle: false,
         lazy_mst_node_cache_bytes: (args.lazy_mst_node_cache_mb << 20) as usize,
@@ -1193,14 +1175,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
     server::spawn_reporters(&app);
     tracing::info!(listen = %args.listen, metrics_listen = metrics_listen(&args).as_deref().unwrap_or("(app port)"), "vlpds serving");
     if let Some(l) = metrics_listener {
-        let r = server::metrics_router(&app);
-        tokio::spawn(async move {
-            if let Err(e) = server::serve(l, r).await {
-                tracing::error!("metrics server exited: {e:#}");
-            }
-        });
+        server::spawn_metrics_listener(&app, l);
     }
-    // background services
     vlpds::xrpc::spawn_blob_gc(app.clone());
     vlpds::xrpc::spawn_account_stats(app.clone());
     vlpds::xrpc::spawn_reserved_key_gc(app.clone());
@@ -1230,7 +1206,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
 }
 
-/// Binds `addr` with an explicit accept backlog (see `--listen-backlog`).
 async fn bind(addr: &str, backlog: u32) -> anyhow::Result<tokio::net::TcpListener> {
     let mut last = None;
     for a in tokio::net::lookup_host(addr).await? {
@@ -1245,8 +1220,6 @@ async fn bind(addr: &str, backlog: u32) -> anyhow::Result<tokio::net::TcpListene
     Err(last.map_or_else(|| anyhow::anyhow!("{addr}: no address"), |e| anyhow::Error::from(e).context(format!("binding {addr}"))))
 }
 
-/// How long a gracefully stopping node keeps answering after it handed
-/// its shards out and dropped its lease.
 const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
 
 async fn shutdown_signal() {
@@ -1258,7 +1231,7 @@ async fn shutdown_signal() {
     }
 }
 
-/// A non-empty flag value, else the reference PDS's environment variable.
+/// Else the reference PDS's environment variable.
 fn flag_or_env(v: &Option<String>, k: &str) -> Option<String> {
     v.clone().filter(|v| !v.is_empty()).or_else(|| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }

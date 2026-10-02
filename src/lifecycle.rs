@@ -81,8 +81,8 @@ pub fn record_exit(code: i32, reason: &str) {
 }
 
 /// Exit codes: 2 segment upload, 3 log fenced / ordinal taken, 4 state
-/// apply, 5 lease lost or lapsed, 6 repeated signature faults, 9 a critical
-/// thread or task panicked.
+/// apply, 5 lease lost or lapsed, 6 repeated signature faults, 8 a graceful
+/// shutdown couldn't fence its own log, 9 a critical thread or task panicked.
 pub fn fail_stop(code: i32, reason: &str) -> ! {
     record_exit(code, reason);
     std::process::exit(code)
