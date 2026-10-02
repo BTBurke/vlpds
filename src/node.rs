@@ -30,7 +30,8 @@ pub struct Node {
     pub firehose: Arc<Firehose>,
     pub merger_tx: mpsc::UnboundedSender<LogBatch>,
     pub workers: Workers,
-    pub cache_dir: Option<std::path::PathBuf>,
+    /// The local SST disk cache (`--cache-dir`, `--disk-cache-mb`).
+    pub disk_cache: Option<partition::DiskCacheConfig>,
     pub internal_token: String,
     /// Node-to-node client (nudges).
     pub http: crate::http::PeerClient,
@@ -50,7 +51,7 @@ impl Node {
         firehose: Arc<Firehose>,
         merger_tx: mpsc::UnboundedSender<LogBatch>,
         workers: Workers,
-        cache_dir: Option<std::path::PathBuf>,
+        disk_cache: Option<partition::DiskCacheConfig>,
         internal_token: String,
         http: crate::http::PeerClient,
         recent_cap: usize,
@@ -64,7 +65,7 @@ impl Node {
             firehose,
             merger_tx,
             workers,
-            cache_dir,
+            disk_cache,
             internal_token,
             http,
             recent_cap,
@@ -98,6 +99,16 @@ impl Node {
 }
 
 impl Node {
+    /// The disk cache a shard opened now gets: the node budget split over
+    /// every shard of the layout (plus a split/merge's children), so the
+    /// caps fit the budget even if this node comes to hold them all.
+    pub fn shard_disk_cache(&self) -> Option<partition::DiskCache> {
+        let c = self.disk_cache.as_ref()?;
+        let layout = self.cluster.layout();
+        let shards = layout.shards.len() + layout.op.as_ref().map_or(0, |op| op.children.len());
+        Some(c.for_shards(shards))
+    }
+
     /// Tests only: drops every shard from routing and the workers' caches
     /// without closing anything, as a crash would (see `Cluster::halt`).
     pub fn halt(&self) {
@@ -151,10 +162,12 @@ impl ShardHost for Node {
         }
         let started = Instant::now();
         let n = shards.len();
+        let cache = self.shard_disk_cache();
+        let cache = cache.as_ref();
         // 1. open every shard's SlateDB concurrently
         let opened: Vec<(ShardId, u64, Vec<Span>, anyhow::Result<Arc<slatedb::Db>>)> = futures::stream::iter(shards)
             .map(|(s, e, h)| async move {
-                let db = partition::open_db(&self.state_store, s, self.cache_dir.as_deref()).await.map(Arc::new);
+                let db = partition::open_db(&self.state_store, s, cache).await.map(Arc::new);
                 (s, e, h, db)
             })
             .buffer_unordered(32)

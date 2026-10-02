@@ -36,6 +36,83 @@ pub fn routes() -> Router<Arc<App>> {
             post(submit_plc_operation),
         )
         .route("/.well-known/atproto-did", get(well_known_atproto_did))
+        .route("/.well-known/did.json", get(well_known_did_json))
+        .route("/tls-check", get(tls_check))
+}
+
+/// The DID of the active account here whose handle is `handle`: None if
+/// there is none (or it is deactivated / taken down, as the reference's
+/// getAccount(handle)); an error only when that can't be told (owner
+/// unreachable, shard moving: retry). Any node answers for any account.
+async fn active_handle_did(app: &Arc<App>, handle: &str) -> Result<Option<String>, XrpcError> {
+    let Ok(Some(did)) = app.resolve_handle(handle).await else {
+        return Ok(None);
+    };
+    match super::internal::account_anywhere(app, &did).await {
+        Ok(a) if a.status.is_none() && a.handle == handle => Ok(Some(did)),
+        Err(e) if e.status.is_server_error() => Err(e),
+        _ => Ok(None),
+    }
+}
+
+/// Whether `host` is under one of our handle domains.
+fn under_handle_domain(app: &App, host: &str) -> bool {
+    host.ends_with(&format!(".{}", app.handle_domain))
+}
+
+/// The host of `--public-url` (the PDS hostname).
+fn public_host(app: &App) -> Option<String> {
+    reqwest::Url::parse(&app.public_url).ok()?.host_str().map(|h| h.to_ascii_lowercase())
+}
+
+#[derive(Deserialize)]
+struct TlsCheckQ {
+    domain: Option<String>,
+}
+
+/// Caddy on-demand TLS `ask` endpoint, as the reference PDS distribution's
+/// `/tls-check`: 200 for the PDS hostname and for handles of active
+/// accounts here under the handle domain; 400 for a missing domain or one
+/// outside the handle domain, 404 for an unknown handle (Caddy issues a
+/// certificate only on 2xx). Every node answers for every account.
+async fn tls_check(State(app): AppState, Query(q): Query<TlsCheckQ>) -> Response {
+    let err = |status: StatusCode, error: &str, message: &str| (status, Json(json!({"error": error, "message": message}))).into_response();
+    let domain = match q.domain.as_deref().map(|d| d.trim_end_matches('.').to_ascii_lowercase()) {
+        Some(d) if !d.is_empty() => d,
+        _ => return err(StatusCode::BAD_REQUEST, "InvalidRequest", "bad or missing domain query param"),
+    };
+    if public_host(&app).as_deref() == Some(domain.as_str()) {
+        return Json(json!({"success": true})).into_response();
+    }
+    if !under_handle_domain(&app, &domain) {
+        return err(StatusCode::BAD_REQUEST, "InvalidRequest", "handles are not provided on this domain");
+    }
+    match active_handle_did(&app, &domain).await {
+        Ok(Some(_)) => Json(json!({"success": true})).into_response(),
+        Ok(None) => err(StatusCode::NOT_FOUND, "NotFound", "handle not found for this domain"),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// The DID document of the PDS's own did:web service DID (`--service-did`),
+/// so the DID it signs and accepts service auth as resolves to this server.
+/// The reference PDS serves none; this follows the reference AppView's
+/// (bsky well-known.ts) shape with a PDS service entry, and no verification
+/// method (the service DID signs nothing). 404 for a non-did:web DID.
+async fn well_known_did_json(State(app): AppState) -> Response {
+    let did = &app.jwt.service_did;
+    if !did.starts_with("did:web:") {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    Json(service_did_doc(did, &app.public_url)).into_response()
+}
+
+pub(crate) fn service_did_doc(did: &str, public_url: &str) -> J {
+    json!({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": did,
+        "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": public_url.trim_end_matches('/')}],
+    })
 }
 
 /// HTTPS handle verification for handles under our domain (the reference's
@@ -52,19 +129,14 @@ async fn well_known_atproto_did(State(app): AppState, headers: HeaderMap) -> Res
     }
     .to_ascii_lowercase();
     let not_found = || (StatusCode::NOT_FOUND, "User not found").into_response();
-    if !handle.ends_with(&format!(".{}", app.handle_domain)) {
+    if !under_handle_domain(&app, &handle) {
         return not_found();
     }
-    let Ok(Some(did)) = app.resolve_handle(&handle).await else {
-        return not_found();
-    };
-    match super::internal::account_anywhere(&app, &did).await {
-        Ok(a) if a.status.is_none() && a.handle == handle => {
-            ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], did).into_response()
-        }
+    match active_handle_did(&app, &handle).await {
+        Ok(Some(did)) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], did).into_response(),
+        Ok(None) => not_found(),
         // owner unreachable / shard moving: retry, not "no such user"
-        Err(e) if e.status.is_server_error() => e.into_response(),
-        _ => not_found(),
+        Err(e) => e.into_response(),
     }
 }
 

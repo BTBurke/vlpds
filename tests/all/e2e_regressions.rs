@@ -252,6 +252,46 @@ async fn well_known_atproto_did_by_host() {
     }
 }
 
+/// Caddy on-demand TLS asks `/tls-check?domain=` (the reference PDS
+/// distribution's semantics): 200 for the PDS hostname and active local
+/// handles, 400 for no domain / a domain we don't serve handles on, 404 for
+/// unknown or deactivated handles; any node answers for any account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tls_check_for_caddy_on_demand_tls() {
+    let (a, b, c) = cluster("e2e-tls").await;
+    let acct = a.create_account("tls").await;
+    let http = reqwest::Client::new();
+    let check = |n: &TestServer, domain: Option<&str>| {
+        let mut rb = http.get(format!("{}/tls-check", n.url));
+        if let Some(d) = domain {
+            rb = rb.query(&[("domain", d)]);
+        }
+        async move {
+            let r = rb.send().await.unwrap();
+            let status = r.status().as_u16();
+            (status, r.json::<serde_json::Value>().await.unwrap_or_default())
+        }
+    };
+    let unknown = format!("nobody-{}.{HANDLE_DOMAIN}", unique_name("x"));
+    for n in [&a, &b, &c] {
+        // the PDS hostname (--public-url's host)
+        assert_eq!(check(n, Some("127.0.0.1")).await, (200, json!({"success": true})));
+        let (s, j) = check(n, Some(&acct.handle)).await;
+        assert_eq!((s, j), (200, json!({"success": true})), "{}", acct.handle);
+        assert_eq!(check(n, Some(&acct.handle.to_uppercase())).await.0, 200);
+        let (s, j) = check(n, Some(&unknown)).await;
+        assert_eq!((s, j["error"].as_str()), (404, Some("NotFound")));
+        let (s, j) = check(n, Some("example.com")).await;
+        assert_eq!((s, j["error"].as_str()), (400, Some("InvalidRequest")));
+        assert_eq!(check(n, None).await.0, 400);
+        assert_eq!(check(n, Some("")).await.0, 400);
+    }
+    a.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &acct.auth()).await.ok();
+    for n in [&a, &b, &c] {
+        assert_eq!(check(n, Some(&acct.handle)).await.0, 404);
+    }
+}
+
 /// Admin calls naming the account as `account` (updateAccountEmail) or
 /// `recipientDid` (sendEmail) weren't routed; getAccountInfos read only the
 /// receiving node's shards (silently dropping the rest, or 503 on invites).

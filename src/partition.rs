@@ -393,11 +393,52 @@ fn gc_options() -> slatedb::config::GarbageCollectorOptions {
     }
 }
 
-pub async fn open_db(
-    store: &Store,
-    partition: ShardId,
-    cache_dir: Option<&std::path::Path>,
-) -> anyhow::Result<Db> {
+/// A node's local SST disk cache (`--cache-dir`, `--disk-cache-mb`): one
+/// directory per shard under `dir`, each capped at `shard_bytes`.
+#[derive(Clone, Debug)]
+pub struct DiskCache {
+    pub dir: std::path::PathBuf,
+    pub shard_bytes: u64,
+}
+
+/// SlateDB's own per-DB default (16 GiB), kept when `--disk-cache-mb` is unset.
+pub const DEFAULT_DISK_CACHE_SHARD_BYTES: u64 = 16 << 30;
+/// The smallest per-shard cap: a few of SlateDB's 4 MiB cache parts.
+pub const MIN_DISK_CACHE_SHARD_BYTES: u64 = 64 << 20;
+
+/// The per-shard disk cache cap for a node budget of `node_bytes` when
+/// `shards` shards exist: the budget divided by every shard (not just those
+/// owned now), so the caps sum to at most the budget even if this node ends
+/// up holding every shard (a failover, the first node up). An explicit
+/// `per_shard` wins.
+pub fn disk_cache_shard_bytes(node_bytes: Option<u64>, per_shard: Option<u64>, shards: usize) -> u64 {
+    let b = match (per_shard, node_bytes) {
+        (Some(p), _) => p,
+        (None, Some(n)) => n / shards.max(1) as u64,
+        (None, None) => DEFAULT_DISK_CACHE_SHARD_BYTES,
+    };
+    b.max(MIN_DISK_CACHE_SHARD_BYTES)
+}
+
+/// A node's disk cache flags: `--cache-dir`, `--disk-cache-mb` (node
+/// budget) and `--disk-cache-shard-mb` (explicit per-shard cap).
+#[derive(Clone, Debug)]
+pub struct DiskCacheConfig {
+    pub dir: std::path::PathBuf,
+    pub node_bytes: Option<u64>,
+    pub shard_bytes: Option<u64>,
+}
+
+impl DiskCacheConfig {
+    /// The cache a shard opens with while `shards` shards exist (the layout's
+    /// plus a split/merge's children: both are open during the op).
+    pub fn for_shards(&self, shards: usize) -> DiskCache {
+        DiskCache { dir: self.dir.clone(), shard_bytes: disk_cache_shard_bytes(self.node_bytes, self.shard_bytes, shards) }
+    }
+}
+
+/// The settings [`open_db`] opens a shard with.
+fn shard_settings(partition: ShardId, cache: Option<&DiskCache>) -> slatedb::Settings {
     // Per-shard LSM shape. A whole repo lives in one shard, so one shard must
     // absorb a bulk import (bench 2026-10-02 §4). With 8 MiB L0s and
     // SlateDB's default cap of 8, L0 filled in ~2 s at 25 MB/s and then
@@ -437,14 +478,24 @@ pub async fn open_db(
         compactor_options: None,
         ..Default::default()
     };
-    if let Some(dir) = cache_dir {
+    if let Some(c) = cache {
         // Local disk cache of SST parts: restarts and takeovers start warm
         // instead of turning every cold repo load into object store GETs.
         let oc = &mut settings.object_store_cache_options;
-        oc.root_folder = Some(dir.join(partition.key()));
+        oc.root_folder = Some(c.dir.join(partition.key()));
+        oc.max_cache_size_bytes = Some(c.shard_bytes as usize);
         oc.cache_on_flush = true;
         oc.cache_on_compaction = true;
     }
+    settings
+}
+
+pub async fn open_db(
+    store: &Store,
+    partition: ShardId,
+    cache: Option<&DiskCache>,
+) -> anyhow::Result<Db> {
+    let settings = shard_settings(partition, cache);
     let path = db_path(store, partition);
     // cache ids only need to be distinct per DB in this process (tests open
     // several prefixes with the same shard numbers)
@@ -1268,5 +1319,33 @@ mod clone_tests {
         assert_eq!(scan(b"C/x\0", None).await.len(), 4);
         assert!(scan(b"M/", None).await.is_empty());
         db.close().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod disk_cache_tests {
+    use super::*;
+
+    #[test]
+    fn node_budget_is_split_over_every_shard() {
+        // unset: SlateDB's own default per shard
+        assert_eq!(disk_cache_shard_bytes(None, None, 64), DEFAULT_DISK_CACHE_SHARD_BYTES);
+        // 64 GiB over 64 shards = 1 GiB each, whatever this node owns
+        assert_eq!(disk_cache_shard_bytes(Some(64 << 30), None, 64), 1 << 30);
+        assert_eq!(disk_cache_shard_bytes(Some(64 << 30), None, 0), 64 << 30);
+        // an explicit per-shard cap wins; tiny budgets get the floor
+        assert_eq!(disk_cache_shard_bytes(Some(64 << 30), Some(3 << 30), 64), 3 << 30);
+        assert_eq!(disk_cache_shard_bytes(Some(100 << 20), None, 64), MIN_DISK_CACHE_SHARD_BYTES);
+    }
+
+    #[test]
+    fn cap_reaches_slatedb_settings() {
+        let cfg = DiskCacheConfig { dir: "/var/cache/vlpds".into(), node_bytes: Some(32 << 30), shard_bytes: None };
+        let s = shard_settings(ShardId(7), Some(&cfg.for_shards(16)));
+        let oc = &s.object_store_cache_options;
+        assert_eq!(oc.max_cache_size_bytes, Some(2 << 30));
+        assert_eq!(oc.root_folder, Some(std::path::Path::new("/var/cache/vlpds").join(ShardId(7).key())));
+        assert!(oc.cache_on_flush && oc.cache_on_compaction);
+        assert!(shard_settings(ShardId(7), None).object_store_cache_options.root_folder.is_none());
     }
 }

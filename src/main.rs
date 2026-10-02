@@ -158,6 +158,17 @@ struct Args {
     /// Local disk cache for SlateDB SSTs (empty = disabled).
     #[arg(long, env = "VLPDS_CACHE_DIR", default_value = "")]
     cache_dir: String,
+    /// Disk budget of --cache-dir on this node (MiB). Each shard's cache is
+    /// capped at this divided by the layout's shard count (all of them, so
+    /// the caps fit even if this node comes to hold every shard). Unset:
+    /// SlateDB's 16 GiB per shard (64 shards = 1 TiB).
+    #[arg(long, env = "VLPDS_DISK_CACHE_MB")]
+    disk_cache_mb: Option<u64>,
+    /// Per-shard --cache-dir cap (MiB), instead of dividing --disk-cache-mb:
+    /// for an N-node cluster where each node holds ~1/N of the shards (the
+    /// disk must then absorb a failover's extra shards).
+    #[arg(long, env = "VLPDS_DISK_CACHE_SHARD_MB")]
+    disk_cache_shard_mb: Option<u64>,
     /// Local file where a fail-stop records its reason and exit code, read
     /// by the next start for `vlpds_last_exit_reason_info` (lifecycle.rs).
     /// Default: `vlpds-exit-<node-id>.json` in --cache-dir; empty with no
@@ -296,10 +307,14 @@ struct Args {
     kek_old: Vec<String>,
     /// Google Cloud KMS CryptoKey that wraps secrets
     /// (projects/P/locations/L/keyRings/R/cryptoKeys/K), used with the
-    /// node's service account (metadata server). Takes precedence over
-    /// --kek-file for new wraps.
+    /// node's service account (metadata server) or --gcp-credentials-file.
+    /// Takes precedence over --kek-file for new wraps.
     #[arg(long, env = "VLPDS_GCP_KMS_KEY")]
     gcp_kms_key: Option<String>,
+    /// Service-account JSON key file for Cloud KMS (off GCE); falls back to
+    /// GOOGLE_APPLICATION_CREDENTIALS, then the GCE metadata server.
+    #[arg(long, env = "VLPDS_GCP_CREDENTIALS_FILE")]
+    gcp_credentials_file: Option<std::path::PathBuf>,
     /// Previous CryptoKeys, unwrap only (moving to another key).
     #[arg(long, env = "VLPDS_GCP_KMS_OLD_KEY", value_delimiter = ',')]
     gcp_kms_old_key: Vec<String>,
@@ -475,6 +490,11 @@ struct Args {
     /// bench/obs runs one on http://127.0.0.1:4040).
     #[arg(long, env = "VLPDS_PYROSCOPE_URL")]
     pyroscope_url: Option<String>,
+    /// Log line format on stderr: text (ANSI colour only on a terminal,
+    /// never with NO_COLOR) or json (one object per line; production). Level
+    /// filter: RUST_LOG (default info,slatedb=warn).
+    #[arg(long, env = "VLPDS_LOG_FORMAT", value_enum, default_value_t = LogFormat::Text)]
+    log_format: LogFormat,
 }
 
 fn url_did(v: &Option<String>) -> anyhow::Result<Option<(String, String)>> {
@@ -634,13 +654,8 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("admin") {
         return admin_main(AdminArgs::parse_from(std::env::args().skip(1)));
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,slatedb=warn".into()),
-        )
-        .init();
     let args = Args::parse();
+    init_logging(args.log_format)?;
     raise_nofile_limit();
     let node_id = args.node_id.clone().unwrap_or_else(|| "single".into());
     let exit_state = match (args.exit_state_file.as_str(), args.cache_dir.as_str()) {
@@ -670,6 +685,32 @@ fn main() -> anyhow::Result<()> {
         Err(_) => vlpds::lifecycle::record_exit(1, "error"),
     }
     r
+}
+
+/// `--log-format`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum LogFormat {
+    /// Human-readable lines; ANSI colour only when stderr is a terminal and
+    /// NO_COLOR is unset.
+    Text,
+    /// One JSON object per line (journald / log shippers).
+    Json,
+}
+
+/// Logs go to stderr, so stdout carries only machine output
+/// (`--wrap-plc-rotation-key`'s wrapped key, `vlpds admin` tables/--json).
+fn init_logging(format: LogFormat) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,slatedb=warn".into());
+    let b = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    let r = match format {
+        LogFormat::Json => b.json().flatten_event(true).with_current_span(false).try_init(),
+        LogFormat::Text => {
+            let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+            b.with_ansi(!no_color && std::io::stderr().is_terminal()).try_init()
+        }
+    };
+    r.map_err(|e| anyhow::anyhow!("logging: {e}"))
 }
 
 /// A secret flag's value; the well-known dev default only in dev mode (an
@@ -733,13 +774,22 @@ fn kek_config(args: &Args) -> anyhow::Result<vlpds::secrets::KekConfig> {
     for v in args.kek_old.iter().filter(|v| !v.trim().is_empty()) {
         local_old.push(KekBytes::parse(v)?);
     }
+    let gcp_key = args.gcp_kms_key.clone().filter(|k| !k.is_empty());
+    let gcp_old_keys: Vec<String> = args.gcp_kms_old_key.iter().filter(|k| !k.is_empty()).cloned().collect();
+    // read the credentials only when KMS is in use (a stray
+    // GOOGLE_APPLICATION_CREDENTIALS doesn't matter otherwise)
+    let gcp_token = if gcp_key.is_some() || !gcp_old_keys.is_empty() {
+        Some(vlpds::secrets::GcpToken::from_credentials(args.gcp_credentials_file.as_deref())?)
+    } else {
+        None
+    };
     Ok(vlpds::secrets::KekConfig {
         local,
         local_old,
-        gcp_key: args.gcp_kms_key.clone().filter(|k| !k.is_empty()),
-        gcp_old_keys: args.gcp_kms_old_key.iter().filter(|k| !k.is_empty()).cloned().collect(),
+        gcp_key,
+        gcp_old_keys,
         gcp_endpoint: Some(args.gcp_kms_endpoint.clone()),
-        gcp_token: None,
+        gcp_token,
         kms_concurrency: args.kms_concurrency,
     })
 }
@@ -809,6 +859,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         hedge_after: Duration::from_millis(args.hedge_after_ms),
         max_inflight_writes: args.max_inflight_writes,
         cache_dir: (!args.cache_dir.is_empty()).then(|| std::path::PathBuf::from(&args.cache_dir)),
+        disk_cache_bytes: args.disk_cache_mb.map(|m| m << 20),
+        disk_cache_shard_bytes: args.disk_cache_shard_mb.map(|m| m << 20),
         appview: url_did(&args.appview)?,
         report_service: url_did(&args.report_service)?,
         appview_cdn_url_pattern: args.bsky_app_view_cdn_url_pattern.clone().filter(|p| !p.is_empty()),
@@ -893,6 +945,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         None => None,
     };
     let app = server::build(cfg).await?;
+    if let Some(c) = app.node.shard_disk_cache() {
+        tracing::info!(dir = %c.dir.display(), shard_mb = c.shard_bytes >> 20, "SST disk cache (per shard)");
+    }
     server::spawn_reporters(&app);
     tracing::info!(listen = %args.listen, metrics_listen = args.metrics_listen.as_deref().unwrap_or("(app port)"), "vlpds serving");
     if let Some(l) = metrics_listener {

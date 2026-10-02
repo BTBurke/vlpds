@@ -65,6 +65,8 @@ it is marked **(unverified)**.
 | What | How |
 |---|---|
 | Liveness | `GET /xrpc/_health` -> `{"version":"vlpds"}` |
+| Caddy on-demand TLS | `on_demand_tls { ask http://127.0.0.1:2583/tls-check }`: `GET /tls-check?domain=D` is 200 for the `--public-url` host and handles of active accounts here, 400 outside `--handle-domain`, 404 for unknown/deactivated handles (any node answers) |
+| Service DID document | `GET /.well-known/did.json`: the `did:web` `--service-did`'s document (`#atproto_pds` at `--public-url`); 404 for any other DID method |
 | Metrics | `GET /metrics` (Prometheus text) |
 | Cluster view (admin) | `GET /xrpc/vlpds.admin.getClusterStatus` with `Authorization: Basic base64(admin:$VLPDS_ADMIN_TOKEN)`. Returns `node`, `log`, `logDurableOrdinal`, `owned` (shard ids), `shards`, `table` (owner per shard in slot order, `null` = unowned), `layout` (`version`, `shards`, `op` = split/merge in progress), `leaseValid`, `leaseExpiresMs`, `fencedLogs`, `firehose.{lastEmitted,minWatermark,sources[{log,watermark,local}]}`, `version` (feature levels: `active`, `target` while a raise runs, `history`, this build's `binary.{min,max,rev}`, `mixedBuilds`, `revs`, `finalizable`, `finalizedAt`; see [Rolling upgrade](#rolling-upgrade-finalize-rollback)), and `nodes[]` with each peer's `reachable`, `leaseValid`, `logDurableOrdinal`, `owned` count, `writer`, `expiresMs`, `rev`, `minLevel`, `maxLevel`, `seenLevel` (peers fetched with a 1.5 s timeout). |
 | Feature level raise (admin) | `POST /xrpc/vlpds.admin.setFeatureLevel {"level": N}` (CLI `vlpds admin cluster finalize`): 200 with the new `cluster/version`; 409 `IncompatibleNodes` names live nodes whose build can't run N (nothing changed); 400 below the active level or past the asked node's build. With `"lower": true` (CLI `vlpds admin cluster lower`) it lowers instead: 400 past a persistent level or during a raise, 409 while a live node can't run N. |
@@ -108,6 +110,20 @@ OOM kill, abort, host loss), `none` (first start or no file).
 an incarnation that ended without fencing its own log counts
 `vlpds_peer_takeovers_total{reason="peer"|"restart"}` (a graceful stop fences
 its own log, so it never counts): that survives a node that never comes back.
+
+**Logs** go to stderr; stdout carries only machine output (wrapped keys,
+`vlpds admin` tables and `--json`). `--log-format json` (`VLPDS_LOG_FORMAT`)
+for production: one JSON object per line. `text` (the default) colours only
+when stderr is a terminal and `NO_COLOR` is unset. Filter with `RUST_LOG`
+(default `info,slatedb=warn`).
+
+**Disk cache sizing**: `--cache-dir` on local NVMe, plus `--disk-cache-mb`
+(`VLPDS_DISK_CACHE_MB`) = the space you give it on that node. Each shard's
+cap is that divided by the layout's shard count, so the total fits even if
+this node takes every shard; in steady state an N-node cluster uses about
+1/N of it. If the disk is sized for failover, set the per-shard cap instead
+(`--disk-cache-shard-mb`). Unset: 16 GiB per shard (1 TiB at 64 shards).
+The start-up line `SST disk cache (per shard)` shows `dir` and `shard_mb`.
 
 **Useful log lines** (tracing, info/warn unless noted):
 `acquired shards` (shards, owned, fair, live), `shards opened` (shards,
@@ -1129,8 +1145,15 @@ refuses to start without one. Every node of a cluster needs the same KEK set.
   on that key only. Nobody routinely gets `cloudkms.cryptoKeyVersions.destroy`.
   Set the destroy-scheduled duration to its maximum. Start nodes with
   `--gcp-kms-key projects/P/locations/us/keyRings/vlpds/cryptoKeys/secrets`
-  (`VLPDS_GCP_KMS_KEY`). Tokens come from the metadata server
-  (`GCE_METADATA_HOST` overrides it). Losing this key loses every account's
+  (`VLPDS_GCP_KMS_KEY`). On GCE, tokens come from the metadata server
+  (`GCE_METADATA_HOST` overrides it). Elsewhere, create a key for a service
+  account holding only that role (`gcloud iam service-accounts keys create
+  sa.json --iam-account ...`), distribute it like the other secrets (mode
+  0400) and pass `--gcp-credentials-file sa.json`
+  (`VLPDS_GCP_CREDENTIALS_FILE`; `GOOGLE_APPLICATION_CREDENTIALS` also
+  works). Only `service_account` key files are accepted; the node exchanges a
+  signed JWT for an access token on first use, caches it about an hour and
+  refreshes it before expiry or on a 401. Losing this key loses every account's
   signing key (each would need a PLC rotation), so it is part of the backup plan.
 - **Local KEK.** `openssl rand -out kek.bin 32` (raw 32 bytes; 64 hex chars or
   base64 also work). Distribute it like the other secrets (sops / Ansible Vault),
@@ -1205,7 +1228,9 @@ migrations out); users with their own recovery key can still recover.
    `vlpds --gcp-kms-key projects/P/locations/us/keyRings/vlpds/cryptoKeys/secrets --wrap-plc-rotation-key </dev/null >plc-rotation.key`
    (empty stdin = a new key; or pipe 64 hex chars to wrap an existing key,
    e.g. a reference PDS's `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`). The
-   did:key goes to stderr: record it.
+   did:key goes to stderr with the logs: record it. stdout is the wrapped
+   key only: check the file is one `vw1.` line (`head -c 4 plc-rotation.key`;
+   builds before the deploy fixes logged to stdout and put log lines in it).
 2. Distribute `plc-rotation.key` like the other secrets (sops / Ansible
    Vault), mode 0400, and start nodes with `--plc-rotation-key-file`
    (`VLPDS_PLC_ROTATION_KEY_FILE`). The file is useless without KMS decrypt

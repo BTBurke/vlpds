@@ -10,7 +10,9 @@
 //!   XChaCha20-Poly1305 with a random 192-bit nonce per wrap. Dev mode
 //!   falls back to a well-known [`dev_kek`] (refused outside dev mode).
 //! - [`GcpKms`]: Google Cloud KMS `encrypt`/`decrypt` over its REST API
-//!   with the node's service-account token (metadata server). The secret
+//!   with the node's service-account token (metadata server), or one
+//!   exchanged for a service-account key file's signed JWT
+//!   ([`ServiceAccount`]; off GCE). The secret
 //!   itself is the KMS plaintext (32 bytes), so a bucket copy is useless
 //!   without KMS decrypt permission, and every unwrap is in KMS audit logs.
 //!
@@ -292,9 +294,161 @@ pub enum GcpToken {
     /// The GCE/GKE metadata server (the node's service account). The URL is
     /// the token endpoint; `GCE_METADATA_HOST` overrides its host.
     Metadata(String),
+    /// A service-account key file (`--gcp-credentials-file`,
+    /// `GOOGLE_APPLICATION_CREDENTIALS`): tokens from the JWT bearer grant.
+    ServiceAccount(Arc<ServiceAccount>),
     /// A fixed bearer token (tests, or a short-lived token for an operator
     /// running an admin task off-cluster).
     Static(String),
+}
+
+impl GcpToken {
+    /// The token source for the KMS flags: `file` (`--gcp-credentials-file`),
+    /// else `GOOGLE_APPLICATION_CREDENTIALS`, else the metadata server.
+    pub fn from_credentials(file: Option<&std::path::Path>) -> anyhow::Result<GcpToken> {
+        let env = std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        match file.map(std::path::Path::to_path_buf).or(env) {
+            Some(p) => Ok(GcpToken::ServiceAccount(ServiceAccount::from_file(&p)?)),
+            None => Ok(GcpToken::default()),
+        }
+    }
+}
+
+/// OAuth scope of Cloud KMS tokens minted from a service-account key.
+pub const CLOUD_KMS_SCOPE: &str = "https://www.googleapis.com/auth/cloudkms";
+/// Google's token endpoint, when the key file names none.
+pub const GOOGLE_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
+
+/// A service-account JSON key (`"type": "service_account"`): its RSA key
+/// signs a JWT assertion (RS256, 1 h) that the token endpoint exchanges
+/// for an access token (RFC 7523 JWT bearer grant). Tokens are cached,
+/// shared by every Cloud KMS key using this account, and refreshed a minute
+/// before they expire or when KMS answers 401.
+pub struct ServiceAccount {
+    pub client_email: String,
+    pub token_uri: String,
+    key_id: Option<String>,
+    key: ring::signature::RsaKeyPair,
+    cached: tokio::sync::Mutex<Option<(String, Instant)>>,
+}
+
+impl std::fmt::Debug for ServiceAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceAccount").field("client_email", &self.client_email).field("token_uri", &self.token_uri).finish_non_exhaustive()
+    }
+}
+
+impl ServiceAccount {
+    pub fn from_file(path: &std::path::Path) -> anyhow::Result<Arc<ServiceAccount>> {
+        let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("GCP credentials {}: {e}", path.display()))?);
+        ServiceAccount::from_json(&text).map_err(|e| e.context(format!("GCP credentials {}", path.display())))
+    }
+
+    pub fn from_json(text: &str) -> anyhow::Result<Arc<ServiceAccount>> {
+        #[derive(serde::Deserialize)]
+        struct KeyFile {
+            #[serde(rename = "type")]
+            kind: Option<String>,
+            client_email: Option<String>,
+            private_key: Option<String>,
+            private_key_id: Option<String>,
+            token_uri: Option<String>,
+        }
+        let f: KeyFile = serde_json::from_str(text).map_err(|e| anyhow::anyhow!("not a JSON key file: {e}"))?;
+        anyhow::ensure!(
+            f.kind.as_deref() == Some("service_account"),
+            "only service-account key files are supported (\"type\": \"service_account\"), not {:?}",
+            f.kind.as_deref().unwrap_or("(none)")
+        );
+        let client_email = f.client_email.filter(|e| !e.is_empty()).ok_or_else(|| anyhow::anyhow!("key file has no client_email"))?;
+        let pem = Zeroizing::new(f.private_key.ok_or_else(|| anyhow::anyhow!("key file has no private_key"))?);
+        let body: Zeroizing<String> = Zeroizing::new(pem.lines().filter(|l| !l.starts_with("-----")).map(str::trim).collect());
+        let der = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD.decode(body.as_bytes()).map_err(|e| anyhow::anyhow!("private_key is not PEM: {e}"))?,
+        );
+        let key = ring::signature::RsaKeyPair::from_pkcs8(&der).map_err(|e| anyhow::anyhow!("private_key is not a PKCS#8 RSA key: {e}"))?;
+        Ok(Arc::new(ServiceAccount {
+            client_email,
+            token_uri: f.token_uri.filter(|u| !u.is_empty()).unwrap_or_else(|| GOOGLE_TOKEN_URI.into()),
+            key_id: f.private_key_id.filter(|k| !k.is_empty()),
+            key,
+            cached: tokio::sync::Mutex::new(None),
+        }))
+    }
+
+    /// The signed JWT assertion for the token request, issued at `now`
+    /// (Unix seconds).
+    pub fn assertion(&self, now: u64) -> anyhow::Result<String> {
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut header = serde_json::json!({"alg": "RS256", "typ": "JWT"});
+        if let Some(kid) = &self.key_id {
+            header["kid"] = kid.as_str().into();
+        }
+        let claims = serde_json::json!({
+            "iss": self.client_email,
+            "scope": CLOUD_KMS_SCOPE,
+            "aud": self.token_uri,
+            "iat": now,
+            "exp": now + 3600,
+        });
+        let msg = format!("{}.{}", b64.encode(header.to_string()), b64.encode(claims.to_string()));
+        let mut sig = vec![0u8; self.key.public().modulus_len()];
+        self.key
+            .sign(&ring::signature::RSA_PKCS1_SHA256, &ring::rand::SystemRandom::new(), msg.as_bytes(), &mut sig)
+            .map_err(|_| anyhow::anyhow!("RS256 signing failed"))?;
+        Ok(format!("{msg}.{}", b64.encode(sig)))
+    }
+
+    /// The public key (DER RSAPublicKey), for verifying assertions in tests.
+    pub fn public_key_der(&self) -> Vec<u8> {
+        self.key.public().as_ref().to_vec()
+    }
+
+    async fn fetch(&self, http: &reqwest::Client) -> Result<(String, u64), SecretError> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        let jwt = self.assertion(now).map_err(|e| SecretError::Unavailable(format!("service-account token: {e}")))?;
+        // the assertion is base64url and dots: nothing to escape
+        let body = format!("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={jwt}");
+        let r = http
+            .post(&self.token_uri)
+            .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body)
+            .timeout(KMS_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| SecretError::Unavailable(format!("service-account token: {e}")))?;
+        let status = r.status();
+        if !status.is_success() {
+            let text = r.text().await.unwrap_or_default();
+            return Err(SecretError::Unavailable(format!("service-account token ({}): HTTP {status}: {}", self.client_email, truncate(&text))));
+        }
+        let t: Tok = r.json().await.map_err(|e| SecretError::Unavailable(format!("service-account token: {e}")))?;
+        Ok((t.access_token, t.expires_in))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Tok {
+    access_token: String,
+    expires_in: u64,
+}
+
+/// The cached token, else (or with `refresh`) a fresh one from `fetch`,
+/// kept until a minute before it expires (tokens last ~1 h).
+async fn cached_token<F>(cache: &tokio::sync::Mutex<Option<(String, Instant)>>, refresh: bool, fetch: F) -> Result<String, SecretError>
+where
+    F: std::future::Future<Output = Result<(String, u64), SecretError>>,
+{
+    let mut g = cache.lock().await;
+    if let Some((t, exp)) = g.as_ref() {
+        if !refresh && Instant::now() < *exp {
+            return Ok(t.clone());
+        }
+    }
+    let (token, expires_in) = fetch.await?;
+    let exp = Instant::now() + Duration::from_secs(expires_in.saturating_sub(60).max(1));
+    *g = Some((token.clone(), exp));
+    Ok(token)
 }
 
 impl Default for GcpToken {
@@ -338,21 +492,14 @@ impl GcpKms {
     }
 
     async fn access_token(&self, refresh: bool) -> Result<String, SecretError> {
-        let url = match &self.token {
-            GcpToken::Static(t) => return Ok(t.clone()),
-            GcpToken::Metadata(url) => url,
-        };
-        let mut g = self.cached.lock().await;
-        if let Some((t, exp)) = g.as_ref() {
-            if !refresh && Instant::now() < *exp {
-                return Ok(t.clone());
-            }
+        match &self.token {
+            GcpToken::Static(t) => Ok(t.clone()),
+            GcpToken::ServiceAccount(sa) => cached_token(&sa.cached, refresh, sa.fetch(&self.http)).await,
+            GcpToken::Metadata(url) => cached_token(&self.cached, refresh, self.metadata_token(url)).await,
         }
-        #[derive(serde::Deserialize)]
-        struct Tok {
-            access_token: String,
-            expires_in: u64,
-        }
+    }
+
+    async fn metadata_token(&self, url: &str) -> Result<(String, u64), SecretError> {
         let r = self
             .http
             .get(url)
@@ -365,10 +512,7 @@ impl GcpKms {
             return Err(SecretError::Unavailable(format!("metadata token: HTTP {}", r.status())));
         }
         let t: Tok = r.json().await.map_err(|e| SecretError::Unavailable(format!("metadata token: {e}")))?;
-        // refresh a minute early (tokens last ~1 h)
-        let exp = Instant::now() + Duration::from_secs(t.expires_in.saturating_sub(60).max(1));
-        *g = Some((t.access_token.clone(), exp));
-        Ok(t.access_token)
+        Ok((t.access_token, t.expires_in))
     }
 
     async fn call(&self, op: &str, body: serde_json::Value) -> Result<serde_json::Value, SecretError> {
@@ -391,7 +535,7 @@ impl GcpKms {
             let text = r.text().await.unwrap_or_default();
             match status.as_u16() {
                 // an expired token: refresh once
-                401 if attempt == 0 && matches!(self.token, GcpToken::Metadata(_)) => continue,
+                401 if attempt == 0 && !matches!(self.token, GcpToken::Static(_)) => continue,
                 // wrong AAD, corrupt ciphertext, or a ciphertext of another key
                 400 => return Err(SecretError::Rejected(format!("cloud kms {op}: {}", truncate(&text)))),
                 _ => return Err(SecretError::Unavailable(format!("cloud kms {op}: HTTP {status}: {}", truncate(&text)))),
@@ -988,5 +1132,157 @@ mod tests {
     #[test]
     fn crc32c_known_value() {
         assert_eq!(crc32c(b"123456789"), 0xE306_9283);
+    }
+
+    fn sa_json(token_uri: &str) -> String {
+        let pem = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/gcp-test-sa-key.pem")).unwrap();
+        serde_json::json!({
+            "type": "service_account",
+            "project_id": "p",
+            "private_key_id": "kid-1",
+            "private_key": pem,
+            "client_email": "vlpds@p.iam.gserviceaccount.com",
+            "token_uri": token_uri,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn service_account_key_files() {
+        let sa = ServiceAccount::from_json(&sa_json("https://oauth2.example/token")).unwrap();
+        assert_eq!(sa.client_email, "vlpds@p.iam.gserviceaccount.com");
+        assert!(!format!("{sa:?}").contains("PRIVATE"));
+        // no token_uri: Google's
+        let mut j: serde_json::Value = serde_json::from_str(&sa_json("")).unwrap();
+        j.as_object_mut().unwrap().remove("token_uri");
+        assert_eq!(ServiceAccount::from_json(&j.to_string()).unwrap().token_uri, GOOGLE_TOKEN_URI);
+        // other credential types and broken keys are refused at startup
+        let user = serde_json::json!({"type": "authorized_user", "client_id": "x", "refresh_token": "y"}).to_string();
+        assert!(format!("{:#}", ServiceAccount::from_json(&user).unwrap_err()).contains("service_account"));
+        j["private_key"] = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n".into();
+        assert!(ServiceAccount::from_json(&j.to_string()).is_err());
+        assert!(ServiceAccount::from_json("not json").is_err());
+    }
+
+    /// A token endpoint that checks the JWT bearer grant (RS256 signature
+    /// by the key file's key, claims) and a Cloud KMS that accepts only the
+    /// latest token it minted.
+    struct MockGoogle {
+        url: String,
+        tokens: AtomicU64,
+        /// the token KMS accepts (0 = none)
+        valid: AtomicU64,
+        expires_in: AtomicU64,
+        kms_calls: AtomicU64,
+    }
+
+    async fn mock_google(public_key: Vec<u8>) -> Arc<MockGoogle> {
+        use axum::extract::State;
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::response::IntoResponse;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let m = Arc::new(MockGoogle {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            tokens: AtomicU64::new(0),
+            valid: AtomicU64::new(0),
+            expires_in: AtomicU64::new(3600),
+            kms_calls: AtomicU64::new(0),
+        });
+        type S = State<(Arc<MockGoogle>, Arc<Vec<u8>>)>;
+        async fn token(State((m, pk)): S, headers: HeaderMap, body: String) -> axum::response::Response {
+            let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            assert_eq!(headers["content-type"], "application/x-www-form-urlencoded");
+            let form: std::collections::HashMap<String, String> = body
+                .split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.replace("%3A", ":")))
+                .collect();
+            assert_eq!(form["grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer");
+            let jwt = &form["assertion"];
+            let (msg, sig) = jwt.rsplit_once('.').unwrap();
+            let key = ring::signature::UnparsedPublicKey::new(&ring::signature::RSA_PKCS1_2048_8192_SHA256, pk.as_slice());
+            if key.verify(msg.as_bytes(), &b64.decode(sig).unwrap()).is_err() {
+                return (StatusCode::BAD_REQUEST, "invalid_grant").into_response();
+            }
+            let (h, c) = msg.split_once('.').unwrap();
+            let h: serde_json::Value = serde_json::from_slice(&b64.decode(h).unwrap()).unwrap();
+            let c: serde_json::Value = serde_json::from_slice(&b64.decode(c).unwrap()).unwrap();
+            assert_eq!(h["alg"], "RS256");
+            assert_eq!(h["kid"], "kid-1");
+            assert_eq!(c["iss"], "vlpds@p.iam.gserviceaccount.com");
+            assert_eq!(c["scope"], CLOUD_KMS_SCOPE);
+            assert_eq!(c["aud"], format!("{}/token", m.url));
+            assert_eq!(c["exp"].as_u64().unwrap() - c["iat"].as_u64().unwrap(), 3600);
+            let n = m.tokens.fetch_add(1, Ordering::SeqCst) + 1;
+            m.valid.store(n, Ordering::SeqCst);
+            axum::Json(serde_json::json!({"access_token": format!("sa-token-{n}"), "expires_in": m.expires_in.load(Ordering::SeqCst), "token_type": "Bearer"})).into_response()
+        }
+        async fn kms(State((m, _)): S, headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>) -> axum::response::Response {
+            m.kms_calls.fetch_add(1, Ordering::SeqCst);
+            let want = format!("Bearer sa-token-{}", m.valid.load(Ordering::SeqCst));
+            if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(want.as_str()) {
+                return (StatusCode::UNAUTHORIZED, "expired").into_response();
+            }
+            // identity "encryption" is enough to test the auth path
+            let v = body.get("plaintext").or(body.get("ciphertext")).cloned().unwrap();
+            axum::Json(serde_json::json!({"name": "k/cryptoKeyVersions/1", "ciphertext": v, "plaintext": v, "usedPrimary": true})).into_response()
+        }
+        let app = axum::Router::new()
+            .route("/token", axum::routing::post(token))
+            .route("/v1/{*rest}", axum::routing::post(kms))
+            .with_state((m.clone(), Arc::new(public_key)));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        m
+    }
+
+    /// Off GCE, a service-account key file mints Cloud KMS tokens: one token
+    /// exchange serves many calls (and every key using that account), a
+    /// 401 refreshes it once, and an expiring token is replaced.
+    #[tokio::test]
+    async fn service_account_tokens_are_cached_and_refreshed() {
+        let probe = ServiceAccount::from_json(&sa_json("http://unused/token")).unwrap();
+        let m = mock_google(probe.public_key_der()).await;
+        let path = std::env::temp_dir().join(format!("vlpds-sa-{}.json", std::process::id()));
+        std::fs::write(&path, sa_json(&format!("{}/token", m.url))).unwrap();
+        let token = GcpToken::from_credentials(Some(&path)).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(token, GcpToken::ServiceAccount(_)));
+        let cfg = KekConfig {
+            gcp_key: Some("projects/p/locations/global/keyRings/r/cryptoKeys/a".into()),
+            gcp_old_keys: vec!["projects/p/locations/global/keyRings/r/cryptoKeys/b".into()],
+            gcp_endpoint: Some(m.url.clone()),
+            gcp_token: Some(token),
+            ..Default::default()
+        };
+        let s = Secrets::from_config(&cfg, false).unwrap();
+        assert!(s.current_kid().starts_with('G'));
+        let secret = [9u8; 32];
+        for i in 0..5 {
+            let w = s.wrap(Purpose::SigningKey, &format!("did:plc:{i}"), &secret).await.unwrap();
+            assert_eq!(&s.unwrap(Purpose::SigningKey, &format!("did:plc:{i}"), &w).await.unwrap().plaintext[..], &secret);
+        }
+        assert_eq!(m.tokens.load(Ordering::SeqCst), 1, "one token exchange for every call");
+        // the old key's wrapper shares the account's token
+        let old = GcpKms::new("projects/p/locations/global/keyRings/r/cryptoKeys/b", &m.url, cfg.gcp_token.clone().unwrap()).unwrap();
+        old.wrap(b"aad", &secret).await.unwrap();
+        assert_eq!(m.tokens.load(Ordering::SeqCst), 1);
+        // revoked upstream (KMS says 401): refreshed once, the call succeeds
+        m.valid.store(0, Ordering::SeqCst);
+        s.wrap(Purpose::SigningKey, "did:plc:x", &secret).await.unwrap();
+        assert_eq!(m.tokens.load(Ordering::SeqCst), 2);
+        // a token about to expire is replaced before KMS sees it
+        m.expires_in.store(61, Ordering::SeqCst);
+        m.valid.store(0, Ordering::SeqCst);
+        s.wrap(Purpose::SigningKey, "did:plc:y", &secret).await.unwrap();
+        assert_eq!(m.tokens.load(Ordering::SeqCst), 3);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let calls = m.kms_calls.load(Ordering::SeqCst);
+        s.wrap(Purpose::SigningKey, "did:plc:z", &secret).await.unwrap();
+        assert_eq!(m.tokens.load(Ordering::SeqCst), 4, "expired token refreshed proactively");
+        assert_eq!(m.kms_calls.load(Ordering::SeqCst), calls + 1, "no 401 round trip");
+        // a token endpoint refusing the grant is a retryable outage, not a panic
+        let bad = ServiceAccount::from_json(&sa_json(&format!("{}/nope", m.url))).unwrap();
+        let k = GcpKms::new("projects/p/locations/global/keyRings/r/cryptoKeys/c", &m.url, GcpToken::ServiceAccount(bad)).unwrap();
+        assert!(matches!(k.wrap(b"aad", &secret).await, Err(SecretError::Unavailable(_))));
     }
 }

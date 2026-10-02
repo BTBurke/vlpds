@@ -66,6 +66,11 @@ pub struct Config {
     pub hedge_after: Duration,
     pub max_inflight_writes: usize,
     pub cache_dir: Option<std::path::PathBuf>,
+    /// The SST disk cache budget of this node (`--disk-cache-mb`), split
+    /// over the layout's shards; None = SlateDB's 16 GiB per shard.
+    pub disk_cache_bytes: Option<u64>,
+    /// An explicit per-shard disk cache cap (`--disk-cache-shard-mb`).
+    pub disk_cache_shard_bytes: Option<u64>,
     /// Default AppView for proxied app.bsky.* / chat.bsky.* (url, service DID).
     pub appview: Option<(String, String)>,
     /// Moderation service for createReport (url, service DID).
@@ -252,6 +257,8 @@ impl Default for Config {
             hedge_after: Duration::from_millis(100),
             max_inflight_writes: 20_000,
             cache_dir: None,
+            disk_cache_bytes: None,
+            disk_cache_shard_bytes: None,
             appview: None,
             report_service: None,
             appview_cdn_url_pattern: None,
@@ -388,7 +395,11 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         firehose.clone(),
         merger_tx,
         workers.clone(),
-        cfg.cache_dir.clone(),
+        cfg.cache_dir.clone().map(|dir| crate::partition::DiskCacheConfig {
+            dir,
+            node_bytes: cfg.disk_cache_bytes,
+            shard_bytes: cfg.disk_cache_shard_bytes,
+        }),
         cfg.internal_token.clone(),
         http.clone(),
         cfg.preload_recent,

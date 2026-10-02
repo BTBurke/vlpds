@@ -218,6 +218,17 @@ swappable.
   Likely the benchbox regression (63k -> 35k/s at 10M, -13-28 % on small
   repos) from 2e64422's 6 IO threads to fa0975c's 32. Decompression was
   not it: blocks are cached decoded, and the sweep reads 2,000 records.
+- The local SST disk cache (`--cache-dir`, one directory per shard) is
+  capped per shard: SlateDB's default is 16 GiB per DB, 1 TiB at 64 shards.
+  `--disk-cache-mb` is the node's budget, divided by the layout's shard
+  count (plus a split/merge's children while one runs) when a shard opens:
+  every shard, not just those owned now, so the caps sum to at most the
+  budget even when this node ends up holding all of them (the first node
+  up, a failover). In an N-node cluster that uses ~1/N of the budget in
+  steady state; `--disk-cache-shard-mb` sets the per-shard cap directly
+  when the disk is sized for the failover case. Floor 64 MiB per shard.
+  The cap applies at open: a reshard changes it only for shards opened
+  afterwards.
 - Each shard's compactor (coordinator + one worker writing the same SST
   format) starts after the DB opens rather than inside the open, so a
   takeover or handback serves ~11 store round trips sooner. Its outputs
@@ -447,6 +458,29 @@ resets, 1,024 local error resets; CVE-2023-44487). Metrics:
 `vlpds_http_server_connections_total`, `_connections_open`,
 `vlpds_http_server_active_requests{version}` (h2 = streams awaiting a
 response head).
+
+Deployment endpoints (`src/xrpc/identity.rs`; any node answers for any
+account, as `/.well-known/atproto-did` does):
+- `GET /tls-check?domain=`: the `ask` URL for Caddy's on-demand TLS, with
+  the reference PDS distribution's semantics (its `service/index.js`, not
+  the atproto package): 200 `{"success":true}` for the `--public-url` host
+  and for the handle of an active account here under `--handle-domain`; 400
+  `InvalidRequest` for a missing domain or one outside the handle domain;
+  404 `NotFound` for an unknown, deactivated or taken-down handle. Caddy
+  only issues on a 2xx, so a 503 while a shard moves just delays a cert.
+- `GET /.well-known/did.json`: the document of a `did:web` `--service-did`
+  (404 otherwise), so the DID that service auth is addressed to resolves
+  to this server. The reference PDS serves none (only the reference AppView
+  does, with its signing key and AppView services); ours has one
+  `#atproto_pds` / `AtprotoPersonalDataServer` service at `--public-url` and
+  no verification method (the service DID signs nothing).
+
+Logs go to stderr (`tracing` with a stderr writer), so stdout carries only
+machine output: `--wrap-plc-rotation-key`'s wrapped key, `vlpds admin`
+tables and `--json`, `vlpds-bucket-probe`'s report. `--log-format text`
+(default; ANSI colour only when stderr is a terminal and `NO_COLOR` is
+unset) or `json` (one flattened object per line, for journald / log
+shippers); the level filter is `RUST_LOG` (default `info,slatedb=warn`).
 
 Listen backlog: `--listen-backlog` (default 16384) instead of tokio's 1024.
 The kernel clamps it to `net.core.somaxconn` (Linux; 4096 on benchbox, older
@@ -2504,9 +2538,15 @@ Cloud KMS key name). Backends:
 - *Google Cloud KMS* (`--gcp-kms-key`): the secret itself (32 bytes) is
   the KMS plaintext: `encrypt`/`decrypt` over the REST API with CRC32C
   integrity fields and `additionalAuthenticatedData`, using the node's
-  service-account token from the metadata server. The client is the shared
-  public client (§7), with a 5 s deadline per call and one token refresh on
-  a 401. No new dependencies, so no cargo feature. A bucket copy is useless
+  service-account token from the metadata server, or off GCE a
+  service-account JSON key (`--gcp-credentials-file`, else
+  `GOOGLE_APPLICATION_CREDENTIALS`; only `"type": "service_account"`): an
+  RS256 JWT assertion (scope `cloudkms`, 1 h, signed with `ring`, already in
+  the tree via rustls) exchanged at the key file's `token_uri` (RFC 7523
+  JWT bearer grant). Tokens are cached until a minute before expiry; a
+  service account's cache is shared by its current and old CryptoKeys. The
+  client is the shared public client (§7), with a 5 s deadline per call and
+  one token refresh on a 401. No cargo feature. A bucket copy is useless
   without decrypt permission on the key, and every unwrap shows in the KMS
   audit log. Not a per-account DEK: a DEK would still need a KMS call to
   unwrap per account, and one deployment-wide DEK held in memory would undo

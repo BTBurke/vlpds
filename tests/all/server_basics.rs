@@ -93,6 +93,54 @@ async fn malformed_json_and_missing_params_are_400() {
     assert!(r.error_name().is_some(), "XRPC error envelope expected: {}", r.text());
 }
 
+/// `/.well-known/did.json` resolves a did:web service DID to this PDS; any
+/// other service DID has no document here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn service_did_web_document() {
+    let s = TestServer::spawn_with(|c| c.service_did = "did:web:pds.example.com".into()).await;
+    let r = s.xrpc.send(s.xrpc.http.get(format!("{}/.well-known/did.json", s.url))).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(
+        r.json,
+        json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": "did:web:pds.example.com",
+            "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": s.url}],
+        })
+    );
+    let s = TestServer::spawn_with(|c| c.service_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into()).await;
+    let r = s.xrpc.send(s.xrpc.http.get(format!("{}/.well-known/did.json", s.url))).await;
+    assert_eq!(r.status, 404);
+}
+
+/// `--disk-cache-mb` is split over the layout's shards and reaches every
+/// shard's SlateDB disk cache (partition.rs tests check the settings).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disk_cache_budget_per_shard() {
+    let dir = std::env::temp_dir().join(unique_name("vlpds-disk-cache"));
+    let d = dir.clone();
+    let s = TestServer::spawn_with(move |c| {
+        c.cache_dir = Some(d);
+        c.shards = 4;
+        c.disk_cache_bytes = Some(1 << 30);
+    })
+    .await;
+    let cache = s.app.node.shard_disk_cache().expect("disk cache configured");
+    assert_eq!((cache.dir.as_path(), cache.shard_bytes), (dir.as_path(), 256 << 20));
+    let a = s.create_account("dc").await;
+    s.xrpc
+        .post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("cached")}), &a.auth())
+        .await
+        .ok();
+    vlpds::server::shutdown(&s.app).await;
+    std::fs::remove_dir_all(&dir).ok();
+    // unset: SlateDB's 16 GiB per shard; no cache dir, no cache
+    let s = TestServer::spawn_with(|c| c.cache_dir = Some(std::env::temp_dir().join(unique_name("vlpds-disk-cache")))).await;
+    assert_eq!(s.app.node.shard_disk_cache().unwrap().shard_bytes, 16 << 30);
+    std::fs::remove_dir_all(&s.app.node.shard_disk_cache().unwrap().dir).ok();
+    assert!(TestServer::spawn().await.app.node.shard_disk_cache().is_none());
+}
+
 /// Wrong HTTP method on a local XRPC route: 400 InvalidRequest with an XRPC
 /// body (reference "Incorrect HTTP method (X) expected Y"), not a bare 405.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
