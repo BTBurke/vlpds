@@ -1497,6 +1497,38 @@ pub(super) async fn create_account_inner(
     inp: CreateAccountIn,
     requester: Option<&str>,
 ) -> XResult<Account> {
+    let r = create_account_checked(app, inp, requester).await;
+    let result = match &r {
+        Ok(_) => "created",
+        Err(e) => signup_refusal(e),
+    };
+    crate::metrics::SIGNUPS.with_label_values(&[result]).inc();
+    if r.is_ok() {
+        crate::metrics::ACCOUNT_EVENTS.with_label_values(&["created"]).inc();
+    }
+    r
+}
+
+/// `vlpds_signups_total` result of a refused sign-up.
+fn signup_refusal(e: &XrpcError) -> &'static str {
+    if e.status.is_server_error() {
+        return "error";
+    }
+    match (e.error.as_str(), e.message.as_str()) {
+        ("InvalidInviteCode", _) => "invite",
+        (_, m) if m.starts_with("This email address is not supported") => "email_policy",
+        (_, "Inappropriate language in handle" | "Reserved handle") => "handle_policy",
+        ("HandleNotAvailable", _) => "taken",
+        (_, m) if m.starts_with("Email already taken") => "taken",
+        _ => "invalid",
+    }
+}
+
+async fn create_account_checked(
+    app: &App,
+    inp: CreateAccountIn,
+    requester: Option<&str>,
+) -> XResult<Account> {
     if inp.plc_op.is_some() {
         return Err(invalid_request("Unsupported input: \"plcOp\""));
     }
@@ -1845,10 +1877,37 @@ async fn verify_app_password(app: &App, did: &str, password: &str) -> XResult<Op
     }))
 }
 
+/// How far a createSession got, for `vlpds_logins_total`.
+struct LoginStep {
+    method: &'static str,
+    second_factor: bool,
+}
+
 async fn create_session(
     State(app): AppState,
     Json(inp): Json<CreateSessionIn>,
 ) -> XResult<Json<J>> {
+    let mut step = LoginStep { method: "password", second_factor: false };
+    let r = create_session_inner(&app, inp, &mut step).await;
+    let result = match &r {
+        Ok(_) => "success",
+        Err(e) if e.status == StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+        Err(e) if e.status.is_server_error() => "error",
+        Err(e) if e.error == "AuthFactorTokenRequired" => "second_factor_required",
+        Err(_) if step.second_factor => "second_factor_failed",
+        Err(e) if e.error == "AccountTakedown" => "blocked",
+        Err(_) => "failed",
+    };
+    crate::metrics::login(step.method, result);
+    r
+}
+
+async fn create_session_inner(
+    app: &Arc<App>,
+    inp: CreateSessionIn,
+    step: &mut LoginStep,
+) -> XResult<Json<J>> {
+    let app = app.clone();
     if inp.password.len() > OLD_PASSWORD_MAX_LENGTH {
         return Err(auth_required(
             "Password too long. Consider resetting your password.",
@@ -1883,6 +1942,7 @@ async fn create_session(
                 .await?
                 .ok_or_else(invalid)?,
         );
+        step.method = "app_password";
     }
     if soft_deleted && !inp.allow_takendown {
         return Err(takedown_error());
@@ -1890,7 +1950,9 @@ async fn create_session(
     // second factor for password logins (app passwords bypass it): TOTP,
     // else the email factor (src/xrpc/email2fa.rs); a code sent anyway is
     // still checked, as in the reference
+    step.second_factor = true;
     super::email2fa::check_second_factor(&app, &acct, inp.auth_factor_token.as_deref(), app_pass.is_some()).await?;
+    step.second_factor = false;
     // the session is created only if no revocation (a password change) hit
     // the account since its password was checked (see auth_epoch)
     let epoch = epoch_for_login(&app, &acct).await?.ok_or_else(invalid)?;
@@ -2145,6 +2207,8 @@ pub(super) async fn set_deactivated(
         // a deactivated account's DID resolves through the directory from
         // now on (identity::serves_local_doc): not from a stale cache entry
         app.did_resolver.invalidate(did);
+        let event = if deactivated { "deactivated" } else { "reactivated" };
+        crate::metrics::ACCOUNT_EVENTS.with_label_values(&[event]).inc();
     })
 }
 
@@ -2235,6 +2299,7 @@ async fn activate_account(State(app): AppState, Auth(creds): Auth) -> XResult<St
         Ok(true)
     })
     .await?;
+    crate::metrics::ACCOUNT_EVENTS.with_label_values(&["reactivated"]).inc();
     Ok(StatusCode::OK)
 }
 
@@ -2410,6 +2475,7 @@ pub(super) async fn delete_account_fully(app: &App, did: &str) -> XResult<()> {
         .await?;
     }
     ctl_changed(app, did);
+    crate::metrics::ACCOUNT_EVENTS.with_label_values(&["deleted"]).inc();
     Ok(())
 }
 
@@ -2787,6 +2853,7 @@ async fn request_password_reset(
     };
     let token = create_email_token(&app, &acct.did, "reset_password").await?;
     deliver(&app, &email, crate::mail::Email::ResetPassword { handle: &acct.handle, token: &token });
+    crate::metrics::PASSWORD_RESETS.with_label_values(&["requested"]).inc();
     Ok(StatusCode::OK)
 }
 
@@ -2846,6 +2913,7 @@ async fn reset_password(
     change_password_hashed(&app, &did, hash).await?;
     app.put_private(&routing, vec![pmut(&routing, "t", None)])
         .await?;
+    crate::metrics::PASSWORD_RESETS.with_label_values(&["completed"]).inc();
     Ok(StatusCode::OK)
 }
 

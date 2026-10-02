@@ -139,6 +139,7 @@ pub fn sync_frame(did: &str, rev: &str, blocks: &[u8], time: &str) -> Frame {
 
 /// `#identity`: did seq time handle
 pub fn identity_frame(did: &str, handle: &str, time: &str) -> Frame {
+    crate::metrics::IDENTITY_EVENTS.with_label_values(&["identity"]).inc();
     let mut p = Vec::with_capacity(96);
     header(&mut p, "#identity");
     write_map_head(&mut p, 4);
@@ -158,6 +159,7 @@ pub fn identity_frame(did: &str, handle: &str, time: &str) -> Frame {
 
 /// `#account`: did seq time active [status]
 pub fn account_frame(did: &str, active: bool, status: Option<&str>, time: &str) -> Frame {
+    crate::metrics::IDENTITY_EVENTS.with_label_values(&["account"]).inc();
     let mut p = Vec::with_capacity(96);
     header(&mut p, "#account");
     write_map_head(&mut p, if status.is_some() { 5 } else { 4 });

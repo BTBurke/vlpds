@@ -1468,6 +1468,25 @@ async fn sign_in(
     device: &mut Device,
     f: &HashMap<String, String>,
 ) -> Result<SignIn, OAuthError> {
+    let r = sign_in_inner(app, device, f).await;
+    let result = match &r {
+        Ok(SignIn::Ok(_)) => "success",
+        Ok(SignIn::NeedTotp(..)) => "second_factor_required",
+        Ok(SignIn::NeedTotpErr(..)) | Ok(SignIn::Failed(_, LoginError::BadCode | LoginError::TooManyCodes)) => "second_factor_failed",
+        Ok(SignIn::Failed(_, LoginError::RateLimited)) => "rate_limited",
+        Ok(SignIn::Failed(_, LoginError::Inactive)) => "blocked",
+        Ok(SignIn::Failed(_, LoginError::Invalid | LoginError::Timeout)) => "failed",
+        Err(_) => "error",
+    };
+    crate::metrics::login("oauth", result);
+    r
+}
+
+async fn sign_in_inner(
+    app: &App,
+    device: &mut Device,
+    f: &HashMap<String, String>,
+) -> Result<SignIn, OAuthError> {
     use crate::ratelimit as rl;
     let now = now_secs();
     let code = f.get("code").map(|c| c.trim()).filter(|c| !c.is_empty());

@@ -132,6 +132,9 @@ pub struct Config {
     pub contact_email_address: Option<String>,
     /// Unreferenced blobs older than this are deleted by the blob GC.
     pub blob_gc_grace: Duration,
+    /// Period of the account / repo / disk-cache count behind the operator
+    /// dashboard's totals (`xrpc::spawn_account_stats`); zero = off.
+    pub account_stats_interval: Duration,
     /// PLC directory: resolves did:plc documents and, with PLC registration
     /// on (`plc`), receives new accounts' genesis ops and their updates.
     pub plc_url: String,
@@ -324,6 +327,7 @@ impl Default for Config {
             terms_of_service_url: None,
             contact_email_address: None,
             blob_gc_grace: Duration::from_secs(6 * 3600),
+            account_stats_interval: Duration::ZERO,
             plc_url: crate::plc::DEFAULT_PLC_URL.into(),
             plc: Default::default(),
             invite_required: false,

@@ -2348,6 +2348,7 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
             "update" => OPS_UPDATE.inc(),
             _ => OPS_DELETE.inc(),
         }
+        metrics::record_written(op.path, op.action);
     }
     metrics::COMMIT_OPS.observe(ops.len() as f64);
     metrics::COMMIT_REQUESTS.observe(batch.waiters.len() as f64);

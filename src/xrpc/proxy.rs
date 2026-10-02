@@ -891,6 +891,8 @@ async fn send(
     let ep = endpoint(&target.url)?;
     let with_body = f.body.is_some();
     let headers = forward_headers(f.headers, with_body, authorization.as_deref(), f.accept_encoding);
+    let started = std::time::Instant::now();
+    let report = f.lxm == CREATE_REPORT;
     let sent = match ep.h1.as_ref().filter(|_| target.trusted) {
         // operator-configured plain-HTTP upstream: the HTTP/1.1 fast path
         Some(authority) => {
@@ -921,10 +923,29 @@ async fn send(
             }
         }
     };
+    observe_upstream(&target.service_id, started, sent.as_ref().ok().map(|(p, _)| p.status), report);
     sent.map_err(|e| {
         tracing::warn!(endpoint = %target.url, path = f.path_and_query, "proxy upstream error: {e}");
         upstream_failure("Upstream service unreachable")
     })
+}
+
+/// Operator metrics of one proxied request: the upstream's answer (`None`:
+/// unreachable) and time to its response head, by service; reports.
+fn observe_upstream(service_id: &str, started: std::time::Instant, status: Option<StatusCode>, report: bool) {
+    let service = crate::metrics::upstream_service(service_id);
+    crate::metrics::UPSTREAM_DURATION.with_label_values(&[service]).observe(started.elapsed().as_secs_f64());
+    let result = match status.map(|s| s.as_u16()) {
+        None => "unreachable",
+        Some(500..) => "server_error",
+        Some(400..) => "client_error",
+        Some(_) => "ok",
+    };
+    crate::metrics::UPSTREAM_REQUESTS.with_label_values(&[service, result]).inc();
+    if report {
+        let ok = status.is_some_and(|s| s.is_success());
+        crate::metrics::REPORTS.with_label_values(&[if ok { "ok" } else { "failed" }]).inc();
+    }
 }
 
 /// Unauthenticated pipethrough of a GET to the `atproto-proxy` target or the

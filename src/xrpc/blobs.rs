@@ -127,6 +127,8 @@ async fn upload_blob(
             "Blob has been takendown, cannot re-upload",
         ));
     }
+    crate::metrics::BLOB_UPLOADS.with_label_values(&[crate::metrics::blob_kind(&up.mime)]).inc();
+    crate::metrics::BLOB_UPLOAD_BYTES.inc_by(size);
     Ok(Json(blob_json(&cid, &up.mime, size)))
 }
 

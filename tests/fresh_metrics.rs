@@ -69,6 +69,25 @@ const AT_ZERO: &[&str] = &[
     "vlpds_log_stream_lagged_total",
     "vlpds_http_server_accept_errors_total",
     "vlpds_forward_seconds_count",
+    // the operator dashboard's user, content and network counters
+    r#"vlpds_signups_total{result="created"}"#,
+    r#"vlpds_signups_total{result="email_policy"}"#,
+    r#"vlpds_account_events_total{event="deleted"}"#,
+    r#"vlpds_logins_total{method="password",result="success"}"#,
+    r#"vlpds_logins_total{method="oauth",result="second_factor_failed"}"#,
+    r#"vlpds_moderation_actions_total{action="takedown",subject="account"}"#,
+    r#"vlpds_password_resets_total{step="requested"}"#,
+    r#"vlpds_invite_codes_total{event="used"}"#,
+    r#"vlpds_records_written_total{action="create",collection="app.bsky.feed.post"}"#,
+    r#"vlpds_records_written_total{action="delete",collection="other"}"#,
+    r#"vlpds_blob_uploads_total{kind="image"}"#,
+    "vlpds_blob_upload_bytes_total",
+    r#"vlpds_reports_total{result="ok"}"#,
+    r#"vlpds_upstream_requests_total{result="server_error",service="appview"}"#,
+    r#"vlpds_upstream_request_seconds_count{service="appview"}"#,
+    r#"vlpds_handle_resolutions_total{result="not_found"}"#,
+    r#"vlpds_request_crawl_total{result="failed"}"#,
+    r#"vlpds_mail_messages_total{purpose="reset_password",result="failed"}"#,
 ];
 
 /// Exported from the start; startup itself may move them.

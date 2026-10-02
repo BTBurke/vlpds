@@ -232,6 +232,97 @@ lazy!(RETENTION_PASS_SECONDS: Histogram = register_histogram!("vlpds_retention_p
 lazy!(RETENTION_DEAD_SEGMENTS: IntGauge = register_int_gauge!("vlpds_retention_dead_log_segments", "Log objects left below the end of dead (writer gone) logs, as of the last pass that checked them all; only the dead-log pruner (owner of slot 0's shard) reports non-zero"));
 lazy!(RETENTION_DEAD_LOGS: IntGaugeVec = register_int_gauge_vec!("vlpds_retention_dead_logs", "Dead logs by state as of the last pass that checked them all: unfenced (no successor fenced it yet), needed (a shard's replay may still read it), pruning (segments inside the window, or deleting), fenced (pruned to its fence, which goes after --fence-retention)", &["state"]));
 
+// ---- operator view: users, content, network (the `vlpds` dashboard) ----
+// Each is an atomic increment where the event completes; bounded labels only.
+lazy!(SIGNUPS: IntCounterVec = register_int_counter_vec!("vlpds_signups_total", "Sign-up attempts (createAccount, the OAuth sign-up form) by result: created, or refused for invite (missing or unusable invite code), email_policy (unsupported or disposable address), handle_policy (reserved or inappropriate handle), taken (handle or email already in use), invalid (other bad input), error (server-side failure)", &["result"]));
+lazy!(ACCOUNT_EVENTS: IntCounterVec = register_int_counter_vec!("vlpds_account_events_total", "Account lifecycle events: created (sign-ups and migrations in; not vlpds.admin.bulkCreate), deleted, deactivated, reactivated", &["event"]));
+lazy!(MODERATION_ACTIONS: IntCounterVec = register_int_counter_vec!("vlpds_moderation_actions_total", "Takedowns applied or reversed (com.atproto.admin.updateSubjectStatus), by subject (account, record, blob) and action (takedown, reversed)", &["subject", "action"]));
+lazy!(LOGINS: IntCounterVec = register_int_counter_vec!("vlpds_logins_total", "Sign-ins by method (password: createSession with the account password; app_password: createSession with an app password; oauth: the OAuth sign-in page) and result: success, failed (wrong identifier or password, or a timed-out step), second_factor_required (a 2FA code was asked for or mailed), second_factor_failed (wrong or locked-out 2FA code), blocked (taken-down or inactive account), rate_limited, error (server-side failure)", &["method", "result"]));
+lazy!(PASSWORD_RESETS: IntCounterVec = register_int_counter_vec!("vlpds_password_resets_total", "Password resets: requested (a reset email asked for), completed (a new password set with its token)", &["step"]));
+lazy!(INVITE_CODES: IntCounterVec = register_int_counter_vec!("vlpds_invite_codes_total", "Invite codes: created (admin or earned), used (by a sign-up)", &["event"]));
+lazy!(RECORDS_WRITTEN: IntCounterVec = register_int_counter_vec!("vlpds_records_written_total", "Record ops committed by collection (the well-known app.bsky / chat.bsky collections; any other is `other`) and action (create, update, delete)", &["collection", "action"]));
+lazy!(BLOB_UPLOADS: IntCounterVec = register_int_counter_vec!("vlpds_blob_uploads_total", "Blobs stored by uploadBlob, by kind (image, video, other: from the stored MIME type)", &["kind"]));
+lazy!(BLOB_UPLOAD_BYTES: IntCounter = register_int_counter!("vlpds_blob_upload_bytes_total", "Bytes of blobs stored by uploadBlob"));
+lazy!(REPORTS: IntCounterVec = register_int_counter_vec!("vlpds_reports_total", "Moderation reports (com.atproto.moderation.createReport) passed on to the moderation service, by result (ok; failed: the service refused it or was unreachable)", &["result"]));
+lazy!(UPSTREAM_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_upstream_requests_total", "Requests proxied for users to other services, by service (appview: the Bluesky AppView, chat, moderation, other) and result (ok: 2xx/3xx; client_error: 4xx; server_error: 5xx; unreachable: connection failure or timeout)", &["service", "result"]));
+lazy!(UPSTREAM_DURATION: HistogramVec = register_histogram_vec!("vlpds_upstream_request_seconds", "Proxied request time until the upstream service's response head, by service (unreachable ones included)", &["service"], latency_buckets()));
+lazy!(HANDLE_RESOLUTIONS: IntCounterVec = register_int_counter_vec!("vlpds_handle_resolutions_total", "Custom-domain handle lookups by result (dns: TXT _atproto record; http: /.well-known/atproto-did; not_found: neither answered with a DID)", &["result"]));
+lazy!(IDENTITY_EVENTS: IntCounterVec = register_int_counter_vec!("vlpds_identity_events_total", "#identity and #account firehose events built (new accounts, handle changes, status changes), by kind", &["kind"]));
+lazy!(REQUEST_CRAWL: IntCounterVec = register_int_counter_vec!("vlpds_request_crawl_total", "requestCrawl calls to relays (at startup, and vlpds.admin.requestCrawl) by result (ok; rejected: non-2xx answer; failed: unreachable)", &["result"]));
+lazy!(REQUEST_CRAWL_LAST_OK: Gauge = register_gauge!("vlpds_request_crawl_last_success_time_seconds", "Unix time of this node's last requestCrawl a relay accepted (0: none since the process started)"));
+lazy!(ACCOUNTS: IntGaugeVec = register_int_gauge_vec!("vlpds_accounts", "Accounts on the shards this node owns, by status (active, deactivated, takendown, suspended, other), as of the last periodic count (--account-stats-interval-secs); sum over nodes for the PDS", &["status"]));
+lazy!(REPOS_WRITTEN_WITHIN: IntGaugeVec = register_int_gauge_vec!("vlpds_repos_written_within", "Repos on this node's shards whose latest commit is within the window (1d, 7d, 30d), and all of them (all), as of the last periodic count", &["window"]));
+lazy!(ACCOUNT_STATS_TIME: Gauge = register_gauge!("vlpds_account_stats_time_seconds", "Unix time of this node's last completed account count (0: none yet)"));
+lazy!(CPU_CORES: Gauge = register_gauge!("vlpds_cpu_cores", "CPU cores available to this process (std::thread::available_parallelism: affinity and cgroup quota aware)"));
+lazy!(DISK_CACHE_BYTES: IntGaugeVec = register_int_gauge_vec!("vlpds_disk_cache_bytes", "SST disk cache (--cache-dir): used (bytes of its files, as of the last periodic count) and capacity (configured)", &["kind"]));
+
+/// Collections with their own `vlpds_records_written_total` label; the rest are `other`.
+pub const KNOWN_COLLECTIONS: [&str; 18] = [
+    "app.bsky.feed.post",
+    "app.bsky.feed.like",
+    "app.bsky.feed.repost",
+    "app.bsky.graph.follow",
+    "app.bsky.graph.block",
+    "app.bsky.graph.list",
+    "app.bsky.graph.listitem",
+    "app.bsky.graph.listblock",
+    "app.bsky.graph.starterpack",
+    "app.bsky.graph.verification",
+    "app.bsky.actor.profile",
+    "app.bsky.actor.status",
+    "app.bsky.feed.threadgate",
+    "app.bsky.feed.postgate",
+    "app.bsky.feed.generator",
+    "app.bsky.labeler.service",
+    "chat.bsky.actor.declaration",
+    "other",
+];
+const RECORD_ACTIONS: [&str; 3] = ["create", "update", "delete"];
+
+/// Resolved `vlpds_records_written_total` children, [collection][action].
+static RECORD_COUNTERS: LazyLock<Vec<[IntCounter; 3]>> = LazyLock::new(|| {
+    KNOWN_COLLECTIONS
+        .iter()
+        .map(|c| RECORD_ACTIONS.map(|a| RECORDS_WRITTEN.with_label_values(&[c, a])))
+        .collect()
+});
+
+/// Counts one committed record op (`path` = collection/rkey).
+pub fn record_written(path: &str, action: &str) {
+    let coll = path.split_once('/').map_or(path, |(c, _)| c);
+    let ci = KNOWN_COLLECTIONS[..KNOWN_COLLECTIONS.len() - 1]
+        .iter()
+        .position(|k| *k == coll)
+        .unwrap_or(KNOWN_COLLECTIONS.len() - 1);
+    let ai = match action {
+        "create" => 0,
+        "update" => 1,
+        _ => 2,
+    };
+    RECORD_COUNTERS[ci][ai].inc();
+}
+
+/// `vlpds_blob_uploads_total` kind of a MIME type.
+pub fn blob_kind(mime: &str) -> &'static str {
+    if mime.starts_with("image/") {
+        "image"
+    } else if mime.starts_with("video/") {
+        "video"
+    } else {
+        "other"
+    }
+}
+
+/// `vlpds_upstream_requests_total` service of a proxy target's service id.
+pub fn upstream_service(service_id: &str) -> &'static str {
+    match service_id {
+        "bsky_appview" => "appview",
+        "bsky_chat" => "chat",
+        "atproto_labeler" | "bsky_moderation" => "moderation",
+        _ => "other",
+    }
+}
+
 /// Exports counters at 0 before their first event. A counter series that
 /// first appears already at 1 has no earlier sample, so `rate()` and
 /// `increase()` never see that event: a kill -9 survivor's
@@ -272,7 +363,50 @@ pub fn init_counters() {
         for kind in ["replay", "clean"] {
             SHARD_OPEN_SECONDS.with_label_values(&[kind]);
         }
+        // operator view
+        LazyLock::force(&RECORD_COUNTERS);
+        LazyLock::force(&BLOB_UPLOAD_BYTES);
+        LazyLock::force(&REQUEST_CRAWL_LAST_OK);
+        CPU_CORES.set(std::thread::available_parallelism().map_or(0, |n| n.get()) as f64);
+        for method in ["password", "app_password", "oauth"] {
+            for r in LOGIN_RESULTS {
+                LOGINS.with_label_values(&[method, r]);
+            }
+        }
+        for subject in ["account", "record", "blob"] {
+            for action in ["takedown", "reversed"] {
+                MODERATION_ACTIONS.with_label_values(&[subject, action]);
+            }
+        }
+        for service in ["appview", "chat", "moderation", "other"] {
+            for r in ["ok", "client_error", "server_error", "unreachable"] {
+                UPSTREAM_REQUESTS.with_label_values(&[service, r]);
+            }
+            UPSTREAM_DURATION.with_label_values(&[service]);
+        }
+        for purpose in ["reset_password", "delete_account", "confirm_email", "update_email", "plc_operation", "auth_factor"] {
+            for r in ["sent", "failed", "dropped"] {
+                crate::mail::MAIL_MESSAGES.with_label_values(&[r, purpose]);
+            }
+        }
     });
+}
+
+/// Records one requestCrawl call's result (ok, rejected, failed).
+pub fn request_crawl(result: &str) {
+    REQUEST_CRAWL.with_label_values(&[result]).inc();
+    if result == "ok" {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
+        REQUEST_CRAWL_LAST_OK.set(now);
+    }
+}
+
+/// `vlpds_logins_total` results.
+pub const LOGIN_RESULTS: [&str; 7] = ["success", "failed", "second_factor_required", "second_factor_failed", "blocked", "rate_limited", "error"];
+
+/// Records a sign-in attempt's outcome.
+pub fn login(method: &str, result: &str) {
+    LOGINS.with_label_values(&[method, result]).inc();
 }
 
 /// Unlabelled integer counters, exported at 0 by [`init_counters`].
@@ -328,6 +462,15 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&FIREHOSE_DISCONNECTS, &["too_slow"]),
     (&FIREHOSE_REJECTED, &["per_ip"]),
     (&SYNC_EXPORTS_ENDED, &["done", "client_gone", "stalled", "error", "shed"]),
+    (&SIGNUPS, &["created", "invite", "email_policy", "handle_policy", "taken", "invalid", "error"]),
+    (&ACCOUNT_EVENTS, &["created", "deleted", "deactivated", "reactivated"]),
+    (&PASSWORD_RESETS, &["requested", "completed"]),
+    (&INVITE_CODES, &["created", "used"]),
+    (&BLOB_UPLOADS, &["image", "video", "other"]),
+    (&REPORTS, &["ok", "failed"]),
+    (&HANDLE_RESOLUTIONS, &["dns", "http", "not_found"]),
+    (&IDENTITY_EVENTS, &["identity", "account"]),
+    (&REQUEST_CRAWL, &["ok", "rejected", "failed"]),
 ];
 
 /// Retention passes at 0 (Retention::spawn: only nodes that run it).

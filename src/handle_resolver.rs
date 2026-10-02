@@ -113,14 +113,18 @@ where
             h = &mut http, if http_res.is_none() => http_res = Some(h),
         }
     };
+    let counted = |result: &str| crate::metrics::HANDLE_RESOLUTIONS.with_label_values(&[result]).inc();
     if dns_res.is_some() {
+        counted("dns");
         return dns_res;
     }
     let h = match http_res {
         Some(h) => h,
         None => http.await,
     };
-    h.filter(|d| d.starts_with("did:"))
+    let h = h.filter(|d| d.starts_with("did:"));
+    counted(if h.is_some() { "http" } else { "not_found" });
+    h
 }
 
 #[cfg(test)]

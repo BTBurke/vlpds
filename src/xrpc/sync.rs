@@ -1364,14 +1364,19 @@ pub async fn request_crawl(app: Arc<App>) {
                     .await
                 {
                     Ok(r) if r.status().is_success() => {
+                        crate::metrics::request_crawl("ok");
                         tracing::info!(%url, %hostname, "requestCrawl ok")
                     }
                     Ok(r) => {
+                        crate::metrics::request_crawl("rejected");
                         let st = r.status();
                         let body = r.text().await.unwrap_or_default();
                         tracing::warn!(%url, %hostname, %st, %body, "requestCrawl rejected")
                     }
-                    Err(e) => tracing::warn!(%url, %hostname, "requestCrawl failed: {e}"),
+                    Err(e) => {
+                        crate::metrics::request_crawl("failed");
+                        tracing::warn!(%url, %hostname, "requestCrawl failed: {e}")
+                    }
                 }
             }
         });

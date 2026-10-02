@@ -421,6 +421,11 @@ async fn request_crawl(State(app): AppState, Auth(creds): Auth, body: Option<Jso
             let base = if relay.contains("://") { relay.clone() } else { format!("https://{relay}") };
             let url = format!("{base}/xrpc/com.atproto.sync.requestCrawl");
             let r = client.post(&url).json(&json!({"hostname": hostname})).timeout(std::time::Duration::from_secs(10)).send().await;
+            crate::metrics::request_crawl(match &r {
+                Ok(r) if r.status().is_success() => "ok",
+                Ok(_) => "rejected",
+                Err(_) => "failed",
+            });
             match r {
                 Ok(r) if r.status().is_success() => json!({"relay": relay, "url": url, "ok": true, "status": r.status().as_u16()}),
                 Ok(r) => {

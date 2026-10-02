@@ -348,7 +348,9 @@ pub(super) async fn create_invites_by(
         .iter()
         .map(|c| pmut(account, &format!("invite/{c}"), Some(Vec::new())))
         .collect();
-    app.put_private(account, muts).await
+    app.put_private(account, muts).await?;
+    crate::metrics::INVITE_CODES.with_label_values(&["created"]).inc_by(codes.len() as u64);
+    Ok(())
 }
 
 /// Invite codes created for `account` (a DID or "admin").
@@ -450,7 +452,9 @@ pub(super) async fn record_invite_use(app: &App, claim: &InviteClaim, did: &str)
         used_by: did.to_string(),
         used_at: crate::events::now_rfc3339(),
     });
-    put_invite(app, &inv).await
+    put_invite(app, &inv).await?;
+    crate::metrics::INVITE_CODES.with_label_values(&["used"]).inc();
+    Ok(())
 }
 
 async fn set_invites_disabled(app: &App, codes: &[String], disabled: bool) -> XResult<()> {
@@ -943,6 +947,10 @@ async fn update_subject_status(
     }
     let subject = parse_subject(&inp.subject)?;
     if let Some(td) = &inp.takedown {
+        let counted = |kind: &str| {
+            let action = if td.applied { "takedown" } else { "reversed" };
+            crate::metrics::MODERATION_ACTIONS.with_label_values(&[kind, action]).inc();
+        };
         match &subject {
             Subject::Repo(did) => {
                 let r = td
@@ -964,18 +972,21 @@ async fn update_subject_status(
                     super::server::revoke_refresh_tokens(&app, did).await?;
                     revoke_oauth_sessions(&app, did).await?;
                 }
+                counted("account");
             }
             Subject::Record { uri, did, cid } => {
                 let v = td
                     .applied
                     .then(|| json!({"uri": uri, "did": did, "cid": cid, "ref": td.r#ref}));
                 set_subject_takedown(&app, did, &format!("rec/{}", record_path(uri, did)?), v).await?;
+                counted("record");
             }
             Subject::Blob { did, cid } => {
                 let v = td
                     .applied
                     .then(|| json!({"did": did, "cid": cid, "ref": td.r#ref}));
                 set_subject_takedown(&app, did, &format!("blob/{cid}"), v).await?;
+                counted("blob");
             }
         }
     }

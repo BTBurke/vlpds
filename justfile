@@ -85,7 +85,7 @@ obs-up:
 obs-down:
     docker compose -f bench/obs/docker-compose.yml down
 
-# Regenerate the vlpds Grafana dashboard: the bench copy and deploy/ansible's (--check: exit 1 if either is stale)
+# Regenerate the vlpds Grafana dashboards (operator `vlpds` + `vlpds-internals`): bench copies and deploy/ansible's (--check: exit 1 if any is stale)
 dashboards *args:
     python3 bench/obs/grafana/gen_dashboard.py {{args}}
 

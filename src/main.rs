@@ -432,6 +432,11 @@ struct Args {
     /// Delete unreferenced blobs uploaded more than this many seconds ago.
     #[arg(long, env = "VLPDS_BLOB_GC_GRACE_SECS", default_value_t = 6 * 3600)]
     blob_gc_grace_secs: u64,
+    /// How often each node counts the accounts and repos on its shards for
+    /// the dashboard (vlpds_accounts, vlpds_repos_written_within) and sizes
+    /// its disk cache: one scan of the account and head rows. 0 = off.
+    #[arg(long, env = "VLPDS_ACCOUNT_STATS_INTERVAL_SECS", default_value_t = 900)]
+    account_stats_interval_secs: u64,
     /// PLC directory: did:plc resolution and, with PLC registration on,
     /// where new accounts' genesis ops and their updates are submitted (a
     /// local did-method-plc server works for e2e runs).
@@ -979,6 +984,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         terms_of_service_url: flag_or_env(&args.terms_of_service_url, "PDS_TERMS_OF_SERVICE_URL"),
         contact_email_address: flag_or_env(&args.contact_email_address, "PDS_CONTACT_EMAIL_ADDRESS"),
         blob_gc_grace: Duration::from_secs(args.blob_gc_grace_secs),
+        account_stats_interval: Duration::from_secs(args.account_stats_interval_secs),
         plc_url: args.plc_url.clone(),
         plc: plc_config(&args)?,
         invite_required: args.invite_required,
@@ -1064,6 +1070,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     }
     // background services
     vlpds::xrpc::spawn_blob_gc(app.clone());
+    vlpds::xrpc::spawn_account_stats(app.clone());
     vlpds::xrpc::spawn_reserved_key_gc(app.clone());
     vlpds::oauth::gc::spawn_gc(app.clone());
     vlpds::xrpc::key_rotation::spawn_recovery(app.clone());
