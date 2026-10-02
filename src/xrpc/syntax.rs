@@ -1,33 +1,29 @@
-//! atproto identifier syntax (mirrors @atproto/syntax): NSIDs, record keys,
-//! handles, TIDs and DIDs.
+//! atproto identifier syntax, mirroring @atproto/syntax.
 
-/// segment = alpha *( alpha / number / "-" ); name = alpha *( alpha / number );
-/// at least three segments, 317 chars max.
-pub fn valid_nsid(s: &str) -> bool {
-    if s.len() > 253 + 1 + 63
-        || !s
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-    {
-        return false;
+/// Dot-separated labels of 1-63 [A-Za-z0-9-], none starting or ending with
+/// '-', at least `min` of them, `max_len` chars in all.
+fn labels(s: &str, min: usize, max_len: usize) -> Option<Vec<&str>> {
+    if s.len() > max_len || !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+        return None;
     }
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() < 3 {
-        return false;
-    }
-    for p in &parts {
-        if p.is_empty() || p.len() > 63 || p.starts_with('-') || p.ends_with('-') {
-            return false;
-        }
-    }
-    if parts[0].as_bytes()[0].is_ascii_digit() {
-        return false;
-    }
-    let name = parts[parts.len() - 1];
-    name.as_bytes()[0].is_ascii_alphabetic() && name.bytes().all(|b| b.is_ascii_alphanumeric())
+    let labels: Vec<&str> = s.split('.').collect();
+    let ok = labels.len() >= min
+        && labels.iter().all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-'));
+    ok.then_some(labels)
 }
 
-/// 1-512 chars of [A-Za-z0-9._:~-], not "." or "..".
+/// The authority may not start with a digit; the name is alphanumeric and
+/// starts with a letter.
+pub fn valid_nsid(s: &str) -> bool {
+    let Some(parts) = labels(s, 3, 253 + 1 + 63) else {
+        return false;
+    };
+    let name = parts[parts.len() - 1];
+    !parts[0].as_bytes()[0].is_ascii_digit()
+        && name.as_bytes()[0].is_ascii_alphabetic()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
 pub fn valid_rkey(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 512
@@ -37,37 +33,15 @@ pub fn valid_rkey(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._:~-".contains(&b))
 }
 
-/// A repo path `{collection}/{rkey}`.
 pub fn valid_record_path(path: &str) -> bool {
-    match path.split_once('/') {
-        Some((c, r)) => valid_nsid(c) && valid_rkey(r),
-        None => false,
-    }
+    path.split_once('/').is_some_and(|(c, r)| valid_nsid(c) && valid_rkey(r))
 }
 
-/// Domain-name handle: >= 2 labels of 1-63 [A-Za-z0-9-] not starting/ending
-/// with '-', TLD starts with a letter, 253 chars max.
+/// The TLD starts with a letter.
 pub fn valid_handle(h: &str) -> bool {
-    if h.len() > 253
-        || !h
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-    {
-        return false;
-    }
-    let labels: Vec<&str> = h.split('.').collect();
-    if labels.len() < 2 {
-        return false;
-    }
-    for l in &labels {
-        if l.is_empty() || l.len() > 63 || l.starts_with('-') || l.ends_with('-') {
-            return false;
-        }
-    }
-    labels[labels.len() - 1].as_bytes()[0].is_ascii_alphabetic()
+    labels(h, 2, 253).is_some_and(|l| l[l.len() - 1].as_bytes()[0].is_ascii_alphabetic())
 }
 
-/// 13 chars of base32-sortable, first char in [234567abcdefghij].
 pub fn valid_tid(s: &str) -> bool {
     s.len() == 13
         && b"234567abcdefghij".contains(&s.as_bytes()[0])
@@ -75,7 +49,6 @@ pub fn valid_tid(s: &str) -> bool {
             .all(|b| b"234567abcdefghijklmnopqrstuvwxyz".contains(&b))
 }
 
-/// did:{method}:{id} with the spec's character rules.
 pub fn valid_did(s: &str) -> bool {
     let Some(rest) = s.strip_prefix("did:") else {
         return false;

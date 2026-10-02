@@ -1,25 +1,8 @@
-//! XRPC-flavoured `Json` and `Query` extractors. They replace axum's (via the
-//! prelude) so that every rejection is an XRPC error envelope
-//! (`{error, message}`) with the reference's status codes instead of axum's
-//! plain-text 4xx bodies:
-//!
-//! - malformed / mistyped JSON or query params: 400 `InvalidRequest`
-//!   (axum would answer 400/415/422 in plain text);
-//! - JSON bodies over 150 KiB: 413 `PayloadTooLarge` (reference
-//!   `jsonLimit: 150 * 1024`, packages/pds/src/index.ts); record writes
-//!   (`RecordBody`) allow 1,000,000 bytes like the reference's
-//!   createRecord/putRecord/applyWrites;
-//! - params whose lexicon format is fixed everywhere they appear (`did`,
-//!   `repo` (at-identifier), `cid`, `handle`) are syntax-checked, so a bad
-//!   value is a 400 `InvalidRequest` rather than a lookup miss, as the
-//!   reference's lexicon param validation does;
-//! - params and JSON bodies of the bundled com.atproto.* methods are then
-//!   validated against their lexicons (src/lexicon.rs), with the
-//!   reference's `Params ...` / `Input ...` messages. A checked body is
-//!   parsed once into a JSON value, validated, then converted to `T`.
-//!   Record writes ([`RecordBody`]) parse into a borrowed [`JsonValue`]
-//!   instead, which the handler validates and encodes records from.
-//!   [`debug_output_layer`] checks responses in debug builds.
+//! XRPC `Json` and `Query` extractors, replacing axum's (via the prelude)
+//! so every rejection is an XRPC error envelope with the reference's status
+//! codes, and inputs/params are checked against the bundled lexicons
+//! (src/lexicon.rs) with the reference's messages. Body limits follow the
+//! reference's `jsonLimit`: 150 KiB, 1,000,000 bytes for record writes.
 
 use super::syntax;
 use super::XrpcError;
@@ -31,27 +14,20 @@ use futures::StreamExt;
 use crate::cbor::JsonValue;
 use serde::de::DeserializeOwned;
 
-/// Largest JSON request body (reference: 150kb).
-pub const JSON_LIMIT: usize = 150 * 1024;
-/// Largest record-write JSON body (reference createRecord/putRecord/
-/// applyWrites `jsonLimit: 1_000_000`).
-pub const RECORD_JSON_LIMIT: usize = 1_000_000;
+const JSON_LIMIT: usize = 150 * 1024;
+const RECORD_JSON_LIMIT: usize = 1_000_000;
 
 fn invalid(message: impl Into<String>) -> XrpcError {
     XrpcError::bad("InvalidRequest", message)
 }
 
-pub fn too_large() -> XrpcError {
+fn too_large() -> XrpcError {
     XrpcError {
         status: StatusCode::PAYLOAD_TOO_LARGE,
         error: "PayloadTooLarge".into(),
         message: "request entity too large".into(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Json
-// ---------------------------------------------------------------------------
 
 pub struct Json<T>(pub T);
 
@@ -65,8 +41,7 @@ impl<T: serde::Serialize> IntoResponse for Json<T> {
     }
 }
 
-/// Reads at most `limit` bytes of body (413 past it).
-pub async fn read_body(req: Request, limit: usize) -> Result<Vec<u8>, XrpcError> {
+async fn read_body(req: Request, limit: usize) -> Result<Vec<u8>, XrpcError> {
     if req
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -89,21 +64,15 @@ pub async fn read_body(req: Request, limit: usize) -> Result<Vec<u8>, XrpcError>
 }
 
 fn check_content_type(req: &Request) -> Result<(), XrpcError> {
-    match req.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
-        // Missing content type: let the JSON parse decide (clients that omit
-        // it for JSON bodies are common).
-        None => Ok(()),
-        Some(ct) => {
-            let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-            if mime == "application/json" || (mime.starts_with("application/") && mime.ends_with("+json")) {
-                Ok(())
-            } else {
-                Err(invalid(format!(
-                    "Wrong request encoding (Content-Type): {mime}"
-                )))
-            }
-        }
+    // clients commonly omit it for JSON bodies
+    let Some(ct) = req.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) else {
+        return Ok(());
+    };
+    let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if mime == "application/json" || (mime.starts_with("application/") && mime.ends_with("+json")) {
+        return Ok(());
     }
+    Err(invalid(format!("Wrong request encoding (Content-Type): {mime}")))
 }
 
 fn parse<'a, T: serde::Deserialize<'a>>(body: &'a [u8]) -> Result<T, XrpcError> {
@@ -116,7 +85,6 @@ fn parse<'a, T: serde::Deserialize<'a>>(body: &'a [u8]) -> Result<T, XrpcError> 
     })
 }
 
-/// The method NSID of a request whose JSON input has a bundled schema.
 fn input_nsid(req: &Request) -> Option<String> {
     req.uri()
         .path()
@@ -125,9 +93,6 @@ fn input_nsid(req: &Request) -> Option<String> {
         .map(String::from)
 }
 
-/// [`parse`], validating against the method's input schema if it has one.
-/// (Validating a borrowed [`JsonValue`] and then parsing `T` from the bytes
-/// measured no faster for these small bodies: 1.08 us either way.)
 fn parse_input<T: DeserializeOwned>(nsid: Option<&str>, body: &[u8]) -> Result<T, XrpcError> {
     let Some(nsid) = nsid else {
         return parse(body);
@@ -148,17 +113,14 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for Json<T> {
     }
 }
 
-/// A record-write JSON body (createRecord / putRecord / applyWrites) with
-/// the record-write limit ([`RECORD_JSON_LIMIT`]). The handler parses it
-/// once into a [`JsonValue`] borrowing from the body ([`RecordBody::parse`])
-/// and encodes records straight from that tree.
+/// A record-write body, parsed by the handler into a [`JsonValue`] borrowing
+/// from it so records are encoded without an owned copy.
 pub struct RecordBody {
     body: Vec<u8>,
     nsid: Option<String>,
 }
 
 impl RecordBody {
-    /// Parses the body, validated against the method's input schema.
     pub fn parse(&self) -> Result<JsonValue<'_>, XrpcError> {
         let v: JsonValue = parse(&self.body)?;
         if let Some(nsid) = &self.nsid {
@@ -185,7 +147,7 @@ impl<S: Send + Sync> FromRequest<S> for RecordBody {
     }
 }
 
-/// `Option<Json<T>>`: an empty body is `None`; anything else must parse.
+/// An empty body is `None`.
 impl<T: DeserializeOwned, S: Send + Sync> OptionalFromRequest<S> for Json<T> {
     type Rejection = XrpcError;
 
@@ -200,14 +162,8 @@ impl<T: DeserializeOwned, S: Send + Sync> OptionalFromRequest<S> for Json<T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Query
-// ---------------------------------------------------------------------------
-
 pub struct Query<T>(pub T);
 
-/// A `limit` param checked against its lexicon range like the reference's
-/// param validation (400 InvalidRequest when out of range), else `default`.
 pub fn limit_param(v: Option<i64>, default: usize, min: i64, max: i64) -> Result<usize, XrpcError> {
     match v {
         None => Ok(default),
@@ -217,8 +173,7 @@ pub fn limit_param(v: Option<i64>, default: usize, min: i64, max: i64) -> Result
     }
 }
 
-/// CID string syntax (lexicon format `cid`): a multibase CIDv1 string. CIDv0
-/// (`Qm...`) is not supported by atproto.
+/// CIDv0 (`Qm...`) is not valid in atproto.
 pub fn valid_cid_syntax(s: &str) -> bool {
     (8..=256).contains(&s.len())
         && !s.starts_with("Qm")
@@ -227,7 +182,6 @@ pub fn valid_cid_syntax(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"+/=-_".contains(&b))
 }
 
-/// at-identifier: a DID or a handle.
 pub fn valid_at_identifier(s: &str) -> bool {
     if s.starts_with("did:") {
         syntax::valid_did(s)
@@ -236,8 +190,8 @@ pub fn valid_at_identifier(s: &str) -> bool {
     }
 }
 
-/// Syntax checks for params whose lexicon format is the same in every
-/// com.atproto method that takes them, then the method's lexicon params.
+/// `did`/`repo`/`cid`/`handle` have the same format in every com.atproto
+/// method, so a bad one is a 400 rather than a lookup miss.
 fn validate_params(parts: &Parts) -> Result<(), XrpcError> {
     let Some(nsid) = parts.uri.path().strip_prefix("/xrpc/") else {
         return Ok(());
@@ -253,20 +207,14 @@ fn validate_params(parts: &Parts) -> Result<(), XrpcError> {
             .map_err(|e| invalid(e.body_text()))?,
     };
     for (k, v) in &pairs {
-        let ok = match k.as_str() {
-            "did" => syntax::valid_did(v),
-            "repo" => valid_at_identifier(v),
-            "cid" => valid_cid_syntax(v),
-            "handle" => syntax::valid_handle(v),
-            _ => true,
+        let (ok, what) = match k.as_str() {
+            "did" => (syntax::valid_did(v), "DID"),
+            "repo" => (valid_at_identifier(v), "at-identifier"),
+            "cid" => (valid_cid_syntax(v), "CID"),
+            "handle" => (syntax::valid_handle(v), "handle"),
+            _ => continue,
         };
         if !ok {
-            let what = match k.as_str() {
-                "did" => "DID",
-                "repo" => "at-identifier",
-                "cid" => "CID",
-                _ => "handle",
-            };
             return Err(invalid(format!("Invalid {what} in param {k}: {v}")));
         }
     }
@@ -287,20 +235,14 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequestParts<S> for Query<T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// output validation (debug builds)
-// ---------------------------------------------------------------------------
-
-/// Marks a response body built by a handler's [`Json`] (not piped through
-/// from another service), so [`debug_output_layer`] checks it.
+/// Marks a body built by a handler's [`Json`], not piped through from
+/// another service.
 #[cfg(debug_assertions)]
 #[derive(Clone, Copy)]
 struct HandlerJson;
 
-/// Debug builds: validates 200 [`Json`] responses of bundled methods against
-/// their output schema and turns a mismatch into a 500 (like the
-/// reference's output verifier), so handler bugs fail the test suite.
-/// Release builds: no layer at all.
+/// Debug builds only: a 200 [`Json`] response that doesn't match its output
+/// schema becomes a 500, so handler bugs fail the test suite.
 pub fn debug_output_layer<S: Clone + Send + Sync + 'static>(
     r: axum::Router<S>,
 ) -> axum::Router<S> {
