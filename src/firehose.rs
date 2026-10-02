@@ -10,7 +10,10 @@
 //! delivers its events with seq > F (followers catch up from S3, see
 //! remote.rs), the merger drops anything <= F, and cursors at or below F are
 //! backfilled from S3 (backfill.rs). A log followed later starts at the
-//! merger's position at that moment, so nothing above it is skipped either.
+//! merger's position at that moment, so nothing above it is skipped either,
+//! and nothing at or below it is ever delivered: a joining node acks
+//! nothing until every peer follows its log and its seqs pass every such
+//! floor (`Cluster::try_join`).
 
 use crate::backfill::{Reader, SegCache};
 use crate::events;
@@ -24,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -282,6 +285,9 @@ pub struct Firehose {
     pub store: RwLock<Option<crate::store::Store>>,
     max_queue_bytes: AtomicUsize,
     queued_bytes: AtomicUsize,
+    /// Set (for good) when this node leaves the cluster: the merger emits
+    /// nothing more (see `freeze`).
+    frozen: AtomicBool,
     runtime: tokio::runtime::Handle,
     max_lag_bytes: u64,
     readahead_bytes: usize,
@@ -304,6 +310,7 @@ impl Firehose {
             store: RwLock::new(None),
             max_queue_bytes: AtomicUsize::new(DEFAULT_MERGE_QUEUE_BYTES),
             queued_bytes: AtomicUsize::new(0),
+            frozen: AtomicBool::new(false),
             runtime: opts.runtime.unwrap_or_else(tokio::runtime::Handle::current),
             max_lag_bytes: opts.max_lag_bytes as u64,
             readahead_bytes: opts.readahead_bytes,
@@ -361,6 +368,16 @@ impl Firehose {
         }
     }
 
+    /// Stops the merger for good: called as a node leaves the cluster
+    /// (graceful shutdown, before its lease is deleted). It no longer
+    /// discovers joiners, and a node joining once our lease is gone neither
+    /// counts nor greets us, so merging on could emit past a joiner's first
+    /// events without them. Subscribers keep what was emitted; they resume
+    /// elsewhere from their cursors when we close.
+    pub fn freeze(&self) {
+        self.frozen.store(true, Ordering::Release);
+    }
+
     /// Byte budget of the merger's queues (events waiting for the min
     /// watermark). Over it, logs are spilled: see `spawn_merger`.
     pub fn set_max_queue_bytes(&self, n: usize) {
@@ -399,6 +416,16 @@ impl Firehose {
                     tick.tick().await;
                 }
                 behind = false;
+                if fh.frozen.load(Ordering::Acquire) {
+                    loop {
+                        match rx.try_recv() {
+                            Ok(_) => {}
+                            Err(mpsc::error::TryRecvError::Empty) => break,
+                            Err(mpsc::error::TryRecvError::Disconnected) => return,
+                        }
+                    }
+                    continue;
+                }
                 // Read the watermark *before* draining: anything at or below it
                 // was sent to us before the watermark was published. Settle it
                 // under the sources lock (see add_remote): from here on the

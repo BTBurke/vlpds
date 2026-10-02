@@ -82,19 +82,21 @@ struct HelloIn {
 }
 
 /// A joiner greets us: learn its lease and follow its log now (see
-/// `Cluster::learn_peer`). 200 `{"ok": true}` once we do.
+/// `Cluster::learn_peer`). 200 `{"ok": true, "floor": F}` once we do: we
+/// deliver every event of its log with seq > F to our merged firehose.
 async fn cluster_hello(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<HelloIn>) -> XResult<Json<J>> {
     check(&app, &headers)?;
     let Some(c) = &app.cluster else {
         return Ok(Json(json!({"ok": false})));
     };
     let host: Arc<dyn crate::cluster::ShardHost> = app.node.clone();
-    let ok = c.learn_peer(&host, &inp.node_id).await.map_err(XrpcError::from_err)?;
-    Ok(Json(json!({"ok": ok})))
+    let floor = c.learn_peer(&host, &inp.node_id).await.map_err(XrpcError::from_err)?;
+    Ok(Json(json!({"ok": floor.is_some(), "floor": floor})))
 }
 
-/// Greets each live peer (see [`cluster_hello`]); true if all confirmed.
-pub async fn hello_peers(http: &reqwest::Client, token: &str, node_id: &str, addrs: Vec<String>) -> bool {
+/// Greets each peer (see [`cluster_hello`]): per peer, the floor of its
+/// follower of our log, or None if it didn't confirm.
+pub async fn hello_peers(http: &reqwest::Client, token: &str, node_id: &str, addrs: Vec<String>) -> Vec<Option<i64>> {
     let sends = addrs.into_iter().map(|addr| async move {
         let r = http
             .post(format!("{}/internal/v1/cluster/hello", addr.trim_end_matches('/')))
@@ -105,14 +107,14 @@ pub async fn hello_peers(http: &reqwest::Client, token: &str, node_id: &str, add
             .await
             .and_then(|r| r.error_for_status());
         match r {
-            Ok(r) => r.json::<J>().await.is_ok_and(|v| v["ok"] == json!(true)),
+            Ok(r) => r.json::<J>().await.ok().filter(|v| v["ok"] == json!(true)).and_then(|v| v["floor"].as_i64()),
             Err(e) => {
                 tracing::debug!(%addr, "hello failed: {e}");
-                false
+                None
             }
         }
     });
-    futures::future::join_all(sends).await.into_iter().all(|ok| ok)
+    futures::future::join_all(sends).await
 }
 
 /// Sends each `(addr, handoffs)` nudge (see [`cluster_nudge`]). Best effort

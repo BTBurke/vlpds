@@ -5,8 +5,8 @@
 //!   connections (its process is gone) is presumed dead at once, not after
 //!   TTL + skew; one that still accepts connections (frozen, or a halted
 //!   in-process node whose listener lives on) keeps the TTL rule;
-//! - a joiner whose peers all confirm they follow its log (`hello`) ends its
-//!   join grace at once and gets its share right away.
+//! - a joiner whose peers all confirm they follow its log (`hello`) joins at
+//!   once and gets its share right away.
 
 use crate::common::*;
 use std::sync::Arc;

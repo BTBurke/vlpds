@@ -201,6 +201,9 @@ async fn admin_listings_scatter_gather_across_nodes() {
                 renewals,
                 next_ordinal: 0,
                 draining: false,
+                joined: false,
+                follows: Default::default(),
+                wm_cap: 0,
             };
             ghost_store
                 .put(&object_store::path::Path::from("vlpds/nodes/adm-ghost"), serde_json::to_vec(&lease).unwrap().into())

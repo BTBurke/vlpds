@@ -151,6 +151,9 @@ async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json
             renewals: 0,
             next_ordinal: app.log.next_ordinal(),
             draining: false,
+            joined: c.joined(),
+            follows: Default::default(),
+            wm_cap: 0,
         });
     }
     peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));

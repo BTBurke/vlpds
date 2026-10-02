@@ -18,7 +18,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
 }
 
 /// `put_ms`: every segment PUT of this node's log takes that long.
-async fn node_with(id: &str, store: &Arc<object_store::memory::InMemory>, put_ms: Option<f64>) -> TestServer {
+pub(crate) async fn node_with(id: &str, store: &Arc<object_store::memory::InMemory>, put_ms: Option<f64>) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());
     TestServer::spawn_with(move |c| {
         c.memory_store = Some(store);
@@ -39,7 +39,7 @@ async fn node_with(id: &str, store: &Arc<object_store::memory::InMemory>, put_ms
 
 /// Collects (seq, raw frame) from a subscription until `target` is set and
 /// reached.
-fn collect(mut sub: Sub, target: Arc<AtomicI64>) -> tokio::task::JoinHandle<Vec<(i64, Vec<u8>)>> {
+pub(crate) fn collect(mut sub: Sub, target: Arc<AtomicI64>) -> tokio::task::JoinHandle<Vec<(i64, Vec<u8>)>> {
     tokio::spawn(async move {
         let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -64,14 +64,14 @@ fn collect(mut sub: Sub, target: Arc<AtomicI64>) -> tokio::task::JoinHandle<Vec<
 
 /// Writers: each account posts as fast as it can through `via` (forwarded to
 /// the owner); only acked commits count.
-struct Writers {
+pub(crate) struct Writers {
     stop: Arc<AtomicBool>,
     acked: Arc<parking_lot::Mutex<Vec<String>>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Writers {
-    fn start(via: &TestServer, accounts: &[TestAccount]) -> Writers {
+    pub(crate) fn start(via: &TestServer, accounts: &[TestAccount]) -> Writers {
         let stop = Arc::new(AtomicBool::new(false));
         let acked: Arc<parking_lot::Mutex<Vec<String>>> = Default::default();
         let mut tasks = Vec::new();
@@ -95,7 +95,7 @@ impl Writers {
     }
 
     /// Stops the writers; returns the acked commits' CIDs.
-    async fn stop(self) -> Vec<String> {
+    pub(crate) async fn stop(self) -> Vec<String> {
         self.stop.store(true, Ordering::Release);
         for t in self.tasks {
             t.await.unwrap();
@@ -106,7 +106,7 @@ impl Writers {
 
 /// Ground truth: the union of every node log in S3, merged by seq, once it
 /// holds every acked commit (each exactly once).
-async fn s3_union(s: &TestServer, acked: &[String]) -> Vec<(i64, Vec<u8>)> {
+pub(crate) async fn s3_union(s: &TestServer, acked: &[String]) -> Vec<(i64, Vec<u8>)> {
     let s3 = s.app.firehose.store.read().clone().unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let union = loop {
@@ -138,7 +138,7 @@ async fn s3_union(s: &TestServer, acked: &[String]) -> Vec<(i64, Vec<u8>)> {
     union
 }
 
-fn mismatch(what: &str, got: &[(i64, Vec<u8>)], want: &[(i64, Vec<u8>)]) -> String {
+pub(crate) fn mismatch(what: &str, got: &[(i64, Vec<u8>)], want: &[(i64, Vec<u8>)]) -> String {
     let g: Vec<i64> = got.iter().map(|x| x.0).collect();
     let w: Vec<i64> = want.iter().map(|x| x.0).collect();
     let missing: Vec<i64> = w.iter().filter(|s| !g.contains(s)).copied().take(20).collect();

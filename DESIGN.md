@@ -295,6 +295,41 @@ swappable.
   passes them. The queues share a byte budget (256 MiB default); a log over
   budget stops being queued and is read back from S3 in chunks until it reaches
   the live ordinal, so a stalled peer can't grow memory without bound.
+- Joining (`Cluster::try_join`): a log followed late starts at the
+  merger's position *P* at that moment, and never delivers events at or
+  below *P* (the merged stream has emitted past them; live order can't
+  take them). So a new node takes no shard, so acks nothing, until every
+  live peer confirms it follows its log, with its follower's floor: a
+  `/internal/v1/cluster/hello` answer, or the joiner's log in the peer
+  lease's `follows` (log id → floor, published at each renewal). Then its
+  own seqs must pass every floor (a joiner's clock running behind a peer's
+  merger), and for a peer it ignores as dead without a confirmation, that
+  peer's published `wm_cap` (its own watermark's cap as of that renewal, so
+  its merger can't settle past it). Then it publishes `joined`; peers hand
+  shards only to joined nodes. No timer ends the wait: a live peer that
+  doesn't confirm keeps the joiner out (it forwards writes meanwhile)
+  until the peer confirms or is presumed dead. A node whose lease appears
+  after the joiner's lists it at its own startup and follows it from its
+  start floor (the cursor backfill serves everything below). A node
+  leaving gracefully stops its merger for good before it deletes its lease
+  (`Firehose::freeze`): its steps have stopped, so it would never follow a
+  node joining after that, and it keeps serving for 500 ms more.
+
+  This replaced a time-based grace (2 renew intervals, ended early by
+  hellos), which lost events: `tests/all/join_follow.rs` holds one peer's
+  steps and has it ignore hellos while a node joins under write load; the
+  grace expired, the joiner took a handback and acked writes, and once the
+  peer recovered it followed the joiner's log at its current position. Its
+  live subscribers and cursor replays missed 2.1–3.5k of 17–32k commits
+  (6 runs of 6), though all of them were in S3 and in the other nodes'
+  streams. Clock offset alone could do the same with every hello answered:
+  a joiner whose clock ran behind the cluster's slowest by more than its
+  hello → first write time assigned seqs at or below a peer's floor.
+  (Looping the test also found a lost update: a renewal in flight
+  replaced the node's cached lease whole when it landed, dropping a
+  `joined` set meanwhile, so peers never handed the joiner anything; it
+  could drop a `draining` the same way. A renewal now updates only the
+  fields it wrote.)
 - Serving: `subscribeRepos` does its own websocket upgrade and moves the socket
   onto a dedicated firehose runtime (`--firehose-threads`, default 4), so fan-out
   never competes with request handling. The merger frames each batch's websocket
@@ -569,8 +604,8 @@ the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
   first ordinal that isn't a segment), which ends its last span for good. The new owner replays its shards' previous spans
   (one pass over each dead log for all shards) before serving.
 - **Handback to a joiner.** A node owning more than its share hands the
-  extras straight to the peers short of theirs (only peers it has seen for a
-  join grace): after the close it CASes each assignment to name the joiner
+  extras straight to the peers short of theirs (only peers whose lease says
+  `joined`, see §5 "Joining"): after the close it CASes each assignment to name the joiner
   (epoch + 1, its own span closed at the barrier, an open span for the
   joiner starting at the log ordinal the joiner's lease last published,
   never inside an earlier span of the same log) and POSTs the handoffs to
@@ -1067,12 +1102,15 @@ most one step of observation delay, plus replay.
   ~1.5–2.5 renew intervals (3–5 s at TTL 10 s) plus replay.
 - *Greeting.* A joiner's first loop step (not the inline startup step: the
   node must serve before it opens shards) POSTs `/internal/v1/cluster/hello`
-  to every live peer, which reads its lease and starts following its log
-  (`learn_peer`). Once every peer confirmed, the join grace (which waits for
-  exactly that) is over: a node restarted with the same id reclaims the
-  shards still assigned to its previous incarnation, which `join` already
-  fenced, right away; and peers count a greeted joiner as settled, so
-  handbacks start at their next step instead of a grace later.
+  to every live peer not yet confirmed (retried each step), which reads its
+  lease, starts following its log (`learn_peer`) and answers its
+  follower's floor. Once every peer confirmed (here or through its lease)
+  and our seqs passed the floors, the node has joined (§5 "Joining"): a
+  node restarted with the same id reclaims the shards still assigned to
+  its previous incarnation, which `join` already fenced, right away; and it
+  publishes `joined` with an immediate renewal, so peers hand back at their
+  next step. (A nudge to every peer instead made them all release at once,
+  and the joiner's adopts of their batches queued behind each other.)
 - *Writes wait out the gap.* A forward refused at connect sent nothing, so
   the entry node resends a write (marker `forward::NotSent`; reason
   `unreachable`) until routing follows the takeover. A shard this node
@@ -1133,7 +1171,14 @@ linearizable.
   ρ ≤ skew/TTL = 20 %. Real oscillators drift ~10⁻⁵. Within that bound a
   presumed-dead node has already stopped serving, so reads are not stale
   either. Beyond it only availability and read freshness suffer, not acked
-  writes.
+  writes. Firehose completeness across a join (§5 "Joining") rests on the
+  same bound for one case only: a joiner skips a peer it presumes dead,
+  using the `wm_cap` it last read from that peer's lease. A dead or lapsed
+  peer never renews again, so that cap is final; a peer wrongly presumed
+  dead that keeps renewing (beyond the bound) raises it and could, until a
+  fence or reassignment makes it fail-stop, emit a stream to its own
+  subscribers that skips the joiner's first events. Every other node's
+  stream, and S3, keep them.
 - **Monotonic clocks count paused time** (`CLOCK_MONOTONIC` counts SIGSTOP and
   cgroup freezes). A VM or host suspend that stops the monotonic clock makes
   a node believe its lease is still valid on wake. It then serves stale reads
@@ -1147,6 +1192,14 @@ linearizable.
     before serving.
   - The merged firehose emits at `min W`, so it lags by the largest offset
     between nodes.
+  - A joiner whose clock is behind a peer's merger waits (uncapped: it
+    stays out, forwarding writes, and retries each step) until its seqs
+    pass every peer's follow floor before it joins (§5 "Joining"). The
+    one floor it can't read is a node that left gracefully just before
+    (lease deleted, merger frozen at *S*): a joiner whose clock runs behind
+    *S* by more than the time from that node's exit to its own first ack
+    could assign seqs below *S*, which that node's last subscribers (who
+    resume elsewhere from cursors near *S*) would miss.
   - Revs use `next_rev(prev)` and stay monotonic regardless of the clock.
 
 **Renewal RTT ceiling.** Renewals are sequential CAS PUTs, and validity counts

@@ -386,9 +386,17 @@ impl ShardHost for Node {
         crate::xrpc::internal::nudge_peers(&self.http, &self.internal_token, nudges).await;
     }
 
-    async fn greet(&self, peers: Vec<crate::cluster::NodeLease>) -> bool {
+    async fn greet(&self, peers: Vec<crate::cluster::NodeLease>) -> Vec<Option<i64>> {
         let addrs = peers.into_iter().map(|l| l.addr).collect();
         crate::xrpc::internal::hello_peers(&self.http, &self.internal_token, &self.cluster.cfg.node_id, addrs).await
+    }
+
+    fn leaving(&self) {
+        self.firehose.freeze();
+    }
+
+    fn follow_floors(&self) -> std::collections::BTreeMap<String, i64> {
+        self.followers.lock().iter().map(|(log_id, f)| (log_id.clone(), f.floor)).collect()
     }
 
     async fn refused(&self, addr: &str) -> bool {

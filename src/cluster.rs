@@ -59,6 +59,22 @@ pub struct NodeLease {
     /// Set by a graceful shutdown before it hands its shards out: peers stop
     /// counting it toward fair shares and never hand it shards.
     pub draining: bool,
+    /// Set once this incarnation has joined: every live peer follows its
+    /// log from below its first seq (see `Cluster::try_join`). Peers hand
+    /// shards only to joined nodes; a node takes none before.
+    #[serde(default)]
+    pub joined: bool,
+    /// Every peer log this node's merged firehose follows -> the follower's
+    /// floor (it delivers each of the log's events above it). A joiner
+    /// reads its own log here as this node's confirmation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub follows: BTreeMap<String, i64>,
+    /// This node's own watermark is capped here as of this renewal (seq of
+    /// its send time + TTL on its own clock), so its merged firehose never
+    /// settles past it unless a later renewal lands. A joiner that ignores
+    /// this node as dead makes its own seqs pass it.
+    #[serde(default)]
+    pub wm_cap: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -171,12 +187,24 @@ pub trait ShardHost: Send + Sync + 'static {
     fn shard_stats(&self) -> Vec<(ShardId, u64, u64)> {
         Vec::new()
     }
-    /// Joiner: asks each of `peers` to learn our lease now (and follow our
-    /// log) instead of at its next step. True only if every one confirmed;
-    /// then our join grace is over at once (see `Cluster::join_grace`).
-    async fn greet(&self, _peers: Vec<NodeLease>) -> bool {
-        false
+    /// Joiner: asks each of `peers` to learn our lease now and follow our
+    /// log (instead of at its next step). Per peer, the floor its follower
+    /// of our log delivers every event above, or None if it didn't confirm
+    /// (see `Cluster::try_join`). A host without a firehose (unit tests)
+    /// has nothing to lose: every peer confirms.
+    async fn greet(&self, peers: Vec<NodeLease>) -> Vec<Option<i64>> {
+        peers.iter().map(|_| Some(i64::MIN)).collect()
     }
+    /// The peer logs our merged firehose follows -> each follower's floor
+    /// (published in our lease: a joiner's confirmation).
+    fn follow_floors(&self) -> BTreeMap<String, i64> {
+        BTreeMap::new()
+    }
+    /// Graceful shutdown is about to delete our lease: a node joining from
+    /// now on won't count us (or greet us), and our steps (which would
+    /// follow its log) have stopped, so our merged firehose must emit
+    /// nothing more (see `Cluster::try_join`).
+    fn leaving(&self) {}
     /// Whether a TCP connect to `addr` (a peer's advertised URL) is refused:
     /// nothing listens there, so the process that holds that lease is gone.
     async fn refused(&self, _addr: &str) -> bool {
@@ -191,8 +219,6 @@ struct Seen {
     changed_at: Instant,
     /// When we first saw this incarnation (log_id) of the peer.
     first_seen: Instant,
-    /// It greeted us (`learn_peer`): past its join grace already.
-    greeted: bool,
 }
 
 /// Re-read every assignment (not only those whose ETag changed in the
@@ -267,11 +293,18 @@ pub struct Cluster {
     /// No live peer as of the last step (or greeting): nothing routes
     /// elsewhere (see `forward::Router::alone`).
     alone: AtomicBool,
-    /// Every live peer confirmed it follows our log (`ShardHost::greet`):
-    /// our join grace ended early.
-    greeted: AtomicBool,
-    /// The step loop runs (`spawn`). Greeting waits for it: the inline first
-    /// step at startup must not open shards before the node serves.
+    /// Every peer follows our log and our seqs passed every floor (see
+    /// `try_join`): we may take shards.
+    joined: AtomicBool,
+    /// Peers' confirmations (hello answers) that they follow our log: peer
+    /// log id -> its follower's floor.
+    confirmed: parking_lot::Mutex<HashMap<String, i64>>,
+    /// Our previous incarnation's published `wm_cap` (its lease, which ours
+    /// overwrote): our seqs pass it before we join.
+    join_floor: std::sync::atomic::AtomicI64,
+    /// The step loop runs (`spawn`). Greeting waits for it when we have
+    /// peers: the inline first step at startup must not open shards before
+    /// the node serves.
     spawned: AtomicBool,
     /// Highest epoch of each shard this incarnation has opened. An
     /// assignment naming us at a newer epoch was handed to us; at an epoch we
@@ -279,6 +312,11 @@ pub struct Cluster {
     /// and must not be adopted again: its history minus our span would
     /// replay older owners' writes over ours.
     opened: RwLock<HashMap<ShardId, u64>>,
+    /// Tests: skip every step (renewals go on), as a node whose step loop
+    /// is stuck would (`test_hold_steps`).
+    hold_steps: AtomicBool,
+    /// Tests: answer every greeting "not following" (`test_ignore_hellos`).
+    ignore_hellos: AtomicBool,
 }
 
 fn now_ms() -> u64 {
@@ -298,7 +336,19 @@ impl Cluster {
             writer: 0,
             store,
             lease_etag: RwLock::new(None),
-            lease: RwLock::new(NodeLease { node_id: cfg.node_id.clone(), log_id, addr: cfg.addr.clone(), writer: 0, expires_ms: 0, renewals: 0, next_ordinal: 0, draining: false }),
+            lease: RwLock::new(NodeLease {
+                node_id: cfg.node_id.clone(),
+                log_id,
+                addr: cfg.addr.clone(),
+                writer: 0,
+                expires_ms: 0,
+                renewals: 0,
+                next_ordinal: 0,
+                draining: false,
+                joined: false,
+                follows: BTreeMap::new(),
+                wm_cap: 0,
+            }),
             expires_local_ms: AtomicU64::new(0),
             valid_until: RwLock::new(Instant::now()),
             table: RwLock::new(BTreeMap::new()),
@@ -323,9 +373,13 @@ impl Cluster {
             nudged: tokio::sync::Notify::new(),
             handed: parking_lot::Mutex::new(Vec::new()),
             opened: RwLock::new(HashMap::new()),
-            greeted: AtomicBool::new(false),
+            joined: AtomicBool::new(false),
+            confirmed: parking_lot::Mutex::new(HashMap::new()),
+            join_floor: std::sync::atomic::AtomicI64::new(0),
             spawned: AtomicBool::new(false),
             alone: AtomicBool::new(false),
+            hold_steps: AtomicBool::new(false),
+            ignore_hellos: AtomicBool::new(false),
             cfg,
         };
         // create (or take over our own stale) node lease
@@ -341,6 +395,8 @@ impl Cluster {
                 if l.log_id != c.log_id {
                     c.fence_dead(&l.log_id, "restart").await?;
                 }
+                // its merged firehose (if it still runs) settles no further
+                c.join_floor.store(l.wm_cap, Ordering::Release);
                 c.lease.write().renewals = l.renewals;
                 PutMode::Update(UpdateVersion { e_tag: etag, version: None })
             }
@@ -575,12 +631,23 @@ impl Cluster {
         let mut l = self.lease.read().clone();
         l.expires_ms = self.wall_ms() + self.cfg.ttl.as_millis() as u64;
         l.renewals += 1;
+        // our watermark cap once this lands (published as `wm_cap`): from
+        // the send time, so the cap never exceeds what peers read
+        let expires_local_ms = now_ms() + self.cfg.ttl.as_millis() as u64;
+        l.wm_cap = crate::nodelog::seq_floor(expires_local_ms * 1000);
         let put = self.put_json_unbounded(&self.path(&format!("nodes/{}", self.cfg.node_id)), &l, mode).await;
         crate::metrics::LEASE_RENEW_SECONDS.observe(sent.elapsed().as_secs_f64());
         let etag = put?;
         *self.lease_etag.write() = etag;
-        *self.lease.write() = l;
-        self.expires_local_ms.store(now_ms() + self.cfg.ttl.as_millis() as u64, Ordering::Release);
+        {
+            // only what this write changed: a flag set meanwhile (`joined`,
+            // `draining`) must survive until the next write carries it
+            let mut cur = self.lease.write();
+            cur.renewals = l.renewals;
+            cur.expires_ms = l.expires_ms;
+            cur.wm_cap = l.wm_cap;
+        }
+        self.expires_local_ms.store(expires_local_ms, Ordering::Release);
         *self.valid_until.write() = sent + self.cfg.ttl - self.cfg.skew;
         Ok(())
     }
@@ -600,6 +667,22 @@ impl Cluster {
         self.halted.store(true, Ordering::Release);
         self.gone.store(true, Ordering::Release);
         self.stopping.store(true, Ordering::Release);
+    }
+
+    /// Tests only: while set, steps do nothing (no membership, routing or
+    /// shard moves; the lease is still renewed): a peer whose step loop is
+    /// stuck or slow.
+    pub fn test_hold_steps(&self, on: bool) {
+        self.hold_steps.store(on, Ordering::Release);
+        if !on {
+            self.nudged.notify_one();
+        }
+    }
+
+    /// Tests only: while set, greetings are answered "not following" (a
+    /// peer whose hello handling is slow or unreachable).
+    pub fn test_ignore_hellos(&self, on: bool) {
+        self.ignore_hellos.store(on, Ordering::Release);
     }
 
     pub fn halted(&self) -> bool {
@@ -774,16 +857,13 @@ impl Cluster {
             let mut tick = tokio::time::interval(me.cfg.renew_every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                // Step every tick, when a peer nudges us (it released shards
-                // for us: take them now, not up to a tick later), and once
-                // more as our join grace ends (a nudge during it is a no-op).
-                let grace_end = tokio::time::Instant::from_std(me.joined_at + me.join_grace());
+                // Step every tick, and when a peer nudges us (it released
+                // shards for us: take them now, not up to a tick later).
                 tokio::select! {
                     _ = tick.tick() => {}
                     _ = me.nudged.notified() => {
                         crate::metrics::CLUSTER_NUDGES.with_label_values(&["received"]).inc();
                     }
-                    _ = tokio::time::sleep_until(grace_end), if tokio::time::Instant::now() < grace_end => {}
                 }
                 if let Err(e) = me.adopt_handed(&host).await {
                     tracing::warn!("adopting handed shards failed: {e:#}");
@@ -819,8 +899,8 @@ impl Cluster {
         }
         let _step = self.step_lock.lock().await;
         let handed = std::mem::take(&mut *self.handed.lock());
-        // in our join grace (or without a lease) the step adopts them later
-        if self.stopping.load(Ordering::Acquire) || !self.lease_valid() || self.in_join_grace() {
+        // not joined yet (or without a lease): the step adopts them later
+        if self.stopping.load(Ordering::Acquire) || !self.lease_valid() || !self.joined.load(Ordering::Acquire) {
             return Ok(());
         }
         let mut adopt = Vec::new();
@@ -882,47 +962,134 @@ impl Cluster {
         Ok(())
     }
 
-    /// After joining, give every peer a membership refresh to discover us
-    /// (and start following our log) before we produce events, so no peer's
-    /// merged firehose has already moved past our first seqs.
+    /// Joining: before it takes any shard (acks anything), a new incarnation
+    /// needs every peer's merged firehose to follow its log from below its
+    /// first seq. A peer that starts following a log late starts at its
+    /// merger's position at that moment (`Firehose::add_remote`): it never
+    /// delivers the log's events at or below that floor, and its merged
+    /// stream (already emitted past them) can't take them in order. So:
     ///
-    /// A greeting ends it early: every live peer confirmed it has learned
-    /// our lease and follows our log (`learn_peer`). That is what the grace
-    /// waits for, so a restarted node (same id, its old shards still
-    /// assigned to its previous incarnation) reclaims them as soon as it
-    /// runs its first loop step instead of 2 renew intervals later.
-    fn join_grace(&self) -> Duration {
-        self.cfg.renew_every * 2
+    /// - every live peer must confirm it follows our log, with its
+    ///   follower's floor: a hello answer (`ShardHost::greet`, retried each
+    ///   step), or our log in its lease's `follows` (its step discovered us);
+    /// - our seqs must pass every floor (and, for a peer we ignore as dead
+    ///   without its confirmation, its published `wm_cap`, past which its
+    ///   merger can't settle) before we join: a peer's floor is its merger's
+    ///   position, which a joiner's clock running behind could still be at.
+    ///
+    /// No timer ends this: a live peer that never confirms keeps us out
+    /// (we forward writes meanwhile) until it confirms or we presume it
+    /// dead (TTL + skew without a renewal). Any peer that appears later lists
+    /// our lease at its own startup and follows our log from its start
+    /// floor (its cursor backfill serves everything below). Once joined we
+    /// publish `joined` at once: peers hand us shards at their next step,
+    /// as they used to once we greeted them. (Nudging them all made every
+    /// peer release at the same instant, and our adopts of the batches
+    /// queue behind each other.)
+    ///
+    /// The inline first step at startup doesn't greet (the node must serve
+    /// first); a node with no live peer joins there.
+    async fn try_join(&self, host: &Arc<dyn ShardHost>, live: &[NodeLease], dead: &[NodeLease]) -> bool {
+        let peers: Vec<&NodeLease> = live.iter().filter(|l| l.node_id != self.cfg.node_id).collect();
+        if !peers.is_empty() && !self.spawned.load(Ordering::Acquire) {
+            return false;
+        }
+        let confirmed = |l: &NodeLease, c: &HashMap<String, i64>| l.follows.get(&self.log_id).or_else(|| c.get(&l.log_id)).copied();
+        let mut floor = self.join_floor.load(Ordering::Acquire);
+        let mut pending = Vec::new();
+        {
+            let c = self.confirmed.lock();
+            for l in &peers {
+                match confirmed(l, &c) {
+                    Some(f) => floor = floor.max(f),
+                    None => pending.push((*l).clone()),
+                }
+            }
+        }
+        if !pending.is_empty() {
+            let answers = host.greet(pending.clone()).await;
+            let mut c = self.confirmed.lock();
+            let mut missing = Vec::new();
+            for (l, a) in pending.iter().zip(answers.into_iter().chain(std::iter::repeat(None))) {
+                match a {
+                    Some(f) => {
+                        c.insert(l.log_id.clone(), f);
+                        floor = floor.max(f);
+                    }
+                    None => missing.push(l.node_id.clone()),
+                }
+            }
+            if !missing.is_empty() {
+                tracing::info!(?missing, after_ms = self.joined_at.elapsed().as_millis() as u64, "not joining yet: peers not following our log");
+                return false;
+            }
+        }
+        {
+            let c = self.confirmed.lock();
+            for d in dead.iter().filter(|d| d.node_id != self.cfg.node_id) {
+                floor = floor.max(confirmed(d, &c).unwrap_or(d.wm_cap));
+            }
+        }
+        if !self.wait_seq_past(floor).await {
+            tracing::warn!(floor, "not joining yet: our clock is behind a peer's merged firehose");
+            return false;
+        }
+        self.joined.store(true, Ordering::Release);
+        self.lease.write().joined = true;
+        tracing::info!(after_ms = self.joined_at.elapsed().as_millis() as u64, peers = peers.len(), "every peer follows our log: joined");
+        self.renew(host).await;
+        true
     }
 
-    fn in_join_grace(&self) -> bool {
-        !self.greeted.load(Ordering::Acquire) && self.joined_at.elapsed() < self.join_grace()
+    /// Waits (up to a renew interval) until every seq we assign exceeds
+    /// `floor`. False if our clock is still behind it.
+    async fn wait_seq_past(&self, floor: i64) -> bool {
+        let deadline = Instant::now() + self.cfg.renew_every;
+        loop {
+            let now = crate::tid::now_micros();
+            if crate::nodelog::seq_floor(now) > floor {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let ahead_us = ((floor >> 8) as u64).saturating_sub(now);
+            tokio::time::sleep(Duration::from_micros(ahead_us.clamp(1_000, 50_000))).await;
+        }
+    }
+
+    /// Whether this incarnation has joined (see `try_join`).
+    pub fn joined(&self) -> bool {
+        self.joined.load(Ordering::Acquire)
     }
 
     /// A joiner greeted us: learn its lease now (one GET) and follow its
-    /// log, as our next step would. False if it has no lease or we already
-    /// presume it dead.
-    pub async fn learn_peer(&self, host: &Arc<dyn ShardHost>, node_id: &str) -> anyhow::Result<bool> {
-        if node_id == self.cfg.node_id {
-            return Ok(false);
+    /// log, as our next step would. Returns our follower's floor for its
+    /// log (we deliver every event of it above), or None if it has no
+    /// lease, we presume it dead, or we don't follow it yet (a step racing
+    /// us replaced our peer list: it asks again).
+    pub async fn learn_peer(&self, host: &Arc<dyn ShardHost>, node_id: &str) -> anyhow::Result<Option<i64>> {
+        if node_id == self.cfg.node_id || self.ignore_hellos.load(Ordering::Acquire) {
+            return Ok(None);
         }
         let Some((lease, etag)) = self.get_json::<NodeLease>(&self.path(&format!("nodes/{node_id}"))).await? else {
-            return Ok(false);
+            return Ok(None);
         };
         if lease.draining || self.fenced.read().contains_key(&lease.log_id) {
-            return Ok(false);
+            return Ok(None);
         }
+        let log_id = lease.log_id.clone();
         {
             let now = Instant::now();
             let mut seen = self.seen.write();
             let same = seen.get(node_id).filter(|s| s.lease.log_id == lease.log_id);
             let first_seen = same.map_or(now, |s| s.first_seen);
-            seen.insert(node_id.to_string(), Seen { etag, lease: lease.clone(), changed_at: now, first_seen, greeted: true });
+            seen.insert(node_id.to_string(), Seen { etag, lease: lease.clone(), changed_at: now, first_seen });
         }
         self.peers.write().insert(node_id.to_string(), lease);
         self.alone.store(false, Ordering::Release);
         host.on_membership();
-        Ok(true)
+        Ok(host.follow_floors().get(&log_id).copied())
     }
 
     /// Renews our node lease (CAS on its ETag); a conflict means someone
@@ -943,7 +1110,11 @@ impl Cluster {
             host.lost();
             return;
         }
-        self.lease.write().next_ordinal = host.next_ordinal();
+        {
+            let mut l = self.lease.write();
+            l.next_ordinal = host.next_ordinal();
+            l.follows = host.follow_floors();
+        }
         let etag = self.lease_etag.read().clone();
         if let Err(e) = self.write_lease(PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
             match e.downcast_ref::<object_store::Error>() {
@@ -1012,8 +1183,7 @@ impl Cluster {
                         let same = seen.get(&id).filter(|s| s.lease.log_id == lease.log_id);
                         let first_seen = same.map_or(now, |s| s.first_seen);
                         let changed_at = same.filter(|s| s.lease.renewals == lease.renewals).map_or(now, |s| s.changed_at);
-                        let greeted = same.is_some_and(|s| s.greeted);
-                        seen.insert(id, Seen { etag, lease, changed_at, first_seen, greeted });
+                        seen.insert(id, Seen { etag, lease, changed_at, first_seen });
                     }
                 }
             }
@@ -1169,7 +1339,7 @@ impl Cluster {
 
     async fn step_inner(&self, host: &Arc<dyn ShardHost>, renew: bool) -> anyhow::Result<()> {
         let _step = self.step_lock.lock().await;
-        if self.stopping.load(Ordering::Acquire) {
+        if self.stopping.load(Ordering::Acquire) || self.hold_steps.load(Ordering::Acquire) {
             return Ok(());
         }
         // 1. renew our node lease (the spawned loop renews on its own task)
@@ -1212,15 +1382,9 @@ impl Cluster {
             return Ok(());
         }
         let fair = layout.shards.len().div_ceil(live.iter().filter(|l| !l.draining).count().max(1));
-        // Join grace (see `join_grace`).
-        let has_peers = live.iter().any(|l| l.node_id != self.cfg.node_id);
-        if has_peers && self.in_join_grace() {
-            let others: Vec<NodeLease> = live.iter().filter(|l| l.node_id != self.cfg.node_id).cloned().collect();
-            if !self.spawned.load(Ordering::Acquire) || !host.greet(others).await {
-                return Ok(());
-            }
-            tracing::info!(after_ms = self.joined_at.elapsed().as_millis() as u64, "every peer follows our log: join grace over");
-            self.greeted.store(true, Ordering::Release);
+        // Join first: no shard before every peer follows our log (`try_join`).
+        if !self.joined.load(Ordering::Acquire) && !self.try_join(host, &live, &dead).await {
+            return Ok(());
         }
         // HA fix: never take (or juggle) shards without a valid lease, e.g. a
         // zombie that woke after its peers fenced it, or while renewals fail.
@@ -1265,8 +1429,8 @@ impl Cluster {
             self.acquire(host, layout.ids(), fair - owned.len(), &live_ids, &dead_logs, fair, live.len()).await?;
         } else {
             // 5. hand extras straight to the peers short of their share. A
-            //    peer counts only once it is past its join grace (as we time
-            //    it): it can't adopt anything before that. Parents of a
+            //    peer counts only once it has joined (its lease says so): it
+            //    can't adopt anything before that. Parents of a
             //    reshard stay (they are about to freeze), and shards we
             //    opened most recently go last (a split's children).
             let settled = self.settled_peers();
@@ -1422,15 +1586,10 @@ impl Cluster {
         Ok(())
     }
 
-    /// Live peers we've seen for at least a join grace (past theirs).
+    /// Live peers that have joined (see `try_join`) and aren't draining:
+    /// the ones that may take shards.
     fn settled_peers(&self) -> Vec<NodeLease> {
-        let seen = self.seen.read();
-        self.peers
-            .read()
-            .values()
-            .filter(|l| !l.draining && seen.get(&l.node_id).is_some_and(|s| s.greeted || s.first_seen.elapsed() >= self.join_grace()))
-            .cloned()
-            .collect()
+        self.peers.read().values().filter(|l| !l.draining && l.joined).cloned().collect()
     }
 
     /// `peers` owning fewer than `share` shards (per our assignment cache),
@@ -1652,6 +1811,7 @@ impl Cluster {
             let _r = self.renew_lock.lock().await;
             self.gone.store(true, Ordering::Release);
         }
+        host.leaving();
         self.delete(&format!("nodes/{}", self.cfg.node_id)).await;
         // Our lease is gone, so peers' next step counts us out and takes
         // whatever we didn't hand them: run it now, not a step interval later.
@@ -1677,6 +1837,10 @@ mod tests {
         lost: AtomicU64,
         fail_close: Mutex<HashSet<ShardId>>,
         nudged: Mutex<Vec<(String, Vec<Handoff>)>>,
+        /// peers answer our greetings "not following"
+        unheard: std::sync::atomic::AtomicBool,
+        /// peer logs our "firehose" follows (published in our lease)
+        follows: Mutex<BTreeMap<String, i64>>,
     }
 
     #[async_trait::async_trait]
@@ -1712,6 +1876,21 @@ mod tests {
         async fn nudge(&self, nudges: Vec<(String, Vec<Handoff>)>) {
             self.nudged.lock().extend(nudges);
         }
+        async fn greet(&self, peers: Vec<NodeLease>) -> Vec<Option<i64>> {
+            let ok = !self.unheard.load(Ordering::SeqCst);
+            peers.iter().map(|_| ok.then_some(i64::MIN)).collect()
+        }
+        fn follow_floors(&self) -> BTreeMap<String, i64> {
+            self.follows.lock().clone()
+        }
+    }
+
+    /// Joins as a node whose step loop runs (`spawn`): it greets peers, so
+    /// its steps can join with live peers around (`try_join`).
+    async fn join(cfg: ClusterConfig, store: Store) -> anyhow::Result<Arc<Cluster>> {
+        let c = Cluster::join(cfg, store).await?;
+        c.spawned.store(true, Ordering::Release);
+        Ok(c)
     }
 
     fn cfg(id: &str) -> ClusterConfig {
@@ -1755,7 +1934,7 @@ mod tests {
         let (h, hd) = host();
         let id = format!("lease-metrics-{}", crate::tid::now_micros());
         let restarts0 = crate::metrics::PEER_TAKEOVERS.with_label_values(&["restart"]).get();
-        let a = Cluster::join(cfg(&id), store.clone()).await.unwrap();
+        let a = join(cfg(&id), store.clone()).await.unwrap();
         let (timed0, conflicts0) = (crate::metrics::LEASE_RENEW_SECONDS.get_sample_count(), m.with_label_values(&["conflict"]).get());
         a.renew(&hd).await;
         assert!(crate::metrics::LEASE_RENEW_SECONDS.get_sample_count() > timed0);
@@ -1770,9 +1949,21 @@ mod tests {
         assert!(m.with_label_values(&["conflict"]).get() > conflicts0);
         // a restart with the same id (its predecessor never fenced its log)
         store.raw.delete(&a.path(&format!("nodes/{id}"))).await.unwrap();
-        let lease = NodeLease { node_id: id.clone(), log_id: a.log_id.clone(), addr: String::new(), writer: 0, expires_ms: 0, renewals: 1, next_ordinal: 0, draining: false };
+        let lease = NodeLease {
+            node_id: id.clone(),
+            log_id: a.log_id.clone(),
+            addr: String::new(),
+            writer: 0,
+            expires_ms: 0,
+            renewals: 1,
+            next_ordinal: 0,
+            draining: false,
+            joined: true,
+            follows: BTreeMap::new(),
+            wm_cap: 0,
+        };
         a.put_json(&a.path(&format!("nodes/{id}")), &lease, PutMode::Overwrite).await.unwrap();
-        let b = Cluster::join(cfg(&id), store.clone()).await.unwrap();
+        let b = join(cfg(&id), store.clone()).await.unwrap();
         assert!(b.fenced_logs().contains_key(&a.log_id));
         assert!(crate::metrics::PEER_TAKEOVERS.with_label_values(&["restart"]).get() > restarts0);
     }
@@ -1794,9 +1985,9 @@ mod tests {
             data.extend_from_slice(&b.body);
             store.raw.put(&crate::nodelog::segment_path(&store, log, ord), PutPayload::from(data)).await.unwrap();
         }
-        let a = Cluster::join(cfg("a"), store.clone()).await.unwrap();
+        let a = join(cfg("a"), store.clone()).await.unwrap();
         assert_eq!(a.fence(log).await.unwrap(), (3, 102), "fence at the hole; last seq from the durable prefix");
-        let b = Cluster::join(cfg("b"), store.clone()).await.unwrap();
+        let b = join(cfg("b"), store.clone()).await.unwrap();
         assert_eq!(b.fence(log).await.unwrap(), (3, 102), "a second fencer finds the same end instead of stacking one");
         let r = store
             .raw
@@ -1808,22 +1999,20 @@ mod tests {
     #[tokio::test]
     async fn assignment_handoff_fencing() {
         let store = Store::memory(None);
-        let a = Cluster::join(cfg("a"), store.clone()).await.unwrap();
+        let a = join(cfg("a"), store.clone()).await.unwrap();
         let (ha, ha_dyn) = host();
         a.step(&ha_dyn).await.unwrap();
         assert_eq!(a.owned().len(), 8);
         ha.ord.store(5, Ordering::SeqCst); // a wrote 5 segments
         ha.seq.store(1000, Ordering::SeqCst);
 
-        let b = Cluster::join(cfg("b"), store.clone()).await.unwrap();
+        let b = join(cfg("b"), store.clone()).await.unwrap();
         assert_ne!(a.writer, b.writer, "writer ids unique among live nodes");
         let (hb, hb_dyn) = host();
         b.step(&hb_dyn).await.unwrap();
-        assert!(b.owned().is_empty(), "join grace: no shards before peers can discover us");
-        a.step(&ha_dyn).await.unwrap(); // a first sees b
-        assert!(ha.closed.lock().is_empty(), "a keeps its shards while b is in its join grace");
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        a.step(&ha_dyn).await.unwrap(); // a releases 4
+        assert!(b.joined(), "a confirmed it follows b's log");
+        assert!(b.owned().is_empty(), "every shard has a live owner");
+        a.step(&ha_dyn).await.unwrap(); // a sees b joined: releases 4
         assert_eq!(ha.closed.lock().len(), 1, "the 4 extras are closed in one batch (one barrier segment)");
         let nudged = ha.nudged.lock().clone();
         assert_eq!(nudged.len(), 1, "one nudge, to the node short of its share");
@@ -1883,11 +2072,11 @@ mod tests {
     #[tokio::test]
     async fn missed_nudge_is_adopted_by_the_next_step_once() {
         let store = Store::memory(None);
-        let a = Cluster::join(cfg("a"), store.clone()).await.unwrap();
+        let a = join(cfg("a"), store.clone()).await.unwrap();
         let (ha, ha_dyn) = host();
         a.step(&ha_dyn).await.unwrap();
         ha.ord.store(3, Ordering::SeqCst);
-        let b = Cluster::join(cfg("b"), store.clone()).await.unwrap();
+        let b = join(cfg("b"), store.clone()).await.unwrap();
         let (hb, hb_dyn) = host();
         hb.ord.store(7, Ordering::SeqCst);
         b.step(&hb_dyn).await.unwrap(); // renews: publishes ordinal 7
@@ -1913,20 +2102,73 @@ mod tests {
         assert_eq!((hist[1].log_id.as_str(), hist[1].epoch, hist[1].end.is_some()), (b.log_id.as_str(), 2, true), "b's span closed and replayed");
     }
 
+    /// No timer lets a joiner in: while a live peer doesn't confirm it
+    /// follows the joiner's log, the joiner takes nothing and nobody hands
+    /// it anything, however long that takes (a peer following late would
+    /// skip whatever it acked meanwhile). A confirmation through the peer's
+    /// lease (`follows`) counts like a hello answer.
+    #[tokio::test]
+    async fn joiner_waits_for_every_peer_to_follow_its_log() {
+        let store = Store::memory(None);
+        let a = join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        assert_eq!(a.owned().len(), 8);
+        let b = join(cfg("b"), store.clone()).await.unwrap();
+        let (hb, hb_dyn) = host();
+        hb.unheard.store(true, Ordering::SeqCst);
+        for _ in 0..5 {
+            // 5 x 100 ms: well past the old 2-renew-interval grace
+            b.step(&hb_dyn).await.unwrap();
+            a.step(&ha_dyn).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!b.joined());
+        assert!(b.owned().is_empty() && ha.closed.lock().is_empty(), "no handback to a node that hasn't joined");
+        // a's lease names b's log among those it follows: that's a's confirmation
+        ha.follows.lock().insert(b.log_id.clone(), 42);
+        a.renew(&ha_dyn).await;
+        b.step(&hb_dyn).await.unwrap();
+        assert!(b.joined(), "confirmed through a's lease");
+        a.step(&ha_dyn).await.unwrap();
+        assert_eq!(ha.closed.lock().len(), 1, "a hands b its share at once");
+    }
+
+    /// A joiner's seqs must pass every floor before it joins: here its
+    /// previous incarnation's published watermark cap, as a clock behind it.
+    #[tokio::test]
+    async fn joiner_waits_until_its_seqs_pass_the_floors() {
+        let store = Store::memory(None);
+        let id = format!("floors-{}", crate::tid::now_micros());
+        let a = join(cfg(&id), store.clone()).await.unwrap();
+        // a's previous incarnation's merger may have settled up to 300 ms
+        // ahead of our clock
+        let cap = crate::nodelog::seq_floor(crate::tid::now_micros() + 300_000);
+        let mut lease = a.lease.read().clone();
+        lease.wm_cap = cap;
+        a.put_json(&a.path(&format!("nodes/{id}")), &lease, PutMode::Overwrite).await.unwrap();
+        let b = join(cfg(&id), store.clone()).await.unwrap();
+        let (_hb, hb_dyn) = host();
+        b.step(&hb_dyn).await.unwrap();
+        assert!(!b.joined() && b.owned().is_empty(), "our clock is behind the floor: not joined");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        b.step(&hb_dyn).await.unwrap();
+        assert!(b.joined() && b.owned().len() == 8);
+        assert!(crate::nodelog::seq_floor(crate::tid::now_micros()) > cap);
+    }
+
     /// A shard whose close failed (its barrier never became durable) is
     /// never released: entries of it may still be in flight past the span
     /// end we'd publish. The node fail-stops; a successor fences and replays.
     #[tokio::test]
     async fn failed_close_is_not_released() {
         let store = Store::memory(None);
-        let a = Cluster::join(cfg("a"), store.clone()).await.unwrap();
+        let a = join(cfg("a"), store.clone()).await.unwrap();
         let (ha, ha_dyn) = host();
         a.step(&ha_dyn).await.unwrap();
-        let b = Cluster::join(cfg("b"), store.clone()).await.unwrap();
+        let b = join(cfg("b"), store.clone()).await.unwrap();
         let (_hb, hb_dyn) = host();
-        b.step(&hb_dyn).await.unwrap();
-        a.step(&ha_dyn).await.unwrap(); // a first sees b
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        b.step(&hb_dyn).await.unwrap(); // b joins
         ha.fail_close.lock().insert(ShardId(7)); // a releases 7..4 (highest first)
         a.step(&ha_dyn).await.unwrap();
         assert_eq!(ha.lost.load(Ordering::SeqCst), 1, "fail-stop on a failed close");
@@ -1950,8 +2192,8 @@ mod tests {
     #[tokio::test]
     async fn skewed_clocks_stay_live() {
         let store = Store::memory(None);
-        let slow = Cluster::join(skewed("slow", -120_000), store.clone()).await.unwrap();
-        let fast = Cluster::join(skewed("fast", 120_000), store.clone()).await.unwrap();
+        let slow = join(skewed("slow", -120_000), store.clone()).await.unwrap();
+        let fast = join(skewed("fast", 120_000), store.clone()).await.unwrap();
         let (hs, hs_dyn) = host();
         let (hf, hf_dyn) = host();
         for _ in 0..25 {
@@ -1971,13 +2213,13 @@ mod tests {
     #[tokio::test]
     async fn dead_peer_with_future_clock_is_taken_over() {
         let store = Store::memory(None);
-        let a = Cluster::join(skewed("a", 3_600_000), store.clone()).await.unwrap();
+        let a = join(skewed("a", 3_600_000), store.clone()).await.unwrap();
         let (_ha, ha_dyn) = host();
         a.step(&ha_dyn).await.unwrap();
         assert_eq!(a.owned().len(), 8);
         // a dies now; c joins later and has never seen a's lease change
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let c = Cluster::join(cfg("c"), store.clone()).await.unwrap();
+        let c = join(cfg("c"), store.clone()).await.unwrap();
         let (hc, hc_dyn) = host();
         let first_seen = Instant::now();
         while c.owned().len() < 8 {
@@ -2069,7 +2311,7 @@ mod tests {
     async fn stalled_store_calls_do_not_stall_takeover() {
         let stalls = Arc::new(Stalls::default());
         let store = Store { raw: stalls.clone(), ..Store::memory(None) };
-        let a = Cluster::join(cfg("a"), store.clone()).await.unwrap();
+        let a = join(cfg("a"), store.clone()).await.unwrap();
         let (_ha, ha_dyn) = host();
         a.step(&ha_dyn).await.unwrap();
         assert_eq!(a.owned().len(), 8);
@@ -2077,7 +2319,7 @@ mod tests {
         // of the assignments, the GET of a's lease, the LIST and a header
         // read of a's log (fencing it), and an assignment CAS
         let died = Instant::now();
-        let b = Cluster::join(cfg("b"), store.clone()).await.unwrap();
+        let b = join(cfg("b"), store.clone()).await.unwrap();
         stalls.arm("list", "assign");
         stalls.arm("get", "nodes/a");
         stalls.arm("list", &format!("log/{}", a.log_id));
@@ -2104,8 +2346,8 @@ mod tests {
         let store = Store::memory(None);
         let mut c = cfg("a");
         c.shards = 256;
-        let a = Cluster::join(c.clone(), store.clone()).await.unwrap();
-        let b = Cluster::join(ClusterConfig { node_id: "b".into(), ..c }, store.clone()).await.unwrap();
+        let a = join(c.clone(), store.clone()).await.unwrap();
+        let b = join(ClusterConfig { node_id: "b".into(), ..c }, store.clone()).await.unwrap();
         let ((_, ha), (_, hb)) = (host(), host());
         for _ in 0..10 {
             a.step(&ha).await.unwrap();

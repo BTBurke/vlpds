@@ -123,6 +123,9 @@ pub async fn serve_stream(mut ws: WebSocket, log: Arc<NodeLog>) {
 /// A follower of one peer log feeding our merger.
 pub struct Follower {
     pub log_id: Arc<str>,
+    /// Every event of the log above this is delivered to the merger (its
+    /// position when the follower started, see `Firehose::add_remote`).
+    pub floor: i64,
     pub watermark: Arc<AtomicI64>,
     pub stop: Arc<AtomicBool>,
     /// Set once a dead log has been drained up to its fence.
@@ -143,6 +146,7 @@ pub fn follow_log(
     let (floor, watermark) = fh.add_remote(&log_id);
     let f = Follower {
         log_id: log_id.clone(),
+        floor,
         watermark,
         stop: Arc::new(AtomicBool::new(false)),
         done: Arc::new(AtomicBool::new(false)),
