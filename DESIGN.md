@@ -135,17 +135,10 @@ interior nodes (~3.3–3.5 KB into SlateDB per commit, ~7 node puts and ~7
 deletes), all in one state batch.
 
 ### 3. Log = WAL = firehose
-> **Superseded by the HA section below:** the log is per *node*, with up to K
-> segment PUTs in flight finalized in ordinal order (adaptive batching:
-> whatever queues during a PUT forms the next segment; see "Pipelined segment
-> PUTs").
-
-- A sequencer task per partition assigns `seq` and splices it into frames that
-  workers pre-encoded (header + body DAG-CBOR) in the open segment buffer.
-- At 75k/s with 25 ms PUTs and 16 partitions: ~500 PUTs/s of ~450 KB.
-- **Fencing:** `PUT log/{first_seq}.seg` with `If-None-Match: *`. A zombie writer
-  collides on the next segment name and stops. This is the basis for active/standby
-  failover.
+- The log is per *node* (`log/{log_id}/{ord:012}.seg`), with up to K segment
+  PUTs in flight finalized in ordinal order (adaptive batching: whatever
+  queues during a PUT forms the next segment). The HA section below has the
+  details ("Pipelined segment PUTs", fencing, takeover).
 - **Failure policy: fail-stop.** A segment PUT is retried until it succeeds (the
   idempotent key makes this safe). If it is unrecoverable, the process exits and
   recovery replays from durable state. Unacked in-memory commits are discarded,
@@ -1928,11 +1921,9 @@ differently:
      shards / 3 in-process nodes: see TODO.md.
    - Rate limits and abuse controls per shard.
 
-The current implementation (per-partition logs, P = 16–64, per-partition
-leases) is the right shape for a handful of nodes and tens of millions of
-accounts. Moving to items 2–5 is mostly confined to the log and cluster
-layers: segments, the sequencer, leases and the merger. Repo workers, the MST,
-SlateDB state, XRPC and OAuth are unchanged.
+Moving further is mostly confined to the log and cluster layers: segments,
+the sequencer, leases and the merger. Repo workers, the MST, SlateDB state,
+XRPC and OAuth are unchanged.
 
 ## Initial deployment sizing: Bluesky scale with headroom
 

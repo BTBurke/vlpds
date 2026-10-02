@@ -9,7 +9,7 @@
 #   bench/ha/run_all.sh kill9-1of3 ...  # named scenarios
 #
 # Knobs (env): VLPDS_HA_TTL_MS (3000), VLPDS_HA_RATE (150 writes/s per node),
-# VLPDS_HA_PARTITIONS (16), VLPDS_HA_NODE_ARGS (node flag template, see
+# VLPDS_HA_PARTITIONS (64 shards), VLPDS_HA_NODE_ARGS (node flag template, see
 # hactl.py), VLPDS_BIN_DIR (vlpds + loadgen), HA_RUN_ID, SKIP_BUILD=1.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
