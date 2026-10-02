@@ -165,11 +165,13 @@ compaction, i.e. an LSM. SlateDB is used only as a sorted KV, so it is
 swappable.
 
 - On durable watermark advance, apply that segment's effects as one `WriteBatch`
-  (records put/delete, head updates, `meta/applied_seq`) with `await_durable=false`.
+  (records put/delete, head updates, the applied marker `meta/applied2`) with
+  `await_durable=false`.
   It is visible in the memtable immediately (read-your-writes before the HTTP ack),
   and SlateDB flushes L0 SSTs to S3 on its own schedule.
-- No double-write: the log is the WAL. Crash recovery = open SlateDB, read
-  `applied_seq`, replay segments after it (events carry record blocks + commit).
+- No double-write: the log is the WAL. Crash recovery = open SlateDB, read the
+  applied marker `meta/applied2` = (log id, ordinal), replay the shard's spans
+  after it (events carry record blocks + commit).
 - Keys (each prefixed by `0x01 ‖ slot` of its account, so a shard's state is
   one key range: see "Online shard split/merge"):
   - `h/{did}` → head `{commit cid, signed commit bytes, rev, data cid, status}`
@@ -178,6 +180,10 @@ swappable.
     first 8 bytes of the CID's digest). Written in the same batch as the `R/` key,
     one per path (a CID can sit at several). A lookup prefix-scans
     `c/{did}\0{cid8}` on the snapshot and checks each path's record CID.
+  - `C/{collection}\0{did}` → empty: collection index (which repos have
+    records in a collection; `sync.listReposByCollection`).
+  - `b/{did}\0{blob cid}\0{record path}` → empty: blob-ref index (which
+    records reference a blob; blob listing and GC).
   - `M/{did}\0{cid digest}` → MST node block (lazy MSTs): exactly the
     interior nodes of the tree at `h/{did}`'s data root, put and deleted in
     the commit's batch (puts derived from the #commit CAR at replay).
@@ -194,7 +200,11 @@ swappable.
   - `p/{routing}\0{name}` → private per-account state: sessions, app
     password hashes, email-token digests, TOTP state (secret wrapped),
     reserved signing keys (`p/_reserved:{did:key}\0k`, wrapped), OAuth rows.
-  - `meta/applied_seq`
+  - `meta/applied2` → applied marker (`nodelog::encode_marker`: log id,
+    ordinal): everything for this shard in that log up to the ordinal is
+    applied. `meta/recent` → the shard's recently written DIDs, which its
+    next owner preloads. (Unprefixed: they sort outside the `0x01` slot
+    keys.)
 - Reads (`getRecord`, `listRecords`, `describeRepo`) → SlateDB (memtable → block
   cache → local disk cache → S3).
 - SST blocks (16 KiB) are zstd-compressed (`--sst-compression none|lz4|zstd`;
@@ -440,7 +450,7 @@ load it should stay flat (a rising rate means pool churn).
 
 | Role | Used for | Settings |
 |---|---|---|
-| peer | forwarding, internal calls | h2c prior knowledge; 4 MiB stream / 64 MiB conn windows; PING every 10 s (also idle), dead after 5 s; TCP keepalive 30 s; nodelay; connect 1 s; `--peer-connections` (default 4) connections per peer, round-robin |
+| peer | forwarding, internal calls | h2c prior knowledge; 4 MiB stream / 64 MiB conn windows; PING every 10 s (also idle), dead after 5 s; TCP keepalive 30 s; nodelay; connect 1 s; 15 s total per request (client default; forwards override it with their own deadlines, 3 s to the response head); `--peer-connections` (default 4) connections per peer, round-robin |
 | public | PLC, requestCrawl, Cloud KMS (5 s per call) | h2 by ALPN on https, HTTP/1.1 on http with 1,024 idle per host; idle close 60 s; h2 PING 20 s / 10 s; TCP keepalive; connect 5 s, read 30 s |
 | proxy | configured AppView / report service | `http://`: hyper HTTP/1.1 connections, one pool per host with a slot per IO thread: a connection goes back to the slot of the thread that finished its body, a request takes from its own slot, else from another slot, else connects; at most 1,024 connections per host (idle + busy; past that a request waits for one, `vlpds_http_client_pool_waits_total`); idle close 60 s, retry once if a reused connection was closed before the request went out; `https://`: public's settings as one client per IO thread. No read timeout: the proxy arms a 10 s head deadline and a 30 s body-idle timer only while the upstream makes it wait. Responses stream through unbuffered; compressed ones as the upstream encoded them (Content-Encoding/-Length kept, never decoded or re-compressed; the client's Accept-Encoding is forwarded, for the read-after-write methods only its decodable codings: §8); a client that goes away mid-body closes the upstream connection. CORS preflights are answered locally (no auth, no upstream) |
 | guarded | user-derived URLs: did:web, handle `.well-known`, OAuth client metadata, lexicons, DID-doc service endpoints | public's settings, 32 idle per host, plus a resolver that drops non-public addresses (outside dev mode); pair with `check_outbound_url` |
@@ -908,7 +918,7 @@ and its PUT at F collides with the fence, so it fail-stops instead (exit 3). Its
 land, but nothing reads past F. Garbage is left in place; it's bounded by
 K − 1 segments per crash.
 
-### Log compression (`VLSEG05`, `--log-compression`)
+### Log compression (`VLSEG06`, `--log-compression`)
 
 Segments are ~5.4 KB per single-record commit on real data, ~85% of it the
 firehose frame (MST proof blocks dominate). The sealed body is stored as one
@@ -2142,8 +2152,9 @@ the full-tree mode is removed).
   export spread 105-159 ms across runs of one binary at load 20-70;
   instructions ±1%). Profile (`sample`, 4 concurrent exports): ~75% of an
   export is the `R/` scan inside SlateDB's `DbIterator::next` (~11k
-  instructions per row: a boxed future per iterator layer per row, so
-  allocator traffic, `RowEntry` moves and the merge heap), ~8% the `M/`
+  instructions per row at the time: a boxed future per iterator layer per
+  row, so allocator traffic, `RowEntry` moves and the merge heap; since cut
+  to ~3.4k, see "Batched scans" below), ~8% the `M/`
   read-ahead scan (same per-row cost), ~10% the walk (leaf encode and
   SHA-256, interior decode; the hash was ~1/3 of it, `M/` nodes ~60% of
   that), ~6% hyper. SHA-256 is the hardware one: `sha2` 0.10 with `asm`
@@ -2174,6 +2185,14 @@ the full-tree mode is removed).
   an export ~50% more instructions than jemalloc (the server's), so
   benches of scan-heavy paths overstate them. What is left to win is
   mostly in SlateDB's iterator stack (the fork), not in this walk.
+- Batched scans (Oct 2, fork rev fc2aae0a, branch vlpds-0.17-batch-next).
+  `DbIterator::next` takes a synchronous fast path over loaded blocks and
+  memtables, and `next_batch` returns many rows per await;
+  `state::BatchedScan` reads 256 rows at a time for the getRepo `R/` scan
+  (and its resume), the `M/` read-ahead, leaf range rebuilds and
+  listRecords. A scan row costs ~3.4k instructions instead of ~12.5k:
+  `bench_readers` getRepo (100k records, 22.5 MB, jemalloc) 1,100 M ->
+  476 M instructions per export (-57%), CPU ~105 -> ~52 ms.
 - Leaf getBlocks is an index lookup plus a walk to the leaf's key; cold
   leaves (the bench's random leaves are mostly cold) cost a small `R/`
   range scan each, now shared with their siblings: 196 µs of CPU (median of
@@ -3394,14 +3413,14 @@ effect at the next segment). Not built yet: everything under "Later".
 | Entry muts | inside segments | none: raw SlateDB key/value bytes, plus muts *derived* by the reader from `#commit` frames (`derive_commit_muts`, top bit of `mut_count`) | an old reader writes new-format bytes blindly into state |
 | Head `h/` | `state.rs` `Head::encode` | none (fixed binary: cid ‖ cid ‖ rev ‖ block) | `decode` "short head" or garbage |
 | Record `R/` | `state::record_value` | none (cid ‖ rev ‖ bytes) | garbage |
-| Index `c/ C/ b/ n/ K/` | `state.rs` | key layout only, empty/plain values | key not found |
+| Index `c/ C/ b/ bl/ n/ K/` | `state.rs` | key layout only, empty/plain values | key not found |
 | MST nodes `M/` | `state.rs`, `mst_lazy.rs` | dag-cbor, content-addressed | stable by construction |
 | Account `a/` | `state::Account` JSON | none; tolerant (`#[serde(default)]`, `#[serde(flatten)] extra` keeps unknown fields) | round-trips unknown fields |
 | Private `p/` rows | sessions, app passwords, tokens, TOTP (`totp.rs`), OAuth (`oauth/store.rs`), `sec/` revocations/takedowns (`xrpc/server.rs`) | none; mostly JSON | per type; mostly serde-default |
 | Shard meta | `meta/applied2` (`nodelog::encode_marker`), `meta/recent` | key-name suffix (`applied2`): the only precedent | **(built)** `decode_marker` of anything but exactly its bytes is an error (the shard doesn't open, `format="applied_marker"`), never "no marker" |
 | SlateDB SSTs + manifest | `state/{id}/` | slatedb's own (pinned fork rev, `Cargo.toml`); SST compression from flags | slatedb error at open |
 | Node lease | `nodes/{id}`, `cluster::NodeLease` | none; serde ignores unknown fields | **(built)** new fields (`rev`, `min_level`, `max_level`, `seen_level`) default (a lease without them is a level-1 build) |
-| Assignment | `assign/{s:03}`, `cluster::Assignment` | none; CAS read-modify-write by *every* node | **(built)** `#[serde(default)]` + `flatten extra`: an old node's CAS (acquire, release, handoff) keeps fields it doesn't know. `Span` (history entries) is closed: a new span field needs a new object |
+| Assignment | `assign/{id:010}`, `cluster::Assignment` | none; CAS read-modify-write by *every* node | **(built)** `#[serde(default)]` + `flatten extra`: an old node's CAS (acquire, release, handoff) keeps fields it doesn't know. `Span` (history entries) is closed: a new span field needs a new object |
 | Layout | `assign/layout`, `slots::Layout` | `version` = routing generation, not format | **(built)** `flatten extra` on `Layout` and its `op` (`Reshard`); every layout write derives from the one read. `ShardRange` is closed |
 | Writer claim | `writers/{w:03}` | none | n/a |
 | Retention report | `retain/{log_id}`, `retention::Report` | none | **(built)** `#[serde(default)]` (written by its log's owner only; no `extra`) |
@@ -3571,9 +3590,11 @@ active level and is restored only by a build whose window contains it).
   window plus replay floors). Read support for an old magic is dropped
   (`MIN_LEVEL` raised) only when no reachable segment can have it:
   `retain/{log_id}` gains `min_seg_format` (lowest magic among the log's
-  unpruned segments, known to the writer), and `cluster finalize --min`
-  requires every report and every log named in an assignment span to be
-  past it. Backups keep old segments; a restore build must still read
+  unpruned segments, known to the writer), and a `cluster finalize --min`
+  would require every report and every log named in an assignment span to
+  be past it (**not built**: today `min_seg_format` is the test level's
+  lower bound and `finalize` has no `--min`; TODO.md "Rolling upgrades,
+  when first needed"). Backups keep old segments; a restore build must still read
   them, so dropping a magic is also gated on backup retention.
 - **State key families: dual-read always, lazy write-through, background
   sweep only to drop read support.** Binary values gain a leading tag

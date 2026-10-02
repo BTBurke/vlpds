@@ -87,6 +87,8 @@ lazy!(FIREHOSE_RING_BYTES: IntGauge = register_int_gauge!("vlpds_firehose_ring_b
 lazy!(FIREHOSE_DISCONNECTS: IntCounterVec = register_int_counter_vec!("vlpds_firehose_disconnects_total", "Subscriber disconnects by reason", &["reason"]));
 lazy!(FIREHOSE_SENT: IntCounter = register_int_counter!("vlpds_firehose_frames_sent_total", "Frames sent to subscribers"));
 lazy!(FIREHOSE_MERGE_QUEUE_BYTES: IntGauge = register_int_gauge!("vlpds_firehose_merge_queue_bytes", "Frame bytes queued in the merger waiting for the min watermark"));
+lazy!(FIREHOSE_MERGE_QUEUE_BUDGET: IntGauge = register_int_gauge!("vlpds_firehose_merge_queue_budget_bytes", "Configured byte budget of the merger's queues (--firehose-merge-queue-mb); past it a log spills to S3 read-back"));
+lazy!(FIREHOSE_MAX_LAG: IntGauge = register_int_gauge!("vlpds_firehose_max_lag_bytes", "Configured subscriber lag past which a live subscriber is cut off with ConsumerTooSlow (--firehose-max-lag-mb)"));
 lazy!(FIREHOSE_SPILLS: IntCounter = register_int_counter!("vlpds_firehose_merge_spills_total", "Logs the merger stopped queueing (over budget) and reads back from S3"));
 lazy!(FIREHOSE_SPILL_SEGMENTS: IntCounter = register_int_counter!("vlpds_firehose_merge_spill_segments_total", "Segments the merger read back from S3 for spilled logs"));
 lazy!(FIREHOSE_SENT_BYTES: IntCounter = register_int_counter!("vlpds_firehose_bytes_sent_total", "Websocket bytes written to subscribers (frames + headers)"));
@@ -159,7 +161,36 @@ lazy!(TOKIO_GLOBAL_QUEUE: IntGauge = register_int_gauge!("vlpds_tokio_global_que
 lazy!(TOKIO_BUSY: Gauge = register_gauge!("vlpds_tokio_busy_seconds_total", "Busy time summed over tokio workers (rate / workers = utilization)"));
 
 // ---- leases, fail-stops, takeovers (ops/RUNBOOK.md) ----
-lazy!(LEASE_RENEW_SECONDS: Histogram = register_histogram!("vlpds_lease_renew_seconds", "Node lease renewal round trip (the CAS PUT of nodes/{node_id}), answered or failed. Validity ends TTL - skew after a renewal's send time, so round trips over 0.4 x TTL (4 s at the default TTL) open a gap and the node fail-stops", exponential_buckets(0.001, 2.0, 14).unwrap()));
+/// `vlpds_lease_renew_seconds`, plus the same round trip as a fraction of
+/// the configured TTL (`vlpds_lease_renew_ttl_ratio`, recorded once
+/// [`export_lease_config`] has set the TTL): alert thresholds like "over
+/// 0.2 x TTL" then work at any --lease-ttl-ms (ops/alerts.yml).
+pub struct LeaseRenewHistogram {
+    secs: Histogram,
+    ttl_ratio: Histogram,
+}
+
+impl LeaseRenewHistogram {
+    pub fn observe(&self, secs: f64) {
+        self.secs.observe(secs);
+        let ttl = LEASE_TTL.get();
+        if ttl > 0.0 {
+            self.ttl_ratio.observe(secs / ttl);
+        }
+    }
+
+    pub fn get_sample_count(&self) -> u64 {
+        self.secs.get_sample_count()
+    }
+}
+
+pub static LEASE_RENEW_SECONDS: LazyLock<LeaseRenewHistogram> = LazyLock::new(|| LeaseRenewHistogram {
+    secs: register_histogram!("vlpds_lease_renew_seconds", "Node lease renewal round trip (the CAS PUT of nodes/{node_id}), answered or failed. Validity ends TTL - skew after a renewal's send time, so round trips over 0.4 x TTL (4 s at the default TTL) open a gap and the node fail-stops", exponential_buckets(0.001, 2.0, 14).unwrap()).unwrap(),
+    ttl_ratio: register_histogram!("vlpds_lease_renew_ttl_ratio", "Node lease renewal round trip as a fraction of the lease TTL (vlpds_lease_renew_seconds / vlpds_lease_ttl_seconds). Over 0.4 the node's validity gaps and it fail-stops", vec![0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]).unwrap(),
+});
+lazy!(LEASE_TTL: Gauge = register_gauge!("vlpds_lease_ttl_seconds", "Configured node lease TTL (--lease-ttl-ms). Renewal ceiling = 0.4 x TTL; a crashed node's shards are taken over after about TTL + skew"));
+lazy!(LEASE_RENEW_INTERVAL: Gauge = register_gauge!("vlpds_lease_renew_interval_seconds", "Configured node lease renewal interval (TTL / 5)"));
+lazy!(LEASE_SKEW: Gauge = register_gauge!("vlpds_lease_skew_seconds", "Configured clock-skew margin of the node lease (TTL / 5): validity ends TTL - skew after a renewal's send time"));
 lazy!(LEASE_RENEW_ERRORS: IntCounterVec = register_int_counter_vec!("vlpds_lease_renew_errors_total", "Failed node lease renewals by kind: timeout / error (retried next interval), conflict (someone rewrote our lease: fail-stop), lapsed (validity ended before the renewal: fail-stop)", &["kind"]));
 lazy!(LEASE_VALIDITY: GaugeVec = register_gauge_vec!("vlpds_lease_validity_seconds", "Seconds until this node's own lease validity ends (TTL - skew after the send time of its last successful renewal), computed at scrape. Normally between TTL - skew - one renew interval and TTL - skew; negative = lapsed", &["node_id"]));
 lazy!(PEER_TAKEOVERS: IntCounterVec = register_int_counter_vec!("vlpds_peer_takeovers_total", "Log incarnations this node fenced because they ended without fencing themselves (crash, kill, fail-stop, partition): peer = a dead peer's log, before taking its shards; restart = our own previous incarnation's, at startup. A graceful stop fences its own log and is not counted", &["reason"]));
@@ -203,6 +234,21 @@ impl Drop for InflightGuard {
     fn drop(&mut self) {
         self.0.dec();
     }
+}
+
+/// Exports the lease configuration (vlpds_lease_{ttl,renew_interval,skew}_seconds)
+/// so alert thresholds can scale with it; also enables
+/// `vlpds_lease_renew_ttl_ratio`.
+pub fn export_lease_config(ttl: std::time::Duration, renew_every: std::time::Duration, skew: std::time::Duration) {
+    LEASE_TTL.set(ttl.as_secs_f64());
+    LEASE_RENEW_INTERVAL.set(renew_every.as_secs_f64());
+    LEASE_SKEW.set(skew.as_secs_f64());
+}
+
+/// Exports the firehose byte budgets alerts compare against.
+pub fn export_firehose_config(merge_queue_bytes: usize, max_lag_bytes: usize) {
+    FIREHOSE_MERGE_QUEUE_BUDGET.set(merge_queue_bytes as i64);
+    FIREHOSE_MAX_LAG.set(max_lag_bytes as i64);
 }
 
 /// Records a forwarded request's outcome (forward.rs).

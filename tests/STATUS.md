@@ -7,8 +7,13 @@ module of it (`tests/all/<name>.rs`), and the shared harness is `tests/all/commo
 `Cargo.toml` sets `autotests = false` and declares the binary as `[[test]] name = "all"`.
 A new test file goes in `tests/all/` plus a `mod <name>;` line in `main.rs`.
 
+One more integration binary lives apart: `tests/level_gating.rs` (`[[test]] name = "level_gating"`,
+`required-features = ["test-level"]`), the rolling-upgrade level-gating test, which needs the test-only feature level and
+its own process (the active level is process-wide). Plain `cargo test` skips it; run it with
+`cargo test --features test-level --test level_gating` (`just upgrade-ci` does, with the two-build scenario).
+
 ```bash
-cargo test                          # unit tests (src/) + the whole suite
+cargo test                          # unit tests (src/) + the whole suite (not level_gating)
 cargo test --test all               # just the integration suite
 cargo test --test all crud::        # one former file (module)
 cargo test --test all crud::put_    # name prefix within a module
@@ -20,7 +25,8 @@ no LTO, no debuginfo, incremental. Don't run the suite with `--profile dev-relea
 `go_checker` needs a Go toolchain (set `VLPDS_SKIP_GO_CHECKER=1` to skip it). It builds the checker once per run into `CARGO_TARGET_TMPDIR`.
 
 Every test boots its own in-process server (`TestServer::spawn`: in-memory store, port 0, `shards: 8`, `workers: 2`,
-rate limits off). Boot takes milliseconds, and the whole suite runs in about 3 s with tests in parallel. Sharing a server per module would
+rate limits off). Boot takes milliseconds; the whole suite took ~3 s in parallel when it was merged into one binary and ~65 s now
+(2026-10-02, after the HA, reshard and retention modules grew). Sharing a server per module would
 save almost nothing, and each `#[tokio::test]` has its own runtime, which would cost isolation. So it isn't done.
 Handles come from `unique_name()` (process-wide counter + random suffix), so tests never collide.
 
@@ -62,11 +68,18 @@ These are equal within the noise of a loaded machine. The tail latencies swing b
 
 ## Results
 
-Last full run: 2026-10-02, after the reference-coverage pass (`tests/REFERENCE_COVERAGE.md`): `cargo test --test all` all green; `cargo test --lib` 191 passed, 12 ignored.
+Last full run: 2026-10-02 (vlpds head 0539d2f + the ops refresh): `cargo test --test all` 586 passed, 0 failed,
+21 ignored in 64.6 s; `cargo test --lib` 249 passed, 0 failed, 12 ignored. `level_gating` (separate binary, above) was not
+part of this run.
 
-**Totals:** 523 passed, 0 failed, 22 ignored, across 96 modules. The ignored tests are benchmarks and long-running scale/fault tests
-(run them with `--ignored`), plus two documented reference gaps: `ref_account::ref_signing_key_rotation_resigns_the_repo` and
-`ref_repo::ref_prevents_duplicate_backlinks`. The two email-2FA cases in `auth` that used to be ignored now run (vlpds has email 2FA).
+**Totals:** 586 passed, 0 failed, 21 ignored, across 104 modules. The ignored tests are all benchmarks and long-running
+scale/fault tests (run them with `--ignored`): `cbor_transcode::bench`, `checkpoint_stall::stall_*`,
+`cold_start::restart_window_*`, `compaction_polling::*`, `cost_defaults::deep_l0_ingest_keeps_up`,
+`differential_shrike::{json,syntax}_reference_oracle` and `real_records_from_clickhouse`, `interop_crypto::sign_verify_bench`,
+`list_repos_scale::enumeration_bench`, `mst_lazy::bench*`, `oauth::bench_dpop_resource_requests`,
+`segment_bytes::segment_bytes_per_commit`, `shard_ingest::one_shard_sustains_bulk_ingest`. No reference gap is ignored any
+more: `ref_account::ref_signing_key_rotation_resigns_the_repo` and `ref_repo::ref_prevents_duplicate_backlinks` now run
+and pass.
 
 The `ref_*` modules port cases from the reference PDS's own test suite; `tests/REFERENCE_COVERAGE.md` maps every reference `it()` case to a
 vlpds test, an N/A reason, a documented divergence or a gap.
@@ -77,11 +90,13 @@ vlpds test, an N/A reason, a documented divergence or a gap.
 | account_deactivation | 6 | 0 | 0 |
 | account_races | 5 | 0 | 0 |
 | account_status | 8 | 0 | 0 |
+| admin_cli | 7 | 0 | 0 |
 | admin_cluster | 2 | 0 | 0 |
 | app_passwords | 3 | 0 | 0 |
 | auth | 15 | 0 | 0 |
 | auth_caches | 3 | 0 | 0 |
-| blob_deletes | 6 | 0 | 0 |
+| backlinks | 6 | 0 | 0 |
+| blob_deletes | 7 | 0 | 0 |
 | blob_gc_race | 2 | 0 | 0 |
 | blobs | 2 | 0 | 0 |
 | bulk_create | 2 | 0 | 0 |
@@ -95,20 +110,20 @@ vlpds test, an N/A reason, a documented divergence or a gap.
 | create_post | 2 | 0 | 0 |
 | crud | 32 | 0 | 0 |
 | differential_shrike | 25 | 0 | 3 |
-| e2e_regressions | 6 | 0 | 0 |
-| email_2fa | 6 | 0 | 0 |
+| e2e_regressions | 7 | 0 | 0 |
+| email_2fa | 7 | 0 | 0 |
 | email_flows | 6 | 0 | 0 |
-| fast_failover | 3 | 0 | 0 |
+| fast_failover | 4 | 0 | 0 |
 | feature_levels | 2 | 0 | 0 |
 | file_uploads | 11 | 0 | 0 |
 | firehose_backfill | 2 | 0 | 0 |
 | firehose_fanout | 2 | 0 | 0 |
 | firehose_shards | 3 | 0 | 0 |
-| firehose_startup | 3 | 0 | 0 |
+| firehose_startup | 4 | 0 | 0 |
 | formats | 3 | 0 | 0 |
 | get_blocks_index | 1 | 0 | 0 |
-| go_checker | 2 | 0 | 0 |
-| ha_auth | 2 | 0 | 0 |
+| go_checker | 3 | 0 | 0 |
+| ha_auth | 3 | 0 | 0 |
 | ha_liveness | 1 | 0 | 0 |
 | handle_validation | 6 | 0 | 0 |
 | handles | 14 | 0 | 0 |
@@ -119,16 +134,18 @@ vlpds test, an N/A reason, a documented divergence or a gap.
 | interop_mst | 8 | 0 | 0 |
 | interop_syntax | 15 | 0 | 0 |
 | invertible_ops | 1 | 0 | 0 |
-| invite_codes | 11 | 0 | 0 |
+| invite_codes | 14 | 0 | 0 |
 | invites_optional | 1 | 0 | 0 |
+| join_follow | 1 | 0 | 0 |
+| key_rotation | 5 | 0 | 0 |
 | lexicons | 6 | 0 | 0 |
 | list_repos_scale | 2 | 0 | 1 |
 | log_pipeline | 2 | 0 | 0 |
-| log_retention | 3 | 0 | 0 |
+| log_retention | 6 | 0 | 0 |
 | migration | 2 | 0 | 0 |
 | moderation | 7 | 0 | 0 |
-| mst_lazy | 8 | 0 | 4 |
-| oauth | 25 | 0 | 1 |
+| mst_lazy | 10 | 0 | 5 |
+| oauth | 26 | 0 | 1 |
 | oauth_replay_durable | 2 | 0 | 0 |
 | ops_metrics | 1 | 0 | 0 |
 | plc | 10 | 0 | 0 |
@@ -139,26 +156,27 @@ vlpds test, an N/A reason, a documented divergence or a gap.
 | races | 4 | 0 | 0 |
 | rate_limit_config | 2 | 0 | 0 |
 | rate_limits | 7 | 0 | 0 |
-| read_after_write | 7 | 0 | 0 |
+| read_after_write | 8 | 0 | 0 |
 | rebalance_handback | 2 | 0 | 0 |
 | record_encode | 3 | 0 | 0 |
-| ref_account | 8 | 0 | 1 |
+| ref_account | 10 | 0 | 0 |
 | ref_auth | 5 | 0 | 0 |
-| ref_handles | 5 | 0 | 0 |
+| ref_handles | 7 | 0 | 0 |
 | ref_invites | 4 | 0 | 0 |
 | ref_moderation | 1 | 0 | 0 |
+| ref_moderator_auth | 7 | 0 | 0 |
 | ref_plc | 1 | 0 | 0 |
 | ref_proxy | 9 | 0 | 0 |
-| ref_repo | 10 | 0 | 1 |
+| ref_repo | 11 | 0 | 0 |
 | ref_ssrf | 2 | 0 | 0 |
 | ref_sync | 1 | 0 | 0 |
-| reshard | 13 | 0 | 0 |
+| reshard | 15 | 0 | 0 |
 | revocation_gc | 1 | 0 | 0 |
 | secrets_at_rest | 4 | 0 | 0 |
 | segment_bytes | 0 | 0 | 1 |
 | segment_compression | 1 | 0 | 0 |
 | sequencer | 6 | 0 | 0 |
-| server_basics | 7 | 0 | 0 |
+| server_basics | 9 | 0 | 0 |
 | service_auth | 7 | 0 | 0 |
 | shard_ingest | 0 | 0 | 1 |
 | shrike_adopt | 8 | 0 | 0 |
@@ -171,6 +189,7 @@ vlpds test, an N/A reason, a documented divergence or a gap.
 | takedown_routes | 1 | 0 | 0 |
 | totp | 6 | 0 | 0 |
 | untrusted_repo_data | 2 | 0 | 0 |
+| user_service_auth | 6 | 0 | 0 |
 
 ## Speed pass (2026-10-01): test-side changes
 

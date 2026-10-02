@@ -13,7 +13,11 @@ import os
 # one that benchbox's Alloy remote-writes to (deploy/ansible, see bench/obs/README.md).
 PROM = {"type": "prometheus", "uid": os.environ.get("VLPDS_PROM_UID", "prom")}
 PYRO = {"type": "grafana-pyroscope-datasource", "uid": os.environ.get("VLPDS_PYRO_UID", "pyroscope")}
-I = 'instance=~"$instance"'
+# Every query is scoped to the cluster variable (Alloy's remote_write adds
+# cluster=<deploy_env>; the bench Prometheus has no cluster label, which
+# the All value ".*" still matches) and the instance variable.
+C = 'cluster=~"$cluster"'
+I = C + ', instance=~"$instance"'
 RI = "[$__rate_interval]"
 # MinIO is scraped every 5 s: rate windows need >= 2 samples
 MRI = "[20s]"
@@ -244,11 +248,13 @@ ts("Forwards/s per node", [t(f"sum by (instance) (rate(vlpds_forwards_total{{{I}
 row("Leases, takeovers, replay")
 ts("Lease renewal round trip", [t(f"histogram_quantile({q}, sum by (le, instance) (rate(vlpds_lease_renew_seconds_bucket{{{I}}}{RI})))", f"{n} {{{{instance}}}}")
                                 for q, n in ((0.5, "p50"), (0.99, "p99"))] +
-   [t("vector(4)", "fail-stop ceiling (0.4 x TTL)")], "s", w=8,
+   [t(f"0.4 * min(vlpds_lease_ttl_seconds{{{I}}})", "fail-stop ceiling (0.4 x TTL)")], "s", w=8,
    desc="One CAS PUT of nodes/{node_id} every TTL/5. Validity ends TTL - skew after a renewal's send time, so a round trip over 0.4 x TTL "
-        "(4 s at the default 10 s TTL) lapses the lease and the node fail-stops (exit 5). The ceiling line assumes the default TTL.")
+        "(4 s at the default 10 s TTL, 24 s at 60 s) lapses the lease and the node fail-stops (exit 5). The ceiling line is 0.4 x the "
+        "smallest exported vlpds_lease_ttl_seconds.")
 ts("Lease validity left", [t(f"vlpds_lease_validity_seconds{{{I}}}", "{{node_id}}")], "s", w=8,
-   desc="Seconds until each node's own lease validity ends, computed at scrape: normally TTL - skew minus up to one renew interval (6-8 s by default); "
+   desc="Seconds until each node's own lease validity ends, computed at scrape: normally TTL - skew minus up to one renew interval "
+        "(0.6-0.8 x TTL: 6-8 s by default, 36-48 s at 60 s); "
         "a sawtooth dipping toward 0 = renewals overdue")
 ts("Renew errors, takeovers, fail-stops", [rate("vlpds_lease_renew_errors_total", by="kind", legend="renew {{kind}}"),
                                          rate("vlpds_peer_takeovers_total", by="reason", legend="takeover {{reason}}"),
@@ -302,12 +308,12 @@ ts("Object store p99 (SlateDB)", [t(f"histogram_quantile(0.99, sum by (le, api) 
 
 # ---------------------------------------------------------------- minio
 row("MinIO (5 s scrape)", collapsed=True)
-ts("S3 requests/s by API", [t(f"sum by (api) (rate(minio_s3_requests_total{MRI})) > 0", "{{api}}")], "reqps")
-ts("S3 TTFB p99 by API", [t(f"histogram_quantile(0.99, sum by (le, api) (rate(minio_s3_requests_ttfb_seconds_distribution{MRI})))", "{{api}}")], "s")
-ts("S3 traffic", [t(f"sum(rate(minio_s3_traffic_received_bytes{MRI}))", "received"), t(f"sum(rate(minio_s3_traffic_sent_bytes{MRI}))", "sent")], "Bps")
-ts("S3 errors / in flight", [t(f"sum(rate(minio_s3_requests_errors_total{MRI}))", "errors/s"), t("sum(minio_s3_requests_inflight_total)", "in flight"),
-                             t("sum(minio_s3_requests_waiting_total)", "waiting")], "short")
-ts("Bucket usage", [t("sum by (instance) (minio_cluster_usage_total_bytes)", "{{instance}}")], "bytes")
+ts("S3 requests/s by API", [t(f"sum by (api) (rate(minio_s3_requests_total{{{C}}}{MRI})) > 0", "{{api}}")], "reqps")
+ts("S3 TTFB p99 by API", [t(f"histogram_quantile(0.99, sum by (le, api) (rate(minio_s3_requests_ttfb_seconds_distribution{{{C}}}{MRI})))", "{{api}}")], "s")
+ts("S3 traffic", [t(f"sum(rate(minio_s3_traffic_received_bytes{{{C}}}{MRI}))", "received"), t(f"sum(rate(minio_s3_traffic_sent_bytes{{{C}}}{MRI}))", "sent")], "Bps")
+ts("S3 errors / in flight", [t(f"sum(rate(minio_s3_requests_errors_total{{{C}}}{MRI}))", "errors/s"), t(f"sum(minio_s3_requests_inflight_total{{{C}}})", "in flight"),
+                             t(f"sum(minio_s3_requests_waiting_total{{{C}}})", "waiting")], "short")
+ts("Bucket usage", [t(f"sum by (instance) (minio_cluster_usage_total_bytes{{{C}}})", "{{instance}}")], "bytes")
 
 # ---------------------------------------------------------------- process
 row("Process / runtime")
@@ -349,13 +355,17 @@ dashboard = {
          "name": "bench steps", "target": {"type": "tags", "tags": ["vlpds-bench"], "matchAny": True, "limit": 500}},
     ]},
     "templating": {"list": [
+        {"name": "cluster", "label": "cluster", "type": "query", "datasource": PROM,
+         "query": {"query": "label_values(vlpds_build_info, cluster)", "refId": "cluster"},
+         "definition": "label_values(vlpds_build_info, cluster)", "refresh": 2, "multi": True, "includeAll": True,
+         "allValue": ".*", "current": {"selected": True, "text": ["All"], "value": ["$__all"]}, "sort": 1},
         {"name": "instance", "label": "instance", "type": "query", "datasource": PROM,
-         "query": {"query": "label_values(vlpds_build_info, instance)", "refId": "instance"},
-         "definition": "label_values(vlpds_build_info, instance)", "refresh": 2, "multi": True, "includeAll": True,
+         "query": {"query": 'label_values(vlpds_build_info{cluster=~"$cluster"}, instance)', "refId": "instance"},
+         "definition": 'label_values(vlpds_build_info{cluster=~"$cluster"}, instance)', "refresh": 2, "multi": True, "includeAll": True,
          "allValue": ".*", "current": {"selected": True, "text": ["All"], "value": ["$__all"]}, "sort": 1},
         {"name": "node", "label": "node (profiles)", "type": "query", "datasource": PROM,
-         "query": {"query": 'label_values(vlpds_build_info{instance=~"$instance"}, node_id)', "refId": "node"},
-         "definition": 'label_values(vlpds_build_info{instance=~"$instance"}, node_id)', "refresh": 2, "multi": True,
+         "query": {"query": f'label_values(vlpds_build_info{{{I}}}, node_id)', "refId": "node"},
+         "definition": f'label_values(vlpds_build_info{{{I}}}, node_id)', "refresh": 2, "multi": True,
          "includeAll": True, "allValue": ".*", "current": {"selected": True, "text": ["All"], "value": ["$__all"]}, "sort": 1},
     ]},
     "panels": panels,

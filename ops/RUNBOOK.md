@@ -23,7 +23,9 @@ it is marked **(unverified)**.
   (who owns what, and the slot -> shard map; `{id}` is the shard id as 10
   zero-padded decimal digits, e.g. shard 42 is `state/0000000042/`), `nodes/{node_id}` (node leases),
   `writers/{w}` (unique seq low byte per live node), `retain/{log_id}` (retention
-  reports), `handle/`, `email/`, `blob/`. The local disk is only a SlateDB SST cache.
+  reports), `cluster/version` (the cluster's active feature level and its
+  history), `handle/`, `email/`, `blob/`. The local disk is only a SlateDB SST
+  cache.
 - **Shards.** 65,536 hash slots grouped into shards (default `--shards 64`,
   changed online by split/merge). Each shard has exactly one owner node at a time.
   A node takes free or orphaned shards up to its fair share, `ceil(shards / live
@@ -32,13 +34,18 @@ it is marked **(unverified)**.
   every earlier one are durable (`If-None-Match` PUTs, up to `--log-inflight` 4 in
   flight, finalized in order) **and** only while the node's lease is valid.
 - **Leases.** `nodes/{node_id}` is CAS-renewed every TTL/5 (2 s at the default
-  `--lease-ttl-ms 10000`). A node's own validity ends `TTL - skew` (8 s) after the
-  *send time* of its last successful renewal. A renewal round trip over
-  `0.4 x TTL` = **4 s** opens a validity gap and the node **fail-stops**. A
-  cluster-wide object-store brownout past 4 s stops every node.
+  `--lease-ttl-ms 10000`, 12 s at the tiny profile's 60 s). A node's own validity
+  ends `TTL - skew` = 0.8 x TTL (8 s / 48 s) after the *send time* of its last
+  successful renewal. A renewal round trip over `0.4 x TTL` (**4 s** / 24 s)
+  opens a validity gap and the node **fail-stops**. A cluster-wide object-store
+  brownout past that ceiling stops every node. Each node exports its settings
+  (`vlpds_lease_ttl_seconds`, `vlpds_lease_renew_interval_seconds`,
+  `vlpds_lease_skew_seconds`) and its renewals as a fraction of the TTL
+  (`vlpds_lease_renew_ttl_ratio`); the lease alerts are relative to them.
 - **Takeover.** Peers presume a node dead after its lease has not changed for
-  `TTL + skew` (12 s) of their own monotonic time, or within ~1.5-2.5 renew
-  intervals (3-5 s) if its advertised port refuses TCP connections (process gone).
+  `TTL + skew` = 1.2 x TTL (12 s at the default, 72 s at 60 s) of their own
+  monotonic time, or within ~1.5-2.5 renew intervals (3-5 s at the default) if
+  its advertised port refuses TCP connections (process gone).
   The new owner **fences** the dead log (conditional create at the end of its
   durable prefix), CASes the assignment, replays the shard's spans, waits out the
   previous owner's `seq_floor` (commit-wait, max 30 s), then serves.
@@ -82,9 +89,9 @@ it is marked **(unverified)**.
 | Feature level raise (admin) | `POST /xrpc/vlpds.admin.setFeatureLevel {"level": N}` (CLI `vlpds admin cluster finalize`): 200 with the new `cluster/version`; 409 `IncompatibleNodes` names live nodes whose build can't run N (nothing changed); 400 below the active level or past the asked node's build. With `"lower": true` (CLI `vlpds admin cluster lower`) it lowers instead: 400 past a persistent level or during a raise, 409 while a live node can't run N. |
 | Cluster view (node-to-node) | `GET /internal/v1/cluster` with header `x-vlpds-internal: $VLPDS_INTERNAL_TOKEN`: this node's `owned`, `table`, `layout`, `peers`, `lease_valid`, `log_durable_ordinal`, `firehose_last_emitted`, `firehose_min_watermark`. |
 | Operator console | `/admin` (Cluster page polls getClusterStatus), `/admin/metrics` (live metrics). |
-| Shard layout | `vlpds admin layout --url http://<node>:2583` (`VLPDS_ADMIN_TOKEN` env), or `GET /xrpc/vlpds.admin.getShardLayout`. Also `shard-split`, `shard-merge`, `reshard-abort` (abort only before the flip). |
+| Shard layout | `vlpds admin layout --url http://<node>:2583` (or `vlpds admin --url ... layout`; `VLPDS_ADMIN_TOKEN` env), or `GET /xrpc/vlpds.admin.getShardLayout`. Also `shard-split`, `shard-merge`, `reshard-abort` (abort only before the flip). |
 | Accounts, identity, repos | `vlpds admin ...`: the pdsadmin equivalents, see [Admin CLI](#admin-cli). |
-| CPU profile | `just profile <node:port> [seconds]` (`/debug/pprof/`) |
+| CPU profile | `just profile <node:port> [seconds]` (`/debug/pprof/`; only in a build with `--features profiling`, e.g. the image built with that feature: a default build has no profiler and the endpoint is absent) |
 
 A quick cluster check:
 
@@ -152,7 +159,7 @@ The start-up line `SST disk cache (per shard)` shows `dir` and `shard_mb`.
 ## Admin CLI
 
 `vlpds admin [--url URL] [--admin-token T] [--json] <command>` talks admin
-XRPC to one node (`--url`, default `http://127.0.0.1:2583`, env `VLPDS_URL`;
+XRPC to one node (the three flags are accepted before or after the command) (`--url`, default `http://127.0.0.1:2583`, env `VLPDS_URL`;
 token from `VLPDS_ADMIN_TOKEN`, as the node's). Any node will do: calls naming
 a DID are routed to the repo's owner, and the per-node maintenance commands
 (`rotate-plc-keys`, `rewrap-secrets`) are sent to every node that
@@ -223,8 +230,8 @@ the rewrite makes it fail with `InvalidSwap`: run it again.
 ### VlpdsNodeDown
 
 **Means:** Prometheus can't scrape a node for 2 minutes. If the process is gone,
-peers took its shards within 3-5 s (refused probe) or ~12 s (TTL + skew) plus
-replay. If the host is up but frozen/partitioned, its socket still exists and
+peers took its shards within 3-5 s (refused probe) or TTL + skew (12 s at the
+default TTL, 72 s at 60 s) plus replay. If the host is up but frozen/partitioned, its socket still exists and
 takeover waits the full TTL + skew; the frozen node's own watchdog fail-stops it
 2 x skew after its validity lapses.
 
@@ -240,6 +247,31 @@ normally down: check this is a real node.
 cluster is running with less capacity. Restart the process (same `--node-id`) or
 follow [Replacing a dead host](#replacing-a-dead-host). If several nodes are down at
 once, look for an object-store outage first ([procedure](#object-store-outage)).
+
+### VlpdsNotScraped
+
+**Means:** no `up{job="vlpds"}` series at all (for this cluster, when the rule
+set is scoped with `extra_labels`) for 10 minutes: nothing scrapes the nodes, so
+every other vlpds alert is blind, including `VlpdsNodeDown`. Different from a
+node that is scraped and down (`up == 0`).
+
+**Causes:** the host's Alloy isn't running or doesn't carry the
+`vlpds-monitoring` fragment (on the prod inventory `vlpds_manage_alloy` is off
+until the host's existing setup is reviewed, so this fires there until then),
+remote_write from Alloy to VictoriaMetrics failing, a renamed job or `cluster`
+label (`deploy_env`), or the monitoring host itself is unhealthy (then other
+deployments' alerts go quiet too).
+
+**Confirm:** in Grafana / VictoriaMetrics, `up{job="vlpds"}` by `cluster`;
+Alloy's UI/logs on the vlpds host (`systemctl status alloy`, its
+`prometheus.scrape` and `prometheus.remote_write` components); `curl -s
+127.0.0.1:9583/metrics | head` on the host (the node answering locally means the
+pipeline, not vlpds, is broken).
+
+**Do:** fix the scrape pipeline (deploy roles/alloy with the `vlpds-monitoring`
+fragment, or repair remote_write). Meanwhile check the cluster by hand
+(`vlpds admin cluster-status`). Silence it only for a cluster that is
+intentionally unmonitored.
 
 ### VlpdsNodeRestarted
 
@@ -289,10 +321,10 @@ incarnation's `vlpds_last_exit_reason_info` once it restarts.
 **Means:** 3+ restarts in an hour. Each restart moves its shards out and back
 (ownership churn, cold repo loads, write resends).
 
-**Causes:** persistent store errors (exit 2/4), renewals regularly over 4 s
-(exit 5), two processes with the same `--node-id` fencing each other (exit 3
-alternating) **(the ping-pong is inferred from `join` fencing the previous
-incarnation's log)**, OOM (see [VlpdsMemoryCritical](#vlpdsmemorycritical)), a
+**Causes:** persistent store errors (exit 2/4), renewals regularly over
+0.4 x TTL (exit 5), two processes with the same `--node-id` fencing each other
+(exit 3 alternating: each start fences the previous incarnation's log at join,
+`vlpds_peer_takeovers_total{reason="restart"}`), OOM (see [VlpdsMemoryCritical](#vlpdsmemorycritical)), a
 bad binary.
 
 **Do:** stop the node (SIGTERM) and leave it down while you diagnose; its shards
@@ -317,8 +349,10 @@ for the minutes of a rolling deploy.
 **Do:** finish or roll back the deploy ([Rolling upgrade](#rolling-upgrade-finalize-rollback)).
 Mixed builds are safe while the cluster's feature level is one every node's
 build can run (they all write that level's formats); `vlpds admin
-cluster-status` shows each node's rev and level window. **(not yet tested
-with two real builds: the two-build HA scenarios are TODO.md)**
+cluster-status` shows each node's rev and level window. Tested with two real
+builds: the `upgrade-*` HA scenarios (rolling upgrade, rollback, old-node
+refusal, raise race) pass, see `bench/ha/RESULTS.md` "Two-build upgrade
+scenarios".
 
 ### VlpdsFormatErrors
 
@@ -384,7 +418,7 @@ is seconds; 2 minutes is not.
 
 **Causes:**
 - A frozen (not dead) node: its socket accepts, so takeover waits TTL + skew
-  (12 s), then fence + replay. Long replay (see
+  (12 s at the default TTL, 72 s at 60 s), then fence + replay. Long replay (see
   [VlpdsTakeoverReplaySlow](#vlpdstakeoverreplayslow)) stretches it.
 - Survivors can't take shards: control-plane calls timing out
   ([VlpdsControlPlaneTimeouts](#vlpdscontrolplanetimeouts)), fence or assignment
@@ -489,13 +523,15 @@ opens (store latency).
 ### VlpdsLeaseRenewalNearCeiling
 
 **Means:** at least one lease renewal (one CAS PUT of `nodes/{node_id}`) took over
-2 s in the last 5 minutes (`vlpds_lease_renew_seconds`). Validity ends TTL - skew
-(8 s) after a renewal's *send time* and renewals go out every 2 s, so a round
-trip over 0.4 x TTL (4 s) lapses the lease and the node fail-stops (exit 5).
-Several nodes at once: a store brownout that will stop the whole cluster past
-4 s.
+0.2 x TTL in the last 5 minutes (`vlpds_lease_renew_ttl_ratio`; 2 s at the
+default 10 s TTL, 12 s at 60 s). Validity ends TTL - skew (0.8 x TTL) after a
+renewal's *send time* and renewals go out every 0.2 x TTL, so a round trip over
+0.4 x TTL lapses the lease and the node fail-stops (exit 5). Several nodes at
+once: a store brownout that will stop the whole cluster past the ceiling.
+Thresholds follow each node's `vlpds_lease_ttl_seconds`.
 
-**Confirm:** `vlpds_lease_validity_seconds` (dips below ~6 s), renew errors,
+**Confirm:** `vlpds_lease_validity_seconds` (dips below ~0.6 x TTL), renew
+errors, `vlpds_lease_renew_seconds` (absolute round trips),
 `vlpds_object_store_request_seconds{component="ctl_lease"}` and the other
 components on the same node (node-side network vs store), runtime stalls
 ([VlpdsRuntimeStalls](#vlpdsruntimestalls): a starved runtime delays the renew
@@ -504,10 +540,22 @@ task itself, not the store).
 **Do:** one node -> its network path to the store, CPU. Many -> the
 [Object-store outage](#object-store-outage) procedure. Don't lower the TTL.
 
+### VlpdsLeaseRenewalAtCeiling
+
+**Means:** a renewal took over 0.4 x TTL (4 s at the default TTL, 24 s at
+60 s): past the ceiling. The node's validity gapped, so it stopped acking and
+fail-stopped (exit 5) or is about to; `VlpdsNodeRestarted` /
+`VlpdsNodeFailStopped` follow. On several nodes at once, the store is browning
+out and the cluster is stopping.
+
+**Do:** as [VlpdsLeaseRenewalNearCeiling](#vlpdsleaserenewalnearceiling), now;
+for many nodes go straight to [Object-store outage](#object-store-outage).
+
 ### VlpdsLeaseRenewalSlow
 
 **Means:** renewal p99 over 500 ms for 10 minutes (normal: one small PUT,
-~25-50 ms). Not dangerous yet; the trend toward the 4 s ceiling is.
+~25-50 ms). Not dangerous yet at any supported TTL; the trend toward the
+0.4 x TTL ceiling is.
 
 **Do:** as [VlpdsLeaseRenewalNearCeiling](#vlpdsleaserenewalnearceiling), without
 the urgency.
@@ -515,10 +563,10 @@ the urgency.
 ### VlpdsLeaseRenewErrors
 
 **Means:** renewals failed with a store error (`kind="error"`) or the HTTP
-client's timeout (`kind="timeout"`) and will be retried at the next tick (2 s).
-Every failed renewal eats into the 8 s validity: four in a row lapse it.
-`kind="conflict"` (someone rewrote our lease) and `kind="lapsed"` (validity
-ended before a renewal) fail-stop at once and show as restarts.
+client's timeout (`kind="timeout"`) and will be retried at the next tick
+(TTL / 5). Every failed renewal eats into the 0.8 x TTL validity: four in a row
+lapse it. `kind="conflict"` (someone rewrote our lease) and `kind="lapsed"`
+(validity ended before a renewal) fail-stop at once and show as restarts.
 
 **Confirm:** `node lease renew error (will retry)` warnings with the error text;
 [VlpdsObjectStoreRequestErrors](#vlpdsobjectstorerequesterrors) for `ctl_lease`.
@@ -527,11 +575,12 @@ ended before a renewal) fail-stop at once and show as restarts.
 
 ### VlpdsLeaseValidityLow
 
-**Means:** a scrape saw this node with under 4 s of lease validity left
-(`vlpds_lease_validity_seconds`, normally 6-8 s with a 2 s renew interval): its
-renewals were 2+ s overdue, so it came within seconds of a fail-stop. Sampled at
-scrape time, so short dips can be missed: the renewal histogram is the complete
-record.
+**Means:** a scrape saw this node with under 0.4 x TTL of lease validity left
+(`vlpds_lease_validity_seconds` against `vlpds_lease_ttl_seconds`; normally
+0.6-0.8 x TTL, i.e. 6-8 s at the default TTL and 36-48 s at 60 s): its renewals
+were 0.2 x TTL or more overdue, so it came within 0.4 x TTL of a fail-stop.
+Sampled at scrape time, so short dips can be missed: the renewal histograms are
+the complete record.
 
 **Do:** as [VlpdsLeaseRenewalNearCeiling](#vlpdsleaserenewalnearceiling).
 
@@ -552,7 +601,8 @@ CPU -> add nodes or shed load. Apply slow -> [VlpdsSlateDbL0Stalls](#vlpdsslated
 ### VlpdsCommitLatencyCritical
 
 **Means:** p99 over 2 s. Forwarded writes start failing at the 3 s deadline and
-the node is within 2x of the 4 s renewal ceiling if the cause is the store.
+the node is within 2x of the 4 s renewal ceiling (at the default 10 s TTL) if the
+cause is the store.
 
 **Do:** as [VlpdsCommitLatencyHigh](#vlpdscommitlatencyhigh), urgently. If every
 node is affected, assume an object-store brownout ([procedure](#object-store-outage)).
@@ -711,14 +761,14 @@ watermark advertises its clock).
 stuck log's lease (`nodes[]`) and `fencedLogs`.
 
 **Do:** a dead node's log is fenced by the node that takes over its shards; if
-none were left to take, **(unverified)** restarting the dead node with the same
-`--node-id` fences its previous log at join. Fix clocks. Restart the stalled node
+none were left to take, restarting the dead node with the same `--node-id`
+fences its previous log at join (`vlpds_peer_takeovers_total{reason="restart"}`). Fix clocks. Restart the stalled node
 as a last resort.
 
 ### VlpdsFirehoseConsumersTooSlow
 
-**Means:** subscribers more than `--firehose-max-lag-mb` (128 MiB) behind are cut
-off with `ConsumerTooSlow` and resume from their cursor. Isolated cases are the
+**Means:** subscribers more than `--firehose-max-lag-mb` (default 128 MiB; the
+node's value is `vlpds_firehose_max_lag_bytes`) behind are cut off with `ConsumerTooSlow` and resume from their cursor. Isolated cases are the
 consumer's problem; a high rate across subscribers points at the server.
 
 **Confirm:** `vlpds_firehose_subscribers`, `vlpds_firehose_bytes_sent_total` rate vs
@@ -729,7 +779,7 @@ NIC, `vlpds_runtime_tick_late_seconds`, `--firehose-threads` (default 4) CPU.
 ### VlpdsFirehoseMergeSpilling
 
 **Means:** a log exceeded the merger's queue budget (`--firehose-merge-queue-mb`,
-256 MiB) while waiting for the minimum watermark; the merger now reads it back
+default 256 MiB, `vlpds_firehose_merge_queue_budget_bytes`) while waiting for the minimum watermark; the merger now reads it back
 from S3 in chunks (`vlpds_firehose_merge_spill_segments_total`, extra GETs).
 
 **Do:** find the laggard log as in [VlpdsFirehoseEmitDelayHigh](#vlpdsfirehoseemitdelayhigh).
@@ -748,8 +798,9 @@ firehose delay.
 `fence`, `fence-scan`) were abandoned at `min(TTL, 5 s)`; the step retries next
 tick. Lease **renewals** are separate: they are never timed out and not counted
 here (their own metrics: `vlpds_lease_renew_seconds`, `vlpds_lease_renew_errors_total`).
-But a store that takes 5 s for control-plane calls is past the 4 s renewal
-ceiling, so lease lapses (exit 5) are likely next.
+But a store that takes 5 s for control-plane calls is past the 0.4 x TTL
+renewal ceiling at the default TTL (4 s), so lease lapses (exit 5) are likely
+next; at 60 s the ceiling is 24 s and there is more room.
 
 **Confirm:** logs `control-plane <op> timed out`, `node lease renew error`;
 `vlpds_object_store_request_seconds{component=~"ctl_.*"}` and SlateDB latency on
@@ -762,8 +813,8 @@ abandoned calls); one node or many (see
 ### VlpdsObjectStoreBrownout
 
 **Means:** two or more nodes timing out control-plane calls in the same 5
-minutes. DESIGN: a cluster-wide brownout past the 4 s renewal ceiling stops every
-node.
+minutes. DESIGN: a cluster-wide brownout past the 0.4 x TTL renewal ceiling (4 s at
+the default TTL) stops every node.
 
 **Do:** [Object-store outage](#object-store-outage) procedure.
 
@@ -788,7 +839,7 @@ the matching warn/error log lines.
 **Means:** p99 of control-plane object-store requests (`ctl_*` components:
 leases, assignments, writer claims) over 1 s for 10 minutes; normally tens of
 ms. Every takeover step is a few of these in sequence, and the lease renewal is
-one: past 4 s nodes fail-stop.
+one: past 0.4 x TTL nodes fail-stop.
 
 **Confirm:** `vlpds_object_store_request_seconds` by `component` and `op` on the
 node; [VlpdsLeaseRenewalSlow](#vlpdsleaserenewalslow); the same on other nodes.
@@ -862,7 +913,7 @@ delete log objects by hand to compensate.
 ### VlpdsRetentionNotRunning
 
 **Means:** no pass (ok or error) for 15 minutes on a scraped node. A pass runs
-every 60 s; a pass that hangs on a store call would look like this
+every `--log-retention-interval` (default 60 s); a pass that hangs on a store call would look like this
 **(unverified: retention calls are not individually timed out)**.
 `vlpds_retention_pass_seconds` shows how long the finished passes took (a
 creeping p99 precedes a hang), and `vlpds_object_store_requests_total{result="cancelled"}`
@@ -1104,18 +1155,22 @@ cloud provider's host-maintenance or hardware-degradation events.
 
 **Means:** a bounded in-memory cache (`session_tokens`, `oauth_tokens`,
 `proxy_accounts`, `proxy_jwts`, `did_docs`, `lexicons`, `oauth_clients`,
-`permission_sets`, `security_controls`) has been at its entry cap for 6 hours. A
-full LRU is normal for hot caches; it matters only with symptoms (proxy latency,
-PLC lookups). `vlpds_proxy_cache_total{result}` gives a hit ratio for the proxy
-fast path; the others have no hit/miss metric.
+`permission_sets`, `security_controls`, `signing_keys`, `recent_writes`) has
+been at its entry cap for 6 hours. A full LRU is normal for hot caches; it
+matters only with symptoms (proxy latency, PLC lookups, KMS calls).
+`vlpds_proxy_cache_total{result}` gives a hit ratio for the proxy fast path and
+`vlpds_signing_key_cache_total{result}` for unwrapped signing keys (a full
+`signing_keys` cache with many misses means KMS unwraps on cold writes); the
+others have no hit/miss metric.
 
 **Do:** raise `--cache-budget-mb` or set `--cache-entries <cache>=<n>` if a
 symptom correlates.
 
 ### VlpdsFirehoseMergeQueueNearBudget
 
-**Means:** the merger holds over 80% of its 256 MiB budget waiting for the minimum
-watermark. Past the budget it spills (see
+**Means:** the merger holds over 80% of its byte budget
+(`--firehose-merge-queue-mb`, default 256 MiB, exported as
+`vlpds_firehose_merge_queue_budget_bytes`) waiting for the minimum watermark. Past the budget it spills (see
 [VlpdsFirehoseMergeSpilling](#vlpdsfirehosemergespilling)).
 
 **Do:** find the laggard log (same as emit delay).
@@ -1127,7 +1182,7 @@ runtime threads are blocked or starved. Lease renewals, step loops and acks run 
 it, so heavy stalls risk lease lapses.
 
 **Confirm:** `tokio runtime stall` logs (late_ms), host CPU/load, a CPU profile
-(`just profile`).
+(`just profile`, on a `--features profiling` build).
 
 **Do:** reduce co-located load; add CPU; profile for blocking work on the runtime.
 
@@ -1394,7 +1449,8 @@ deploy such a build (it logs `TEST BUILD` at startup).
 ### Replacing a dead host
 
 1. Nothing must be done for data safety: peers fence the dead log and take its
-   shards (3-5 s if the port refuses, ~12 s + replay if the host is unreachable).
+   shards (3-5 s if the port refuses, TTL + skew + replay if the host is
+   unreachable: ~12 s at the default TTL, ~72 s at 60 s).
 2. Make sure the old process can never come back on its own (power it off). If it
    did, it would find its log fenced or its shards reassigned and fail-stop, but
    don't rely on it.
@@ -1423,7 +1479,7 @@ deploy such a build (it logs `TEST BUILD` at startup).
 What happens, from DESIGN and the code:
 - Segment PUTs retry until they succeed; commits queue, acks stop, write latency
   climbs, then admission control sheds (`Overloaded`) and forwards time out.
-- Renewals slower than 4 s (at TTL 10 s) open validity gaps: nodes stop acking and
+- Renewals slower than 0.4 x TTL (4 s at TTL 10 s, 24 s at 60 s) open validity gaps: nodes stop acking and
   fail-stop (exit 5). A cluster-wide brownout past that ceiling stops **every**
   node. No acked write is lost: acks require durable segments.
 - When the store recovers, restarted nodes rejoin, fence the dead incarnations'
@@ -1545,12 +1601,19 @@ only TOTP is asked for.
   the fence on its next segment PUT and exits 3. With a supervisor restarting both,
   they keep fencing each other.
 - **Never delete or edit objects by hand** under `log/`, `assign/`, `nodes/`,
-  `writers/`, `retain/` or `state/`:
+  `writers/`, `retain/`, `state/` or `cluster/` (`cluster/version`):
   - `log/`: segments are the WAL; anything a shard hasn't checkpointed lives only
     there. A missing segment is a hole: readers stop there and replay treats a hole
     inside a span as an error.
   - Fence objects in `log/` are what makes a zombie of that incarnation fail-stop
-    whatever its clock says; retention deliberately keeps them forever.
+    whatever its clock says. Retention keeps a retired dead log's fence for
+    `--fence-retention` (default 7 days; `off` = forever) and then deletes it
+    (`vlpds_retention_deleted_objects_total{log="fence"}`). A zombie paused
+    longer than that (a suspended VM whose monotonic clock stopped) would find
+    no fence when it wakes: don't pause VMs (below), and raise
+    `--fence-retention` (or `off`) where a pause that long is possible.
+  - `cluster/version` is the cluster's feature level: only `vlpds admin cluster
+    finalize` / `cluster lower` change it.
   - `assign/` holds each shard's epoch and span history: what successors replay.
     `assign/layout` is the slot map.
   - `nodes/` and `writers/`: deleting a live lease or claim breaks liveness and
@@ -1561,7 +1624,9 @@ only TOTP is asked for.
 - **Don't SIGKILL for routine restarts.** Use SIGTERM and wait.
 - **Don't suspend/snapshot-pause a running node's VM.** A paused monotonic clock
   makes the node think its lease is still valid on wake: it serves stale reads
-  until its next PUT hits the fence (it still acks nothing).
+  until its next PUT hits the fence (it still acks nothing). That relies on the
+  fence still existing: one paused longer than `--fence-retention` (7 days by
+  default) wakes after its fence was deleted.
 - **Don't let host clocks drift.** Offsets don't affect safety but delay the
   merged firehose by the largest offset, and a new owner waits out the previous
   owner's `seq_floor` (up to 30 s) before serving.
@@ -1609,4 +1674,6 @@ Closed (were gaps when the alerts were first written):
 | Memory limit (was the hand-kept `vlpds:memory_limit_bytes`) | `vlpds_memory_limit_bytes` |
 | Repo cache capacity | `vlpds_repo_cache_capacity_bytes` (all workers) |
 | Object-store errors/latency on vlpds' own clients | `vlpds_object_store_requests_total{...,result=ok\|not_found\|precondition\|timeout\|error\|cancelled}`, `vlpds_object_store_request_seconds{op,component}` (every request through `objstats.rs`: control plane, segments, replay, backfill, retention, SlateDB) |
-| Retention pass duration, dead-log holdings | `vlpds_retention_pass_seconds`, `vlpds_retention_dead_logs{state=unfenced\|needed\|pruning}`, `vlpds_retention_dead_log_segments` |
+| Retention pass duration, dead-log holdings | `vlpds_retention_pass_seconds`, `vlpds_retention_dead_logs{state=unfenced\|needed\|pruning\|fenced}` (fenced = pruned to its fence, kept for `--fence-retention`), `vlpds_retention_dead_log_segments` |
+| Lease configuration (alert thresholds were fixed for a 10 s TTL) | `vlpds_lease_ttl_seconds`, `vlpds_lease_renew_interval_seconds`, `vlpds_lease_skew_seconds`, `vlpds_lease_renew_ttl_ratio` (renewal round trip / TTL) |
+| Firehose budgets (alerts hard-coded the defaults) | `vlpds_firehose_merge_queue_budget_bytes`, `vlpds_firehose_max_lag_bytes` |

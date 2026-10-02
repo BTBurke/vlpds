@@ -11,14 +11,19 @@
 #   real cluster's nodes, or VlpdsNodeDown fires for every idle bench port.
 # - One cluster per Prometheus. With several, add a cluster label to the
 #   targets and to every `sum(...)` / `count(...)` below (`by (cluster)`).
-# - The lease alerts assume the default --lease-ttl-ms 10000 (renew every
-#   2 s, validity TTL - skew = 8 s, renewal ceiling 4 s). Scale their
-#   thresholds with the TTL.
+# - The lease alerts scale with each node's configured --lease-ttl-ms, which
+#   it exports as vlpds_lease_ttl_seconds (with vlpds_lease_renew_interval_
+#   seconds and vlpds_lease_skew_seconds, both TTL / 5) and through the
+#   vlpds_lease_renew_ttl_ratio histogram (renewal round trip / TTL). At the
+#   default 10 s TTL: renew every 2 s, validity TTL - skew = 8 s, renewal
+#   ceiling 4 s; at 60 s (the tiny profile): every 12 s, 48 s, 24 s.
+#   Nodes built before these metrics existed export neither, and the
+#   TTL-relative lease alerts stay silent for them.
 #
 # Thresholds: the design numbers are ~40-50 ms p50 / ~150 ms p99 commit ack
 # on S3 Standard, ~25 ms segment PUTs, hedging after 100 ms, a 3 s forward
-# deadline, and a lease renewal ceiling of 0.4 x TTL = 4 s at the default
-# 10 s TTL. Thresholds derived from those are marked "design"; the rest are
+# deadline, and a lease renewal ceiling of 0.4 x TTL (4 s at the default
+# 10 s TTL). Thresholds derived from those are marked "design"; the rest are
 # marked "guess" and should be tuned against a week of production data.
 
 groups:
@@ -46,11 +51,27 @@ groups:
         annotations:
           summary: "vlpds node {{ $labels.instance }} has not answered a scrape for 2 minutes"
           description: >-
-            Peers take its shards over after TTL + skew (12 s at the default
-            TTL) or within 3-5 s if its port refuses connections, so writes
+            Peers take its shards over after TTL + skew (1.2 x TTL: 12 s at
+            the default 10 s TTL, 72 s at 60 s) or within 3-5 s if its port
+            refuses connections, so writes
             should already be served elsewhere; capacity is reduced and a
             second loss may overload the rest.
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsnodedown"
+
+      # No vlpds target is scraped at all (scrape config missing, the
+      # collector down, or every target dropped): every other alert here
+      # is blind. With several clusters on one evaluator, scope it per
+      # cluster (roles/monitoring's extra_labels adds the cluster filter to
+      # the selector and the label to the alert), or one scraped cluster
+      # hides another's absence.
+      - alert: VlpdsNotScraped
+        expr: absent(up{job="vlpds"})
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "No vlpds scrape target has reported for 10 minutes: vlpds alerting is blind"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsnotscraped"
 
       # A new process: its start time changed. Expected during a deploy.
       - alert: VlpdsNodeRestarted
@@ -65,8 +86,10 @@ groups:
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsnoderestarted"
 
       # The process exits on purpose (fail-stop) when its lease lapses, its
-      # log is fenced, or a segment upload / state apply fails (exit codes
-      # 2-5). It records why in its exit-state file (--exit-state-file, by
+      # log is fenced, a segment upload / state apply fails, a signature
+      # faults repeatedly, its build can't run the cluster's feature level,
+      # or a graceful stop's shutdown fence fails (exit codes 2-8: 6
+      # signature_fault, 7 incompatible_level, 8 shutdown_fence). It records why in its exit-state file (--exit-state-file, by
       # default in --cache-dir) and the next process exports it while it runs.
       # crash = the previous process recorded no exit (SIGKILL, OOM, abort).
       # Only reported for 30 minutes after the restart.
@@ -164,8 +187,8 @@ groups:
     rules:
       # A dead node's series go stale on its failed scrape, so its shards
       # count as unowned until a peer opens them: normally 3-5 s (refused
-      # probe) or ~12 s (TTL + skew) plus replay. 2 minutes is far past that
-      # (design). `or vector(0)` keeps it firing when every node is down.
+      # probe) or TTL + skew (12 s at the default TTL, 72 s at 60 s) plus
+      # replay. 2 minutes is past that at TTLs up to ~60 s (design). `or vector(0)` keeps it firing when every node is down.
       - alert: VlpdsShardsUnowned
         expr: (sum(vlpds_owned_partitions{job="vlpds"}) or vector(0)) < vlpds:layout_shards
         for: 2m
@@ -238,26 +261,43 @@ groups:
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdstakeoverreplayslow"
 
   # ---------------------------------------------------------------------------
-  # Node leases (defaults: renew every 2 s, validity 8 s after a renewal's
-  # send time, fail-stop once a renewal round trip exceeds 0.4 x TTL = 4 s)
+  # Node leases (renew every TTL / 5, validity TTL - skew = 0.8 x TTL after a
+  # renewal's send time, fail-stop once a renewal round trip exceeds the
+  # 0.4 x TTL ceiling; 2 s / 8 s / 4 s at the default 10 s TTL). Thresholds
+  # are fractions of each node's own vlpds_lease_ttl_seconds.
   # ---------------------------------------------------------------------------
   - name: vlpds-leases
     rules:
-      # Any renewal over 2 s (the 2.048 s bucket): half the 4 s ceiling past
-      # which the node's validity lapses and it fail-stops (design). With a
-      # cluster-wide brownout every node stops.
+      # Any renewal over 0.2 x TTL (vlpds_lease_renew_ttl_ratio): half the
+      # 0.4 x TTL ceiling past which the node's validity lapses and it
+      # fail-stops (design). Not a fail-stop yet; VlpdsLeaseRenewalAtCeiling
+      # is.
       - alert: VlpdsLeaseRenewalNearCeiling
         expr: >-
-          sum by (instance) (increase(vlpds_lease_renew_seconds_count{job="vlpds"}[5m]))
-            - sum by (instance) (increase(vlpds_lease_renew_seconds_bucket{job="vlpds",le="2.048"}[5m])) > 0
+          sum by (instance) (increase(vlpds_lease_renew_ttl_ratio_count{job="vlpds"}[5m]))
+            - sum by (instance) (increase(vlpds_lease_renew_ttl_ratio_bucket{job="vlpds",le="0.2"}[5m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | printf \"%.0f\" }} lease renewal(s) took over 0.2 x TTL in 5 minutes (fail-stop at 0.4 x TTL)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewalnearceiling"
+
+      # A renewal over 0.4 x TTL: the node's validity gapped and it
+      # fail-stopped (or is about to). On several nodes at once this is a
+      # store brownout stopping the cluster (design).
+      - alert: VlpdsLeaseRenewalAtCeiling
+        expr: >-
+          sum by (instance) (increase(vlpds_lease_renew_ttl_ratio_count{job="vlpds"}[5m]))
+            - sum by (instance) (increase(vlpds_lease_renew_ttl_ratio_bucket{job="vlpds",le="0.4"}[5m])) > 0
         labels:
           severity: page
         annotations:
-          summary: "{{ $labels.instance }}: {{ $value | printf \"%.0f\" }} lease renewal(s) took over 2 s in 5 minutes (fail-stop at 4 s)"
-          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewalnearceiling"
+          summary: "{{ $labels.instance }}: {{ $value | printf \"%.0f\" }} lease renewal(s) took over 0.4 x TTL in 5 minutes: past the fail-stop ceiling"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewalatceiling"
 
       # A renewal is one small CAS PUT (~25-50 ms on S3). p99 over 500 ms for
-      # 10 minutes is store or network trouble building up (guess).
+      # 10 minutes is store or network trouble building up, whatever the TTL
+      # (guess).
       - alert: VlpdsLeaseRenewalSlow
         expr: >-
           histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_lease_renew_seconds_bucket{job="vlpds"}[5m]))) > 0.5
@@ -265,12 +305,12 @@ groups:
         labels:
           severity: ticket
         annotations:
-          summary: "Lease renewal p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }} (fail-stop ceiling 4 s)"
+          summary: "Lease renewal p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }} (fail-stop ceiling 0.4 x TTL)"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewalslow"
 
       # Renewals that failed with an error or a client timeout (retried at
-      # the next 2 s tick; conflict and lapsed fail-stop and show up as
-      # restarts instead).
+      # the next renew tick, TTL / 5; conflict and lapsed fail-stop and show
+      # up as restarts instead).
       - alert: VlpdsLeaseRenewErrors
         expr: sum by (instance, kind) (increase(vlpds_lease_renew_errors_total{job="vlpds",kind=~"timeout|error"}[5m])) > 0
         labels:
@@ -279,15 +319,18 @@ groups:
           summary: "{{ $labels.instance }}: {{ $value | printf \"%.0f\" }} lease renewal(s) failed ({{ $labels.kind }}) in 5 minutes"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewerrors"
 
-      # Validity left normally stays between 6 and 8 s (renewed every 2 s).
-      # Under 4 s at a scrape means renewals are 2+ s overdue: the node is
-      # within seconds of a fail-stop (design).
+      # Validity left normally stays between 0.6 and 0.8 x TTL (renewed
+      # every 0.2 x TTL). Under 0.4 x TTL at a scrape means renewals are
+      # 0.2 x TTL or more overdue: the node is within 0.4 x TTL of a
+      # fail-stop (design).
       - alert: VlpdsLeaseValidityLow
-        expr: min_over_time(vlpds_lease_validity_seconds{job="vlpds"}[5m]) < 4
+        expr: >-
+          min_over_time(vlpds_lease_validity_seconds{job="vlpds"}[5m])
+            < ignoring (node_id) group_left 0.4 * vlpds_lease_ttl_seconds{job="vlpds"}
         labels:
           severity: ticket
         annotations:
-          summary: "{{ $labels.instance }} ({{ $labels.node_id }}) had only {{ $value | humanizeDuration }} of lease validity left"
+          summary: "{{ $labels.instance }} ({{ $labels.node_id }}) had only {{ $value | humanizeDuration }} of lease validity left (under 0.4 x TTL)"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleasevaliditylow"
 
   # ---------------------------------------------------------------------------
@@ -307,8 +350,8 @@ groups:
           summary: "Commit ack p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }} (design ~150 ms)"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscommitlatencyhigh"
 
-      # 2 s: half the 4 s lease renewal ceiling and close to the 3 s forward
-      # deadline, past which forwarded writes fail (design-derived).
+      # 2 s: close to the 3 s forward deadline, past which forwarded writes
+      # fail (design-derived).
       - alert: VlpdsCommitLatencyCritical
         expr: >-
           histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_commit_durable_seconds_bucket{job="vlpds"}[5m]))) > 2
@@ -336,7 +379,7 @@ groups:
       # now - own watermark, in microseconds. Idle logs advertise the clock
       # (lag ~0); under load it is about one segment PUT. Only meaningful
       # while the node owns shards (the gauge is not updated otherwise).
-      # 2 s (guess, half the lease ceiling).
+      # 2 s (guess: half the lease ceiling at the default 10 s TTL).
       - alert: VlpdsWatermarkLagHigh
         expr: >-
           max by (instance) (vlpds_watermark_lag_microseconds{job="vlpds"}) > 2e6
@@ -491,7 +534,8 @@ groups:
           summary: "{{ $labels.instance }}'s firehose emitted nothing in 5 minutes while the cluster is committing"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsfirehosestalled"
 
-      # Subscribers more than --firehose-max-lag-mb (128 MiB) behind are cut
+      # Subscribers more than --firehose-max-lag-mb behind (default 128 MiB;
+      # each node exports its value as vlpds_firehose_max_lag_bytes) are cut
       # off with ConsumerTooSlow. A few are normal; a cluster-wide rate means
       # the server is the slow side (guess: 0.1/s).
       - alert: VlpdsFirehoseConsumersTooSlow
@@ -532,7 +576,8 @@ groups:
       # Control-plane calls (leases' peers LIST, assignments, fences) given
       # up at min(TTL, 5 s). Lease renewals are not bounded and not counted
       # here (see the vlpds-leases group), but a store slow enough to time
-      # these out is past the 4 s renewal ceiling, where nodes fail-stop.
+      # these out is near the 0.4 x TTL renewal ceiling (4 s at the default
+      # TTL), where nodes fail-stop.
       - alert: VlpdsControlPlaneTimeouts
         expr: sum by (instance, op) (increase(vlpds_cluster_store_timeouts_total{job="vlpds"}[5m])) > 0
         labels:
@@ -542,7 +587,8 @@ groups:
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscontrolplanetimeouts"
 
       # The same on two or more nodes at once: a store brownout, which stops
-      # every node once renewals take over 4 s (DESIGN "Renewal RTT ceiling").
+      # every node once renewals take over 0.4 x TTL (DESIGN "Renewal RTT
+      # ceiling").
       - alert: VlpdsObjectStoreBrownout
         expr: count(sum by (instance) (increase(vlpds_cluster_store_timeouts_total{job="vlpds"}[5m])) > 0) >= 2
         labels:
@@ -568,7 +614,7 @@ groups:
 
       # Control-plane requests (leases, assignments, writer claims) are small
       # GET/PUT/LISTs: ~10-50 ms. p99 over 1 s is a quarter of the renewal
-      # ceiling and slows every takeover step (guess).
+      # ceiling at the default TTL and slows every takeover step (guess).
       - alert: VlpdsControlPlaneLatencyHigh
         expr: >-
           histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_object_store_request_seconds_bucket{job="vlpds",component=~"ctl_.*"}[5m]))) > 1
@@ -647,7 +693,8 @@ groups:
           summary: "A takeover of {{ $labels.instance }}'s shards would replay ~{{ $value | humanizeDuration }} of its log"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsreplaybackloghigh"
 
-      # A pass runs every 60 s on every node.
+      # A pass runs every --log-retention-interval (default 60 s) on every
+      # node.
       - alert: VlpdsRetentionFailing
         expr: >-
           sum by (instance) (increase(vlpds_retention_ticks_total{job="vlpds",result="error"}[1h]))
@@ -877,15 +924,18 @@ groups:
           summary: "{{ $labels.instance }}'s {{ $labels.cache }} cache has been at its entry cap for 6 hours"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscacheatcapacity"
 
-      # Merger queue near its byte budget (256 MiB default); past it, logs
-      # spill to S3 read-back.
+      # Merger queue over 80% of its byte budget (--firehose-merge-queue-mb,
+      # default 256 MiB, exported as vlpds_firehose_merge_queue_budget_bytes);
+      # past it, logs spill to S3 read-back.
       - alert: VlpdsFirehoseMergeQueueNearBudget
-        expr: vlpds_firehose_merge_queue_bytes{job="vlpds"} > 0.8 * 256 * 1024 * 1024
+        expr: >-
+          vlpds_firehose_merge_queue_bytes{job="vlpds"}
+            > 0.8 * vlpds_firehose_merge_queue_budget_bytes{job="vlpds"}
         for: 10m
         labels:
           severity: ticket
         annotations:
-          summary: "{{ $labels.instance }}'s firehose merger holds {{ $value | humanize1024 }}B waiting for the min watermark"
+          summary: "{{ $labels.instance }}'s firehose merger holds {{ $value | humanize1024 }}B waiting for the min watermark (over 80% of its budget)"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsfirehosemergequeuenearbudget"
 
       # Fraction of wall time the 10 ms ticker could not run (runtime threads

@@ -586,10 +586,10 @@ fn raise_nofile_limit() {}
 #[command(name = "vlpds admin", about = "Operator commands against a running vlpds node (pdsadmin equivalents, shard layout)")]
 struct AdminArgs {
     /// Any node of the cluster.
-    #[arg(long, env = "VLPDS_URL", default_value = "http://127.0.0.1:2583")]
+    #[arg(long, global = true, env = "VLPDS_URL", default_value = "http://127.0.0.1:2583")]
     url: String,
     /// Admin token (default: the dev token).
-    #[arg(long, env = "VLPDS_ADMIN_TOKEN", hide_env_values = true)]
+    #[arg(long, global = true, env = "VLPDS_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
     /// Print raw JSON results instead of tables.
     #[arg(long, global = true)]
@@ -951,6 +951,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         retry_unapplied_writes: args.retry_unapplied_writes,
     };
     cfg.check_secrets()?;
+    if let Some(c) = &cfg.cluster {
+        vlpds::metrics::export_lease_config(c.ttl, c.renew_every, c.skew);
+    }
+    vlpds::metrics::export_firehose_config(cfg.firehose_merge_queue_bytes, cfg.firehose_max_lag_bytes);
     if args.lease_ttl_ms < 10_000 && !args.dev_mode {
         tracing::warn!(
             lease_ttl_ms = args.lease_ttl_ms,
