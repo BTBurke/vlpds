@@ -1,0 +1,108 @@
+--- a/packages/vlpds/src/bin/loadgen.rs	2026-10-01 14:09:38
++++ b/packages/vlpds/src/bin/loadgen.rs	2026-10-01 14:09:46
+@@ -138,7 +138,17 @@
+         cursor: Option<i64>,
+         #[arg(long, default_value = "")]
+         json_out: String,
++        /// Sharded subscriptions: subscriber i asks for ?shard=(i % n)/n (0 = full stream).
++        #[arg(long, default_value_t = 0)]
++        shard_of: usize,
+     },
++    /// Enumerate every repo with sync.listRepos (cursor paging) and report the rate.
++    ListRepos {
++        #[arg(long, default_value_t = 1000)]
++        limit: usize,
++        #[arg(long, default_value = "")]
++        json_out: String,
++    },
+     /// Minimal AppView stand-in for proxy benchmarks: answers every request
+     /// with a fixed JSON body of `body_bytes`.
+     StubAppview {
+@@ -268,7 +278,9 @@
+                 seconds,
+                 cursor,
+                 json_out,
+-            } => fanout(&args, *subscribers, *seconds, *cursor, json_out).await,
++                shard_of,
++            } => fanout(&args, *subscribers, *seconds, *cursor, json_out, *shard_of).await,
++            Cmd::ListRepos { limit, json_out } => list_repos_all(&args, *limit, json_out).await,
+             Cmd::Verify { acked } => verify(&args, acked).await,
+             Cmd::StubAppview { listen, body_bytes } => stub_appview(listen, *body_bytes).await,
+             Cmd::Proxy { active, concurrency, seconds, path, connections, jwt_secret, service_did, json_out } => {
+@@ -865,6 +877,46 @@
+     Ok(())
+ }
+ 
++async fn list_repos_all(args: &Args, limit: usize, json_out: &str) -> anyhow::Result<()> {
++    let c = client();
++    let t = Instant::now();
++    let (mut repos, mut pages, mut bytes) = (0u64, 0u64, 0u64);
++    let mut page_lat = hist();
++    let mut cursor: Option<String> = None;
++    loop {
++        let mut q = vec![("limit", limit.to_string())];
++        if let Some(cu) = &cursor {
++            q.push(("cursor", cu.clone()));
++        }
++        let t0 = Instant::now();
++        let resp = c.get(format!("{}/xrpc/com.atproto.sync.listRepos", args.host)).query(&q).send().await?;
++        anyhow::ensure!(resp.status().is_success(), "listRepos {}", resp.status());
++        let b = resp.bytes().await?;
++        let _ = page_lat.record(t0.elapsed().as_micros().max(1) as u64);
++        bytes += b.len() as u64;
++        let v: serde_json::Value = serde_json::from_slice(&b)?;
++        let n = v["repos"].as_array().map(|a| a.len()).unwrap_or(0) as u64;
++        repos += n;
++        pages += 1;
++        if pages % 1000 == 0 {
++            eprintln!("listRepos: {repos} repos, {pages} pages ({:.0} repos/s)", repos as f64 / t.elapsed().as_secs_f64());
++        }
++        match v["cursor"].as_str() {
++            Some(cu) if n > 0 => cursor = Some(cu.to_string()),
++            _ => break,
++        }
++    }
++    let secs = t.elapsed().as_secs_f64();
++    let q = |p: f64| page_lat.value_at_quantile(p) as f64 / 1000.0;
++    let out = json!({"method": "listRepos-enumerate", "limit": limit, "repos": repos, "pages": pages, "secs": secs,
++        "repos_per_s": repos as f64 / secs, "mb": bytes as f64 / 1e6, "page_p50_ms": q(0.5), "page_p99_ms": q(0.99), "page_max_ms": page_lat.max() as f64 / 1000.0});
++    println!("{out}");
++    if !json_out.is_empty() {
++        std::fs::write(json_out, out.to_string())?;
++    }
++    Ok(())
++}
++
+ // ---------------- per-method benchmark ----------------
+ 
+ fn method_keys() -> Vec<&'static str> {
+@@ -1172,19 +1224,24 @@
+     seconds: u64,
+     cursor: Option<i64>,
+     json_out: &str,
++    shard_of: usize,
+ ) -> anyhow::Result<()> {
+     use tokio_tungstenite::tungstenite::Message;
+-    let mut url = format!(
++    let base = format!(
+         "{}/xrpc/com.atproto.sync.subscribeRepos",
+         args.host.replacen("http", "ws", 1)
+     );
+-    if let Some(c) = cursor {
+-        url.push_str(&format!("?cursor={c}"));
+-    }
+     let deadline = Instant::now() + Duration::from_secs(seconds);
+     let mut tasks = Vec::new();
+     for i in 0..subscribers {
+-        let url = url.clone();
++        let mut q = Vec::new();
++        if let Some(c) = cursor {
++            q.push(format!("cursor={c}"));
++        }
++        if shard_of > 0 {
++            q.push(format!("shard={}/{shard_of}", i % shard_of));
++        }
++        let url = if q.is_empty() { base.clone() } else { format!("{base}?{}", q.join("&")) };
+         tasks.push(tokio::spawn(async move {
+             let mut events = 0u64;
+             let mut bytes = 0u64;
