@@ -47,14 +47,19 @@ struct Srv {
 }
 
 async fn spawn() -> Srv {
+    spawn_with(|_| {}).await
+}
+
+async fn spawn_with(f: impl FnOnce(&mut vlpds::server::Config)) -> Srv {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
-    let cfg = vlpds::server::Config {
+    let mut cfg = vlpds::server::Config {
         dev_mode: true,
         public_url: base.clone(),
         ..Default::default()
     };
+    f(&mut cfg);
     let (app, _) = vlpds::server::spawn(cfg, listener).await.unwrap();
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -787,6 +792,85 @@ async fn scope_enforcement() {
         f3.par(&s, &pkce(), "x").await.body["error"],
         "invalid_scope"
     );
+}
+
+/// app.bsky.notification.{register,unregister}Push over OAuth (reference
+/// registerPush.ts): the token needs `rpc:{lxm}?aud={serviceDid}#bsky_notif`;
+/// without it, 403 ScopeMissingError naming that scope, and nothing is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_registration_rpc_scope() {
+    const APPVIEW: &str = "did:web:appview.test";
+    const REGISTER: &str = "app.bsky.notification.registerPush";
+    const UNREGISTER: &str = "app.bsky.notification.unregisterPush";
+    let hits = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let appview = format!("http://{}", l.local_addr().unwrap());
+    let h = hits.clone();
+    let router = axum::Router::new().fallback(move |req: axum::extract::Request| {
+        let h = h.clone();
+        async move {
+            h.lock().push(req.uri().path().to_string());
+            axum::http::StatusCode::OK
+        }
+    });
+    tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+    let s = spawn_with(|c| c.appview = Some((appview, APPVIEW.into()))).await;
+    let acct = create_account(&s, "pushy").await;
+    let input = |service_did: &str| {
+        json!({"serviceDid": service_did, "token": "device-1", "platform": "ios", "appId": "xyz.blueskyweb.app"})
+    };
+    let redirect = "http://127.0.0.1/cb";
+    let login = |scope: &'static str| {
+        let (s, acct) = (&s, &acct);
+        async move {
+            let key = DpopKey::new();
+            let cid = loopback_client_id(scope, redirect);
+            let f = Flow::new(&cid, redirect, scope, &key);
+            let p = pkce();
+            let mut b = Browser::default();
+            let code = authorize_interactive(s, &mut b, &f, acct, &p).await;
+            let t = tokens(&exchange(s, &f, &code, &p, &[]).await);
+            assert_eq!(t.scope, scope);
+            (key, t.access)
+        }
+    };
+
+    // granted for registerPush at the AppView's #bsky_notif only
+    let (key, tok) = login("atproto rpc:app.bsky.notification.registerPush?aud=did:web:appview.test%23bsky_notif").await;
+    let r = xrpc_dpop(&s, &key, &tok, "POST", REGISTER, Some(input(APPVIEW))).await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(hits.lock().drain(..).collect::<Vec<_>>(), [format!("/xrpc/{REGISTER}")]);
+    let r = xrpc_dpop(&s, &key, &tok, "POST", UNREGISTER, Some(input(APPVIEW))).await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert_eq!(r.body["error"], "ScopeMissingError");
+    assert_eq!(
+        r.body["message"],
+        "Missing required scope \"rpc:app.bsky.notification.unregisterPush?aud=did:web:appview.test%23bsky_notif\""
+    );
+    // another service DID is another audience
+    let r = xrpc_dpop(&s, &key, &tok, "POST", REGISTER, Some(input("did:web:push.example.com"))).await;
+    assert_eq!(r.status, 403, "{}", r.body);
+    assert_eq!(r.body["error"], "ScopeMissingError");
+    assert_eq!(
+        r.body["message"],
+        "Missing required scope \"rpc:app.bsky.notification.registerPush?aud=did:web:push.example.com%23bsky_notif\""
+    );
+    assert!(hits.lock().is_empty());
+
+    // an unrelated scope set allows neither; transition:generic allows both
+    let (key, tok) = login("atproto repo:app.bsky.feed.like").await;
+    for lxm in [REGISTER, UNREGISTER] {
+        let r = xrpc_dpop(&s, &key, &tok, "POST", lxm, Some(input(APPVIEW))).await;
+        assert_eq!(r.status, 403, "{lxm}: {}", r.body);
+        assert_eq!(r.body["error"], "ScopeMissingError");
+    }
+    assert!(hits.lock().is_empty());
+    let (key, tok) = login("atproto transition:generic").await;
+    for lxm in [REGISTER, UNREGISTER] {
+        let r = xrpc_dpop(&s, &key, &tok, "POST", lxm, Some(input(APPVIEW))).await;
+        assert_eq!(r.status, 200, "{lxm}: {}", r.body);
+    }
+    assert_eq!(hits.lock().len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

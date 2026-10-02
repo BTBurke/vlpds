@@ -27,6 +27,8 @@ zstd = "0.13"
 # decoding gzip/deflate AppView responses for read-after-write munging (the
 # flate2 tower-http already links)
 flate2 = "1"
+# brotli (`br`) decoding of proxied AppView bodies for read-after-write
+brotli-decompressor = "5"
 object_store = { version = "0.14", features = ["aws"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }
@@ -139,6 +141,8 @@ incremental = true
 opt-level = 2
 
 [dev-dependencies]
+# brotli-encoded stub AppView bodies (read-after-write tests)
+brotli = "8"
 # tests cross-check libsecp256k1 signatures against RustCrypto
 k256 = { version = "0.13", features = ["ecdsa"] }
 # differential tests (tests/all/differential_shrike.rs): a second atproto

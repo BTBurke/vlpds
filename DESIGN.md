@@ -509,10 +509,14 @@ valid only in the partition epoch they were made in. A request then costs:
   hit it. Loads that raced a commit are not cached (per-shard generations).
 
 Only a response with records to merge is buffered (10 MiB bound on the
-wire and decoded), decoded (gzip, deflate, zstd), parsed and re-serialized;
-for these methods the client's Accept-Encoding is narrowed to codings vlpds
-can decode (`br` dropped, `*` = gzip/deflate; the reference negotiates its
-own list for the same reason). Unparseable or unexpected upstream JSON is
+wire and decoded), decoded (gzip, deflate, br, zstd), parsed and
+re-serialized; for these methods the client's Accept-Encoding is narrowed
+to codings vlpds can decode (the reference's gzip/deflate/br plus zstd, so
+the usual `gzip, deflate, br` passes as is; others such as `compress` are
+dropped, `*` = whichever of gzip/deflate/br aren't named; the reference
+negotiates its own list for the same reason). As in the reference, a
+malformed header is 400 and one ruling out identity, gzip, deflate and br
+is 406. Unparseable or unexpected upstream JSON is
 returned as received. Metric: `vlpds_proxy_read_after_write_total{result}`
 (log_nothing, log_records, store_read; munged, unchanged, failed).
 Measured cost on the no-merge path (laptop, shared and loaded ~30-40, 6
@@ -2395,7 +2399,9 @@ corpus file).
 `app.bsky.notification.{registerPush,unregisterPush}` name their service in
 the body (`serviceDid`), so the generic proxy (which would always pick the
 AppView) doesn't serve them. As in the reference: the OAuth check is
-`rpc:{lxm}?aud={serviceDid}#bsky_notif`; the forwarded call carries a
+`rpc:{lxm}?aud={serviceDid}#bsky_notif` (missing: 403 `ScopeMissingError`,
+`Missing required scope "rpc:...?aud=...%23bsky_notif"`, the reference's
+`assertRpc`, via `Credentials::need_rpc`); the forwarded call carries a
 service-auth JWT from the account's repo key through the proxy's signer
 (hedged nonce, verify-after-sign) with iss = account, **aud = the bare
 `serviceDid`** (the reference's `serviceAuthHeaders(did, serviceDid, lxm)`;
@@ -2439,8 +2445,13 @@ offers; vlpds's TOTP (`vlpds.server.*Totp`) stays as a second option.
   turning TOTP off falls back to the email factor, but the weaker factor
   never substitutes for the stronger one. The Bluesky app shows its generic
   code field on `AuthFactorTokenRequired`, which takes a TOTP code too.
-- Unlike the reference, an `authFactorToken` sent for an account without a
-  factor is ignored rather than checked.
+- As in the reference's `login()` (`if (authFactorToken)`), a non-empty
+  `authFactorToken` is checked as an `auth_factor` email code whenever one
+  is sent: for an account without a factor (no code was mailed: 400
+  `InvalidToken`) and for app-password logins too (which otherwise skip the
+  factor; a valid mailed code is accepted and spent). Such guesses count
+  against the same lockout. With TOTP on, a password login's code is
+  checked as TOTP only (Precedence above).
 
 ## PLC identity (`src/plc`)
 

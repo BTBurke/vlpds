@@ -87,10 +87,27 @@ fn factor_required() -> XrpcError {
     }
 }
 
-/// Second factor of a password login (createSession, OAuth sign-in): TOTP
-/// when enabled, else the email factor when enabled, else nothing.
-pub(super) async fn check_second_factor(app: &App, acct: &Account, code: Option<&str>) -> Result<(), FactorErr> {
+/// Second factor of a login (createSession, OAuth sign-in): TOTP when
+/// enabled, else the email factor when enabled. App passwords
+/// (`app_password`) bypass both. A code sent anyway (no factor, or an app
+/// password) is still checked as an email sign-in code, as the reference's
+/// `login()` does (`if (authFactorToken) assertValidEmailTokenAndCleanup`):
+/// with no code mailed it fails 400 `InvalidToken`, and counts against the
+/// lockout like any wrong code.
+pub(super) async fn check_second_factor(
+    app: &App,
+    acct: &Account,
+    code: Option<&str>,
+    app_password: bool,
+) -> Result<(), FactorErr> {
     let code = code.map(str::trim).filter(|c| !c.is_empty());
+    let hint = || Factor::Email { hint: acct.email.as_deref().map(obfuscate_email).unwrap_or_default() };
+    if app_password {
+        return match code {
+            Some(c) => check_email_code(app, acct, None, Some(c)).await.map_err(|err| FactorErr { err, factor: hint() }),
+            None => Ok(()),
+        };
+    }
     let totp = crate::totp::enabled_for(app, acct)
         .await
         .map_err(|err| FactorErr { err, factor: Factor::Totp })?;
@@ -99,16 +116,16 @@ pub(super) async fn check_second_factor(app: &App, acct: &Account, code: Option<
             .await
             .map_err(|err| FactorErr { err, factor: Factor::Totp });
     }
-    match (&acct.email, enabled(acct)) {
-        (Some(email), true) => {
-            let factor = Factor::Email { hint: obfuscate_email(email) };
-            check_email_code(app, acct, email, code).await.map_err(|err| FactorErr { err, factor })
-        }
+    match (&acct.email, enabled(acct), code) {
+        (Some(email), true, _) => check_email_code(app, acct, Some(email), code).await.map_err(|err| FactorErr { err, factor: hint() }),
+        (_, _, Some(c)) => check_email_code(app, acct, None, Some(c)).await.map_err(|err| FactorErr { err, factor: hint() }),
         _ => Ok(()),
     }
 }
 
-async fn check_email_code(app: &App, acct: &Account, email: &str, code: Option<&str>) -> XResult<()> {
+/// Checks `code` (under the lockout), or mails a fresh one to `email` when
+/// there's none (the factor is on: `email` is always given then).
+async fn check_email_code(app: &App, acct: &Account, email: Option<&str>, code: Option<&str>) -> XResult<()> {
     let did = acct.did.as_str();
     // the TOTP lock also serializes this factor's counter updates
     let _g = crate::totp::lock(did).await;
@@ -118,6 +135,9 @@ async fn check_email_code(app: &App, acct: &Account, email: &str, code: Option<&
         return Err(crate::totp::locked_out());
     }
     let Some(code) = code else {
+        let Some(email) = email else {
+            return Ok(());
+        };
         let token = create_email_token(app, did, PURPOSE).await?;
         deliver(app, email, crate::mail::Email::SignInAuthFactor { handle: Some(&acct.handle), token: &token });
         return Err(factor_required());

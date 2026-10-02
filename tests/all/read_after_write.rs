@@ -34,6 +34,8 @@ struct Stub {
     raw_gzip: Mutex<Option<Vec<u8>>>,
     /// gzip JSON bodies when the request accepts gzip
     gzip: AtomicBool,
+    /// brotli JSON bodies when the request accepts br
+    br: AtomicBool,
     seen: Mutex<Vec<Seen>>,
 }
 
@@ -82,6 +84,12 @@ async fn spawn_stub() -> (Arc<Stub>, String) {
                 .unwrap_or((200, json!({})));
             drop(bodies);
             let bytes = serde_json::to_vec(&body).unwrap();
+            if st.br.load(Ordering::Relaxed) && seen.accept_encoding.contains("br") {
+                let mut out = Vec::new();
+                brotli::BrotliCompress(&mut &bytes[..], &mut out, &Default::default()).unwrap();
+                b = b.header("content-encoding", "br");
+                return b.status(status).body(axum::body::Body::from(out)).unwrap();
+            }
             if st.gzip.load(Ordering::Relaxed) && seen.accept_encoding.contains("gzip") {
                 let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
                 e.write_all(&bytes).unwrap();
@@ -432,7 +440,7 @@ async fn compressed_upstream_is_munged() {
     let r = reqwest::Client::new()
         .get(format!("{}/xrpc/app.bsky.feed.getTimeline", s.url))
         .header("authorization", format!("Bearer {}", a.access))
-        .header("accept-encoding", "gzip, br")
+        .header("accept-encoding", "gzip, compress")
         .send()
         .await
         .unwrap();
@@ -454,9 +462,48 @@ async fn compressed_upstream_is_munged() {
     assert_eq!(j["cursor"], pad);
     // methods without read-after-write forward the client's Accept-Encoding as is
     s.xrpc
-        .send(s.xrpc.http.get(format!("{}/xrpc/app.bsky.feed.getLikes?uri=x", s.url)).header("authorization", format!("Bearer {}", a.access)).header("accept-encoding", "gzip, br"))
+        .send(s.xrpc.http.get(format!("{}/xrpc/app.bsky.feed.getLikes?uri=x", s.url)).header("authorization", format!("Bearer {}", a.access)).header("accept-encoding", "gzip, compress"))
         .await;
-    assert_eq!(stub.last("app.bsky.feed.getLikes").accept_encoding, "gzip, br");
+    assert_eq!(stub.last("app.bsky.feed.getLikes").accept_encoding, "gzip, compress");
+}
+
+/// Brotli is decodable (the reference's set is gzip, deflate, br): a
+/// client's `br` reaches the AppView as is and its brotli body is merged into.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn brotli_upstream_is_munged() {
+    let (stub, s) = setup().await;
+    let a = s.create_account("rawbrotli").await;
+    s.post(&a, "indexed").await;
+    stub.set_rev(&rev(&s, &a.did).await);
+    stub.br.store(true, Ordering::Relaxed);
+    let pad = "y".repeat(4000);
+    stub.set("app.bsky.feed.getTimeline", json!({"feed": [], "cursor": pad}));
+    let p = s.post(&a, "fresh").await;
+    let r = reqwest::Client::new()
+        .get(format!("{}/xrpc/app.bsky.feed.getTimeline", s.url))
+        .header("authorization", format!("Bearer {}", a.access))
+        .header("accept-encoding", "br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(stub.last("app.bsky.feed.getTimeline").accept_encoding, "br");
+    assert!(r.headers().get("atproto-upstream-lag").is_some());
+    let enc = r.headers().get("content-encoding").map(|v| v.to_str().unwrap().to_string());
+    let body = r.bytes().await.unwrap();
+    // the munged body is re-encoded by the PDS's own compression layer (or not)
+    let body = match enc.as_deref() {
+        Some("br") => {
+            let mut out = Vec::new();
+            brotli::BrotliDecompress(&mut &body[..], &mut out).unwrap();
+            out
+        }
+        None => body.to_vec(),
+        Some(other) => panic!("{other}"),
+    };
+    let j: J = serde_json::from_slice(&body).unwrap();
+    assert_eq!(j["feed"][0]["post"]["uri"], p.uri);
+    assert_eq!(j["cursor"], pad);
 }
 
 /// A repo with no records at or below the AppView's rev (a new account's

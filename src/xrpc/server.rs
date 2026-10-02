@@ -1677,10 +1677,9 @@ async fn create_session(
         return Err(takedown_error());
     }
     // second factor for password logins (app passwords bypass it): TOTP,
-    // else the email factor (src/xrpc/email2fa.rs)
-    if app_pass.is_none() {
-        super::email2fa::check_second_factor(&app, &acct, inp.auth_factor_token.as_deref()).await?;
-    }
+    // else the email factor (src/xrpc/email2fa.rs); a code sent anyway is
+    // still checked, as in the reference
+    super::email2fa::check_second_factor(&app, &acct, inp.auth_factor_token.as_deref(), app_pass.is_some()).await?;
     let (access, refresh) =
         create_session_tokens_scoped(&app, &acct.did, app_pass, soft_deleted).await?;
     let mut out = session_info(&app, &acct, true).await;

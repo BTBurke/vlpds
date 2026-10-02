@@ -199,6 +199,37 @@ async fn sign_in_with_emailed_code() {
     assert_eq!(sess["emailAuthFactor"], json!(true));
 }
 
+/// The reference's `login()` checks an `authFactorToken` whenever one is
+/// sent (`if (authFactorToken) assertValidEmailTokenAndCleanup(...)`), not
+/// only when the factor is on: with no factor (and so no code mailed) it is
+/// refused, and app passwords, which skip the factor, check a sent code too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn code_without_a_factor_is_still_checked() {
+    let s = TestServer::spawn().await;
+    let a = confirmed_account(&s, "lou").await;
+    let ap = s.xrpc.post("com.atproto.server.createAppPassword", &json!({"name": "phone"}), &a.auth()).await.ok();
+    let ap = ap["password"].as_str().unwrap().to_string();
+    // no factor: a code is refused, no code is a plain sign-in
+    let (r, _) = mails(&s, &a.email, 0, login(&s, &a.handle, &a.password, Some("AAAAA-AAAAA"))).await;
+    r.err(400, "InvalidToken");
+    assert!(r.text().contains("Token is invalid"), "{}", r.text());
+    login(&s, &a.handle, &ap, Some("AAAAA-AAAAA")).await.err(400, "InvalidToken");
+    // empty is no code (JS truthiness)
+    login(&s, &a.handle, &a.password, Some("")).await.ok();
+    login(&s, &a.handle, &a.password, None).await.ok();
+    login(&s, &a.handle, &ap, None).await.ok();
+
+    // factor on: an app password with no code still bypasses it; with a
+    // mailed code, the code is checked and spent
+    enable(&s, &a).await;
+    let code = request_code(&s, &a).await;
+    let (r, _) = mails(&s, &a.email, 0, login(&s, &a.handle, &ap, None)).await;
+    r.ok();
+    login(&s, &a.handle, &ap, Some("AAAAA-AAAAA")).await.err(400, "InvalidToken");
+    login(&s, &a.handle, &ap, Some(&code)).await.ok();
+    login(&s, &a.handle, &a.password, Some(&code)).await.err(400, "InvalidToken");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn expired_code_is_refused() {
     let s = TestServer::spawn().await;

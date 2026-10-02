@@ -1509,7 +1509,7 @@ async fn sign_in(
         (acct, ident)
     };
     // TOTP, else the email factor (which mails the code on the password step)
-    match super::email2fa::check_second_factor(app, &acct, code).await {
+    match super::email2fa::check_second_factor(app, &acct, code, false).await {
         Ok(()) => {}
         Err(fe) if fe.err.error == "AuthFactorTokenRequired" => {
             device.pending_2fa = Some((acct.did.clone(), now));

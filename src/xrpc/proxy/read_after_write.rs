@@ -78,12 +78,12 @@ static COUNTERS: LazyLock<Counters> = LazyLock::new(|| {
 
 /// Content codings a munged response can be decoded from.
 fn decodable(coding: &str) -> bool {
-    ["gzip", "x-gzip", "deflate", "zstd", "identity"].iter().any(|c| coding.eq_ignore_ascii_case(c))
+    ["gzip", "x-gzip", "deflate", "br", "zstd", "identity"].iter().any(|c| coding.eq_ignore_ascii_case(c))
 }
 
 /// The client's Accept-Encoding limited to codings this PDS can decode
 /// (the reference negotiates its own list for the same reason); None keeps
-/// the client's as it is (nearly always: `gzip`, `gzip, deflate`, ...).
+/// the client's as it is (nearly always: `gzip`, `gzip, deflate, br`, ...).
 /// `*` stands for the decodable ones; nothing left means identity.
 fn accept_encoding(client: Option<&header::HeaderValue>) -> Option<header::HeaderValue> {
     let v = client?.to_str().ok()?;
@@ -101,7 +101,7 @@ fn accept_encoding(client: Option<&header::HeaderValue>) -> Option<header::Heade
         if n == "*" {
             // `*` stands only for the codings not named explicitly
             // ("gzip, *;q=0" must not turn into "gzip, gzip;q=0")
-            let rest = ["gzip", "deflate"]
+            let rest = ["gzip", "deflate", "br"]
                 .into_iter()
                 .filter(|c| !named.iter().any(|x| x.eq_ignore_ascii_case(c)));
             out.extend(rest.map(|c| format!("{c}{params}")));
@@ -144,7 +144,7 @@ fn check_accept_encoding(client: Option<&header::HeaderValue>) -> XResult<()> {
     }
     let q = |n: &str| q_of.get(n).or_else(|| q_of.get("*")).copied();
     let identity_ok = q("identity").is_none_or(|q| q > 0.0);
-    let coded_ok = ["gzip", "deflate"].iter().any(|c| q(c).is_some_and(|q| q > 0.0));
+    let coded_ok = ["gzip", "deflate", "br"].iter().any(|c| q(c).is_some_and(|q| q > 0.0));
     if !identity_ok && !coded_ok {
         return Err(xerr(
             StatusCode::NOT_ACCEPTABLE,
@@ -185,6 +185,7 @@ fn decode(body: Bytes, codings: &[String]) -> Result<Bytes, String> {
         let r = match c.as_str() {
             "gzip" | "x-gzip" => flate2::read::MultiGzDecoder::new(&cur[..]).take(limit).read_to_end(&mut out),
             "deflate" => flate2::read::ZlibDecoder::new(&cur[..]).take(limit).read_to_end(&mut out),
+            "br" => brotli_decompressor::Decompressor::new(&cur[..], 4096).take(limit).read_to_end(&mut out),
             "zstd" => zstd::stream::read::Decoder::new(&cur[..]).and_then(|d| d.take(limit).read_to_end(&mut out)),
             other => return Err(format!("unsupported content-encoding: \"{other}\"")),
         };
@@ -881,17 +882,20 @@ mod tests {
         let hv = |s: &str| header::HeaderValue::from_str(s).unwrap();
         assert!(accept_encoding(Some(&hv("gzip, deflate"))).is_none());
         assert!(accept_encoding(None).is_none());
-        assert_eq!(accept_encoding(Some(&hv("gzip, br"))).unwrap(), "gzip");
-        assert_eq!(accept_encoding(Some(&hv("br"))).unwrap(), "identity");
-        assert_eq!(accept_encoding(Some(&hv("br;q=1, *;q=0.5"))).unwrap(), "gzip;q=0.5, deflate;q=0.5");
-        assert_eq!(accept_encoding(Some(&hv("gzip, *;q=0"))).unwrap(), "gzip, deflate;q=0");
+        assert!(accept_encoding(Some(&hv("gzip, br"))).is_none());
+        assert!(accept_encoding(Some(&hv("br, zstd"))).is_none());
+        assert_eq!(accept_encoding(Some(&hv("compress"))).unwrap(), "identity");
+        assert_eq!(accept_encoding(Some(&hv("gzip, compress"))).unwrap(), "gzip");
+        assert_eq!(accept_encoding(Some(&hv("compress;q=1, *;q=0.5"))).unwrap(), "gzip;q=0.5, deflate;q=0.5, br;q=0.5");
+        assert_eq!(accept_encoding(Some(&hv("gzip, *;q=0"))).unwrap(), "gzip, deflate;q=0, br;q=0");
+        assert_eq!(accept_encoding(Some(&hv("br, *;q=0"))).unwrap(), "br, gzip;q=0, deflate;q=0");
     }
 
     #[test]
     fn accept_encoding_negotiation() {
         let hv = |s: &str| header::HeaderValue::from_str(s).unwrap();
         let check = |s: &str| check_accept_encoding(Some(&hv(s))).map_err(|e| (e.status.as_u16(), e.message));
-        for ok in ["identity", "gzip, *;q=0", "invalid", "br", "gzip;q=0.5, deflate", "GZIP;Q=1", "*"] {
+        for ok in ["identity", "gzip, *;q=0", "invalid", "br", "br, identity;q=0", "gzip;q=0.5, deflate", "GZIP;Q=1", "*"] {
             assert!(check(ok).is_ok(), "{ok}");
         }
         assert!(check_accept_encoding(None).is_ok());
@@ -899,7 +903,7 @@ mod tests {
             assert_eq!(check(bad).unwrap_err().0, 400, "{bad}");
         }
         assert_eq!(check(";q=1").unwrap_err().1, "Invalid accept-encoding: \";q=1\"");
-        for none in ["invalid, *;q=0", "identity;q=0", "br, identity;q=0", "*;q=0"] {
+        for none in ["invalid, *;q=0", "identity;q=0", "compress, identity;q=0", "*;q=0", "br;q=0, identity;q=0"] {
             assert_eq!(
                 check(none).unwrap_err(),
                 (406, "this service does not support any of the requested encodings".to_string()),
@@ -918,6 +922,10 @@ mod tests {
         assert!(decode(Bytes::from_static(b"nope"), &["gzip".into()]).is_err());
         let zs = Bytes::from(zstd::encode_all(&b"{}"[..], 1).unwrap());
         assert_eq!(&decode(zs, &["zstd".into()]).unwrap()[..], b"{}");
+        let mut br = Vec::new();
+        brotli::BrotliCompress(&mut &b"{\"b\":2}"[..], &mut br, &Default::default()).unwrap();
+        assert_eq!(&decode(Bytes::from(br), &["br".into()]).unwrap()[..], b"{\"b\":2}");
+        assert!(decode(Bytes::from_static(b"nope"), &["br".into()]).is_err());
     }
 
     #[test]
