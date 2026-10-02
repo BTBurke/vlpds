@@ -68,6 +68,7 @@ mod proxy;
 mod proxy_fast_path;
 mod races;
 mod rebalance_handback;
+mod rate_limit_config;
 mod rate_limits;
 mod record_encode;
 mod reshard;

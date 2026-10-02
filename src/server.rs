@@ -390,6 +390,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         admin_token: cfg.admin_token.clone(),
         did_resolver: Arc::new(crate::did_resolver::DidResolver::new(&cfg.plc_url, cfg.dev_mode)),
         http,
+        ratelimit: Arc::new(crate::ratelimit::Limiter::new(&cfg)),
         config: Arc::new(cfg),
         cluster: Some(cluster),
         log,

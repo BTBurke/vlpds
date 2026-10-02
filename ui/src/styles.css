@@ -1632,3 +1632,78 @@ dialog.modal.lightbox .inner {
   padding: 5px 11px;
   font-size: 13px;
 }
+
+/* ------------------------------------------------------------ rate limits */
+
+.rl-h {
+  font-size: 15px;
+  margin: 18px 0 8px;
+}
+.rl-p {
+  margin: 0 0 10px;
+  max-width: 80ch;
+}
+table.data.rl-edit td {
+  vertical-align: top;
+}
+table.data.rl-edit input[type='number'] {
+  width: 110px;
+  min-height: 30px;
+  padding: 4px 8px;
+  font-size: 13.5px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+table.data.rl-edit input[type='checkbox'] {
+  margin-top: 8px;
+  accent-color: var(--accent);
+}
+table.data.rl-edit tr.off td:first-child .mono {
+  color: var(--ink3);
+  text-decoration: line-through;
+}
+.rl-add {
+  margin-top: 12px;
+}
+.rl-add .field {
+  flex: 1 1 160px;
+}
+.rl-save {
+  margin-top: 22px;
+  padding-top: 16px;
+  border-top: 1px solid var(--rule);
+}
+.rl-meter {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 140px;
+  height: 18px;
+  border-radius: 3px;
+  background: var(--sunk);
+  overflow: hidden;
+  vertical-align: middle;
+}
+.rl-meter > span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--accent-wash);
+  border-right: 2px solid var(--accent);
+}
+.rl-meter > span.near {
+  background: var(--amber-wash);
+  border-color: var(--amber);
+}
+.rl-meter > span.over {
+  background: var(--danger-wash);
+  border-color: var(--danger);
+}
+.rl-meter > b {
+  position: relative;
+  margin-left: auto;
+  padding: 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink2);
+}

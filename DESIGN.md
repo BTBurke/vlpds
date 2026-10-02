@@ -1801,3 +1801,109 @@ The last line is the verdict: `SAFE for vlpds` (exit 0) or `UNSAFE: <check>:
 <reason>` (exit 1); exit 2 means it could not run (endpoint, credentials, a
 non-empty `--prefix`). `--json PATH` also writes the report as JSON (`--json -`
 prints only the JSON); `--skip-latency` runs only the checks.
+
+## Rate limits: observability and runtime config
+
+The reference-parity buckets (`src/ratelimit.rs`) are defaults. Operators
+can see who is consuming them and change them on a live cluster without a
+restart (`src/ratelimit/{config,runtime}.rs`, `src/xrpc/ratelimits.rs`,
+console tab "Rate limits").
+
+**Config object.** `{prefix}/config/ratelimits.json` in the shared bucket is
+a versioned JSON document of changes from the defaults:
+- per built-in bucket: `points`, `windowSecs`, `enabled`;
+- a global `enabled` switch;
+- extra IP-keyed `routes` for any XRPC method (`route:{nsid}`, max 64,
+  proxied methods included);
+- `overrides` (max 1000): an IP/CIDR or a DID, optionally limited to named
+  buckets, either `exempt` or a custom `points` limit;
+- server-written metadata: `version`, `updatedAt`, `updatedBy`, `note`,
+  `history` (the last 50 changes).
+
+`{}` (or no object) means the flag defaults. `--no-rate-limits` still
+removes the layer from that node; its refresher keeps running, so its
+console can show and edit the cluster's config. Unknown fields are
+rejected, so a typo never silently does nothing.
+
+**Override semantics.** An IP override matches the request's client IP (as
+`trusted_proxies` resolves it) and covers every bucket that request consumes.
+A DID override matches DID-keyed buckets (repo writes, updateHandle, email
+flows, sign-in-account) by key. It does not touch global-ip: the layer runs
+before authentication, and trusting an unverified token's `sub` would let
+anyone claim a trusted DID. Exempt beats a custom limit; between custom
+limits the larger wins.
+
+**Writes: CAS plus optimistic concurrency.** `vlpds.admin.updateRateLimits
+{config, ifVersion, actor?, note?}` works as follows:
+1. Reads the object and refuses with 409 `ConfigConflict` unless
+   `ifVersion` is its version (an unreadable object's version counts, so a
+   hand-broken object can be replaced).
+2. Validates, refusing with 400 `InvalidConfig`, which lists every problem
+   with its JSON path.
+3. Writes version + 1 with `If-Match` (or create-if-absent). A lost race is
+   also a 409.
+4. Installs the new policy locally, then POSTs
+   `/internal/v1/ratelimits/reload` to every live peer (2 s each). The
+   response lists the version each node now runs.
+
+Each save logs an audit line (target `vlpds::audit`: version, actor, client
+IP, node, a readable diff) and appends the same entry to `history`.
+
+**Reads: every node converges.** Each node re-reads the object at startup,
+when nudged, and every 10 s with `If-None-Match` (a 304 when unchanged: one
+conditional GET per node per 10 s, about $0.0035/node/day on S3). A missed
+nudge costs at most 10 s of staleness. It deliberately doesn't ride on the
+cluster step, whose steady-state request budget is asserted in
+`cluster::tests`. On one node, loads and saves are serialized, so a slow
+load never installs an older version over a newer one.
+
+An object that fails parsing or validation never takes a node down. The
+node keeps its last good policy (defaults if it never had one), records
+`configError {version, message}` (shown per node in the endpoint and
+console) and bumps `vlpds_rate_limit_config_errors_total`.
+
+**Swap without losing state.** The policy is an immutable `Arc<Policy>`
+behind a lock; each request takes one snapshot. Counters are keyed by
+(bucket, window length, key):
+- A new points value or override applies to each key's live window.
+- A new window length starts fresh windows. The old ones expire through the
+  normal sweep.
+- Key types never change: built-ins are fixed, and route buckets are always
+  per IP.
+
+**Observability, bounded.**
+- *Heavy hitters.* Each of the 64 counter shards keeps up to 8 candidates
+  per bucket, updated under the shard lock the consume already holds. A key
+  enters only when it outweighs the lightest candidate, and keys are
+  truncated to 96 bytes. Memory is at most 64 × 8 × buckets entries. A top-N
+  list is exact unless more than 8 of its keys hash to one shard.
+- *429 tallies.* Rejections are counted by (bucket, route) in 15 one-minute
+  slots, capped at 1024 series; the route is the matched XRPC method or
+  path, else `_proxy_or_unmatched`.
+- *Metrics* (additive; labels are bucket and route only, never IPs or DIDs):
+  - `vlpds_rate_limit_rejections_total{limiter,route}`
+  - `vlpds_rate_limit_config_version`
+  - `vlpds_rate_limit_config_errors_total`
+  - `vlpds_rate_limit_config_loads_total{result}`
+  - `vlpds_rate_limited_total` (unchanged)
+
+`vlpds.admin.getRateLimits?top=N` (admin) returns this node's view and
+gathers peers' `/internal/v1/ratelimits` over the peer client (3 s per
+peer; a peer that fails is listed in `unreachableNodes`). It merges top
+keys per bucket: `used` is summed and `maxNodeUsed` is what one node checks
+against its limit, since per-IP counters are per node. It also sums the 429
+tallies and lists each node's config version, error and load times.
+`local=true` skips the fan-out. The console polls it every 5 s and derives
+429/s per bucket from successive totals, as Live metrics does from
+`/metrics`.
+
+**Cost on the hot path.** Per limited request:
+- one policy snapshot (a read lock and an `Arc` clone);
+- no extra work for overrides unless any are configured (IP overrides are
+  matched once per request, DID overrides are one hash lookup per DID
+  consume);
+- one small-map lookup plus a scan of up to 8 entries per consume for the
+  heavy hitters.
+
+Requests without rate limits (`--no-rate-limits`, non-XRPC paths) are
+unchanged.

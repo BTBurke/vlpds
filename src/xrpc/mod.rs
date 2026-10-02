@@ -9,6 +9,7 @@ pub mod blobs;
 mod identity;
 pub mod oauth;
 pub(crate) mod proxy;
+mod ratelimits;
 mod repo;
 mod server;
 mod sync;
@@ -78,6 +79,8 @@ pub struct App {
     pub log: Arc<crate::nodelog::NodeLog>,
     /// Shard host (graceful shutdown).
     pub node: Arc<crate::node::Node>,
+    /// Rate limits: counters, the policy in force and its runtime config.
+    pub ratelimit: Arc<crate::ratelimit::Limiter>,
 }
 
 type AppState = State<Arc<App>>;
@@ -226,11 +229,13 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(oauth::routes())
         .merge(internal::routes())
         .merge(crate::profiling::routes())
+        .merge(ratelimits::routes())
         .merge(webui::routes());
+    ratelimits::start(&app);
     // DPoP-Nonce / WWW-Authenticate on DPoP-authenticated requests
     let r = oauth::with_dpop_layer(r, &app);
     let r = if app.config.rate_limits_enabled {
-        let limiter = Arc::new(crate::ratelimit::Limiter::new(&app.config));
+        let limiter = app.ratelimit.clone();
         r.layer(axum::middleware::from_fn_with_state(limiter, crate::ratelimit::layer))
     } else {
         r

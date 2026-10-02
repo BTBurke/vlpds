@@ -7,12 +7,14 @@ import { Cluster } from './Cluster'
 import { Metrics } from './Metrics'
 import { AccountDetail, Accounts } from './Accounts'
 import { Invites } from './Invites'
+import { RateLimits } from './RateLimits'
 
 const TABS = [
   { to: '/admin', label: 'Cluster' },
   { to: '/admin/metrics', label: 'Live metrics' },
   { to: '/admin/accounts', label: 'Accounts' },
   { to: '/admin/invites', label: 'Invite codes' },
+  { to: '/admin/ratelimits', label: 'Rate limits' },
 ]
 
 export function AdminApp({ path }: { path: string }) {
@@ -26,6 +28,7 @@ export function AdminApp({ path }: { path: string }) {
   else if (p === '/admin/accounts') page = <Accounts />
   else if ((m = match('/admin/accounts/:did', p))) page = <AccountDetail did={m.did} />
   else if (p === '/admin/invites') page = <Invites />
+  else if (p === '/admin/ratelimits') page = <RateLimits />
   else page = <Notice kind="warn">There is no console page at {p}.</Notice>
   const current = (to: string) => (to === '/admin' ? p === '/admin' : p === to || p.startsWith(`${to}/`))
   return (
