@@ -2,9 +2,8 @@ use super::extract::RecordBody;
 use super::*;
 use crate::cbor::{JsonValue, RecordRefs};
 
-/// `max_import_bytes`: the importRepo body limit (`Config::max_import_bytes`).
 pub fn routes(max_import_bytes: usize) -> Router<Arc<App>> {
-    let r = Router::new()
+    Router::new()
         .route("/xrpc/com.atproto.repo.createRecord", post(create_record))
         .route("/xrpc/com.atproto.repo.putRecord", post(put_record))
         .route("/xrpc/com.atproto.repo.deleteRecord", post(delete_record))
@@ -15,42 +14,28 @@ pub fn routes(max_import_bytes: usize) -> Router<Arc<App>> {
         .route(
             "/xrpc/com.atproto.repo.importRepo",
             post(import_repo).layer(axum::extract::DefaultBodyLimit::max(max_import_bytes)),
-        );
-    r
+        )
 }
 
-/// Default largest CAR importRepo accepts (`Config::max_import_bytes`).
-/// It is parsed in memory (the body plus the parsed tree: record bytes
-/// aren't copied), and the import is written as one log entry, about the
-/// CAR's size (a segment of its own when larger than a segment).
+/// The CAR is parsed in memory and written as one log entry about its size.
 pub const DEFAULT_MAX_IMPORT_BYTES: usize = 1 << 30;
 
-/// Largest record block an import takes. The reference sets none; vlpds's
-/// own writes refuse a record over 1 MB, so this leaves room for records
-/// made elsewhere while bounding what one record costs every later read.
+/// The reference sets no limit; our own writes refuse a record over 1 MB,
+/// so this leaves room for records made elsewhere while bounding what one
+/// record costs every later read.
 const MAX_IMPORT_RECORD_BYTES: usize = 2 << 20;
 
-/// Collection must be an NSID and rkey a valid record key.
 fn check_path(collection: &str, rkey: Option<&str>) -> XResult<()> {
     if !super::syntax::valid_nsid(collection) {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            format!("Invalid collection: {collection} is not a valid NSID"),
-        ));
+        return Err(XrpcError::bad("InvalidRequest", format!("Invalid collection: {collection} is not a valid NSID")));
     }
-    if let Some(r) = rkey {
-        if !super::syntax::valid_rkey(r) {
-            return Err(XrpcError::bad(
-                "InvalidRequest",
-                format!("Invalid record key: {r}"),
-            ));
-        }
+    if let Some(r) = rkey.filter(|r| !super::syntax::valid_rkey(r)) {
+        return Err(XrpcError::bad("InvalidRequest", format!("Invalid record key: {r}")));
     }
     Ok(())
 }
 
-/// Reference prepareCreate/prepareUpdate: a client-chosen record key may not
-/// contain an explicit slur (src/handle_policy.rs). Deletes are not checked.
+/// Reference prepareCreate/prepareUpdate; deletes are not checked.
 fn check_rkey_slur(rkey: Option<&str>) -> XResult<()> {
     if rkey.is_some_and(crate::handle_policy::has_explicit_slur) {
         return Err(XrpcError::bad("InvalidRequest", "Unacceptable slur in record key"));
@@ -60,25 +45,23 @@ fn check_rkey_slur(rkey: Option<&str>) -> XResult<()> {
 
 fn parse_cid_opt(v: &Option<String>) -> XResult<Option<Cid>> {
     v.as_deref()
-        .map(|s| {
-            Cid::parse(s).map_err(|_| XrpcError::bad("InvalidRequest", format!("bad cid {s}")))
-        })
+        .map(|s| Cid::parse(s).map_err(|_| XrpcError::bad("InvalidRequest", format!("bad cid {s}"))))
         .transpose()
 }
 
 /// An encoded record: (cid, DAG-CBOR bytes, blob refs, validation status,
 /// declared blob refs).
+const CREATE: &str = "com.atproto.repo.applyWrites#create";
+const UPDATE: &str = "com.atproto.repo.applyWrites#update";
+const DELETE: &str = "com.atproto.repo.applyWrites#delete";
+
 type Encoded = (Cid, Bytes, Vec<Cid>, crate::lexicon::ValidationStatus, Vec<BlobDecl>);
 
 /// A blob ref as the record declares it: (cid, mimeType, size).
 type BlobDecl = (Cid, Option<String>, Option<i64>);
 
-/// JSON record -> DAG-CBOR, as the reference's prepareWrite: a missing
-/// `$type` defaults to the collection and any other value must equal it,
-/// then known lexicons are validated (record key included); `resolved` is
-/// the dynamically resolved lexicon of `collection`, if any. One pass over
-/// the parsed tree writes the canonical bytes and collects blob refs (and
-/// legacy blob refs); validation then reads the same tree.
+/// Reference prepareWrite: a missing `$type` defaults to the collection.
+/// `resolved` is the dynamically resolved lexicon of `collection`, if any.
 fn encode_record(
     v: &mut JsonValue,
     collection: &str,
@@ -93,10 +76,7 @@ fn encode_record(
         None => v.insert("$type", JsonValue::Str(collection.to_string().into())),
         Some(JsonValue::Str(t)) if t == collection => {}
         Some(t) => {
-            return Err(XrpcError::bad(
-                "InvalidRequest",
-                format!("Invalid $type: expected {collection}, got {}", t.to_json()),
-            ))
+            return Err(XrpcError::bad("InvalidRequest", format!("Invalid $type: expected {collection}, got {}", t.to_json())))
         }
     }
     let mut bytes = Vec::with_capacity(512);
@@ -106,10 +86,7 @@ fn encode_record(
     let status = crate::lexicon::validate_record(collection, rkey, &*v, validate, resolved)
         .map_err(|e| XrpcError::bad("InvalidRequest", e))?;
     if let Some(c) = refs.legacy {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            format!("Legacy blobs are not allowed ({c})"),
-        ));
+        return Err(XrpcError::bad("InvalidRequest", format!("Legacy blobs are not allowed ({c})")));
     }
     if bytes.len() > 1_000_000 {
         return Err(XrpcError::bad("InvalidRequest", "record too large"));
@@ -118,7 +95,6 @@ fn encode_record(
     Ok((Cid::dag_cbor(&bytes), Bytes::from(bytes), blobs, status, refs.blobs))
 }
 
-/// Adds `validationStatus` unless validation was skipped.
 fn with_status(mut out: J, status: crate::lexicon::ValidationStatus) -> J {
     if let Some(st) = status {
         out["validationStatus"] = json!(st);
@@ -126,9 +102,7 @@ fn with_status(mut out: J, status: crate::lexicon::ValidationStatus) -> J {
     out
 }
 
-/// Input fields of a record write, read from the validated body tree (the
-/// input lexicon has already checked their types; the errors below are
-/// what the old serde structs reported).
+/// Serde's wording, for fields read from the body tree.
 fn field_err(m: String) -> XrpcError {
     XrpcError::bad("InvalidRequest", format!("Invalid JSON body: {m}"))
 }
@@ -153,23 +127,17 @@ fn opt_bool(v: &JsonValue, k: &str) -> XResult<Option<bool>> {
     }
 }
 
-/// Moves `k` out of the body tree.
 fn take<'a>(v: &mut JsonValue<'a>, k: &str) -> XResult<JsonValue<'a>> {
     v.get_mut(k)
         .map(|x| std::mem::replace(x, JsonValue::Null))
         .ok_or_else(|| field_err(format!("missing field `{k}`")))
 }
 
-/// Every blob a write references must have been uploaded by the repo and not
-/// be taken down (reference: processWriteBlobs -> "Could not find blob"),
-/// and its declared mimeType and size must match the stored blob (reference
-/// verifyBlob), so lexicon `accept`/`maxSize` checks hold for the real bytes.
-///
-/// One takedown check and HEAD per distinct blob (a 1 MB record can declare
-/// ~9k refs), one comparison per distinct declaration. The returned guard
-/// holds the blobs against the GC's purge ([`super::blobs::HeldBlobs`]):
-/// keep it until the write has applied (or failed). It is taken before the
-/// checks, so a quarantine that races them is covered too.
+/// Reference processWriteBlobs + verifyBlob: declared mimeType and size must
+/// match the stored blob, so lexicon `accept`/`maxSize` checks hold for the
+/// real bytes. One HEAD per distinct blob (a 1 MB record can declare ~9k
+/// refs). Keep the returned guard until the write has applied or failed; it
+/// is taken before the checks, so a quarantine that races them is covered.
 async fn check_blobs(app: &App, did: &str, decls: &[BlobDecl]) -> XResult<super::blobs::HeldBlobs> {
     let mut seen = std::collections::HashSet::with_capacity(decls.len());
     let decls: Vec<&BlobDecl> = decls.iter().filter(|d| seen.insert(*d)).collect();
@@ -221,8 +189,8 @@ async fn submit(
     writes: Vec<Write>,
     swap_commit: Option<Cid>,
 ) -> XResult<CommitAck> {
-    // held by the queued message until the worker takes it (a handler that
-    // goes away doesn't free its slot while its write still sits queued)
+    // held by the queued message, so a handler that goes away doesn't free
+    // its slot while its write still sits queued
     let Ok(permit) = app.write_permits.clone().try_acquire_owned() else {
         STATS.write_errors.fetch_add(1, Ordering::Relaxed);
         metrics::WRITES_SHED.inc();
@@ -235,9 +203,9 @@ async fn submit(
     let start = Instant::now();
     STATS.write_requests.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = oneshot::channel();
-    // A peer forwarded this and fails it at its time-to-first-byte deadline:
-    // if the write can't start soon (cold repo load), give it up unapplied
-    // and say so; the peer resends it (crate::forward, "RepoLoading").
+    // A forwarding peer fails this at its time-to-first-byte deadline: if the
+    // write can't start soon (cold repo load), give it up unapplied and say
+    // so; the peer resends it (crate::forward, "RepoLoading").
     let start_wait = app.config.forwarded_write_start.filter(|_| crate::forward::is_forwarded());
     let claim = start_wait.map(|_| Arc::new(crate::worker::Claim::default()));
     app.workers
@@ -326,7 +294,6 @@ async fn create_record(
     creds.need_repo(&inp.collection, "create")?;
     check_path(&inp.collection, inp.rkey.as_deref())?;
     check_rkey_slur(inp.rkey.as_deref())?;
-    // as the reference: no rkey = a fresh TID (validated against the schema's key)
     let rkey = inp.rkey.unwrap_or_else(|| app.tids.next().to_string());
     let schema = crate::lexicon::resolve_record_schema(&app, &inp.collection, inp.validate).await;
     let (cid, bytes, blobs, status, decls) =
@@ -365,7 +332,7 @@ struct PutRecordIn<'a> {
     collection: String,
     rkey: String,
     record: JsonValue<'a>,
-    /// None = absent, Some(None) = an explicit null.
+    /// Some(None): an explicit null.
     swap_record: Option<Option<String>>,
     swap_commit: Option<String>,
     validate: Option<bool>,
@@ -392,11 +359,7 @@ fn parse_swap_record(v: &Option<Option<String>>) -> XResult<Option<Option<Cid>>>
     match v {
         None => Ok(None),
         Some(None) => Ok(Some(None)),
-        Some(Some(s)) => {
-            Ok(Some(Some(Cid::parse(s).map_err(|_| {
-                XrpcError::bad("InvalidRequest", "bad swapRecord")
-            })?)))
-        }
+        Some(Some(s)) => Ok(Some(Some(Cid::parse(s).map_err(|_| XrpcError::bad("InvalidRequest", "bad swapRecord"))?))),
     }
 }
 
@@ -418,9 +381,8 @@ async fn put_record(
     let swap = parse_cid_opt(&inp.swap_commit)?;
     let swap_record = parse_swap_record(&inp.swap_record)?;
     let path = format!("{}/{}", inp.collection, inp.rkey);
-    // Writing the record it already holds is a no-op: no commit, the current
-    // cid back and no `commit` field (reference putRecord; it skips the swap
-    // checks too).
+    // Writing the record it already holds is a no-op with no `commit` field
+    // and no swap checks (reference putRecord).
     let p = app.partition(&did)?;
     if let Some(cur) = p
         .db
@@ -479,9 +441,8 @@ async fn delete_record(
     check_path(&inp.collection, Some(&inp.rkey))?;
     let swap = parse_cid_opt(&inp.swap_commit)?;
     let swap_record = parse_cid_opt(&inp.swap_record)?.map(Some);
-    // Deleting a record that doesn't exist is a no-op with no commit (as in
-    // the reference). The worker would otherwise emit an empty commit whose
-    // CAR lacks the unchanged MST root, which relays reject.
+    // A no-op, as in the reference: the worker would otherwise emit an empty
+    // commit whose CAR lacks the unchanged MST root, which relays reject.
     let path = format!("{}/{}", inp.collection, inp.rkey);
     let p = app.partition(&did)?;
     if p.db
@@ -535,8 +496,8 @@ async fn apply_writes(
             .writes
             .iter()
             .map(|w| match w.get("$type").and_then(|t| t.as_str()) {
-                Some("com.atproto.repo.applyWrites#create") => CREATE_POINTS,
-                Some("com.atproto.repo.applyWrites#update") => UPDATE_POINTS,
+                Some(CREATE) => CREATE_POINTS,
+                Some(UPDATE) => UPDATE_POINTS,
                 _ => DELETE_POINTS,
             })
             .sum();
@@ -545,27 +506,19 @@ async fn apply_writes(
     let did = authed_repo(&app, &creds, &inp.repo).await?;
     let swap = parse_cid_opt(&inp.swap_commit)?;
     if inp.writes.len() > crate::worker::MAX_COMMIT_OPS {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            format!("Too many writes. Max: {}", crate::worker::MAX_COMMIT_OPS),
-        ));
+        return Err(XrpcError::bad("InvalidRequest", format!("Too many writes. Max: {}", crate::worker::MAX_COMMIT_OPS)));
     }
     let mut writes = Vec::with_capacity(inp.writes.len());
     let mut statuses = Vec::with_capacity(inp.writes.len());
     let mut decls = Vec::new();
-    // dynamically resolved lexicons, once per collection
     let mut schemas: std::collections::HashMap<String, Option<Arc<crate::lexicon::Lexicons>>> = Default::default();
     for w in inp.writes.iter_mut() {
         let t = w.get("$type").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let collection = w
-            .get("collection")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
+        let collection = w.get("collection").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let rkey = w.get("rkey").and_then(|v| v.as_str()).map(String::from);
         let action = match t.as_str() {
-            "com.atproto.repo.applyWrites#create" => "create",
-            "com.atproto.repo.applyWrites#update" => "update",
+            CREATE => "create",
+            UPDATE => "update",
             _ => "delete",
         };
         creds.need_repo(&collection, action)?;
@@ -579,57 +532,25 @@ async fn apply_writes(
         }
         let schema = schemas.get(&collection).cloned().flatten();
         let mut value = w.get_mut("value").map(|x| std::mem::replace(x, JsonValue::Null)).unwrap_or(JsonValue::Null);
-        match t.as_str() {
-            "com.atproto.repo.applyWrites#create" => {
-                let rkey = rkey.unwrap_or_else(|| app.tids.next().to_string());
-                let (cid, bytes, blobs, status, d) =
-                    encode_record(&mut value, &collection, &rkey, inp.validate, schema.as_deref())?;
-                statuses.push(status);
-                decls.extend(d);
-                // the reference prunes duplicate backlinks in createRecord only
-                writes.push(Write::Create {
-                    collection,
-                    rkey,
-                    cid,
-                    bytes,
-                    blobs,
-                    prune_backlinks: false,
-                });
-            }
-            "com.atproto.repo.applyWrites#update" => {
-                let rkey =
-                    rkey.ok_or_else(|| XrpcError::bad("InvalidRequest", "update requires rkey"))?;
-                let (cid, bytes, blobs, status, d) =
-                    encode_record(&mut value, &collection, &rkey, inp.validate, schema.as_deref())?;
-                statuses.push(status);
-                decls.extend(d);
-                writes.push(Write::Update {
-                    collection,
-                    rkey,
-                    cid,
-                    bytes,
-                    blobs,
-                    swap: None,
-                    must_exist: true,
-                });
-            }
-            "com.atproto.repo.applyWrites#delete" => {
-                let rkey =
-                    rkey.ok_or_else(|| XrpcError::bad("InvalidRequest", "delete requires rkey"))?;
-                statuses.push(None);
-                writes.push(Write::Delete {
-                    collection,
-                    rkey,
-                    swap: None,
-                });
-            }
-            _ => {
-                return Err(XrpcError::bad(
-                    "InvalidRequest",
-                    format!("unknown write type {t}"),
-                ))
-            }
+        let rkey = match t.as_str() {
+            CREATE => rkey.unwrap_or_else(|| app.tids.next().to_string()),
+            UPDATE | DELETE => rkey.ok_or_else(|| XrpcError::bad("InvalidRequest", format!("{action} requires rkey")))?,
+            _ => return Err(XrpcError::bad("InvalidRequest", format!("unknown write type {t}"))),
+        };
+        if t == DELETE {
+            statuses.push(None);
+            writes.push(Write::Delete { collection, rkey, swap: None });
+            continue;
         }
+        let (cid, bytes, blobs, status, d) = encode_record(&mut value, &collection, &rkey, inp.validate, schema.as_deref())?;
+        statuses.push(status);
+        decls.extend(d);
+        writes.push(if t == CREATE {
+            // the reference prunes duplicate backlinks in createRecord only
+            Write::Create { collection, rkey, cid, bytes, blobs, prune_backlinks: false }
+        } else {
+            Write::Update { collection, rkey, cid, bytes, blobs, swap: None, must_exist: true }
+        });
     }
     let _held = check_blobs(&app, &did, &decls).await?;
     let ack = submit(&app, did.clone(), writes, swap).await?;
@@ -643,9 +564,7 @@ async fn apply_writes(
             WriteOutcome::Delete => json!({"$type": "com.atproto.repo.applyWrites#deleteResult"}),
         })
         .collect();
-    Ok(Json(
-        json!({"commit": commit_json(&ack), "results": results}),
-    ))
+    Ok(Json(json!({"commit": commit_json(&ack), "results": results})))
 }
 
 #[derive(Deserialize)]
@@ -656,9 +575,8 @@ struct GetRecordQ {
     cid: Option<String>,
 }
 
-/// Records of repos not hosted here (unknown handle, or no local account
-/// for the DID) are piped through to the AppView, as in the reference. In
-/// cluster mode a DID owned by another node was already forwarded there.
+/// Records of repos not hosted here are piped through to the AppView, as in
+/// the reference. A DID owned by another node was already forwarded there.
 async fn get_record(
     State(app): AppState,
     MaybeAuth(creds): MaybeAuth,
@@ -686,38 +604,18 @@ async fn get_record(
     super::sync::assert_available(&app, &did, creds.as_ref()).await?;
     let p = app.partition(&did)?;
     let path = format!("{}/{}", q.collection, q.rkey);
-    let v =
-        p.db.get(state::record_key(&did, &path))
-            .await
-            .map_err(XrpcError::from_err)?;
-    let v = v.ok_or_else(|| {
-        XrpcError::bad(
-            "RecordNotFound",
-            format!("Could not locate record: at://{did}/{path}"),
-        )
-    })?;
+    let not_found = || XrpcError::bad("RecordNotFound", format!("Could not locate record: at://{did}/{path}"));
+    let v = p.db.get(state::record_key(&did, &path)).await.map_err(XrpcError::from_err)?.ok_or_else(not_found)?;
     let (cid, bytes) = state::decode_record_value(&v).map_err(XrpcError::from_err)?;
-    if super::admin::is_record_takendown(&app, &did, &path).await? {
-        return Err(XrpcError::bad(
-            "RecordNotFound",
-            format!("Could not locate record: at://{did}/{path}"),
-        ));
-    }
-    if let Some(want) = &q.cid {
-        if *want != cid.to_string() {
-            return Err(XrpcError::bad(
-                "RecordNotFound",
-                format!("Could not locate record: at://{did}/{path}"),
-            ));
-        }
+    if super::admin::is_record_takendown(&app, &did, &path).await? || q.cid.as_ref().is_some_and(|want| *want != cid.to_string()) {
+        return Err(not_found());
     }
     let mut out = Vec::with_capacity(bytes.len() * 2 + 128);
     write_record_json(&mut out, &uri(&did, &path), &cid, &bytes)?;
     Ok(json_bytes(out))
 }
 
-/// Appends `{"uri","cid","value"}` for one stored record, transcoding the
-/// DAG-CBOR value straight to JSON (no intermediate value tree).
+/// Appends `{"uri","cid","value"}`, transcoding DAG-CBOR straight to JSON.
 fn write_record_json(out: &mut Vec<u8>, uri: &str, cid: &Cid, bytes: &[u8]) -> XResult<()> {
     out.extend_from_slice(b"{\"uri\":");
     serde_json::to_writer(&mut *out, uri).map_err(XrpcError::from_err)?;
@@ -748,8 +646,7 @@ async fn list_records(
     Query(q): Query<ListRecordsQ>,
 ) -> XResult<Response> {
     check_path(&q.collection, None)?;
-    // reference listRecords: an unknown, taken-down or deactivated repo is
-    // `InvalidRequestError("Could not find repo: {repo}")`
+    // reference listRecords: any unavailable repo is "Could not find repo"
     let not_found = |e: XrpcError| {
         if e.status == StatusCode::BAD_REQUEST && e.error.starts_with("Repo") {
             XrpcError::bad("InvalidRequest", format!("Could not find repo: {}", q.repo))
@@ -762,33 +659,18 @@ async fn list_records(
         .await
         .map_err(not_found)?;
     let p = app.partition(&did)?;
-    // lexicon: integer, minimum 1, maximum 100
     let limit = match q.limit {
         None => 50,
         Some(n @ 1..=100) => n as usize,
-        Some(n) => {
-            return Err(XrpcError::bad(
-                "InvalidRequest",
-                format!("limit must be between 1 and 100, got {n}"),
-            ))
-        }
+        Some(n) => return Err(XrpcError::bad("InvalidRequest", format!("limit must be between 1 and 100, got {n}"))),
     };
     let prefix = state::record_key(&did, &format!("{}/", q.collection));
     let end = state::prefix_end(&prefix);
-    // default order is newest first (descending rkey); reverse=true is ascending
+    // newest first (descending rkey) unless reverse
     let ascending = q.reverse.unwrap_or(false);
     let (lo, hi) = match (&q.cursor, ascending) {
-        (Some(c), true) => {
-            let mut k = prefix.clone();
-            k.extend_from_slice(c.as_bytes());
-            k.push(0);
-            (k, end)
-        }
-        (Some(c), false) => {
-            let mut k = prefix.clone();
-            k.extend_from_slice(c.as_bytes());
-            (prefix.clone(), k)
-        }
+        (Some(c), true) => ([&prefix[..], c.as_bytes(), &[0]].concat(), end),
+        (Some(c), false) => (prefix.clone(), [&prefix[..], c.as_bytes()].concat()),
         (None, _) => (prefix.clone(), end),
     };
     let order = if ascending {
@@ -797,7 +679,6 @@ async fn list_records(
         slatedb::IterationOrder::Descending
     };
     let opts = slatedb::config::ScanOptions::default().with_order(order);
-    // the repo's takedowns, read once for the page
     let takedowns = super::server::ctl(&app, &did).await?;
     let mut iter =
         p.db.scan_with_options(lo..hi, &opts)
@@ -808,7 +689,6 @@ async fn list_records(
     let mut n = 0;
     let mut last_rkey = None;
     while n < limit {
-        // at most the rows the page still needs (a taken-down one asks again)
         let rows = iter.next_batch(limit - n).await.map_err(XrpcError::from_err)?;
         if rows.is_empty() {
             break;
@@ -843,8 +723,7 @@ struct RepoQ {
     repo: String,
 }
 
-/// Collections in the repo: one seek per collection over its contiguous
-/// `R/{did}\0{collection}/...` key range.
+/// One seek per collection over its contiguous key range.
 async fn list_collections(app: &App, did: &str) -> XResult<Vec<String>> {
     let p = app.partition(did)?;
     let prefix = state::record_prefix(did);
@@ -884,36 +763,21 @@ async fn describe_repo(State(app): AppState, Query(q): Query<RepoQ>) -> XResult<
     })))
 }
 
-/// Replaces the caller's repo with the contents of a CAR (one root: a
-/// commit). The MST is loaded from the CAR and checked complete; every
-/// record block must hash to its CID. The worker writes a new commit (new
-/// rev, signed with our key) and emits `#sync` unless the account is
-/// deactivated (migration in: activation announces it). Like the reference,
-/// neither the imported commit's signature nor its `did` is checked: only
-/// its contents are used, re-signed for the caller's DID.
+/// The worker writes a new commit signed with our key, and emits `#sync`
+/// unless the account is deactivated (migration in: activation announces
+/// it). Like the reference, neither the imported commit's signature nor its
+/// `did` is checked: only its contents are used.
 async fn import_repo(
     State(app): AppState,
     Auth(creds): Auth,
     body: AxBytes,
 ) -> XResult<StatusCode> {
-    let did = creds
-        .did()
-        .ok_or_else(|| XrpcError::auth("user credentials required"))?
-        .to_string();
+    let did = creds.user_did()?.to_string();
     creds.need_account("repo", "manage")?;
-    let acct = app.account(&did).await?;
-    if matches!(
-        acct.status.as_deref(),
-        Some("takendown") | Some("suspended")
-    ) {
-        return Err(XrpcError {
-            status: StatusCode::UNAUTHORIZED,
-            error: "AccountTakedown".into(),
-            message: "Account has been taken down".into(),
-        });
+    if super::server::is_takendown_account(&app.account(&did).await?) {
+        return Err(super::server::takedown_error());
     }
-    // parsing, checking and building the new tree all run on the blocking
-    // pool: the repo's worker only writes the result
+    // off the repo's worker, which only writes the result
     let parsed = tokio::task::spawn_blocking(move || parse_import(&body).map(|r| (did, r)))
         .await
         .map_err(XrpcError::from_err)?;
@@ -928,30 +792,22 @@ async fn import_repo(
 
 type ImportedRecord = (String, Cid, Bytes, Vec<Cid>);
 
-/// The records of an import CAR, their bytes sliced from `body` (no
-/// copies), and their MST (checked to rebuild to the commit's data root).
+/// Record bytes are sliced from `body`, not copied.
 fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate::mst::Tree)> {
     let bad = |m: String| XrpcError::bad("InvalidRequest", m);
     let (roots, blocks) = car::read_car(body).map_err(|e| bad(format!("invalid CAR: {e}")))?;
     if roots.len() != 1 {
         return Err(bad("expected one root".into()));
     }
-    let mut map: std::collections::HashMap<Cid, &[u8]> =
-        std::collections::HashMap::with_capacity(blocks.len());
+    let mut map: std::collections::HashMap<Cid, &[u8]> = std::collections::HashMap::with_capacity(blocks.len());
     for (c, b) in blocks {
-        let actual = if c.codec == crate::cid::CODEC_RAW {
-            Cid::raw(b)
-        } else {
-            Cid::dag_cbor(b)
-        };
+        let actual = if c.codec == crate::cid::CODEC_RAW { Cid::raw(b) } else { Cid::dag_cbor(b) };
         if actual != c {
             return Err(bad(format!("block does not match its cid: {c}")));
         }
         map.insert(c, b);
     }
-    let commit_bytes = map
-        .get(&roots[0])
-        .ok_or_else(|| bad("missing commit block".into()))?;
+    let commit_bytes = map.get(&roots[0]).ok_or_else(|| bad("missing commit block".into()))?;
     let commit = Value::decode(commit_bytes).map_err(|e| bad(format!("invalid commit: {e}")))?;
     match commit.get("version") {
         Some(Value::Int(2 | 3)) => {}
@@ -960,8 +816,7 @@ fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate::mst::Tree)
     let Some(Value::Link(data)) = commit.get("data") else {
         return Err(bad("commit has no data root".into()));
     };
-    let tree = crate::mst::Tree::load_from_blocks(&map, *data)
-        .map_err(|e| bad(format!("could not load MST: {e}")))?;
+    let tree = crate::mst::Tree::load_from_blocks(&map, *data).map_err(|e| bad(format!("could not load MST: {e}")))?;
     let mut entries: Vec<(String, Cid)> = Vec::new();
     let mut key_err = None;
     tree.walk(&mut |k, c| match std::str::from_utf8(k) {
@@ -977,9 +832,7 @@ fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate::mst::Tree)
     // tree is the one the worker writes.
     let mut check = crate::mst::Tree::new();
     for (path, cid) in &entries {
-        check
-            .insert_no_proof(path.as_bytes(), *cid)
-            .map_err(|e| bad(format!("invalid record path {path}: {e}")))?;
+        check.insert_no_proof(path.as_bytes(), *cid).map_err(|e| bad(format!("invalid record path {path}: {e}")))?;
     }
     if check.root_cid().map_err(XrpcError::from_err)? != *data {
         return Err(bad("CAR does not contain the complete MST".into()));
@@ -989,14 +842,11 @@ fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate::mst::Tree)
         if !super::syntax::valid_record_path(&path) {
             return Err(bad(format!("invalid record path {path}")));
         }
-        let bytes = *map
-            .get(&cid)
-            .ok_or_else(|| bad(format!("missing record block {cid} at {path}")))?;
+        let bytes = *map.get(&cid).ok_or_else(|| bad(format!("missing record block {cid} at {path}")))?;
         if bytes.len() > MAX_IMPORT_RECORD_BYTES {
             return Err(bad(format!("record at '{path}' too large ({} bytes)", bytes.len())));
         }
-        let v =
-            Value::decode(bytes).map_err(|_| bad(format!("Could not parse record at '{path}'")))?;
+        let v = Value::decode(bytes).map_err(|_| bad(format!("Could not parse record at '{path}'")))?;
         let mut blobs = Vec::new();
         blob_refs(&v, &mut blobs);
         out.push((path, cid, body.slice_ref(bytes), blobs));
@@ -1008,9 +858,7 @@ fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate::mst::Tree)
 mod tests {
     use super::*;
 
-    /// The record path before `JsonValue` (body -> `serde_json::Value` ->
-    /// input lexicon -> serde struct -> `Value::from_json` -> lexicon ->
-    /// three walks -> `to_cbor`), kept as the oracle for the new one.
+    /// The `serde_json::Value`-based record path, kept as an oracle.
     mod legacy {
         use super::super::*;
 
