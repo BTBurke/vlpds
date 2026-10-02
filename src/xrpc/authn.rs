@@ -258,9 +258,7 @@ async fn issuer_key(app: &App, iss: &str, fresh: bool) -> XResult<String> {
     let key_id = if service == "atproto_labeler" { "atproto_label" } else { "atproto" };
     if key_id == "atproto" {
         if let Ok(a) = app.account(did).await {
-            let k = Keypair::from_bytes(&hex::decode(&a.signing_key).map_err(XrpcError::from_err)?)
-                .map_err(XrpcError::from_err)?;
-            return Ok(k.public_multibase());
+            return Ok(a.signing_pubkey);
         }
     }
     if fresh {

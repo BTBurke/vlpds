@@ -241,6 +241,7 @@ async fn submit(
             WriteError::Invalid(_) => "invalid",
             WriteError::Internal(_) => "internal",
             WriteError::Unavailable(_) => "unavailable",
+            WriteError::KeyUnavailable(_) => "key_unavailable",
         };
         metrics::WRITE_ERRORS.with_label_values(&[kind]).inc();
         e.into()

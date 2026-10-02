@@ -40,7 +40,7 @@ async fn fingerprint(s: &TestServer, i: u64) -> (String, String, usize) {
     let acct = p.db.get(vlpds::state::account_key(&did)).await.unwrap().expect("account");
     let acct: J = serde_json::from_slice(&acct).unwrap();
     let recs = s.list_records(&did, "app.bsky.feed.post", &[("limit", "100")]).await.ok();
-    (head.to_string(), acct["signing_key"].as_str().unwrap_or_default().to_string(), recs["records"].as_array().unwrap().len())
+    (head.to_string(), acct["wrapped_signing_key"].as_str().unwrap_or_default().to_string(), recs["records"].as_array().unwrap().len())
 }
 
 /// A resumed chunk creates nothing: the second run finds every account

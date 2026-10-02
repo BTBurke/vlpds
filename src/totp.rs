@@ -58,6 +58,44 @@ pub struct TotpState {
     /// Unix seconds until which every code is refused.
     #[serde(default)]
     pub locked_until: u64,
+    /// The wrapped forms `load` read, by plaintext: `save` reuses one while
+    /// its secret is unchanged (no KEK call per login attempt).
+    #[serde(skip)]
+    sealed: Vec<(zeroize::Zeroizing<String>, String)>,
+}
+
+/// In storage `secret` and `pending` are wrapped under the KEK
+/// (`secrets::Purpose::Totp`, bound to the DID); in memory they are base32.
+async fn seal(app: &App, did: &str, st: &TotpState) -> Result<TotpState, XrpcError> {
+    let mut out = st.clone();
+    out.sealed.clear();
+    for f in [&mut out.secret, &mut out.pending] {
+        if let Some(plain) = f.take() {
+            let wrapped = match st.sealed.iter().find(|(p, _)| **p == plain) {
+                Some((_, w)) => w.clone(),
+                None => app.secrets.wrap(crate::secrets::Purpose::Totp, did, plain.as_bytes()).await?,
+            };
+            drop(zeroize::Zeroizing::new(plain));
+            *f = Some(wrapped);
+        }
+    }
+    Ok(out)
+}
+
+async fn unseal(app: &App, did: &str, mut st: TotpState) -> Result<TotpState, XrpcError> {
+    for i in 0..2 {
+        let f = if i == 0 { &mut st.secret } else { &mut st.pending };
+        if let Some(wrapped) = f.take() {
+            let u = app.secrets.unwrap(crate::secrets::Purpose::Totp, did, &wrapped).await?;
+            let plain = String::from_utf8(u.plaintext.to_vec()).map_err(|_| XrpcError::internal("corrupt TOTP secret"))?;
+            *f = Some(plain.clone());
+            // a stale blob (old KEK) isn't reused: the next save rewraps it
+            if !u.stale {
+                st.sealed.push((zeroize::Zeroizing::new(plain), wrapped));
+            }
+        }
+    }
+    Ok(st)
 }
 
 impl TotpState {
@@ -182,7 +220,7 @@ pub fn hash_recovery_code(code: &str) -> String {
 
 pub async fn load(app: &App, did: &str) -> Result<TotpState, XrpcError> {
     match app.get_private(did, PRIVATE_NAME).await? {
-        Some(v) => serde_json::from_slice(&v).map_err(XrpcError::from_err),
+        Some(v) => unseal(app, did, serde_json::from_slice(&v).map_err(XrpcError::from_err)?).await,
         None => Ok(TotpState::default()),
     }
 }
@@ -192,7 +230,7 @@ pub async fn save(app: &App, did: &str, st: &TotpState) -> Result<(), XrpcError>
         None
     } else {
         Some(Bytes::from(
-            serde_json::to_vec(st).map_err(XrpcError::from_err)?,
+            serde_json::to_vec(&seal(app, did, st).await?).map_err(XrpcError::from_err)?,
         ))
     };
     app.put_private(
@@ -203,6 +241,28 @@ pub async fn save(app: &App, did: &str, st: &TotpState) -> Result<(), XrpcError>
         }],
     )
     .await
+}
+
+/// KEK rotation (`vlpds.admin.rewrapSecrets`): rewraps `did`'s TOTP
+/// secrets if any is under an old KEK (or, with `check_versions`, an old
+/// KMS key version). Returns whether one was stale; `dry_run` only checks.
+pub async fn rewrap(app: &App, did: &str, check_versions: bool, dry_run: bool) -> Result<bool, XrpcError> {
+    let Some(v) = app.get_private(did, PRIVATE_NAME).await? else {
+        return Ok(false);
+    };
+    let stored: TotpState = serde_json::from_slice(&v).map_err(XrpcError::from_err)?;
+    let blobs: Vec<&String> = [&stored.secret, &stored.pending].into_iter().flatten().collect();
+    if !check_versions && blobs.iter().all(|b| app.secrets.is_current(b)) {
+        return Ok(false);
+    }
+    let _g = lock(did).await;
+    let st = load(app, did).await?;
+    // unseal memoized only the blobs that are current
+    let stale = st.sealed.len() < [&st.secret, &st.pending].into_iter().flatten().count();
+    if stale && !dry_run {
+        save(app, did, &st).await?;
+    }
+    Ok(stale)
 }
 
 /// Serializes read-modify-write of one account's TOTP state on this node.

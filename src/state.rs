@@ -8,7 +8,7 @@
 //! outside every slot range.
 //!
 //! h/{did}                 -> head: commit cid | data cid | rev u64 | signed commit block
-//! a/{did}                 -> account JSON
+//! a/{did}                 -> account JSON (signing key wrapped: src/secrets.rs)
 //! n/{handle}              -> did (slot of the account's DID)
 //! R/{did}\0{coll}/{rkey}  -> record cid | rev | record bytes
 //! c/{did}\0{cid8}{path}   -> empty (record CID index for getBlocks)
@@ -277,8 +277,14 @@ pub fn record_value_rev(v: &[u8]) -> u64 {
 pub struct Account {
     pub did: String,
     pub handle: String,
-    /// hex secp256k1 secret (prototype: plaintext; KMS-wrapped in production)
-    pub signing_key: String,
+    /// The repo signing key (secp256k1 secret), wrapped under the KEK
+    /// (`secrets::Purpose::SigningKey`, bound to this DID). Never plaintext
+    /// at rest: rows reach the log and SSTs as-is. Unwrap through
+    /// `Secrets::account_signing_key` (cached).
+    pub wrapped_signing_key: String,
+    /// Its public key (multibase multikey, as in the DID document): readers
+    /// that only need the public half never unwrap.
+    pub signing_pubkey: String,
     pub password_hash: String,
     pub created_at: String,
     /// None = active; otherwise "deactivated" | "takendown" | "suspended" | "deleted".

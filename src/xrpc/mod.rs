@@ -81,6 +81,8 @@ pub struct App {
     pub node: Arc<crate::node::Node>,
     /// Rate limits: counters, the policy in force and its runtime config.
     pub ratelimit: Arc<crate::ratelimit::Limiter>,
+    /// Key-encryption keys and the unwrapped signing-key cache (src/secrets.rs).
+    pub secrets: Arc<crate::secrets::Secrets>,
 }
 
 type AppState = State<Arc<App>>;
@@ -185,6 +187,22 @@ impl From<WriteError> for XrpcError {
             // not applied (the shard left before the write started): the
             // entry node resends repo writes (crate::forward)
             WriteError::Unavailable(m) => XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: crate::forward::SHARD_MOVED.into(), message: m },
+            // the repo's signing key couldn't be unwrapped (KMS down): nothing applied
+            WriteError::KeyUnavailable(m) => XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: KEY_UNAVAILABLE.into(), message: m },
+        }
+    }
+}
+
+/// 503 error of a write whose signing key can't be unwrapped right now.
+pub const KEY_UNAVAILABLE: &str = "KeyUnavailable";
+
+impl From<crate::secrets::SecretError> for XrpcError {
+    fn from(e: crate::secrets::SecretError) -> XrpcError {
+        if e.retryable() {
+            XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: KEY_UNAVAILABLE.into(), message: e.to_string() }
+        } else {
+            tracing::error!("secret unwrap failed: {e}");
+            XrpcError::internal(e.to_string())
         }
     }
 }

@@ -264,7 +264,7 @@ pub async fn resolve_did(app: &App, did: &str) -> Result<Arc<J>, did_resolver::R
 }
 
 fn local_did_doc(app: &App, acct: &Account) -> Option<J> {
-    let key = Keypair::from_bytes(&hex::decode(&acct.signing_key).ok()?).ok()?;
+    (!acct.signing_pubkey.is_empty()).then_some(())?;
     Some(json!({
         "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
         "id": acct.did,
@@ -273,7 +273,7 @@ fn local_did_doc(app: &App, acct: &Account) -> Option<J> {
             "id": format!("{}#atproto", acct.did),
             "type": "Multikey",
             "controller": acct.did,
-            "publicKeyMultibase": key.public_multibase(),
+            "publicKeyMultibase": acct.signing_pubkey,
         }],
         "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": app.public_url}],
     }))
@@ -605,7 +605,9 @@ async fn cached_account(app: &App, did: &str) -> XResult<CachedAcct> {
     #[derive(serde::Deserialize)]
     struct KeyAndStatus<'a> {
         #[serde(borrow)]
-        signing_key: std::borrow::Cow<'a, str>,
+        wrapped_signing_key: std::borrow::Cow<'a, str>,
+        #[serde(borrow)]
+        signing_pubkey: std::borrow::Cow<'a, str>,
         #[serde(default, borrow)]
         status: Option<std::borrow::Cow<'a, str>>,
     }
@@ -617,14 +619,14 @@ async fn cached_account(app: &App, did: &str) -> XResult<CachedAcct> {
         .map_err(XrpcError::from_err)?
         .ok_or_else(|| XrpcError::bad("AccountNotFound", format!("no account {did}")))?;
     let acct: KeyAndStatus = serde_json::from_slice(&raw).map_err(XrpcError::from_err)?;
-    let key_id = fixed_hash(&*acct.signing_key);
-    // an unchanged key keeps its parsed form
+    // the public key identifies the signing key (a rewrap under a new KEK
+    // changes the wrapped form, not the key)
+    let key_id = fixed_hash(&*acct.signing_pubkey);
+    // an unchanged key keeps its unwrapped form; else the keyring's cache
+    // (a KMS unwrap only on its miss)
     let key = match prev.filter(|p| p.key_id == key_id) {
         Some(p) => p.key,
-        None => Arc::new(
-            Keypair::from_bytes(&hex::decode(&*acct.signing_key).map_err(XrpcError::from_err)?)
-                .map_err(XrpcError::from_err)?,
-        ),
+        None => app.secrets.signing_key(did, &acct.wrapped_signing_key, &acct.signing_pubkey).await?,
     };
     let c = CachedAcct { key, key_id, status: acct.status.map(Into::into), part: (part.id, part.epoch) };
     ACCTS.put_unless_changed(did.to_string(), c.clone(), ACCT_TTL, Some(gen));

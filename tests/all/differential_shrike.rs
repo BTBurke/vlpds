@@ -1711,7 +1711,7 @@ fn k256_signatures_and_did_keys() {
     let mut rng = StdRng::seed_from_u64(0x5167);
     for i in 0..48 {
         let kp = crypto::Keypair::generate();
-        let sk = shrike::crypto::K256SigningKey::from_bytes(&kp.to_bytes().try_into().unwrap()).unwrap();
+        let sk = shrike::crypto::K256SigningKey::from_bytes(&<[u8; 32]>::try_from(&kp.to_bytes()[..]).unwrap()).unwrap();
         // did:key / multibase / SEC1 identical; each side parses the other's
         assert_eq!(sk.public_key().did_key(), kp.did_key());
         assert_eq!(sk.public_key().multibase(), kp.public_multibase());

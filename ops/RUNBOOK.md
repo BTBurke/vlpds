@@ -782,6 +782,31 @@ It indicates inconsistent derived state and should not happen.
 **Do:** capture the log lines (repo DID, shard) and file a bug. No operator action
 on data.
 
+### VlpdsKeyServiceUnavailable
+
+**Means:** calls to the KEK's key service (Cloud KMS) fail or time out
+(`vlpds_kms_requests_total{result="unavailable"}`; the `key service unavailable`
+warn log names the key and the error). Accounts whose signing key is cached keep
+writing. Cold accounts (first write since the node started or took the shard)
+get **503 `KeyUnavailable`**, and nothing is written. createAccount, reserveSigningKey,
+setupTotp and TOTP logins fail with 503. Reads, exports, the firehose and the
+proxy for warm accounts are unaffected.
+
+**Do:** follow [Key service (KMS) outage](#key-service-kms-outage).
+
+### VlpdsSecretUnwrapRejected
+
+**Means:** a wrapped secret failed authentication under its KEK: a KEK file
+with the right id but other bytes, a Cloud KMS key that rejects the ciphertext,
+or a corrupt row. That account's writes fail with 500. A blob under a KEK the
+node doesn't have at all fails the same way but only logs (`wrapped under unknown
+key-encryption key L…/G…`): usually an old KEK retired before the rewrap finished.
+
+**Do:** find the DID in the `secret unwrap failed` / `repo load failed` logs. If
+the kid is unknown, add the old KEK back (`--kek-old-file` / `--gcp-kms-old-key`)
+on every node and rerun the rewrap ([KEK rotation](#kek-rotation)). Otherwise
+compare the node's KEK config with its peers'. Never "fix" a row by hand.
+
 ### VlpdsCacheAtCapacity
 
 **Means:** a bounded in-memory cache (`session_tokens`, `oauth_tokens`,
@@ -824,6 +849,81 @@ it, so heavy stalls risk lease lapses.
 
 ## Procedures
 
+### KEK provisioning
+
+Repo signing keys, reserved keys and TOTP secrets are stored wrapped under a
+key-encryption key (DESIGN "Secrets at rest"). Outside `--dev-mode` a node
+refuses to start without one. Every node of a cluster needs the same KEK set.
+
+- **Cloud KMS (production on GCS).** Create a symmetric ENCRYPT_DECRYPT key in a
+  multi-region or dual-region location, e.g.
+  `gcloud kms keyrings create vlpds --location us` and
+  `gcloud kms keys create secrets --keyring vlpds --location us --purpose encryption`.
+  Grant the nodes' service account `roles/cloudkms.cryptoKeyEncrypterDecrypter`
+  on that key only. Nobody routinely gets `cloudkms.cryptoKeyVersions.destroy`.
+  Set the destroy-scheduled duration to its maximum. Start nodes with
+  `--gcp-kms-key projects/P/locations/us/keyRings/vlpds/cryptoKeys/secrets`
+  (`VLPDS_GCP_KMS_KEY`). Tokens come from the metadata server
+  (`GCE_METADATA_HOST` overrides it). Losing this key loses every account's
+  signing key (each would need a PLC rotation), so it is part of the backup plan.
+- **Local KEK.** `openssl rand -out kek.bin 32` (raw 32 bytes; 64 hex chars or
+  base64 also work). Distribute it like the other secrets (sops / Ansible Vault),
+  mode 0400. Pass `--kek-file /path/kek.bin` (`VLPDS_KEK_FILE`) or the value in
+  `VLPDS_KEK`. Back it up offline: it is the only way to read the stored keys.
+- Check after start: the `secrets at rest` log line prints `kek=` (the current
+  key id: `L…` local, `G…` Cloud KMS) and `unwrap_keks=`. It must match on
+  every node. `vlpds_kms_requests_total` shows wraps (account creation) and
+  unwraps (cold loads).
+- The node caches unwrapped signing keys (`signing_keys` cache, sized from
+  `--cache-budget-mb`; `--cache-entries signing_keys=N`). Cloud KMS calls are
+  limited to `--kms-concurrency` (64) in flight per node, 5 s each.
+
+### KEK rotation
+
+New wraps use the current KEK. Old blobs keep working as long as their KEK is
+configured for unwrap.
+
+1. Roll every node with the new KEK as current and the old one as unwrap-only:
+   - local: `--kek-file new.bin --kek-old-file old.bin`;
+   - Cloud KMS, new key version in the same CryptoKey: nothing to configure
+     (`gcloud kms keys versions create` + set primary). KMS keeps decrypting
+     old versions;
+   - Cloud KMS, another CryptoKey (or local -> KMS): `--gcp-kms-key NEW
+     --gcp-kms-old-key OLD` (or `--gcp-kms-key NEW --kek-file old.bin`; with
+     `--gcp-kms-key` set, the local KEK is unwrap-only).
+2. On **every** node (each covers the shards it owns):
+   `curl -XPOST -u admin:$ADMIN -H 'content-type: application/json' -d '{}' $NODE/xrpc/vlpds.admin.rewrapSecrets`.
+   For a version rotation inside one CryptoKey, pass `{"checkVersions": true}`
+   (one KMS decrypt per secret). It reports `stale` (rewrapped), `failed` and
+   the first errors. Rewrapping doesn't change keys, emits no events and doesn't
+   evict repos. Re-run until `failed` is 0.
+3. Verify on every node with `{"dryRun": true}` (plus `checkVersions` as above)
+   until `stale` is 0. Shards that moved during step 2 show up here: rerun step 2.
+4. Only then drop the old KEK (`--kek-old-file`), or disable the old KMS
+   version. **Keep the old KEK material (or keep the version disabled, not
+   destroyed) for the backup retention period**: backups and log segments still
+   hold blobs wrapped under it.
+
+### Key service (KMS) outage
+
+1. Confirm: `vlpds_kms_requests_total{result="unavailable"}` on all nodes, the
+   `key service unavailable` log (HTTP status or timeout), Google Cloud status,
+   and IAM (a 403 from a removed role looks the same). Clients retry 503s; after
+   a failure a node fails cold unwraps fast for 1 s before it tries KMS again.
+2. **Don't restart nodes and don't move shards** (no rolling deploys, splits or
+   handbacks) while KMS is down. A restart or takeover empties the key cache,
+   which turns warm accounts cold: every account the node owns becomes
+   unwritable until KMS is back.
+3. If one node is affected (network or metadata-server problem), drain it with
+   SIGTERM. Its shards move to nodes that can reach KMS.
+4. When KMS is back, cold writes succeed on their next retry. Nothing needs
+   replaying: refused writes were never applied.
+5. If KMS is lost for good (key destroyed), restore the key from a backup if one
+   exists. Otherwise, start nodes with a new KEK: accounts can no longer sign, and
+   each needs a new signing key installed (`admin.updateAccountSigningKey`) and a
+   PLC rotation, which needs the PLC rotation keys the users or their recovery
+   flow hold.
+
 ### Rolling deploy
 
 1. One node at a time. Send **SIGTERM** (never SIGKILL). A graceful stop
@@ -863,7 +963,7 @@ it, so heavy stalls risk lease lapses.
 
 ### Adding a node
 
-1. Pick a **unique** `--node-id`. Same bucket, prefix, `--jwt-secret`,
+1. Pick a **unique** `--node-id`. Same bucket, prefix, KEK flags, `--jwt-secret`,
    `--admin-token`, `--internal-token`; set `--advertise-url` to an address all
    peers can reach; add it to `--trusted-proxies` lists if used.
 2. Start it. After it greets every peer, each peer above the new fair share
@@ -937,6 +1037,9 @@ ownership alerts read the count from there.
 - **Don't point two clusters at the same bucket + prefix**, and don't change
   `--shards` expecting it to reshard an existing prefix (it applies when a prefix
   is created; use split/merge).
+- **Never retire an old KEK** (`--kek-old-file`, a KMS key version) before
+  `vlpds.admin.rewrapSecrets` with `dryRun` reports `stale: 0` on every node, and
+  never destroy KEK material that backups still need.
 - **Don't shrink `--log-retention`** below what firehose consumers need for
   cursor resume; older cursors get `OutdatedCursor`.
 

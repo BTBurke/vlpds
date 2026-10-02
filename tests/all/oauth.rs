@@ -1636,11 +1636,10 @@ async fn include_permission_set() {
         .await
         .unwrap();
     let acct = s.app.account(&publisher.did).await.ok().unwrap();
-    let kp = vlpds::crypto::Keypair::from_bytes(&hex::decode(&acct.signing_key).unwrap()).unwrap();
     let rec = vlpds::oauth::lexicon::verify_record_proof(
         &car,
         &publisher.did,
-        &kp.public_multibase(),
+        &acct.signing_pubkey,
         &format!("com.atproto.lexicon.schema/{nsid}"),
     )
     .unwrap();

@@ -73,6 +73,7 @@ mod rate_limits;
 mod record_encode;
 mod reshard;
 mod revocation_gc;
+mod secrets_at_rest;
 mod segment_bytes;
 mod segment_compression;
 mod sequencer;

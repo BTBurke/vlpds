@@ -78,6 +78,10 @@ tower = { version = "0.5", features = ["util"] }
 rust-embed = { version = "8", features = ["mime-guess"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "decompression-gzip", "decompression-deflate"] }
 # outbound email (src/mail.rs): async SMTP over rustls (ring, webpki roots), no native-tls
+# secrets at rest (src/secrets.rs): XChaCha20-Poly1305 under the local KEK;
+# unwrapped key material is zeroized on drop
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "pool", "hostname", "builder", "tokio1", "tokio1-rustls", "ring", "webpki-roots"] }
 
 [[test]]

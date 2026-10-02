@@ -182,8 +182,13 @@ swappable.
     interior nodes of the tree at `h/{did}`'s data root, put and deleted in
     the commit's batch (puts derived from the #commit CAR at replay).
   - `a/{did}`, `n/{handle}` → account. The account row carries the repo
-    signing key (`Account::signing_key`, plaintext in the prototype;
-    KMS-wrapped later), so account rows in log segments carry it too.
+    signing key only wrapped under the KEK (`Account::wrapped_signing_key`,
+    bound to the DID) next to its public key (`signing_pubkey`, which DID
+    documents and service-auth checks read without unwrapping); account
+    rows in log segments carry the same wrapped form. See "Secrets at rest".
+  - `p/{routing}\0{name}` → private per-account state: sessions, app
+    password hashes, email-token digests, TOTP state (secret wrapped),
+    reserved signing keys (`p/_reserved:{did:key}\0k`, wrapped), OAuth rows.
   - `meta/applied_seq`
 - Reads (`getRecord`, `listRecords`, `describeRepo`) → SlateDB (memtable → block
   cache → local disk cache → S3).
@@ -362,7 +367,7 @@ load it should stay flat (a rising rate means pool churn).
 | Role | Used for | Settings |
 |---|---|---|
 | peer | forwarding, internal calls | h2c prior knowledge; 4 MiB stream / 64 MiB conn windows; PING every 10 s (also idle), dead after 5 s; TCP keepalive 30 s; nodelay; connect 1 s; `--peer-connections` (default 4) connections per peer, round-robin |
-| public | PLC, requestCrawl | h2 by ALPN on https, HTTP/1.1 on http with 1,024 idle per host; idle close 60 s; h2 PING 20 s / 10 s; TCP keepalive; connect 5 s, read 30 s |
+| public | PLC, requestCrawl, Cloud KMS (5 s per call) | h2 by ALPN on https, HTTP/1.1 on http with 1,024 idle per host; idle close 60 s; h2 PING 20 s / 10 s; TCP keepalive; connect 5 s, read 30 s |
 | proxy | configured AppView / report service | `http://`: hyper HTTP/1.1 connections, one pool per host with a slot per IO thread: a connection goes back to the slot of the thread that finished its body, a request takes from its own slot, else from another slot, else connects; at most 1,024 connections per host (idle + busy; past that a request waits for one, `vlpds_http_client_pool_waits_total`); idle close 60 s, retry once if a reused connection was closed before the request went out; `https://`: public's settings as one client per IO thread. No read timeout: the proxy arms a 10 s head deadline and a 30 s body-idle timer only while the upstream makes it wait. Responses stream through unbuffered; compressed ones as the upstream encoded them (Content-Encoding/-Length kept, never decoded or re-compressed; the client's Accept-Encoding is forwarded); a client that goes away mid-body closes the upstream connection. CORS preflights are answered locally (no auth, no upstream) |
 | guarded | user-derived URLs: did:web, handle `.well-known`, OAuth client metadata, lexicons, DID-doc service endpoints | public's settings, 32 idle per host, plus a resolver that drops non-public addresses (outside dev mode); pair with `check_outbound_url` |
 | S3 (object_store) | log and state stores (separate pools) | HTTP/1.1 only, 256 idle per host, idle close 15 s (S3 closes at ~20 s), connect 2 s, 30 s total |
@@ -1230,7 +1235,8 @@ fan-out nodes: not planned" for when that would change.
 ### Before production data
 Fixed slots with a shard map, the per-node log, node leases and
 assignments are done ("HA"). Still open:
-- Signing keys KMS-wrapped (§4; plaintext today).
+- ~~Signing keys KMS-wrapped (§4; plaintext today).~~ Done: "Secrets at
+  rest" (local KEK or Cloud KMS); provision the production KEK.
 - ~~Partial MSTs wired in (required by 32 GB nodes).~~ Done, and the only
   mode ("Partial MSTs", "As built").
 - Backups ("Backups and restore").
@@ -1741,19 +1747,22 @@ $0.02/GB): verify before relying on them. Restore times assume
 server-side clones and replay at bench rates; none of it is measured.
 
 ### Signing keys
-Every account's secp256k1 signing key is plaintext in its account row
-(`Account::signing_key` in `a/{did}`; §4 calls it `k/{did}`), along with its
-argon2 password hash. Account rows reach the log as mutations, so they are
-in segments too. **Every noncurrent version, checkpoint, log archive,
-replica and account dump is therefore a copy of every account's signing
-key** until keys are KMS-wrapped. Anyone who can read a backup can sign
-commits as any user, and a 30-day compliance lock means a leaked key stays
-in the backups for 30 days whatever happens to the live copy. Until
-wrapping: SSE-KMS with a key owned by the backup account, reads only
-through a break-glass role, access logging. After wrapping, backups hold
-only wrapped keys, but the KMS key becomes part of the backup: lose it
-and no restored account can sign, so every account would need a PLC
-rotation. It needs its own multi-region replica and deletion protection.
+Signing keys, reserved keys and TOTP secrets are stored only wrapped under
+the KEK ("Secrets at rest"), in account rows (`a/{did}`) and private state,
+and so in log segments, SSTs and every backup copy of them. A backup alone
+no longer lets its reader sign as any user. What it still holds: argon2id
+password hashes, app-password and recovery-code hashes, and email-token
+keyed digests (see the table in "Secrets at rest"). The catch: **the KEK is
+now part of every backup.** Lose it (a deleted or disabled Cloud KMS key,
+a lost `--kek-file`) and no restored account can sign, so every account
+would need a PLC rotation. The KMS key needs its own multi-region replica
+(or a key in a multi-region location), deletion protection (Cloud KMS
+destroy-scheduled duration at its maximum, IAM that keeps
+`cloudkms.cryptoKeyVersions.destroy` from node and operator roles), and a
+restore drill that unwraps from the backup. The 30-day compliance lock on
+backups also keeps blobs wrapped under a KEK version that has since been
+rotated out: keep old KEK versions enabled (or their key files) for at
+least the backup retention.
 
 ## Email
 
@@ -1941,3 +1950,119 @@ tallies and lists each node's config version, error and load times.
 
 Requests without rate limits (`--no-rate-limits`, non-XRPC paths) are
 unchanged.
+
+## Secrets at rest (`src/secrets.rs`)
+
+Everything durable is in one bucket (and its log segments, SSTs, backups
+and replicas), so anyone who can read the bucket would get any secret
+stored there as-is. Secrets the PDS must be able to recover are stored
+only **wrapped under a key-encryption key (KEK)**. Secrets it only verifies
+are stored as hashes.
+
+| Secret | Where | At rest |
+|---|---|---|
+| Repo signing key (secp256k1) | `a/{did}` `wrapped_signing_key` | wrapped, AAD = purpose + DID; public key alongside (`signing_pubkey`) |
+| Reserved signing key | `p/_reserved:{did:key}\0k` | wrapped, AAD = purpose + did:key |
+| TOTP secret (enabled and pending) | `p/{did}\0totp` | wrapped, AAD = purpose + DID |
+| Account password | `a/{did}` `password_hash` | argon2id (unchanged: a verifier) |
+| App passwords | `p/{did}\0apphash/{h}` | SHA-256 of DID + server-generated ~80-bit password (unchanged) |
+| TOTP recovery codes | in `p/{did}\0totp` | SHA-256 (unchanged; ~50 bits, second factor only, needs the password too) |
+| Email tokens (confirm, update, reset, delete, PLC) | `p/{did}\0etok/{purpose}`, `p/_reset:{digest}\0t` | HMAC-SHA256 under a key derived from `jwt_secret` (were plaintext, the reset token even in the key) |
+| OAuth codes, refresh tokens | `oauth/*` rows | hashes / MACs under keys derived from `jwt_secret` (unchanged) |
+| Sessions | `p/{did}\0sess/{id}` | ids only: tokens are JWTs under `jwt_secret` (unchanged) |
+| PLC rotation key | none | the PDS holds none (DIDs minted locally; `getRecommendedDidCredentials` recommends none) |
+| `jwt_secret`, admin / internal tokens, SMTP credentials | flags / env | never in the bucket |
+| DPoP keys | clients | never on the server |
+
+**Wrapping.** A `KeyWrapper` holds one KEK and wraps a secret with
+associated data `vlpds-secret-v1 ‖ purpose ‖ subject`. A blob copied into
+another account's row, or used for another purpose, fails authentication.
+The stored form is `vw1.{kid}.{base64url}`, where `kid` names the KEK (`L` +
+16 hex chars of a hash of a local key, `G` + 16 hex chars of a hash of a
+Cloud KMS key name). Backends:
+- *Local* (`--kek-file` / `VLPDS_KEK`, 32 random bytes): XChaCha20-Poly1305
+  with a random 192-bit nonce per wrap. Required outside `--dev-mode` unless
+  Cloud KMS is configured. Dev mode falls back to a well-known dev KEK, and
+  `check_secrets` refuses that KEK outside dev mode.
+- *Google Cloud KMS* (`--gcp-kms-key`): the secret itself (32 bytes) is
+  the KMS plaintext: `encrypt`/`decrypt` over the REST API with CRC32C
+  integrity fields and `additionalAuthenticatedData`, using the node's
+  service-account token from the metadata server. The client is the shared
+  public client (§7), with a 5 s deadline per call and one token refresh on
+  a 401. No new dependencies, so no cargo feature. A bucket copy is useless
+  without decrypt permission on the key, and every unwrap shows in the KMS
+  audit log. Not a per-account DEK: a DEK would still need a KMS call to
+  unwrap per account, and one deployment-wide DEK held in memory would undo
+  the audit and revocation properties.
+- AWS KMS is not implemented. It would be another `KeyWrapper` (SigV4
+  `Encrypt`/`Decrypt` with `EncryptionContext`).
+
+**Rotation.** The keyring wraps under its current KEK (the Cloud KMS key if
+set, else the local KEK) and unwraps under any configured KEK
+(`--kek-old-file`, `VLPDS_KEK_OLD`, `--gcp-kms-old-key`), by `kid`. Inside
+one CryptoKey, KMS rotates versions by itself, and `decrypt`'s
+`usedPrimary: false` marks a blob stale. `vlpds.admin.rewrapSecrets`
+(per node, over the shards it owns) rewraps every stale signing key
+(an account update with no events; a key that changed meanwhile is left
+alone), reserved key and TOTP secret. `dryRun` counts what is left;
+`checkVersions` unwraps even blobs under the current kid, to find old KMS
+versions. Old KEK material must outlive the backup retention
+("Backups and restore").
+
+**Hot path.** Unwrapped signing keys are cached per DID (the `signing_keys`
+cache in `caches.rs`: 16 LRU shards bounded by the cache budget; an entry
+is valid only for the account's current public key, so a key rotation
+misses and a rewrap still hits). `Keypair` erases its scalar on drop, and
+plaintext buffers are `Zeroizing`. Keys enter the cache when created
+(createAccount, bulkCreate and updateAccountSigningKey wrap and cache in
+one step), so new accounts never unwrap. Otherwise a key is unwrapped once
+per account per cache lifetime: at a repo's cold load (shard preloads warm
+recently written repos after a takeover), on a proxy service-JWT miss, and
+for getServiceAuth. Cold unwraps of one DID are coalesced (256 striped
+locks). Remote calls are limited to `--kms-concurrency` (64) in flight,
+time out after 5 s, and fail fast for 1 s after the key service fails. A
+loaded repo holds its `Arc<Keypair>`, so the commit path never touches the
+keyring. Readers that only need the public key (DID documents,
+describeRepo, service-auth issuer checks, `checkAccountStatus`,
+getRecommendedDidCredentials) read `signing_pubkey` and never unwrap.
+
+**Failure behaviour.** If an unwrap fails as unavailable (timeout, 5xx,
+auth), the repo still loads without its key: reads and exports work, writes
+answer 503 `KeyUnavailable` (nothing applied; every 503 carries
+Retry-After), and the next write reloads and tries again. A new account,
+reserved key or TOTP secret that can't be wrapped fails with the same 503
+and writes nothing (createAccount releases the handle and email claims it
+made while the wrap was in flight). A *rejected* unwrap (wrong KEK or
+AAD, corrupt, unknown kid) is a 500 and a log line. Metrics:
+`vlpds_kms_requests_total{backend,op,result}`,
+`vlpds_kms_request_seconds{backend,op}`,
+`vlpds_signing_key_cache_total{result}`, and
+`vlpds_cache_entries{cache="signing_keys"}`. Alerts:
+`VlpdsKeyServiceUnavailable`, `VlpdsSecretUnwrapRejected`
+(ops/RUNBOOK.md).
+
+**Cost (M4 Pro, dev-release, shared machine).** `bench_commit_cpu` measured
+before and after on a loaded machine (measured before full-tree mode was
+removed): lazy trees 20.9–23.4 µs/commit before and 21.3–24.5 after (full
+trees 17.2–18.1 vs 17.6–18.6). That is within run-to-run noise: the commit path changed only by an `Option`
+deref. Keyring (`secrets::tests::bench_keyring`): a cache hit is about
+0.1 µs. A local-KEK cold unwrap, including key parsing and the public-key
+check, takes 43–65 µs, against a few milliseconds of store reads for the
+cold repo load it is part of. A Cloud KMS unwrap adds one KMS round trip
+(typically 5–30 ms in-region) to that cold load, once per account per
+cache lifetime. Account creation adds one KMS encrypt, run concurrently
+with the argon2 hash (~20 ms).
+
+Tests: `secrets::tests` (round trip, AAD and KEK binding, tampering,
+rotation and rewrap, cache, KEK parsing, the dev-KEK rules) and
+`tests/all/secrets_at_rest.rs`. The integration tests check:
+- no signing key (current, rotated out or reserved), TOTP secret, reset
+  token or KEK appears in any common encoding in any bucket object (log
+  segments decoded) or in any state key or value;
+- rotation end to end: a new KEK with the old one unwrap-only, a dry run,
+  a rewrap and a dry run that finds nothing, then the old KEK retired; a
+  node without the KEK still serves reads;
+- against a mocked Cloud KMS: one wrap per new account and no unwraps
+  while warm; at most one decrypt per account after a restart, even with
+  racing writes; with KMS down, 503 `KeyUnavailable` with nothing written,
+  while reads and getRepo work; writes resume after recovery.

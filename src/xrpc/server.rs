@@ -7,9 +7,9 @@
 //!   p/{did}\0sess/{refresh id}     refresh-token session (rotated on refresh)
 //!   p/{did}\0apppass/{name}        app password metadata
 //!   p/{did}\0apphash/{hash}        app password hash -> name (login lookup)
-//!   p/{did}\0etok/{purpose}        current email token per purpose
-//!   p/{did}\0totp                  TOTP state (src/totp.rs)
-//!   p/_reset:{TOKEN}\0t            password-reset token -> did
+//!   p/{did}\0etok/{purpose}        current email token per purpose (keyed digest)
+//!   p/{did}\0totp                  TOTP state (src/totp.rs; secrets wrapped)
+//!   p/_reset:{digest}\0t           password-reset token digest -> did
 //!   p/_invite:{code}\0c            invite code (+ p/{account}\0invite/{code} index)
 //!   p/{did}\0sec/rvk/f/{family}    revoked session family (access tokens), TTL'd
 //!   p/{did}\0sec/rvk/d             all sessions of the DID revoked before a time
@@ -685,10 +685,20 @@ pub(super) fn deliver(
 // email tokens
 // ---------------------------------------------------------------------------
 
+/// Only a keyed digest of the token is stored (bucket readers can't use a
+/// live one): `token_hash` = [`email_token_digest`].
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EmailToken {
-    token: String,
+    token_hash: String,
     requested_at: u64,
+}
+
+/// HMAC-SHA256 of an (uppercased) email token under a key derived from the
+/// server secret, which isn't in the bucket. Tokens have ~50 bits and live
+/// 15 minutes; an unkeyed hash of one could be brute-forced offline.
+fn email_token_digest(app: &App, token: &str) -> String {
+    let key = crate::oauth::util::derive_secret(&app.config.jwt_secret, "email-token");
+    hex::encode(crate::oauth::util::hmac_sha256(&key, &[token.trim().to_ascii_uppercase().as_bytes()]))
 }
 
 pub(super) const EMAIL_PURPOSES: &[&str] = &[
@@ -702,8 +712,9 @@ pub(super) const EMAIL_PURPOSES: &[&str] = &[
 /// Creates (replacing any previous) the account's token for `purpose`.
 pub(super) async fn create_email_token(app: &App, did: &str, purpose: &str) -> XResult<String> {
     let token = random_token().to_ascii_uppercase();
+    let digest = email_token_digest(app, &token);
     let rec = EmailToken {
-        token: token.clone(),
+        token_hash: digest.clone(),
         requested_at: now_ms(),
     };
     app.put_private(
@@ -716,7 +727,7 @@ pub(super) async fn create_email_token(app: &App, did: &str, purpose: &str) -> X
     )
     .await?;
     if purpose == "reset_password" {
-        let routing = format!("_reset:{token}");
+        let routing = format!("_reset:{digest}");
         app.put_private(
             &routing,
             vec![pmut(&routing, "t", Some(did.as_bytes().to_vec()))],
@@ -736,7 +747,7 @@ pub(super) async fn assert_email_token(
     let Some(rec) = rec else {
         return Err(invalid_token("Token is invalid"));
     };
-    if !rec.token.eq_ignore_ascii_case(token.trim()) {
+    if !crate::auth::token_eq(&rec.token_hash, &email_token_digest(app, token)) {
         return Err(invalid_token("Token is invalid"));
     }
     if now_ms().saturating_sub(rec.requested_at) > EMAIL_TOKEN_TTL_MS {
@@ -1373,9 +1384,28 @@ pub(super) async fn create_account_inner(
     // password hash (~20 ms of CPU on the blocking pool) run concurrently:
     // one after the other they were most of createAccount's latency, and at
     // a fixed concurrency its rate.
-    let (h, e, password_hash) =
-        tokio::join!(claim_handle(app, &handle, &did), claim_email(app, &email, &did), state::hash_password(&password));
+    // The signing key is wrapped (a KMS call in production) alongside.
+    let key = Arc::new(Keypair::generate());
+    let (h, e, password_hash, wrapped) = tokio::join!(
+        claim_handle(app, &handle, &did),
+        claim_email(app, &email, &did),
+        state::hash_password(&password),
+        app.secrets.wrap_signing_key(&did, &key)
+    );
     let (h_ok, e_ok) = (matches!(h, Ok(true)), matches!(e, Ok(true)));
+    let (wrapped_signing_key, signing_pubkey) = match wrapped {
+        Ok(w) => w,
+        Err(err) => {
+            if h_ok {
+                release_handle(app, &handle, &did).await;
+            }
+            if e_ok {
+                release_email(app, &email, &did).await;
+            }
+            release(claim).await;
+            return Err(err.into());
+        }
+    };
     if !(h_ok && e_ok) {
         if h_ok {
             release_handle(app, &handle, &did).await;
@@ -1390,11 +1420,11 @@ pub(super) async fn create_account_inner(
         e?;
         return Err(invalid_request(format!("Email already taken: {email}")));
     }
-    let key = Arc::new(Keypair::generate());
     let mut acct = Account {
         did: did.clone(),
         handle: handle.clone(),
-        signing_key: hex::encode(key.to_bytes()),
+        wrapped_signing_key,
+        signing_pubkey,
         created_at: crate::events::now_rfc3339(),
         email: Some(email.clone()),
         ..Default::default()
@@ -1865,9 +1895,7 @@ async fn assert_valid_did_doc(app: &App, a: &Account) -> XResult<()> {
             "DID document atproto_pds service endpoint does not match PDS public url",
         ));
     }
-    let key = Keypair::from_bytes(&hex::decode(&a.signing_key).map_err(XrpcError::from_err)?)
-        .map_err(XrpcError::from_err)?;
-    if crate::did_resolver::signing_key_multibase(&doc).as_deref() != Some(key.public_multibase().as_str()) {
+    if crate::did_resolver::signing_key_multibase(&doc).as_deref() != Some(a.signing_pubkey.as_str()) {
         return Err(invalid_request(
             "DID document verification method does not match expected signing key",
         ));
@@ -2085,7 +2113,9 @@ async fn reserve_signing_key(
     let did_key = key.did_key();
     let routing = reserved_routing(&did_key);
     let now = crate::events::now_rfc3339();
-    let rec = json!({"key": hex::encode(key.to_bytes()), "did": did, "createdAt": now});
+    // wrapped, bound to the did:key it is reserved under
+    let wrapped = app.secrets.wrap(crate::secrets::Purpose::ReservedKey, &did_key, &key.to_bytes()).await?;
+    let rec = json!({"key": wrapped, "did": did, "createdAt": now});
     app.put_private(
         &routing,
         vec![pmut(&routing, "k", Some(to_json_bytes(&rec)))],
@@ -2107,19 +2137,24 @@ pub(super) async fn take_reserved_key(app: &App, did_key: &str) -> XResult<Optio
     let Some(rec) = get_json::<J>(app, &routing, "k").await? else {
         return Ok(None);
     };
+    // unwrap before consuming the reservation: with the key service down
+    // the caller retries and the reservation is still there
+    let raw = if reservation_expired(&rec, RESERVED_KEY_TTL) {
+        None
+    } else {
+        let blob = rec["key"].as_str().unwrap_or("");
+        Some(app.secrets.unwrap(crate::secrets::Purpose::ReservedKey, did_key, blob).await?.plaintext)
+    };
     app.put_private(&routing, vec![pmut(&routing, "k", None)])
         .await?;
     if let Some(did) = rec["did"].as_str() {
         let idx = reserved_routing(did);
         app.put_private(&idx, vec![pmut(&idx, "k", None)]).await?;
     }
-    if reservation_expired(&rec, RESERVED_KEY_TTL) {
+    let Some(raw) = raw else {
         return Ok(None);
-    }
-    let key = Keypair::from_bytes(
-        &hex::decode(rec["key"].as_str().unwrap_or("")).map_err(XrpcError::from_err)?,
-    )
-    .map_err(XrpcError::from_err)?;
+    };
+    let key = Keypair::from_bytes(&raw).map_err(XrpcError::from_err)?;
     Ok(Some(key))
 }
 
@@ -2388,7 +2423,7 @@ struct ResetPasswordIn {
 /// The account a password-reset token was issued for (a global lookup; HA
 /// routing sends resetPassword to that account's owner).
 pub async fn reset_token_did(app: &App, token: &str) -> XResult<Option<String>> {
-    let routing = format!("_reset:{}", token.trim().to_ascii_uppercase());
+    let routing = format!("_reset:{}", email_token_digest(app, token));
     Ok(app
         .get_private(&routing, "t")
         .await?
@@ -2418,7 +2453,7 @@ async fn reset_password(
         return Err(invalid_request("Invalid password length."));
     }
     let token = inp.token.trim().to_ascii_uppercase();
-    let routing = format!("_reset:{token}");
+    let routing = format!("_reset:{}", email_token_digest(&app, &token));
     let did = reset_token_did(&app, &token)
         .await?
         .ok_or_else(|| invalid_token("Token is invalid"))?;
@@ -2625,8 +2660,7 @@ async fn get_service_auth(
             "cannot request a service auth token for the following protected method: {l}"
         )));
     }
-    let key = Keypair::from_bytes(&hex::decode(&acct.signing_key).map_err(XrpcError::from_err)?)
-        .map_err(XrpcError::from_err)?;
+    let key = app.secrets.account_signing_key(&acct).await?;
     let token = crate::auth::service_auth_jwt(&key, &did, &q.aud, lxm, ttl);
     Ok(Json(json!({"token": token})))
 }

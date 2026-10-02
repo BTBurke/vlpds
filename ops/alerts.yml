@@ -695,6 +695,28 @@ groups:
           summary: "{{ $labels.instance }}: cold repo loads are failing ({{ $value | humanize }}/s)"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsrepoloaderrors"
 
+      # The KEK's key service (Cloud KMS) fails or times out: writes to
+      # accounts whose signing key isn't cached get 503 KeyUnavailable, new
+      # accounts can't be created. Reads are unaffected. (guess)
+      - alert: VlpdsKeyServiceUnavailable
+        expr: sum by (instance) (rate(vlpds_kms_requests_total{job="vlpds",result="unavailable"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}: KEK service unavailable ({{ $value | humanize }}/s failed calls); cold writes are failing"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdskeyserviceunavailable"
+
+      # A wrapped secret didn't authenticate (wrong KEK, KEK retired too
+      # early, or a corrupt row): that account can't write. Should never happen.
+      - alert: VlpdsSecretUnwrapRejected
+        expr: sum by (instance) (increase(vlpds_kms_requests_total{job="vlpds",op="unwrap",result="rejected"}[1h])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: wrapped secrets rejected by the KEK"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssecretunwraprejected"
+
       # A persisted MST node or rebuilt subtree didn't match its link: the
       # repo was rebuilt from its records instead. Should never happen.
       - alert: VlpdsLazyMstInvalid

@@ -41,9 +41,12 @@ pub enum Cache {
     PermissionSets,
     /// Per-DID session revocations + record/blob takedowns (xrpc/server.rs `ctl`).
     SecurityControls,
+    /// Unwrapped repo signing keys (secrets.rs): a miss is a KEK unwrap
+    /// (a Cloud KMS round trip in production).
+    SigningKeys,
 }
 
-const N: usize = 9;
+const N: usize = 10;
 
 impl Cache {
     pub const ALL: [Cache; N] = [
@@ -56,6 +59,7 @@ impl Cache {
         Cache::OAuthClients,
         Cache::PermissionSets,
         Cache::SecurityControls,
+        Cache::SigningKeys,
     ];
 
     pub fn name(self) -> &'static str {
@@ -69,6 +73,7 @@ impl Cache {
             Cache::OAuthClients => "oauth_clients",
             Cache::PermissionSets => "permission_sets",
             Cache::SecurityControls => "security_controls",
+            Cache::SigningKeys => "signing_keys",
         }
     }
 
@@ -92,14 +97,16 @@ impl Cache {
             Cache::PermissionSets => 4 << 10,
             // DID + Arc<Ctl> (empty sets for almost every account)
             Cache::SecurityControls => 256,
+            // DID + public multibase + Arc<Keypair> + LRU links
+            Cache::SigningKeys => 256,
         }
     }
 
     /// Share of the budget, in percent (the weights sum to 100).
     fn weight(self) -> u64 {
         match self {
-            Cache::SessionTokens => 27,
-            Cache::OAuthTokens => 27,
+            Cache::SessionTokens => 25,
+            Cache::OAuthTokens => 25,
             Cache::ProxyAccounts => 15,
             Cache::ProxyJwts => 10,
             Cache::DidDocs => 10,
@@ -107,6 +114,7 @@ impl Cache {
             Cache::OAuthClients => 2,
             Cache::PermissionSets => 1,
             Cache::SecurityControls => 6,
+            Cache::SigningKeys => 4,
         }
     }
 
@@ -319,8 +327,8 @@ mod tests {
     fn budget_split() {
         assert_eq!(Cache::ALL.iter().map(|c| c.weight()).sum::<u64>(), 100);
         let caps = Caps::from_budget(1 << 30);
-        // 27% of 1 GiB at 400 B each
-        assert_eq!(caps.get(Cache::SessionTokens), (((1u64 << 30) / 100 * 27) / 400) as usize);
+        // 25% of 1 GiB at 400 B each
+        assert_eq!(caps.get(Cache::SessionTokens), (((1u64 << 30) / 100 * 25) / 400) as usize);
         assert!(caps.total_bytes() <= 1 << 30, "{caps}");
         assert!(caps.total_bytes() > (1 << 30) * 9 / 10, "{caps}");
         // tiny budgets keep a floor

@@ -245,6 +245,37 @@ struct Args {
     /// well-known dev secrets are accepted.
     #[arg(long, env = "VLPDS_DEV_MODE")]
     dev_mode: bool,
+    /// Key-encryption key for secrets at rest (signing keys, TOTP secrets;
+    /// DESIGN.md "Secrets at rest"): a file of 32 random bytes (raw, hex or
+    /// base64), the same on every node. Required outside --dev-mode unless
+    /// --gcp-kms-key is set (then it is accepted for unwrap only).
+    #[arg(long, env = "VLPDS_KEK_FILE")]
+    kek_file: Option<std::path::PathBuf>,
+    /// The KEK itself (hex or base64), instead of --kek-file.
+    #[arg(long, env = "VLPDS_KEK", hide_env_values = true, conflicts_with = "kek_file")]
+    kek: Option<String>,
+    /// Previous KEK files, accepted for unwrap only (KEK rotation: keep them
+    /// until `vlpds.admin.rewrapSecrets` reports nothing stale).
+    #[arg(long, env = "VLPDS_KEK_OLD_FILE", value_delimiter = ',')]
+    kek_old_file: Vec<std::path::PathBuf>,
+    /// Previous KEKs as values (hex or base64, comma-separated).
+    #[arg(long, env = "VLPDS_KEK_OLD", value_delimiter = ',', hide_env_values = true)]
+    kek_old: Vec<String>,
+    /// Google Cloud KMS CryptoKey that wraps secrets
+    /// (projects/P/locations/L/keyRings/R/cryptoKeys/K), used with the
+    /// node's service account (metadata server). Takes precedence over
+    /// --kek-file for new wraps.
+    #[arg(long, env = "VLPDS_GCP_KMS_KEY")]
+    gcp_kms_key: Option<String>,
+    /// Previous CryptoKeys, unwrap only (moving to another key).
+    #[arg(long, env = "VLPDS_GCP_KMS_OLD_KEY", value_delimiter = ',')]
+    gcp_kms_old_key: Vec<String>,
+    /// Cloud KMS API base URL.
+    #[arg(long, env = "VLPDS_GCP_KMS_ENDPOINT", default_value = vlpds::secrets::GCP_KMS_ENDPOINT)]
+    gcp_kms_endpoint: String,
+    /// Remote KMS calls in flight per node (cold signing-key unwraps).
+    #[arg(long, env = "VLPDS_KMS_CONCURRENCY", default_value_t = vlpds::secrets::DEFAULT_KMS_CONCURRENCY)]
+    kms_concurrency: usize,
     /// Send email over SMTP: smtp://[user:pass@]host[:port] (STARTTLS when
     /// offered; ?tls=required|none) or smtps://... (implicit TLS). Falls back
     /// to the reference PDS's PDS_EMAIL_SMTP_URL. Unset: mail is only logged
@@ -514,6 +545,29 @@ fn secret(v: &Option<String>, dev_mode: bool, dev_default: &str) -> String {
     }
 }
 
+/// The KEK flags as a [`vlpds::secrets::KekConfig`].
+fn kek_config(args: &Args) -> anyhow::Result<vlpds::secrets::KekConfig> {
+    use vlpds::secrets::KekBytes;
+    let local = match (&args.kek_file, &args.kek) {
+        (Some(p), _) => Some(KekBytes::from_file(p)?),
+        (None, Some(v)) => Some(KekBytes::parse(v)?),
+        (None, None) => None,
+    };
+    let mut local_old = args.kek_old_file.iter().map(|p| KekBytes::from_file(p)).collect::<anyhow::Result<Vec<_>>>()?;
+    for v in args.kek_old.iter().filter(|v| !v.trim().is_empty()) {
+        local_old.push(KekBytes::parse(v)?);
+    }
+    Ok(vlpds::secrets::KekConfig {
+        local,
+        local_old,
+        gcp_key: args.gcp_kms_key.clone().filter(|k| !k.is_empty()),
+        gcp_old_keys: args.gcp_kms_old_key.iter().filter(|k| !k.is_empty()).cloned().collect(),
+        gcp_endpoint: Some(args.gcp_kms_endpoint.clone()),
+        gcp_token: None,
+        kms_concurrency: args.kms_concurrency,
+    })
+}
+
 async fn run(args: Args) -> anyhow::Result<()> {
     vlpds::partition::set_block_cache_bytes(args.block_cache_mb << 20);
     vlpds::partition::set_sst_compression(args.sst_compression.parse()?);
@@ -567,6 +621,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         report_service: url_did(&args.report_service)?,
         crawlers: args.crawlers.clone(),
         dev_mode: args.dev_mode,
+        kek: kek_config(&args)?,
         mailer: vlpds::mail::from_flags(args.email_smtp_url.clone(), args.email_from_address.clone())?,
         max_blob_size: args.max_blob_mb << 20,
         blob_gc_grace: Duration::from_secs(args.blob_gc_grace_secs),

@@ -14,6 +14,7 @@ use super::*;
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/xrpc/vlpds.admin.bulkCreate", post(bulk_create))
+        .route("/xrpc/vlpds.admin.rewrapSecrets", post(rewrap_secrets))
         .route("/xrpc/vlpds.admin.getDevMail", get(get_dev_mail))
         .route(
             "/xrpc/com.atproto.admin.getAccountInfo",
@@ -771,9 +772,12 @@ async fn update_account_signing_key(
         None => Keypair::generate(),
     };
     let did_key = key.did_key();
-    let secret = hex::encode(key.to_bytes());
+    // wrapped for the row; cached unwrapped, so the repo's reload after the
+    // rotation needs no unwrap
+    let (wrapped, pubkey) = app.secrets.wrap_signing_key(&inp.did, &Arc::new(key)).await?;
     update_account(&app, &inp.did, true, false, |a| {
-        a.signing_key = secret;
+        a.wrapped_signing_key = wrapped;
+        a.signing_pubkey = pubkey;
         Ok(())
     })
     .await?;
@@ -1367,10 +1371,12 @@ async fn bulk_create(
         }
         let handle = state::bulk_handle(i);
         let key = Arc::new(Keypair::generate());
+        let (wrapped_signing_key, signing_pubkey) = app.secrets.wrap_signing_key(&did, &key).await?;
         let acct = Account {
             did: did.clone(),
             handle: handle.clone(),
-            signing_key: hex::encode(key.to_bytes()),
+            wrapped_signing_key,
+            signing_pubkey,
             // simulation accounts share one precomputed hash (Argon2id is ~20 ms each)
             password_hash: BULK_PASSWORD_HASH.clone(),
             created_at: crate::events::now_rfc3339(),
@@ -1423,3 +1429,136 @@ async fn bulk_create(
 
 static BULK_PASSWORD_HASH: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| state::hash_password_blocking("hunter2"));
+
+// ---------------------------------------------------------------------------
+// KEK rotation (DESIGN.md "Secrets at rest")
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct RewrapIn {
+    /// Count what is stale, change nothing.
+    #[serde(default)]
+    dry_run: bool,
+    /// Also unwrap blobs already under the current KEK's id, to find (and
+    /// rewrap) ones under an older version of a Cloud KMS key. One KMS
+    /// decrypt per secret.
+    #[serde(default)]
+    check_versions: bool,
+}
+
+/// Rewraps every secret at rest in the shards this node owns under the
+/// current KEK: account signing keys, reserved signing keys and TOTP
+/// secrets. Run it on every node after adding a new KEK (the old one
+/// still configured for unwrap), and again with `dryRun` until each
+/// reports `stale: 0` before retiring the old KEK. Shards that move during
+/// a run are covered by running it again. Idempotent.
+async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Json<RewrapIn>>) -> XResult<Json<J>> {
+    use crate::secrets::Purpose;
+    use futures::StreamExt;
+    require_admin(&creds)?;
+    let inp = body.map(|Json(b)| b).unwrap_or_default();
+    let started = std::time::Instant::now();
+    // the accounts of the owned shards
+    let mut dids = Vec::new();
+    for p in app.partitions.owned() {
+        let mut it = state::FamilyScan::new(p.db.as_ref(), state::ACCOUNT_FAMILY, None, &Default::default())
+            .await
+            .map_err(XrpcError::from_err)?;
+        while let Some(kv) = it.next().await.map_err(XrpcError::from_err)? {
+            let a: Account = serde_json::from_slice(&kv.value).map_err(XrpcError::from_err)?;
+            dids.push((a.did, a.wrapped_signing_key));
+        }
+    }
+    let (accounts, check, dry) = (dids.len(), inp.check_versions, inp.dry_run);
+    let app2 = app.clone();
+    // (stale signing key, stale TOTP, errors)
+    let results: Vec<(bool, bool, Option<String>)> = futures::stream::iter(dids)
+        .map(|(did, blob)| {
+            let app = app2.clone();
+            async move {
+                let r: XResult<(bool, bool)> = async {
+                    let key_stale = if !check && app.secrets.is_current(&blob) {
+                        false
+                    } else if dry {
+                        app.secrets.unwrap(Purpose::SigningKey, &did, &blob).await?.stale
+                    } else {
+                        match app.secrets.rewrap(Purpose::SigningKey, &did, &blob).await? {
+                            None => false,
+                            Some(new) => {
+                                update_account(&app, &did, false, false, move |a| {
+                                    // unless rotated meanwhile
+                                    if a.wrapped_signing_key == blob {
+                                        a.wrapped_signing_key = new;
+                                    }
+                                    Ok(())
+                                })
+                                .await?;
+                                true
+                            }
+                        }
+                    };
+                    let totp_stale = crate::totp::rewrap(&app, &did, check, dry).await?;
+                    Ok((key_stale, totp_stale))
+                }
+                .await;
+                match r {
+                    Ok((k, t)) => (k, t, None),
+                    Err(e) => (false, false, Some(format!("{did}: {}", e.message))),
+                }
+            }
+        })
+        .buffer_unordered(16)
+        .collect()
+        .await;
+    let mut errors: Vec<String> = Vec::new();
+    let (mut keys, mut totp) = (0u64, 0u64);
+    for (k, t, e) in results {
+        keys += k as u64;
+        totp += t as u64;
+        errors.extend(e);
+    }
+    // reserved signing keys (did:key-indexed rows carry the wrapped key)
+    let mut reserved = 0u64;
+    for (routing, name, val) in super::server::scan_private_routing(&app, "_reserved:").await? {
+        let Some(did_key) = routing.strip_prefix("_reserved:").filter(|r| r.starts_with("did:key:") && name == "k") else {
+            continue;
+        };
+        let Ok(mut rec) = serde_json::from_slice::<J>(&val) else { continue };
+        let Some(blob) = rec["key"].as_str().map(str::to_string) else { continue };
+        if !check && app.secrets.is_current(&blob) {
+            continue;
+        }
+        let r = if dry {
+            app.secrets.unwrap(Purpose::ReservedKey, did_key, &blob).await.map(|u| u.stale.then_some(String::new()))
+        } else {
+            app.secrets.rewrap(Purpose::ReservedKey, did_key, &blob).await
+        };
+        match r {
+            Ok(None) => {}
+            Ok(Some(_)) if dry => reserved += 1,
+            Ok(Some(new)) => {
+                rec["key"] = json!(new);
+                app.put_private(&routing, vec![pmut(&routing, "k", Some(to_json_bytes(&rec)))]).await?;
+                reserved += 1;
+            }
+            Err(e) => errors.push(format!("{did_key}: {e}")),
+        }
+    }
+    let stale = keys + totp + reserved;
+    tracing::info!(accounts, signing_keys = keys, totp, reserved, errors = errors.len(), dry_run = dry, kek = app.secrets.current_kid(), elapsed_ms = started.elapsed().as_millis() as u64, "rewrap secrets");
+    let failed = errors.len();
+    errors.truncate(20);
+    Ok(Json(json!({
+        "kek": app.secrets.current_kid(),
+        "dryRun": dry,
+        "accounts": accounts,
+        // stale secrets found (dry run) or rewrapped
+        "stale": stale,
+        "signingKeys": keys,
+        "totpSecrets": totp,
+        "reservedKeys": reserved,
+        "failed": failed,
+        "errors": errors,
+    })))
+}

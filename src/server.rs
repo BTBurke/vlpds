@@ -74,6 +74,9 @@ pub struct Config {
     pub crawlers: Vec<String>,
     /// Dev mode: email/password-reset tokens are returned/logged instead of mailed.
     pub dev_mode: bool,
+    /// Key-encryption keys for secrets at rest (src/secrets.rs; `--kek-file`,
+    /// `--gcp-kms-key`). Empty: the dev KEK, dev mode only.
+    pub kek: crate::secrets::KekConfig,
     /// This node's outbound email (`--email-smtp-url`, crate::mail). None:
     /// the process-wide mailer (logs only, unless `xrpc::set_mailer`).
     pub mailer: Option<crate::mail::SharedMailer>,
@@ -167,6 +170,7 @@ impl Config {
             anyhow::ensure!(v != dev, "{name} is the dev default; set a real secret (or run with --dev-mode)");
             anyhow::ensure!(v.len() >= MIN_SECRET_LEN, "{name} must be at least {MIN_SECRET_LEN} bytes");
         }
+        self.kek.check(self.dev_mode)?;
         if !self.dev_mode {
             for (i, (a, va, _)) in secrets.iter().enumerate() {
                 for (b, vb, _) in &secrets[i + 1..] {
@@ -213,6 +217,7 @@ impl Default for Config {
             report_service: None,
             crawlers: Vec::new(),
             dev_mode: true,
+            kek: Default::default(),
             mailer: None,
             cluster: None,
             max_blob_size: 100 << 20,
@@ -280,7 +285,9 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let lookup: worker::PartitionLookup = Arc::new(move |did: &str| lookup_parts.for_key(did));
     let limits = worker::CacheLimits { entries: cfg.cache_per_worker, bytes: cfg.repo_cache_bytes / cfg.workers.max(1), prefetch_bytes: cfg.lazy_mst_prefetch_bytes, unload_idle: cfg.lazy_mst_unload_idle };
     crate::mst_store::NODE_CACHE.set_bytes(cfg.lazy_mst_node_cache_bytes);
-    let workers = worker::spawn(cfg.workers, limits, lookup, tokio::runtime::Handle::current());
+    let secrets = Arc::new(crate::secrets::Secrets::from_config(&cfg.kek, cfg.dev_mode)?);
+    tracing::info!(kek = secrets.current_kid(), unwrap_keks = ?secrets.kids(), dev = secrets.is_dev(), "secrets at rest");
+    let workers = worker::spawn_with_secrets(cfg.workers, limits, lookup, tokio::runtime::Handle::current(), secrets.clone());
 
     let mut cc = cfg.cluster.clone().unwrap_or_else(|| ClusterConfig { node_id: "single".into(), addr: cfg.public_url.clone(), ..Default::default() });
     cc.shards = n;
@@ -371,6 +378,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         did_resolver: Arc::new(crate::did_resolver::DidResolver::new(&cfg.plc_url, cfg.dev_mode)),
         http,
         ratelimit: Arc::new(crate::ratelimit::Limiter::new(&cfg)),
+        secrets,
         config: Arc::new(cfg),
         cluster: Some(cluster),
         log,
@@ -627,10 +635,16 @@ mod tests {
             jwt_secret: jwt.into(),
             admin_token: admin.into(),
             internal_token: internal.into(),
+            kek: crate::secrets::KekConfig { local: Some(crate::secrets::KekBytes::random()), ..Default::default() },
             ..Config::default()
         };
         let (a, b, c) = ("a".repeat(32), "b".repeat(32), "c".repeat(32));
         prod(&a, &b, &c).check_secrets().expect("strong distinct secrets");
+        // a KEK is required, and not the dev one
+        let e = Config { kek: Default::default(), ..prod(&a, &b, &c) }.check_secrets().unwrap_err();
+        assert!(e.to_string().contains("key-encryption key"), "{e}");
+        let dev_kek = crate::secrets::KekConfig { local: Some(crate::secrets::dev_kek()), ..Default::default() };
+        assert!(Config { kek: dev_kek, ..prod(&a, &b, &c) }.check_secrets().is_err());
         // dev defaults
         let e = Config { dev_mode: false, ..Config::default() }.check_secrets().unwrap_err();
         assert!(e.to_string().contains("VLPDS_JWT_SECRET"), "{e}");

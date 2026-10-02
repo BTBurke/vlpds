@@ -13,6 +13,7 @@ use crate::mst::Tree;
 use crate::mst_lazy::{LazyTree, Source};
 use crate::mst_store::{DbSource, ScanSource};
 use crate::partition::{LogEntry, Partition};
+use crate::secrets::Secrets;
 use crate::segment::Mutation;
 use crate::state::{self, Head};
 use crate::stats::STATS;
@@ -44,6 +45,9 @@ pub enum WriteError {
     /// owners). Only raised before the request started, so it was never
     /// applied: 503 `ShardMoved`, which the entry node resends.
     Unavailable(String),
+    /// The repo's signing key couldn't be unwrapped (key service down; see
+    /// src/secrets.rs). Nothing was applied: 503 `KeyUnavailable`.
+    KeyUnavailable(String),
 }
 
 pub enum Write {
@@ -279,7 +283,9 @@ pub struct RepoState {
     /// The repo's MST, loaded along the paths recent operations visited.
     pub mst: LazyTree,
     pub head: Head,
-    pub key: Arc<Keypair>,
+    /// The unwrapped signing key; None if the key service was down at load
+    /// (reads are served, writes refused with `KeyUnavailable`).
+    pub key: Option<Arc<Keypair>>,
     pub pending: Arc<AtomicU32>,
     pub account: state::Account,
     /// Blob refs per record path (drives the b/{did}\0{blob}\0{path} index).
@@ -395,6 +401,17 @@ pub fn spawn(
     partitions: PartitionLookup,
     rt: tokio::runtime::Handle,
 ) -> Workers {
+    spawn_with_secrets(n, limits, partitions, rt, Secrets::dev())
+}
+
+/// [`spawn`] with the node's keyring (signing keys are unwrapped on load).
+pub fn spawn_with_secrets(
+    n: usize,
+    limits: impl Into<CacheLimits>,
+    partitions: PartitionLookup,
+    rt: tokio::runtime::Handle,
+    secrets: Arc<Secrets>,
+) -> Workers {
     let limits = limits.into();
     let mut senders = Vec::with_capacity(n);
     let mut receivers = Vec::with_capacity(n);
@@ -407,9 +424,10 @@ pub fn spawn(
         let me = senders[i].clone();
         let partitions = partitions.clone();
         let rt = rt.clone();
+        let secrets = secrets.clone();
         std::thread::Builder::new()
             .name(format!("repo-worker-{i}"))
-            .spawn(move || Worker::new(i, me, partitions, rt, limits).run(rx))
+            .spawn(move || Worker::new(i, me, partitions, rt, limits, secrets).run(rx))
             .unwrap();
     }
     Workers {
@@ -439,6 +457,8 @@ struct Worker {
     stop: bool,
     /// Repos charged over [`LAZY_REPO_MAX_BYTES`]: unloaded once idle.
     big: HashSet<Arc<str>>,
+    /// Unwraps signing keys on cold loads.
+    secrets: Arc<Secrets>,
 }
 
 impl Worker {
@@ -448,8 +468,10 @@ impl Worker {
         partitions: PartitionLookup,
         rt: tokio::runtime::Handle,
         limits: CacheLimits,
+        secrets: Arc<Secrets>,
     ) -> Worker {
         Worker {
+            secrets,
             label: idx.to_string(),
             me,
             partitions,
@@ -569,10 +591,17 @@ impl Worker {
                     }
                 };
                 let wrote = reqs.iter().any(|q| matches!(q, Queued::Write(_)));
+                let had_key = st.key.is_some();
                 if let Err(e) = process(st, reqs, self.clock_id, &self.rt) {
                     // MST errors mean in-memory state can't be trusted: drop it and
                     // reload from durable state, once nothing is in flight.
                     tracing::error!(%did, "commit failed, evicting repo: {e:#}");
+                    self.discard(did);
+                    continue;
+                }
+                // Without its signing key (key service down at load, or just
+                // rotated) writes are refused: reload, which unwraps again.
+                if st.key.is_none() && (wrote || had_key) {
                     self.discard(did);
                     continue;
                 }
@@ -782,7 +811,7 @@ impl Worker {
     /// [`spawn_load`](Self::spawn_load), also loading what `need` (the first
     /// request's) visits.
     fn spawn_load_with(&mut self, did: Arc<str>, need: Option<Need>) {
-        let opts = LoadOpts { prefetch_bytes: self.limits.prefetch_bytes, need };
+        let opts = LoadOpts { prefetch_bytes: self.limits.prefetch_bytes, need, secrets: Some(self.secrets.clone()) };
         metrics::LOADING_REPOS.inc();
         let me = self.me.clone();
         let Some(partition) = (self.partitions)(&did) else {
@@ -1057,7 +1086,7 @@ impl Worker {
             partition: partition.clone(),
             mst,
             head,
-            key: req.key,
+            key: Some(req.key),
             pending,
             account,
             blob_refs: HashMap::new(),
@@ -1224,6 +1253,8 @@ pub struct LoadOpts {
     pub prefetch_bytes: usize,
     /// What to load besides the root (the first request's paths).
     pub need: Option<Need>,
+    /// Unwraps the account's signing key (None: the dev keyring).
+    pub secrets: Option<Arc<Secrets>>,
 }
 
 /// Recently-written-repo preloads in flight per node: typical repos (a few
@@ -1309,7 +1340,7 @@ pub async fn load_repo(
     partition: Arc<Partition>,
     did: Arc<str>,
 ) -> anyhow::Result<Option<RepoState>> {
-    load_repo_with(partition, did, LoadOpts { prefetch_bytes: DEFAULT_PREFETCH_BYTES, need: None }).await
+    load_repo_with(partition, did, LoadOpts { prefetch_bytes: DEFAULT_PREFETCH_BYTES, need: None, secrets: None }).await
 }
 
 pub async fn load_repo_with(
@@ -1327,7 +1358,15 @@ pub async fn load_repo_with(
         .await?
         .ok_or_else(|| anyhow::anyhow!("head without account"))?;
     let acct: state::Account = serde_json::from_slice(&av)?;
-    let key = Keypair::from_bytes(&hex::decode(&acct.signing_key)?)?;
+    // the signing key: cached, else unwrapped (a KMS call). With the key
+    // service down the repo still loads for reads; writes get a 503
+    // (process_with) and the next one reloads (retries the unwrap).
+    let secrets = opts.secrets.clone().unwrap_or_else(Secrets::dev);
+    let key = match secrets.account_signing_key(&acct).await {
+        Ok(k) => Some(k),
+        Err(e) if e.retryable() => None,
+        Err(e) => return Err(anyhow::anyhow!("signing key of {did}: {e}")),
+    };
     let (mst, backfill) = open_lazy(&partition, &did, &head, &opts).await?;
     let blob_refs = load_blob_refs(db, &did).await?;
     let mut st = finish_load(partition.clone(), did, mst, head, key, acct)?;
@@ -1404,7 +1443,7 @@ fn finish_load(
     did: Arc<str>,
     mut mst: LazyTree,
     head: Head,
-    key: Keypair,
+    key: Option<Arc<Keypair>>,
     account: state::Account,
 ) -> anyhow::Result<RepoState> {
     let root = mst.tree.root_cid()?;
@@ -1420,7 +1459,7 @@ fn finish_load(
         partition,
         mst,
         head,
-        key: Arc::new(key),
+        key,
         pending: Arc::new(AtomicU32::new(0)),
         account,
         blob_refs: HashMap::new(),
@@ -1495,6 +1534,10 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, rt: &tokio::run
     r
 }
 
+fn key_unavailable(did: &str) -> WriteError {
+    WriteError::KeyUnavailable(format!("signing key of {did} is unavailable (key service unreachable); retry"))
+}
+
 fn process_with(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, src: &dyn Source) -> anyhow::Result<()> {
     let mut batch = Batch::new();
     for q in reqs {
@@ -1521,6 +1564,10 @@ fn process_with(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, src: &dyn 
             let _ = req
                 .reply
                 .send(Err(WriteError::RepoInactive(status.clone())));
+            continue;
+        }
+        if st.key.is_none() {
+            let _ = req.reply.send(Err(key_unavailable(&st.did)));
             continue;
         }
         if req.writes.len() > MAX_COMMIT_OPS {
@@ -1712,7 +1759,9 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
     let rev = tid::next_rev(Some(st.head.rev), clock_id);
     let rev_s = rev.to_string();
     let since_s = st.head.rev.to_string();
-    let (commit, commit_block) = sign_commit(&st.did, &rev_s, &data, &st.key);
+    // process_with refuses writes to a repo without its key
+    let key = st.key.as_deref().ok_or_else(|| anyhow::anyhow!("signing key unavailable"))?;
+    let (commit, commit_block) = sign_commit(&st.did, &rev_s, &data, key);
 
     let mut ops = Vec::with_capacity(batch.ops.len());
     let mut muts = Vec::with_capacity(batch.ops.len() + 1);
@@ -2041,8 +2090,12 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
                 ));
             }
             // signing key rotation (admin.updateAccountSigningKey): sign later commits with the new key
-            if account.signing_key != st.account.signing_key {
-                st.key = Arc::new(Keypair::from_bytes(&hex::decode(&account.signing_key)?)?);
+            // (only its wrapped form is in the row: drop the old key, and the
+            // worker reloads the repo, which finds the new one in the
+            // keyring's cache, put there by the rotation). A rewrap under a
+            // new KEK keeps the key.
+            if account.signing_pubkey != st.account.signing_pubkey {
+                st.key = None;
             }
             st.account = account;
         }
@@ -2085,6 +2138,10 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
                     .send(Err(WriteError::RepoInactive(status.clone())));
                 return Ok(());
             }
+            let Some(key) = st.key.clone() else {
+                let _ = req.reply.send(Err(key_unavailable(&st.did)));
+                return Ok(());
+            };
             let old_nodes = clear_repo_mutations(st, &mut muts, src)?;
             let rev = tid::next_rev(Some(st.head.rev), clock_id);
             let mut tree = Tree::new();
@@ -2106,7 +2163,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             }
             let data = tree.root_cid()?;
             replace_nodes_mutations(&st.did, old_nodes, &tree, &mut muts);
-            let (commit, commit_block) = sign_commit(&st.did, &rev.to_string(), &data, &st.key);
+            let (commit, commit_block) = sign_commit(&st.did, &rev.to_string(), &data, &key);
             // a deactivated account (mid-migration) is announced with #sync
             // when activated (reference importRepo sequences nothing)
             if st.account.status.is_none() {
@@ -2231,7 +2288,7 @@ mod tests {
         let did: Arc<str> = "did:plc:test".into();
         let key = Arc::new(Keypair::generate());
         let account = serde_json::json!({
-            "did": &*did, "handle": "t.test", "signing_key": hex::encode(key.to_bytes()),
+            "did": &*did, "handle": "t.test", "wrapped_signing_key": Secrets::dev().wrap_signing_key(&did, &key).await.unwrap().0, "signing_pubkey": key.public_multibase(),
             "password_hash": "", "created_at": "2026-01-01T00:00:00Z",
         });
         let (reply, created) = oneshot::channel();
@@ -2287,7 +2344,7 @@ mod tests {
         let did: Arc<str> = "did:plc:claims".into();
         let key = Arc::new(Keypair::generate());
         let account = serde_json::json!({
-            "did": &*did, "handle": "t.test", "signing_key": hex::encode(key.to_bytes()),
+            "did": &*did, "handle": "t.test", "wrapped_signing_key": Secrets::dev().wrap_signing_key(&did, &key).await.unwrap().0, "signing_pubkey": key.public_multibase(),
             "password_hash": "", "created_at": "2026-01-01T00:00:00Z",
         });
         let (reply, created) = oneshot::channel();
@@ -2347,10 +2404,10 @@ mod tests {
             let root = tree.root_cid().unwrap();
             let head = Head { commit: root, data: root, rev: Tid(1), commit_block: Bytes::new() };
             let acct: state::Account = serde_json::from_value(serde_json::json!({
-                "did": &*did, "handle": "t.test", "signing_key": hex::encode(key.to_bytes()), "password_hash": "", "created_at": "",
+                "did": &*did, "handle": "t.test", "wrapped_signing_key": "", "signing_pubkey": key.public_multibase(), "password_hash": "", "created_at": "",
             }))
             .unwrap();
-            (did.clone(), finish_load(part.clone(), did, LazyTree::loaded(tree, 1), head, key, acct).unwrap())
+            (did.clone(), finish_load(part.clone(), did, LazyTree::loaded(tree, 1), head, Some(Arc::new(key)), acct).unwrap())
         };
         // a repo's charge fully loaded, and with its root only
         let charges = |records: u32| {
@@ -2363,7 +2420,7 @@ mod tests {
         assert!(full > 3 * root, "{full} vs {root}");
         let limits = CacheLimits { entries: 100, bytes: full + root + root / 2, ..CacheLimits::from(0) };
         let (me, _me_rx) = crossbeam_channel::unbounded();
-        let mut w = Worker::new(0, me, Arc::new(|_: &str| None), tokio::runtime::Handle::current(), limits);
+        let mut w = Worker::new(0, me, Arc::new(|_: &str| None), tokio::runtime::Handle::current(), limits, Secrets::dev());
         let put = |w: &mut Worker, (did, st): (Arc<str>, RepoState)| {
             w.cache_put(did.clone(), st);
             w.settle(&did);
@@ -2461,10 +2518,10 @@ mod tests {
             let root = tree.root_cid().unwrap();
             let head = Head { commit: root, data: root, rev: Tid(1), commit_block: Bytes::new() };
             let acct: state::Account = serde_json::from_value(serde_json::json!({
-                "did": &*did, "handle": "t.test", "signing_key": hex::encode(key.to_bytes()), "password_hash": "", "created_at": "",
+                "did": &*did, "handle": "t.test", "wrapped_signing_key": "", "signing_pubkey": key.public_multibase(), "password_hash": "", "created_at": "",
             }))
             .unwrap();
-            let mut st = finish_load(part.clone(), did.clone(), LazyTree::loaded(tree, 1), head, key, acct).unwrap();
+            let mut st = finish_load(part.clone(), did.clone(), LazyTree::loaded(tree, 1), head, Some(Arc::new(key)), acct).unwrap();
             let mut next = records;
             let (mut state_bytes, mut seg_bytes, mut commits) = (0usize, 0usize, 0usize);
             let mut one = |st: &mut RepoState| {

@@ -70,8 +70,6 @@ async fn well_known_atproto_did(State(app): AppState, headers: HeaderMap) -> Res
 
 /// The DID document of a local account (also used by describeRepo).
 pub(super) fn did_doc(app: &App, acct: &Account) -> XResult<J> {
-    let key = Keypair::from_bytes(&hex::decode(&acct.signing_key).map_err(XrpcError::from_err)?)
-        .map_err(XrpcError::from_err)?;
     Ok(json!({
         "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1", "https://w3id.org/security/suites/secp256k1-2019/v1"],
         "id": acct.did,
@@ -80,7 +78,7 @@ pub(super) fn did_doc(app: &App, acct: &Account) -> XResult<J> {
             "id": format!("{}#atproto", acct.did),
             "type": "Multikey",
             "controller": acct.did,
-            "publicKeyMultibase": key.public_multibase(),
+            "publicKeyMultibase": acct.signing_pubkey,
         }],
         "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": app.public_url}],
     }))
@@ -360,11 +358,9 @@ async fn get_recommended_did_credentials(
         .ok_or_else(|| XrpcError::auth("user credentials required"))?
         .to_string();
     let acct = app.account(&did).await?;
-    let key = Keypair::from_bytes(&hex::decode(&acct.signing_key).map_err(XrpcError::from_err)?)
-        .map_err(XrpcError::from_err)?;
     Ok(Json(json!({
         "alsoKnownAs": [format!("at://{}", acct.handle)],
-        "verificationMethods": {"atproto": key.did_key()},
+        "verificationMethods": {"atproto": format!("did:key:{}", acct.signing_pubkey)},
         // This PDS holds no PLC rotation key (DIDs are minted locally and
         // never registered), so it recommends none.
         "rotationKeys": [],

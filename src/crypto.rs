@@ -16,6 +16,15 @@ pub struct Keypair {
     pk: OnceLock<PublicKey>,
 }
 
+/// Unwrapped signing keys live in caches (`secrets::Secrets`, repo state):
+/// overwrite the scalar when the last holder lets go (best effort; see
+/// `SecretKey::non_secure_erase`).
+impl Drop for Keypair {
+    fn drop(&mut self) {
+        self.sk.non_secure_erase();
+    }
+}
+
 impl Keypair {
     fn new(sk: SecretKey) -> Keypair {
         Keypair { sk, pk: OnceLock::new() }
@@ -36,8 +45,12 @@ impl Keypair {
         Ok(Keypair::new(SecretKey::from_slice(b)?))
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.sk.secret_bytes().to_vec()
+    /// The raw secret (callers wrap it at once: `secrets::Secrets`).
+    pub fn to_bytes(&self) -> zeroize::Zeroizing<Vec<u8>> {
+        let mut b = self.sk.secret_bytes();
+        let v = zeroize::Zeroizing::new(b.to_vec());
+        zeroize::Zeroize::zeroize(&mut b);
+        v
     }
 
     /// Low-S ECDSA signature over sha256(data), 64-byte compact form.
