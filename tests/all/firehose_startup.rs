@@ -14,9 +14,15 @@ use std::time::Duration;
 const SHARDS: u16 = 8;
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
+    node_with(id, store, None).await
+}
+
+/// `put_ms`: every segment PUT of this node's log takes that long.
+async fn node_with(id: &str, store: &Arc<object_store::memory::InMemory>, put_ms: Option<f64>) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());
     TestServer::spawn_with(move |c| {
         c.memory_store = Some(store);
+        c.inject_latency = put_ms.map(|ms| (ms, 0.0));
         c.shards = SHARDS;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
@@ -56,6 +62,90 @@ fn collect(mut sub: Sub, target: Arc<AtomicI64>) -> tokio::task::JoinHandle<Vec<
     })
 }
 
+/// Writers: each account posts as fast as it can through `via` (forwarded to
+/// the owner); only acked commits count.
+struct Writers {
+    stop: Arc<AtomicBool>,
+    acked: Arc<parking_lot::Mutex<Vec<String>>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Writers {
+    fn start(via: &TestServer, accounts: &[TestAccount]) -> Writers {
+        let stop = Arc::new(AtomicBool::new(false));
+        let acked: Arc<parking_lot::Mutex<Vec<String>>> = Default::default();
+        let mut tasks = Vec::new();
+        for acct in accounts.iter().cloned() {
+            let (x, stop, acked) = (Xrpc::new(&via.url), stop.clone(), acked.clone());
+            tasks.push(tokio::spawn(async move {
+                let mut i = 0;
+                while !stop.load(Ordering::Acquire) {
+                    i += 1;
+                    let body = json!({"repo": acct.did, "collection": "app.bsky.feed.post", "record": post_record(&format!("seam {i}"))});
+                    let r = x.post("com.atproto.repo.createRecord", &body, &acct.auth()).await;
+                    if r.is_ok() {
+                        acked.lock().push(r.ok()["commit"]["cid"].as_str().expect("commit cid").to_string());
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(5)).await; // shard moving: retry
+                    }
+                }
+            }));
+        }
+        Writers { stop, acked, tasks }
+    }
+
+    /// Stops the writers; returns the acked commits' CIDs.
+    async fn stop(self) -> Vec<String> {
+        self.stop.store(true, Ordering::Release);
+        for t in self.tasks {
+            t.await.unwrap();
+        }
+        self.acked.lock().clone()
+    }
+}
+
+/// Ground truth: the union of every node log in S3, merged by seq, once it
+/// holds every acked commit (each exactly once).
+async fn s3_union(s: &TestServer, acked: &[String]) -> Vec<(i64, Vec<u8>)> {
+    let s3 = s.app.firehose.store.read().clone().unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let union = loop {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1 << 16);
+        let st = s3.clone();
+        let job = tokio::spawn(async move { vlpds::backfill::backfill(&st, 0, i64::MAX, &tx).await });
+        let mut all = Vec::new();
+        while let Some((seq, frame)) = rx.recv().await {
+            all.push((seq, frame.to_vec()));
+        }
+        job.await.unwrap().unwrap();
+        let commits: HashMap<String, usize> = all
+            .iter()
+            .filter_map(|(_, raw)| Frame::decode(raw).unwrap().commit().map(|c| c.commit.to_string()))
+            .fold(HashMap::new(), |mut m, c| {
+                *m.entry(c).or_default() += 1;
+                m
+            });
+        if acked.iter().all(|c| commits.contains_key(c)) {
+            for c in acked {
+                assert_eq!(commits[c], 1, "acked commit {c} logged more than once");
+            }
+            break all;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "acked commits never all reached S3");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(union.windows(2).all(|w| w[0].0 < w[1].0), "union of logs has duplicate seqs");
+    union
+}
+
+fn mismatch(what: &str, got: &[(i64, Vec<u8>)], want: &[(i64, Vec<u8>)]) -> String {
+    let g: Vec<i64> = got.iter().map(|x| x.0).collect();
+    let w: Vec<i64> = want.iter().map(|x| x.0).collect();
+    let missing: Vec<i64> = w.iter().filter(|s| !g.contains(s)).copied().take(20).collect();
+    let extra: Vec<i64> = g.iter().filter(|s| !w.contains(s)).copied().take(20).collect();
+    format!("{what}: got {} events, want {}; missing {missing:?} extra {extra:?}", g.len(), w.len())
+}
+
 /// A node streams only the log a follower names: a peer following a dead
 /// incarnation's log at the same address must not get the new log's batches
 /// (they were merged under the old log's id too: duplicate firehose events).
@@ -86,28 +176,7 @@ async fn staggered_starts_under_load_lose_no_events() {
     let store = Arc::new(object_store::memory::InMemory::new());
     let a = node("fs-a", &store).await;
     let accounts: Vec<TestAccount> = futures::future::join_all((0..6).map(|_| a.create_account("fs"))).await;
-
-    // writers: each account posts as fast as it can through node a (forwarded
-    // to the owner); only acked commits count
-    let stop = Arc::new(AtomicBool::new(false));
-    let acked: Arc<parking_lot::Mutex<Vec<String>>> = Default::default();
-    let mut writers = Vec::new();
-    for acct in accounts.clone() {
-        let (x, stop, acked) = (Xrpc::new(&a.url), stop.clone(), acked.clone());
-        writers.push(tokio::spawn(async move {
-            let mut i = 0;
-            while !stop.load(Ordering::Acquire) {
-                i += 1;
-                let body = json!({"repo": acct.did, "collection": "app.bsky.feed.post", "record": post_record(&format!("seam {i}"))});
-                let r = x.post("com.atproto.repo.createRecord", &body, &acct.auth()).await;
-                if r.is_ok() {
-                    acked.lock().push(r.ok()["commit"]["cid"].as_str().expect("commit cid").to_string());
-                } else {
-                    tokio::time::sleep(Duration::from_millis(5)).await; // shard moving: retry
-                }
-            }
-        }));
-    }
+    let writers = Writers::start(&a, &accounts);
 
     // nodes join one by one; each gets a cursor-0 and a live subscriber the
     // moment it is up
@@ -123,51 +192,12 @@ async fn staggered_starts_under_load_lose_no_events() {
         nodes.push(n);
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
-    stop.store(true, Ordering::Release);
-    for w in writers {
-        w.await.unwrap();
-    }
-
-    // ground truth: the union of every node log in S3, merged by seq, once
-    // every node's merged firehose has passed the last acked write
-    let acked = acked.lock().clone();
+    let acked = writers.stop().await;
     assert!(acked.len() > 200, "write load too light: {} acked", acked.len());
-    let s3 = nodes[0].app.firehose.store.read().clone().unwrap();
-    let union = loop {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1 << 16);
-        let s = s3.clone();
-        let job = tokio::spawn(async move { vlpds::backfill::backfill(&s, 0, i64::MAX, &tx).await });
-        let mut all = Vec::new();
-        while let Some((seq, frame)) = rx.recv().await {
-            all.push((seq, frame.to_vec()));
-        }
-        job.await.unwrap().unwrap();
-        let commits: HashMap<String, usize> = all
-            .iter()
-            .filter_map(|(_, raw)| Frame::decode(raw).unwrap().commit().map(|c| c.commit.to_string()))
-            .fold(HashMap::new(), |mut m, c| {
-                *m.entry(c).or_default() += 1;
-                m
-            });
-        if acked.iter().all(|c| commits.contains_key(c)) {
-            for c in &acked {
-                assert_eq!(commits[c], 1, "acked commit {c} logged more than once");
-            }
-            break all;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let union = s3_union(&nodes[0], &acked).await;
     let seqs: Vec<i64> = union.iter().map(|x| x.0).collect();
-    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "union of logs has duplicate seqs");
     target.store(*seqs.last().unwrap(), Ordering::Release);
 
-    let mismatch = |what: &str, got: &[(i64, Vec<u8>)], want: &[(i64, Vec<u8>)]| {
-        let g: Vec<i64> = got.iter().map(|x| x.0).collect();
-        let w: Vec<i64> = want.iter().map(|x| x.0).collect();
-        let missing: Vec<i64> = w.iter().filter(|s| !g.contains(s)).copied().take(20).collect();
-        let extra: Vec<i64> = g.iter().filter(|s| !w.contains(s)).copied().take(20).collect();
-        format!("{what}: got {} events, want {}; missing {missing:?} extra {extra:?}", g.len(), w.len())
-    };
     for (i, (z, l)) in from_zero.into_iter().zip(live).enumerate() {
         let got = z.await.unwrap();
         assert!(got == union, "{}", mismatch(&format!("node {i} cursor-0 subscriber attached at start"), &got, &union));
@@ -178,4 +208,32 @@ async fn staggered_starts_under_load_lose_no_events() {
         replay.truncate(union.len() + 1);
         assert!(replay == union, "{}", mismatch(&format!("node {i} replay from cursor 0"), &replay, &union));
     }
+}
+
+/// A node that starts while a peer's segments are in flight: its start floor
+/// F is above seqs the peer assigned but hasn't made durable yet. A cursor-0
+/// subscriber attached the moment the node is up backfills (0, F] from S3,
+/// which has to wait until every peer's log is durable past F. The merger
+/// drops events <= F as the backfill's, so an early backfill loses the
+/// peer's in-flight ones for good (they used to be: a follower's watermark
+/// started at F, before the peer had reported anything).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn start_floor_waits_for_peers_in_flight_segments() {
+    let store = Arc::new(object_store::memory::InMemory::new());
+    // every segment PUT of a's log takes 300 ms: at any instant a few
+    // segments' worth of its seqs are assigned but not in S3
+    let a = node_with("fl-a", &store, Some(300.0)).await;
+    let accounts: Vec<TestAccount> = futures::future::join_all((0..6).map(|_| a.create_account("fl"))).await;
+    let writers = Writers::start(&a, &accounts);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let target = Arc::new(AtomicI64::new(0));
+    let b = node("fl-b", &store).await;
+    let from_zero = collect(b.subscribe(Some(0)).await, target.clone());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let acked = writers.stop().await;
+    assert!(acked.len() >= 6, "write load too light: {} acked", acked.len());
+    let union = s3_union(&a, &acked).await;
+    target.store(union.last().unwrap().0, Ordering::Release);
+    let got = from_zero.await.unwrap();
+    assert!(got == union, "{}", mismatch("cursor-0 subscriber attached at b's start", &got, &union));
 }

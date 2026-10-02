@@ -716,20 +716,16 @@ async fn policy_splits_a_hot_shard() {
     let hot = s.app.partitions.shard_of(&acct.did);
     let t = Instant::now();
     let mut n = 0;
-    // a write may see 503 while its shard is frozen for the split: retried
+    // A write that finds its shard frozen for the split (ShardMoved) is
+    // resent by the node until the children open, so the client never sees
+    // the split. (This lone node used to pass the 503 through, and the test
+    // retried for ~2 s, which a split under parallel load could outlast.)
     let post = |text: String| {
         let body = json!({"repo": acct.did, "collection": "app.bsky.feed.post", "record": post_record(&text)});
         let (x, auth) = (&s.xrpc, acct.auth());
         async move {
-            for _ in 0..100 {
-                let r = x.post("com.atproto.repo.createRecord", &body, &auth).await;
-                if r.status != 503 {
-                    assert!(r.is_ok(), "{r:?}");
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-            panic!("write kept failing with 503");
+            let r = x.post("com.atproto.repo.createRecord", &body, &auth).await;
+            assert!(r.is_ok(), "{r:?}");
         }
     };
     while cluster(&s).layout().contains(hot) {

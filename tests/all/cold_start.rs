@@ -134,6 +134,39 @@ async fn writes_survive_a_handback() {
     }
 }
 
+/// A lone node serves requests without the routing work, but a write there
+/// can still find its shard gone before it starts: frozen for a split, or
+/// taken by a node that joined after the check (writes_survive_a_handback
+/// once got a ShardMoved that way). It is resent until the shard is back,
+/// as on a node with peers, instead of failing with a 503.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lone_node_resends_a_write_whose_shard_left() {
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let a = node("lone", &store, 4, |_| {}).await;
+    populate(&[&a], 0..1, 1).await;
+    assert!(a.app.cluster.as_ref().unwrap().alone());
+    let did = bulk_did(0);
+    let shard = a.app.partitions.shard_of(&did);
+    let p = a.app.partitions.get(shard).expect("owned");
+    // out of routing and the workers' caches, as a close does when it moves
+    a.app.partitions.set(shard, None);
+    for w in a.app.workers.senders.iter() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        w.send(WorkerMsg::DropPartition(shard, tx)).unwrap();
+        let _ = rx.await;
+    }
+    let table = a.app.partitions.clone();
+    let back = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        table.set(shard, Some(p));
+    });
+    let r = create_via(&a, &did, "while its shard was away").await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    back.await.unwrap();
+    let r = a.list_records(&did, "app.bsky.feed.post", &[("limit", "100")]).await.ok();
+    assert_eq!(r["records"].as_array().unwrap().len(), 2, "applied once");
+}
+
 /// A shard's recently written repos survive a restart: the node that opens
 /// it next loads them before any request asks (from the set persisted with
 /// the checkpoint).

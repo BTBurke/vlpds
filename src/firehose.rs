@@ -327,13 +327,22 @@ impl Firehose {
     }
 
     /// Registers a newly followed peer log: returns the floor its follower
-    /// must deliver every event above, and its watermark (starting there).
-    /// Taken under the sources lock, so no merger tick that ignored this log
-    /// can settle past the floor afterwards.
+    /// must deliver every event above, and its watermark (starting just
+    /// below it). Taken under the sources lock, so no merger tick that
+    /// ignored this log can settle past the floor afterwards.
+    ///
+    /// The watermark starts *below* the floor, not at it: the merger isn't
+    /// owed the log's events <= floor, but at startup (floor = the start
+    /// floor) the S3 backfill serves them, and it waits for `settled` to
+    /// reach the floor as proof that every log is durable up to it. Only
+    /// the peer can vouch for that (its first heartbeat, or a segment read
+    /// back from S3). Starting at the floor let a backfill run while the
+    /// peer still had segments in flight with seqs <= floor and skip them
+    /// for good (the merger drops them as the backfill's).
     pub fn add_remote(&self, log_id: &str) -> (i64, Arc<AtomicI64>) {
         let mut s = self.sources.write();
         let floor = self.position();
-        let wm = Arc::new(AtomicI64::new(floor));
+        let wm = Arc::new(AtomicI64::new(floor - 1));
         s.insert(log_id.into(), Source::Remote(wm.clone()));
         (floor, wm)
     }

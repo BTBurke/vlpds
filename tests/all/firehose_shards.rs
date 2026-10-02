@@ -96,18 +96,25 @@ async fn sharded_streams_partition_the_full_stream() {
         }
         check_partition(&full, &shards, n);
     }
-    // a cursor from the full stream: exactly the slice's events after it
+    // a cursor from the full stream: exactly the slice's events after it, in
+    // both halves (which half has any depends on the random DIDs; together
+    // they carry everything after the cursor)
     let mid = full[full.len() / 2].0;
-    let range = SlotRange::new(1, 2).unwrap();
-    let got = events(&read_to(sub_shard(&s, mid, 1, 2).await, last_in(&full, range).filter(|q| *q > mid)).await);
-    let want: Vec<(i64, Vec<u8>)> = read_to(s.subscribe(Some(mid)).await, Some(head))
-        .await
-        .into_iter()
-        .filter(|f| f.did().is_some_and(|d| range.contains(slot_of(d))))
-        .filter_map(|f| f.seq().map(|q| (q, f.raw.clone())))
-        .collect();
-    assert!(!want.is_empty());
-    assert_eq!(got, want);
+    let after: Vec<Frame> = read_to(s.subscribe(Some(mid)).await, Some(head)).await;
+    let mut carried = 0;
+    for k in 0..2 {
+        let range = SlotRange::new(k, 2).unwrap();
+        let got = events(&read_to(sub_shard(&s, mid, k, 2).await, last_in(&full, range).filter(|q| *q > mid)).await);
+        let want: Vec<(i64, Vec<u8>)> = after
+            .iter()
+            .filter(|f| f.did().is_some_and(|d| range.contains(slot_of(d))))
+            .filter_map(|f| f.seq().map(|q| (q, f.raw.clone())))
+            .collect();
+        assert_eq!(got, want, "shard {k}/2 from cursor {mid}");
+        carried += want.len();
+    }
+    assert_eq!(carried, events(&after).len());
+    assert!(carried > 0);
 }
 
 /// A cursor older than a tiny ring is backfilled from the S3 segments with

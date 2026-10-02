@@ -1060,7 +1060,9 @@ async fn replay_after_kill_reconstructs_nodes() {
         check_stored_nodes(survivor, &x.did).await;
     }
     // and the survivor writes on the replayed nodes
-    let fallbacks0: u64 = ["missing", "invalid", "missing_node"].iter().map(|r| vlpds::metrics::LAZY_MST_FALLBACKS.with_label_values(&[r]).get()).sum();
+    // this node's count: tests running alongside bump the global metric
+    let fallbacks = || survivor.app.workers.lazy_fallbacks.load(std::sync::atomic::Ordering::Relaxed);
+    let fallbacks0 = fallbacks();
     let accts: Vec<TestAccount> = moved.into_iter().cloned().collect();
     for step in random_steps(&mut rng, accts.len(), 200) {
         run_step(survivor, &accts, &step).await;
@@ -1068,8 +1070,7 @@ async fn replay_after_kill_reconstructs_nodes() {
     for x in &accts {
         check_stored_nodes(survivor, &x.did).await;
     }
-    let fallbacks: u64 = ["missing", "invalid", "missing_node"].iter().map(|r| vlpds::metrics::LAZY_MST_FALLBACKS.with_label_values(&[r]).get()).sum();
-    assert_eq!(fallbacks, fallbacks0, "lazy opens fell back to a rebuild from records");
+    assert_eq!(fallbacks(), fallbacks0, "lazy opens fell back to a rebuild from records");
 }
 
 /// An open whose `M/` nodes are missing or wrong (a bug, or a lost
@@ -1092,6 +1093,7 @@ async fn lazy_open_rebuilds_missing_or_bad_nodes() {
     assert!(nodes.len() > 3, "an interior tree");
     for (case, reason) in [("missing", "missing"), ("bad", "invalid")] {
         let n0 = vlpds::metrics::LAZY_MST_FALLBACKS.with_label_values(&[reason]).get();
+        let here0 = s.app.workers.lazy_fallbacks.load(std::sync::atomic::Ordering::Relaxed);
         let nodes = stored_nodes(&s, &a.did).await;
         // under the repo's feet: it isn't cached (cache of 1 per worker and
         // nothing loaded once idle) and its next open reads these
@@ -1116,6 +1118,7 @@ async fn lazy_open_rebuilds_missing_or_bad_nodes() {
         let st = Step::Create(0, "com.example.thing".into(), format!("after-{case}"), 5);
         ref_step(&s, &accts, &mut refs, &st).await;
         assert!(vlpds::metrics::LAZY_MST_FALLBACKS.with_label_values(&[reason]).get() > n0, "{case}: no fallback");
+        assert!(s.app.workers.lazy_fallbacks.load(std::sync::atomic::Ordering::Relaxed) > here0, "{case}: not counted on the node");
         refs[0].check_repo(&s, a).await;
         // the backfill is applied with the commit after it
         check_stored_nodes(&s, &a.did).await;
@@ -1461,7 +1464,8 @@ async fn reshard_carries_nodes() {
         ok += (run_step(&s, &accts, &st).await == 200) as usize;
     }
     assert!(ok > 150, "{ok} writes applied");
-    let fallbacks = || -> u64 { ["missing", "invalid", "missing_node"].iter().map(|r| vlpds::metrics::LAZY_MST_FALLBACKS.with_label_values(&[r]).get()).sum() };
+    // this node's count: tests running alongside bump the global metric
+    let fallbacks = || s.app.workers.lazy_fallbacks.load(std::sync::atomic::Ordering::Relaxed);
     let f0 = fallbacks();
     let admin = |nsid: &'static str, body: J| {
         let x = s.xrpc.clone();

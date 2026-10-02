@@ -507,7 +507,16 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
     if take_forwarded(&mut req, app) {
         return FORWARDED.scope((), next.run(req)).await;
     }
+    let token = app.map(|a| a.config.internal_token.as_str());
+    let retry = app.is_some_and(|a| a.config.retry_unapplied_writes);
     if router.alone() {
+        // Served here without the routing work. A write can still find its
+        // shard gone before it starts (frozen for a split, or taken by a
+        // node that joined after this check): resent like any other, its
+        // routing key worked out only then.
+        if xrpc && retry && retryable_write(&req) {
+            return write_with_retries(router, client, None, req, token, next).await;
+        }
         return next.run(req).await;
     }
     let target = if xrpc {
@@ -519,10 +528,8 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
         Ok(t) => t,
         Err(r) => return r,
     };
-    let token = app.map(|a| a.config.internal_token.as_str());
-    let retry = app.is_some_and(|a| a.config.retry_unapplied_writes);
     if let Some(k) = key.as_deref().filter(|_| retry && retryable_write(&req)) {
-        return write_with_retries(router, client, k, req, token, next).await;
+        return write_with_retries(router, client, Some(k), req, token, next).await;
     }
     let Some(owner) = key.as_deref().and_then(|k| router.remote_owner(k)) else {
         return next.run(req).await;
@@ -540,11 +547,12 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
 /// gave it up while its repo loaded ([`REPO_LOADING`]), or the shard moved
 /// away before it started ([`SHARD_MOVED`]). Within [`WRITE_RETRY_BUDGET`];
 /// after that the last 503 (+ Retry-After) goes to the client. The body is
-/// buffered for the resends (JSON, at most 4 MiB).
+/// buffered for the resends (JSON, at most 4 MiB). `key` None: served here
+/// first (a lone node), the key is worked out for a resend.
 async fn write_with_retries(
     router: &dyn Router,
     client: &crate::http::PeerClient,
-    key: &str,
+    key: Option<&str>,
     req: Request,
     token: Option<&str>,
     next: axum::middleware::Next,
@@ -555,6 +563,16 @@ async fn write_with_retries(
     };
     let ttfb = ttfb_for(&req);
     let (parts, _) = req.into_parts();
+    let rebuild = || {
+        let mut req = Request::new(Body::from(body.clone()));
+        *req.method_mut() = parts.method.clone();
+        *req.uri_mut() = parts.uri.clone();
+        *req.version_mut() = parts.version;
+        *req.headers_mut() = parts.headers.clone();
+        *req.extensions_mut() = parts.extensions.clone();
+        req
+    };
+    let mut key = key.map(str::to_string);
     let started = Instant::now();
     // Resends back off (doubling, at most 1 s): an owner that is reopening
     // shards must not be swamped by every entry node's resends (seen at
@@ -562,13 +580,14 @@ async fn write_with_retries(
     // replay, 0.5 s -> 60 s).
     let mut attempt = 0u32;
     loop {
-        let mut req = Request::new(Body::from(body.clone()));
-        *req.method_mut() = parts.method.clone();
-        *req.uri_mut() = parts.uri.clone();
-        *req.version_mut() = parts.version;
-        *req.headers_mut() = parts.headers.clone();
-        *req.extensions_mut() = parts.extensions.clone();
-        let resp = match router.remote_owner(key) {
+        if attempt > 0 && key.is_none() {
+            key = match xrpc_target(router, router.app(), rebuild()).await {
+                Ok((_, k)) => k,
+                Err(r) => return r,
+            };
+        }
+        let req = rebuild();
+        let resp = match key.as_deref().and_then(|k| router.remote_owner(k)) {
             None => next.clone().run(req).await,
             Some(owner) => {
                 crate::metrics::FORWARDED.inc();

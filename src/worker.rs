@@ -21,7 +21,7 @@ use crate::tid::{self, Tid};
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use prometheus::IntCounter;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
@@ -370,6 +370,10 @@ fn new_view(head: &Head, mst: &LazyTree, nodes: &crate::mst::SharedNodeIndex) ->
 #[derive(Clone)]
 pub struct Workers {
     pub senders: Arc<WorkerSenders>,
+    /// Cold opens on these workers whose lazy MST fell back to rebuilding
+    /// from the records: this node's share of `LAZY_MST_FALLBACKS` (tests
+    /// running side by side in one process all bump the global one).
+    pub lazy_fallbacks: Arc<AtomicU64>,
 }
 
 /// The workers' channels. Dropping the last handle stops the threads.
@@ -424,18 +428,21 @@ pub fn spawn_with_secrets(
         senders.push(tx);
         receivers.push(rx);
     }
+    let lazy_fallbacks = Arc::new(AtomicU64::new(0));
     for (i, rx) in receivers.into_iter().enumerate() {
         let me = senders[i].clone();
         let partitions = partitions.clone();
         let rt = rt.clone();
         let secrets = secrets.clone();
+        let fallbacks = lazy_fallbacks.clone();
         std::thread::Builder::new()
             .name(format!("repo-worker-{i}"))
-            .spawn(move || Worker::new(i, me, partitions, rt, limits, secrets).run(rx))
+            .spawn(move || Worker::new(i, me, partitions, rt, limits, secrets, fallbacks).run(rx))
             .unwrap();
     }
     Workers {
         senders: Arc::new(WorkerSenders(senders)),
+        lazy_fallbacks,
     }
 }
 
@@ -463,6 +470,8 @@ struct Worker {
     big: HashSet<Arc<str>>,
     /// Unwraps signing keys on cold loads.
     secrets: Arc<Secrets>,
+    /// `Workers::lazy_fallbacks`
+    fallbacks: Arc<AtomicU64>,
 }
 
 impl Worker {
@@ -473,9 +482,11 @@ impl Worker {
         rt: tokio::runtime::Handle,
         limits: CacheLimits,
         secrets: Arc<Secrets>,
+        fallbacks: Arc<AtomicU64>,
     ) -> Worker {
         Worker {
             secrets,
+            fallbacks,
             label: idx.to_string(),
             me,
             partitions,
@@ -817,7 +828,7 @@ impl Worker {
     fn spawn_load_with(&mut self, did: Arc<str>, need: Option<Need>) {
         let opts = LoadOpts { prefetch_bytes: self.limits.prefetch_bytes, need, secrets: Some(self.secrets.clone()) };
         metrics::LOADING_REPOS.inc();
-        let me = self.me.clone();
+        let (me, fallbacks) = (self.me.clone(), self.fallbacks.clone());
         let Some(partition) = (self.partitions)(&did) else {
             let _ = me.send(WorkerMsg::Loaded {
                 did,
@@ -837,6 +848,9 @@ impl Worker {
                     e
                 }
             });
+            if res.as_ref().is_ok_and(|st| st.as_ref().is_some_and(|st| st.backfill)) {
+                fallbacks.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = STATS
                 .load_us
                 .lock()
@@ -1330,7 +1344,7 @@ pub fn spawn_preload(workers: &Workers, shards: Vec<(u16, Arc<slatedb::Db>, Arc<
                     let rx = {
                         let senders = senders.upgrade()?;
                         let (tx, rx) = oneshot::channel();
-                        let w = Workers { senders };
+                        let w = Workers { senders, lazy_fallbacks: Default::default() };
                         w.route(&did).send(WorkerMsg::Preload { did, done: tx }).ok()?;
                         rx
                     };
@@ -2487,7 +2501,7 @@ mod tests {
         assert!(full > 3 * root, "{full} vs {root}");
         let limits = CacheLimits { entries: 100, bytes: full + root + root / 2, ..CacheLimits::from(0) };
         let (me, _me_rx) = crossbeam_channel::unbounded();
-        let mut w = Worker::new(0, me, Arc::new(|_: &str| None), tokio::runtime::Handle::current(), limits, Secrets::dev());
+        let mut w = Worker::new(0, me, Arc::new(|_: &str| None), tokio::runtime::Handle::current(), limits, Secrets::dev(), Default::default());
         let put = |w: &mut Worker, (did, st): (Arc<str>, RepoState)| {
             w.cache_put(did.clone(), st);
             w.settle(&did);
