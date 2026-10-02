@@ -1786,13 +1786,54 @@ least the backup retention.
 ## Email
 
 Email confirmation, email update, password reset, account deletion, PLC
-operation and admin `sendEmail` mail go out over SMTP (`src/mail.rs`, lettre
-over rustls) when configured:
+operation, sign-in code (email 2FA) and admin `sendEmail` mail go out over
+SMTP (`src/mail.rs`, lettre over rustls) when configured:
 
 | Flag | Env | Reference PDS env (also read) |
 |---|---|---|
 | `--email-smtp-url` (alias `--smtp-url`) | `VLPDS_EMAIL_SMTP_URL` | `PDS_EMAIL_SMTP_URL` |
 | `--email-from-address` (alias `--email-from`) | `VLPDS_EMAIL_FROM_ADDRESS` | `PDS_EMAIL_FROM_ADDRESS` |
+| `--moderation-email-smtp-url` | `VLPDS_MODERATION_EMAIL_SMTP_URL` | `PDS_MODERATION_EMAIL_SMTP_URL` |
+| `--moderation-email-address` | `VLPDS_MODERATION_EMAIL_ADDRESS` | `PDS_MODERATION_EMAIL_ADDRESS` |
+| `--email-brand-name` | `VLPDS_EMAIL_BRAND_NAME` | `PDS_SERVICE_NAME` |
+| `--email-home-url` | `VLPDS_EMAIL_HOME_URL` | `PDS_HOME_URL` |
+| `--email-logo-url` | `VLPDS_EMAIL_LOGO_URL` | `PDS_LOGO_URL` |
+| `--email-primary-color` | `VLPDS_EMAIL_PRIMARY_COLOR` | `PDS_PRIMARY_COLOR` |
+| `--email-disable-confirmation-link` | `VLPDS_EMAIL_DISABLE_CONFIRMATION_LINK` | `PDS_EMAIL_DISABLE_CONFIRMATION_LINK` |
+
+**Templates** (`src/mail/templates.rs`, `src/mail/layout.html`). The account
+emails are the reference's six `ServerMailer` templates (reset password,
+delete account, confirm email, update email, PLC operation, sign-in auth
+factor), with its subjects ("Password Reset Requested", "Account Deletion
+Requested", "Email Confirmation", "Email Update Requested", "PLC Update
+Operation Requested", "Sign-in Confirmation") and its wording. They go out as
+`multipart/alternative`: a plain-text part (title, intro, the token on its own
+line, outro, footer) and the reference's HTML. The reference's `.hbs` files
+share one layout and differ only in title, preheader, intro, outro and token,
+so vlpds compiles that layout in once (`include_str!`) and fills those slots by
+single-pass `{{name}}` substitution, with no template engine. Every value is
+HTML-escaped (`& < > " '`), including handles, tokens and the operator's
+branding; only the intro and outro fragments, built in Rust from escaped
+pieces, go in raw. Branding follows the reference's `BrandingConfig`: the
+service name defaults to "{hostname} PDS" (from `--public-url`), and the home
+URL, logo and color default to the reference's (bsky.app, the Bluesky logo,
+`#067df7`). The sign-in mail's "changing your password" link is
+`{public_url}/.well-known/change-password` (the reference uses its OAuth
+issuer, which is the same URL). The layout and wording come from
+bluesky-social/atproto (MIT / Apache-2.0); `src/mail/NOTICE` carries its MIT
+copyright and permission notice.
+
+**Moderation mail.** As in the reference's `ModerationMailer`, admin
+`sendEmail` content is HTML from the moderator. It goes out unchanged as the
+HTML part, with a plain-text part derived by stripping tags (block tags
+become line breaks, entities are decoded), through the moderation mailer when
+`--moderation-email-smtp-url` and `--moderation-email-address` are set (both
+or neither, as in the reference). **Unlike the reference**, if they are unset
+admin mail falls back to the main mailer and its from address. The reference
+puts moderation mail on a JSON (log-only) transport in that case, so
+`sendEmail` answers `sent: true` and nothing is delivered. vlpds sends it
+through the main mailer instead, so a single-SMTP deployment still delivers
+moderation mail. With no mailer at all, it is logged like other mail.
 
 The URL follows the reference PDS's (nodemailer) form:
 `smtp://user:pass@host[:port]` upgrades with STARTTLS when offered (port 587;
@@ -1811,8 +1852,8 @@ attempt; transient failures (4xx, network, timeout) retry after ~2 s, 10 s and
 `vlpds_mail_retries_total`, `vlpds_mail_queue_depth`, `vlpds_mail_send_seconds`.
 Each node mails for the requests it handles; tokens live in the account's
 private state, so any node verifies them. Queued mail is lost if the node
-stops (the user asks again). The reference's separate moderation mailer
-(`PDS_MODERATION_EMAIL_*`) is not split out: admin mail uses the same one.
+stops (the user asks again). A moderation mailer is a second `SmtpMailer`
+with its own queue and pool; the metrics are shared (`purpose="admin"`).
 
 ## Choosing a bucket (`vlpds-bucket-probe`)
 

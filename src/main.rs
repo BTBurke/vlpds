@@ -286,6 +286,34 @@ struct Args {
     /// back to PDS_EMAIL_FROM_ADDRESS. Required with --email-smtp-url.
     #[arg(long, alias = "email-from", env = "VLPDS_EMAIL_FROM_ADDRESS")]
     email_from_address: Option<String>,
+    /// Service name in email (falls back to PDS_SERVICE_NAME; default
+    /// "{hostname} PDS").
+    #[arg(long, env = "VLPDS_EMAIL_BRAND_NAME")]
+    email_brand_name: Option<String>,
+    /// Footer link in email (falls back to PDS_HOME_URL; default
+    /// https://bsky.app, as the reference).
+    #[arg(long, env = "VLPDS_EMAIL_HOME_URL")]
+    email_home_url: Option<String>,
+    /// Logo image URL in email (falls back to PDS_LOGO_URL; default the
+    /// reference's Bluesky logo).
+    #[arg(long, env = "VLPDS_EMAIL_LOGO_URL")]
+    email_logo_url: Option<String>,
+    /// Accent color in email (falls back to PDS_PRIMARY_COLOR; default #067df7).
+    #[arg(long, env = "VLPDS_EMAIL_PRIMARY_COLOR")]
+    email_primary_color: Option<String>,
+    /// Drop the bsky.app "click here" link from email confirmation mail
+    /// (or PDS_EMAIL_DISABLE_CONFIRMATION_LINK=true).
+    #[arg(long, env = "VLPDS_EMAIL_DISABLE_CONFIRMATION_LINK")]
+    email_disable_confirmation_link: bool,
+    /// SMTP URL for admin sendEmail (moderation mail; same forms as
+    /// --email-smtp-url). Falls back to PDS_MODERATION_EMAIL_SMTP_URL.
+    /// Unset: admin sendEmail goes through the main mailer.
+    #[arg(long, env = "VLPDS_MODERATION_EMAIL_SMTP_URL", hide_env_values = true)]
+    moderation_email_smtp_url: Option<String>,
+    /// From address for moderation mail (falls back to
+    /// PDS_MODERATION_EMAIL_ADDRESS). Required with --moderation-email-smtp-url.
+    #[arg(long, env = "VLPDS_MODERATION_EMAIL_ADDRESS")]
+    moderation_email_address: Option<String>,
     /// Max uploadBlob size (MB).
     #[arg(long, env = "VLPDS_MAX_BLOB_MB", default_value_t = 100)]
     max_blob_mb: u64,
@@ -703,6 +731,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
         dev_mode: args.dev_mode,
         kek: kek_config(&args)?,
         mailer: vlpds::mail::from_flags(args.email_smtp_url.clone(), args.email_from_address.clone())?,
+        moderation_mailer: vlpds::mail::moderation_from_flags(
+            args.moderation_email_smtp_url.clone(),
+            args.moderation_email_address.clone(),
+        )?,
+        email_branding: vlpds::mail::Branding::from_flags(
+            args.email_brand_name.clone(),
+            args.email_home_url.clone(),
+            args.email_logo_url.clone(),
+            args.email_primary_color.clone(),
+            args.email_disable_confirmation_link,
+        ),
         max_blob_size: args.max_blob_mb << 20,
         blob_gc_grace: Duration::from_secs(args.blob_gc_grace_secs),
         plc_url: args.plc_url.clone(),

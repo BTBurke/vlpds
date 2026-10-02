@@ -1155,6 +1155,30 @@ What to do:
 `vlpds_shard_layout_shards` / `vlpds_shard_layout_version` follow the flip; the
 ownership alerts read the count from there.
 
+### Email (SMTP, moderation mail, branding)
+
+DESIGN "Email" has the details. Every node needs the same flags. A flag left
+unset falls back to the reference PDS's variable, so a reference `pds.env`
+works as is:
+
+| Flag | Env | Reference env | Notes |
+|---|---|---|---|
+| `--email-smtp-url` | `VLPDS_EMAIL_SMTP_URL` | `PDS_EMAIL_SMTP_URL` | `smtp://user:pass@host:587` / `smtps://...:465`; unset: mail is only logged |
+| `--email-from-address` | `VLPDS_EMAIL_FROM_ADDRESS` | `PDS_EMAIL_FROM_ADDRESS` | required with the URL |
+| `--moderation-email-smtp-url` | `VLPDS_MODERATION_EMAIL_SMTP_URL` | `PDS_MODERATION_EMAIL_SMTP_URL` | admin `sendEmail` only; unset: uses the main mailer |
+| `--moderation-email-address` | `VLPDS_MODERATION_EMAIL_ADDRESS` | `PDS_MODERATION_EMAIL_ADDRESS` | required with the moderation URL |
+| `--email-brand-name` | `VLPDS_EMAIL_BRAND_NAME` | `PDS_SERVICE_NAME` | default "{hostname} PDS" |
+| `--email-home-url` | `VLPDS_EMAIL_HOME_URL` | `PDS_HOME_URL` | footer link; default https://bsky.app |
+| `--email-logo-url` | `VLPDS_EMAIL_LOGO_URL` | `PDS_LOGO_URL` | default: the Bluesky logo, as in the reference |
+| `--email-primary-color` | `VLPDS_EMAIL_PRIMARY_COLOR` | `PDS_PRIMARY_COLOR` | default `#067df7` |
+| `--email-disable-confirmation-link` | `VLPDS_EMAIL_DISABLE_CONFIRMATION_LINK` | `PDS_EMAIL_DISABLE_CONFIRMATION_LINK` | drops the bsky.app "click here" link |
+
+Setting a URL without its address (or the reverse) fails startup. If mail is
+not arriving, check `vlpds_mail_messages_total{result="failed"|"dropped"}` and
+the `mail not sent` / `mail dropped` warnings (they log the recipient and
+purpose, never the token). `purpose="admin"` is moderation mail. Dev mode
+keeps every mail, with its HTML, in `vlpds.admin.getDevMail`.
+
 ### A user locked out by a second factor
 
 Two factors exist (DESIGN "Email second factor"): the reference's email code

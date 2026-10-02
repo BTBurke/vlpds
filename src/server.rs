@@ -80,6 +80,11 @@ pub struct Config {
     /// This node's outbound email (`--email-smtp-url`, crate::mail). None:
     /// the process-wide mailer (logs only, unless `xrpc::set_mailer`).
     pub mailer: Option<crate::mail::SharedMailer>,
+    /// admin sendEmail's mailer (`--moderation-email-smtp-url`). None: the
+    /// main mailer above.
+    pub moderation_mailer: Option<crate::mail::SharedMailer>,
+    /// Email branding (`--email-brand-name` etc., crate::mail::Branding).
+    pub email_branding: crate::mail::Branding,
     /// Max uploadBlob size in bytes.
     pub max_blob_size: u64,
     /// Unreferenced blobs older than this are deleted by the blob GC.
@@ -225,6 +230,8 @@ impl Default for Config {
             dev_mode: true,
             kek: Default::default(),
             mailer: None,
+            moderation_mailer: None,
+            email_branding: Default::default(),
             cluster: None,
             max_blob_size: 100 << 20,
             blob_gc_grace: Duration::from_secs(6 * 3600),

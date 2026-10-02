@@ -1247,7 +1247,7 @@ async fn send_email(
         .email
         .ok_or_else(|| invalid_request("account does not have an email address"))?;
     let subject = inp.subject.unwrap_or_else(|| "Message via your PDS".into());
-    super::server::deliver(&app, &to, &subject, &inp.content, "admin", None);
+    super::server::deliver_moderation(&app, &to, &subject, &inp.content);
     Ok(Json(json!({"sent": true})))
 }
 

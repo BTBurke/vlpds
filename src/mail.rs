@@ -1,8 +1,10 @@
 //! Outbound email over SMTP (DESIGN.md "Email").
 //!
-//! `xrpc::server::deliver` hands each `Mail` (email confirmation, email
-//! update, password reset, account deletion, PLC operation, admin sendEmail)
-//! to the node's mailer on the request path. [`SmtpMailer::send`] only
+//! `xrpc::server::deliver` renders each account email (email confirmation,
+//! email update, password reset, account deletion, PLC operation, sign-in
+//! code; [`templates`]) as HTML with a plain-text alternative and hands the
+//! `Mail` to the node's mailer on the request path; admin sendEmail goes to
+//! the moderation mailer (`--moderation-email-*`, else the main one). [`SmtpMailer::send`] only
 //! enqueues it on a bounded channel (`try_send`: never blocks; a full queue
 //! drops the mail and counts it); a background task sends up to
 //! `concurrency` at a time over a pooled lettre transport, retrying
@@ -18,8 +20,12 @@
 //! Unconfigured, the node keeps the log-only mailer (`xrpc::LogMailer`).
 //! Neither mailer logs the token or body above debug level.
 
+mod templates;
+
+pub use templates::{esc, html_to_text, Branding, Email, Rendered};
+
 use crate::xrpc::{Mail, Mailer};
-use lettre::message::{header::ContentType, Mailbox};
+use lettre::message::{header::ContentType, Mailbox, MultiPart};
 use lettre::transport::smtp::PoolConfig;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use prometheus::{
@@ -109,9 +115,7 @@ impl SmtpConfig {
 /// only one of them is an error, as in the reference PDS. Must run inside
 /// the tokio runtime (it spawns the sender task).
 pub fn from_flags(url: Option<String>, from: Option<String>) -> anyhow::Result<Option<SharedMailer>> {
-    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    let url = url.filter(|v| !v.is_empty()).or_else(|| env("PDS_EMAIL_SMTP_URL"));
-    let from = from.filter(|v| !v.is_empty()).or_else(|| env("PDS_EMAIL_FROM_ADDRESS"));
+    let (url, from) = (pick(url, "PDS_EMAIL_SMTP_URL"), pick(from, "PDS_EMAIL_FROM_ADDRESS"));
     match (url, from) {
         (None, None) => {
             tracing::info!("email disabled (no --email-smtp-url): mail is logged without its token and not sent");
@@ -123,6 +127,32 @@ pub fn from_flags(url: Option<String>, from: Option<String>) -> anyhow::Result<O
         }
         _ => anyhow::bail!("partial email config: set both --email-smtp-url and --email-from-address (or neither)"),
     }
+}
+
+/// The moderation mailer for admin sendEmail, as the reference's
+/// ModerationMailer: `--moderation-email-smtp-url` /
+/// `--moderation-email-address` (or PDS_MODERATION_EMAIL_SMTP_URL /
+/// PDS_MODERATION_EMAIL_ADDRESS). Both or neither, as in the reference.
+/// None: admin sendEmail falls back to the main mailer (the reference
+/// instead only logs it; see DESIGN.md "Email").
+pub fn moderation_from_flags(url: Option<String>, from: Option<String>) -> anyhow::Result<Option<SharedMailer>> {
+    let (url, from) = (pick(url, "PDS_MODERATION_EMAIL_SMTP_URL"), pick(from, "PDS_MODERATION_EMAIL_ADDRESS"));
+    match (url, from) {
+        (None, None) => Ok(None),
+        (Some(url), Some(from)) => {
+            tracing::info!("moderation email (admin sendEmail) has its own SMTP mailer");
+            let m = SmtpMailer::start(SmtpConfig::new(url, from))?;
+            Ok(Some(SharedMailer(Arc::new(m))))
+        }
+        _ => anyhow::bail!(
+            "partial moderation email config: set both --moderation-email-smtp-url and --moderation-email-address (or neither)"
+        ),
+    }
+}
+
+/// A non-empty flag value, else the non-empty env var `k`.
+fn pick(v: Option<String>, k: &str) -> Option<String> {
+    v.filter(|v| !v.is_empty()).or_else(|| std::env::var(k).ok().filter(|v| !v.is_empty()))
 }
 
 /// Queues mail for a background SMTP sender.
@@ -222,12 +252,12 @@ async fn run(
 
 fn message(from: &Mailbox, m: &Mail) -> anyhow::Result<Message> {
     let to: Mailbox = m.to.parse().map_err(|e| anyhow::anyhow!("recipient: {e}"))?;
-    Ok(Message::builder()
-        .from(from.clone())
-        .to(to)
-        .subject(m.subject.as_str())
-        .header(ContentType::TEXT_PLAIN)
-        .body(m.body.clone())?)
+    let b = Message::builder().from(from.clone()).to(to).subject(m.subject.as_str());
+    Ok(match &m.html {
+        // multipart/alternative: text/plain first, text/html preferred
+        Some(html) => b.multipart(MultiPart::alternative_plain_html(m.body.clone(), html.clone()))?,
+        None => b.header(ContentType::TEXT_PLAIN).body(m.body.clone())?,
+    })
 }
 
 /// Transient: worth another attempt (4xx, network, TLS, timeout).

@@ -119,18 +119,7 @@ async fn check_email_code(app: &App, acct: &Account, email: &str, code: Option<&
     }
     let Some(code) = code else {
         let token = create_email_token(app, did, PURPOSE).await?;
-        deliver(
-            app,
-            email,
-            "Sign-in Confirmation",
-            &format!(
-                "Your sign-in code for @{} is {token}\n\nIt expires in 15 minutes. If you did not just try to \
-                 sign in, someone has your password: reset it now.",
-                acct.handle
-            ),
-            PURPOSE,
-            Some(&token),
-        );
+        deliver(app, email, crate::mail::Email::SignInAuthFactor { handle: Some(&acct.handle), token: &token });
         return Err(factor_required());
     };
     match assert_email_token(app, did, PURPOSE, code).await {
@@ -187,14 +176,7 @@ pub(super) async fn disable(app: &App, acct: &Account, token: Option<&str>) -> X
     let email = acct.email.clone().ok_or_else(|| XrpcError::internal("account has no email address"))?;
     let Some(token) = token.map(str::trim).filter(|t| !t.is_empty()) else {
         let otp = create_email_token(app, did, "update_email").await?;
-        deliver(
-            app,
-            &email,
-            "Update your email",
-            &format!("Your email update code is {otp}"),
-            "update_email",
-            Some(&otp),
-        );
+        deliver(app, &email, crate::mail::Email::UpdateEmail { token: &otp });
         return Err(XrpcError::bad("TokenRequired", "confirmation token required"));
     };
     assert_email_token(app, did, "update_email", token).await?;

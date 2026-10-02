@@ -615,7 +615,10 @@ pub(super) async fn put_sec(app: &App, did: &str, muts: Vec<Mutation>) -> XResul
 pub struct Mail {
     pub to: String,
     pub subject: String,
+    /// The plain-text part (the whole mail when `html` is None).
     pub body: String,
+    /// The HTML part: sent as multipart/alternative with `body`.
+    pub html: Option<String>,
     /// confirm_email | update_email | reset_password | delete_account | plc_operation | auth_factor | admin
     pub purpose: String,
     pub token: Option<String>,
@@ -646,27 +649,46 @@ pub fn set_mailer(m: Box<dyn Mailer>) -> bool {
     MAILER.set(m).is_ok()
 }
 
-/// Sends through the mailer; in dev mode also keeps it in the per-address
-/// dev mailbox (vlpds.admin.getDevMail).
-pub(super) fn deliver(
-    app: &App,
-    to: &str,
-    subject: &str,
-    body: &str,
-    purpose: &str,
-    token: Option<&str>,
-) {
+/// Renders an account email (crate::mail::Email: HTML + text, the node's
+/// branding) and sends it through the node's mailer; see [`send_mail`].
+pub(super) fn deliver(app: &App, to: &str, email: crate::mail::Email<'_>) {
+    let r = email.render(&app.config.email_branding, &app.public_url);
+    let mail = Mail {
+        to: to.to_string(),
+        subject: r.subject,
+        body: r.text,
+        html: Some(r.html),
+        purpose: email.purpose().to_string(),
+        token: Some(email.token().to_string()),
+        sent_at: crate::events::now_rfc3339(),
+    };
+    send_mail(app, mail, app.config.mailer.as_ref());
+}
+
+/// admin sendEmail: `content` is HTML (as in the reference's
+/// ModerationMailer), sent with a derived plain-text part through the
+/// moderation mailer (`--moderation-email-smtp-url`), else the main one.
+pub(super) fn deliver_moderation(app: &App, to: &str, subject: &str, content: &str) {
     let mail = Mail {
         to: to.to_string(),
         subject: subject.to_string(),
-        body: body.to_string(),
-        purpose: purpose.to_string(),
-        token: token.map(str::to_string),
+        body: crate::mail::html_to_text(content),
+        html: Some(content.to_string()),
+        purpose: "admin".into(),
+        token: None,
         sent_at: crate::events::now_rfc3339(),
     };
+    let m = app.config.moderation_mailer.as_ref().or(app.config.mailer.as_ref());
+    send_mail(app, mail, m);
+}
+
+/// Sends through `mailer`; in dev mode also keeps it in the per-address dev
+/// mailbox (vlpds.admin.getDevMail).
+fn send_mail(app: &App, mail: Mail, mailer: Option<&crate::mail::SharedMailer>) {
+    let to = mail.to.clone();
     // The node's own mailer (--email-smtp-url, crate::mail; queues, never
     // blocks), else the process-wide one (LogMailer unless `set_mailer`).
-    match &app.config.mailer {
+    match mailer {
         Some(m) => m.send(&mail),
         None => MAILER.get_or_init(|| Box::new(LogMailer)).send(&mail),
     }
@@ -2062,14 +2084,7 @@ async fn request_account_delete(State(app): AppState, Auth(creds): Auth) -> XRes
         .clone()
         .ok_or_else(|| invalid_request("account does not have an email address"))?;
     let token = create_email_token(&app, &did, "delete_account").await?;
-    deliver(
-        &app,
-        &email,
-        "Account Deletion Request",
-        &format!("Your account deletion code is {token}"),
-        "delete_account",
-        Some(&token),
-    );
+    deliver(&app, &email, crate::mail::Email::DeleteAccount { token: &token });
     Ok(StatusCode::OK)
 }
 
@@ -2287,14 +2302,7 @@ async fn request_email_confirmation(
         .clone()
         .ok_or_else(|| invalid_request("account does not have an email address"))?;
     let token = create_email_token(&app, &did, "confirm_email").await?;
-    deliver(
-        &app,
-        &email,
-        "Confirm your email",
-        &format!("Your email confirmation code is {token}"),
-        "confirm_email",
-        Some(&token),
-    );
+    deliver(&app, &email, crate::mail::Email::ConfirmEmail { token: &token });
     Ok(StatusCode::OK)
 }
 
@@ -2351,14 +2359,7 @@ async fn request_email_update(State(app): AppState, Auth(creds): Auth) -> XResul
     let token_required = acct.email_confirmed;
     if token_required {
         let token = create_email_token(&app, &did, "update_email").await?;
-        deliver(
-            &app,
-            &email,
-            "Update your email",
-            &format!("Your email update code is {token}"),
-            "update_email",
-            Some(&token),
-        );
+        deliver(&app, &email, crate::mail::Email::UpdateEmail { token: &token });
     }
     Ok(Json(json!({"tokenRequired": token_required})))
 }
@@ -2487,14 +2488,7 @@ async fn request_password_reset(
         return Err(invalid_request("account does not have an email address"));
     };
     let token = create_email_token(&app, &acct.did, "reset_password").await?;
-    deliver(
-        &app,
-        &email,
-        "Password Reset Requested",
-        &format!("Hi {}, your password reset code is {token}", acct.handle),
-        "reset_password",
-        Some(&token),
-    );
+    deliver(&app, &email, crate::mail::Email::ResetPassword { handle: &acct.handle, token: &token });
     Ok(StatusCode::OK)
 }
 
