@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # Production vlpds image: the web UI (ui/) built with node, embedded into a
-# release build of the vlpds (and loadgen) binaries, on a slim non-root runtime.
+# release build of the vlpds (and loadgen, vlpds-bucket-probe) binaries, on a slim non-root runtime.
 #
 #   docker build -t vlpds:local .            (or: just docker-build)
 #   docker run -p 2583:2583 -e VLPDS_S3_ENDPOINT=... -e VLPDS_JWT_SECRET=... \
@@ -23,6 +23,10 @@ RUN npm run build
 
 # --- rust release build -----------------------------------------------------
 FROM rust:1.98.1-bookworm AS build
+# Extra cargo features, e.g. --build-arg VLPDS_FEATURES=profiling for
+# --pyroscope-url (continuous CPU profiles).
+ARG VLPDS_FEATURES=""
+
 # cmake/clang: aws-lc-sys (rustls) and the vendored libsecp256k1 / jemalloc C builds
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake clang \
@@ -44,9 +48,9 @@ ENV CARGO_PROFILE_RELEASE_DEBUG=0
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked --bins \
+    cargo build --release --locked --bins ${VLPDS_FEATURES:+--features "$VLPDS_FEATURES"} \
     && mkdir -p /out \
-    && cp target/release/vlpds target/release/loadgen /out/
+    && cp target/release/vlpds target/release/loadgen target/release/vlpds-bucket-probe /out/
 
 # --- runtime ----------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -55,7 +59,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 vlpds \
     && useradd --system --uid 10001 --gid vlpds --home-dir /var/lib/vlpds --create-home vlpds
-COPY --from=build /out/vlpds /out/loadgen /usr/local/bin/
+# vlpds-bucket-probe: the bucket pre-flight (DESIGN.md "Choosing a bucket"),
+# run with --entrypoint from the node's own env
+COPY --from=build /out/vlpds /out/loadgen /out/vlpds-bucket-probe /usr/local/bin/
 USER vlpds:vlpds
 WORKDIR /var/lib/vlpds
 ENV VLPDS_LISTEN=0.0.0.0:2583 \
