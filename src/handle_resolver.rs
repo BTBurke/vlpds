@@ -1,36 +1,28 @@
 //! External handle resolution, as the reference's `HandleResolver`
-//! (@atproto/identity): DNS TXT `_atproto.<handle>` (`did=<DID>`) and
-//! `https://<handle>/.well-known/atproto-did`, started together; the DNS
-//! answer wins when there is one, else the HTTPS one. Each has a 3 s deadline
-//! (the reference's `timeout` default). The reference's optional backup
-//! nameservers are not implemented.
-//!
-//! Abuse bounds: TXT lookups go only to the system resolver (or the injected
-//! [`TxtResolver`]), for a fully qualified name (trailing dot: no search
-//! domains), at most [`MAX_TXT_RECORDS`] records of at most
-//! [`MAX_TXT_BYTES`] each are considered. The HTTPS fetch is the caller's
-//! (SSRF-guarded, size-capped: `xrpc::identity`).
+//! (@atproto/identity): DNS TXT and `/.well-known/atproto-did` started
+//! together, DNS's answer winning. The reference's backup nameservers are
+//! not implemented. TXT names are fully qualified (no search domains); the
+//! HTTPS fetch is the caller's (SSRF-guarded: `xrpc::identity`).
 
 use futures::future::BoxFuture;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-/// Deadline of each method (reference HandleResolver `timeout`: 3000 ms).
+/// Per method (reference HandleResolver `timeout`).
 pub const TIMEOUT: Duration = Duration::from_secs(3);
-/// TXT records considered per lookup; the rest are ignored.
-pub const MAX_TXT_RECORDS: usize = 32;
+const MAX_TXT_RECORDS: usize = 32;
 /// A longer TXT record (its strings joined) is ignored.
-pub const MAX_TXT_BYTES: usize = 4096;
+const MAX_TXT_BYTES: usize = 4096;
 
 const SUBDOMAIN: &str = "_atproto";
 const PREFIX: &str = "did=";
 
-/// TXT lookups: each record's character-strings joined.
+/// Each record's character-strings joined.
 pub trait TxtResolver: Send + Sync {
     fn txt<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<String>, String>>;
 }
 
-/// A shared resolver in `server::Config` (Debug for the config's derive).
+/// Debug for `server::Config`'s derive.
 #[derive(Clone)]
 pub struct TxtResolverRef(pub Arc<dyn TxtResolver>);
 
@@ -40,7 +32,6 @@ impl std::fmt::Debug for TxtResolverRef {
     }
 }
 
-/// The system resolver (hickory, /etc/resolv.conf).
 struct SystemTxt;
 
 static SYSTEM: LazyLock<Option<hickory_resolver::TokioResolver>> = LazyLock::new(|| {
@@ -68,15 +59,13 @@ impl TxtResolver for SystemTxt {
     }
 }
 
-/// The configured resolver, else the system one.
 pub fn resolver(configured: Option<&TxtResolverRef>) -> Arc<dyn TxtResolver> {
     static DEFAULT: LazyLock<Arc<dyn TxtResolver>> = LazyLock::new(|| Arc::new(SystemTxt));
     configured.map(|r| r.0.clone()).unwrap_or_else(|| DEFAULT.clone())
 }
 
-/// The DID of exactly one `did=` record (reference `parseDnsResult`: none
-/// or several is no answer).
-pub fn parse_dns_result(records: &[String]) -> Option<String> {
+/// Reference `parseDnsResult`: zero or several `did=` records is no answer.
+fn parse_dns_result(records: &[String]) -> Option<String> {
     let found: Vec<&str> = records
         .iter()
         .take(MAX_TXT_RECORDS)
@@ -89,16 +78,12 @@ pub fn parse_dns_result(records: &[String]) -> Option<String> {
     }
 }
 
-/// `_atproto.<handle>` TXT -> DID; any failure (NXDOMAIN, timeout) is None.
-pub async fn resolve_dns(r: &dyn TxtResolver, handle: &str) -> Option<String> {
+async fn resolve_dns(r: &dyn TxtResolver, handle: &str) -> Option<String> {
     let name = format!("{SUBDOMAIN}.{handle}.");
     let records = tokio::time::timeout(TIMEOUT, r.txt(&name)).await.ok()?.ok()?;
     parse_dns_result(&records)
 }
 
-/// The reference's resolution order: DNS and `http` concurrently; DNS's
-/// answer if it has one (the HTTPS fetch is dropped), else `http`'s (a value
-/// starting with `did:`).
 pub async fn resolve<H>(r: &dyn TxtResolver, handle: &str, http: H) -> Option<String>
 where
     H: std::future::Future<Output = Option<String>>,

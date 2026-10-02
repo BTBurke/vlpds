@@ -1,26 +1,12 @@
-//! TOTP second factor (RFC 6238: HMAC-SHA-1, 6 digits, 30 s steps, ±1 step
-//! of clock skew) plus one-time recovery codes.
+//! TOTP second factor (RFC 6238, SHA-1, 6 digits, 30 s, ±1 step) plus
+//! one-time recovery codes, for password logins and the OAuth sign-in page.
 //!
-//! State lives in private account state (`p/{did}\0totp`) and is written
-//! through the partition log like every other durable change. Accepted codes
-//! advance `last_step`, so a code can't be replayed inside its window.
-//!
-//! Used by `com.atproto.server.createSession` (password logins only; app
-//! passwords bypass it) and by the OAuth login page via
-//! [`check_second_factor`].
-//!
-//! Guessing is bounded per account, across both login paths and restarts:
-//! every [`MAX_FAILURES`] consecutive wrong codes lock the factor for
-//! [`LOCKOUT_SECS`], doubling with each further lockout (capped at a day).
-//! While locked every code, right or wrong, is refused with 429
-//! `RateLimitExceeded`; a correct code after the lock resets the count.
-//!
-//! Every change of the state (an accepted code's `last_step`, a recovery
-//! code used, the failure count) is a conditional write at the account's
-//! owner ([`save_if`], src/xrpc/cas.rs): it lands only if the row still
-//! holds what was read, else the attempt is redone on the new state. So
-//! concurrent attempts on several nodes neither lose failures (N nodes
-//! don't give N times the guesses) nor accept one code twice.
+//! Accepted codes advance `last_step`, so a code can't be replayed inside its
+//! window. Guessing is bounded per account across both login paths and
+//! restarts: every [`MAX_FAILURES`] wrong codes in a row lock the factor,
+//! doubling per lockout. Every state change is a conditional write
+//! ([`save_if`], src/xrpc/cas.rs) redone on conflict, so concurrent attempts
+//! on several nodes neither lose failures nor accept one code twice.
 
 use crate::state::{self, Account};
 use crate::xrpc::{App, XrpcError};
@@ -35,9 +21,7 @@ pub const DIGITS: u32 = 6;
 /// Accepted clock skew, in steps, on either side of now.
 pub const SKEW: u64 = 1;
 pub const RECOVERY_CODES: usize = 10;
-/// Private-state name under the account's DID.
 pub const PRIVATE_NAME: &str = "totp";
-/// Consecutive wrong codes before a lockout.
 pub const MAX_FAILURES: u32 = 5;
 /// First lockout; doubles per further lockout up to [`MAX_LOCKOUT_SECS`].
 pub const LOCKOUT_SECS: u64 = 5 * 60;
@@ -45,34 +29,30 @@ pub const MAX_LOCKOUT_SECS: u64 = 24 * 3600;
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct TotpState {
-    /// Base32 secret of the enabled factor (None = TOTP disabled).
+    /// Base32 in memory, KEK-wrapped in storage (see [`seal`]). None: disabled.
     #[serde(default)]
     pub secret: Option<String>,
-    /// Base32 secret from setupTotp awaiting confirmTotp.
+    /// From setupTotp, awaiting confirmTotp.
     #[serde(default)]
     pub pending: Option<String>,
-    /// [`hash_recovery_code`] of each unused recovery code.
     #[serde(default)]
     pub recovery: Vec<String>,
-    /// Highest time step accepted so far; codes for steps <= this are replays.
+    /// Codes for steps <= this are replays.
     #[serde(default)]
     pub last_step: u64,
     #[serde(default)]
     pub enabled_at: Option<String>,
-    /// Consecutive wrong codes (reset by an accepted one).
     #[serde(default)]
     pub failures: u32,
-    /// Unix seconds until which every code is refused.
+    /// Unix seconds.
     #[serde(default)]
     pub locked_until: u64,
-    /// The wrapped forms `load` read, by plaintext: `save` reuses one while
+    /// The wrapped forms `load` read, by plaintext: `seal` reuses one while
     /// its secret is unchanged (no KEK call per login attempt).
     #[serde(skip)]
     sealed: Vec<(zeroize::Zeroizing<String>, String)>,
 }
 
-/// In storage `secret` and `pending` are wrapped under the KEK
-/// (`secrets::Purpose::Totp`, bound to the DID); in memory they are base32.
 async fn seal(app: &App, did: &str, st: &TotpState) -> Result<TotpState, XrpcError> {
     let mut out = st.clone();
     out.sealed.clear();
@@ -90,8 +70,7 @@ async fn seal(app: &App, did: &str, st: &TotpState) -> Result<TotpState, XrpcErr
 }
 
 async fn unseal(app: &App, did: &str, mut st: TotpState) -> Result<TotpState, XrpcError> {
-    for i in 0..2 {
-        let f = if i == 0 { &mut st.secret } else { &mut st.pending };
+    for f in [&mut st.secret, &mut st.pending] {
         if let Some(wrapped) = f.take() {
             let u = app.secrets.unwrap(crate::secrets::Purpose::Totp, did, &wrapped).await?;
             let plain = String::from_utf8(u.plaintext.to_vec()).map_err(|_| XrpcError::internal("corrupt TOTP secret"))?;
@@ -111,8 +90,8 @@ impl TotpState {
     }
 }
 
-/// HOTP (RFC 4226) value for `counter`, truncated to `DIGITS` digits.
-pub fn hotp(secret: &[u8], counter: u64) -> u32 {
+/// RFC 4226.
+fn hotp(secret: &[u8], counter: u64) -> u32 {
     let mut mac = Hmac::<Sha1>::new_from_slice(secret).expect("hmac accepts any key length");
     mac.update(&counter.to_be_bytes());
     let h = mac.finalize().into_bytes();
@@ -136,8 +115,7 @@ pub fn now_secs() -> u64 {
     crate::tid::now_micros() / 1_000_000
 }
 
-/// Returns the matched step if `code` is valid for a step within ±SKEW of
-/// `now` that is strictly after `after_step`.
+/// The matched step, if within ±SKEW of `now` and after `after_step`.
 pub fn verify_code(secret: &[u8], code: &str, now: u64, after_step: u64) -> Option<u64> {
     let code = code.trim();
     if code.len() != DIGITS as usize || !code.bytes().all(|b| b.is_ascii_digit()) {
@@ -165,7 +143,7 @@ pub fn generate_secret() -> Vec<u8> {
     rand::random::<[u8; 20]>().to_vec()
 }
 
-/// RFC 4648 base32, uppercase, no padding (what authenticator apps expect).
+/// Uppercase, no padding: what authenticator apps expect.
 pub fn base32_encode(b: &[u8]) -> String {
     crate::cid::base32_encode(b).to_ascii_uppercase()
 }
@@ -191,7 +169,6 @@ fn uri_encode(s: &str) -> String {
     out
 }
 
-/// otpauth:// provisioning URI (Key Uri Format).
 pub fn otpauth_uri(secret_b32: &str, issuer: &str, account: &str) -> String {
     format!(
         "otpauth://totp/{}:{}?secret={}&issuer={}&algorithm=SHA1&digits={}&period={}",
@@ -204,7 +181,6 @@ pub fn otpauth_uri(secret_b32: &str, issuer: &str, account: &str) -> String {
     )
 }
 
-/// Ten random recovery codes formatted `xxxxx-xxxxx` (base32).
 pub fn generate_recovery_codes() -> Vec<String> {
     (0..RECOVERY_CODES)
         .map(|_| {
@@ -214,9 +190,8 @@ pub fn generate_recovery_codes() -> Vec<String> {
         .collect()
 }
 
-/// A recovery code's stored form: HMAC-SHA256 keyed by the factor's TOTP
-/// secret (KEK-wrapped at rest), so a leaked state row can't be brute-forced
-/// offline for its ~50-bit codes without the KEK.
+/// Keyed by the TOTP secret (KEK-wrapped at rest), so a leaked state row
+/// can't be brute-forced offline for its ~50-bit codes without the KEK.
 pub fn hash_recovery_code(secret: &[u8], code: &str) -> String {
     let norm: String = code
         .chars()
@@ -233,8 +208,7 @@ pub async fn load(app: &App, did: &str) -> Result<TotpState, XrpcError> {
     Ok(load_raw(app, did).await?.0)
 }
 
-/// The state and the stored bytes it was read from (the condition of
-/// [`save_if`]).
+/// Also returns the stored bytes: the condition for [`save_if`].
 pub async fn load_raw(app: &App, did: &str) -> Result<(TotpState, Option<Bytes>), XrpcError> {
     match app.get_private(did, PRIVATE_NAME).await? {
         Some(v) => Ok((unseal(app, did, serde_json::from_slice(&v).map_err(XrpcError::from_err)?).await?, Some(v))),
@@ -242,9 +216,8 @@ pub async fn load_raw(app: &App, did: &str) -> Result<(TotpState, Option<Bytes>)
     }
 }
 
-/// Writes `st` if the stored row is still `read` (what [`load_raw`]
-/// returned): Ok(false) = it changed meanwhile (another attempt, maybe on
-/// another node), nothing written; reload and redo.
+/// Ok(false): the row is no longer `read` and nothing was written; reload
+/// and redo.
 pub async fn save_if(app: &App, did: &str, st: &TotpState, read: Option<Bytes>) -> Result<bool, XrpcError> {
     use crate::xrpc::cas::{Cond, Op};
     let val = if st.secret.is_none() && st.pending.is_none() {
@@ -258,10 +231,8 @@ pub async fn save_if(app: &App, did: &str, st: &TotpState, read: Option<Bytes>) 
     Ok(out.applied)
 }
 
-/// Rounds of a [`load_raw`] / [`save_if`] loop before giving up.
 pub const CAS_ROUNDS: usize = 8;
 
-/// A [`save_if`] loop lost [`CAS_ROUNDS`] times in a row (503, retryable).
 pub fn conflict() -> XrpcError {
     XrpcError {
         status: StatusCode::SERVICE_UNAVAILABLE,
@@ -270,9 +241,7 @@ pub fn conflict() -> XrpcError {
     }
 }
 
-/// KEK rotation (`vlpds.admin.rewrapSecrets`): rewraps `did`'s TOTP
-/// secrets if any is under an old KEK (or, with `check_versions`, an old
-/// KMS key version). Returns whether one was stale; `dry_run` only checks.
+/// `vlpds.admin.rewrapSecrets`. Returns whether a secret was stale.
 pub async fn rewrap(app: &App, did: &str, check_versions: bool, dry_run: bool) -> Result<bool, XrpcError> {
     let Some(v) = app.get_private(did, PRIVATE_NAME).await? else {
         return Ok(false);
@@ -294,8 +263,7 @@ pub async fn rewrap(app: &App, did: &str, check_versions: bool, dry_run: bool) -
     Err(conflict())
 }
 
-/// Serializes read-modify-write of one account's TOTP state on this node
-/// (an economy: [`save_if`] is what is correct across nodes).
+/// An economy only: [`save_if`] is what is correct across nodes.
 static LOCKS: [tokio::sync::Mutex<()>; 32] = [const { tokio::sync::Mutex::const_new(()) }; 32];
 
 pub async fn lock(did: &str) -> tokio::sync::MutexGuard<'static, ()> {
@@ -324,18 +292,11 @@ pub fn locked_out() -> XrpcError {
     }
 }
 
-/// Whether `e` (from [`check_second_factor`]) is the failed-code lockout.
 pub fn is_lockout(e: &XrpcError) -> bool {
     e.status == StatusCode::TOO_MANY_REQUESTS
 }
 
-/// Records a wrong code; locks the factor every [`MAX_FAILURES`] in a row.
-pub fn record_failure(st: &mut TotpState, now: u64) {
-    record_failure_in(&mut st.failures, &mut st.locked_until, now);
-}
-
-/// The lockout schedule on bare counters (shared with the email factor,
-/// src/xrpc/email2fa.rs, so both factors bound guessing the same way).
+/// Shared with the email factor so both bound guessing the same way.
 pub fn record_failure_in(failures: &mut u32, locked_until: &mut u64, now: u64) {
     *failures = failures.saturating_add(1);
     if failures.is_multiple_of(MAX_FAILURES) {
@@ -344,22 +305,20 @@ pub fn record_failure_in(failures: &mut u32, locked_until: &mut u64, now: u64) {
     }
 }
 
-/// Whether `account` has TOTP enabled (cheap when its `totpEnabled` flag
-/// says no, as for most accounts).
+/// Most accounts never enable TOTP: their `totpEnabled` flag skips the read.
+fn flagged_off(account: &Account) -> bool {
+    account.extra.get("totpEnabled").and_then(|v| v.as_bool()) == Some(false)
+}
+
 pub async fn enabled_for(app: &App, account: &Account) -> Result<bool, XrpcError> {
-    if account.extra.get("totpEnabled").and_then(|v| v.as_bool()) == Some(false) {
+    if flagged_off(account) {
         return Ok(false);
     }
     Ok(load(app, &account.did).await?.enabled())
 }
 
-/// Consumes `code` (a current TOTP code or an unused recovery code) against
-/// the given state, updating it in memory. Caller persists.
-pub fn consume(st: &mut TotpState, code: &str) -> Result<(), XrpcError> {
-    consume_at(st, code, now_secs())
-}
-
-fn consume_at(st: &mut TotpState, code: &str, now: u64) -> Result<(), XrpcError> {
+/// `code` is a TOTP code or an unused recovery code. Caller persists.
+fn consume(st: &mut TotpState, code: &str, now: u64) -> Result<(), XrpcError> {
     let secret = st
         .secret
         .as_deref()
@@ -367,9 +326,7 @@ fn consume_at(st: &mut TotpState, code: &str, now: u64) -> Result<(), XrpcError>
         .ok_or_else(|| XrpcError::internal("corrupt TOTP secret"))?;
     let trimmed = code.trim();
     if trimmed.len() == DIGITS as usize && trimmed.bytes().all(|b| b.is_ascii_digit()) {
-        let step =
-            verify_code(&secret, trimmed, now, st.last_step).ok_or_else(invalid_code)?;
-        st.last_step = step;
+        st.last_step = verify_code(&secret, trimmed, now, st.last_step).ok_or_else(invalid_code)?;
         return Ok(());
     }
     let h = hash_recovery_code(&secret, trimmed);
@@ -382,17 +339,14 @@ fn consume_at(st: &mut TotpState, code: &str, now: u64) -> Result<(), XrpcError>
     Ok(())
 }
 
-/// Second-factor check for a password login. Ok when the account has no TOTP
-/// enabled; otherwise `code` must be a valid, unused TOTP code or recovery
-/// code (401 AuthFactorTokenRequired when missing, 400 InvalidToken when
-/// wrong, 429 RateLimitExceeded while locked out; see [`is_lockout`]).
+/// 401 AuthFactorTokenRequired when `code` is missing, 400 InvalidToken when
+/// wrong, 429 RateLimitExceeded while locked out.
 pub async fn check_second_factor(
     app: &App,
     account: &Account,
     code: Option<&str>,
 ) -> Result<(), XrpcError> {
-    // cheap path: most accounts never enable TOTP
-    if account.extra.get("totpEnabled").and_then(|v| v.as_bool()) == Some(false) {
+    if flagged_off(account) {
         return Ok(());
     }
     let _g = lock(&account.did).await;
@@ -409,9 +363,8 @@ pub async fn check_second_factor(
             .map(str::trim)
             .filter(|c| !c.is_empty())
             .ok_or_else(factor_required)?;
-        // saved either way: the failure count is persisted, so it survives
-        // restarts and is shared by createSession and the OAuth sign-in
-        // page; and only if nothing changed since the read (module docs)
+        // saved even on failure: the count must survive restarts and be
+        // shared by both login paths
         let r = attempt(&mut st, code, now);
         crate::xrpc::cas::pause_point("totp", &account.did).await;
         if save_if(app, &account.did, &st, raw).await? {
@@ -421,21 +374,19 @@ pub async fn check_second_factor(
     Err(conflict())
 }
 
-/// [`consume`] under the lockout: refuses while locked, records a wrong
-/// code (possibly locking), resets the count on success. The caller holds
-/// [`lock`] and persists `st` whatever the outcome, with [`save_if`].
+/// The caller holds [`lock`] and persists `st` whatever the outcome.
 pub fn attempt(st: &mut TotpState, code: &str, now: u64) -> Result<(), XrpcError> {
     if now < st.locked_until {
         return Err(locked_out());
     }
-    match consume_at(st, code, now) {
+    match consume(st, code, now) {
         Ok(()) => {
             st.failures = 0;
             Ok(())
         }
         Err(e) if e.status == StatusCode::INTERNAL_SERVER_ERROR => Err(e),
         Err(e) => {
-            record_failure(st, now);
+            record_failure_in(&mut st.failures, &mut st.locked_until, now);
             Err(if now < st.locked_until { locked_out() } else { e })
         }
     }
@@ -479,17 +430,17 @@ mod tests {
     fn lockout_backoff() {
         let mut st = TotpState::default();
         for _ in 0..MAX_FAILURES - 1 {
-            record_failure(&mut st, 1000);
+            record_failure_in(&mut st.failures, &mut st.locked_until, 1000);
         }
         assert_eq!(st.locked_until, 0, "a few wrong codes don't lock");
-        record_failure(&mut st, 1000);
+        record_failure_in(&mut st.failures, &mut st.locked_until, 1000);
         assert_eq!(st.locked_until, 1000 + LOCKOUT_SECS);
         for _ in 0..MAX_FAILURES {
-            record_failure(&mut st, 5000);
+            record_failure_in(&mut st.failures, &mut st.locked_until, 5000);
         }
         assert_eq!(st.locked_until, 5000 + 2 * LOCKOUT_SECS, "doubles");
         for _ in 0..20 * MAX_FAILURES {
-            record_failure(&mut st, 9000);
+            record_failure_in(&mut st.failures, &mut st.locked_until, 9000);
         }
         assert_eq!(st.locked_until, 9000 + MAX_LOCKOUT_SECS, "capped");
     }
@@ -528,8 +479,8 @@ mod tests {
             recovery: codes.iter().map(|c| hash_recovery_code(&sec, c)).collect(),
             ..Default::default()
         };
-        assert!(consume(&mut st, &codes[3].to_uppercase()).is_ok());
+        assert!(consume(&mut st, &codes[3].to_uppercase(), now_secs()).is_ok());
         assert_eq!(st.recovery.len(), 9);
-        assert!(consume(&mut st, &codes[3]).is_err());
+        assert!(consume(&mut st, &codes[3], now_secs()).is_err());
     }
 }

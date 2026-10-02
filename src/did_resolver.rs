@@ -1,10 +1,6 @@
-//! DID document resolution (did:plc via the PLC directory, did:web via
-//! /.well-known/did.json) with an in-memory TTL cache, plus the SSRF policy
-//! for outbound requests to user-controlled endpoints (the guarded client
-//! itself is [`crate::http::guarded`]).
-//!
-//! DIDs of accounts active on this PDS are resolved by the caller without
-//! the network (see `xrpc::identity::account_did_doc`).
+//! DID document resolution with a TTL cache, plus the SSRF policy for
+//! outbound requests to user-controlled endpoints. DIDs of accounts active
+//! here never come through this (`xrpc::identity::account_did_doc`).
 
 use parking_lot::Mutex;
 use serde_json::Value as J;
@@ -16,13 +12,10 @@ use std::time::{Duration, Instant};
 const CACHE_TTL: Duration = Duration::from_secs(600);
 const MAX_DOC_BYTES: usize = 256 << 10;
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
-/// A failed resolution (not found, unreachable, bad document) is remembered
-/// this long, so a stream of requests naming a bogus DID (forged service
-/// JWTs, ...) doesn't turn into a stream of outbound fetches.
+/// Failures are remembered so a stream of requests naming a bogus DID
+/// (forged service JWTs, ...) doesn't turn into a stream of outbound fetches.
 const NEGATIVE_TTL: Duration = Duration::from_secs(30);
-/// [`DidResolver::refresh`] re-fetches a DID's document at most this often.
 const REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(30);
-/// Bound on the negative-result and refresh-time maps (cleared when full).
 const SIDE_MAP_CAP: usize = 10_000;
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -38,25 +31,21 @@ pub enum ResolveError {
 pub struct DidResolver {
     plc_url: String,
     /// Allow http:// and private addresses (dev/test only).
-    pub allow_insecure: bool,
-    /// SSRF-guarded client (non-public addresses refused unless `allow_insecure`).
+    allow_insecure: bool,
+    /// SSRF-guarded.
     http: reqwest::Client,
-    /// Client for the operator-configured PLC directory (may be local).
+    /// Not guarded: the operator-configured PLC directory may be local.
     plc_http: reqwest::Client,
-    /// Capped by the `did_docs` cap ([`crate::caches`]).
     cache: Arc<Mutex<HashMap<String, (Instant, Arc<J>)>>>,
-    /// Recent failed resolutions ([`NEGATIVE_TTL`]).
     negative: Mutex<HashMap<String, (Instant, ResolveError)>>,
-    /// Last forced refresh per DID ([`REFRESH_MIN_INTERVAL`]).
     refreshed: Mutex<HashMap<String, (Instant, ())>>,
 }
 
-/// Inserts into a side map bounded by [`SIDE_MAP_CAP`]: when full, entries
-/// older than `ttl` go, else all of them.
-fn bounded_insert<V>(m: &mut HashMap<String, (Instant, V)>, k: &str, v: V, ttl: Duration) {
-    if m.len() >= SIDE_MAP_CAP && !m.contains_key(k) {
+/// When full, entries older than `ttl` go, else all of them.
+fn bounded_insert<V>(m: &mut HashMap<String, (Instant, V)>, k: &str, v: V, ttl: Duration, cap: usize) {
+    if m.len() >= cap && !m.contains_key(k) {
         m.retain(|_, (at, _)| at.elapsed() < ttl);
-        if m.len() >= SIDE_MAP_CAP {
+        if m.len() >= cap {
             m.clear();
         }
     }
@@ -76,11 +65,6 @@ impl DidResolver {
         }
     }
 
-    /// The SSRF-guarded client ([`crate::http::guarded`]).
-    pub fn http(&self) -> &reqwest::Client {
-        &self.http
-    }
-
     pub fn cached(&self, did: &str) -> Option<Arc<J>> {
         let c = self.cache.lock();
         c.get(did)
@@ -93,18 +77,17 @@ impl DidResolver {
         self.negative.lock().remove(did);
     }
 
-    /// Like [`Self::invalidate`] (the next resolve re-fetches), but at most
-    /// once per [`REFRESH_MIN_INTERVAL`] per DID: for refreshes an outside
-    /// party can trigger (a service JWT whose signature doesn't match the
-    /// cached key), so they can't evict a busy DID's document on every
-    /// request. Returns whether the cache was dropped.
+    /// [`Self::invalidate`] at most once per [`REFRESH_MIN_INTERVAL`] per
+    /// DID: outside parties can trigger it (a service JWT that doesn't match
+    /// the cached key), and must not evict a busy DID on every request.
+    /// Returns whether the cache was dropped.
     pub fn refresh(&self, did: &str) -> bool {
         {
             let mut r = self.refreshed.lock();
             if r.get(did).is_some_and(|(at, _)| at.elapsed() < REFRESH_MIN_INTERVAL) {
                 return false;
             }
-            bounded_insert(&mut r, did, (), REFRESH_MIN_INTERVAL);
+            bounded_insert(&mut r, did, (), REFRESH_MIN_INTERVAL, SIDE_MAP_CAP);
         }
         self.invalidate(did);
         true
@@ -120,7 +103,7 @@ impl DidResolver {
         let r = self.fetch(did).await;
         if let Err(e) = &r {
             if !matches!(e, ResolveError::BadDid(_)) {
-                bounded_insert(&mut self.negative.lock(), did, e.clone(), NEGATIVE_TTL);
+                bounded_insert(&mut self.negative.lock(), did, e.clone(), NEGATIVE_TTL, SIDE_MAP_CAP);
             }
         }
         r
@@ -160,19 +143,12 @@ impl DidResolver {
         }
         let doc = Arc::new(doc);
         let cap = crate::caches::cap(crate::caches::Cache::DidDocs);
-        let mut c = self.cache.lock();
-        if c.len() >= cap {
-            c.retain(|_, (at, _)| at.elapsed() < CACHE_TTL);
-            if c.len() >= cap {
-                c.clear();
-            }
-        }
-        c.insert(did.to_string(), (Instant::now(), doc.clone()));
+        bounded_insert(&mut self.cache.lock(), did, doc.clone(), CACHE_TTL, cap);
         Ok(doc)
     }
 
     fn did_web_url(&self, did: &str, rest: &str) -> Result<String, ResolveError> {
-        // atproto only supports hostname-level did:web (no path segments).
+        // atproto supports only hostname-level did:web
         if rest.is_empty() || rest.contains(':') || rest.contains('/') {
             return Err(ResolveError::BadDid(did.into()));
         }
@@ -234,8 +210,7 @@ async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<J, FetchError
     serde_json::from_slice(&buf).map_err(|e| FetchError::Other(format!("invalid JSON: {e}")))
 }
 
-/// Finds a service endpoint in a DID document by fragment id ("atproto_pds",
-/// "bsky_appview", ...). Accepts both "#id" and "{did}#id" forms.
+/// `service_id` without '#'; both "#id" and "{did}#id" ids match.
 pub fn service_endpoint(doc: &J, service_id: &str) -> Option<String> {
     let did = doc.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let short = format!("#{service_id}");
@@ -253,7 +228,6 @@ pub fn service_endpoint(doc: &J, service_id: &str) -> Option<String> {
     })
 }
 
-/// atproto signing key (#atproto verification method) as a multibase string.
 pub fn signing_key_multibase(doc: &J) -> Option<String> {
     let did = doc.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let full = format!("{did}#atproto");
@@ -267,9 +241,7 @@ pub fn signing_key_multibase(doc: &J) -> Option<String> {
         })
 }
 
-/// True for globally routable unicast addresses. Loopback, private (RFC 1918 /
-/// ULA), link-local, CGNAT, multicast, unspecified, documentation and other
-/// special-purpose ranges are rejected (SSRF protection).
+/// Globally routable unicast only (SSRF protection).
 pub fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -312,8 +284,8 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// Checks a URL against the SSRF policy before connecting: https only and no
-/// non-public IP literals (DNS names are filtered by the client's resolver).
+/// https only and no non-public IP literals; DNS names are filtered by the
+/// guarded client's resolver.
 pub fn check_outbound_url(url: &reqwest::Url, allow_insecure: bool) -> Result<(), String> {
     if allow_insecure {
         return match url.scheme() {

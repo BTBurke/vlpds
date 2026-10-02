@@ -1,14 +1,6 @@
-//! Handle policy, ported from the reference PDS (packages/pds/src/handle):
-//! the reserved service-domain labels and the explicit-slur filter. Both
-//! lists are data files compiled into the binary (`handle_policy/*.txt`,
-//! verbatim from the reference) so they can be diffed against upstream.
-//!
-//! Where they apply (as in the reference's `normalizeAndValidateHandle`):
-//! - slur filter: any handle a user picks (createAccount, OAuth sign-up,
-//!   updateHandle), service-domain or custom domain, and record keys on
-//!   writes. Admins (`com.atproto.admin.updateAccountHandle`) bypass it.
-//! - reserved labels: only the first label of a handle under the service
-//!   domain; custom domains prove control instead. Admins bypass it too.
+//! The reference PDS's reserved handle labels and explicit-slur filter
+//! (packages/pds/src/handle), compiled in verbatim so they diff against
+//! upstream. Where each applies: DESIGN.md "Handle policy".
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
@@ -31,14 +23,12 @@ static SLURS: LazyLock<Vec<regex::Regex>> = LazyLock::new(|| {
         .collect()
 });
 
-/// Whether `label` (the part of a service-domain handle before the domain)
-/// is reserved.
+/// `label`: the part of a service-domain handle before the domain.
 pub fn is_reserved(label: &str) -> bool {
     RESERVED.contains(label)
 }
 
-/// Reference `hasExplicitSlur`: a pattern matches the string as is, or with
-/// every '.', '-' and '_' removed.
+/// Reference `hasExplicitSlur`: also matches with '.', '-' and '_' removed.
 pub fn has_explicit_slur(s: &str) -> bool {
     let squashed: String = s.chars().filter(|c| !matches!(c, '.' | '-' | '_')).collect();
     SLURS.iter().any(|r| r.is_match(s) || r.is_match(&squashed))

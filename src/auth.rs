@@ -12,24 +12,20 @@ use std::sync::Arc;
 pub struct Jwt {
     secret: Vec<u8>,
     pub service_did: String,
-    /// Tokens whose signature this secret verified, with their claims.
     verified: Arc<TokenCache<Arc<Claims>>>,
 }
 
 const TOKEN_CACHE_SHARDS: usize = 64;
 
-/// Verified bearer tokens: what a token proves by itself (signature checked,
-/// claims parsed), kept until its `exp`, so a token pays for verification
-/// and parsing once instead of on every request. Only signed tokens are put
-/// here, and a hit compares the whole token. Revocation, sessions and
-/// account status are not cached: callers check them on every request.
-/// Bounded by its [`crate::caches`] cap (sized from the memory budget): a
-/// full shard drops its expired entries, then all of them.
+/// Verified bearer tokens (signature checked, claims parsed) until their
+/// `exp`. A hit compares the whole token. Revocation, sessions and account
+/// status are not cached: callers check them on every request. A full shard
+/// drops its expired entries, then all of them.
 pub struct TokenCache<V> {
     /// signature segment -> (whole token, value, exp unix secs)
     shards: Vec<parking_lot::Mutex<HashMap<Box<str>, (Box<str>, V, u64)>>>,
     kind: crate::caches::Cache,
-    /// A cap of its own instead of the process-wide one (tests).
+    /// Tests: a cap of its own instead of the process-wide one.
     fixed_cap: Option<usize>,
 }
 
@@ -40,14 +36,12 @@ impl<V: Send> crate::caches::Len for TokenCache<V> {
 }
 
 impl<V: Clone + Send + 'static> TokenCache<V> {
-    /// A cache capped at `kind`'s process-wide cap, counted in its metrics.
     pub fn tracked(kind: crate::caches::Cache) -> Arc<Self> {
         crate::caches::track(kind, Arc::new(Self::build(kind, None)))
     }
 }
 
 impl<V: Clone> TokenCache<V> {
-    /// A cache of about `capacity` tokens (untracked).
     pub fn with_capacity(capacity: usize) -> Self {
         Self::build(crate::caches::Cache::SessionTokens, Some(capacity))
     }
@@ -64,8 +58,8 @@ impl<V: Clone> TokenCache<V> {
         self.fixed_cap.unwrap_or_else(|| crate::caches::cap(self.kind)).div_ceil(TOKEN_CACHE_SHARDS).max(1)
     }
 
-    /// (shard, signature segment). The signature is random-looking, so its
-    /// last bytes pick the shard without hashing the token.
+    /// The signature is random-looking, so its last bytes pick the shard
+    /// without hashing the token.
     fn slot<'t>(&self, token: &'t str) -> (&parking_lot::Mutex<HashMap<Box<str>, (Box<str>, V, u64)>>, &'t str) {
         let sig = token.rsplit_once('.').map_or(token, |(_, s)| s);
         let b = sig.as_bytes();
@@ -73,7 +67,6 @@ impl<V: Clone> TokenCache<V> {
         (&self.shards[tail % self.shards.len()], sig)
     }
 
-    /// The value cached for exactly `token`, unless it expired before `now`.
     pub fn get(&self, token: &str, now: u64) -> Option<V> {
         let (shard, sig) = self.slot(token);
         let m = shard.lock();
@@ -81,7 +74,7 @@ impl<V: Clone> TokenCache<V> {
         (**tok == *token && *exp >= now).then(|| v.clone())
     }
 
-    /// Caches `v` for `token` (whose signature the caller verified) until `exp`.
+    /// The caller verified `token`'s signature.
     pub fn put(&self, token: &str, v: V, exp: u64, now: u64) {
         if exp < now {
             return;
@@ -106,8 +99,7 @@ pub struct Claims {
     pub aud: String,
     pub iat: u64,
     pub exp: u64,
-    /// Session id (refresh tokens: the token id; access tokens: the session
-    /// family id). Used for revocation.
+    /// Refresh tokens: the token id; access tokens: the session family id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jti: Option<String>,
 }
@@ -125,11 +117,6 @@ impl Jwt {
         Hmac::<Sha256>::new_from_slice(&self.secret).unwrap()
     }
 
-    fn issue(&self, did: &str, scope: &str, ttl_secs: u64, typ: &str) -> String {
-        self.issue_with_jti(did, scope, ttl_secs, typ, None)
-    }
-
-    /// Signs a session JWT carrying an optional `jti` (session id).
     pub fn issue_with_jti(
         &self,
         did: &str,
@@ -159,15 +146,10 @@ impl Jwt {
     }
 
     pub fn access(&self, did: &str) -> String {
-        self.issue(did, "com.atproto.access", 2 * 3600, "at+jwt")
+        self.issue_with_jti(did, "com.atproto.access", 2 * 3600, "at+jwt", None)
     }
 
-    pub fn refresh(&self, did: &str) -> String {
-        self.issue(did, "com.atproto.refresh", 90 * 86400, "refresh+jwt")
-    }
-
-    /// Verifies the signature only and returns the claims (expiry and scope
-    /// are the caller's to check).
+    /// Expiry and scope are the caller's to check.
     pub fn verify_signature(&self, token: &str) -> Option<Claims> {
         let (signing_input, sig) = token.rsplit_once('.')?;
         let sig = B64.decode(sig).ok()?;
@@ -178,9 +160,7 @@ impl Jwt {
         serde_json::from_slice(&B64.decode(payload).ok()?).ok()
     }
 
-    /// [`Jwt::verify_signature`] through the verified-token cache: the
-    /// signature is checked and the claims parsed once per token (until its
-    /// expiry); expiry, scope and revocation stay the caller's to check.
+    /// Expiry, scope and revocation are the caller's to check.
     pub fn verify_signature_cached(&self, token: &str) -> Option<Arc<Claims>> {
         let now = crate::tid::now_micros() / 1_000_000;
         if let Some(c) = self.verified.get(token, now) {
@@ -190,29 +170,10 @@ impl Jwt {
         self.verified.put(token, c.clone(), c.exp, now);
         Some(c)
     }
-
-    /// Returns the DID of a valid access token.
-    pub fn verify_access(&self, token: &str) -> Option<String> {
-        let (signing_input, sig) = token.rsplit_once('.')?;
-        let sig = B64.decode(sig).ok()?;
-        let mut mac = self.mac();
-        mac.update(signing_input.as_bytes());
-        mac.verify_slice(&sig).ok()?;
-        let (_, payload) = signing_input.split_once('.')?;
-        let claims: Claims = serde_json::from_slice(&B64.decode(payload).ok()?).ok()?;
-        let now = crate::tid::now_micros() / 1_000_000;
-        if claims.scope != "com.atproto.access" || claims.exp < now {
-            return None;
-        }
-        Some(claims.sub)
-    }
 }
 
-/// Inter-service auth JWT (ES256K) signed with the account's signing key, as
-/// used by getServiceAuth and service proxying. `aud` is the target service DID
-/// (optionally with a #fragment); `lxm` binds the token to one XRPC method.
-/// The signature is hedged and verified before it is returned (src/crypto.rs);
-/// Err: it failed twice, nothing was issued.
+/// ES256K service-auth JWT. `aud` may carry a #fragment. Err: signing failed
+/// verification twice and nothing was issued.
 pub fn service_auth_jwt(
     key: &crate::crypto::Keypair,
     iss: &str,
@@ -238,7 +199,6 @@ pub fn service_auth_jwt(
     Ok(format!("{signing_input}.{}", B64.encode(sig)))
 }
 
-/// Constant-time secret comparison for admin / internal / bypass tokens.
 /// Compares SHA-256 digests, so neither content nor length leaks through
 /// timing. An empty `expected` (unset secret) never matches.
 pub fn token_eq(expected: &str, given: &str) -> bool {
@@ -250,16 +210,15 @@ pub fn token_eq(expected: &str, given: &str) -> bool {
     a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// `Authorization: Basic <b64>` value (after the scheme) carrying
-/// `admin:<admin_token>`.
+/// `b64` is the `Authorization: Basic` value after the scheme.
 pub fn basic_admin_ok(b64: &str, admin_token: &str) -> bool {
     let dec = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
         .unwrap_or_default();
-    match std::str::from_utf8(&dec).ok().and_then(|s| s.strip_prefix("admin:")) {
-        Some(tok) => token_eq(admin_token, tok),
-        None => false,
-    }
+    std::str::from_utf8(&dec)
+        .ok()
+        .and_then(|s| s.strip_prefix("admin:"))
+        .is_some_and(|tok| token_eq(admin_token, tok))
 }
 
 #[cfg(test)]

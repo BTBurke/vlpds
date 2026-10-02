@@ -1,32 +1,11 @@
-//! secp256k1 (K-256) signing keys and did:key / multikey encodings.
+//! secp256k1 signing keys (libsecp256k1, faster than RustCrypto `k256`)
+//! and did:key / multikey encodings.
 //!
-//! Backed by libsecp256k1 (the `secp256k1` crate, vendored C built by `cc`):
-//! on the M4 Pro it signs in ~13.4 µs vs ~22.5 µs for RustCrypto `k256`, and
-//! verifies in ~13 µs vs ~35 µs. P-256 stays on RustCrypto (`p256`), used by
-//! OAuth/JOSE and P-256 did:keys.
-//!
-//! **Signing hardening** (fault attacks: Rowhammer, voltage/clock glitches,
-//! bad RAM). With purely deterministic ECDSA (RFC 6979), one fault while
-//! signing a message that is also signed correctly leaks the private key
-//! from the two signatures, and commit signatures go straight to the public
-//! firehose. So:
-//! - every signature is *hedged*: 32 fresh bytes from a thread-local CSPRNG
-//!   (`rand::thread_rng`, ChaCha12 seeded from the OS) go into the nonce
-//!   derivation as RFC 6979 §3.6 additional data (libsecp256k1's `ndata`),
-//!   so no two signatures share a nonce, even over the same message, and a
-//!   broken RNG still leaves RFC 6979's guarantee;
-//! - signatures that leave the node ([`Keypair::sign_verified`]: commits,
-//!   service-auth JWTs; `oauth::jose::ServerKey::sign` for access tokens)
-//!   are verified against the key's cached public key, over a freshly
-//!   hashed message, before they are used. A failure is never emitted: it
-//!   counts `vlpds_signature_verify_failures_total{purpose}`, logs an
-//!   error and signs once more (fresh nonce); a second failure is a
-//!   retryable error. [`FAULT_FAIL_STOP`] failures within [`FAULT_WINDOW`]
-//!   fail-stop the node (`signature_fault`, exit code 6): a host that flips
-//!   bits must not keep signing.
-//!
-//! The deterministic path stays for tests and tools that compare against
-//! other RFC 6979 implementations ([`Keypair::sign_deterministic`]).
+//! With deterministic ECDSA, one faulty signature next to a correct one over
+//! the same message leaks the key, and commit signatures are public. So
+//! every signature is hedged (fresh random bytes as RFC 6979 §3.6 additional
+//! data), and what leaves the node is verified before use, fail-stopping a
+//! host that keeps faulting. DESIGN.md "Signing hardening".
 
 use secp256k1::{ecdsa::Signature, Message, PublicKey, SecretKey, SECP256K1};
 use sha2::{Digest, Sha256};
@@ -37,13 +16,12 @@ use std::time::{Duration, Instant};
 
 pub struct Keypair {
     sk: SecretKey,
-    /// derived lazily: deriving costs ~9 µs and most loads only sign
+    /// Lazy: deriving costs about as much as a signature and most loads only sign.
     pk: OnceLock<PublicKey>,
 }
 
-/// Unwrapped signing keys live in caches (`secrets::Secrets`, repo state):
-/// overwrite the scalar when the last holder lets go (best effort; see
-/// `SecretKey::non_secure_erase`).
+/// Unwrapped keys live in caches: erase the scalar when the last holder
+/// lets go (best effort).
 impl Drop for Keypair {
     fn drop(&mut self) {
         self.sk.non_secure_erase();
@@ -70,7 +48,6 @@ impl Keypair {
         Ok(Keypair::new(SecretKey::from_slice(b)?))
     }
 
-    /// The raw secret (callers wrap it at once: `secrets::Secrets`).
     pub fn to_bytes(&self) -> zeroize::Zeroizing<Vec<u8>> {
         let mut b = self.sk.secret_bytes();
         let v = zeroize::Zeroizing::new(b.to_vec());
@@ -78,18 +55,15 @@ impl Keypair {
         v
     }
 
-    /// Low-S ECDSA signature over sha256(data), 64-byte compact form, with a
-    /// hedged nonce. Not verified: what leaves the node goes through
-    /// [`sign_verified`](Self::sign_verified).
+    /// Low-S compact ECDSA over sha256(data), hedged. Not verified: what
+    /// leaves the node goes through [`sign_verified`](Self::sign_verified).
     pub fn sign(&self, data: &[u8]) -> [u8; 64] {
         let digest: [u8; 32] = Sha256::digest(data).into();
         sign_hedged(&self.sk, &digest)
     }
 
-    /// RFC 6979 without additional data: the signature `k256`, shrike or
-    /// `SECP256K1.sign_ecdsa` make for the same key and message. For tests
-    /// and tools that compare signatures byte for byte, never for anything a
-    /// node emits.
+    /// Plain RFC 6979, byte-identical to `k256` / shrike: for tests and
+    /// tools only, never for anything a node emits.
     pub fn sign_deterministic(&self, data: &[u8]) -> [u8; 64] {
         let digest: [u8; 32] = Sha256::digest(data).into();
         let mut sig = sign_digest(&self.sk, &digest, None);
@@ -97,12 +71,9 @@ impl Keypair {
         sig.serialize_compact()
     }
 
-    /// [`sign`](Self::sign), then checked against this key's cached public
-    /// key over a freshly computed hash of `data` before it is returned. A
-    /// signature that fails is never returned: it is recorded
-    /// ([`record_fault`]: metric, error log, fail-stop on repeats) and
-    /// signing is retried once with a fresh nonce; a second failure is a
-    /// [`SignatureFault`] (retryable: nothing was emitted).
+    /// Verifies against the cached public key over a fresh hash of `data`;
+    /// a failure is recorded ([`record_fault`]) and signing retried once
+    /// with a fresh nonce. Err: nothing was emitted, retryable.
     pub fn sign_verified(&self, purpose: Purpose, data: &[u8]) -> Result<[u8; 64], SignatureFault> {
         let pk = self.public_key();
         for _ in 0..2 {
@@ -133,9 +104,8 @@ impl Keypair {
         Err(SignatureFault { purpose: purpose.as_str() })
     }
 
-    /// Whether the secret scalar still derives the cached public key and
-    /// `multibase` (the account's stored public key; empty: the cached key
-    /// only). One public-key derivation (~9 µs): once per repo load.
+    /// Whether the scalar still derives the cached public key and
+    /// `multibase` (empty: the cached key only).
     pub fn matches_public(&self, multibase: &str) -> bool {
         let fresh = PublicKey::from_secret_key(SECP256K1, &self.sk);
         fresh == *self.public_key() && (multibase.is_empty() || self.public_multibase() == multibase)
@@ -146,12 +116,10 @@ impl Keypair {
             .get_or_init(|| PublicKey::from_secret_key(SECP256K1, &self.sk))
     }
 
-    /// Compressed SEC1 public key (33 bytes).
     pub fn public_key_sec1(&self) -> [u8; 33] {
         self.public_key().serialize()
     }
 
-    /// Multibase (base58btc) multikey: secp256k1-pub multicodec + compressed point.
     pub fn public_multibase(&self) -> String {
         let mut b = vec![0xe7, 0x01];
         b.extend_from_slice(&self.public_key_sec1());
@@ -163,8 +131,6 @@ impl Keypair {
     }
 }
 
-/// A low-S compact signature with 32 fresh random bytes as the nonce's
-/// additional data.
 fn sign_hedged(sk: &SecretKey, digest: &[u8; 32]) -> [u8; 64] {
     let mut extra = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut extra);
@@ -174,11 +140,9 @@ fn sign_hedged(sk: &SecretKey, digest: &[u8; 32]) -> [u8; 64] {
     sig.serialize_compact()
 }
 
-/// libsecp256k1's `secp256k1_ecdsa_sign` with [`rfc6979_nonce`]: the same
-/// signature as `SECP256K1.sign_ecdsa_with_noncedata` (`sign_ecdsa` without
-/// `extra`), with the nonce's HMAC-SHA256 on the `sha2` crate's hardware
-/// SHA-256 (SHA-NI / ARMv8 SHA2) instead of libsecp256k1's portable C
-/// SHA-256, which was ~2.5 µs (~17%) of a ~14.5 µs signature.
+/// `SECP256K1.sign_ecdsa_with_noncedata`, but with [`rfc6979_nonce`] so the
+/// nonce's HMACs run on hardware SHA-256 instead of libsecp256k1's portable
+/// C SHA-256 (a sizeable share of a signature).
 fn sign_digest(sk: &SecretKey, digest: &[u8; 32], extra: Option<&[u8; 32]>) -> Signature {
     use secp256k1::ffi::{self, CPtr};
     let ndata = extra.map_or(std::ptr::null(), |e| e.as_ptr() as *const std::os::raw::c_void);
@@ -201,22 +165,20 @@ fn sign_digest(sk: &SecretKey, digest: &[u8; 32], extra: Option<&[u8; 32]>) -> S
     Signature::from(sig)
 }
 
-/// `sig` (compact, as emitted) is a valid low-S signature by `pk` over
-/// sha256(`data`), hashed here again rather than reusing the signer's digest.
+/// Hashes `data` again rather than reusing the signer's digest.
 fn verify_compact(pk: &PublicKey, data: &[u8], sig: &[u8; 64]) -> bool {
     let Ok(sig) = Signature::from_compact(sig) else { return false };
     let digest: [u8; 32] = Sha256::digest(data).into();
     SECP256K1.verify_ecdsa(&Message::from_digest(digest), &sig, pk).is_ok()
 }
 
-/// The secp256k1 group order n, big-endian.
+/// The secp256k1 group order n.
 const ORDER: [u8; 32] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
     0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
 ];
 
-/// `m mod n` for a 32-byte big-endian value (m < 2^256 < 2n: at most one
-/// subtraction). Constant time.
+/// m < 2^256 < 2n: at most one subtraction. Constant time.
 fn reduce_mod_order(m: &[u8; 32]) -> [u8; 32] {
     let mut diff = [0u8; 32];
     let mut borrow = 0u16;
@@ -234,7 +196,6 @@ fn reduce_mod_order(m: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// HMAC-SHA256 with a 32-byte key over the concatenation of `parts`.
 fn hmac_sha256(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
     let mut pad = [0x36u8; 64];
     for (p, k) in pad.iter_mut().zip(key) {
@@ -256,12 +217,9 @@ fn hmac_sha256(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// libsecp256k1's `nonce_function_rfc6979` (its default ECDSA nonce, see
-/// secp256k1.c and hash_impl.h `rfc6979_hmac_sha256_*`) step for step:
-/// HMAC-DRBG seeded with key32 || (msg32 mod n) [|| data32], output number
-/// `counter`. `data` is the hedge (RFC 6979 §3.6 additional data), appended
-/// to the seed as the C function does. Calls with an algorithm tag (never
-/// made here) go to the C function.
+/// libsecp256k1's `nonce_function_rfc6979` step for step (secp256k1.c,
+/// hash_impl.h `rfc6979_hmac_sha256_*`), tested against it. Calls with an
+/// algorithm tag (never made here) go to the C function.
 unsafe extern "C" fn rfc6979_nonce(
     nonce32: *mut std::os::raw::c_uchar,
     msg32: *const std::os::raw::c_uchar,
@@ -323,44 +281,36 @@ unsafe extern "C" fn rfc6979_nonce(
     1
 }
 
-/// atproto ES256K check: `sig` is compact 64-byte (r||s) over sha256(msg),
-/// and must be low-S (high-S is rejected, as `k256` and the reference do).
-/// Err for a malformed key or signature encoding, Ok(false) for a bad signature.
+/// Compact signature over sha256(msg); high-S is rejected, as `k256` and the
+/// reference do. Err: malformed key or signature encoding.
 pub fn verify_k256(pubkey_sec1: &[u8], msg: &[u8], sig: &[u8]) -> anyhow::Result<bool> {
-    let pk = PublicKey::from_slice(pubkey_sec1)?;
-    let sig = Signature::from_compact(sig)?;
-    let digest: [u8; 32] = Sha256::digest(msg).into();
-    Ok(SECP256K1
-        .verify_ecdsa(&Message::from_digest(digest), &sig, &pk)
-        .is_ok())
+    verify_k256_inner(pubkey_sec1, msg, sig, false)
 }
 
-/// [`verify_k256`], also accepting the high-S form of a signature: the
-/// reference's `allowMalleableSig`, used for inter-service JWTs only (commits
-/// and records stay low-S).
+/// Also accepts high-S: the reference's `allowMalleableSig`, for
+/// inter-service JWTs only.
 pub fn verify_k256_malleable(pubkey_sec1: &[u8], msg: &[u8], sig: &[u8]) -> anyhow::Result<bool> {
+    verify_k256_inner(pubkey_sec1, msg, sig, true)
+}
+
+fn verify_k256_inner(pubkey_sec1: &[u8], msg: &[u8], sig: &[u8], malleable: bool) -> anyhow::Result<bool> {
     let pk = PublicKey::from_slice(pubkey_sec1)?;
     let mut sig = Signature::from_compact(sig)?;
-    sig.normalize_s();
+    if malleable {
+        sig.normalize_s();
+    }
     let digest: [u8; 32] = Sha256::digest(msg).into();
-    Ok(SECP256K1
-        .verify_ecdsa(&Message::from_digest(digest), &sig, &pk)
-        .is_ok())
+    Ok(SECP256K1.verify_ecdsa(&Message::from_digest(digest), &sig, &pk).is_ok())
 }
 
-/// What a verified signature is for: the `purpose` label of
-/// `vlpds_signature_verify_failures_total`.
+/// The `purpose` label of `vlpds_signature_verify_failures_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Purpose {
-    /// A repo commit (firehose, getRepo, sync).
     Commit,
-    /// An inter-service auth JWT (proxy, getServiceAuth).
     ServiceAuth,
-    /// An OAuth access token (the server's ES256 key).
     OAuthToken,
     /// A loaded signing key whose scalar no longer derives its public key.
     KeyLoad,
-    /// A PLC operation signed with the server's rotation key.
     PlcOperation,
 }
 
@@ -378,30 +328,27 @@ impl Purpose {
     }
 }
 
-/// A signature failed verification twice in a row and was not emitted.
-/// Retryable: nothing was written or sent.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{purpose} signature failed verification after signing (suspected hardware fault); nothing was emitted, retry")]
 pub struct SignatureFault {
     pub purpose: &'static str,
 }
 
-/// Verify failures within [`FAULT_WINDOW`] that fail-stop the node.
-pub const FAULT_FAIL_STOP: usize = 3;
-pub const FAULT_WINDOW: Duration = Duration::from_secs(60);
-/// Exit code and reason of the signature-fault fail-stop (lifecycle.rs).
-pub const FAULT_EXIT_CODE: i32 = 6;
-pub const FAULT_REASON: &str = "signature_fault";
+/// Verify failures within [`FAULT_WINDOW`] that fail-stop the node: a host
+/// that flips bits must not keep signing.
+const FAULT_FAIL_STOP: usize = 3;
+const FAULT_WINDOW: Duration = Duration::from_secs(60);
+const FAULT_EXIT_CODE: i32 = 6;
+const FAULT_REASON: &str = "signature_fault";
 
-/// Recent verify failures (a sliding window).
 #[derive(Default)]
-pub struct FaultWindow {
+struct FaultWindow {
     times: parking_lot::Mutex<VecDeque<Instant>>,
 }
 
 impl FaultWindow {
-    /// Records a failure at `now`; returns the failures within [`FAULT_WINDOW`].
-    pub fn record(&self, now: Instant) -> usize {
+    /// Returns the failures within [`FAULT_WINDOW`].
+    fn record(&self, now: Instant) -> usize {
         let mut t = self.times.lock();
         while t.front().is_some_and(|&f| now.duration_since(f) >= FAULT_WINDOW) {
             t.pop_front();
@@ -416,16 +363,12 @@ static FAULTS: LazyLock<FaultWindow> = LazyLock::new(FaultWindow::default);
 type FailStopHook = Arc<dyn Fn(&'static str) + Send + Sync>;
 static FAIL_STOP_HOOK: parking_lot::RwLock<Option<FailStopHook>> = parking_lot::RwLock::new(None);
 
-/// Tests: replaces the signature-fault fail-stop (process exit) with `f`.
+/// Tests: replaces the fail-stop's process exit with `f`.
 #[doc(hidden)]
 pub fn set_fail_stop_hook(f: Option<FailStopHook>) {
     *FAIL_STOP_HOOK.write() = f;
 }
 
-/// One signature that failed verification (never emitted): counts
-/// `vlpds_signature_verify_failures_total{purpose}`, logs at error, and
-/// fail-stops the node once [`FAULT_FAIL_STOP`] happened within
-/// [`FAULT_WINDOW`].
 pub fn record_fault(purpose: Purpose) {
     crate::metrics::SIGNATURE_VERIFY_FAILURES.with_label_values(&[purpose.as_str()]).inc();
     let recent = FAULTS.record(Instant::now());
@@ -446,29 +389,23 @@ pub fn record_fault(purpose: Purpose) {
     }
 }
 
-/// Exports every purpose's failure counter at 0 (so `increase()` sees the
-/// first failure).
+/// Exports every purpose at 0 so `increase()` sees the first failure.
 pub fn touch_metrics() {
     for p in Purpose::ALL {
         crate::metrics::SIGNATURE_VERIFY_FAILURES.with_label_values(&[p.as_str()]);
     }
 }
 
-/// Test-only fault injection: corrupts the next signatures made by one key
-/// (named by its compressed SEC1 public key), so tests can prove a faulty
-/// signature is never emitted. Costs one relaxed load per signature unless
-/// a test armed it.
+/// Test-only fault injection for one key (named by its compressed SEC1
+/// public key). Costs one relaxed load per signature unless armed.
 #[doc(hidden)]
 pub mod fault {
     use super::*;
 
-    /// Where the fault lands.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Fault {
-        /// A bit of the finished signature flips.
         Signature,
-        /// A bit of the secret scalar flips while signing (secp256k1 keys;
-        /// P-256 treats it as `Signature`).
+        /// A bit of the scalar flips while signing (P-256 treats it as `Signature`).
         Secret,
     }
 
@@ -476,7 +413,6 @@ pub mod fault {
     static ARMED: AtomicBool = AtomicBool::new(false);
     static PENDING: LazyLock<parking_lot::Mutex<Pending>> = LazyLock::new(Default::default);
 
-    /// Corrupts the next `n` signatures by the key `key_id` with `f`.
     pub fn inject(key_id: &[u8], f: Fault, n: u32) {
         let mut p = PENDING.lock();
         if n == 0 {
@@ -487,12 +423,11 @@ pub mod fault {
         ARMED.store(!p.is_empty(), Ordering::Release);
     }
 
-    /// Whether any fault is pending (lets callers skip computing a key id).
+    /// Lets callers skip computing a key id.
     pub fn armed() -> bool {
         ARMED.load(Ordering::Relaxed)
     }
 
-    /// Whether (and how) to corrupt this signature by `key_id`.
     pub fn take(key_id: &[u8]) -> Option<Fault> {
         if !armed() {
             return None;
