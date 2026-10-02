@@ -1,24 +1,12 @@
-//! Resolution of permission-set lexicons for `include:` scopes, via the
-//! atproto lexicon resolution mechanism:
+//! Permission-set lexicons for `include:` scopes, resolved the atproto way
+//! (DNS `_lexicon` authority, then a getRecord proof verified end to end)
+//! and persisted, so token refreshes keep working while a publisher is
+//! unreachable (as the reference LexiconGetter does).
 //!
-//! 1. authority: DNS TXT `_lexicon.<reversed NSID authority>` -> `did=<DID>`
-//! 2. DID document -> PDS endpoint + `#atproto` signing key
-//! 3. `com.atproto.sync.getRecord` for `com.atproto.lexicon.schema/<nsid>`,
-//!    verified end to end: block CIDs, commit signature, MST inclusion proof
-//! 4. the record must be a lexicon whose `id` is the NSID and whose
-//!    `defs.main` is a `permission-set`.
-//!
-//! Lexicons published by accounts on this PDS are read from local state (no
-//! proof needed). Results are cached in memory for 5 minutes and persisted
-//! (`oauth:lex:{nsid}`), so token refreshes keep working while a publisher is
-//! temporarily unreachable (as the reference LexiconGetter does).
-//!
-//! The token endpoint ([`build_token_scope_cached`]) never waits on a
-//! publisher it has a copy from: it uses the last good copy and re-resolves
-//! a stale one in the background, so a slow or failing publisher can't
-//! hold a code exchange or refresh open (and with it the window in which
-//! it races a revocation). Only a set never seen before is resolved inline,
-//! within [`INLINE_BUDGET`].
+//! The token endpoint never waits on a publisher it has a copy from: it uses
+//! the last good copy and re-resolves a stale one in the background, so a
+//! slow publisher can't hold a code exchange or refresh open (and with it
+//! the window in which it races a revocation).
 
 use super::scopes::{is_nsid, IncludeScope};
 use super::store::{self, StoredLexicon};
@@ -32,39 +20,31 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 const REFRESH: Duration = Duration::from_secs(300);
-/// A background re-resolution that failed is retried after this.
+/// After a failed background re-resolution.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
-/// Longest the token endpoint waits for a permission set it has no copy of.
-pub const INLINE_BUDGET: Duration = Duration::from_secs(3);
+/// For a permission set with no copy anywhere.
+const INLINE_BUDGET: Duration = Duration::from_secs(3);
 const LEXICON_COLLECTION: &str = "com.atproto.lexicon.schema";
 const MAX_CAR_BYTES: usize = 1 << 20;
 
-/// Permission sets by NSID, at most the `permission_sets` cap
-/// ([`crate::caches`]); stale entries are the fallback while a publisher is
-/// unreachable.
+/// Stale entries are the fallback while a publisher is unreachable.
 static CACHE: LazyLock<Arc<parking_lot::Mutex<HashMap<String, (Instant, J)>>>> =
     LazyLock::new(|| crate::caches::track(crate::caches::Cache::PermissionSets, Default::default()));
 static OVERRIDES: LazyLock<parking_lot::Mutex<HashMap<String, String>>> =
     LazyLock::new(Default::default);
-/// NSIDs being re-resolved in the background (one task per NSID).
+/// Being re-resolved in the background.
 static IN_FLIGHT: LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
     LazyLock::new(Default::default);
-static DNS: LazyLock<Option<hickory_resolver::TokioResolver>> = LazyLock::new(|| {
-    hickory_resolver::TokioResolver::builder_tokio()
-        .ok()
-        .map(|b| b.build())
-});
 
-/// Pins the lexicon authority DID for an NSID authority domain (e.g.
-/// "example.com" for `com.example.*`), bypassing DNS. Used by tests and for
-/// operator overrides; resolution of the DID and record proceeds normally.
+/// Tests: pins the authority DID of e.g. "example.com" for `com.example.*`,
+/// bypassing DNS.
 pub fn override_authority(authority: &str, did: &str) {
     OVERRIDES
         .lock()
         .insert(authority.to_ascii_lowercase(), did.to_string());
 }
 
-/// The NSID authority domain: all segments but the name, reversed.
+/// All segments but the name, reversed.
 pub fn nsid_authority(nsid: &str) -> String {
     let segs: Vec<&str> = nsid.split('.').collect();
     segs[..segs.len().saturating_sub(1)]
@@ -76,8 +56,8 @@ pub fn nsid_authority(nsid: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// Returns the permission set (`defs.main`) for `nsid`.
-pub async fn permission_set(app: &App, nsid: &str) -> Result<J, String> {
+/// `defs.main`.
+async fn permission_set(app: &App, nsid: &str) -> Result<J, String> {
     if !is_nsid(nsid) {
         return Err(format!("invalid NSID {nsid}"));
     }
@@ -101,7 +81,7 @@ pub async fn permission_set(app: &App, nsid: &str) -> Result<J, String> {
             main_def(nsid, &doc)
         }
         Err(e) => {
-            // Fall back to the last good copy (memory, then durable).
+            // the last good copy: memory, then durable
             if let Some((_, doc)) = CACHE.lock().get(nsid) {
                 return main_def(nsid, doc);
             }
@@ -114,7 +94,7 @@ pub async fn permission_set(app: &App, nsid: &str) -> Result<J, String> {
     }
 }
 
-/// Caches `doc` for `nsid`; a full cache drops its stale entries, then all.
+/// A full cache drops its stale entries, then all.
 fn cache_put(nsid: &str, at: Instant, doc: J) {
     let cap = crate::caches::cap(crate::caches::Cache::PermissionSets);
     let mut m = CACHE.lock();
@@ -147,8 +127,7 @@ fn main_def(nsid: &str, doc: &J) -> Result<J, String> {
     Ok(main.clone())
 }
 
-/// Resolves and fetches the lexicon document for `nsid` (at-uri, doc),
-/// uncached. Also used for record validation (crate::lexicon).
+/// (at-uri, doc), uncached.
 pub(crate) async fn resolve(app: &App, nsid: &str) -> Result<(String, J), String> {
     let did = resolve_authority(nsid).await?;
     let uri = format!("at://{did}/{LEXICON_COLLECTION}/{nsid}");
@@ -163,23 +142,13 @@ async fn resolve_authority(nsid: &str) -> Result<String, String> {
     if let Some(d) = OVERRIDES.lock().get(&authority) {
         return Ok(d.clone());
     }
-    let resolver = DNS.as_ref().ok_or("DNS resolver unavailable")?;
     let name = format!("_lexicon.{authority}.");
     let fail = |m: String| format!("Failed to resolve lexicon DID authority for {nsid}: {m}");
-    let lookup = tokio::time::timeout(Duration::from_secs(5), resolver.txt_lookup(name.as_str()))
+    let records = tokio::time::timeout(Duration::from_secs(5), crate::handle_resolver::resolver(None).txt(&name))
         .await
         .map_err(|_| fail("DNS timeout".into()))?
-        .map_err(|e| fail(e.to_string()))?;
-    let dids: Vec<String> = lookup
-        .iter()
-        .map(|txt| {
-            txt.txt_data()
-                .iter()
-                .map(|c| String::from_utf8_lossy(c).into_owned())
-                .collect::<String>()
-        })
-        .filter_map(|l| l.strip_prefix("did=").map(String::from))
-        .collect();
+        .map_err(fail)?;
+    let dids: Vec<String> = records.iter().filter_map(|l| l.strip_prefix("did=").map(String::from)).collect();
     match dids.as_slice() {
         [d] if super::scopes::is_atproto_did(d) => Ok(d.clone()),
         [_] => Err(fail("invalid DID in DNS TXT record".into())),
@@ -190,7 +159,7 @@ async fn resolve_authority(nsid: &str) -> Result<String, String> {
 
 async fn fetch_record(app: &App, did: &str, nsid: &str) -> Result<J, String> {
     let rpath = format!("{LEXICON_COLLECTION}/{nsid}");
-    // Hosted here: read our own materialized state.
+    // hosted here: no proof needed
     if app.account(did).await.is_ok() {
         let p = app.partition(did).map_err(|e| e.message)?;
         let v =
@@ -257,9 +226,8 @@ async fn fetch_bytes(url: &str, dev_mode: bool) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// Verifies a getRecord CAR: every block hashes to its CID, the root commit
-/// is for `did` and signed by `key_multibase`, and the MST rooted at
-/// `commit.data` maps `rpath` to the included record.
+/// Every block hashes to its CID, the root commit is `did`'s and signed by
+/// `key_multibase`, and its MST maps `rpath` to the included record.
 pub fn verify_record_proof(
     car: &[u8],
     did: &str,
@@ -306,15 +274,13 @@ pub fn verify_record_proof(
     check_record_type(rec.to_json())
 }
 
-/// atproto multikey (secp256k1 or P-256, compressed) signature check, for
-/// commits and records: compact 64-byte signatures, low-S only (a high-S
-/// signature is Ok(false), as in the reference's default verification).
+/// Compact signatures, low-S only (high-S is Ok(false), as the reference's
+/// default verification).
 pub(crate) fn verify_sig(multibase: &str, msg: &[u8], sig: &[u8]) -> Result<bool, String> {
     verify_multikey(multibase, msg, sig, false)
 }
 
-/// [`verify_sig`] that also accepts high-S signatures: inter-service JWTs
-/// only (the reference verifies them with `allowMalleableSig: true`).
+/// Inter-service JWTs only: the reference's `allowMalleableSig: true`.
 pub(crate) fn verify_sig_malleable(multibase: &str, msg: &[u8], sig: &[u8]) -> Result<bool, String> {
     verify_multikey(multibase, msg, sig, true)
 }
@@ -346,9 +312,6 @@ fn verify_multikey(multibase: &str, msg: &[u8], sig: &[u8], allow_high_s: bool) 
     }
 }
 
-/// [`permission_set`] for the token endpoint: the last good copy (memory,
-/// then durable) at once, re-resolved in the background when stale; only a
-/// set with no copy anywhere is resolved inline, within [`INLINE_BUDGET`].
 async fn permission_set_cached(app: &Arc<App>, nsid: &str) -> Result<J, String> {
     if !is_nsid(nsid) {
         return Err(format!("invalid NSID {nsid}"));
@@ -377,8 +340,6 @@ async fn permission_set_cached(app: &Arc<App>, nsid: &str) -> Result<J, String> 
     }
 }
 
-/// Re-resolves `nsid` in a background task (unless one is running); a
-/// failure keeps the stale copy and is retried after [`RETRY_AFTER`].
 fn refresh_in_background(app: &Arc<App>, nsid: &str) {
     if !IN_FLIGHT.lock().insert(nsid.to_string()) {
         return;
@@ -400,8 +361,8 @@ fn refresh_in_background(app: &Arc<App>, nsid: &str) {
     });
 }
 
-/// [`build_token_scope`] from [`permission_set_cached`] sets (the token
-/// endpoint: bounded time).
+/// `include:` scopes replaced by the permissions their sets grant
+/// (`LexiconManager.buildTokenScope`), in bounded time.
 pub async fn build_token_scope_cached(app: &Arc<App>, scope: &str) -> Result<String, String> {
     if !scope.split(' ').any(|s| IncludeScope::parse(s).is_some()) {
         return Ok(scope.to_string());
@@ -421,7 +382,6 @@ pub async fn build_token_scope_cached(app: &Arc<App>, scope: &str) -> Result<Str
     Ok(out.join(" "))
 }
 
-/// Every permission set referenced by `include:` scopes in `scope`.
 pub async fn permission_sets_for_scope(
     app: &App,
     scope: &str,
@@ -434,27 +394,6 @@ pub async fn permission_sets_for_scope(
         }
     }
     Ok(out)
-}
-
-/// Token scope: `include:` scopes replaced by the repo/rpc permissions their
-/// permission sets grant (`LexiconManager.buildTokenScope`).
-pub async fn build_token_scope(app: &App, scope: &str) -> Result<String, String> {
-    if !scope.split(' ').any(|s| IncludeScope::parse(s).is_some()) {
-        return Ok(scope.to_string());
-    }
-    let mut out: Vec<String> = Vec::new();
-    let mut others: Vec<String> = Vec::new();
-    for s in scope.split(' ') {
-        match IncludeScope::parse(s) {
-            Some(inc) => {
-                let set = permission_set(app, &inc.nsid).await?;
-                out.extend(inc.to_permissions(&set).iter().map(|p| p.to_scope_string()));
-            }
-            None => others.push(s.to_string()),
-        }
-    }
-    out.extend(others);
-    Ok(out.join(" "))
 }
 
 #[cfg(test)]

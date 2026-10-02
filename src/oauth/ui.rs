@@ -63,9 +63,8 @@ label.check{display:flex;align-items:center;gap:8px;font-weight:500;margin:12px 
 static STYLE_HASH: LazyLock<String> =
     LazyLock::new(|| base64::engine::general_purpose::STANDARD.encode(sha256(STYLE)));
 
-/// Content-Security-Policy for our pages. `form_action` lists extra
-/// form-action sources: browsers apply form-action to the redirect that
-/// follows a form post, so the consent page must allow the client's
+/// `form_action`: extra sources. Browsers apply form-action to the redirect
+/// that follows a form post, so the consent page must allow the client's
 /// redirect_uri origin/scheme.
 pub fn csp(form_action: &[String]) -> String {
     let mut fa = String::from("'self'");
@@ -79,8 +78,7 @@ pub fn csp(form_action: &[String]) -> String {
     )
 }
 
-/// Auto-submit for the form_post response page. Submits once; the guard
-/// keeps a page restored from history from posting the code again.
+/// The guard keeps a page restored from history from posting the code again.
 const AUTO_SUBMIT: &str = "var f=document.forms[0],done=false;\
 f.addEventListener('submit',function(e){if(done){e.preventDefault()}done=true});\
 setTimeout(function(){if(!done){done=true;f.submit()}},1);";
@@ -88,8 +86,6 @@ setTimeout(function(){if(!done){done=true;f.submit()}},1);";
 static AUTO_SUBMIT_HASH: LazyLock<String> =
     LazyLock::new(|| base64::engine::general_purpose::STANDARD.encode(sha256(AUTO_SUBMIT)));
 
-/// CSP for the form_post response page: [`csp`] plus the auto-submit
-/// script by hash (nothing else may run).
 pub fn csp_form_post(form_action: &[String]) -> String {
     format!(
         "{}; script-src 'sha256-{}'",
@@ -98,9 +94,7 @@ pub fn csp_form_post(form_action: &[String]) -> String {
     )
 }
 
-/// `response_mode=form_post` (OAuth 2.0 Form Post Response Mode): the
-/// authorization response as hidden fields posted to the redirect URI. The
-/// button is the no-script fallback.
+/// `response_mode=form_post`. The button is the no-script fallback.
 pub fn form_post(redirect_uri: &str, params: &[(String, String)]) -> String {
     let mut fields = String::new();
     for (k, v) in params {
@@ -110,33 +104,35 @@ pub fn form_post(redirect_uri: &str, params: &[(String, String)]) -> String {
             e(v)
         ));
     }
-    format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-<meta name=\"referrer\" content=\"no-referrer\"><title>Returning to the app</title><style>{STYLE}</style></head><body><main>\
-<div class=\"brand\">{MARK}vlpds<span>account security</span></div><div class=\"card\"><div class=\"strata\"></div>\
-<h1>Returning to the app</h1><form method=\"post\" action=\"{}\">{fields}<div class=\"row\">\
-<button type=\"submit\" class=\"primary\">Continue</button></div></form></div></main><script>{AUTO_SUBMIT}</script></body></html>",
+    let body = format!(
+        "<h1>Returning to the app</h1><form method=\"post\" action=\"{}\">{fields}<div class=\"row\">\
+<button type=\"submit\" class=\"primary\">Continue</button></div></form>",
         e(redirect_uri)
-    )
+    );
+    page_with_script("Returning to the app", &body, AUTO_SUBMIT)
 }
 
-/// The vlpds mark: three strata (log segments settling into state).
+/// Three strata: log segments settling into state.
 const MARK: &str = "<svg width=\"22\" height=\"18\" viewBox=\"0 0 22 18\" aria-hidden=\"true\">\
 <rect x=\"0\" y=\"0\" width=\"22\" height=\"4\" rx=\"1\" fill=\"currentColor\"/>\
 <rect x=\"3\" y=\"7\" width=\"16\" height=\"4\" rx=\"1\" fill=\"currentColor\" opacity=\".6\"/>\
 <rect x=\"6\" y=\"14\" width=\"10\" height=\"4\" rx=\"1\" fill=\"currentColor\" opacity=\".35\"/></svg>";
 
 pub fn page(title: &str, body: &str) -> String {
+    page_with_script(title, body, "")
+}
+
+fn page_with_script(title: &str, body: &str, script: &str) -> String {
+    let script = if script.is_empty() { String::new() } else { format!("<script>{script}</script>") };
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <meta name=\"referrer\" content=\"no-referrer\"><title>{}</title><style>{STYLE}</style></head><body><main>\
 <div class=\"brand\">{MARK}vlpds<span>account security</span></div>\
-<div class=\"card\"><div class=\"strata\"></div>{body}</div></main></body></html>",
+<div class=\"card\"><div class=\"strata\"></div>{body}</div></main>{script}</body></html>",
         e(title)
     )
 }
 
-/// Hidden fields every authorization form carries.
 pub struct Ctx<'a> {
     pub request_uri: &'a str,
     pub csrf: &'a str,
@@ -167,8 +163,7 @@ pub struct LoginForm<'a> {
     pub error: Option<&'a str>,
     /// Password accepted; ask for the second-factor code.
     pub totp: bool,
-    /// With `totp`: the code was emailed to this (obfuscated) address
-    /// rather than coming from an authenticator app.
+    /// With `totp`: the code was emailed to this (obfuscated) address.
     pub email_hint: Option<&'a str>,
 }
 
@@ -245,8 +240,6 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
     page("Sign in", &b)
 }
 
-/// The authorization page of this request showing `screen` ("sign-in" or
-/// "sign-up").
 fn screen_url(c: &Ctx, screen: &str) -> String {
     format!(
         "/oauth/authorize?client_id={}&request_uri={}&screen={screen}",
@@ -256,7 +249,7 @@ fn screen_url(c: &Ctx, screen: &str) -> String {
 }
 
 pub struct SignupForm<'a> {
-    /// The handle's first label (the account gets `{handle}.{domain}`).
+    /// The first label.
     pub handle: &'a str,
     pub domain: &'a str,
     pub email: &'a str,
@@ -265,9 +258,6 @@ pub struct SignupForm<'a> {
     pub error: Option<&'a str>,
 }
 
-/// Account creation inside the authorization flow (prompt=create, or "Create
-/// an account" on the sign-in page). Posts to `/oauth/authorize/sign-up`;
-/// the new account is signed in on the device and continues to consent.
 pub fn signup(ctx: &Ctx, f: &SignupForm) -> String {
     let mut b = format!(
         "<h1>Create an account on {}</h1><p class=\"muted\">to continue to</p>{}",
@@ -333,7 +323,8 @@ pub fn chooser(ctx: &Ctx, accounts: &[(String, String)]) -> String {
     page("Choose an account", &b)
 }
 
-/// One plain-language line per requested permission.
+/// One plain-language line per requested permission; a line starting with
+/// NUL is already-escaped HTML.
 pub fn describe_scopes(scope: &str, sets: &[(IncludeScope, J)]) -> Vec<String> {
     let mut out = Vec::new();
     for s in scope.split(' ').filter(|s| !s.is_empty()) {
@@ -366,7 +357,6 @@ pub fn describe_scopes(scope: &str, sets: &[(IncludeScope, J)]) -> Vec<String> {
                             line.push_str("</ul>");
                         }
                     }
-                    // already escaped above; mark with a sentinel prefix
                     out.push(format!("\u{0}{line}"));
                 }
             }
@@ -443,9 +433,8 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// `email_choice`: offer to withhold the email address (the requested scope
-/// has an `account:email` read scope and no `transition:` scope, as in the
-/// reference consent form).
+/// `email_choice`: offer to withhold the email address, as the reference
+/// consent form does.
 pub fn consent(ctx: &Ctx, did: &str, handle: &str, perms: &[String], email_choice: bool) -> String {
     let mut b = format!(
         "<h1>Authorize access</h1><p class=\"muted\">Signed in as <b>@{}</b></p><p>This app wants access to your account:</p>{}<p>It will be able to:</p><ul class=\"perms\">",
@@ -459,21 +448,18 @@ pub fn consent(ctx: &Ctx, did: &str, handle: &str, perms: &[String], email_choic
         }
     }
     b.push_str("</ul><p class=\"muted\">You can revoke this access at any time under <b>Connected apps</b> in your account settings on this server.</p>");
+    let email = if email_choice {
+        "<input type=\"hidden\" name=\"email_choice\" value=\"1\">\
+<label class=\"check\"><input type=\"checkbox\" name=\"allow_email\" value=\"1\" checked>Share my email address with this app</label>"
+    } else {
+        ""
+    };
     b.push_str(&format!(
-        "<form method=\"post\" action=\"/oauth/authorize/consent\">{}<input type=\"hidden\" name=\"did\" value=\"{}\"><div class=\"row\">\
+        "<form method=\"post\" action=\"/oauth/authorize/consent\">{}<input type=\"hidden\" name=\"did\" value=\"{}\">{email}<div class=\"row\">\
 <button type=\"submit\" name=\"action\" value=\"deny\">Deny</button><button type=\"submit\" class=\"primary\" name=\"action\" value=\"allow\" autofocus>Allow</button></div></form>",
         hidden(ctx),
         e(did)
     ));
-    if email_choice {
-        // the checkbox goes inside the form, before the buttons
-        let at = b.rfind("<div class=\"row\">").expect("consent buttons");
-        b.insert_str(
-            at,
-            "<input type=\"hidden\" name=\"email_choice\" value=\"1\">\
-<label class=\"check\"><input type=\"checkbox\" name=\"allow_email\" value=\"1\" checked>Share my email address with this app</label>",
-        );
-    }
     page("Authorize access", &b)
 }
 

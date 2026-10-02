@@ -1,7 +1,6 @@
-//! OAuth clients: client_id parsing (loopback `http://localhost` dev clients
-//! and discoverable https client-metadata documents), metadata fetching with
-//! SSRF protection and caching, metadata validation, redirect-URI matching and
-//! confidential-client authentication (`private_key_jwt`, RFC 7523).
+//! OAuth clients: client_id parsing, metadata fetching and validation (as the
+//! reference `ClientManager`), redirect-URI matching, `private_key_jwt`
+//! authentication (RFC 7523) and request objects (RFC 9101).
 
 use super::jose::{jwk_thumbprint, jwk_to_key, DecodedJwt};
 use super::util::{client_routing, now_secs, parse_form, Replay};
@@ -12,29 +11,26 @@ use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-pub const CLIENT_ASSERTION_TYPE_JWT_BEARER: &str =
+const CLIENT_ASSERTION_TYPE_JWT_BEARER: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 pub const AUTH_METHODS_SUPPORTED: [&str; 2] = ["none", "private_key_jwt"];
 
 const DAY: i64 = 86_400;
-/// Public ("untrusted") clients: 2-week session and refresh-token lifetimes.
+/// Public clients.
 pub const SESSION_LIFETIME: i64 = 14 * DAY;
 pub const REFRESH_LIFETIME: i64 = 14 * DAY;
-/// Confidential clients: 2-year sessions; each refresh token lives 3 months
-/// (the spec allows unlimited sessions and caps refresh tokens at 180 days).
+/// Confidential clients (the spec caps refresh tokens at 180 days).
 pub const SESSION_LIFETIME_EXTENDED: i64 = 730 * DAY;
 pub const REFRESH_LIFETIME_EXTENDED: i64 = 91 * DAY;
-/// Client assertions must be younger than this (seconds).
 const CLIENT_ASSERTION_MAX_AGE: i64 = 60;
-/// Request objects (JAR) must be younger than this (RFC 9101 §10.2: "less
-/// than a minute"; the reference's `JAR_MAX_AGE`).
-pub const JAR_MAX_AGE: i64 = 59;
-/// Accepted clock skew for `iat` / `nbf` in the future (seconds).
+/// RFC 9101 §10.2 "less than a minute", as the reference.
+const JAR_MAX_AGE: i64 = 59;
+/// For `iat` / `nbf` in the future.
 const CLOCK_TOLERANCE: i64 = 10;
 
 const METADATA_MAX_BYTES: usize = 64 << 10;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// Client metadata / JWKS are re-fetched at least this often.
+/// Metadata and keys are re-fetched at least this often.
 const CACHE_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -59,8 +55,7 @@ pub struct Client {
     pub grant_types: Vec<String>,
     pub response_types: Vec<String>,
     pub auth_method: String,
-    pub application_type: String,
-    /// Keys for private_key_jwt (inline `jwks` or fetched `jwks_uri`).
+    /// Inline `jwks` or fetched `jwks_uri`.
     pub jwks: Vec<J>,
     pub loopback: bool,
 }
@@ -96,17 +91,8 @@ impl Client {
             .any(|a| compare_redirect_uri(a, uri))
     }
 
-    /// Display fields are only trusted for... nobody: unknown clients are
-    /// shown by client_id (spec: metadata must not be displayed for unknown
-    /// clients). Kept here for future trusted-client lists.
-    pub fn display_name(&self) -> String {
-        self.id.clone()
-    }
-
-    /// Validates a client assertion (RFC 7523 §3) and returns the binding
-    /// to store with the session. `issuer` is our issuer identifier (the
-    /// required `aud`). An assertion's `jti` comes back as a [`Replay`] the
-    /// caller must claim (single use for the assertion's validity period).
+    /// RFC 7523 §3. Returns the binding to store with the session and the
+    /// assertion's `jti` as a [`Replay`] the caller must claim.
     pub fn authenticate(
         &self,
         creds: &ClientCredentials,
@@ -186,19 +172,14 @@ impl Client {
                 if jwt.claim_str("sub") != Some(self.id.as_str()) {
                     return Err(fail("unexpected \"sub\" claim value"));
                 }
-                let aud_ok = match jwt.payload.get("aud") {
-                    Some(J::String(a)) => a == issuer,
-                    Some(J::Array(a)) => a.iter().any(|x| x.as_str() == Some(issuer)),
-                    _ => false,
-                };
-                if !aud_ok {
+                if aud_matches(&jwt.payload, issuer) != Some(true) {
                     return Err(fail("unexpected \"aud\" claim value"));
                 }
                 let now = now_secs();
                 let iat = jwt
                     .claim_i64("iat")
                     .ok_or_else(|| fail("missing \"iat\" claim"))?;
-                if iat > now + 10 || now - iat > CLIENT_ASSERTION_MAX_AGE {
+                if iat > now + CLOCK_TOLERANCE || now - iat > CLIENT_ASSERTION_MAX_AGE {
                     return Err(fail("\"iat\" claim timestamp check failed"));
                 }
                 if let Some(exp) = jwt.claim_i64("exp") {
@@ -207,7 +188,7 @@ impl Client {
                     }
                 }
                 if let Some(nbf) = jwt.claim_i64("nbf") {
-                    if nbf > now + 10 {
+                    if nbf > now + CLOCK_TOLERANCE {
                         return Err(fail("\"nbf\" claim timestamp check failed"));
                     }
                 }
@@ -215,10 +196,8 @@ impl Client {
                     .claim_str("jti")
                     .filter(|j| !j.is_empty())
                     .ok_or_else(|| fail("missing \"jti\" claim"))?;
-                // jti must be unique for as long as the assertion is accepted:
-                // its `iat` age is checked above, so past iat + max age (+
-                // skew) it is refused whatever its `exp` (a far-future `exp`
-                // must not pin a claim: util::MAX_CLAIM_TTL)
+                // past iat + max age the assertion is refused anyway, so a
+                // far-future `exp` must not pin the claim
                 let until = iat + CLIENT_ASSERTION_MAX_AGE + CLOCK_TOLERANCE;
                 let replay = Replay {
                     routing: client_routing(&self.id),
@@ -241,9 +220,7 @@ impl Client {
         }
     }
 
-    /// Whether the key bound to a session (by kid + thumbprint) is still in
-    /// the client's current key set. Sessions whose key disappeared must be
-    /// revoked.
+    /// Sessions whose key left the client's key set must be revoked.
     pub fn has_key(&self, auth: &ClientAuth) -> bool {
         match auth {
             ClientAuth::None => true,
@@ -256,16 +233,10 @@ impl Client {
 }
 
 impl Client {
-    /// Verifies a JWT-secured authorization request (RFC 9101 request
-    /// object, `Client.decodeRequestObject` + `decodeJAR` in the reference)
-    /// and returns its payload.
-    ///
-    /// Signed with one of the client's keys (`jwks` / `jwks_uri`), with
-    /// `iss` = client_id and `aud` = our issuer; or unsecured (`alg: none`)
+    /// Reference `decodeRequestObject` + `decodeJAR`. Unsecured (`alg: none`)
     /// only when the client registered `request_object_signing_alg: "none"`,
-    /// in which case `iss` / `aud` are optional but checked when present.
-    /// `iat` is required and must be under [`JAR_MAX_AGE`]; `jti` is required
-    /// and single-use: it comes back as a [`Replay`] for the caller to claim.
+    /// and then `iss` / `aud` are optional but checked when present. The
+    /// `jti` comes back as a [`Replay`] for the caller to claim.
     pub fn decode_request_object(&self, jar: &str, issuer: &str) -> Result<(J, Replay), OAuthError> {
         let fail =
             |m: &str| OAuthError::invalid_request(&format!("Invalid \"request\" object: {m}"));
@@ -317,20 +288,12 @@ impl Client {
                 return Err(fail("signature verification failed"));
             }
         }
-        // iss / aud: required when signed (jose `jwtVerify` with issuer +
-        // audience), checked only when present for unsecured objects.
         match jwt.payload.get("iss") {
             None if unsecured => {}
             Some(J::String(i)) if *i == self.id => {}
             _ => return Err(fail("unexpected \"iss\" claim value")),
         }
-        let aud_ok = match jwt.payload.get("aud") {
-            None => unsecured,
-            Some(J::String(a)) => a == issuer,
-            Some(J::Array(a)) => a.iter().any(|x| x.as_str() == Some(issuer)),
-            _ => false,
-        };
-        if !aud_ok {
+        if !aud_matches(&jwt.payload, issuer).unwrap_or(unsecured) {
             return Err(fail("unexpected \"aud\" claim value"));
         }
         let now = now_secs();
@@ -365,7 +328,15 @@ impl Client {
     }
 }
 
-/// Client credentials from a PAR / token / revocation request body.
+/// None: no `aud`.
+fn aud_matches(payload: &J, issuer: &str) -> Option<bool> {
+    Some(match payload.get("aud")? {
+        J::String(a) => a == issuer,
+        J::Array(a) => a.iter().any(|x| x.as_str() == Some(issuer)),
+        _ => false,
+    })
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ClientCredentials {
     pub client_id: String,
@@ -388,14 +359,12 @@ impl ClientCredentials {
     }
 }
 
-// ---------- redirect URIs ----------
-
-pub fn is_loopback_host(h: &str) -> bool {
+fn is_loopback_host(h: &str) -> bool {
     h == "localhost" || h == "127.0.0.1" || h == "[::1]"
 }
 
 /// `isLocalHostname`: single-label names and reserved TLDs.
-pub fn is_local_hostname(h: &str) -> bool {
+fn is_local_hostname(h: &str) -> bool {
     let parts: Vec<&str> = h.split('.').collect();
     if parts.len() < 2 {
         return true;
@@ -419,9 +388,9 @@ fn is_ip_host(h: &str) -> bool {
         .is_ok()
 }
 
-/// RFC 8252 §8.4 / §7.3 redirect URI comparison: exact match, except that
-/// loopback redirect URIs registered without a port match any port.
-pub fn compare_redirect_uri(allowed: &str, requested: &str) -> bool {
+/// RFC 8252 §8.4 / §7.3: loopback redirect URIs registered without a port
+/// match any port.
+fn compare_redirect_uri(allowed: &str, requested: &str) -> bool {
     if allowed == requested {
         return true;
     }
@@ -465,8 +434,7 @@ fn parse_redirect_uri(uri: &str) -> Result<reqwest::Url, OAuthError> {
         .map_err(|_| OAuthError::invalid_redirect_uri(&format!("Invalid redirect URI {uri}")))
 }
 
-/// Validates a loopback client's `redirect_uri` query parameter value
-/// (http, 127.0.0.1 or [::1]; "localhost" is not allowed per RFC 8252).
+/// RFC 8252 disallows "localhost".
 fn is_loopback_redirect_uri(uri: &str) -> bool {
     if !uri.starts_with("http://") || uri.starts_with("http://localhost") {
         return false;
@@ -476,9 +444,7 @@ fn is_loopback_redirect_uri(uri: &str) -> bool {
         .unwrap_or(false)
 }
 
-// ---------- client ids ----------
-
-pub enum ClientIdKind {
+enum ClientIdKind {
     /// `http://localhost[/][?scope=...&redirect_uri=...]`
     Loopback {
         scope: String,
@@ -487,7 +453,7 @@ pub enum ClientIdKind {
     Discoverable(reqwest::Url),
 }
 
-pub fn parse_client_id(id: &str, dev_mode: bool) -> Result<ClientIdKind, OAuthError> {
+fn parse_client_id(id: &str, dev_mode: bool) -> Result<ClientIdKind, OAuthError> {
     let bad =
         |m: &str| OAuthError::invalid_client_metadata(&format!("Invalid client ID \"{id}\": {m}"));
     const ORIGIN: &str = "http://localhost";
@@ -541,8 +507,7 @@ pub fn parse_client_id(id: &str, dev_mode: bool) -> Result<ClientIdKind, OAuthEr
             });
         }
     }
-    // Discoverable client: https URL of the client metadata document. In dev
-    // mode plain http (e.g. a local test server on 127.0.0.1) is allowed too.
+    // discoverable: the metadata document's URL (dev mode: http too)
     let https = id.starts_with("https://");
     if !https && !(dev_mode && id.starts_with("http://")) {
         return Err(bad("ClientID must be an https URL"));
@@ -593,12 +558,9 @@ pub fn parse_client_id(id: &str, dev_mode: bool) -> Result<ClientIdKind, OAuthEr
     Ok(ClientIdKind::Discoverable(url))
 }
 
-// ---------- fetching ----------
-
-/// Hardened GET of a JSON document from a user-controlled URL: https only and
-/// public addresses only (both relaxed in dev mode), no redirects, timeouts,
-/// a size cap, and a JSON content type.
-pub async fn fetch_json(url: &str, dev_mode: bool, max_bytes: usize) -> Result<J, String> {
+/// From a user-controlled URL: https and public addresses only (outside dev
+/// mode), no redirects, size-capped.
+async fn fetch_json(url: &str, dev_mode: bool, max_bytes: usize) -> Result<J, String> {
     use futures::StreamExt;
     let u = reqwest::Url::parse(url).map_err(|_| "invalid URL".to_string())?;
     if !dev_mode {
@@ -657,7 +619,6 @@ pub async fn fetch_json(url: &str, dev_mode: bool, max_bytes: usize) -> Result<J
     serde_json::from_slice(&buf).map_err(|e| format!("invalid JSON: {e}"))
 }
 
-/// Capped by the `oauth_clients` cap ([`crate::caches`]).
 struct Cache<T> {
     map: parking_lot::Mutex<HashMap<String, (Instant, T)>>,
 }
@@ -697,8 +658,6 @@ impl<T: Clone> Cache<T> {
 static CLIENTS: LazyLock<Arc<Cache<Arc<Client>>>> =
     LazyLock::new(|| crate::caches::track(crate::caches::Cache::OAuthClients, Arc::new(Cache::new())));
 
-/// Resolves and validates a client (cached for 10 minutes, so metadata and
-/// keys are re-fetched periodically).
 pub async fn get_client(client_id: &str, dev_mode: bool) -> Result<Arc<Client>, OAuthError> {
     if let Some(c) = CLIENTS.get(client_id) {
         return Ok(c);
@@ -708,11 +667,6 @@ pub async fn get_client(client_id: &str, dev_mode: bool) -> Result<Arc<Client>, 
         CLIENTS.put(client_id, client.clone());
     }
     Ok(client)
-}
-
-/// Drops a cached client (tests; or after a metadata-related failure).
-pub fn invalidate_client(client_id: &str) {
-    CLIENTS.map.lock().remove(client_id);
 }
 
 async fn load_client(client_id: &str, dev_mode: bool) -> Result<Client, OAuthError> {
@@ -775,7 +729,7 @@ fn parse_jwks(jwks: &J) -> Result<Vec<J>, OAuthError> {
                 "JWKS must not contain private keys",
             ));
         }
-        // Keep only usable EC P-256 keys with a kid; others are ignored.
+        // other keys are ignored, not refused
         if k.get("kid").and_then(|v| v.as_str()).is_some() && jwk_to_key(k).is_ok() {
             out.push(k.clone());
         }
@@ -810,9 +764,7 @@ fn has_dup(v: &[String]) -> Option<&String> {
         .map(|(_, x)| x)
 }
 
-/// Client metadata validation (OAuth/OIDC registration rules + atproto
-/// requirements), following the reference `ClientManager`.
-pub fn validate_metadata(
+fn validate_metadata(
     client_id: &str,
     md: J,
     loopback: bool,
@@ -881,7 +833,7 @@ pub fn validate_metadata(
             if gs("token_endpoint_auth_signing_alg").is_some() {
                 return Err(bad("token_endpoint_auth_method \"none\" must not have token_endpoint_auth_signing_alg"));
             }
-            // Public clients may still sign request objects (JAR).
+            // public clients may still sign request objects
             if let Some(j) = md.get("jwks") {
                 jwks = parse_jwks(j)?;
             }
@@ -1056,7 +1008,6 @@ pub fn validate_metadata(
         grant_types,
         response_types,
         auth_method,
-        application_type,
         jwks,
         loopback,
         metadata: md,
@@ -1205,7 +1156,6 @@ mod tests {
             grant_types: vec![],
             response_types: vec![],
             auth_method: "private_key_jwt".into(),
-            application_type: "web".into(),
             jwks: vec![jwk],
             loopback: false,
         };

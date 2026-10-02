@@ -1,29 +1,19 @@
 //! atproto OAuth permission grammar, ported from `@atproto/oauth-scopes`.
-//!
-//! Scope values: the static scopes (`atproto`, `transition:generic`,
-//! `transition:chat.bsky`, `transition:email`) and the resource permissions
-//! `repo:`, `rpc:`, `blob:`, `account:`, `identity:` plus `include:` (lexicon
-//! permission sets, expanded into `repo:`/`rpc:` permissions at token time).
-//!
-//! A permission is `prefix[:positional][?k=v&k=v...]`. Parsing goes through a
-//! small schema engine (`Schema::parse` / `Schema::format`) that mirrors the
-//! reference `Parser` exactly, including its normalization rules, so scope
-//! strings round-trip identically to the TypeScript implementation.
+//! The schema engine mirrors the reference `Parser` exactly, normalization
+//! included, so scope strings round-trip identically to TypeScript.
 
 use super::util::{encode_uri_component, form_encode, parse_form, percent_decode_strict};
 use serde_json::Value as J;
 
-pub const STATIC_SCOPES: [&str; 4] = [
+const STATIC_SCOPES: [&str; 4] = [
     "atproto",
     "transition:email",
     "transition:generic",
     "transition:chat.bsky",
 ];
 
-// ---------- syntax ----------
-
-/// `isScopeStringFor`: value is exactly `prefix`, or `prefix` followed by ':' or '?'.
-pub fn is_scope_string_for(value: &str, prefix: &str) -> bool {
+/// `isScopeStringFor`.
+fn is_scope_string_for(value: &str, prefix: &str) -> bool {
     if value.len() > prefix.len() {
         let next = value.as_bytes()[prefix.len()];
         (next == b':' || next == b'?') && value.starts_with(prefix)
@@ -38,16 +28,16 @@ enum Params {
     Lex(serde_json::Map<String, J>),
 }
 
-/// A parsed scope syntax: either a scope string or a lexicon permission object.
+/// A scope string or a lexicon permission object.
 pub struct Syntax {
     pub prefix: String,
     pub positional: Option<String>,
     params: Params,
 }
 
-/// Result of reading a parameter: absent, invalid (wrong arity), or values.
 enum Param {
     Absent,
+    /// Wrong arity.
     Invalid,
     Values(Vec<J>),
 }
@@ -159,7 +149,7 @@ impl Syntax {
     }
 }
 
-/// Scope-string normalization: these characters are left unescaped.
+/// The reference leaves these unescaped.
 fn normalize_uri_component(v: &str) -> String {
     v.replace("%3A", ":")
         .replace("%2F", "/")
@@ -182,8 +172,6 @@ fn syntax_to_string(prefix: &str, positional: Option<&str>, params: &[(String, S
     s
 }
 
-// ---------- schema engine ----------
-
 type Validate = fn(&str) -> bool;
 type Normalize = fn(Vec<String>) -> Vec<String>;
 
@@ -202,7 +190,7 @@ struct Schema {
     positional: Option<&'static str>,
 }
 
-/// Parsed values per parameter (None = undefined).
+/// None: undefined.
 type Values = Vec<(&'static str, Option<Vec<String>>)>;
 
 fn val<'a>(v: &'a Values, name: &str) -> Option<&'a Vec<String>> {
@@ -214,7 +202,7 @@ fn val<'a>(v: &'a Values, name: &str) -> Option<&'a Vec<String>> {
 fn as_param_str(v: &J) -> Option<String> {
     match v {
         J::String(s) => Some(s.clone()),
-        // Non-string param values never pass any validator below.
+        // never passes any validator
         _ => None,
     }
 }
@@ -313,9 +301,7 @@ fn same_set(a: &[&str], b: &[String]) -> bool {
     a.iter().all(|x| b.iter().any(|y| y == x)) && b.iter().all(|y| a.iter().any(|x| x == y))
 }
 
-// ---------- validators ----------
-
-/// atproto NSID syntax (`@atproto/syntax` isValidNsid).
+/// `@atproto/syntax` isValidNsid.
 pub fn is_nsid(s: &str) -> bool {
     if s.len() > 317 || !s.is_ascii() {
         return false;
@@ -347,7 +333,7 @@ pub fn is_nsid(s: &str) -> bool {
         && nb.iter().all(|c| c.is_ascii_alphanumeric())
 }
 
-/// did:plc (base32, 32 chars) or hostname-level did:web (port only for localhost).
+/// Hostname-level did:web only, with a port only for localhost.
 pub fn is_atproto_did(s: &str) -> bool {
     if let Some(id) = s.strip_prefix("did:plc:") {
         return s.len() == 32 && id.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'));
@@ -379,8 +365,7 @@ fn is_fragment(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?%".contains(&b))
 }
 
-/// `did:...#fragment` with an atproto DID.
-pub fn is_did_ref_absolute(s: &str) -> bool {
+fn is_did_ref_absolute(s: &str) -> bool {
     match s.split_once('#') {
         Some((did, frag)) => is_atproto_did(did) && is_fragment(frag),
         None => false,
@@ -394,7 +379,7 @@ fn is_string_slash_string(v: &str) -> bool {
     }
 }
 
-pub fn is_mime(v: &str) -> bool {
+fn is_mime(v: &str) -> bool {
     is_string_slash_string(v) && !v.contains('*')
 }
 
@@ -431,7 +416,7 @@ fn v_identity_attr(v: &str) -> bool {
     ["handle", "*"].contains(&v)
 }
 
-pub const REPO_ACTIONS: [&str; 3] = ["create", "update", "delete"];
+const REPO_ACTIONS: [&str; 3] = ["create", "update", "delete"];
 
 fn n_collection(v: Vec<String>) -> Vec<String> {
     if v.len() > 1 {
@@ -599,8 +584,6 @@ static INCLUDE: Schema = Schema {
     positional: Some("nsid"),
 };
 
-// ---------- permissions ----------
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum Permission {
     Repo {
@@ -747,9 +730,8 @@ impl IncludeScope {
         ])
     }
 
-    /// Whether `other` is under this permission set's NSID group (same
-    /// authority + group prefix, i.e. everything up to the last '.').
-    pub fn is_parent_authority_of(&self, other: &str) -> bool {
+    /// Same NSID group: everything up to the last '.'.
+    fn is_parent_authority_of(&self, other: &str) -> bool {
         if other == "*" {
             return false;
         }
@@ -762,8 +744,7 @@ impl IncludeScope {
         other.as_bytes().get(..=group_end) == self.nsid.as_bytes().get(..=group_end)
     }
 
-    /// Expands a permission-set lexicon (`defs.main`, type "permission-set")
-    /// into the repo/rpc permissions it grants under this include scope.
+    /// `permission_set`: its `defs.main`.
     pub fn to_permissions(&self, permission_set: &J) -> Vec<Permission> {
         let mut out = Vec::new();
         let Some(perms) = permission_set.get("permissions").and_then(|p| p.as_array()) else {
@@ -775,7 +756,7 @@ impl IncludeScope {
             let syn = match resource {
                 "repo" => Syntax::from_lex(obj),
                 "rpc" => {
-                    // "rpc" permissions with a fixed audience are not allowed in permission sets.
+                    // permission sets may not fix an rpc audience
                     match obj.get("aud") {
                         None => {}
                         Some(J::String(a)) if a == "*" => {}
@@ -814,13 +795,14 @@ impl IncludeScope {
     }
 }
 
-/// `isAtprotoOauthScope`: a static scope or a parseable permission/include.
+/// `isAtprotoOauthScope`.
 pub fn is_atproto_oauth_scope(v: &str) -> bool {
     STATIC_SCOPES.contains(&v) || Permission::parse(v).is_some() || IncludeScope::parse(v).is_some()
 }
 
 /// `normalizeAtprotoOauthScopeValue`.
-pub fn normalize_scope_value(v: &str) -> Option<String> {
+#[cfg(test)]
+fn normalize_scope_value(v: &str) -> Option<String> {
     if STATIC_SCOPES.contains(&v) {
         return Some(v.to_string());
     }
@@ -830,22 +812,11 @@ pub fn normalize_scope_value(v: &str) -> Option<String> {
     IncludeScope::parse(v).map(|i| i.to_scope_string())
 }
 
-/// The scope a resource check would have needed (for error messages).
-pub fn scope_needed_repo(collection: &str, action: &str) -> String {
-    REPO.format(&vec![
-        ("collection", Some(vec![collection.into()])),
-        ("action", Some(vec![action.into()])),
-    ])
-}
-
-// ---------- granted scopes ----------
-
-/// Granted OAuth scopes of an access token, pre-parsed. The `allows_*`
-/// methods implement `ScopePermissionsTransition` (granular permissions plus
-/// the transitional `transition:*` scopes).
+/// An access token's scopes. The `allows_*` methods are the reference's
+/// `ScopePermissionsTransition`.
 #[derive(Clone, Debug, Default)]
 pub struct ScopeSet {
-    pub raw: Vec<String>,
+    raw: Vec<String>,
     perms: Vec<Permission>,
     generic: bool,
     chat: bool,
@@ -873,11 +844,6 @@ impl ScopeSet {
         self.raw.iter().any(|s| s == scope)
     }
 
-    pub fn to_scope_string(&self) -> String {
-        self.raw.join(" ")
-    }
-
-    /// action: "create" | "update" | "delete"
     pub fn allows_repo(&self, collection: &str, action: &str) -> bool {
         self.generic
             || self
@@ -900,7 +866,6 @@ impl ScopeSet {
         self.generic || self.perms.iter().any(|p| p.matches_blob(mime))
     }
 
-    /// attr: "email" | "repo" | "status"; action: "read" | "manage"
     pub fn allows_account(&self, attr: &str, action: &str) -> bool {
         if attr == "email" && action == "read" && self.email {
             return true;
@@ -908,7 +873,6 @@ impl ScopeSet {
         self.perms.iter().any(|p| p.matches_account(attr, action))
     }
 
-    /// attr: "handle" | "*"
     pub fn allows_identity(&self, attr: &str) -> bool {
         self.perms.iter().any(|p| p.matches_identity(attr))
     }
