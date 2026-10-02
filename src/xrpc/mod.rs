@@ -9,6 +9,7 @@ pub mod internal;
 pub mod authn;
 pub mod blobs;
 mod identity;
+pub mod key_rotation;
 pub mod oauth;
 pub(crate) mod proxy;
 mod ratelimits;

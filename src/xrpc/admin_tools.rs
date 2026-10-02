@@ -56,23 +56,34 @@ struct PublishIdentityIn {
 
 /// Emits `#identity` for an account hosted here (any status but deleted),
 /// as the reference's `sequenceIdentity`; caches of its DID document are
-/// dropped. With `syncPlc`, a did:plc whose directory document names
-/// another signing key is updated first (signed with the server rotation
-/// key); a PLC failure emits nothing.
+/// dropped. With `syncPlc` (the reference's rotate-keys), a did:plc whose
+/// directory document names another signing key is updated first (signed
+/// with the server rotation key), then the repo is re-signed (an empty
+/// commit) and `#identity` + `#sync` emitted, so relays that saw commits
+/// fail against the old document resynchronize; a PLC failure emits nothing.
 async fn publish_identity(State(app): AppState, Auth(creds): Auth, Json(inp): Json<PublishIdentityIn>) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let did = inp.did;
     let acct = app.account(&did).await.map_err(|_| not_found(&did))?;
+    if !inp.sync_plc {
+        // a rewrite of the unchanged account row, ordered with the repo's
+        // commits, carrying the #identity frame
+        let (_, after) = app.mutate_account(&did, true, false, false, |_| Ok(true)).await?;
+        app.did_resolver.invalidate(&did);
+        return Ok(Json(json!({"did": did, "handle": after.handle, "plcUpdated": J::Null})));
+    }
+    if acct.pending_signing_key.is_some() {
+        return Err(invalid("a signing key rotation is in progress for this account"));
+    }
     let mut plc_updated = J::Null;
-    if inp.sync_plc && did.starts_with("did:plc:") {
+    if did.starts_with("did:plc:") {
         let plc = app.plc.as_ref().ok_or_else(|| invalid("PLC registration is off on this PDS"))?;
         plc_updated = json!(plc.update_signing_key(&did, &format!("did:key:{}", acct.signing_pubkey)).await?);
     }
-    // a rewrite of the unchanged account row, ordered with the repo's
-    // commits, carrying the #identity frame
-    let (_, after) = app.mutate_account(&did, true, false, false, |_| Ok(true)).await?;
+    let key = app.secrets.account_signing_key(&acct).await?;
+    let head = app.account_op(&did, crate::worker::AccountOp::SigningKey(crate::worker::KeyStep::Finish { key })).await?;
     app.did_resolver.invalidate(&did);
-    Ok(Json(json!({"did": did, "handle": after.handle, "plcUpdated": plc_updated})))
+    Ok(Json(json!({"did": did, "handle": acct.handle, "plcUpdated": plc_updated, "rev": head.rev.to_string()})))
 }
 
 // ---------------------------------------------------------------------------

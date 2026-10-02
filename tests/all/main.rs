@@ -56,6 +56,7 @@ mod invertible_ops;
 mod invite_codes;
 mod invites_optional;
 mod join_follow;
+mod key_rotation;
 mod lexicons;
 mod list_repos_scale;
 mod log_pipeline;

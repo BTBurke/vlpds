@@ -169,9 +169,10 @@ async fn signing_key_rotation_updates_the_directory() {
     let s = pds(&plc, &new_key(), "did:web:pds.test", None).await;
     let a = s.create_account("sk").await;
     let before = signing_did_key(&s, &a.did).await;
-    plc.fail_posts(1, 500);
+    // a refusal (an outage leaves the rotation pending: tests/all/key_rotation.rs)
+    plc.fail_posts(1, 400);
     s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.err(500, "InternalServerError");
-    assert_eq!(signing_did_key(&s, &a.did).await, before, "no local change on PLC failure");
+    assert_eq!(signing_did_key(&s, &a.did).await, before, "no local change on a PLC refusal");
     let j = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.ok();
     let new = j["signingKey"].as_str().unwrap();
     assert_ne!(new, before);

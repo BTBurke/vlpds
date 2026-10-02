@@ -776,11 +776,13 @@ struct UpdateSigningKeyIn {
 
 /// Rotates the account's repo signing key. The PDS signs commits, so it must
 /// hold the private key: `signingKey` must be a did:key reserved with
-/// server.reserveSigningKey, or omitted/"generate" for a fresh key. The DID
-/// document changes, so an #identity event is emitted; with PLC
-/// registration on, a did:plc's `atproto` key is first updated in the PLC
-/// directory (as the reference's rotate-keys script), and a failure there
-/// changes nothing here.
+/// server.reserveSigningKey, or omitted/"generate" for a fresh key. As the
+/// reference's rotate-keys script: with PLC registration on, a did:plc's
+/// `atproto` key is updated in the PLC directory, then the repo is re-signed
+/// with the new key (an empty commit) and `#identity` + `#sync` emitted
+/// (src/xrpc/key_rotation.rs: writes wait out the rotation; one the
+/// directory refused changes nothing; one interrupted after the new key was
+/// recorded is finished in the background).
 async fn update_account_signing_key(
     State(app): AppState,
     Auth(creds): Auth,
@@ -805,20 +807,7 @@ async fn update_account_signing_key(
         }
         None => Keypair::generate(),
     };
-    let did_key = key.did_key();
-    if let (Some(plc), true) = (&app.plc, inp.did.starts_with("did:plc:")) {
-        plc.update_signing_key(&inp.did, &did_key).await?;
-    }
-    // wrapped for the row; cached unwrapped, so the repo's reload after the
-    // rotation needs no unwrap
-    let (wrapped, pubkey) = app.secrets.wrap_signing_key(&inp.did, &Arc::new(key)).await?;
-    update_account(&app, &inp.did, true, false, |a| {
-        a.wrapped_signing_key = wrapped;
-        a.signing_pubkey = pubkey;
-        Ok(())
-    })
-    .await?;
-    app.did_resolver.invalidate(&inp.did);
+    let did_key = super::key_rotation::rotate(&app, &inp.did, key).await?;
     Ok(Json(json!({"signingKey": did_key})))
 }
 

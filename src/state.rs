@@ -16,6 +16,7 @@
 //! b/{did}\0{cid}\0{path}  -> empty (blob references)
 //! p/{routing}\0{name}     -> private per-account state (slot of the routing key)
 //! M/{did}\0{cid digest}   -> MST node block, height >= 1 (DESIGN.md "Partial MSTs")
+//! K/{did}                 -> empty (signing-key rotation pending: `Account::pending_signing_key`)
 
 use crate::cid::{Cid, CID_BYTES_LEN};
 use crate::tid::Tid;
@@ -130,6 +131,15 @@ pub fn mst_node_prefix(did: &str) -> Vec<u8> {
 }
 
 pub const MST_NODE_FAMILY: &[u8] = b"M/";
+
+/// Marks `did` as having a signing-key rotation pending (set and cleared
+/// with `Account::pending_signing_key`), so recovery finds them with one
+/// family scan instead of reading every account row.
+pub fn key_rotation_key(did: &str) -> Vec<u8> {
+    keyed(did, KEY_ROTATION_FAMILY, &[did.as_bytes()])
+}
+
+pub const KEY_ROTATION_FAMILY: &[u8] = b"K/";
 
 pub fn record_prefix(did: &str) -> Vec<u8> {
     keyed(did, b"R/", &[did.as_bytes(), b"\0"])
@@ -294,9 +304,24 @@ pub struct Account {
     pub email: Option<String>,
     #[serde(default)]
     pub email_confirmed: bool,
+    /// A signing key being rotated to (admin.updateAccountSigningKey):
+    /// recorded before the DID document changes and cleared when the repo is
+    /// re-signed with it, or when the rotation is abandoned. Repo writes are
+    /// refused meanwhile (DESIGN.md "Signing-key rotation").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_signing_key: Option<PendingSigningKey>,
     /// Extension fields owned by individual XRPC modules.
     #[serde(default, flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A rotation's new signing key, as the account row keeps its current one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingSigningKey {
+    /// Wrapped under the KEK like `Account::wrapped_signing_key`.
+    pub wrapped: String,
+    /// Public multibase multikey.
+    pub pubkey: String,
 }
 
 /// Argon2id (OWASP baseline: m=19 MiB, t=2, p=1) PHC string. ~20 ms of CPU,

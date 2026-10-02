@@ -866,6 +866,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     vlpds::xrpc::spawn_blob_gc(app.clone());
     vlpds::xrpc::spawn_reserved_key_gc(app.clone());
     vlpds::oauth::gc::spawn_gc(app.clone());
+    vlpds::xrpc::key_rotation::spawn_recovery(app.clone());
     tokio::spawn(vlpds::xrpc::request_crawl(app.clone()));
     let router = server::router(&app);
     // Keep serving through a graceful shutdown: peers forward to us until

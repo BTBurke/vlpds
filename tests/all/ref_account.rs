@@ -230,10 +230,9 @@ async fn ref_plc_operation_signature_mail() {
 /// The reference's rotate-keys script updates the DID's signing key, then
 /// writes an empty commit signed with the new key and sequences #identity
 /// and #sync, so the served repo verifies against the new key right away.
-/// vlpds's admin.updateAccountSigningKey emits #identity only and signs the
-/// *next* commit with the new key: until the account writes again, its head
-/// commit is signed by a key its DID document no longer lists.
-#[ignore = "GAP: key rotation does not re-sign the head commit or emit #sync (needs a worker AccountOp)"]
+/// vlpds's admin.updateAccountSigningKey does the same (the worker's
+/// KeyStep::Finish; tests/all/key_rotation.rs covers concurrent writes,
+/// PLC failures and crashes mid-rotation).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ref_signing_key_rotation_resigns_the_repo() {
     let s = TestServer::spawn().await;

@@ -57,8 +57,9 @@ pub enum Cmd {
         file: Option<PathBuf>,
     },
     /// Make each DID's PLC `atproto` key the signing key this PDS holds,
-    /// then emit #identity (script rotate-keys). `--generate`: rotate to a
-    /// fresh signing key instead (admin updateAccountSigningKey).
+    /// then re-sign the repo and emit #identity + #sync (script
+    /// rotate-keys). `--generate`: rotate to a fresh signing key instead
+    /// (admin updateAccountSigningKey, which re-signs too).
     RotateKeys {
         dids: Vec<String>,
         #[arg(long)]
@@ -340,9 +341,9 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
                     }
                     let r = c.post("vlpds.admin.publishIdentity", &json!({"did": did, "syncPlc": true})).await?;
                     let what = match r["plcUpdated"].as_bool() {
-                        Some(true) => "PLC signing key updated, identity published",
-                        Some(false) => "PLC signing key already current, identity published",
-                        None => "not a did:plc (nothing to update), identity published",
+                        Some(true) => "PLC signing key updated, repo re-signed, identity published",
+                        Some(false) => "PLC signing key already current, repo re-signed, identity published",
+                        None => "not a did:plc (nothing to update), repo re-signed, identity published",
                     };
                     Ok((format!("{did}: {what}"), r))
                 }

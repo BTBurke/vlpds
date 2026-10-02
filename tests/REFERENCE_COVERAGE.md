@@ -18,10 +18,10 @@ Status values:
 | | Cases |
 |---|---:|
 | covered | 295 |
-| ported | 74 |
+| ported | 75 |
 | N/A | 64 |
 | divergent | 7 |
-| GAP (left) | 5 |
+| GAP (left) | 4 |
 | **total** | **445** |
 
 Some rows marked `ported` or `covered` also carry a partial divergence that the row explains, for example "ported + divergent".
@@ -60,6 +60,11 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
     and updateEmail.
 12. **DNS TXT handle proof** (`src/handle_resolver.rs`): `_atproto.<handle>` TXT alongside `/.well-known/atproto-did`, in the
     reference HandleResolver's order and timeouts.
+13. **Signing-key rotation re-signs the repo** (`src/xrpc/key_rotation.rs`, worker `KeyStep`). `admin.updateAccountSigningKey`
+    (and `publishIdentity` with `syncPlc`, the rotate-keys script) writes an empty commit signed with the new key and emits
+    `#identity` then `#sync`, so `getRepo` and the firehose verify against the new DID document right away. The new key is
+    recorded before PLC is updated, writes wait out the rotation, and a rotation interrupted by an outage or a crash is finished
+    from durable state (DESIGN.md "Signing-key rotation").
 
 ## Notable divergences
 
@@ -88,7 +93,6 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
 
 | Gap | Reference cases | Why not fixed here |
 |---|---|---|
-| Signing-key rotation doesn't re-sign the head. `admin.updateAccountSigningKey` emits `#identity` only. The served head stays signed by the old key until the next write, so a relay that verifies `getRepo` against the new DID doc fails. The reference writes an empty commit with the new key and emits `#sync`. | recovery "rotates keys for users" | Needs a worker `AccountOp` (worker.rs, owned by other lanes). Test `ref_account::ref_signing_key_rotation_resigns_the_repo` is `#[ignore]`d with a GAP reason. |
 | Duplicate likes/reposts/follows/blocks are not pruned. The reference's createRecord deletes the account's earlier record with the same subject in the same commit (`getBacklinkConflicts`). | crud "prevents duplicate likes/reposts/follows/blocks" (4) | Needs a backlink index across apply, import, reshard and migration. Test `ref_repo::ref_prevents_duplicate_backlinks` is `#[ignore]`d. |
 
 ---
@@ -174,7 +178,7 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
 | case | status | vlpds |
 |---|---|---|
 | recovers repos based on the sequencer | N/A | operator script restoring SQLite actor stores from the sequencer DB. vlpds has no separate actor stores: the log is the WAL and state is rebuilt from it on restart/takeover (`cold_start::*`, `fast_failover::*`, `firehose_backfill::*`) |
-| rotates keys for users | GAP | the reference's `rotate-keys` script updates PLC, writes an empty commit signed with the new key and sequences `#identity` + `#sync`. vlpds's `admin.updateAccountSigningKey` (`plc::signing_key_rotation_updates_the_directory`) updates PLC and emits `#identity`, but signs only the *next* commit with the new key: the head stays signed by the old key and no `#sync` is sent. Test `ref_account::ref_signing_key_rotation_resigns_the_repo` is `#[ignore]`d; fixing it needs a worker AccountOp (re-sign head, `#sync`) |
+| rotates keys for users | ported | `ref_account::ref_signing_key_rotation_resigns_the_repo`: `admin.updateAccountSigningKey` re-signs the head with the new key (same data, new rev) and emits `#identity` + `#sync`, as the reference's `rotate-keys`. Product fix: it used to emit `#identity` only and sign just the next commit with the new key. `tests/all/key_rotation.rs` adds writers racing the rotation, PLC refusal/outage, a deactivated account, and the owner crashing after recording the key and after the PLC update; `go_checker::go_checker_accepts_key_rotation_resync` runs the Go checker over it |
 
 ### takedown-appeal.test.ts
 

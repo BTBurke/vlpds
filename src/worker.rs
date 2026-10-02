@@ -200,6 +200,41 @@ pub enum AccountOp {
     /// Persist a reactivated account: #account, #identity and #sync of the
     /// current commit, as the reference's sequenceAccountActivation.
     Activate { mutate: AccountMutation },
+    /// A step of a signing-key rotation (src/xrpc/key_rotation.rs).
+    SigningKey(KeyStep),
+}
+
+/// The repo side of a signing-key rotation (DESIGN.md "Signing-key
+/// rotation"): `Begin` before the DID document names the new key, then
+/// `Finish` (or `Abort` if it never will).
+pub enum KeyStep {
+    /// Records the new key (wrapped) as the account's pending key, with its
+    /// `K/` marker. From here until `Finish` or `Abort`, writes and imports
+    /// are refused (503 `KeyUnavailable`, retryable), so no commit is signed
+    /// with the old key once the DID document may list the new one. No
+    /// events. The same key already pending: a no-op; another one: refused.
+    Begin(state::PendingSigningKey),
+    /// Drops the pending key `pubkey` and its marker (a no-op unless it is
+    /// the pending one): the DID document doesn't name it.
+    Abort { pubkey: String },
+    /// Makes `key` the signing key and re-signs the head with it, as the
+    /// reference's rotate-keys (an empty commit): same data root, new rev,
+    /// `#identity` then `#sync` of the new commit (no `#sync` while the
+    /// account is inactive: activation emits it). `key` must be the pending
+    /// key, or the current one (a re-sign alone: `publishIdentity` with
+    /// `syncPlc`, or a `Finish` repeated after it applied).
+    Finish { key: Arc<Keypair> },
+}
+
+/// What [`key_step`] did.
+enum KeyOutcome {
+    /// Nothing to write.
+    Noop,
+    /// Refused; nothing changed.
+    Refused(WriteError),
+    /// `frames` and `muts` hold the step; a re-sign also carries its
+    /// read-after-write entry, applied at the ack.
+    Written(Option<crate::recent_writes::Commit>),
 }
 
 pub enum Queued {
@@ -1654,6 +1689,12 @@ fn key_unavailable(did: &str) -> WriteError {
     WriteError::KeyUnavailable(format!("signing key of {did} is unavailable (key service unreachable); retry"))
 }
 
+/// A write refused while the repo's signing key is being rotated
+/// (`KeyStep::Begin`): retryable, nothing applied.
+fn key_rotating(did: &str) -> WriteError {
+    WriteError::KeyUnavailable(format!("signing key of {did} is being rotated; retry"))
+}
+
 fn process_with(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, src: &dyn Source) -> anyhow::Result<()> {
     let mut rest = reqs.into_iter();
     let r = process_reqs(st, &mut rest, clock_id, src);
@@ -1695,6 +1736,10 @@ fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock
             let _ = req
                 .reply
                 .send(Err(WriteError::RepoInactive(status.clone())));
+            continue;
+        }
+        if st.account.pending_signing_key.is_some() {
+            let _ = req.reply.send(Err(key_rotating(&st.did)));
             continue;
         }
         if st.key.is_none() {
@@ -2213,6 +2258,8 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
     let mut frames = Vec::new();
     let mut muts = Vec::new();
     let whole_tree = matches!(req.op, AccountOp::ReplaceRepo { .. } | AccountOp::Delete);
+    // a re-signed head (KeyStep::Finish): extends read-after-write's log at the ack
+    let mut resigned: Option<crate::recent_writes::Commit> = None;
     match req.op {
         AccountOp::Update {
             mutate,
@@ -2307,6 +2354,10 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
                     .send(Err(WriteError::RepoInactive(status.clone())));
                 return Ok(());
             }
+            if st.account.pending_signing_key.is_some() {
+                let _ = req.reply.send(Err(key_rotating(&st.did)));
+                return Ok(());
+            }
             let Some(key) = st.key.clone() else {
                 let _ = req.reply.send(Err(key_unavailable(&st.did)));
                 return Ok(());
@@ -2383,6 +2434,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
                 key: state::handle_key(&st.did, &st.account.handle).into(),
                 val: None,
             });
+            muts.push(Mutation { key: state::key_rotation_key(&st.did).into(), val: None });
             frames.push(events::account_frame(
                 &st.did,
                 false,
@@ -2391,6 +2443,18 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             ));
             st.account.status = Some("deleted".into());
         }
+        AccountOp::SigningKey(step) => match key_step(st, step, clock_id, &time, &mut frames, &mut muts)? {
+            // nothing to write: ack now (a no-op logs nothing)
+            KeyOutcome::Noop => {
+                let _ = req.reply.send(Ok(st.head.clone()));
+                return Ok(());
+            }
+            KeyOutcome::Refused(e) => {
+                let _ = req.reply.send(Err(e));
+                return Ok(());
+            }
+            KeyOutcome::Written(c) => resigned = c,
+        },
     }
     let applied = whole_tree.then(|| track_inflight(st, None));
     let entry = LogEntry {
@@ -2404,6 +2468,9 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             Box::new(move |r| {
                 if r.is_ok() {
                     *view.write() = snap;
+                    if let Some(c) = resigned {
+                        c.apply();
+                    }
                 }
                 if let Some(a) = applied {
                     a.store(true, Ordering::Release);
@@ -2421,6 +2488,94 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
         enqueued: Instant::now(),
     };
     send_entry(st, entry)
+}
+
+/// Applies a [`KeyStep`] to the repo (see [`KeyOutcome`]).
+fn key_step(
+    st: &mut RepoState,
+    step: KeyStep,
+    clock_id: u64,
+    time: &str,
+    frames: &mut Vec<events::Frame>,
+    muts: &mut Vec<Mutation>,
+) -> anyhow::Result<KeyOutcome> {
+    if st.account.status.as_deref() == Some("deleted") {
+        return Ok(KeyOutcome::Refused(WriteError::RepoNotFound));
+    }
+    let marker = Bytes::from(state::key_rotation_key(&st.did));
+    let mut account = st.account.clone();
+    let mut resigned = None;
+    match step {
+        KeyStep::Begin(p) => {
+            match &account.pending_signing_key {
+                Some(cur) if *cur == p => return Ok(KeyOutcome::Noop),
+                Some(_) => return Ok(KeyOutcome::Refused(WriteError::Invalid("a signing key rotation is already in progress".into()))),
+                None if p.pubkey == account.signing_pubkey => {
+                    return Ok(KeyOutcome::Refused(WriteError::Invalid("that is already the account's signing key".into())))
+                }
+                None => {}
+            }
+            account.pending_signing_key = Some(p);
+            muts.push(Mutation { key: marker, val: Some(Bytes::new()) });
+        }
+        KeyStep::Abort { pubkey } => {
+            if account.pending_signing_key.as_ref().is_none_or(|p| p.pubkey != pubkey) {
+                return Ok(KeyOutcome::Noop);
+            }
+            account.pending_signing_key = None;
+            muts.push(Mutation { key: marker, val: None });
+        }
+        KeyStep::Finish { key } => {
+            let pubkey = key.public_multibase();
+            match account.pending_signing_key.take() {
+                Some(p) if p.pubkey == pubkey => {
+                    account.wrapped_signing_key = p.wrapped;
+                    account.signing_pubkey = p.pubkey;
+                    muts.push(Mutation { key: marker, val: None });
+                }
+                None if account.signing_pubkey == pubkey => {}
+                Some(_) => return Ok(KeyOutcome::Refused(WriteError::Invalid("another signing key rotation is in progress".into()))),
+                None => return Ok(KeyOutcome::Refused(WriteError::Invalid("not the account's signing key or its pending one".into()))),
+            }
+            // the empty commit: same data root, new rev, signed with the
+            // new key (and verified before anything can sequence it)
+            let rev = tid::next_rev(Some(st.head.rev), clock_id);
+            let (commit, commit_block) = match sign_commit(&st.did, &rev.to_string(), &st.head.data, &key) {
+                Ok(c) => c,
+                Err(e) => return Ok(KeyOutcome::Refused(signature_fault(&e))),
+            };
+            let since = st.head.rev;
+            let head = Head { commit, data: st.head.data, rev, commit_block };
+            muts.push(Mutation { key: state::head_key(&st.did).into(), val: Some(head.encode()) });
+            frames.push(events::identity_frame(&st.did, &account.handle, time));
+            if account.status.is_none() {
+                let mut car_bytes = Vec::with_capacity(head.commit_block.len() + 64);
+                car::write_header(&mut car_bytes, &head.commit);
+                car::write_block(&mut car_bytes, &head.commit, &head.commit_block);
+                frames.push(events::sync_frame(&st.did, &rev.to_string(), &car_bytes, time));
+            }
+            {
+                // no MST node changed: the node index just moves to the new rev
+                let mut nodes = st.nodes.lock();
+                if nodes.wanted {
+                    nodes.commit(since.0, rev.0, Vec::new());
+                }
+            }
+            resigned = Some(crate::recent_writes::Commit {
+                did: st.did.clone(),
+                part: (st.partition.id, st.partition.epoch),
+                since: since.0,
+                rev: rev.0,
+                prev_nonempty: st.head.data != *crate::recent_writes::EMPTY_ROOT,
+                ops: Some(Vec::new()),
+            });
+            st.head = head;
+            st.key = Some(key);
+        }
+    }
+    muts.push(Mutation { key: state::account_key(&st.did).into(), val: Some(Bytes::from(serde_json::to_vec(&account)?)) });
+    st.account = account;
+    Ok(KeyOutcome::Written(resigned))
 }
 
 #[cfg(test)]

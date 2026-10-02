@@ -186,6 +186,8 @@ swappable.
     bound to the DID) next to its public key (`signing_pubkey`, which DID
     documents and service-auth checks read without unwrapping); account
     rows in log segments carry the same wrapped form. See "Secrets at rest".
+  - `K/{did}` → empty: a signing-key rotation is pending
+    (`Account::pending_signing_key`; see "Signing-key rotation").
   - `p/{routing}\0{name}` → private per-account state: sessions, app
     password hashes, email-token digests, TOTP state (secret wrapped),
     reserved signing keys (`p/_reserved:{did:key}\0k`, wrapped), OAuth rows.
@@ -2554,9 +2556,9 @@ first `at://` alias, `prev` = its CID), then swap the handle locally and
 emit `#identity`. A PLC failure releases the claim and changes nothing; an
 unchanged alias submits nothing (the reference would submit a no-op
 update). A `did:web` account's document must already name the handle
-(reference). Admin `updateAccountSigningKey` updates the `atproto` key in
-PLC before the local rotation. Failure after PLC accepted (local swap
-failing) is repaired by retrying: the PLC step is then a no-op.
+(reference). Admin `updateAccountSigningKey` records the new key, updates
+the `atproto` key in PLC, then re-signs the repo with it: see "Signing-key
+rotation".
 
 **Endpoints** (reference semantics): `requestPlcOperationSignature` mails a
 `plc_operation` token (full session, taken-down session, or OAuth
@@ -2648,6 +2650,68 @@ updates, sign/submit, migration out, unregistered mode, bulkCreate, key
 rotation), `tests/all/secrets_at_rest.rs`
 (`plc_rotation_key_never_reaches_the_bucket`).
 
+## Signing-key rotation (`src/xrpc/key_rotation.rs`)
+
+A repo's head commit must verify against the key its DID document lists:
+relays check `#commit`/`#sync` signatures and `getRepo` against it. The
+reference's rotate-keys script updates the document, then writes an empty
+commit signed with the new key and sequences `#identity` and `#sync`. Admin
+`updateAccountSigningKey` (CLI `rotate-keys --generate`) does that here,
+in three steps ordered with the repo's commits by its worker
+(`AccountOp::SigningKey(KeyStep)`):
+
+1. **Begin.** The new key, wrapped under the KEK, goes into the account row
+   as `pending_signing_key`, with a `K/{did}` marker, in one durable log
+   entry (no events). From then on the worker refuses the repo's writes and
+   imports with a retryable 503 `KeyUnavailable`. The key is durable before
+   any directory can name it (the old code updated PLC first, so a crash
+   right after lost the only copy of the key PLC now listed), and nothing
+   is signed with the old key once the document may have changed.
+2. **PLC.** A did:plc's `atproto` key is set to it (with PLC registration
+   on; a did:web's document is its owner's to change).
+3. **Finish.** The account takes the new key (marker deleted) and the head
+   is re-signed: same data root, next rev, signed through the hedged
+   verify-after-sign signer. One log entry carries the head, the row,
+   `#identity` and `#sync` (only `#identity` while the account is
+   inactive: activation's `#sync` then announces the re-signed head). The
+   call is acknowledged once it is durable, which is also when the durable
+   view (`getRepo`, `getLatestCommit`) moves to the new head, so nothing
+   served after the acknowledgement is signed with the old key. The next
+   `#commit` chains off the `#sync` (`since` = its rev, `prevData` = its
+   data).
+
+The firehose sees commits signed with the old key, then `#identity`
+immediately followed by `#sync`, then commits signed with the new key
+(`tests/all/key_rotation.rs` checks this with writers racing the rotation;
+`go_checker::go_checker_accepts_key_rotation_resync` runs the independent
+Go checker over it).
+
+**Pending rotations.** A rotation stopped between Begin and Finish (an
+outage of the directory or the key service, a crash, the shard moving)
+stays pending, its writes fenced. `key_rotation::complete` finishes one
+from durable state alone and may run any number of times, concurrently
+too: it sets the directory's key to the pending one (a no-op when it
+already is), unwraps the pending key and runs Finish (a repeat re-signs
+once more with the same key, harmlessly). It abandons the rotation
+(`Abort`: pending key and marker dropped) only if the directory refused
+the update definitely (4xx, tombstoned DID) and still doesn't name the key;
+an ambiguous failure (5xx, timeout) is never taken as "not applied", since
+the update may still land. The handler retries in the background after an
+undecided failure (1 s backoff doubling to 60 s, while the node owns the
+repo), and each node runs `key_rotation::recover_pending` at start and
+every 60 s over the `K/` markers of its shards, so after a crash or
+takeover the new owner finishes it (`tests/all/key_rotation.rs`
+`crash_after_*`: the owner is killed after Begin and after the PLC
+update). A second rotation while one is pending is refused (400).
+
+`vlpds.admin.publishIdentity` with `syncPlc` (CLI `rotate-keys`) runs
+Finish with the account's current key after setting PLC's key to it, the
+script's empty commit and `#sync`.
+
+**Not done.** `rewrapSecrets` doesn't rewrap a pending key (it lives until
+the rotation ends; retiring its KEK meanwhile strands it). The marker sweep
+costs one seek per populated slot of each owned shard per minute.
+
 ## Admin CLI (`src/cli/admin.rs`, `src/xrpc/admin_tools.rs`)
 
 `vlpds admin <command>` covers the reference's `pdsadmin` (account
@@ -2665,9 +2729,10 @@ is what the binary calls and what `tests/all/admin_cli.rs` drives.
 Endpoints added where com.atproto.admin.* has nothing:
 `vlpds.admin.publishIdentity {did, syncPlc?}` (the reference's
 `sequenceIdentity`, an unchanged account row rewritten through the repo's
-worker carrying `#identity`; `syncPlc` first sets the PLC `atproto` key to
-the held signing key, the rotate-keys script without its empty commit, as
-the commit key didn't change), `vlpds.admin.checkRepo?did=` (one shard
+worker carrying `#identity`; `syncPlc` is the rotate-keys script: it sets
+the PLC `atproto` key to the held signing key, then re-signs the repo with
+it, `#identity` + `#sync`, the worker's `KeyStep::Finish` with the current
+key), `vlpds.admin.checkRepo?did=` (one shard
 snapshot under the apply lock: commit hash / data / DID / signature,
 records hash, MST from `R/` vs the head's data root, `M/` vs that tree,
 record-CID / blob-ref / collection indexes; no worker involved, so it works
@@ -2705,7 +2770,7 @@ able to strand data in a format a running node can't read.
 | Entry muts | inside segments | none: raw SlateDB key/value bytes, plus muts *derived* by the reader from `#commit` frames (`derive_commit_muts`, top bit of `mut_count`) | an old reader writes new-format bytes blindly into state |
 | Head `h/` | `state.rs` `Head::encode` | none (fixed binary: cid ‖ cid ‖ rev ‖ block) | `decode` "short head" or garbage |
 | Record `R/` | `state::record_value` | none (cid ‖ rev ‖ bytes) | garbage |
-| Index `c/ C/ b/ n/` | `state.rs` | key layout only, empty/plain values | key not found |
+| Index `c/ C/ b/ n/ K/` | `state.rs` | key layout only, empty/plain values | key not found |
 | MST nodes `M/` | `state.rs`, `mst_lazy.rs` | dag-cbor, content-addressed | stable by construction |
 | Account `a/` | `state::Account` JSON | none; tolerant (`#[serde(default)]`, `#[serde(flatten)] extra` keeps unknown fields) | round-trips unknown fields |
 | Private `p/` rows | sessions, app passwords, tokens, TOTP (`totp.rs`), OAuth (`oauth/store.rs`), `sec/` revocations/takedowns (`xrpc/server.rs`) | none; mostly JSON | per type; mostly serde-default |
@@ -2969,6 +3034,9 @@ notable ones:
   append-only log, so a replay from before the deletion still carries that DID's earlier frames until retention drops the
   segments. The shared guarantee is that `#account` with status `deleted` is the DID's last event, which consumers must treat as
   a tombstone (`ref_sync::account_deletion_is_the_last_event_on_replay`).
+- **Writes wait out a signing-key rotation.** Between recording the new key and re-signing the repo with it, the account's writes
+  get a retryable 503 `KeyUnavailable`, so no commit is signed with a key the DID document no longer lists. The reference doesn't
+  fence them.
 - **listRepos order** is `(slot, DID)`, because listings are served per shard, not by creation order.
 - **Fresh uploads are readable.** Blobs are written under their final key at upload, so getBlob serves an upload before any record
   references it, until the blob GC collects it. The reference keeps uploads in a temp store.
@@ -2978,5 +3046,4 @@ notable ones:
 
 These known gaps are tracked in that file and are not deliberate:
 
-- signing-key rotation writes no re-signed commit and emits no `#sync`;
 - duplicate backlinks (likes, reposts, follows, blocks) are not pruned.

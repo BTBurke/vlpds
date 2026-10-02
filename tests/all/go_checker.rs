@@ -170,6 +170,55 @@ async fn go_checker_accepts_firehose() {
     assert!(stdout.contains(&format!("max-events {n} reached")), "checker did not read all {n} events:\n{stdout}");
 }
 
+/// A signing-key rotation, as a relay sees it: from the rotation's
+/// `#identity` (the checker refetches the key), the `#sync` of the
+/// re-signed head verifies against the new key, and the commits after it
+/// chain off the `#sync` and verify too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn go_checker_accepts_key_rotation_resync() {
+    let Some(bin) = tokio::task::spawn_blocking(build_checker).await.unwrap() else {
+        return;
+    };
+    let s = TestServer::spawn().await;
+    let a = s.create_account("gcrot").await;
+    let mut refs = Vec::new();
+    for i in 0..5 {
+        refs.push(s.post(&a, &format!("before {i}")).await);
+    }
+    let cursor = s.settled_now().await;
+    let mut sub = s.subscribe(Some(cursor)).await;
+    s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.ok();
+    for i in 0..8 {
+        s.post(&a, &format!("after {i}")).await;
+    }
+    // an update and a delete of records written before the rotation
+    s.xrpc
+        .post("com.atproto.repo.putRecord", &json!({"repo": a.did, "collection": refs[0].collection(), "rkey": refs[0].rkey(), "record": post_record("edited")}), &a.auth())
+        .await
+        .ok();
+    s.xrpc.post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": refs[1].collection(), "rkey": refs[1].rkey()}), &a.auth()).await.ok();
+    let frames = sub.until(Duration::from_secs(20), |fs| fs.len() >= 12).await;
+    let kinds: Vec<&str> = frames.iter().map(|f| f.kind()).collect();
+    assert_eq!(&kinds[..3], &["#identity", "#sync", "#commit"], "{kinds:?}");
+    let n = frames.len();
+
+    let out = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::process::Command::new(&bin)
+            .args(["-host", &s.url, "-cursor", &cursor.to_string(), "-max-events", &n.to_string(), "-strict", "-quiet", "-workers", "1"])
+            .output(),
+    )
+    .await
+    .expect("checker timed out")
+    .expect("run checker");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "Go checker rejected the rotation's events (exit {:?}):\n{stdout}\n{stderr}", out.status.code());
+    assert!(stdout.contains(&format!("max-events {n} reached")), "{stdout}");
+    let sync_line = stdout.lines().find(|l| l.trim_start().starts_with("#sync:")).unwrap_or_default();
+    assert!(sync_line.contains("1 (1 verified clean)"), "{stdout}");
+}
+
 /// The checker is not vacuous: pointed at a server whose firehose carries a
 /// commit signed by a key that no longer matches the DID document, it fails.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
