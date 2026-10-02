@@ -683,6 +683,11 @@ async fn update_account_handle(
 ) -> XResult<StatusCode> {
     require_admin(&creds)?;
     let handle = normalize_handle(&inp.handle)?;
+    // reference allowAnyValid: no slur or reserved-name checks, but a
+    // service-domain handle still has to be one 3-18 char label
+    if handle.ends_with(&format!(".{}", app.handle_domain)) {
+        super::server::ensure_service_handle(&app, &handle, true)?;
+    }
     let did = inp.did.clone();
     app.account(&did)
         .await

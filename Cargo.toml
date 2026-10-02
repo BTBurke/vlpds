@@ -35,6 +35,8 @@ serde_json = "1"
 secp256k1 = { version = "0.30", features = ["global-context"] }
 sha2 = { version = "0.10", features = ["asm"] }
 rand = "0.8"
+# explicit-slur handle filter (src/handle_policy.rs; the reference's regexes)
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
 anyhow = "1"
 argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"

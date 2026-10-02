@@ -1046,6 +1046,23 @@ What to do:
 `vlpds_shard_layout_shards` / `vlpds_shard_layout_version` follow the flip; the
 ownership alerts read the count from there.
 
+### A user locked out by a second factor
+
+Two factors exist (DESIGN "Email second factor"): the reference's email code
+(`emailAuthFactor`, what the Bluesky app offers) and vlpds TOTP. With both on,
+only TOTP is asked for.
+- **Too many wrong codes** (429 `RateLimitExceeded` on createSession or the
+  sign-in page): the factor is locked for 5 min, doubling per further
+  lockout up to a day. It clears by itself; there is nothing to reset.
+- **Lost the inbox** (email factor): after verifying the user out of band,
+  `com.atproto.admin.updateAccountEmail` to a new address drops the factor
+  (any address change does, as in the reference); the user re-confirms and
+  re-enables it.
+- **Lost the authenticator** (TOTP): a recovery code works in place of a
+  code. There is no admin reset of TOTP.
+- App passwords bypass both factors (reference behaviour), so a user with
+  one can still use apps while sorting out the factor.
+
 ---
 
 ## What NOT to do

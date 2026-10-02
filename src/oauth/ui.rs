@@ -165,8 +165,11 @@ pub struct LoginForm<'a> {
     pub action: &'a str,
     pub identifier: &'a str,
     pub error: Option<&'a str>,
-    /// Password accepted; ask for the authenticator code.
+    /// Password accepted; ask for the second-factor code.
     pub totp: bool,
+    /// With `totp`: the code was emailed to this (obfuscated) address
+    /// rather than coming from an authenticator app.
+    pub email_hint: Option<&'a str>,
 }
 
 pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
@@ -197,7 +200,16 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
             e(csrf_only)
         )),
     }
-    if f.totp {
+    if let (true, Some(hint)) = (f.totp, f.email_hint) {
+        b.push_str(&format!(
+            "<p>Two-factor authentication is enabled for <b>{}</b>. We sent a sign-in code to <b>{}</b>.</p>\
+<label for=\"code\">Sign-in code from your email</label>\
+<input type=\"text\" id=\"code\" name=\"code\" autocomplete=\"one-time-code\" autocapitalize=\"characters\" spellcheck=\"false\" required autofocus>\
+<input type=\"hidden\" name=\"step\" value=\"totp\">",
+            e(f.identifier),
+            e(hint)
+        ));
+    } else if f.totp {
         b.push_str(&format!(
             "<p>Two-factor authentication is enabled for <b>{}</b>.</p>\
 <label for=\"code\">Authenticator code (or a recovery code)</label>\

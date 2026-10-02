@@ -77,3 +77,24 @@ async fn rejects_invalid_handle_syntax() {
         assert!(matches!(r.error_name(), Some("InvalidHandle") | Some("InvalidRequest")), "{bad}: {}", r.text());
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejects_slurs_and_reports_them_unavailable() {
+    let s = TestServer::spawn().await;
+    let d = HANDLE_DOMAIN;
+    // stored reversed so the source doesn't spell it out
+    let word: String = "reggin".chars().rev().collect();
+    let handle = format!("{word}.{d}");
+    let r = try_create(&s, &handle).await;
+    r.err(400, "InvalidHandle");
+    assert!(r.text().contains("Inappropriate language in handle"), "{}", r.text());
+    // separators don't hide it
+    let dashed: String = "reg-gin".chars().rev().collect();
+    try_create(&s, &format!("{dashed}.{d}")).await.err(400, "InvalidHandle");
+    let r = s.xrpc.get("com.atproto.temp.checkHandleAvailability", &[("handle", handle.as_str())], &Auth::None).await;
+    assert_eq!(r.ok()["result"]["$type"], json!("com.atproto.temp.checkHandleAvailability#resultUnavailable"));
+    // the reserved list is the reference's, all three sections
+    for label in ["pds", "xrpc", "postmaster", "taylorswift"] {
+        try_create(&s, &format!("{label}.{d}")).await.err(400, "HandleNotAvailable");
+    }
+}

@@ -223,12 +223,9 @@ struct UpdateHandleIn {
 /// external proof is skipped. (DNS TXT `_atproto` verification isn't
 /// implemented: no DNS resolver dependency.)
 pub(super) async fn check_new_handle(app: &App, handle: &str, did: &str) -> XResult<()> {
-    if !super::syntax::valid_handle(handle) {
-        return Err(XrpcError::bad(
-            "InvalidHandle",
-            "Input/handle must be a valid handle",
-        ));
-    }
+    // syntax + disallowed TLDs, then the slur filter (reference order)
+    super::server::normalize_handle(handle)?;
+    super::server::ensure_no_slur(handle)?;
     let suffix = format!(".{}", app.handle_domain);
     if handle.ends_with(&suffix) {
         // same rules as createAccount, reserved names included

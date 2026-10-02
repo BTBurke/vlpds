@@ -19,7 +19,7 @@
 //!                                  conditional create, like handle claims)
 //! Account fields owned here live in `Account.extra`: deactivatedAt,
 //! deleteAfter, takedownRef, emailConfirmedAt, invitesDisabled, invitedBy,
-//! totpEnabled.
+//! totpEnabled, emailAuthFactorAt (src/xrpc/email2fa.rs).
 //!
 //! Access tokens carry `jti` = session family id (`{issue micros:016x}{rand}`),
 //! refresh tokens `jti` = refresh id. Revocations and takedowns live in the
@@ -616,7 +616,7 @@ pub struct Mail {
     pub to: String,
     pub subject: String,
     pub body: String,
-    /// confirm_email | update_email | reset_password | delete_account | plc_operation | admin
+    /// confirm_email | update_email | reset_password | delete_account | plc_operation | auth_factor | admin
     pub purpose: String,
     pub token: Option<String>,
     pub sent_at: String,
@@ -707,6 +707,7 @@ pub(super) const EMAIL_PURPOSES: &[&str] = &[
     "reset_password",
     "delete_account",
     "plc_operation",
+    super::email2fa::PURPOSE,
 ];
 
 /// Creates (replacing any previous) the account's token for `purpose`.
@@ -902,9 +903,16 @@ pub(super) fn normalize_handle(h: &str) -> XResult<String> {
 }
 
 fn is_reserved(front: &str) -> bool {
-    RESERVED_HANDLES
-        .split_ascii_whitespace()
-        .any(|w| w == front)
+    crate::handle_policy::is_reserved(front)
+}
+
+/// Reference slur check on a user-chosen handle (service or custom domain;
+/// admins skip it). Runs after normalization, before the domain checks.
+pub(super) fn ensure_no_slur(handle: &str) -> XResult<()> {
+    if crate::handle_policy::has_explicit_slur(handle) {
+        return Err(XrpcError::bad("InvalidHandle", "Inappropriate language in handle"));
+    }
+    Ok(())
 }
 
 /// Constraints for a handle under our service domain (reference
@@ -1208,7 +1216,7 @@ fn session_info(app: &App, a: &Account, include_email: bool) -> J {
             out["email"] = json!(e);
         }
         out["emailConfirmed"] = json!(a.email_confirmed);
-        out["emailAuthFactor"] = json!(false);
+        out["emailAuthFactor"] = json!(super::email2fa::enabled(a));
     }
     out
 }
@@ -1346,6 +1354,7 @@ pub(super) async fn create_account_inner(
         }
     };
     let handle = normalize_handle(&inp.handle)?;
+    ensure_no_slur(&handle)?;
     let (did, external) = match inp.did.as_deref() {
         Some(d) => {
             // (checked before the handle, whose proof may be fetched)
@@ -1587,9 +1596,10 @@ async fn create_session(
     if soft_deleted && !inp.allow_takendown {
         return Err(takedown_error());
     }
-    // second factor for password logins (app passwords bypass it)
+    // second factor for password logins (app passwords bypass it): TOTP,
+    // else the email factor (src/xrpc/email2fa.rs)
     if app_pass.is_none() {
-        crate::totp::check_second_factor(&app, &acct, inp.auth_factor_token.as_deref()).await?;
+        super::email2fa::check_second_factor(&app, &acct, inp.auth_factor_token.as_deref()).await?;
     }
     let (access, refresh) =
         create_session_tokens_scoped(&app, &acct.did, app_pass, soft_deleted).await?;
@@ -2319,6 +2329,8 @@ pub(super) async fn set_email(app: &App, did: &str, email: &str) -> XResult<()> 
             a.email = Some(new);
             a.email_confirmed = false;
             set_extra(a, "emailConfirmedAt", J::Null);
+            // codes must not go to an unconfirmed inbox (reference parity)
+            a.extra.remove(super::email2fa::FLAG);
             Ok(true)
         })
         .await;
@@ -2359,10 +2371,21 @@ async fn update_email(
         return Err(takedown_error());
     }
     let email = inp.email.trim().to_ascii_lowercase();
-    if inp.email_auth_factor == Some(true) {
-        return Err(invalid_request(
-            "Email two-factor authentication is not supported by this server; use TOTP",
-        ));
+    // explicit factor toggles on the current address (reference updateEmail)
+    if let Some(want) = inp.email_auth_factor {
+        let same = acct.email.as_deref() == Some(email.as_str());
+        if want {
+            if !(same && acct.email_confirmed) {
+                return Err(invalid_request("Please change and verify your email before enabling OTP"));
+            }
+            super::email2fa::enable(&app, &did).await?;
+            return Ok(StatusCode::OK);
+        }
+        if same {
+            super::email2fa::disable(&app, &acct, inp.token.as_deref()).await?;
+            return Ok(StatusCode::OK);
+        }
+        // disabling while changing the address: the change clears it
     }
     if !valid_email(&email) {
         return Err(invalid_request(
@@ -2695,7 +2718,7 @@ struct HandleAvailabilityQ {
 }
 
 async fn handle_available(app: &App, handle: &str) -> XResult<bool> {
-    if ensure_service_handle(app, handle, false).is_err() {
+    if ensure_no_slur(handle).is_err() || ensure_service_handle(app, handle, false).is_err() {
         return Ok(false);
     }
     Ok(app.resolve_handle(handle).await?.is_none())
@@ -2890,83 +2913,3 @@ async fn get_totp_status(State(app): AppState, Auth(creds): Auth) -> XResult<Jso
     }
     Ok(Json(out))
 }
-
-/// Reserved service-domain handle labels (from the reference PDS).
-const RESERVED_HANDLES: &str = concat!(
-    "10downingstreet 10ronaldinho 3gerardpique about abuse access account accounts aclu acme activate activities ",
-    "activity ad add address adele adm admanager admin administration administrator administrators admins ads ",
-    "adsense adult advertising adwords affiliate affiliatepage affiliates afp ajax akiko_lawson akshaykumar aliaa08 ",
-    "aliciakeys all alpha amitshah analysis analytics andresiniesta8 android anon anonymous answer answers ",
-    "anushkasharma aoc ap api apis app appengine appnews apps archive archives arianagrande ariyoshihiroiki ",
-    "arrahman article arvindkejriwal asahi asdf asset assets at atp auth authentication avatar avrillavigne backup ",
-    "bank banner banners barackobama base bbcbreaking bbcworld beginners beingsalmankhan beta beyonce billgates ",
-    "billieeilish billing bin binaries binary blackberry blog blogs blogsearch bluesky board book bookmark ",
-    "bookmarks books bot bots brasildefato britneyspears brunomars bsky bts_bighit bts_twt bug bugs business buy ",
-    "buzz cache calendar call campaign cancel captcha career careers cart carterjwm catalog catalogs categories ",
-    "category cdn cgi cgi-bin championsleague changelog chart charts chat check checked checking checkout ",
-    "chrisbrown claudialeitte client cliente clients clients1 cnarne cnnbrk code coldplay comercial comment ",
-    "comments communities community company compare compras conanobrien config configuration confirm confirmation ",
-    "connect contact contact-us contact_us contacts contactus content contest contribute contributor contributors ",
-    "coppa copyright copyrights core corp correio countries country cpanel create cristiano css cssproxy customise ",
-    "customize danieltosh dashboard data davidguetta db ddlovato deepikapadukone default delete demo design ",
-    "designer desktop destroy dev devel developer developers devs diagram diary dict dictionary did die dir ",
-    "direct-messages direct_messages directory dist diversity dl dmca doc docs documentation documentations ",
-    "documents domain domains donate download downloads dozle_official drake dril e e-mail earth ecommerce edit ",
-    "editor edits edu education elisapie ellendegeneres elonmusk em_com email embed embedded eminem emmawatson ",
-    "employment employments empty enable encrypted end engine enterprise enterprises entries entry error errorlog ",
-    "errors estadao eval event example examplecommunity exampleopenid examplesyn examplesyndicated exampleusername ",
-    "exchange exit explore famima_now faq faqs favorite favorites favourite favourites fcbarcelona feature features ",
-    "feed feedback feedburner feedproxy feeds ff_xiv_jp file files finance first folder folders folha following ",
-    "forgot form forms forum forums founder foxnews free friend friends ftp fuck fujitv fun fusion gadget gadgets ",
-    "game games gazetadopovo gears general geographic get gettingstarted gift gifts gigazine gist git github gmail ",
-    "go golang goto gov graph graphs gretathunberg group groups guest guests guide guides hack hacks hajimesyacho ",
-    "handle harry_styles head help hikakin hillaryclinton home homepage host hosting hostmaster hostname how-to ",
-    "how_to howto html htrnl http httpd https i iamges iamsrk icon icons id idea ideas ihrithik im imac image ",
-    "images imap img imvkohli inbox inboxes index indexes info information inquiry instagram intranet investor ",
-    "investors invitation invitations invite invoice invoices ios ipad iphone irc irnages irng is issue issues it ",
-    "item items ivetesangalo jairbolsonaro java javascript jimmyfallon jlo job jobs jocx joebiden join ",
-    "jornaldobrasil jornaloglobo jotx js json jtimberlake jump justinbieber kaka kamalaharris kanyewest katyperry ",
-    "kb kendalljenner kevinhart4real khloekardashian kimkardashian kingjames kiyo_saiore knowledge-base ",
-    "knowledgebase kourtneykardash kremlinrussia_e kyliejenner lab labs ladygaga language languages last ",
-    "ldap-status ldap_status ldapstatus legal leomessi lex lexicon liampayne license licenses liltunechi link links ",
-    "linux list lists livejournal lj local locale location log log-in log-out log_in log_out login logout logs ",
-    "lucianohuck lulaoficial m mac mac-os mac-os-x mac_os_x macos macosx mail mailer mailing main mainichi ",
-    "maintenance manage manager manual manutd map maps marcosmion mariahcarey marketing master matsu_bouzu me media ",
-    "member members memories memory merchandise message messages messenger mg microblog microblogs mileycyrus mine ",
-    "mis misc mms mob mobile model models mohamadalarefe money movie movies mp3 mp4 msg msn music mx my mymme mysql ",
-    "name named nan naomiosaka narendramodi nasa natgeo navi navigation nba net network networks new news ",
-    "newsletter neymarjr nfl nhk niallofficial nick nickiminaj nickname nike nikkei nil nintendo none notes ",
-    "noticias notification notifications notify npr ns ns1 ns2 ns3 ns4 ns5 nsid ntv null nytimes oauth ",
-    "oauth-clients oauth_clients ocsp offer offers official old onedirection online oowareware1945 openid operator ",
-    "oprah option options order orders org organization organizations other overview owner owners p0rn pack page ",
-    "pager pages paid pamyurin panel partner partnerpage partners password patch paulocoelho pay payment pds people ",
-    "perl person phone photo photoalbum photos php phpmyadmin phppgadmin phpredisadmin pic pics picture pictures ",
-    "ping pink pitbull pixel places plan plans playstation plc plugin plugins pmoindia podcasts poke_times policies ",
-    "policy pop pop3 popular porn portal portalr7 portals post postfix postmaster posts potus pr pr0n premierleague ",
-    "premium press price pricing principles print privacy privacy-policy privacy_policy privacypolicy private ",
-    "priyankachopra prod product production products profile profiles project projects promo promotions proxies ",
-    "proxy pub public purchase purpose put python queries query radio random ranking read reader readme ",
-    "realdonaldtrump recent recruit recruitment rede_globo redirect register registration release remove replies ",
-    "repo report reports repositories repository req request requests research reset resolve resolver review ",
-    "ricky_martin rihanna rnail rnicrosoft roc rolaworld rondesantisfl root rss ruby rule sachin_rt sag sale sales ",
-    "sample samples sandbox save scholar school schools script scripts search secure security seikintv selenagomez ",
-    "self seminars send server server-info server-status server_info server_status servers service services session ",
-    "sessions setting settings setup shakira share shawnmendes shop shopping shortcut shortcuts show sign-in ",
-    "sign-up sign_in sign_up signin signout signup site sitemap sitemaps sitenews sites sketchup sky slash ",
-    "slashinvoice slut smartphone sms smtp snoopdogg soap software sorry source spec special sportscenter ",
-    "spreadsheet spreadsheets sql srbachchan src srntp ssh ssl ssladmin ssladministrator sslwebmaster ssytem staff ",
-    "stage staging starbucksjapan start stat state static statistics stats status store stores stories style ",
-    "styleguide styles stylesheet stylesheets subdomain subhisharma100 subscribe subscription subscriptions suggest ",
-    "suggestqueries support survey surveys surveytool svn swf syn sync syndicated sys sysadmin sysadministrator ",
-    "sysadmins system tablet tablets tag tags talk talkgadget task tasks taylorswift taylorswift13 tbs tbs_pr team ",
-    "teams tech telnet term terms terms-of-service terms_of_service termsofservice test testing tests text ",
-    "theeconomist theme themes therock thread threads ticket tickets tid tmp to-do to_do todo toml tool toolbar ",
-    "toolbars tools top topic topics tos tour trac trace translate translation translations translator trends ",
-    "tutorial tux tv tvasahi tvtokyo twitter txt ukraine ul undef unfollow unsubscribe update updates upgrade ",
-    "upgrades upi upload uploads url usage user username usernames users uuid validation validations ver version ",
-    "video video-stats videos virendersehwag visitor visitors voice volunteer volunteers w washingtonpost watch ",
-    "wave weather web webdisk webhook webhooks webmail webmaster webmasters webrnail website websites welcome ",
-    "whitehouse45 whm whois widget widgets wifi wiki wikis win windows wizkhalifa word work works workshop wpad ww ",
-    "wws www wwws wwww xfn xhtml xhtrnl xml xmpp xpg xrpc xxx yaml year yml yokoono yomiuri_online you yourdomain ",
-    "yourname yoursite yourusername yousuck2020 youtube zaynmalik zelenskyyua zerohora ",
-);

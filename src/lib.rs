@@ -13,6 +13,7 @@ pub mod lifecycle;
 pub mod mail;
 pub mod firehose;
 pub mod forward;
+pub mod handle_policy;
 pub mod http;
 pub mod metrics;
 pub mod mst;

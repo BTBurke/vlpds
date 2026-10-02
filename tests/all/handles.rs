@@ -159,6 +159,64 @@ async fn admin_update_requires_admin_auth() {
     assert_eq!(current_handle(&s, &b.did).await, b.handle);
 }
 
+/// Slur test words are stored reversed so the source doesn't spell them out.
+fn rev(s: &str) -> String {
+    s.chars().rev().collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disallows_slurs_in_handles() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("alice").await;
+    // service-domain and custom-domain handles alike (the reference checks
+    // before the domain split), separators squashed out first
+    for handle in [
+        h(&rev("reggin")),
+        h(&rev("ynnart")),
+        format!("{}.example.com", rev("reg.gin")),
+        format!("{}.com", rev("sekyk")),
+    ] {
+        let r = update_handle(&s, &a, &handle).await;
+        r.err(400, "InvalidHandle");
+        assert!(r.text().contains("Inappropriate language in handle"), "{handle}: {}", r.text());
+    }
+    assert_eq!(current_handle(&s, &a.did).await, a.handle);
+    // admins bypass the filter (allowAnyValid)...
+    let slur = h(&rev("reggin"));
+    s.xrpc.post("com.atproto.admin.updateAccountHandle", &json!({"did": a.did, "handle": slur}), &Auth::Admin).await.ok();
+    assert_eq!(current_handle(&s, &a.did).await, slur);
+    // ...but not the service-domain shape rules
+    for bad in [h("ab"), h("a.bcd")] {
+        let r = s.xrpc.post("com.atproto.admin.updateAccountHandle", &json!({"did": a.did, "handle": bad}), &Auth::Admin).await;
+        r.err(400, "InvalidHandle");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disallows_slurs_in_record_keys() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("alice").await;
+    let coll = "app.bsky.feed.post";
+    let rkey = rev("reggin");
+    let rec = post_record("hi");
+    for (nsid, body) in [
+        ("com.atproto.repo.createRecord", json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec})),
+        ("com.atproto.repo.putRecord", json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec})),
+        (
+            "com.atproto.repo.applyWrites",
+            json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": coll, "rkey": rkey, "value": rec}]}),
+        ),
+    ] {
+        let r = s.xrpc.post(nsid, &body, &a.auth()).await;
+        r.err(400, "InvalidRequest");
+        assert!(r.text().contains("Unacceptable slur in record key"), "{nsid}: {}", r.text());
+    }
+    // ordinary keys are fine (a collection without TID keys); deletes aren't checked
+    s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "com.example.thing", "rkey": "self-intro", "record": {"$type": "com.example.thing", "x": 1}}), &a.auth()).await.ok();
+    let r = s.xrpc.post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": coll, "rkey": rkey}), &a.auth()).await;
+    assert!(!r.text().contains("slur"), "{}", r.text());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_account_handle_uniqueness_is_case_insensitive() {
     let s = TestServer::spawn().await;

@@ -105,7 +105,11 @@ pub fn routes() -> Router<Arc<App>> {
             "/xrpc/com.atproto.moderation.createReport",
             post(create_report),
         )
+        .route("/xrpc/app.bsky.notification.registerPush", post(push::register_push))
+        .route("/xrpc/app.bsky.notification.unregisterPush", post(push::unregister_push))
 }
+
+mod push;
 
 fn xerr(status: StatusCode, error: &str, message: impl Into<String>) -> XrpcError {
     XrpcError {

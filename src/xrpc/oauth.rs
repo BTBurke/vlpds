@@ -1144,6 +1144,7 @@ fn login_page(
             identifier,
             error,
             totp,
+            email_hint: None,
         },
         "",
     );
@@ -1361,10 +1362,11 @@ async fn form_flow(
 
 enum SignIn {
     Ok(String),
-    /// Password accepted; authenticator code needed (handle).
-    NeedTotp(String),
-    /// Wrong authenticator code; still pending (handle).
-    NeedTotpErr(String),
+    /// Password accepted; a second-factor code is needed (handle; the
+    /// obfuscated address when it is an emailed code).
+    NeedTotp(String, Option<String>),
+    /// Wrong code; still pending (handle, email hint).
+    NeedTotpErr(String, Option<String>),
     /// (identifier to pre-fill, why)
     Failed(String, LoginError),
 }
@@ -1506,16 +1508,18 @@ async fn sign_in(
         }
         (acct, ident)
     };
-    match crate::totp::check_second_factor(app, &acct, code).await {
+    // TOTP, else the email factor (which mails the code on the password step)
+    match super::email2fa::check_second_factor(app, &acct, code).await {
         Ok(()) => {}
-        Err(e) if e.error == "AuthFactorTokenRequired" => {
+        Err(fe) if fe.err.error == "AuthFactorTokenRequired" => {
             device.pending_2fa = Some((acct.did.clone(), now));
             device.pending_2fa_failures = 0;
             store::put_device(app, device).await?;
-            return Ok(SignIn::NeedTotp(acct.handle));
+            return Ok(SignIn::NeedTotp(acct.handle, email_hint(fe.factor)));
         }
-        Err(e) if e.status.is_server_error() => return Err(e.into()),
-        Err(e) => {
+        Err(fe) if fe.err.status.is_server_error() => return Err(fe.err.into()),
+        Err(fe) => {
+            let (e, hint) = (fe.err, email_hint(fe.factor));
             // a password step starts a new pending sign-in
             if password_step {
                 device.pending_2fa = Some((acct.did.clone(), now));
@@ -1531,7 +1535,7 @@ async fn sign_in(
                 return Ok(SignIn::Failed(ident, LoginError::TooManyCodes));
             }
             store::put_device(app, device).await?;
-            return Ok(SignIn::NeedTotpErr(acct.handle));
+            return Ok(SignIn::NeedTotpErr(acct.handle, hint));
         }
     }
     let did = acct.did;
@@ -1547,6 +1551,40 @@ async fn sign_in(
     Ok(SignIn::Ok(did))
 }
 
+fn email_hint(f: super::email2fa::Factor) -> Option<String> {
+    match f {
+        super::email2fa::Factor::Email { hint } => Some(hint),
+        super::email2fa::Factor::Totp => None,
+    }
+}
+
+/// The second-factor step of the sign-in page: an authenticator code, or
+/// (`email_hint`) the code just mailed.
+fn code_page(app: &App, flow: &Flow, handle: &str, email_hint: Option<&str>, bad_code: bool) -> Response {
+    let csrf = flow.csrf(app);
+    let name = server_name(app);
+    let error = bad_code.then(|| match email_hint {
+        Some(_) => "Invalid sign-in code",
+        None => LoginError::BadCode.message(),
+    });
+    let body = ui::login(
+        Some(&flow.ctx(&csrf, &name)),
+        &ui::LoginForm {
+            action: "/oauth/authorize/sign-in",
+            identifier: handle,
+            error,
+            totp: true,
+            email_hint,
+        },
+        "",
+    );
+    let mut r = flow.page(app, body);
+    if bad_code {
+        *r.status_mut() = StatusCode::UNAUTHORIZED;
+    }
+    r
+}
+
 async fn authorize_sign_in(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
     let (mut flow, f) = match form_flow(&app, &headers, &body).await {
         Ok(x) => x,
@@ -1558,17 +1596,8 @@ async fn authorize_sign_in(State(app): AppState, headers: HeaderMap, body: AxByt
     }
     match sign_in(&app, &mut flow.device, &f).await {
         Ok(SignIn::Ok(did)) => consent_step(&app, flow, &did).await,
-        Ok(SignIn::NeedTotp(handle)) => {
-            login_page(&app, &flow, &handle, None, true, StatusCode::OK)
-        }
-        Ok(SignIn::NeedTotpErr(handle)) => login_page(
-            &app,
-            &flow,
-            &handle,
-            Some(LoginError::BadCode.message()),
-            true,
-            StatusCode::UNAUTHORIZED,
-        ),
+        Ok(SignIn::NeedTotp(handle, hint)) => code_page(&app, &flow, &handle, hint.as_deref(), false),
+        Ok(SignIn::NeedTotpErr(handle, hint)) => code_page(&app, &flow, &handle, hint.as_deref(), true),
         Ok(SignIn::Failed(ident, e)) => {
             login_page(&app, &flow, &ident, Some(e.message()), false, e.status())
         }
@@ -2272,6 +2301,8 @@ async fn account_page(
                     .and_then(|c| LoginError::from_code(c))
                     .map(LoginError::message),
                 totp: pending,
+                // the address isn't put in the URL; the page says "your email"
+                email_hint: (pending && q.contains_key("email")).then_some("your email address"),
             },
             &csrf,
         );
@@ -2337,9 +2368,12 @@ async fn account_sign_in(State(app): AppState, headers: HeaderMap, body: AxBytes
     };
     match sign_in(&app, &mut device, &f).await {
         Ok(SignIn::Ok(_)) => redirect_to("/oauth/account"),
-        Ok(SignIn::NeedTotp(_)) => redirect_to("/oauth/account?add=1&totp=1"),
-        Ok(SignIn::NeedTotpErr(_)) => redirect_to(&format!(
-            "/oauth/account?add=1&totp=1&error={}",
+        Ok(SignIn::NeedTotp(_, hint)) => {
+            redirect_to(&format!("/oauth/account?add=1&totp=1{}", if hint.is_some() { "&email=1" } else { "" }))
+        }
+        Ok(SignIn::NeedTotpErr(_, hint)) => redirect_to(&format!(
+            "/oauth/account?add=1&totp=1{}&error={}",
+            if hint.is_some() { "&email=1" } else { "" },
             LoginError::BadCode.code()
         )),
         Ok(SignIn::Failed(_, e)) => {

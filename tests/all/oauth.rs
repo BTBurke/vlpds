@@ -1342,6 +1342,85 @@ async fn totp_prompt_on_login() {
     assert!(html.contains("Authorize access"), "{html}");
 }
 
+/// Newest dev-mode mail token of `purpose` sent to `email`.
+async fn dev_mail_token(s: &Srv, email: &str, purpose: &str) -> String {
+    let v: J = s
+        .http
+        .get(format!("{}/xrpc/vlpds.admin.getDevMail?email={}", s.base, enc(email)))
+        .basic_auth("admin", Some("dev-admin-token"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let m = v["messages"].as_array().unwrap().iter().rev().find(|m| m["purpose"] == purpose);
+    m.unwrap_or_else(|| panic!("no {purpose} mail to {email}: {v}"))["token"].as_str().unwrap().into()
+}
+
+/// The reference's email factor on the sign-in page
+/// (SecondAuthenticationFactorRequiredError 'emailOtp'): the password step
+/// mails a code and asks for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn email_code_prompt_on_login() {
+    let s = spawn().await;
+    let acct = create_account(&s, "emma").await;
+    let email = "emma@example.com";
+    let call = |nsid: &str, body: J| {
+        s.http.post(format!("{}/xrpc/{nsid}", s.base)).bearer_auth(&acct.jwt).json(&body).send()
+    };
+    let r = call("com.atproto.server.requestEmailConfirmation", json!({})).await.unwrap();
+    assert!(r.status().is_success());
+    let tok = dev_mail_token(&s, email, "confirm_email").await;
+    let r = call("com.atproto.server.confirmEmail", json!({"email": email, "token": tok})).await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let r = call("com.atproto.server.updateEmail", json!({"email": email, "emailAuthFactor": true})).await.unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+
+    let key = DpopKey::new();
+    let redirect = "http://127.0.0.1/cb";
+    let cid = loopback_client_id("atproto", redirect);
+    let f = Flow::new(&cid, redirect, "atproto", &key);
+    let mut b = Browser::default();
+    let par = f.par(&s, &pkce(), "t").await;
+    let ru = par.body["request_uri"].as_str().unwrap().to_string();
+    let (_, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
+    let csrf = csrf_of(&html);
+    let password_step = [
+        ("request_uri", ru.as_str()),
+        ("csrf", csrf.as_str()),
+        ("identifier", acct.handle.as_str()),
+        ("password", PASSWORD),
+        ("action", "sign-in"),
+    ];
+    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-in", &password_step).await;
+    assert_eq!(st, 200);
+    assert!(
+        html.contains("name=\"code\"") && html.contains("We sent a sign-in code to <b>e***a@e***m</b>"),
+        "expected email code prompt: {html}"
+    );
+    let code = dev_mail_token(&s, email, "auth_factor").await;
+    let code_step = |c: &str| {
+        vec![
+            ("request_uri".to_string(), ru.clone()),
+            ("csrf".to_string(), csrf.clone()),
+            ("step".to_string(), "totp".to_string()),
+            ("code".to_string(), c.to_string()),
+            ("action".to_string(), "sign-in".to_string()),
+        ]
+    };
+    let pairs = code_step("AAAAA-AAAAA");
+    let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-in", &pairs).await;
+    assert_eq!(st, 401);
+    assert!(html.contains("Invalid sign-in code") && html.contains("name=\"code\""), "{html}");
+    let pairs = code_step(&code);
+    let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-in", &pairs).await;
+    assert_eq!(st, 200, "{html}");
+    assert!(html.contains("Authorize access"), "{html}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn session_management() {
     let s = spawn().await;

@@ -2,6 +2,7 @@
 //! `routes()`. Shared state, errors and auth helpers live here.
 
 mod admin;
+mod email2fa;
 pub mod extract;
 pub mod internal;
 pub mod authn;

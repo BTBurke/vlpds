@@ -286,7 +286,7 @@ fn invalid_code() -> XrpcError {
     XrpcError::bad("InvalidToken", "Token is invalid")
 }
 
-fn locked_out() -> XrpcError {
+pub fn locked_out() -> XrpcError {
     XrpcError {
         status: StatusCode::TOO_MANY_REQUESTS,
         error: "RateLimitExceeded".into(),
@@ -301,11 +301,26 @@ pub fn is_lockout(e: &XrpcError) -> bool {
 
 /// Records a wrong code; locks the factor every [`MAX_FAILURES`] in a row.
 pub fn record_failure(st: &mut TotpState, now: u64) {
-    st.failures = st.failures.saturating_add(1);
-    if st.failures.is_multiple_of(MAX_FAILURES) {
-        let n = (st.failures / MAX_FAILURES - 1).min(16);
-        st.locked_until = now + (LOCKOUT_SECS << n).min(MAX_LOCKOUT_SECS);
+    record_failure_in(&mut st.failures, &mut st.locked_until, now);
+}
+
+/// The lockout schedule on bare counters (shared with the email factor,
+/// src/xrpc/email2fa.rs, so both factors bound guessing the same way).
+pub fn record_failure_in(failures: &mut u32, locked_until: &mut u64, now: u64) {
+    *failures = failures.saturating_add(1);
+    if failures.is_multiple_of(MAX_FAILURES) {
+        let n = (*failures / MAX_FAILURES - 1).min(16);
+        *locked_until = now + (LOCKOUT_SECS << n).min(MAX_LOCKOUT_SECS);
     }
+}
+
+/// Whether `account` has TOTP enabled (cheap when its `totpEnabled` flag
+/// says no, as for most accounts).
+pub async fn enabled_for(app: &App, account: &Account) -> Result<bool, XrpcError> {
+    if account.extra.get("totpEnabled").and_then(|v| v.as_bool()) == Some(false) {
+        return Ok(false);
+    }
+    Ok(load(app, &account.did).await?.enabled())
 }
 
 /// Consumes `code` (a current TOTP code or an unused recovery code) against

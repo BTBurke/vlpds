@@ -40,6 +40,15 @@ fn check_path(collection: &str, rkey: Option<&str>) -> XResult<()> {
     Ok(())
 }
 
+/// Reference prepareCreate/prepareUpdate: a client-chosen record key may not
+/// contain an explicit slur (src/handle_policy.rs). Deletes are not checked.
+fn check_rkey_slur(rkey: Option<&str>) -> XResult<()> {
+    if rkey.is_some_and(crate::handle_policy::has_explicit_slur) {
+        return Err(XrpcError::bad("InvalidRequest", "Unacceptable slur in record key"));
+    }
+    Ok(())
+}
+
 fn parse_cid_opt(v: &Option<String>) -> XResult<Option<Cid>> {
     v.as_deref()
         .map(|s| {
@@ -289,6 +298,7 @@ async fn create_record(
     let did = authed_repo(&app, &creds, &inp.repo).await?;
     creds.require(creds.allows_repo(&inp.collection, "create"))?;
     check_path(&inp.collection, inp.rkey.as_deref())?;
+    check_rkey_slur(inp.rkey.as_deref())?;
     // as the reference: no rkey = a fresh TID (validated against the schema's key)
     let rkey = inp.rkey.unwrap_or_else(|| app.tids.next().to_string());
     let schema = crate::lexicon::resolve_record_schema(&app, &inp.collection, inp.validate).await;
@@ -373,6 +383,7 @@ async fn put_record(
             && creds.allows_repo(&inp.collection, "update"),
     )?;
     check_path(&inp.collection, Some(&inp.rkey))?;
+    check_rkey_slur(Some(&inp.rkey))?;
     let schema = crate::lexicon::resolve_record_schema(&app, &inp.collection, inp.validate).await;
     let (cid, bytes, blobs, status, decls) =
         encode_record(&mut inp.record, &inp.collection, &inp.rkey, inp.validate, schema.as_deref())?;
@@ -531,6 +542,9 @@ async fn apply_writes(
         };
         creds.require(creds.allows_repo(&collection, action))?;
         check_path(&collection, rkey.as_deref())?;
+        if action != "delete" {
+            check_rkey_slur(rkey.as_deref())?;
+        }
         if action != "delete" && !schemas.contains_key(&collection) {
             let s = crate::lexicon::resolve_record_schema(&app, &collection, inp.validate).await;
             schemas.insert(collection.clone(), s);

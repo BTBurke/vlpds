@@ -2130,3 +2130,84 @@ runs each, median for 20 / 5000 records: 20.1 / 20.4 µs/commit before
 Verification is the whole ~15 µs: about +15% of the ~96 µs whole-node commit
 (see "CPU"). Verifying only a sample would leave the skipped signatures
 free to leak the key.
+
+## Handle policy (`src/handle_policy.rs`)
+
+The reference's reserved-handle list and explicit-slur filter
+(packages/pds/src/handle), verbatim as data files compiled in
+(`src/handle_policy/reserved.txt`, 1,029 labels in its three sections;
+`explicit_slurs.txt`, its 7 regexes), so a diff against upstream is a diff of
+two text files. Applied where the reference's `normalizeAndValidateHandle`
+is, with its error names and messages:
+- slurs: every user-chosen handle (createAccount, OAuth sign-up,
+  identity.updateHandle), service domain or custom domain, matched as is and
+  with `.`, `-`, `_` removed: 400 `InvalidHandle` "Inappropriate language in
+  handle". Also client-chosen record keys on create/put/applyWrites (not
+  deletes): 400 `InvalidRequest` "Unacceptable slur in record key".
+  checkHandleAvailability reports such handles unavailable.
+- reserved: the first label of a service-domain handle only: 400
+  `HandleNotAvailable` "Reserved handle".
+- admins (`com.atproto.admin.updateAccountHandle`, the reference's
+  `allowAnyValid`) skip both, but a service-domain handle must still be one
+  3-18 character label. Unlike the reference, an admin-set custom domain is
+  not resolved first.
+- updateHandle now also refuses the disallowed TLDs (`.local`, `.onion`, ...)
+  as createAccount does.
+
+The regexes are JS without flags (case-sensitive, ASCII `\b`); handles and
+record keys are ASCII, where the `regex` crate's Unicode `\b` agrees. A
+differential run against the JS implementation over 200k generated strings
+matched (`handle_policy::tests::slurs_corpus_differential`, ignored; needs a
+corpus file).
+
+## Push registration (`src/xrpc/proxy/push.rs`)
+
+`app.bsky.notification.{registerPush,unregisterPush}` name their service in
+the body (`serviceDid`), so the generic proxy (which would always pick the
+AppView) doesn't serve them. As in the reference: the OAuth check is
+`rpc:{lxm}?aud={serviceDid}#bsky_notif`; the forwarded call carries a
+service-auth JWT from the account's repo key through the proxy's signer
+(hedged nonce, verify-after-sign) with iss = account, **aud = the bare
+`serviceDid`** (the reference's `serviceAuthHeaders(did, serviceDid, lxm)`;
+`#bsky_notif` appears only in the scope check), lxm = the method. When
+`serviceDid` is the configured AppView's DID its URL is used; otherwise the
+DID document's `#bsky_notif` service of type `BskyNotificationService` (400
+"invalid notification service details in did document" without one),
+called through the SSRF-guarded client (§7). Without an AppView configured
+the reference doesn't register these methods; vlpds answers 400 "No service
+configured". Upstream errors pass through as for proxied calls.
+
+## Email second factor (`src/xrpc/email2fa.rs`)
+
+The reference's `emailAuthFactor`, the only second factor the Bluesky app
+offers; vlpds's TOTP (`vlpds.server.*Totp`) stays as a second option.
+- **Toggle** via `com.atproto.server.updateEmail` with the current address
+  (case-insensitive): `emailAuthFactor: true` needs a confirmed email and no
+  token ("Please change and verify your email before enabling OTP"
+  otherwise); `false` is two-phase: without a token it mails an
+  `update_email` code and fails `TokenRequired`, with one (from that mail or
+  requestEmailUpdate) it clears the factor. Both are idempotent. Any address
+  change, user or admin, clears it. Stored as `emailAuthFactorAt` on the
+  account; getSession/createSession/refreshSession report `emailAuthFactor`.
+- **Sign-in** (createSession and the OAuth sign-in page; app passwords
+  bypass it, as in the reference): without `authFactorToken` a fresh
+  `auth_factor` code is mailed ("Sign-in Confirmation") and the call fails
+  401 `AuthFactorTokenRequired`; the code is an email token like the others
+  (15 min, single use, newest replaces older, keyed digest at rest), wrong
+  400 `InvalidToken`, stale 400 `ExpiredToken`. The OAuth page shows the
+  code step with the obfuscated address (`a***e@e***m`), like the
+  reference's `SecondAuthenticationFactorRequiredError('emailOtp', hint)`.
+- **Guessing**: on top of createSession's rate limits (the reference's only
+  bound), wrong codes count against a per-account lockout with TOTP's
+  schedule (5 wrong: locked 5 min, doubling to a day; 429
+  `RateLimitExceeded`, no mail sent while locked), persisted in the account's
+  private state (`p/{did}\0eotp_lock`) so it holds across nodes, restarts and
+  both sign-in paths. The OAuth page's per-attempt limit (3 wrong codes drop
+  the pending sign-in) applies to both factors.
+- **Precedence**: with TOTP enabled only TOTP is asked for (TOTP or recovery
+  code); no email code is mailed or accepted. Both may stay enabled:
+  turning TOTP off falls back to the email factor, but the weaker factor
+  never substitutes for the stronger one. The Bluesky app shows its generic
+  code field on `AuthFactorTokenRequired`, which takes a TOTP code too.
+- Unlike the reference, an `authFactorToken` sent for an account without a
+  factor is ignored rather than checked.
