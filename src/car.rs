@@ -41,17 +41,14 @@ pub fn write_block(out: &mut Vec<u8>, c: &Cid, data: &[u8]) {
     out.extend_from_slice(data);
 }
 
-/// Parses a CAR into (roots, blocks).
 pub fn read_car(b: &[u8]) -> anyhow::Result<(Vec<Cid>, Vec<(Cid, &[u8])>)> {
-    // lengths are untrusted varints (up to u64::MAX): check them against
-    // the bytes that remain instead of adding them to a position
+    // untrusted lengths (up to u64::MAX): compare with what remains, never add to a position
     let (hlen, n) = read_varint(b).ok_or_else(|| anyhow::anyhow!("bad car header"))?;
     if hlen > (b.len() - n) as u64 {
         anyhow::bail!("short car");
     }
     let mut pos = n + hlen as usize;
-    // CARv1 header: {version: 1, roots: [CID...]} (as go-car and the
-    // reference require; a v2 or rootless header is not a CARv1)
+    // go-car and the reference refuse a v2 or rootless header
     let header = cbor::ValueRef::decode(&b[n..pos])?;
     if header.get("version") != Some(&cbor::ValueRef::Int(1)) {
         anyhow::bail!("car header version must be 1");

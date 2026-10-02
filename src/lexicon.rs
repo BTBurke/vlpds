@@ -1,39 +1,21 @@
-//! Lexicon validation with one generic schema interpreter over compiled
-//! schemas ([`Lexicons`]: the bundle and each resolved document are
-//! compiled once into indexed defs, so validation does no JSON lookups):
+//! Lexicon validation: one schema interpreter over schemas compiled once
+//! ([`Lexicons`]), with messages as @atproto/lexicon words them.
 //!
-//! - Records, like the reference's `validateRecord`
-//!   (packages/pds/src/repo/prepare.ts): a record whose `$type` has a
-//!   schema is checked (record key + record body) and reported `valid`;
-//!   unknown types are `unknown` unless `validate: true` was requested;
-//!   `validate: false` skips validation.
-//! - XRPC, like @atproto/lexicon's `assertValidXrpcParams` /
-//!   `assertValidXrpcInput`: query params and JSON inputs of the bundled
-//!   com.atproto.* methods are checked by the extractors
-//!   (src/xrpc/extract.rs) before the handler runs (400 `InvalidRequest`).
-//!   Outputs are checked in debug builds only ([`validate_output`], wired as
-//!   a route layer), to catch handler bugs in the test suite at no prod cost.
-//! - Opt-in dynamic resolution (`Config::resolve_lexicons`): record types
-//!   without a bundled schema are resolved like permission sets
-//!   (src/oauth/lexicon.rs: DNS `_lexicon` TXT -> DID ->
-//!   `com.atproto.lexicon.schema` record with proof) and validated too. The
-//!   reference has no such resolution yet (`@TODO` in prepare.ts); a write
-//!   waits at most the configured timeout and otherwise treats the type as
-//!   unknown, while the resolution finishes in the background and fills the
-//!   cache (TTL, negative TTL, size bound) for later writes.
+//! - Records, like the reference's `validateRecord`: a record whose `$type`
+//!   has a schema is checked and reported `valid`; unknown types are
+//!   `unknown` unless `validate: true` was requested.
+//! - XRPC params and JSON inputs of the bundled com.atproto.* methods,
+//!   checked by the extractors. Outputs are checked in debug builds only, to
+//!   catch handler bugs in the test suite at no prod cost.
+//! - Opt-in dynamic resolution of record types without a bundled schema
+//!   (the reference has none yet): a write waits at most the configured
+//!   timeout and otherwise treats the type as unknown, while the resolution
+//!   finishes in the background for later writes.
 //!
-//! `lexicons/bundle.json` bundles every record lexicon of the atproto repo
-//! and every com.atproto.* query/procedure, plus the lexicons they
-//! reference, as `{nsid: lexicon document}` (regenerate with
-//! `lexicons/bundle.py`).
-//!
-//! Checked: object required/nullable fields, string formats, byte and
-//! grapheme lengths, enum/const, integer ranges, arrays, refs, open and
-//! closed unions, blobs (accepted MIME types, max size), bytes and
-//! cid-links. Like the reference, extra object properties are allowed and
-//! open-union members of unknown types are not validated; refs from a
-//! resolved lexicon into other unbundled lexicons are not followed.
-//! Messages follow @atproto/lexicon (`Input/repo must be a string`).
+//! Like the reference, extra object properties are allowed and open-union
+//! members of unknown types are not validated; refs from a resolved lexicon
+//! into other unbundled lexicons are not followed. `lexicons/bundle.json`
+//! is regenerated with `lexicons/bundle.py`.
 
 use crate::cbor::{JsonValue, Value};
 use crate::xrpc::syntax;
@@ -45,20 +27,17 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// The bundle, compiled once ([`Lexicons`]).
 static BUNDLE: LazyLock<Lexicons> = LazyLock::new(|| {
     let docs: HashMap<String, J> =
         serde_json::from_str(include_str!("../lexicons/bundle.json")).expect("bundled lexicons");
     Lexicons::compile(docs.iter().map(|(k, d)| (k.as_str(), d)), None)
 });
 
-/// Result of validating a write: `Some("valid" | "unknown")`, or `None`
-/// when validation was skipped (`validate: false`).
+/// `Some("valid" | "unknown")`, or `None` when skipped (`validate: false`).
 pub type ValidationStatus = Option<&'static str>;
 
-/// Validates a record (with its `$type` already set to `collection`).
-/// `resolved` is a dynamically resolved lexicon for `collection`
-/// ([`resolve_record_schema`]); bundled schemas take precedence.
+/// `record`'s `$type` is already set to `collection`. Bundled schemas take
+/// precedence over `resolved` ([`resolve_record_schema`]).
 pub fn validate_record<N: Node>(
     collection: &str,
     rkey: &str,
@@ -101,11 +80,8 @@ pub fn validate_record<N: Node>(
     Ok(Some("valid"))
 }
 
-/// [`syntax::valid_tid`] through a lookup table: one load per character
-/// instead of a `memchr` over the alphabet for each (~90 ns -> a few ns on
-/// every TID record key; the table-driven approach of shrike's base32 codec
-/// (MIT/Apache-2.0), via data-encoding). Same accepted strings
-/// (tests/all/shrike_adopt.rs).
+/// [`syntax::valid_tid`] through a lookup table (every TID record key pays
+/// for it). Same accepted strings (tests/all/shrike_adopt.rs).
 pub fn valid_tid(s: &str) -> bool {
     // bit 0: base32-sortable character; bit 1: allowed first character
     const T: [u8; 256] = {
@@ -135,25 +111,18 @@ fn split_ref<'a>(r: &'a str, ctx: &'a str) -> (&'a str, &'a str) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// XRPC params / input / output
-// ---------------------------------------------------------------------------
-
 /// Methods whose vlpds input deliberately extends the lexicon:
 /// updateAccountSigningKey generates a key when `signingKey` is omitted.
 const EXTENDED_INPUTS: &[&str] = &["com.atproto.admin.updateAccountSigningKey"];
 
-/// Whether `nsid` is a bundled method with a JSON input schema.
 pub fn has_input_schema(nsid: &str) -> bool {
     !EXTENDED_INPUTS.contains(&nsid) && BUNDLE.methods.get(nsid).is_some_and(|m| m.input.is_some())
 }
 
-/// Whether `nsid` is a bundled method with parameters.
 pub fn has_params(nsid: &str) -> bool {
     BUNDLE.methods.get(nsid).is_some_and(|m| m.params.is_some())
 }
 
-/// Checks a procedure's JSON body (`Input ...` messages).
 pub fn validate_input<N: Node>(nsid: &str, body: &N) -> Result<(), String> {
     if EXTENDED_INPUTS.contains(&nsid) {
         return Ok(());
@@ -161,7 +130,6 @@ pub fn validate_input<N: Node>(nsid: &str, body: &N) -> Result<(), String> {
     validate_payload(BUNDLE.methods.get(nsid).and_then(|m| m.input.as_ref()), "Input", body)
 }
 
-/// Checks a method's JSON response body (`Output ...` messages).
 pub fn validate_output(nsid: &str, body: &J) -> Result<(), String> {
     validate_payload(BUNDLE.methods.get(nsid).and_then(|m| m.output.as_ref()), "Output", body)
 }
@@ -176,9 +144,9 @@ fn validate_payload<N: Node>(schema: Option<&Schema>, root: &str, body: &N) -> R
     Validator::new(root, None).check(&BUNDLE, schema, body)
 }
 
-/// Checks a method's query params (the raw `key=value` pairs, decoded per
-/// the param types like the reference's `decodeQueryParams`). Empty values
-/// count as absent; unknown params are ignored.
+/// The raw pairs are decoded per the param types like the reference's
+/// `decodeQueryParams`. Empty values count as absent; unknown params are
+/// ignored.
 pub fn validate_params(nsid: &str, pairs: &[(String, String)]) -> Result<(), String> {
     let Some(params) = BUNDLE.methods.get(nsid).and_then(|m| m.params.as_ref()) else {
         return Ok(());
@@ -213,15 +181,8 @@ pub fn validate_params(nsid: &str, pairs: &[(String, String)]) -> Result<(), Str
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// dynamic resolution
-// ---------------------------------------------------------------------------
-
-/// Default time a write waits for a lexicon resolution (`--resolve-lexicons`).
 pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long a resolved lexicon is used before it is resolved again.
 const RESOLVED_TTL: Duration = Duration::from_secs(600);
-/// How long a failed resolution is remembered (negative cache).
 const NEGATIVE_TTL: Duration = Duration::from_secs(60);
 
 type Resolution = futures::future::Shared<futures::future::BoxFuture<'static, Option<Arc<Lexicons>>>>;
@@ -241,10 +202,7 @@ impl Slot {
     }
 }
 
-/// Resolutions (resolved, failed or in flight), least recently used
-/// first out past the `lexicons` cap ([`crate::caches`]): O(1) per insert
-/// under the lock (it used to sweep the whole map for expired entries and
-/// then the oldest, per insert, at the cap).
+/// Resolved, failed or in flight.
 static RESOLVED: LazyLock<Arc<Resolved>> = LazyLock::new(|| crate::caches::track(crate::caches::Cache::Lexicons, Default::default()));
 
 struct Resolved(parking_lot::Mutex<lru::LruCache<String, Slot>>);
@@ -261,14 +219,7 @@ impl crate::caches::Len for Resolved {
     }
 }
 
-impl Resolved {
-    fn lock(&self) -> parking_lot::MutexGuard<'_, lru::LruCache<String, Slot>> {
-        self.0.lock()
-    }
-}
-
-/// Inserts (or refreshes) `k`, evicting least recently used entries past
-/// the cap (the cap is runtime-configurable, so it isn't the LRU's own).
+/// The cap is runtime-configurable, so it isn't the LRU's own.
 fn insert_capped(m: &mut lru::LruCache<String, Slot>, k: String, v: Slot) {
     m.put(k, v);
     let cap = crate::caches::cap(crate::caches::Cache::Lexicons).max(1);
@@ -277,11 +228,9 @@ fn insert_capped(m: &mut lru::LruCache<String, Slot>, k: String, v: Slot) {
     }
 }
 
-/// The dynamically resolved (and compiled) lexicon for a record type, when
-/// resolution is enabled, validation isn't skipped and no schema is bundled.
-/// Waits at most `Config::resolve_lexicons` for a resolution; None (the
-/// record is then `unknown`) on failure or timeout. Concurrent writes of
-/// the same type share one resolution.
+/// Only when resolution is enabled, validation isn't skipped and no schema
+/// is bundled. Waits at most `Config::resolve_lexicons`; None on failure or
+/// timeout. Concurrent writes of the same type share one resolution.
 pub async fn resolve_record_schema(
     app: &Arc<App>,
     collection: &str,
@@ -292,7 +241,7 @@ pub async fn resolve_record_schema(
         return None;
     }
     let (fut, prev) = {
-        let mut m = RESOLVED.lock();
+        let mut m = RESOLVED.0.lock();
         match m.get(collection) {
             Some(Slot::Pending { fut, prev }) => (fut.clone(), prev.clone()),
             Some(s @ Slot::Done { doc, .. }) if s.fresh() => return doc.clone(),
@@ -325,13 +274,12 @@ fn spawn_resolution(app: Arc<App>, nsid: String, prev: Option<Arc<Lexicons>>) ->
                 prev
             }
         };
-        insert_capped(&mut RESOLVED.lock(), nsid, Slot::Done { at: Instant::now(), doc: doc.clone() });
+        insert_capped(&mut RESOLVED.0.lock(), nsid, Slot::Done { at: Instant::now(), doc: doc.clone() });
         doc
     });
     async move { task.await.ok().flatten() }.boxed().shared()
 }
 
-/// A resolved lexicon document usable for record validation, compiled.
 fn record_lexicon(nsid: &str, doc: J) -> Result<Lexicons, String> {
     if doc["lexicon"].as_i64() != Some(1) || doc["id"] != nsid {
         return Err(format!("Invalid Lexicon document for {nsid}"));
@@ -344,39 +292,27 @@ fn record_lexicon(nsid: &str, doc: J) -> Result<Lexicons, String> {
     Ok(Lexicons::resolved(&doc))
 }
 
-// ---------------------------------------------------------------------------
-// compiled schemas
-// ---------------------------------------------------------------------------
-
-/// Lexicon documents compiled once, at load, into an indexed form: every
-/// def in an arena, refs resolved to arena indexes, field tables, enums,
-/// formats and error-message fragments precomputed. Validation then never
-/// touches the JSON documents. The bundle is one set; a dynamically
-/// resolved document is a set of its own whose refs to other NSIDs point
-/// into the bundle.
+/// Lexicon documents compiled into an arena of defs with refs resolved to
+/// indexes and message fragments precomputed, so validation never touches
+/// the JSON. A resolved document is a set of its own whose refs to other
+/// NSIDs point into the bundle.
 pub struct Lexicons {
-    /// Every def, addressed by [`Target::Local`] / [`Target::Bundle`].
     defs: Vec<Schema>,
-    /// nsid -> def name -> index into `defs`.
     index: HashMap<Box<str>, HashMap<Box<str>, u32>>,
-    /// nsid -> its `main` def when that is a record.
     records: HashMap<Box<str>, Record>,
-    /// nsid -> its `main` def when that is a query / procedure.
     methods: HashMap<Box<str>, Method>,
-    /// The NSID of a resolved document (None for the bundle).
+    /// None for the bundle.
     id: Option<Box<str>>,
 }
 
 struct Record {
     key: Box<str>,
-    /// The `record` schema (a record def's `record`, checked by its type).
     schema: Schema,
 }
 
 struct Method {
-    /// Present when the method declares `parameters`.
     params: Option<Vec<Param>>,
-    /// JSON (`application/json`) input / output schemas.
+    /// `application/json` only.
     input: Option<Schema>,
     output: Option<Schema>,
 }
@@ -385,7 +321,7 @@ struct Param {
     name: Box<str>,
     schema: Schema,
     is_array: bool,
-    /// How raw values decode (the item type for arrays).
+    /// The item type for arrays.
     item: ParamType,
     required: bool,
 }
@@ -396,21 +332,18 @@ enum ParamType {
     Other,
 }
 
-/// Where a ref points.
 enum Target {
-    /// A def of the set the ref is in.
     Local(u32),
-    /// A def of the bundle (from a resolved document).
+    /// From a resolved document.
     Bundle(u32),
-    /// From the bundle, a def it doesn't have: a resolved document for
-    /// that NSID may define it.
+    /// From the bundle, a def it doesn't have: a resolved document for that
+    /// NSID may define it.
     Unbundled(Box<str>, Box<str>),
-    /// Nothing to follow (can't validate further).
     Missing,
 }
 
-/// A compiled schema node. `token`, `params`, `query`, `procedure`,
-/// `subscription` and unknown types compile to [`Schema::Any`].
+/// `token`, `params`, `query`, `procedure`, `subscription` and unknown types
+/// compile to [`Schema::Any`].
 enum Schema {
     Any,
     Object(Box<Object>),
@@ -435,17 +368,14 @@ struct Object {
 }
 
 struct Union {
-    /// The NSID `#name` refs and `$type`s are relative to.
     ctx: Box<str>,
-    /// (nsid, name, target) per string ref, in order.
     refs: Vec<(Box<str>, Box<str>, Target)>,
-    /// Closed unions: the `$type must be one of ...` message.
+    /// Closed unions' error message.
     closed: Option<String>,
 }
 
 struct Str {
     konst: Option<Box<str>>,
-    /// Accepted values and their `(a|b)` rendering.
     enumeration: Option<(Vec<Box<str>>, String)>,
     max_len: Option<u64>,
     min_len: Option<u64>,
@@ -470,7 +400,7 @@ enum Format {
 }
 
 struct Int {
-    /// The const as an integer (None never matches) and its JSON rendering.
+    /// None never matches.
     konst: Option<(Option<i64>, String)>,
     enumeration: Option<(Vec<i64>, String)>,
     min: Option<i64>,
@@ -478,7 +408,6 @@ struct Int {
 }
 
 struct Blob {
-    /// Accepted MIME patterns and the JSON rendering of `accept`.
     accept: Option<(Vec<Box<str>>, String)>,
     max_size: Option<i64>,
 }
@@ -490,7 +419,7 @@ struct Array {
 }
 
 impl Lexicons {
-    /// Compiles `{nsid: document}`; `own` is a resolved document's NSID.
+    /// `own` is a resolved document's NSID.
     fn compile<'d>(docs: impl Iterator<Item = (&'d str, &'d J)> + Clone, own: Option<&str>) -> Self {
         let mut index: HashMap<Box<str>, HashMap<Box<str>, u32>> = HashMap::new();
         let mut order = Vec::new();
@@ -524,7 +453,6 @@ impl Lexicons {
         set
     }
 
-    /// Compiles one resolved lexicon document (its `id` names it).
     pub fn resolved(doc: &J) -> Self {
         let id = doc["id"].as_str().unwrap_or("");
         Lexicons::compile(std::iter::once((id, doc)), Some(id))
@@ -584,7 +512,6 @@ impl Lexicons {
         Method { params, input: payload("input"), output: payload("output") }
     }
 
-    /// Compiles a schema node found in `ctx`'s document.
     fn schema(&self, d: &J, ctx: &str) -> Schema {
         let u64_of = |k: &str| d.get(k).and_then(|m| m.as_u64());
         let t = d["type"].as_str().unwrap_or("");
@@ -691,15 +618,8 @@ impl Lexicons {
     }
 }
 
-// ---------------------------------------------------------------------------
-// interpreter
-// ---------------------------------------------------------------------------
-
-/// A data-model value the interpreter can check: DAG-CBOR records
-/// ([`Value`]) and JSON bodies ([`J`], [`JsonValue`]: `$link` / `$bytes`
-/// objects are CIDs and bytes, as the reference's `jsonToLex`). Record
-/// writes validate the parsed [`JsonValue`] once it has been encoded
-/// ([`JsonValue::encode_record`] leaves it equal to the record).
+/// A data-model value the interpreter can check. In JSON, `$link` /
+/// `$bytes` objects are CIDs and bytes, as the reference's `jsonToLex`.
 pub trait Node: Sized {
     fn kind(&self) -> Kind<'_, Self>;
     fn get(&self, key: &str) -> Option<&Self>;
@@ -711,7 +631,7 @@ pub enum Kind<'a, N> {
     Int(i64),
     Float,
     Text(&'a str),
-    /// Byte length.
+    /// Length.
     Bytes(usize),
     Link,
     Array(&'a [N]),
@@ -791,12 +711,11 @@ fn text<N: Node>(v: Option<&N>) -> Option<&str> {
     }
 }
 
-/// Most schema indirections (refs, union members) followed at once: a
-/// resolved (untrusted) lexicon may reference itself in a cycle.
+/// Most refs followed at once: an untrusted resolved lexicon may reference
+/// itself in a cycle.
 const MAX_DEPTH: u32 = 128;
 
-/// A step of the path in error messages (`Input/writes/0/collection`),
-/// formatted only when there is an error.
+/// Formatted only when there is an error.
 enum Seg<'a> {
     Key(&'a str),
     Index(usize),
@@ -805,7 +724,7 @@ enum Seg<'a> {
 struct Validator<'a> {
     root: &'a str,
     path: Vec<Seg<'a>>,
-    /// A resolved lexicon, for bundle refs to defs the bundle lacks.
+    /// For bundle refs to defs the bundle lacks.
     doc: Option<&'a Lexicons>,
     depth: u32,
 }
@@ -815,7 +734,6 @@ impl<'a> Validator<'a> {
         Validator { root, path: Vec::new(), doc, depth: 0 }
     }
 
-    /// The set and def a ref in `set` points to.
     fn resolve(&self, set: &'a Lexicons, t: &'a Target) -> Option<(&'a Lexicons, &'a Schema)> {
         match t {
             Target::Local(i) => Some((set, &set.defs[*i as usize])),
@@ -850,10 +768,8 @@ impl<'a> Validator<'a> {
         r
     }
 
-    /// Checks `v` against what `t` points to, one indirection deeper.
     fn follow<N: Node>(&mut self, set: &'a Lexicons, t: &'a Target, v: &N) -> Result<(), String> {
         let Some((set, target)) = self.resolve(set, t) else {
-            // a schema we don't have: can't validate further
             return Ok(());
         };
         if self.depth >= MAX_DEPTH {
@@ -943,7 +859,6 @@ impl<'a> Validator<'a> {
                 Kind::Null => Ok(()),
                 _ => Err(self.err("must be null")),
             },
-            // token / params / anything else: nothing to check here
             Schema::Any => Ok(()),
         }
     }
@@ -1027,7 +942,6 @@ impl<'a> Validator<'a> {
             }
         }
         if let Some(f) = d.format {
-            // (valid, @atproto/lexicon message)
             let (ok, msg) = match f {
                 Format::Datetime => (valid_datetime(s), "must be an valid atproto datetime (both RFC-3339 and ISO-8601)"),
                 Format::Uri => (valid_uri(s), "must be a uri"),
@@ -1085,7 +999,7 @@ impl<'a> Validator<'a> {
     }
 }
 
-/// Enum values / refs joined like JS `Array.join` (strings unquoted).
+/// Like JS `Array.join` (strings unquoted).
 fn join(items: &[J], sep: &str) -> String {
     items
         .iter()
@@ -1093,10 +1007,6 @@ fn join(items: &[J], sep: &str) -> String {
         .collect::<Vec<_>>()
         .join(sep)
 }
-
-// ---------------------------------------------------------------------------
-// string formats (@atproto/syntax)
-// ---------------------------------------------------------------------------
 
 fn digits(s: &str) -> Option<u32> {
     (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok())?
