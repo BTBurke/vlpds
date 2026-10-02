@@ -2567,3 +2567,277 @@ worker, and re-signing the remainder would drop data silently, unlike the
 reference, which trusts its records table. The sequencer-recovery scripts
 have no counterpart (no single sequencer DB; see "Backups and restore").
 `pdsadmin update` is a deploy concern.
+
+## Rolling upgrades and format versioning (design)
+
+**Today:** formats change outright (`VLSEG05` replaced `VLSEG04`; VLSEG06
+widens shard ids), nothing is migrated, and mixed versions in one cluster
+are unsupported (ops/RUNBOOK.md "VlpdsMixedVersions" says so). The rolling
+deploy in the runbook is safe only because consecutive builds happen to
+agree on every format. Before the first production data an SRE needs a
+contract: deploy one node at a time, roll back a bad build, and never be
+able to strand data in a format a running node can't read.
+
+### Inventory: what is persisted or on the wire, and how it's versioned
+
+| Format | Where | Version marker | Unknown-version behavior |
+|---|---|---|---|
+| Log segment | `log/{log_id}/{ord:012}.seg`, `src/segment.rs` | magic `VLSEG05\n` (06 next) is the whole version; `codec` byte (0 none, 1 zstd) | `parse_header`: "bad segment magic"; `decode`: "unknown codec". Replay: shard can't open; apply: fail-stop 4; follower: retry loop |
+| Fence | same path, `VLFENCE\n` + node id | magic | n/a (stable) |
+| Entry muts | inside segments | none: raw SlateDB key/value bytes, plus muts *derived* by the reader from `#commit` frames (`derive_commit_muts`, top bit of `mut_count`) | an old reader writes new-format bytes blindly into state |
+| Head `h/` | `state.rs` `Head::encode` | none (fixed binary: cid ‖ cid ‖ rev ‖ block) | `decode` "short head" or garbage |
+| Record `R/` | `state::record_value` | none (cid ‖ rev ‖ bytes) | garbage |
+| Index `c/ C/ b/ n/` | `state.rs` | key layout only, empty/plain values | key not found |
+| MST nodes `M/` | `state.rs`, `mst_lazy.rs` | dag-cbor, content-addressed | stable by construction |
+| Account `a/` | `state::Account` JSON | none; tolerant (`#[serde(default)]`, `#[serde(flatten)] extra` keeps unknown fields) | round-trips unknown fields |
+| Private `p/` rows | sessions, app passwords, tokens, TOTP (`totp.rs`), OAuth (`oauth/store.rs`), `sec/` revocations/takedowns (`xrpc/server.rs`) | none; mostly JSON | per type; mostly serde-default |
+| Shard meta | `meta/applied2` (`nodelog::encode_marker`), `meta/recent` | key-name suffix (`applied2`): the only precedent | `decode_marker` → `None` = "no marker" (silently replays everything) |
+| SlateDB SSTs + manifest | `state/{id}/` | slatedb's own (pinned fork rev, `Cargo.toml`); SST compression from flags | slatedb error at open |
+| Node lease | `nodes/{id}`, `cluster::NodeLease` | none; serde ignores unknown fields, but new fields lack `default` | missing field = parse error |
+| Assignment | `assign/{s:03}`, `cluster::Assignment` | none; CAS read-modify-write by *every* node | an old node's CAS **drops** fields it doesn't know |
+| Layout | `assign/layout`, `slots::Layout` | `version` = routing generation, not format | as Assignment |
+| Writer claim | `writers/{w:03}` | none | n/a |
+| Retention report | `retain/{log_id}`, `retention::Report` | none | parse error |
+| Global claims | `handle/{h}`, `email/{sha256}` | none (existence + small body) | n/a |
+| Blobs | `blob/{did}/{cid}`, `blob-gc/`, `blob-tmp/` | content-addressed | n/a |
+| Rate-limit config | `config/ratelimits.json`, `ratelimit/config.rs` `Doc` | `version` = CAS revision; `deny_unknown_fields` | rejected, last good config kept (nodes diverge) |
+| Wrapped secrets | `vw1.{kid}.{b64}` in rows/files (`secrets.rs` `WRAP_VERSION`), AAD `vlpds-secret-v1\0…` | yes, explicit | `Malformed` |
+| PLC | rotation key file (`vw1`), DID ops are did-method-plc bytes (`plc/mod.rs`) | external spec | n/a |
+| Exit-state file | local, `lifecycle::ExitRecord` | none (local only) | ignored |
+| Firehose frames | stored verbatim in segments, served by every node | atproto lexicon (external) | clients' problem; must not flip-flop |
+| Log follower ws | `/internal/v1/log/stream`, `remote.rs` | message type byte (0 batch, 1 watermark) | `bail!("unknown message type")` → reconnect loop |
+| Peer JSON RPC | `/internal/v1/{cluster,cluster/nudge,cluster/hello,private/*,account,oauth/replay,admin/*,sync/*}` (`xrpc/internal.rs`) | path `v1`; serde ignores unknown fields | unknown route = 404 |
+| Forwarded XRPC | `forward.rs`, `x-vlpds-forwarded` | none; error names (`RepoLoading`, `ShardMoved`, `PartitionUnavailable`) are protocol | unknown method on an old owner = 501 |
+| Client-held tokens | session JWTs (`auth::Claims`), OAuth tokens/DPoP (`oauth/`) | none | rejected after rollback = forced logout |
+
+Two properties make vlpds stricter than a typical database: **state is a
+pure function of the log** (segments carry raw state bytes, and a reader
+derives more), so a state encoding change is also a segment change; and
+**control objects are read-modify-CAS'd by whichever node acts**, so an
+old node silently rewrites a new node's objects.
+
+### Compatibility contract
+
+- **Feature level.** A single integer, cluster-wide, in a CAS'd object
+  `cluster/version`: `{active: L, target: L'?, history: [{level, at,
+  by}]}`. Each persisted/wire format change gets the next level (a level
+  may bundle several changes from one release). A build declares
+  `MIN_LEVEL..=MAX_LEVEL`: it reads and writes everything at `MAX_LEVEL`
+  and below, and it can still run a cluster whose active level is
+  `MIN_LEVEL`. Levels are in a table in `src/version.rs`, each with a
+  name, a description and `persistent: bool` (does it put new bytes in
+  the bucket, or only gate wire behavior).
+- **Readers accept every level in their window; writers emit `active`.**
+  Every writer of every format above asks `version::active()` (segment
+  sequencer: once per segment, so a segment is homogeneous; derived muts
+  are derived at the *segment's* level, not the binary's; control-object
+  writers; private-row writers; frame builders; token minting; peer RPC
+  senders). A build at `MAX_LEVEL = L+1` running at `active = L` emits
+  byte-for-byte what a level-L build emits. That is the rollback window.
+- **Raising the level is the point of no return** (Kafka's
+  `inter.broker.protocol.version`, CockroachDB's `cluster.preserve_downgrade_option`
+  + finalize). It is manual (`vlpds admin cluster finalize`), never
+  automatic at startup. Before it, rollback = redeploy the old build;
+  after it, rollback = forward-fix. A non-`persistent` level may be
+  lowered again (`cluster lower`); a persistent one never.
+- **Upgrade one release window at a time.** A new build may start only if
+  `active >= its MIN_LEVEL` and `active <= its MAX_LEVEL`. Skipping
+  releases is fine whenever that holds; a build only raises `MIN_LEVEL`
+  (drops read support for level L) once data at L can no longer exist
+  (see "Migrations").
+- **Control objects: tolerant both ways.** Every new field is
+  `#[serde(default)]` (new build reads old objects); every struct that
+  more than one node CASes (`Assignment`, `Layout`, `Report`) gets
+  `#[serde(flatten)] extra: Map` like `Account`, so an old node's
+  read-modify-CAS keeps fields it doesn't know. Semantic fields (an old
+  node *must* honor them) are still level-gated: preserving bytes isn't
+  understanding them. `deny_unknown_fields` stays only on operator input
+  (the rate-limit save endpoint), and the save endpoint rejects fields
+  whose level isn't active, so the runtime loader never meets them.
+- **Peer protocols: additive or capability-gated.** Paths stay `/v1`; a
+  new endpoint or message is used only once the peer's lease advertises a
+  `max_level` that has it (or `active` does), and a 404 from a peer reads
+  as "unsupported", not "unreachable" (admin scatter-gather today counts
+  it as unreachable). The follower stream skips unknown message types
+  instead of bailing (fix now, while every reader can be upgraded at
+  once). New public XRPC methods may 501 when forwarded to an old owner
+  during a deploy; the frontend reports it as `MethodNotImplemented`
+  rather than resending.
+- **SlateDB is a format.** A slatedb rev bump, and any flag that changes
+  stored bytes (`--log-compression` codec, SST compression), is a level:
+  a golden DB written by the old rev must open and compact under the new
+  one, and the new one's output must open under the old one until the
+  level is raised.
+
+### Advertising, refusing, showing
+
+- **Lease.** `NodeLease` gains `rev` (git rev, as in `vlpds_build_info`),
+  `min_level`, `max_level`, and `seen_level` (the active level it last
+  read). Leases are already read by every peer each step, so every node
+  knows the whole cluster's window without a new RPC.
+- **Startup gate** (before claiming `writers/`, following logs or taking
+  shards): read `cluster/version` (absent = create at `MAX_LEVEL` for a
+  fresh prefix, else `1` on legacy prefixes); refuse unless
+  `MIN_LEVEL <= active` and `active`/`target` `<= MAX_LEVEL`. **After**
+  writing its lease, re-read `cluster/version` and apply the same check.
+  Refusal = new fail-stop **exit 7 `incompatible_level`** (lease deleted,
+  nothing read), so a supervisor loop on an old image is loud, not harmful.
+- **Raise protocol** (`vlpds.admin.setFeatureLevel {level}`, CLI `cluster
+  finalize`): (1) CAS `target = L'` onto `cluster/version`; (2) list
+  `nodes/*` *after* that write and require every live lease to have
+  `max_level >= L'`, else clear `target` and fail with the offending
+  nodes; (3) CAS `active = L'`, clear `target`. A node that read the old
+  level and wrote its lease after step 2's listing re-reads the object
+  after its lease write and sees `target` or the new `active` (store
+  writes are linearizable, same argument as "Why safety needs no
+  clocks"), so it exits 7 before reading any data. A dead node's stale
+  lease is ignored by liveness as today; if it restarts on the old image
+  it refuses.
+- **Observation.** Every cluster step (and every nudge) re-reads
+  `cluster/version` with the lease renewal's cadence (TTL/5); a node
+  seeing `active > MAX_LEVEL` fail-stops 7 (can only happen if an
+  operator forced it). Writers switch levels at their next segment; mixed
+  emission across nodes during the switch is fine because every reader
+  already accepts both.
+- **Hello.** `HelloIn`/response gain `{rev, min_level, max_level}` so a
+  joiner logs a mismatch immediately (informational; the lease is
+  authoritative).
+- **Console / admin.** `getClusterStatus` (`xrpc/admin.rs`, UI
+  `ui/src/pages/admin/Cluster.tsx`) shows each node's `rev` and level
+  window, the active level and any pending `target`, and a banner: "mixed
+  builds", "all nodes can run level L+1: finalize available", "finalized
+  at …: rollback no longer possible".
+- **Metrics / alerts** (ops/alerts.yml): `vlpds_feature_level{kind=
+  "active"|"binary_min"|"binary_max"}`; `vlpds_format_errors_total{format}`
+  (any decode that fails on an unknown magic/codec/message/value tag);
+  keep `VlpdsMixedVersions` (1 h); add `VlpdsFormatErrors` (page: any
+  increase), `VlpdsIncompatibleNode` (exit 7 in `vlpds_last_exit_reason_info`),
+  and `VlpdsFeatureLevelUnfinalized` (all nodes `binary_max > active` for
+  14 d: ticket, so the window doesn't stay open forever and block the
+  next `MIN_LEVEL` drop).
+
+### Procedures
+
+**Upgrade (build B, `MAX_LEVEL = L+1`, cluster `active = L`).**
+1. Pre-flight: `vlpds admin cluster-status` shows every node healthy and
+   `active = L`; B's release notes list its levels and whether they are
+   persistent. B's `MIN_LEVEL <= L`.
+2. Rolling deploy exactly as ops/RUNBOOK.md "Rolling deploy" (SIGTERM,
+   ≥ 60 s stop timeout, same `--node-id`, verify step 4 between nodes),
+   plus: the restarted node's lease shows `max_level = L+1` and
+   `vlpds_format_errors_total` is flat.
+3. Soak with the whole fleet on B at level L (default 24 h). Everything B
+   writes is level L: **rollback is a plain redeploy** of the previous
+   build, in any order, any time.
+4. Finalize: `vlpds admin cluster finalize --level L+1`. Watch format
+   errors, commit p99, firehose watermark lag for one TTL; from now on
+   rollback is forward-fix only.
+
+**Rollback before finalize.** Redeploy the previous image node by node
+with the same procedure. Nothing to clean: no level-(L+1) byte exists.
+
+**Rollback after finalize.** Not possible by redeploy (old builds exit 7).
+Ship B' = B + fix. For an emergency where the bug is in the new
+level's *writer*: a non-persistent level can be lowered; a persistent one
+is a restore question ("Backups and restore": a backup records the
+active level and is restored only by a build whose window contains it).
+
+### Migrations where formats change in place
+
+- **Segments: never migrate, roll over.** Readers accept old and new
+  magics; writers switch at a segment boundary when the level rises; old
+  segments age out with retention (`retention.rs`: `--log-retention`
+  window plus replay floors). Read support for an old magic is dropped
+  (`MIN_LEVEL` raised) only when no reachable segment can have it:
+  `retain/{log_id}` gains `min_seg_format` (lowest magic among the log's
+  unpruned segments, known to the writer), and `cluster finalize --min`
+  requires every report and every log named in an assignment span to be
+  past it. Backups keep old segments; a restore build must still read
+  them, so dropping a magic is also gated on backup retention.
+- **State key families: dual-read always, lazy write-through, background
+  sweep only to drop read support.** Binary values gain a leading tag
+  byte where they change: today's `h/` and `R/` values start with a CIDv1
+  (`0x01`, `cid.rs`), so `0x80..=0xFF` are free version tags and an
+  untagged value is "v0" with no ambiguity; JSON values add an optional
+  `"v"` field. A new encoding (level L+1) is written by normal writes
+  once active; the decoder reads both forever, until a sweep. The sweep
+  (when needed) is a per-shard task on the owner that rewrites a family
+  **through the log** as ordinary shard-tagged mutations (so replay,
+  handoff, split/merge and backups see one history; rate-limited, resumable
+  by a cursor in `meta/migrate`), then sets a shard-wide `meta/format`
+  (`{family: version}`) in the same batch as the applied marker. Splits
+  and merges copy `meta/format` into the children explicitly (shard-wide
+  keys stay with the parent today, `partition.rs` test). `MIN_LEVEL` for
+  that family rises once every shard in the layout reports the new
+  format (`getClusterStatus` aggregates it). Renaming a key (the
+  `meta/applied2` precedent) is the fallback for keys whose value can't
+  be tagged; reads then try new, then old.
+- **Derived muts.** A level that changes what `derive_commit_muts`
+  produces records the derivation in the segment format (new magic), so
+  every reader derives the same bytes from the same segment.
+- **Control objects: versioned JSON, tolerant.** Additive fields as above;
+  a breaking change writes a new object name (`assign/layout2`) read with
+  fallback, created at the level raise, old one left for the old window.
+- **Secrets.** Already versioned (`vw1`, AAD `vlpds-secret-v1`); a `vw2`
+  is read alongside `vw1` and `rewrapSecrets` is its sweep.
+- **Tokens.** New claims are optional; a minted token must verify on
+  every build in the window, so token changes are levels like any other.
+
+### Tests and CI
+
+- **Golden fixtures per level**: `testdata/formats/L{n}/` with a segment
+  (both codecs, derived and stored muts), a fence, `h/ R/ a/ p/` rows,
+  `meta/applied2`, every control object, a `retain/` report, the rate-limit
+  doc, a `vw1` blob (fixed test KEK), follower-stream messages, a session
+  JWT, and a tiny SlateDB directory. `tests/all/formats.rs`: (a) the
+  current build decodes every fixture for levels `MIN_LEVEL..=MAX_LEVEL`;
+  (b) writing at each level reproduces that level's fixture byte for byte
+  (`VLPDS_BLESS=1` regenerates only `MAX_LEVEL`). A CI script fails any
+  change to a released level's fixtures (hash manifest
+  `testdata/formats/MANIFEST`), and a change to a format writer without a
+  new level fails (b).
+- **Level-gating test** (in-process, cheap): an `HaCluster` at
+  `active = MAX_LEVEL - 1` runs the full write/handoff/split suite and
+  asserts every object it wrote matches the previous level's fixture
+  encodings (no new-level bytes before finalize).
+- **Two-build tests** (`bench/ha/hactl.py`, new scenarios; build the
+  previous release tag into `target/prev/` once per CI run):
+  `rolling-upgrade` (3 old nodes under loadgen + firehose audit, upgrade
+  one by one, finalize; zero lost acks, identical merged firehose on
+  every node), `rolling-rollback` (upgrade 2 of 3, roll both back),
+  `old-node-refused` (after finalize, an old image exits 7 without
+  touching data), and `raise-race` (start an old node concurrently with
+  finalize; either the raise aborts or the node exits 7).
+- **Release checklist**: the release's level table, fixtures, and the
+  previous tag's `rolling-upgrade` run green.
+
+### Implementation plan
+
+**Before the first production data (≈ 9–10 days):**
+1. **Baseline (0.5 d).** Land the pending breaking changes (VLSEG06 shard
+   ids, anything else queued) the old way, then declare **level 1** = the
+   formats in production on day one, and record its fixtures.
+2. **`src/version.rs` + control object (2 d).** Level table,
+   `cluster/version` CAS, lease fields, startup + post-lease checks, exit
+   7, per-step observation, `version::active()` plumbed to the writers
+   that exist today (segment sequencer, control objects).
+3. **Tolerance fixes (1 d).** `parse_header`/`decode` dispatch on a set of
+   magics; follower stream skips unknown message types; `#[serde(default)]`
+   on lease/assignment/layout/report fields and `flatten extra` on the
+   multi-writer ones; scatter-gather 404 = unsupported; `decode_marker`
+   failure becomes an error, not "no marker".
+4. **Admin + console + alerts (1.5 d).** `setFeatureLevel` / `cluster
+   finalize`, status fields, Cluster page banner and columns, metrics,
+   the three alerts, runbook "Upgrade / finalize / rollback" replacing the
+   "(unverified)" note under VlpdsMixedVersions.
+5. **Golden fixtures + CI guard (1.5 d).**
+6. **Two-build HA scenarios (2 d)** on hactl, plus the level-gating test.
+
+**Later, when first needed:**
+7. Per-shard `meta/format` + through-the-log sweep framework, tagged value
+   decoding (3 d; the first state encoding change after launch).
+8. `min_seg_format` in `retain/` and the `--min` finalize check (1 d;
+   the first time an old segment magic is dropped).
+9. Peer capability gating helper for new internal endpoints/messages
+   (0.5 d), token-format levels (as needed), and an optional
+   auto-finalize after a configured soak (0.5 d).
