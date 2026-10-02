@@ -489,7 +489,7 @@ pub fn has_inherited(m: &VersionedManifest) -> bool {
 /// every source). A suffix of the tree is always a valid compaction: it
 /// keeps recency order, and the output is the bottom run (where tombstones
 /// are dropped). None: nothing to do.
-pub fn rewrite_spec(m: &VersionedManifest, full: bool) -> Option<CompactionSpec> {
+fn rewrite_spec(m: &VersionedManifest, full: bool) -> Option<CompactionSpec> {
     let inherited: Vec<_> = m.external_dbs().iter().flat_map(|e| e.sst_ids.iter()).collect();
     // logical order: L0 newest -> oldest, then sorted runs highest id -> 0
     let mut sources: Vec<(SourceId, bool)> = m.l0().iter().map(|v| (SourceId::SstView(v.id), inherited.contains(&&v.sst.id))).collect();

@@ -95,12 +95,6 @@ pub struct Window {
     pub max: u32,
 }
 
-impl Default for Window {
-    fn default() -> Self {
-        Window::BUILD
-    }
-}
-
 impl Window {
     pub const BUILD: Window = Window { min: MIN_LEVEL, max: MAX_LEVEL };
 

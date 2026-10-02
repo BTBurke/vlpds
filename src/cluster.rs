@@ -414,7 +414,7 @@ impl Cluster {
 
     /// Tests run `before_lease` (a race) between the first level check and
     /// the lease write.
-    pub(crate) async fn join_inner(
+    async fn join_inner(
         cfg: ClusterConfig,
         store: Store,
         before_lease: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
@@ -1237,7 +1237,7 @@ impl Cluster {
     }
 
     /// One that fails to open is released (nothing was logged for it).
-    pub(crate) async fn open_acquired(&self, host: &Arc<dyn ShardHost>, shards: Vec<(ShardId, u64, Vec<Span>)>) -> anyhow::Result<()> {
+    async fn open_acquired(&self, host: &Arc<dyn ShardHost>, shards: Vec<(ShardId, u64, Vec<Span>)>) -> anyhow::Result<()> {
         {
             let mut opened = self.opened.write();
             let (mut at, now) = (self.opened_at.write(), Instant::now());
