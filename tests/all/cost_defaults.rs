@@ -131,7 +131,7 @@ async fn own_writes_visible_with_slow_manifest_poll() {
 async fn markers(s: &TestServer) -> Vec<(vlpds::slots::ShardId, Option<(String, u64)>)> {
     let mut v = Vec::new();
     for p in s.app.partitions.owned() {
-        v.push((p.id, p.db.get(vlpds::nodelog::META_APPLIED).await.unwrap().and_then(|b| vlpds::nodelog::decode_marker(&b))));
+        v.push((p.id, p.db.get(vlpds::nodelog::META_APPLIED).await.unwrap().map(|b| vlpds::nodelog::decode_marker(&b).unwrap())));
     }
     v
 }

@@ -99,11 +99,13 @@ vlpds test, an N/A reason, a documented divergence or a gap.
 | email_2fa | 6 | 0 | 0 |
 | email_flows | 6 | 0 | 0 |
 | fast_failover | 3 | 0 | 0 |
+| feature_levels | 2 | 0 | 0 |
 | file_uploads | 11 | 0 | 0 |
 | firehose_backfill | 2 | 0 | 0 |
 | firehose_fanout | 2 | 0 | 0 |
 | firehose_shards | 3 | 0 | 0 |
 | firehose_startup | 3 | 0 | 0 |
+| formats | 3 | 0 | 0 |
 | get_blocks_index | 1 | 0 | 0 |
 | go_checker | 2 | 0 | 0 |
 | ha_auth | 2 | 0 | 0 |

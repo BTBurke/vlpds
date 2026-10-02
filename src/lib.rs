@@ -44,5 +44,6 @@ pub mod stats;
 pub mod store;
 pub mod tid;
 pub mod totp;
+pub mod version;
 pub mod worker;
 pub mod xrpc;

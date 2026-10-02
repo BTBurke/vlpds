@@ -4,6 +4,7 @@
 mod admin;
 mod admin_tools;
 mod email2fa;
+mod feature_level;
 pub mod extract;
 pub mod internal;
 pub mod authn;
@@ -267,6 +268,7 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(internal::routes())
         .merge(crate::profiling::routes())
         .merge(ratelimits::routes())
+        .merge(feature_level::routes())
         .merge(webui::routes());
     ratelimits::start(&app);
     // DPoP-Nonce / WWW-Authenticate on DPoP-authenticated requests

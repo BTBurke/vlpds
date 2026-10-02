@@ -668,17 +668,20 @@ async fn search_accounts(
     if let Some(c) = cursor {
         res["cursor"] = json!(c);
     }
-    partial_fields(&app, &mut res, g.unreachable, &covered, from);
+    partial_fields(&app, &mut res, g.unreachable, g.unsupported, &covered, from);
     Ok(Json(res))
 }
 
 /// Marks a scatter-gather result incomplete: `unreachableNodes` (peers that
-/// timed out or failed) and `missingShards` (shards holding slots >= `from`
-/// that no answering node owned, e.g. mid-move). Absent when complete.
+/// timed out or failed), `unsupportedNodes` (peers whose build lacks the
+/// endpoint: 404 during a rolling deploy) and `missingShards` (shards
+/// holding slots >= `from` that no answering node owned, e.g. mid-move).
+/// Absent when complete.
 fn partial_fields(
     app: &App,
     res: &mut J,
     unreachable: Vec<String>,
+    unsupported: Vec<String>,
     covered: &std::collections::HashSet<crate::slots::ShardId>,
     from: u32,
 ) {
@@ -686,6 +689,9 @@ fn partial_fields(
         app.partitions.layout().shards.iter().filter(|r| r.hi > from && !covered.contains(&r.id)).map(|r| r.id).collect();
     if !unreachable.is_empty() {
         res["unreachableNodes"] = json!(unreachable);
+    }
+    if !unsupported.is_empty() {
+        res["unsupportedNodes"] = json!(unsupported);
     }
     if !missing.is_empty() {
         res["missingShards"] = json!(missing);
@@ -1227,7 +1233,7 @@ async fn get_invite_codes(
     if more {
         out["cursor"] = json!(all.last().map(|(k, _)| k.cursor()));
     }
-    partial_fields(&app, &mut out, g.unreachable, &covered, 0);
+    partial_fields(&app, &mut out, g.unreachable, g.unsupported, &covered, 0);
     Ok(Json(out))
 }
 

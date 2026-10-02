@@ -388,7 +388,7 @@ impl ShardHost for Node {
 
     async fn greet(&self, peers: Vec<crate::cluster::NodeLease>) -> Vec<Option<i64>> {
         let addrs = peers.into_iter().map(|l| l.addr).collect();
-        crate::xrpc::internal::hello_peers(&self.http, &self.internal_token, &self.cluster.cfg.node_id, addrs).await
+        crate::xrpc::internal::hello_peers(&self.http, &self.internal_token, &self.cluster.cfg.node_id, self.cluster.cfg.levels, addrs).await
     }
 
     fn leaving(&self) {

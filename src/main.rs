@@ -623,7 +623,7 @@ fn main() -> anyhow::Result<()> {
         (f, _) => Some(std::path::PathBuf::from(f)),
     };
     vlpds::lifecycle::init(exit_state);
-    let rev = vlpds::profiling::git_rev();
+    let rev = vlpds::version::build_rev().to_string();
     vlpds::metrics::BUILD_INFO
         .with_label_values(&[node_id.as_str(), rev.as_str(), if vlpds::profiling::ENABLED { "1" } else { "0" }])
         .set(1);
@@ -823,6 +823,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             renew_every: Duration::from_millis(args.lease_ttl_ms / 5),
             skew: Duration::from_millis(args.lease_ttl_ms / 5),
             clock_offset_ms: 0,
+            levels: vlpds::version::Window::BUILD,
         }),
         memory_store: None,
         metrics_listen: args.metrics_listen.clone(),

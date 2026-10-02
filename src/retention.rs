@@ -58,6 +58,7 @@ impl Default for Config {
 
 /// `retain/{log_id}`, written by that log's owner.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct Report {
     /// shard -> highest epoch the log's owner opened it at
     pub opened: BTreeMap<ShardId, u64>,
@@ -588,7 +589,7 @@ mod tests {
         assert_eq!(log.sinks.replay_floor(), 4, "capped at the last durable segment");
         log.durable_ordinal.store(5, std::sync::atomic::Ordering::Release);
         log.checkpoint_all().await;
-        assert_eq!(nodelog::decode_marker(&db.get(nodelog::META_APPLIED).await.unwrap().unwrap()), Some(("L".into(), 5)));
+        assert_eq!(nodelog::decode_marker(&db.get(nodelog::META_APPLIED).await.unwrap().unwrap()).unwrap(), ("L".into(), 5));
         assert_eq!(log.sinks.replay_floor(), 5);
     }
 

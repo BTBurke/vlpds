@@ -19,8 +19,13 @@
 //! Everything is optional: `{}` is the defaults. `version`, `updatedAt`,
 //! `updatedBy`, `note` and `history` are written by the server on save
 //! (whatever a client sends for them is replaced). Unknown fields are
-//! rejected, so a typo never silently does nothing; a node that finds an
-//! object it cannot accept keeps its last good policy (see `runtime`).
+//! rejected on save ([`parse`], the admin endpoint), so a typo never
+//! silently does nothing. The stored object is read with [`parse_stored`],
+//! which drops fields this build doesn't know (a newer feature level's,
+//! DESIGN.md "Rolling upgrades": the save endpoint of that build accepts
+//! them only once its level is active) instead of rejecting the whole
+//! object; a node that finds an object it cannot accept otherwise keeps its
+//! last good policy (see `runtime`).
 
 use super::{Action, Cidr, KeyKind, Ov, Policy, Spec, BUILTIN};
 use serde::{Deserialize, Serialize};
@@ -294,8 +299,50 @@ pub fn compile(doc: Option<&Doc>) -> Result<Policy, Vec<String>> {
 }
 
 /// Parses an object's bytes (any JSON or schema error as one message).
+/// Strict: unknown fields are errors (operator input).
 pub fn parse(bytes: &[u8]) -> Result<Doc, String> {
     serde_json::from_slice(bytes).map_err(|e| format!("invalid config JSON: {e}"))
+}
+
+/// Fields each level of the document knows (this build's).
+const DOC_FIELDS: &[&str] = &["version", "enabled", "limiters", "routes", "overrides", "updatedAt", "updatedBy", "note", "history"];
+const LIMITER_FIELDS: &[&str] = &["enabled", "points", "windowSecs"];
+const ROUTE_FIELDS: &[&str] = &["nsid", "points", "windowSecs", "enabled"];
+const OVERRIDE_FIELDS: &[&str] = &["ip", "did", "limiters", "exempt", "points", "note"];
+
+/// Parses the stored object, dropping fields this build doesn't know
+/// (returned as paths, e.g. `routes[0].burst`) instead of rejecting it:
+/// they were written by a build of a newer feature level. Everything else
+/// is as strict as [`parse`].
+pub fn parse_stored(bytes: &[u8]) -> Result<(Doc, Vec<String>), String> {
+    let mut v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| format!("invalid config JSON: {e}"))?;
+    let mut dropped = Vec::new();
+    fn strip(v: &mut serde_json::Value, known: &[&str], at: &str, dropped: &mut Vec<String>) {
+        if let Some(m) = v.as_object_mut() {
+            m.retain(|k, _| {
+                let keep = known.contains(&k.as_str());
+                if !keep {
+                    dropped.push(if at.is_empty() { k.clone() } else { format!("{at}.{k}") });
+                }
+                keep
+            });
+        }
+    }
+    strip(&mut v, DOC_FIELDS, "", &mut dropped);
+    if let Some(m) = v.get_mut("limiters").and_then(|l| l.as_object_mut()) {
+        for (name, l) in m.iter_mut() {
+            strip(l, LIMITER_FIELDS, &format!("limiters.{name}"), &mut dropped);
+        }
+    }
+    for (key, known) in [("routes", ROUTE_FIELDS), ("overrides", OVERRIDE_FIELDS)] {
+        if let Some(a) = v.get_mut(key).and_then(|l| l.as_array_mut()) {
+            for (i, item) in a.iter_mut().enumerate() {
+                strip(item, known, &format!("{key}[{i}]"), &mut dropped);
+            }
+        }
+    }
+    let doc = serde_json::from_value(v).map_err(|e| format!("invalid config JSON: {e}"))?;
+    Ok((doc, dropped))
 }
 
 fn ov_label(o: &OverrideCfg) -> String {
@@ -479,6 +526,15 @@ mod tests {
     fn unknown_fields_and_bad_json_are_rejected() {
         assert!(parse(br#"{"limiters": {"global-ip": {"point": 5}}}"#).is_err());
         assert!(parse(br#"{"bogus": 1}"#).is_err());
+        // the stored object: a newer level's fields are dropped, not fatal
+        let (d, dropped) = parse_stored(
+            br#"{"version": 3, "burst": 1, "limiters": {"global-ip": {"points": 5, "jitter": 2}}, "routes": [{"nsid": "a.b.c", "points": 1, "windowSecs": 2, "cost": 9}], "overrides": [{"ip": "10.0.0.1", "exempt": true, "until": "x"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(dropped, ["burst", "limiters.global-ip.jitter", "routes[0].cost", "overrides[0].until"]);
+        assert_eq!((d.version, d.limiters["global-ip"].points, d.routes[0].points, d.overrides[0].exempt), (3, Some(5), 1, true));
+        assert!(parse_stored(br#"{"routes": [{"nsid": "a.b.c"}]}"#).is_err(), "a missing field is still an error");
+        assert!(parse_stored(b"nope").is_err());
         assert!(parse(b"not json").is_err());
         assert!(parse(br#"{"limiters": {"global-ip": {"points": -1}}}"#).is_err());
         assert!(!parse(br#"{"enabled": false}"#).unwrap().enabled);

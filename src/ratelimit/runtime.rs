@@ -10,8 +10,10 @@
 //!   version + 1 with CAS on the ETag (or create-if-absent), so concurrent
 //!   admins on different nodes can't overwrite each other. The writer
 //!   installs the new policy before answering and then nudges its peers.
-//! - **Invalid objects** (bad JSON, unknown fields, failed validation, e.g.
-//!   written by hand or by a newer vlpds) never take a node down: it keeps
+//! - **Unknown fields** (a newer vlpds's, `config::parse_stored`) are
+//!   dropped with a warning; the rest of the object applies.
+//! - **Invalid objects** (bad JSON, failed validation, e.g. written by
+//!   hand) never take a node down: it keeps
 //!   its last good policy and reports the error (`configError` in the admin
 //!   endpoint, `vlpds_rate_limit_config_errors_total`).
 //!
@@ -209,7 +211,12 @@ pub async fn refresh(limiter: &Limiter, store: &Store) -> anyhow::Result<bool> {
         label("applied");
         return Ok(true);
     };
-    match config::parse(&bytes) {
+    match config::parse_stored(&bytes).map(|(doc, dropped)| {
+        if !dropped.is_empty() {
+            tracing::warn!(?dropped, "rate-limit config has fields this build doesn't know (a newer feature level's): ignored");
+        }
+        doc
+    }) {
         Err(msg) => {
             let version = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v["version"].as_u64());
             tracing::warn!(?version, "rate-limit config object rejected (keeping the last good config): {msg}");
@@ -272,7 +279,7 @@ pub async fn save(limiter: &Limiter, store: &Store, req: SaveReq) -> Result<Doc,
             // any) is what the caller must have seen
             let raw: Option<serde_json::Value> = serde_json::from_slice(b).ok();
             let v = raw.as_ref().and_then(|v| v["version"].as_u64()).unwrap_or(0);
-            (config::parse(b).ok(), v, e.clone())
+            (config::parse_stored(b).ok().map(|(d, _)| d), v, e.clone())
         }
     };
     if cur_version != req.if_version {

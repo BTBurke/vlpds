@@ -4,7 +4,11 @@
 //! binary messages:
 //!   0x00 | ordinal u64 | count u32 | (seq i64 | len u32 | frame)*   durable batch
 //!   0x01 | watermark i64                                            heartbeat
-//! A watermark promises every event with seq <= it has been sent.
+//! A watermark promises every event with seq <= it has been sent. A message
+//! of any other type is skipped (and counted in
+//! `vlpds_format_errors_total{format="log_stream"}`): a newer build sends one
+//! only to peers whose lease advertises a level that has it (DESIGN.md
+//! "Rolling upgrades and format versioning").
 //!
 //! Every node follows every peer's log. A follower owes the merger every
 //! event of the log above its floor (the merger's position when it started,
@@ -48,9 +52,19 @@ pub fn encode_batch(b: &LogBatch) -> Bytes {
     out.into()
 }
 
+/// A watermark heartbeat (message type 1).
+pub fn encode_watermark(w: i64) -> Bytes {
+    let mut m = Vec::with_capacity(9);
+    m.put_u8(1);
+    m.put_i64(w);
+    m.into()
+}
+
 pub enum StreamMsg {
     Batch(LogBatch),
     Watermark(i64),
+    /// A message type this build doesn't know (skipped by followers).
+    Unknown(u8),
 }
 
 pub fn decode(log_id: &Arc<str>, data: Bytes) -> anyhow::Result<StreamMsg> {
@@ -77,7 +91,7 @@ pub fn decode(log_id: &Arc<str>, data: Bytes) -> anyhow::Result<StreamMsg> {
             anyhow::ensure!(r.remaining() >= 8, "short watermark");
             Ok(StreamMsg::Watermark(r.get_i64()))
         }
-        t => anyhow::bail!("unknown message type {t}"),
+        t => Ok(StreamMsg::Unknown(t)),
     }
 }
 
@@ -111,10 +125,7 @@ pub async fn serve_stream(mut ws: WebSocket, log: Arc<NodeLog>) {
                 }
             }
         }
-        let mut m = Vec::with_capacity(9);
-        m.put_u8(1);
-        m.put_i64(w);
-        if ws.send(Message::Binary(m.into())).await.is_err() {
+        if ws.send(Message::Binary(encode_watermark(w))).await.is_err() {
             return;
         }
     }
@@ -283,10 +294,18 @@ async fn stream_live(
             StreamMsg::Watermark(w) => {
                 wm.fetch_max(w, Ordering::AcqRel);
             }
+            StreamMsg::Unknown(t) => skip_unknown(log_id, t),
         }
     }
     let _ = ws.close(None).await;
     Ok(())
+}
+
+/// A log stream message of a type this build doesn't know: skipped (a
+/// reconnect would only meet it again), counted, logged.
+fn skip_unknown(log_id: &str, t: u8) {
+    crate::version::format_error("log_stream");
+    tracing::warn!(%log_id, message_type = t, "skipping a log stream message of an unknown type (a peer of a newer feature level?)");
 }
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -316,6 +335,24 @@ mod tests {
         let mut obj = b.sealed_header("A", ord, prefix_end);
         obj.extend_from_slice(&b.body);
         store.raw.put(&segment_path(store, "A", ord), PutPayload::from(obj)).await.unwrap();
+    }
+
+    /// Messages of an unknown type decode as `Unknown` (followers skip them)
+    /// instead of failing the stream; known ones round-trip.
+    #[test]
+    fn unknown_message_types_are_skipped() {
+        let log_id: Arc<str> = "A".into();
+        let before = crate::metrics::FORMAT_ERRORS.with_label_values(&["log_stream"]).get();
+        assert!(matches!(decode(&log_id, Bytes::from_static(&[7, 1, 2, 3])).unwrap(), StreamMsg::Unknown(7)));
+        skip_unknown("A", 7);
+        assert_eq!(crate::metrics::FORMAT_ERRORS.with_label_values(&["log_stream"]).get(), before + 1);
+        assert!(matches!(decode(&log_id, encode_watermark(42)).unwrap(), StreamMsg::Watermark(42)));
+        let b = LogBatch { log_id: log_id.clone(), ordinal: 9, events: vec![(5, Bytes::from_static(b"f"))] };
+        let StreamMsg::Batch(back) = decode(&log_id, encode_batch(&b)).unwrap() else { panic!() };
+        assert_eq!((back.ordinal, back.events.len(), &back.events[0].1[..]), (9, 1, &b"f"[..]));
+        // malformed known messages and empty ones are still errors
+        assert!(decode(&log_id, Bytes::new()).is_err());
+        assert!(decode(&log_id, Bytes::from_static(&[1, 0])).is_err());
     }
 
     /// Draining a dead log delivers its gap-free prefix up to the fence and

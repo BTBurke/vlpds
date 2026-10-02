@@ -339,6 +339,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
 
     let mut cc = cfg.cluster.clone().unwrap_or_else(|| ClusterConfig { node_id: "single".into(), addr: cfg.public_url.clone(), ..Default::default() });
     cc.shards = n;
+    crate::version::init_metrics();
     let started = std::time::Instant::now();
     let cluster = Cluster::join(cc, state_store.clone()).await?;
     // route by this prefix's layout (it may differ from --shards: splits,

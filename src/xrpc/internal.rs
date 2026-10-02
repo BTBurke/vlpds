@@ -79,6 +79,23 @@ async fn cluster_nudge(State(app): AppState, headers: HeaderMap, axum::Json(inp)
 #[derive(serde::Serialize, Deserialize)]
 struct HelloIn {
     node_id: String,
+    /// The joiner's build and feature levels (informational: its lease is
+    /// authoritative). Absent from a build that predates levels.
+    #[serde(default)]
+    rev: String,
+    #[serde(default)]
+    min_level: Option<u32>,
+    #[serde(default)]
+    max_level: Option<u32>,
+}
+
+/// Logs a peer whose build or level window differs from ours (a rolling
+/// deploy in progress, or a node that missed one).
+fn note_peer_build(peer: &str, rev: &str, min: Option<u32>, max: Option<u32>, ours: crate::version::Window) {
+    let window = (min.unwrap_or(crate::version::legacy_level()), max.unwrap_or(crate::version::legacy_level()));
+    if window != (ours.min, ours.max) || rev != crate::version::build_rev() {
+        tracing::info!(peer, rev, min_level = window.0, max_level = window.1, our_rev = crate::version::build_rev(), our_min = ours.min, our_max = ours.max, "peer runs a different build");
+    }
 }
 
 /// A joiner greets us: learn its lease and follow its log now (see
@@ -89,25 +106,35 @@ async fn cluster_hello(State(app): AppState, headers: HeaderMap, axum::Json(inp)
     let Some(c) = &app.cluster else {
         return Ok(Json(json!({"ok": false})));
     };
+    note_peer_build(&inp.node_id, &inp.rev, inp.min_level, inp.max_level, c.cfg.levels);
     let host: Arc<dyn crate::cluster::ShardHost> = app.node.clone();
     let floor = c.learn_peer(&host, &inp.node_id).await.map_err(XrpcError::from_err)?;
-    Ok(Json(json!({"ok": floor.is_some(), "floor": floor})))
+    Ok(Json(json!({
+        "ok": floor.is_some(), "floor": floor,
+        "rev": crate::version::build_rev(), "minLevel": c.cfg.levels.min, "maxLevel": c.cfg.levels.max,
+    })))
 }
 
 /// Greets each peer (see [`cluster_hello`]): per peer, the floor of its
 /// follower of our log, or None if it didn't confirm.
-pub async fn hello_peers(http: &reqwest::Client, token: &str, node_id: &str, addrs: Vec<String>) -> Vec<Option<i64>> {
+pub async fn hello_peers(http: &reqwest::Client, token: &str, node_id: &str, levels: crate::version::Window, addrs: Vec<String>) -> Vec<Option<i64>> {
     let sends = addrs.into_iter().map(|addr| async move {
+        let hello = HelloIn { node_id: node_id.to_string(), rev: crate::version::build_rev().to_string(), min_level: Some(levels.min), max_level: Some(levels.max) };
         let r = http
             .post(format!("{}/internal/v1/cluster/hello", addr.trim_end_matches('/')))
             .header(HDR, token)
-            .json(&HelloIn { node_id: node_id.to_string() })
+            .json(&hello)
             .timeout(std::time::Duration::from_secs(2))
             .send()
             .await
             .and_then(|r| r.error_for_status());
         match r {
-            Ok(r) => r.json::<J>().await.ok().filter(|v| v["ok"] == json!(true)).and_then(|v| v["floor"].as_i64()),
+            Ok(r) => {
+                let v = r.json::<J>().await.ok()?;
+                let level = |k: &str| v[k].as_u64().map(|l| l as u32);
+                note_peer_build(&addr, v["rev"].as_str().unwrap_or_default(), level("minLevel"), level("maxLevel"), levels);
+                (v["ok"] == json!(true)).then(|| v["floor"].as_i64()).flatten()
+            }
             Err(e) => {
                 tracing::debug!(%addr, "hello failed: {e}");
                 None
@@ -522,6 +549,14 @@ pub struct Gathered {
     pub replies: Vec<PeerReply>,
     /// Node ids of live peers that failed or timed out.
     pub unreachable: Vec<String>,
+    /// Node ids of live peers that answered 404: their build doesn't have
+    /// the endpoint (a rolling deploy), which is not "unreachable".
+    pub unsupported: Vec<String>,
+}
+
+enum LegError {
+    Unsupported,
+    Failed(String),
 }
 
 /// GETs `path?query` on every live peer (not this node) concurrently, each
@@ -543,11 +578,14 @@ pub async fn gather(app: &App, path: &str, query: &[(&str, String)]) -> Gathered
                 .timeout(GATHER_TIMEOUT)
                 .send()
                 .await
-                .map_err(|e| e.to_string())?;
-            if !r.status().is_success() {
-                return Err(format!("{}: {}", r.status(), r.text().await.unwrap_or_default()));
+                .map_err(|e| LegError::Failed(e.to_string()))?;
+            if r.status() == StatusCode::NOT_FOUND {
+                return Err(LegError::Unsupported);
             }
-            r.json::<J>().await.map_err(|e| e.to_string())
+            if !r.status().is_success() {
+                return Err(LegError::Failed(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
+            }
+            r.json::<J>().await.map_err(|e| LegError::Failed(e.to_string()))
         }
         .await;
         (l.node_id, r)
@@ -559,7 +597,11 @@ pub async fn gather(app: &App, path: &str, query: &[(&str, String)]) -> Gathered
                 let owned = serde_json::from_value(body["owned"].clone()).unwrap_or_default();
                 out.replies.push(PeerReply { node, owned, body });
             }
-            Err(e) => {
+            Err(LegError::Unsupported) => {
+                tracing::warn!(peer = %node, path, "admin scatter-gather: peer's build lacks this endpoint (404): its shards are missing from the result");
+                out.unsupported.push(node);
+            }
+            Err(LegError::Failed(e)) => {
                 tracing::warn!(peer = %node, path, "admin scatter-gather: peer unreachable: {e}");
                 out.unreachable.push(node);
             }

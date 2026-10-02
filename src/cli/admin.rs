@@ -2,8 +2,8 @@
 //! (account list/create/delete/takedown/untakedown/reset-password,
 //! create-invite-code, request-crawl) and its packages/pds/src/scripts
 //! (publish-identity, rotate-keys, rebuild-repo), plus the vlpds-only
-//! cluster operations (cluster-status, rotate-plc-keys, rewrap-secrets,
-//! check-repo). Each is admin XRPC against any node (`--url`, Basic
+//! cluster operations (cluster-status, cluster finalize, rotate-plc-keys,
+//! rewrap-secrets, check-repo). Each is admin XRPC against any node (`--url`, Basic
 //! `admin:<token>`); DID-keyed calls are routed to the repo's owner by
 //! the node, per-node maintenance (rotate-plc-keys, rewrap-secrets) is sent
 //! to every node `getClusterStatus` lists. Human output by default,
@@ -104,6 +104,27 @@ pub enum Cmd {
     },
     /// Nodes, leases, shard ownership, firehose position.
     ClusterStatus,
+    /// Cluster-wide operations: status, feature levels.
+    #[command(subcommand)]
+    Cluster(ClusterCmd),
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum ClusterCmd {
+    /// Same as cluster-status.
+    Status,
+    /// Raise the cluster's feature level (vlpds.admin.setFeatureLevel) once
+    /// every node runs a build that supports it. The point of no return:
+    /// builds that can't run the new level can no longer join, so rollback
+    /// is forward-fix only (ops/RUNBOOK.md "Rolling upgrade").
+    Finalize {
+        /// The level (default: the active level + 1).
+        #[arg(long)]
+        level: Option<u32>,
+        /// Don't ask for confirmation.
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -399,12 +420,33 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
             writeln!(out, "After        : {}", if r["after"]["ok"] == json!(true) { "ok".to_string() } else { s(&r["after"]["problems"]) })?;
             Ok(())
         }
-        Cmd::ClusterStatus => {
+        Cmd::ClusterStatus | Cmd::Cluster(ClusterCmd::Status) => {
             let r = c.get("vlpds.admin.getClusterStatus", &[]).await?;
             if opts.json {
                 return pretty(out, &r);
             }
             write_cluster(out, &r)
+        }
+        Cmd::Cluster(ClusterCmd::Finalize { level, yes }) => {
+            let st = c.get("vlpds.admin.getClusterStatus", &[]).await?;
+            let active = st["version"]["active"].as_u64().context("getClusterStatus has no active feature level")? as u32;
+            let level = level.unwrap_or(active + 1);
+            if level > active && !yes {
+                let nodes: Vec<String> = st["nodes"].as_array().into_iter().flatten().map(|n| format!("{} (max {})", s(&n["node"]), s(&n["maxLevel"]))).collect();
+                eprintln!("Active level {active}; nodes: {}", nodes.join(", "));
+                if !confirm(&format!("Raise the cluster to feature level {level}? Builds that can't run it will no longer start (no rollback by redeploy)"))? {
+                    bail!("aborted");
+                }
+            }
+            let r = c.post("vlpds.admin.setFeatureLevel", &json!({"level": level})).await?;
+            if opts.json {
+                return pretty(out, &r);
+            }
+            writeln!(out, "Feature level: {} (was {active})", s(&r["active"]))?;
+            if let Some(h) = r["history"].as_array().and_then(|h| h.last()) {
+                writeln!(out, "Since        : {} by {}", s(&h["at"]), s(&h["by"]))?;
+            }
+            Ok(())
         }
     }
 }
@@ -423,7 +465,7 @@ async fn account(c: &Client, cmd: AccountCmd, opts: &Opts, out: &mut dyn Write) 
                     q.push(("cursor", cu));
                 }
                 let r = c.get("com.atproto.admin.searchAccounts", &q).await?;
-                for k in ["unreachableNodes", "missingShards"] {
+                for k in ["unreachableNodes", "unsupportedNodes", "missingShards"] {
                     if let Some(v) = r.get(k) {
                         eprintln!("warning: listing incomplete: {k} {v}");
                     }
@@ -669,16 +711,31 @@ fn write_cluster(out: &mut dyn Write, r: &J) -> Result<()> {
         writeln!(out, "Reshard      : {}", r["layout"]["op"])?;
     }
     writeln!(out, "Firehose     : last emitted {}, min watermark {}", s(&r["firehose"]["lastEmitted"]), s(&r["firehose"]["minWatermark"]))?;
+    let v = &r["version"];
+    if !v.is_null() {
+        let target = if v["target"].is_null() { String::new() } else { format!(", raising to {}", s(&v["target"])) };
+        writeln!(out, "Feature level: {} active{target} (this build {}..={}, rev {})", s(&v["active"]), s(&v["binary"]["min"]), s(&v["binary"]["max"]), s(&v["binary"]["rev"]))?;
+        if v["mixedBuilds"] == json!(true) {
+            writeln!(out, "Builds       : mixed ({})", s(&v["revs"]))?;
+        }
+        if !v["finalizable"].is_null() {
+            writeln!(out, "Finalize     : every node can run level {}: `vlpds admin cluster finalize --level {}`", s(&v["finalizable"]), s(&v["finalizable"]))?;
+        }
+        if !v["finalizedAt"].is_null() {
+            writeln!(out, "Finalized    : at {} (older builds can no longer join)", s(&v["finalizedAt"]))?;
+        }
+    }
     if r["fencedLogs"].as_object().is_some_and(|m| !m.is_empty()) {
         writeln!(out, "Fenced logs  : {}", r["fencedLogs"])?;
     }
     let nodes = r["nodes"].as_array().cloned().unwrap_or_default();
     if !nodes.is_empty() {
         writeln!(out)?;
-        let mut rows = vec![["node", "addr", "reachable", "lease", "owned", "durable", "writer"].map(String::from).to_vec()];
+        let mut rows = vec![["node", "addr", "reachable", "lease", "owned", "durable", "writer", "rev", "levels"].map(String::from).to_vec()];
         for n in &nodes {
             let name = if n["self"] == json!(true) { format!("{}*", s(&n["node"])) } else { s(&n["node"]) };
-            rows.push(vec![name, s(&n["addr"]), s(&n["reachable"]), s(&n["leaseValid"]), s(&n["owned"]), s(&n["logDurableOrdinal"]), s(&n["writer"])]);
+            let levels = format!("{}..={}", s(&n["minLevel"]), s(&n["maxLevel"]));
+            rows.push(vec![name, s(&n["addr"]), s(&n["reachable"]), s(&n["leaseValid"]), s(&n["owned"]), s(&n["logDurableOrdinal"]), s(&n["writer"]), s(&n["rev"]), levels]);
         }
         write!(out, "{}", table(&rows))?;
     }

@@ -52,6 +52,9 @@ pub struct Mutation {
 // with a bounded number of probes (see `nodelog::in_prefix`).
 // ---------------------------------------------------------------------------
 
+/// The newest segment magic (level 1's). Writers emit
+/// `version::segment_magic(version::active())`; readers accept every magic
+/// of the build's level window (`version::segment_magics`).
 pub const MAGIC: &[u8; 8] = b"VLSEG06\n";
 /// Bytes of an entry before its frame: seq, shard, epoch, frame_len.
 const ENTRY_HEAD: usize = 8 + 4 + 8 + 4;
@@ -91,6 +94,9 @@ pub struct SegHeader {
     pub codec: u8,
     /// Uncompressed body length.
     pub body_len: u32,
+    /// Feature level of the segment's magic (its entry layout and how its
+    /// derived muts are derived).
+    pub level: u32,
 }
 
 pub struct SegEntry {
@@ -99,6 +105,9 @@ pub struct SegEntry {
     pub epoch: u64,
     pub frame: Bytes,
     pub muts: Vec<Mutation>,
+    /// How many of `muts` (the first ones) were derived from the #commit
+    /// frame rather than stored (0 when parsed without muts).
+    pub derived: usize,
 }
 
 pub enum LogObject {
@@ -227,7 +236,7 @@ impl SegmentBuilder {
     pub fn sealed_header(&self, log_id: &str, ordinal: u64, prefix_end: u64) -> Vec<u8> {
         debug_assert!(prefix_end <= ordinal);
         let mut h = Vec::with_capacity(header_len(log_id));
-        h.put_slice(MAGIC);
+        h.put_slice(crate::version::segment_magic(crate::version::active()));
         h.put_u16(log_id.len() as u16);
         h.put_slice(log_id.as_bytes());
         h.put_u64(ordinal);
@@ -309,7 +318,10 @@ pub fn decode(data: Bytes) -> anyhow::Result<Bytes> {
             crate::metrics::SEGMENT_DECODES.inc();
             Ok(out.into())
         }
-        c => anyhow::bail!("segment {} has unknown codec {c}", h.ordinal),
+        c => {
+            crate::version::format_error("segment");
+            anyhow::bail!("segment {} has unknown codec {c}", h.ordinal)
+        }
     }
 }
 
@@ -326,7 +338,14 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<Option<(SegHeader, usize)>> {
     if data.starts_with(FENCE_MAGIC) {
         return Ok(None);
     }
-    anyhow::ensure!(data.len() >= 10 && data.starts_with(MAGIC), "bad segment magic");
+    let level = match data.get(..8).and_then(crate::version::segment_level) {
+        Some(l) if data.len() >= 10 => l,
+        Some(_) => anyhow::bail!("truncated segment header"),
+        None => {
+            crate::version::format_error("segment");
+            anyhow::bail!("bad segment magic {:?} (not a level this build reads)", String::from_utf8_lossy(&data[..data.len().min(8)]))
+        }
+    };
     let idlen = u16::from_be_bytes(data[8..10].try_into()?) as usize;
     let pos = 10 + idlen;
     anyhow::ensure!(data.len() >= pos + HEADER_TAIL, "truncated segment header");
@@ -340,6 +359,7 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<Option<(SegHeader, usize)>> {
         count: u32::from_be_bytes(data[pos + 32..pos + 36].try_into()?),
         codec: data[pos + 36],
         body_len: u32::from_be_bytes(data[pos + 37..pos + 41].try_into()?),
+        level,
     };
     anyhow::ensure!(h.prefix_end <= h.ordinal, "segment {} has prefix_end {} past it", h.ordinal, h.prefix_end);
     Ok(Some((h, pos + HEADER_TAIL)))
@@ -401,7 +421,8 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<ShardId>) -> anyhow::Re
             }
         }
         if keep {
-            out.push(SegEntry { seq, shard: sh, epoch, frame, muts });
+            let derived = if with_muts { derived } else { 0 };
+            out.push(SegEntry { seq, shard: sh, epoch, frame, muts, derived });
         }
     }
     Ok(LogObject::Segment(h, out))

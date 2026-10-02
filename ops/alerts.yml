@@ -121,6 +121,42 @@ groups:
           summary: "vlpds nodes have run {{ $value }} different git revisions for over an hour (stuck rolling deploy?)"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsmixedversions"
 
+      # A decode met an unknown or malformed format marker (segment magic or
+      # codec, log stream message type, applied marker, cluster/version):
+      # a node wrote a format before its level was active, or corruption.
+      # Never expected (design): page on the first one.
+      - alert: VlpdsFormatErrors
+        expr: sum by (instance, format) (increase(vlpds_format_errors_total{job="vlpds"}[10m])) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value }} {{ $labels.format }} format errors in 10 minutes (unknown version marker or corruption)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsformaterrors"
+
+      # The previous process refused to start (exit 7 incompatible_level):
+      # its build can't run the cluster's feature level. Only visible once a
+      # process on that exit-state file serves again; a node looping on exit 7
+      # never serves /metrics, so VlpdsNodeDown fires for it as well.
+      - alert: VlpdsIncompatibleNode
+        expr: vlpds_last_exit_reason_info{job="vlpds",reason="incompatible_level"} == 1
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}'s previous process exited 7: its build could not run the cluster's feature level (old image after a finalize?)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsincompatiblenode"
+
+      # Every node runs a build that supports a higher feature level than the
+      # active one, for two weeks: the upgrade was never finalized. Open
+      # windows block the next build from dropping old formats (design).
+      - alert: VlpdsFeatureLevelUnfinalized
+        expr: min(vlpds_feature_level{job="vlpds",kind="binary_max"}) > max(vlpds_feature_level{job="vlpds",kind="active"})
+        for: 14d
+        labels:
+          severity: ticket
+        annotations:
+          summary: "every vlpds node can run feature level {{ $value }}+ but the cluster has not been finalized for 14 days"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsfeaturelevelunfinalized"
+
   # ---------------------------------------------------------------------------
   # Shard ownership
   # ---------------------------------------------------------------------------

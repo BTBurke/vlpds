@@ -142,20 +142,13 @@ async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json
     out["fencedLogs"] = json!(c.fenced_logs());
     let mut peers = c.peers();
     if !peers.iter().any(|l| l.node_id == me) {
-        peers.push(crate::cluster::NodeLease {
-            node_id: me.clone(),
-            log_id: app.log.log_id.to_string(),
-            addr: c.cfg.addr.clone(),
-            writer: c.writer,
-            expires_ms: c.lease_expiry_us() / 1000,
-            renewals: 0,
-            next_ordinal: app.log.next_ordinal(),
-            draining: false,
-            joined: c.joined(),
-            follows: Default::default(),
-            wm_cap: 0,
-        });
+        let mut own = c.own_lease();
+        own.expires_ms = c.lease_expiry_us() / 1000;
+        own.next_ordinal = app.log.next_ordinal();
+        own.joined = c.joined();
+        peers.push(own);
     }
+    out["version"] = feature_levels(c, &peers).await;
     peers.sort_by(|a, b| a.node_id.cmp(&b.node_id));
     let fetches = peers.iter().map(|l| {
         let (app, l, me) = (app.clone(), l.clone(), me.clone());
@@ -163,6 +156,7 @@ async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json
             let mut n = json!({
                 "node": l.node_id, "log": l.log_id, "addr": l.addr,
                 "writer": l.writer, "expiresMs": l.expires_ms, "self": l.node_id == me,
+                "rev": l.rev, "minLevel": l.min_level, "maxLevel": l.max_level, "seenLevel": l.seen_level,
             });
             if l.node_id == me {
                 n["reachable"] = json!(true);
@@ -194,4 +188,38 @@ async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json
     });
     out["nodes"] = json!(futures::future::join_all(fetches).await);
     Ok(Json(out))
+}
+
+/// The feature-level part of getClusterStatus: `cluster/version` (read
+/// now), this build's window, and what the console's banner says (DESIGN.md
+/// "Rolling upgrades and format versioning"): `mixedBuilds` (live nodes on
+/// more than one rev), `finalizable` (the highest level every live node can
+/// run, when above the active one: `vlpds admin cluster finalize`) and
+/// `finalizedAt` (when the active level was raised: older builds can no
+/// longer join).
+async fn feature_levels(c: &crate::cluster::Cluster, nodes: &[crate::cluster::NodeLease]) -> J {
+    let (v, error) = match c.read_version().await {
+        Ok(Some((v, _))) => (Some(v), None),
+        Ok(None) => (None, Some(format!("{} is missing", crate::version::OBJECT))),
+        Err(e) => (c.cluster_version(), Some(format!("{e:#}"))),
+    };
+    let revs: std::collections::BTreeSet<&str> = nodes.iter().map(|l| l.rev.as_str()).collect();
+    let common_max = nodes.iter().map(|l| l.max_level).min();
+    let active = v.as_ref().map(|v| v.active);
+    let finalizable = common_max.filter(|m| active.is_some_and(|a| *m > a));
+    let finalized_at = v.as_ref().and_then(|v| v.history.iter().rev().find(|h| h.level == v.active && v.history.len() > 1).map(|h| h.at.clone()));
+    let mut out = json!({
+        "active": active,
+        "target": v.as_ref().and_then(|v| v.target),
+        "history": v.as_ref().map(|v| v.history.clone()).unwrap_or_default(),
+        "binary": {"min": c.cfg.levels.min, "max": c.cfg.levels.max, "rev": crate::version::build_rev()},
+        "mixedBuilds": revs.len() > 1,
+        "revs": revs,
+        "finalizable": finalizable,
+        "finalizedAt": finalized_at,
+    });
+    if let Some(e) = error {
+        out["error"] = json!(e);
+    }
+    out
 }

@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react'
-import { CopyText, ErrorNotice, Loading, Panel, Status } from '../../components/ui'
-import { fmtNum, relTime, seqMillis } from '../../lib/format'
+import { CopyText, ErrorNotice, Loading, Notice, Panel, Status } from '../../components/ui'
+import { fmtNum, fmtTime, relTime, seqMillis } from '../../lib/format'
 import { useLoad } from '../../lib/hooks'
 import { admin } from '../../lib/xrpc'
 
@@ -15,6 +15,25 @@ export type ClusterNode = {
   leaseValid?: boolean
   logDurableOrdinal?: number | null
   owned?: number
+  /** Build (git rev) and the feature levels it can run; the active level it last read. */
+  rev?: string
+  minLevel?: number
+  maxLevel?: number
+  seenLevel?: number
+}
+
+/** `cluster/version` and what the banner says (src/xrpc/webui.rs `feature_levels`). */
+export type FeatureLevels = {
+  active: number | null
+  target: number | null
+  history: { level: number; at: string; by: string }[]
+  binary: { min: number; max: number; rev: string }
+  mixedBuilds: boolean
+  revs: string[]
+  /** Highest level every live node can run, when above the active one. */
+  finalizable: number | null
+  finalizedAt: string | null
+  error?: string
 }
 
 export type ClusterStatus = {
@@ -30,6 +49,7 @@ export type ClusterStatus = {
   firehose: { lastEmitted: string; minWatermark: string | null; sources: { log: string; watermark: string; local: boolean }[] }
   fencedLogs: Record<string, number>
   time: number
+  version?: FeatureLevels
 }
 
 const SLOTS = ['c1', 'c2', 'c3', 'c4', 'c5', 'c6']
@@ -85,6 +105,7 @@ export function Cluster() {
         </span>
       </div>
       <ErrorNotice error={c.error} />
+      {d.version && <LevelsBanner v={d.version} />}
       <div className="tiles">
         <div className="tile">
           <div className="v">{d.nodes.length || 1}</div>
@@ -105,6 +126,15 @@ export function Cluster() {
           <div className="v">{d.logDurableOrdinal ?? '—'}</div>
           <div className="k">Durable log ordinal</div>
         </div>
+        {d.version && (
+          <div className="tile" title={`This build runs levels ${d.version.binary.min}–${d.version.binary.max} (rev ${d.version.binary.rev})`}>
+            <div className="v">
+              {d.version.active ?? '—'}
+              {d.version.target != null && <small>→ {d.version.target}</small>}
+            </div>
+            <div className="k">Feature level</div>
+          </div>
+        )}
         <div className="tile">
           <div className="v">{lastMs ? relTime(lastMs) : '—'}</div>
           <div className="k">Last firehose event</div>
@@ -157,6 +187,7 @@ function NodesPanel({ d, ids, focus, onFocus }: { d: ClusterStatus; ids: string[
               <th className="num" title="Last durable segment ordinal in the node's log">Durable</th>
               <th className="num" title="How far this log's firehose watermark trails now">Firehose lag</th>
               <th className="num">Shards</th>
+              <th title="Git revision and the feature levels the node's build can run">Build</th>
             </tr>
           </thead>
           <tbody>
@@ -197,6 +228,14 @@ function NodesPanel({ d, ids, focus, onFocus }: { d: ClusterStatus; ids: string[
                     {ms ? `${fmtNum(Math.max(0, d.time - ms))} ms` : '—'}
                   </td>
                   <td className="num">{n.owned ?? counts.get(n.node) ?? '—'}</td>
+                  <td className="mono small" title={n.seenLevel ? `Last read active level ${n.seenLevel}` : undefined}>
+                    {n.rev ? n.rev.slice(0, 12) : '—'}{' '}
+                    {n.maxLevel != null && (
+                      <span className={n.maxLevel > (d.version?.active ?? n.maxLevel) ? 'pill amber' : 'muted'}>
+                        L{n.minLevel === n.maxLevel ? n.maxLevel : `${n.minLevel}–${n.maxLevel}`}
+                      </span>
+                    )}
+                  </td>
                 </tr>
               )
             })}
@@ -299,4 +338,42 @@ function ShardMap({ d, ids, focus }: { d: ClusterStatus; ids: string[]; focus?: 
       </div>
     </>
   )
+}
+
+/**
+ * Rolling-upgrade state (DESIGN.md "Rolling upgrades and format versioning"): a raise in progress,
+ * mixed builds (rollback is a plain redeploy until the level is raised), a level every node can now
+ * run (finalize available), or the time the active level was raised (older builds can't join).
+ */
+function LevelsBanner({ v }: { v: FeatureLevels }) {
+  if (v.error) return <Notice kind="err">Feature level unknown: {v.error}</Notice>
+  if (v.target != null)
+    return (
+      <Notice kind="warn">
+        Raising the cluster to feature level <b>{v.target}</b> (active {v.active}): waiting for every live node to confirm it can run it. If this stays, the finalize died between its steps: <code>vlpds admin cluster finalize --level {v.active}</code> clears it.
+      </Notice>
+    )
+  const notes = []
+  if (v.mixedBuilds)
+    notes.push(
+      <Notice kind="warn" key="mixed">
+        Mixed builds: <span className="mono">{v.revs.map((r) => r.slice(0, 12)).join(', ')}</span>. Finish or roll back the deploy;
+        until the feature level is raised, rollback is a plain redeploy.
+      </Notice>,
+    )
+  if (v.finalizable != null)
+    notes.push(
+      <Notice key="final">
+        Every node can run feature level <b>{v.finalizable}</b> (active {v.active}). After the soak, finalize with{' '}
+        <code>vlpds admin cluster finalize --level {v.finalizable}</code>; from then on rollback is forward-fix only.
+      </Notice>,
+    )
+  else if (v.finalizedAt && !v.mixedBuilds)
+    notes.push(
+      <Notice kind="ok" key="done">
+        Feature level {v.active} finalized on {fmtTime(v.finalizedAt)}: builds that can't run it can no longer join (rollback by redeploy is no
+        longer possible).
+      </Notice>,
+    )
+  return <>{notes}</>
 }

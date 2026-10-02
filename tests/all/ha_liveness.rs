@@ -24,6 +24,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, clock_offse
             renew_every: Duration::from_millis(100),
             skew: Duration::from_millis(200),
             clock_offset_ms,
+            ..Default::default()
         });
     })
     .await

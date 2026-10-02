@@ -46,6 +46,7 @@ pub fn component(prefix: &str, path: &str) -> &'static str {
         "nodes" => "ctl_lease",
         "assign" => "ctl_assign",
         "writers" => "ctl_writer",
+        "cluster" => "ctl_version",
         "handle" | "email" => "account_index",
         "blob" | "blob-gc" | "blob-tmp" => "blob",
         "state" => {

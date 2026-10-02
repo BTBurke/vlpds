@@ -107,6 +107,10 @@ pub struct Reshard {
     pub children: Vec<ShardRange>,
     /// Node completing it once every parent is frozen.
     pub driver: String,
+    /// Fields of a newer feature level, kept when this node CASes the
+    /// object (DESIGN.md "Rolling upgrades": tolerant control objects).
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Reshard {
@@ -134,6 +138,10 @@ pub struct Layout {
     pub op_seq: u64,
     #[serde(default)]
     pub op: Option<Reshard>,
+    /// Fields of a newer feature level, kept when this node CASes the
+    /// object (DESIGN.md "Rolling upgrades": tolerant control objects).
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Layout {
@@ -147,7 +155,7 @@ impl Layout {
                 ShardRange { id: ShardId(k), lo: r.lo, hi: r.hi }
             })
             .collect();
-        Layout { version: 1, shards, next_id: ShardId(n), op_seq: 0, op: None }
+        Layout { version: 1, shards, next_id: ShardId(n), op_seq: 0, op: None, extra: Default::default() }
     }
 
     /// The next `n` unused ids, from `next_id`. Allocating is planning an
@@ -228,6 +236,7 @@ impl Layout {
             parents: vec![id],
             children: vec![ShardRange { id: a, lo: r.lo, hi: at }, ShardRange { id: b, lo: at, hi: r.hi }],
             driver: driver.to_string(),
+            extra: Default::default(),
         })
     }
 
@@ -242,6 +251,7 @@ impl Layout {
             parents: vec![left, right],
             children: vec![ShardRange { id, lo: self.shards[i].lo, hi: r.hi }],
             driver: driver.to_string(),
+            extra: Default::default(),
         })
     }
 
@@ -263,7 +273,7 @@ impl Layout {
         let mut shards = self.shards.clone();
         shards.splice(first..first + op.parents.len(), op.children.iter().copied());
         let next_id = self.next_id_after(op);
-        let l = Layout { version: self.version + 1, shards, next_id, op_seq: self.op_seq, op: None };
+        let l = Layout { version: self.version + 1, shards, next_id, op_seq: self.op_seq, op: None, extra: self.extra.clone() };
         l.validate()?;
         Ok(l)
     }
@@ -472,5 +482,27 @@ mod tests {
         full.next_id = ShardId(u32::MAX - 1);
         assert!(full.plan_split(s(0), None, "n").is_err(), "ids exhausted");
         assert_eq!(full.plan_merge(s(0), s(1), "n").unwrap().children[0].id, ShardId(u32::MAX - 1));
+    }
+
+    /// A newer level's fields on the layout (and on its op) survive an
+    /// older node planning, flipping and aborting reshards: every layout
+    /// write derives from the one it read.
+    #[test]
+    fn unknown_layout_fields_round_trip() {
+        let mut j = serde_json::to_value(Layout::uniform(4)).unwrap();
+        j["placement"] = serde_json::json!({"zones": ["a", "b"]});
+        let l: Layout = serde_json::from_value(j).unwrap();
+        let op = l.plan_split(s(1), None, "n").unwrap();
+        let mut planned = serde_json::to_value(l.with_op(op)).unwrap();
+        assert_eq!(planned["placement"]["zones"][1], "b");
+        planned["op"]["weight"] = serde_json::json!(3);
+        let planned: Layout = serde_json::from_value(planned).unwrap();
+        let op = planned.op.clone().unwrap();
+        let again = serde_json::to_value(&planned).unwrap();
+        assert_eq!((again["op"]["weight"].as_u64(), &again["placement"]["zones"][0]), (Some(3), &serde_json::json!("a")));
+        let flipped = serde_json::to_value(planned.flipped(&op).unwrap()).unwrap();
+        assert_eq!(flipped["placement"]["zones"][0], "a");
+        let aborted = serde_json::to_value(Layout { op: None, ..planned }).unwrap();
+        assert_eq!(aborted["placement"]["zones"][0], "a");
     }
 }

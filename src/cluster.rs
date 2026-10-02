@@ -12,6 +12,9 @@
 //!                       shard map (slot ranges -> shard ids), CAS-advanced by
 //!                       splits and merges (reshard.rs)
 //!   log/{log}/{ord}.seg a fence object at a dead log's first hole closes it
+//!   cluster/version     ClusterVersion {active, target?, history}: the feature
+//!                       level writers emit (version.rs); checked before a node
+//!                       touches any data and again once its lease exists
 //!
 //! Liveness never compares wall clocks across nodes. A peer is presumed dead
 //! once its lease object has not changed for TTL + skew of *our* monotonic
@@ -31,6 +34,7 @@
 use crate::nodelog::Span;
 use crate::slots::{Layout, Reshard, ShardId};
 use crate::store::Store;
+use crate::version::{self, ClusterVersion};
 use object_store::path::Path;
 use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
 use parking_lot::RwLock;
@@ -75,9 +79,22 @@ pub struct NodeLease {
     /// this node as dead makes its own seqs pass it.
     #[serde(default)]
     pub wm_cap: i64,
+    /// This build's git revision (as in `vlpds_build_info`).
+    #[serde(default)]
+    pub rev: String,
+    /// Feature levels this build can run (version.rs). A lease written
+    /// before levels existed is from a level-1-only build.
+    #[serde(default = "crate::version::legacy_level")]
+    pub min_level: u32,
+    #[serde(default = "crate::version::legacy_level")]
+    pub max_level: u32,
+    /// The cluster's active level as this node last read it (0 = not yet).
+    #[serde(default)]
+    pub seen_level: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
 pub struct Assignment {
     pub owner: Option<String>,
     pub log_id: Option<String>,
@@ -94,6 +111,10 @@ pub struct Assignment {
     /// of every span in `history` (DESIGN.md "Online shard split/merge").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen: Option<u64>,
+    /// Fields of a newer feature level, kept when this node CASes the
+    /// object (DESIGN.md "Rolling upgrades": tolerant control objects).
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A shard handed straight to a joiner: the releaser closed it and CASed its
@@ -124,6 +145,9 @@ pub struct ClusterConfig {
     /// Tests only: offsets this node's wall clock as the control plane sees
     /// it (the `expires_ms` it publishes), to simulate clock skew in-process.
     pub clock_offset_ms: i64,
+    /// Feature levels this node runs: the build's (`version::Window::BUILD`);
+    /// tests pose as other builds.
+    pub levels: version::Window,
 }
 
 impl Default for ClusterConfig {
@@ -136,6 +160,7 @@ impl Default for ClusterConfig {
             renew_every: Duration::from_secs(2),
             skew: Duration::from_secs(2),
             clock_offset_ms: 0,
+            levels: version::Window::BUILD,
         }
     }
 }
@@ -317,6 +342,39 @@ pub struct Cluster {
     hold_steps: AtomicBool,
     /// Tests: answer every greeting "not following" (`test_ignore_hellos`).
     ignore_hellos: AtomicBool,
+    /// `cluster/version` as last read, and when (re-read once per TTL by steps).
+    version: RwLock<Option<(ClusterVersion, Instant)>>,
+}
+
+/// Why `Cluster::finalize_level` didn't raise the level.
+#[derive(Debug)]
+pub enum FinalizeError {
+    /// The request can't be done (level not above the active one, not in
+    /// this node's window, no version object).
+    Invalid(String),
+    /// Live nodes whose builds can't run the level: (node id, rev, max level).
+    Incompatible { level: u32, nodes: Vec<(String, String, u32)> },
+    /// The object store failed or the object changed under us: retry.
+    Store(anyhow::Error),
+}
+
+impl std::fmt::Display for FinalizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FinalizeError::Invalid(m) => write!(f, "{m}"),
+            FinalizeError::Incompatible { level, nodes } => {
+                let list: Vec<String> = nodes.iter().map(|(n, rev, max)| format!("{n} (rev {rev}, max level {max})")).collect();
+                write!(f, "nodes that can't run level {level}: {}", list.join(", "))
+            }
+            FinalizeError::Store(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl From<anyhow::Error> for FinalizeError {
+    fn from(e: anyhow::Error) -> Self {
+        FinalizeError::Store(e)
+    }
 }
 
 fn now_ms() -> u64 {
@@ -328,8 +386,21 @@ fn is_conflict(e: &object_store::Error) -> bool {
 }
 
 impl Cluster {
-    /// Registers this node: claims a writer id and creates its node lease.
+    /// Registers this node: checks the cluster's feature level, claims a
+    /// writer id and creates its node lease. A node whose levels can't run
+    /// the cluster's refuses (exit 7, `version::refuse`) before it touches
+    /// anything else, or right after its lease write (then deleting it).
     pub async fn join(cfg: ClusterConfig, store: Store) -> anyhow::Result<Arc<Cluster>> {
+        Self::join_inner(cfg, store, None).await
+    }
+
+    /// [`join`](Self::join), running `before_lease` (tests: a race) after
+    /// the first level check and before the lease write.
+    pub(crate) async fn join_inner(
+        cfg: ClusterConfig,
+        store: Store,
+        before_lease: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
+    ) -> anyhow::Result<Arc<Cluster>> {
         let log_id = format!("{}.{}", cfg.node_id, crate::tid::now_micros());
         let mut c = Cluster {
             log_id: log_id.clone(),
@@ -348,6 +419,10 @@ impl Cluster {
                 joined: false,
                 follows: BTreeMap::new(),
                 wm_cap: 0,
+                rev: version::build_rev().to_string(),
+                min_level: cfg.levels.min,
+                max_level: cfg.levels.max,
+                seen_level: 0,
             }),
             expires_local_ms: AtomicU64::new(0),
             valid_until: RwLock::new(Instant::now()),
@@ -380,8 +455,19 @@ impl Cluster {
             alone: AtomicBool::new(false),
             hold_steps: AtomicBool::new(false),
             ignore_hellos: AtomicBool::new(false),
+            version: RwLock::new(None),
             cfg,
         };
+        // the startup gate: before anything else is read or written (our
+        // previous incarnation's log is fenced below)
+        let v = c.ensure_version().await?;
+        if let Err(why) = c.cfg.levels.check(&v) {
+            return Err(version::refuse(&c.cfg.node_id, &why));
+        }
+        c.observed_version(v);
+        if let Some(f) = before_lease {
+            f.await;
+        }
         // create (or take over our own stale) node lease
         let path = c.path(&format!("nodes/{}", c.cfg.node_id));
         let existing = c.get_json::<NodeLease>(&path).await?;
@@ -421,6 +507,18 @@ impl Cluster {
                 Err(e) => return Err(e.into()),
             }
         }
+        // Again now that our lease exists: a raise (`finalize_level`) that
+        // listed the leases before ours landed wrote its target first, so we
+        // see it here (store writes are linearizable) and leave.
+        let v = match c.read_version().await? {
+            Some((v, _)) => v,
+            None => anyhow::bail!("{} vanished", version::OBJECT),
+        };
+        if let Err(why) = c.cfg.levels.check(&v) {
+            c.delete(&format!("nodes/{}", c.cfg.node_id)).await;
+            return Err(version::refuse(&c.cfg.node_id, &why));
+        }
+        c.observed_version(v);
         c.ensure_layout().await?;
         c.bounded.store(true, Ordering::Release);
         let c = Arc::new(c);
@@ -477,6 +575,193 @@ impl Cluster {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// `cluster/version` (None if absent). An unreadable object is an error
+    /// (counted as a format error), never "absent".
+    pub async fn read_version(&self) -> anyhow::Result<Option<Versioned<ClusterVersion>>> {
+        self.get_json::<ClusterVersion>(&self.path(version::OBJECT)).await.map_err(|e| {
+            if e.downcast_ref::<serde_json::Error>().is_some() {
+                version::format_error("cluster_version");
+            }
+            e.context(format!("reading {}", version::OBJECT))
+        })
+    }
+
+    /// Reads `cluster/version`, creating it if this prefix has none: at
+    /// level 1 on a prefix that predates levels (it has a layout), else at
+    /// this build's max level (a fresh cluster). A racing creator's wins.
+    async fn ensure_version(&self) -> anyhow::Result<ClusterVersion> {
+        loop {
+            if let Some((v, _)) = self.read_version().await? {
+                return Ok(v);
+            }
+            self.count("head");
+            let legacy = match self.store.raw.head(&self.path(LAYOUT)).await {
+                Ok(_) => true,
+                Err(object_store::Error::NotFound { .. }) => false,
+                Err(e) => return Err(e.into()),
+            };
+            let level = if legacy { version::legacy_level() } else { self.cfg.levels.max };
+            let v = ClusterVersion::new(level, &self.cfg.node_id);
+            match self.put_json(&self.path(version::OBJECT), &v, PutMode::Create).await {
+                Ok(_) => {
+                    tracing::info!(level, legacy, "created {}", version::OBJECT);
+                    return Ok(v);
+                }
+                Err(e) if is_conflict(&e) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// Records a read of `cluster/version`: the level writers emit, and the
+    /// `seen_level` our next lease write publishes.
+    fn observed_version(&self, v: ClusterVersion) {
+        self.lease.write().seen_level = v.active;
+        version::set_active(v.active);
+        *self.version.write() = Some((v, Instant::now()));
+    }
+
+    /// `cluster/version` as this node last read it.
+    pub fn cluster_version(&self) -> Option<ClusterVersion> {
+        self.version.read().as_ref().map(|(v, _)| v.clone())
+    }
+
+    /// Our own node lease as of its last write (plus flags set since).
+    pub fn own_lease(&self) -> NodeLease {
+        self.lease.read().clone()
+    }
+
+    /// Steps re-read `cluster/version` once per TTL. An active level outside
+    /// our window (an operator forced it) is a fail-stop 7; a `target` past
+    /// it is not (a raise lists our lease and aborts).
+    async fn observe_version(&self) -> anyhow::Result<()> {
+        let due = self.version.read().as_ref().is_none_or(|(_, at)| at.elapsed() >= self.cfg.ttl);
+        if !due || self.halted() {
+            return Ok(());
+        }
+        let Some((v, _)) = self.read_version().await? else {
+            tracing::error!("{} is missing: keeping level {}", version::OBJECT, version::active());
+            return Ok(());
+        };
+        if !self.cfg.levels.contains(v.active) {
+            let why = format!("cluster level {} is outside this build's levels {}..={}", v.active, self.cfg.levels.min, self.cfg.levels.max);
+            return Err(version::refuse(&self.cfg.node_id, &why));
+        }
+        self.observed_version(v);
+        Ok(())
+    }
+
+    /// Raises the cluster's feature level to `level` (DESIGN.md "Raise
+    /// protocol"): (1) CAS `target = level`; (2) list every lease *after*
+    /// that write and require each live one to run `level` (else clear the
+    /// target and fail with the offenders); (3) CAS `active = level`. A
+    /// node whose lease landed after (2)'s listing re-reads the object once
+    /// its lease exists and refuses. Raising a persistent level can't be undone.
+    pub async fn finalize_level(&self, level: u32, by: &str) -> Result<ClusterVersion, FinalizeError> {
+        let path = self.path(version::OBJECT);
+        let Some((cur, etag)) = self.read_version().await? else {
+            return Err(FinalizeError::Invalid(format!("{} is missing", version::OBJECT)));
+        };
+        if level == cur.active {
+            // Already there. A leftover target (a finalize that died between
+            // its steps) keeps nodes that can't run it from starting: clear
+            // it. A raise still in flight then fails its last CAS (retry).
+            if let Some(t) = cur.target {
+                self.clear_target(t).await?;
+                tracing::warn!(target = t, active = level, by, "cleared a pending feature level raise");
+                return Ok(ClusterVersion { target: None, ..cur });
+            }
+            return Ok(cur);
+        }
+        if level < cur.active {
+            return Err(FinalizeError::Invalid(format!("level {level} is below the active level {}: levels are never lowered", cur.active)));
+        }
+        if !self.cfg.levels.contains(level) {
+            return Err(FinalizeError::Invalid(format!("this node runs levels {}..={}, not {level}", self.cfg.levels.min, self.cfg.levels.max)));
+        }
+        // 1. the target: from now on a starting node that can't run it refuses
+        let mut next = cur.clone();
+        next.target = Some(level);
+        let etag = match self.put_json(&path, &next, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
+            Ok(e) => e,
+            Err(e) if is_conflict(&e) => return Err(FinalizeError::Store(anyhow::anyhow!("{} changed concurrently: retry", version::OBJECT))),
+            Err(e) => return Err(FinalizeError::Store(e.into())),
+        };
+        tracing::info!(level, by, "feature level raise: target written");
+        // 2. every live lease, listed after the target landed
+        let offenders = match self.leases_below(level).await {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = self.clear_target(level).await;
+                return Err(FinalizeError::Store(e));
+            }
+        };
+        if !offenders.is_empty() {
+            if let Err(e) = self.clear_target(level).await {
+                tracing::warn!(level, "clearing the raise target failed (the next finalize clears it): {e:#}");
+            }
+            tracing::warn!(level, ?offenders, "feature level raise aborted: nodes can't run it");
+            return Err(FinalizeError::Incompatible { level, nodes: offenders });
+        }
+        // 3. the point of no return
+        next.active = level;
+        next.target = None;
+        next.history.push(version::Change::new(level, by));
+        match self.put_json(&path, &next, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
+            Ok(_) => {}
+            Err(e) if is_conflict(&e) => {
+                // someone else finished (or cleared) it meanwhile
+                return match self.read_version().await? {
+                    Some((v, _)) if v.active == level => {
+                        self.observed_version(v.clone());
+                        Ok(v)
+                    }
+                    _ => Err(FinalizeError::Store(anyhow::anyhow!("{} changed during the raise: retry", version::OBJECT))),
+                };
+            }
+            Err(e) => return Err(FinalizeError::Store(e.into())),
+        }
+        tracing::warn!(level, by, "cluster feature level raised (finalized): rollback to older builds is no longer possible");
+        self.observed_version(next.clone());
+        Ok(next)
+    }
+
+    /// Clears `target` if it is still `level` (an aborted raise).
+    async fn clear_target(&self, level: u32) -> anyhow::Result<()> {
+        let path = self.path(version::OBJECT);
+        for _ in 0..5 {
+            let Some((mut v, etag)) = self.read_version().await? else { return Ok(()) };
+            if v.target != Some(level) {
+                return Ok(());
+            }
+            v.target = None;
+            match self.put_json(&path, &v, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
+                Ok(_) => return Ok(()),
+                Err(e) if is_conflict(&e) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        anyhow::bail!("{} kept changing", version::OBJECT)
+    }
+
+    /// Leases (one LIST, a GET each) whose build can't run `level`: (node
+    /// id, rev, max level). Only a lease whose log we fenced (its node is
+    /// dead and taken over) is ignored; an unreadable one counts as unable.
+    async fn leases_below(&self, level: u32) -> anyhow::Result<Vec<(String, String, u32)>> {
+        let mut out = Vec::new();
+        for (id, _) in self.list("nodes").await? {
+            let got = self.get_json::<serde_json::Value>(&self.path(&format!("nodes/{id}"))).await?;
+            let Some((v, _)) = got else { continue };
+            match serde_json::from_value::<NodeLease>(v) {
+                Ok(l) if self.fenced.read().contains_key(&l.log_id) => {}
+                Ok(l) if l.max_level >= level => {}
+                Ok(l) => out.push((id, l.rev, l.max_level)),
+                Err(_) => out.push((id, "?".into(), 0)),
+            }
+        }
+        Ok(out)
     }
 
     /// Enables the split policy hook (reshard.rs).
@@ -1356,6 +1641,8 @@ impl Cluster {
     }
 
     async fn step_body(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
+        // 1b. the cluster's feature level (once per TTL)
+        self.observe_version().await?;
         // 2. membership
         let (live, dead) = self.read_nodes(host).await?;
         {
@@ -1539,6 +1826,7 @@ impl Cluster {
                 seq_floor,
                 history: next,
                 frozen: None,
+                extra: cur.extra.clone(),
             };
             let mode = match etag {
                 None => PutMode::Create,
@@ -1902,6 +2190,7 @@ mod tests {
             renew_every: Duration::from_millis(100),
             skew: Duration::from_millis(100),
             clock_offset_ms: 0,
+            levels: version::Window::BUILD,
         }
     }
 
@@ -1961,6 +2250,10 @@ mod tests {
             joined: true,
             follows: BTreeMap::new(),
             wm_cap: 0,
+            rev: String::new(),
+            min_level: 1,
+            max_level: 1,
+            seen_level: 1,
         };
         a.put_json(&a.path(&format!("nodes/{id}")), &lease, PutMode::Overwrite).await.unwrap();
         let b = join(cfg(&id), store.clone()).await.unwrap();
@@ -2362,7 +2655,233 @@ mod tests {
             b.step(&hb).await.unwrap();
         }
         let per_step = (a.store_requests() - before) as f64 / 10.0;
-        // renew PUT + 2 LISTs + 1 GET (b's renewed lease)
-        assert!(per_step <= 4.0, "{per_step} requests per step at 256 shards");
+        // renew PUT + 2 LISTs + 1 GET (b's renewed lease), plus one GET of
+        // cluster/version per TTL
+        assert!(per_step <= 4.1, "{per_step} requests per step at 256 shards");
+    }
+
+    // ---- feature levels (version.rs, DESIGN.md "Rolling upgrades") ----
+
+    /// Exit-7 refusals as (node id, why), recorded instead of exiting.
+    fn refusals() -> &'static Mutex<Vec<(String, String)>> {
+        static R: std::sync::OnceLock<Mutex<Vec<(String, String)>>> = std::sync::OnceLock::new();
+        let r = R.get_or_init(|| Mutex::new(Vec::new()));
+        static HOOK: std::sync::Once = std::sync::Once::new();
+        HOOK.call_once(|| version::set_refuse_hook(Some(Arc::new(|node: &str, why: &str| refusals().lock().push((node.into(), why.into()))))));
+        r
+    }
+
+    fn refused(node: &str) -> Vec<String> {
+        refusals().lock().iter().filter(|(n, _)| n == node).map(|(_, w)| w.clone()).collect()
+    }
+
+    /// `cfg(id)` posing as a build running levels `min..=max`.
+    fn levels(id: &str, min: u32, max: u32) -> ClusterConfig {
+        ClusterConfig { levels: version::Window { min, max }, ..cfg(id) }
+    }
+
+    async fn put_version(store: &Store, active: u32, target: Option<u32>) {
+        let v = ClusterVersion { target, ..ClusterVersion::new(active, "test") };
+        store.raw.put(&Path::from(format!("{}/{}", store.prefix, version::OBJECT)), PutPayload::from(serde_json::to_vec(&v).unwrap())).await.unwrap();
+    }
+
+    async fn objects(store: &Store, rel: &str) -> Vec<String> {
+        use futures::StreamExt;
+        store.raw.list(Some(&Path::from(format!("{}/{rel}", store.prefix)))).map(|m| m.unwrap().location.to_string()).collect().await
+    }
+
+    /// A fresh prefix starts at the first node's max level; a prefix that
+    /// predates levels (it has a layout) at level 1. Leases advertise the
+    /// node's window and the level it read.
+    #[tokio::test]
+    async fn version_object_is_created_at_join() {
+        let store = Store::memory(None);
+        let a = join(levels("va", 1, 2), store.clone()).await.unwrap();
+        assert_eq!(a.cluster_version().unwrap().active, 2);
+        let l = a.own_lease();
+        assert_eq!((l.min_level, l.max_level, l.seen_level, l.rev.is_empty()), (1, 2, 2, false));
+        let legacy = Store::memory(None);
+        legacy.raw.put(&Path::from(format!("vlpds/{LAYOUT}")), PutPayload::from(serde_json::to_vec(&Layout::uniform(8)).unwrap())).await.unwrap();
+        let b = join(levels("vb", 1, 2), legacy.clone()).await.unwrap();
+        assert_eq!(b.cluster_version().unwrap().active, 1);
+        // a lease written before levels existed reads as a level-1 build
+        let old: NodeLease = serde_json::from_str(r#"{"node_id":"x","log_id":"x.1","addr":"","writer":1,"expires_ms":0,"renewals":1,"next_ordinal":0,"draining":false}"#).unwrap();
+        assert_eq!((old.min_level, old.max_level, old.seen_level, old.rev.as_str()), (1, 1, 0, ""));
+    }
+
+    /// A node whose build can't run the cluster's level refuses (exit 7)
+    /// before it reads or writes anything: no lease, no writer claim, no
+    /// fence of its previous incarnation's log.
+    #[tokio::test]
+    async fn incompatible_node_is_refused() {
+        refusals();
+        let store = Store::memory(None);
+        put_version(&store, 2, None).await;
+        let id = format!("old-{}", crate::tid::now_micros());
+        let err = join(levels(&id, 1, 1), store.clone()).await.err().expect("refused");
+        assert!(format!("{err:#}").contains(version::EXIT_REASON), "{err:#}");
+        assert_eq!(refused(&id).len(), 1, "fail-stop 7 hook ran once");
+        assert!(refused(&id)[0].contains("outside"), "{:?}", refused(&id));
+        assert!(objects(&store, "nodes").await.is_empty() && objects(&store, "writers").await.is_empty() && objects(&store, "assign").await.is_empty());
+        // a build that can no longer read the active level, and one that is
+        // older than a raise in progress, are refused too
+        let id2 = format!("new-{}", crate::tid::now_micros());
+        assert!(join(levels(&id2, 3, 4), store.clone()).await.is_err());
+        assert_eq!(refused(&id2).len(), 1);
+        put_version(&store, 1, Some(2)).await;
+        let id3 = format!("mid-{}", crate::tid::now_micros());
+        assert!(join(levels(&id3, 1, 1), store.clone()).await.is_err());
+        assert!(refused(&id3)[0].contains("raising"), "{:?}", refused(&id3));
+        // one that can run it joins
+        assert!(join(levels(&format!("ok-{}", crate::tid::now_micros()), 1, 2), store.clone()).await.is_ok());
+    }
+
+    /// An operator forced the active level past a running node's window: its
+    /// next observation (once per TTL) fail-stops it.
+    #[tokio::test]
+    async fn running_node_seeing_a_level_past_it_fail_stops() {
+        refusals();
+        let store = Store::memory(None);
+        let id = format!("run-{}", crate::tid::now_micros());
+        let a = join(levels(&id, 1, 1), store.clone()).await.unwrap();
+        let (_, ha) = host();
+        a.step(&ha).await.unwrap();
+        // a raise in progress isn't a reason to stop (the raise aborts on our lease)
+        put_version(&store, 1, Some(2)).await;
+        tokio::time::sleep(a.cfg.ttl).await;
+        a.step(&ha).await.unwrap();
+        assert!(refused(&id).is_empty());
+        put_version(&store, 2, None).await;
+        tokio::time::sleep(a.cfg.ttl).await;
+        assert!(a.step(&ha).await.is_err());
+        assert_eq!(refused(&id).len(), 1);
+    }
+
+    /// The raise protocol: refused while a live node's build can't run the
+    /// level (target cleared, nothing changed), done once that node is gone;
+    /// then the old build can't rejoin, and levels never go down.
+    #[tokio::test]
+    async fn finalize_raises_only_when_every_live_node_can() {
+        refusals();
+        let store = Store::memory(None);
+        let old_id = format!("fin-old-{}", crate::tid::now_micros());
+        let old = join(levels(&old_id, 1, 1), store.clone()).await.unwrap();
+        let new = join(levels("fin-new", 1, 2), store.clone()).await.unwrap();
+        assert_eq!(new.cluster_version().unwrap().active, 1, "created by the level-1 build");
+        match new.finalize_level(2, "op").await {
+            Err(FinalizeError::Incompatible { level: 2, nodes }) => assert_eq!(nodes.iter().map(|n| n.0.as_str()).collect::<Vec<_>>(), [old_id.as_str()]),
+            r => panic!("{r:?}"),
+        }
+        let (v, _) = new.read_version().await.unwrap().unwrap();
+        assert_eq!((v.active, v.target, v.history.len()), (1, None, 1), "aborted raise leaves no target");
+        assert!(matches!(new.finalize_level(3, "op").await, Err(FinalizeError::Invalid(_))), "past this node's build");
+        // the old node stops (its lease goes)
+        let (_, ho) = host();
+        old.shutdown(&ho).await;
+        let v = new.finalize_level(2, "op").await.unwrap();
+        assert_eq!((v.active, v.target, v.history.last().unwrap().level, v.history.last().unwrap().by.as_str()), (2, None, 2, "op"));
+        assert_eq!(new.finalize_level(2, "op").await.unwrap().active, 2, "idempotent");
+        // a finalize that died after its target: nodes that can't run the
+        // target refuse until a finalize at the active level clears it
+        put_version(&store, 2, Some(3)).await;
+        let stuck = format!("fin-stuck-{}", crate::tid::now_micros());
+        assert!(join(levels(&stuck, 1, 2), store.clone()).await.is_err());
+        assert_eq!(new.finalize_level(2, "op").await.unwrap().target, None);
+        assert_eq!(new.read_version().await.unwrap().unwrap().0.target, None);
+        assert!(join(levels(&stuck, 1, 2), store.clone()).await.is_ok());
+        assert!(matches!(new.finalize_level(1, "op").await, Err(FinalizeError::Invalid(_))), "never lowered");
+        // the old build can't come back
+        assert!(join(levels(&old_id, 1, 1), store.clone()).await.is_err());
+        assert_eq!(refused(&old_id).len(), 1);
+        version::set_active(1);
+    }
+
+    /// A lease of a dead node whose log we fenced doesn't block a raise.
+    #[tokio::test]
+    async fn finalize_ignores_fenced_dead_leases() {
+        let store = Store::memory(None);
+        let old = join(levels("fen-old", 1, 1), store.clone()).await.unwrap();
+        let new = join(levels("fen-new", 1, 2), store.clone()).await.unwrap();
+        assert!(new.finalize_level(2, "op").await.is_err());
+        new.fence(&old.log_id).await.unwrap();
+        assert_eq!(new.finalize_level(2, "op").await.unwrap().active, 2);
+        version::set_active(1);
+    }
+
+    /// The race the target exists for: an old-range node reads the level
+    /// before the raise and writes its lease after the raise listed the
+    /// leases. It re-reads the object once its lease exists and refuses
+    /// (deleting its lease). Either the raise aborts or the node exits 7,
+    /// in every interleaving.
+    #[tokio::test]
+    async fn finalize_races_a_joining_old_node() {
+        refusals();
+        // deterministic: the whole raise runs between the joiner's first
+        // check and its lease write
+        let store = Store::memory(None);
+        put_version(&store, 1, None).await;
+        let new = join(levels("race-new", 1, 2), store.clone()).await.unwrap();
+        let old_id = format!("race-old-{}", crate::tid::now_micros());
+        let n = new.clone();
+        let raise = Box::pin(async move {
+            assert_eq!(n.finalize_level(2, "op").await.unwrap().active, 2, "the joiner had no lease yet");
+        });
+        let r = Cluster::join_inner(levels(&old_id, 1, 1), store.clone(), Some(raise)).await;
+        assert!(r.is_err(), "refused after its lease write");
+        assert_eq!(refused(&old_id).len(), 1);
+        assert!(!objects(&store, "nodes").await.iter().any(|o| o.ends_with(&old_id)), "its lease is deleted");
+        // the other order: the lease lands first, so the raise aborts
+        let store = Store::memory(None);
+        put_version(&store, 1, None).await;
+        let new = join(levels("race-new2", 1, 2), store.clone()).await.unwrap();
+        let _old = join(levels("race-old2", 1, 1), store.clone()).await.unwrap();
+        assert!(matches!(new.finalize_level(2, "op").await, Err(FinalizeError::Incompatible { .. })));
+        assert_eq!(new.read_version().await.unwrap().unwrap().0.active, 1);
+        // concurrently, with jitter: never both
+        for i in 0..20u64 {
+            let store = Store::memory(None);
+            put_version(&store, 1, None).await;
+            let new = join(levels(&format!("racer-new-{i}"), 1, 2), store.clone()).await.unwrap();
+            let old_id = format!("racer-old-{i}-{}", crate::tid::now_micros());
+            let (n, s, oid) = (new.clone(), store.clone(), old_id.clone());
+            let raise = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_micros(rand::random::<u64>() % 3000)).await;
+                n.finalize_level(2, "op").await
+            });
+            let joiner = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_micros(rand::random::<u64>() % 3000)).await;
+                Cluster::join(levels(&oid, 1, 1), s).await
+            });
+            let (raised, joined) = (raise.await.unwrap(), joiner.await.unwrap());
+            assert!(!(raised.is_ok() && joined.is_ok()), "round {i}: a level-1-only node runs at level 2");
+            if joined.is_ok() {
+                assert!(matches!(raised, Err(FinalizeError::Incompatible { .. })), "round {i}: {raised:?}");
+            }
+            if raised.is_ok() {
+                assert!(!objects(&store, "nodes").await.iter().any(|o| o.ends_with(&old_id)), "round {i}: no lease left");
+            }
+        }
+        version::set_active(1);
+    }
+
+    /// An older node's read-modify-CAS of an assignment keeps the fields a
+    /// newer level added (acquire and release both rewrite it).
+    #[tokio::test]
+    async fn old_node_round_trips_unknown_assignment_fields() {
+        let store = Store::memory(None);
+        let mut c = cfg("rt");
+        c.shards = 2;
+        let a = join(c, store.clone()).await.unwrap();
+        let path = a.path(&format!("assign/{}", ShardId(0).key()));
+        let raw = serde_json::json!({"owner": null, "log_id": null, "addr": null, "epoch": 3, "seq_floor": 0, "history": [], "placement": {"zone": "b"}});
+        store.raw.put(&path, PutPayload::from(serde_json::to_vec(&raw).unwrap())).await.unwrap();
+        let (_, ha) = host();
+        a.step(&ha).await.unwrap();
+        assert!(a.is_owner(ShardId(0)));
+        let got: serde_json::Value = serde_json::from_slice(&store.raw.get(&path).await.unwrap().bytes().await.unwrap()).unwrap();
+        assert_eq!((got["epoch"].as_u64(), &got["placement"]), (Some(4), &serde_json::json!({"zone": "b"})), "acquired: {got}");
+        a.release(ShardId(0), 1, 0, None, None).await.unwrap();
+        let got: serde_json::Value = serde_json::from_slice(&store.raw.get(&path).await.unwrap().bytes().await.unwrap()).unwrap();
+        assert_eq!((&got["owner"], &got["placement"]), (&serde_json::Value::Null, &serde_json::json!({"zone": "b"})), "released: {got}");
     }
 }

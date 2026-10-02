@@ -66,7 +66,8 @@ it is marked **(unverified)**.
 |---|---|
 | Liveness | `GET /xrpc/_health` -> `{"version":"vlpds"}` |
 | Metrics | `GET /metrics` (Prometheus text) |
-| Cluster view (admin) | `GET /xrpc/vlpds.admin.getClusterStatus` with `Authorization: Basic base64(admin:$VLPDS_ADMIN_TOKEN)`. Returns `node`, `log`, `logDurableOrdinal`, `owned` (shard ids), `shards`, `table` (owner per shard in slot order, `null` = unowned), `layout` (`version`, `shards`, `op` = split/merge in progress), `leaseValid`, `leaseExpiresMs`, `fencedLogs`, `firehose.{lastEmitted,minWatermark,sources[{log,watermark,local}]}`, and `nodes[]` with each peer's `reachable`, `leaseValid`, `logDurableOrdinal`, `owned` count, `writer`, `expiresMs` (peers fetched with a 1.5 s timeout). |
+| Cluster view (admin) | `GET /xrpc/vlpds.admin.getClusterStatus` with `Authorization: Basic base64(admin:$VLPDS_ADMIN_TOKEN)`. Returns `node`, `log`, `logDurableOrdinal`, `owned` (shard ids), `shards`, `table` (owner per shard in slot order, `null` = unowned), `layout` (`version`, `shards`, `op` = split/merge in progress), `leaseValid`, `leaseExpiresMs`, `fencedLogs`, `firehose.{lastEmitted,minWatermark,sources[{log,watermark,local}]}`, `version` (feature levels: `active`, `target` while a raise runs, `history`, this build's `binary.{min,max,rev}`, `mixedBuilds`, `revs`, `finalizable`, `finalizedAt`; see [Rolling upgrade](#rolling-upgrade-finalize-rollback)), and `nodes[]` with each peer's `reachable`, `leaseValid`, `logDurableOrdinal`, `owned` count, `writer`, `expiresMs`, `rev`, `minLevel`, `maxLevel`, `seenLevel` (peers fetched with a 1.5 s timeout). |
+| Feature level raise (admin) | `POST /xrpc/vlpds.admin.setFeatureLevel {"level": N}` (CLI `vlpds admin cluster finalize`): 200 with the new `cluster/version`; 409 `IncompatibleNodes` names live nodes whose build can't run N (nothing changed); 400 below the active level or past the asked node's build. |
 | Cluster view (node-to-node) | `GET /internal/v1/cluster` with header `x-vlpds-internal: $VLPDS_INTERNAL_TOKEN`: this node's `owned`, `table`, `layout`, `peers`, `lease_valid`, `log_durable_ordinal`, `firehose_last_emitted`, `firehose_min_watermark`. |
 | Operator console | `/admin` (Cluster page polls getClusterStatus), `/admin/metrics` (live metrics). |
 | Shard layout | `vlpds admin layout --url http://<node>:2583` (`VLPDS_ADMIN_TOKEN` env), or `GET /xrpc/vlpds.admin.getShardLayout`. Also `shard-split`, `shard-merge`, `reshard-abort` (abort only before the flip). |
@@ -92,6 +93,7 @@ curl -s -u "admin:$VLPDS_ADMIN_TOKEN" http://NODE:2583/xrpc/vlpds.admin.getClust
 | 4 | `state_apply` | SlateDB apply of a durable segment failed | `state apply failed: ...; exiting` |
 | 5 | `lease_lost` / `lease_lapsed` | Lease lost or lapsed (any reason) | `node lease lost unexpectedly: fail-stop` (`lease_lost`), preceded by one of: `node lease lost (CAS conflict)`, `node lease lapsed before renewal`, `node lease lapsed past takeover` (watchdog), `a shard we hold was reassigned`, `a shard failed to close cleanly`, `our log did not quiesce`; or `node lease lapsed before segment PUT` / `before ack` (`lease_lapsed`) |
 | 6 | `signature_fault` | 3 signatures failed verification right after signing within a minute (suspected memory/CPU fault; see [VlpdsSignatureFault](#vlpdssignaturefault)) | `repeated signature faults: fail-stop (suspect this host's memory or CPU)`, preceded by `signature failed verification against the signing key's public key` (purpose, recent) |
+| 7 | `incompatible_level` | This build can't run the cluster's feature level (`cluster/version`): checked before the node reads or writes anything, again right after its lease write (lease deleted), and once per TTL while running. An old image after a finalize, or a new image whose `MIN_LEVEL` is past the cluster's (see [VlpdsIncompatibleNode](#vlpdsincompatiblenode)) | `incompatible feature level: cluster level N is outside this build's levels A..=B` / `cluster is raising its level to N, past this build's max level B; fail-stop (exit 7)` |
 
 **How the previous process ended** is a metric on the next one
 (`src/lifecycle.rs`): each fail-stop writes its `reason` and code to the
@@ -154,7 +156,8 @@ refuse without `--yes`.
 | `rebuild-repo DID` | `vlpds admin rebuild-repo DID [--dry-run] [--yes]` | `vlpds.admin.rebuildRepo`: see below |
 | (none) | `vlpds admin check-repo DID` | `vlpds.admin.checkRepo`: see below |
 | `sequencer-recovery`, `recovery-repair-repos`, `rotate-keys-recovery` | (none) | no single sequencer DB to replay: durability is the log + SlateDB per shard (DESIGN "Backups and restore") |
-| (none) | `vlpds admin cluster-status` | `vlpds.admin.getClusterStatus`: this node, layout, unowned shards, firehose, a row per node (`*` = the one asked) |
+| (none) | `vlpds admin cluster-status` (or `cluster status`) | `vlpds.admin.getClusterStatus`: this node, layout, unowned shards, firehose, feature level (and the finalize/mixed-builds banner), a row per node (`*` = the one asked) with its rev and level window |
+| (none) | `vlpds admin cluster finalize [--level N] [--yes]` | `vlpds.admin.setFeatureLevel` (default N = active + 1; asks first): [Rolling upgrade](#rolling-upgrade-finalize-rollback) |
 | (none) | `vlpds admin layout`, `shard-split`, `shard-merge`, `reshard-abort` | [Shard split / merge](#shard-split--merge) |
 
 Per-DID batches (`publish-identity`, `rotate-keys`) run one DID at a time,
@@ -283,9 +286,65 @@ node's log` in the observer's logs; the dead node's exit code.
 **Means:** more than one `rev` in `vlpds_build_info` for over an hour. Normal
 for the minutes of a rolling deploy.
 
-**Do:** finish or roll back the deploy. **(unverified)** Mixed-version clusters are
-not tested beyond a deploy window; segment format changes (e.g. `VLSEG06`) need
-every reader upgraded before a writer emits the new format.
+**Do:** finish or roll back the deploy ([Rolling upgrade](#rolling-upgrade-finalize-rollback)).
+Mixed builds are safe while the cluster's feature level is one every node's
+build can run (they all write that level's formats); `vlpds admin
+cluster-status` shows each node's rev and level window. **(not yet tested
+with two real builds: the two-build HA scenarios are TODO.md)**
+
+### VlpdsFormatErrors
+
+**Means:** a node failed to decode something on an unknown or malformed
+format marker (`vlpds_format_errors_total{format}`): `segment` (magic not in
+this build's levels, or unknown codec), `log_stream` (a peer sent a message
+type this build doesn't know: skipped), `applied_marker` (a shard's
+`meta/applied2` doesn't decode: the shard won't open), `cluster_version`
+(`cluster/version` unreadable). With levels working this never happens: a
+writer emits a format only once its level is active, and only builds that can
+read it run.
+
+**Confirm:** the node's logs at that time (`bad segment magic`, `skipping a
+log stream message of an unknown type`, `malformed applied marker`);
+`vlpds admin cluster-status`: is a node on a build whose `maxLevel` is above
+the active level writing early (a bug), or is the object corrupt?
+
+**Do:** stop the writer that emits it if one build is at fault (roll it
+back: before finalize that is a plain redeploy). Corruption of a segment or
+marker: treat like [VlpdsShardOpenErrors](#vlpdsshardopenerrors). Never edit
+`cluster/version` by hand.
+
+### VlpdsIncompatibleNode
+
+**Means:** the previous process on this node exited 7 `incompatible_level`:
+its build can't run the cluster's feature level (`cluster/version`), so it
+left before reading or writing anything. A process looping on exit 7 never
+serves `/metrics` (it stops before serving), so expect
+[VlpdsNodeDown](#vlpdsnodedown) for it too; this alert shows once a good
+image runs there again.
+
+**Confirm:** the node's log line `incompatible feature level: ...` names the
+active level (and a raise `target`, if one was running) and its build's
+window; `vlpds admin cluster-status` shows `version.active`.
+
+**Do:** deploy a build whose level window contains the active level (the
+current release). After a finalize, an older image can never rejoin: that
+is by design (rollback after finalize is forward-fix only). A raise in
+progress (`target` set) that made a starting node refuse finishes or aborts
+by itself within seconds; start the node again afterwards. A `target` that
+stays (the finalizing node died between its steps; `cluster-status` keeps
+saying "raising to N") is cleared by `vlpds admin cluster finalize --level
+<active> --yes`.
+
+### VlpdsFeatureLevelUnfinalized
+
+**Means:** for 14 days every node has run a build that supports a higher
+feature level than the cluster's active one. Fine during a soak, but the
+upgrade was never finished, and the next release can't drop support for the
+old formats while the window is open.
+
+**Do:** if the build has soaked cleanly, finalize ([Rolling
+upgrade](#rolling-upgrade-finalize-rollback) step 4). If not, decide whether
+to roll back instead.
 
 ### VlpdsShardsUnowned
 
@@ -1167,6 +1226,52 @@ For local e2e runs, point `--plc-url` at a local did-method-plc server
    commit p99 and `vlpds_write_retries_total` back to baseline.
 5. Expect: zero client errors for a clean SIGTERM (3-8 when a forward is in
    flight at exit, per DESIGN), resend bursts, cold-load latency on moved repos.
+
+### Rolling upgrade, finalize, rollback
+
+Every format a node persists or sends belongs to a **feature level**
+(`src/version.rs`; DESIGN.md "Rolling upgrades and format versioning"). A
+build runs levels `MIN_LEVEL..=MAX_LEVEL` (its release notes list them, and
+whether each is persistent); the cluster's **active** level is in
+`cluster/version`, and every node writes that level's formats whatever its
+build. A new build therefore writes byte for byte what the old one writes
+until the level is raised, which is what makes rollback a plain redeploy.
+
+**Upgrade** to build B (`MAX_LEVEL = L+1`) on a cluster at level L:
+
+1. Pre-flight: `vlpds admin cluster-status` shows every node healthy and
+   `Feature level: L active`; B's `MIN_LEVEL <= L` (a build whose `MIN_LEVEL`
+   is past the active level refuses to start: exit 7).
+2. Roll B out exactly as [Rolling deploy](#rolling-deploy) (SIGTERM, >= 60 s
+   stop timeout, same `--node-id`, step 4's checks between nodes), plus: the
+   restarted node's row shows B's rev and `1..=L+1`-style levels, and
+   `vlpds_format_errors_total` stays flat.
+3. Soak with the whole fleet on B at level L (default 24 h). The console's
+   Cluster page and `cluster-status` say "every node can run level L+1:
+   finalize available". **Rollback is a plain redeploy** of the previous
+   build, node by node, in any order, at any time.
+4. Finalize: `vlpds admin cluster finalize --level L+1` (asks; `--yes` off a
+   terminal). It writes a raise `target`, lists every lease after that write
+   and requires each live node's build to run L+1 (else it clears the target
+   and names the nodes: 409 `IncompatibleNodes`, nothing changed), then sets
+   `active = L+1`. A node starting during the raise re-reads the object
+   after its lease write and exits 7 if it can't run L+1. Watch format
+   errors, commit p99 and firehose watermark lag for one TTL. **From now on
+   rollback is forward-fix only.**
+
+**Rollback before finalize:** redeploy the previous image node by node with
+the same procedure. Nothing to clean up: no byte of level L+1 exists.
+
+**Rollback after finalize:** not possible by redeploy (the old build exits 7
+`incompatible_level` at startup, before touching data: VlpdsIncompatibleNode).
+Ship B' = B + fix. A level that only gates wire behavior (non-persistent) could
+be lowered again; `cluster lower` is not built yet (TODO.md), and a persistent
+level is never lowered (restore from a backup taken at the old level instead).
+
+Feature levels never change by themselves: a node never raises the level at
+startup, and finalize is the only writer of `cluster/version` after its
+creation (a fresh prefix starts at its first node's max level; a prefix from
+before levels existed at 1).
 
 ### Replacing a dead host
 

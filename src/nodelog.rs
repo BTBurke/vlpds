@@ -489,11 +489,19 @@ pub fn encode_marker(log_id: &str, ordinal: u64) -> Vec<u8> {
     b
 }
 
-pub fn decode_marker(b: &[u8]) -> Option<(String, u64)> {
-    let n = u16::from_be_bytes(b.get(..2)?.try_into().ok()?) as usize;
-    let id = String::from_utf8(b.get(2..2 + n)?.to_vec()).ok()?;
-    let ord = u64::from_be_bytes(b.get(2 + n..10 + n)?.try_into().ok()?);
-    Some((id, ord))
+/// Decodes an applied marker. Anything but exactly `encode_marker`'s bytes
+/// is an error, never "no marker" (which would replay every span).
+pub fn decode_marker(b: &[u8]) -> anyhow::Result<(String, u64)> {
+    let parsed = (|| {
+        let n = u16::from_be_bytes(b.get(..2)?.try_into().ok()?) as usize;
+        let id = String::from_utf8(b.get(2..2 + n)?.to_vec()).ok()?;
+        let ord = u64::from_be_bytes(b.get(2 + n..10 + n)?.try_into().ok()?);
+        (b.len() == 10 + n).then_some((id, ord))
+    })();
+    parsed.ok_or_else(|| {
+        crate::version::format_error("applied_marker");
+        anyhow::anyhow!("malformed applied marker ({} bytes)", b.len())
+    })
 }
 
 impl NodeLog {
@@ -1098,8 +1106,11 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
     use futures::StreamExt;
     // per shard: the spans still to apply, with the ordinal to start from
     let mut todo: Vec<Vec<(Span, u64)>> = Vec::with_capacity(shards.len());
-    for (_, db, history) in shards {
-        let marker = db.get(META_APPLIED).await?.and_then(|b| decode_marker(&b));
+    for (shard, db, history) in shards {
+        let marker = match db.get(META_APPLIED).await? {
+            Some(b) => Some(decode_marker(&b).map_err(|e| e.context(format!("shard {shard}")))?),
+            None => None,
+        };
         let first = match &marker {
             Some((log, ord)) => marker_span(history, log, *ord).unwrap_or(0),
             None => 0,
@@ -1275,6 +1286,31 @@ mod tests {
         db.write(wb).await.unwrap();
         assert_eq!(replay_many(&store, &[(shard, &db, &history)]).await.unwrap(), 1);
         assert!(db.get(b"a3").await.unwrap().is_some());
+    }
+
+    /// A marker that doesn't decode is an error (the shard doesn't open),
+    /// never "no marker": that would replay every span over newer state.
+    #[tokio::test]
+    async fn malformed_applied_marker_is_an_error() {
+        assert_eq!(decode_marker(&encode_marker("A.1", 7)).unwrap(), ("A.1".to_string(), 7));
+        let good = encode_marker("A", 1);
+        let before = crate::metrics::FORMAT_ERRORS.with_label_values(&["applied_marker"]).get();
+        let trailing = [good.as_slice(), b"x".as_slice()].concat();
+        let bads: [&[u8]; 4] = [&good[..good.len() - 1], &trailing, b"", b"\x00\x09abc"];
+        for bad in bads {
+            assert!(decode_marker(bad).is_err(), "{bad:?}");
+        }
+        assert!(crate::metrics::FORMAT_ERRORS.with_label_values(&["applied_marker"]).get() >= before + 4);
+        let store = Store::memory(None);
+        let shard = ShardId(70_008);
+        put_seg(&store, "A", 0, shard, 1, "a0").await;
+        let db = crate::partition::open_db(&store, shard, None).await.unwrap();
+        let mut wb = WriteBatch::new();
+        wb.put(META_APPLIED, b"\x00\x05AB");
+        db.write(wb).await.unwrap();
+        let err = replay_many(&store, &[(shard, &db, &[span("A", 1, 0, None)])]).await.unwrap_err();
+        assert!(format!("{err:#}").contains("malformed applied marker"), "{err:#}");
+        assert!(db.get(b"a0").await.unwrap().is_none(), "nothing replayed");
     }
 
     #[test]

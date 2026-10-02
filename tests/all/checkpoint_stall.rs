@@ -35,7 +35,7 @@ async fn node(stagger: bool, every: Duration, shards: u32, store_ms: u64) -> Tes
 async fn markers(s: &TestServer) -> Vec<Option<(String, u64)>> {
     let mut v = Vec::new();
     for p in s.app.partitions.owned() {
-        v.push(p.db.get(vlpds::nodelog::META_APPLIED).await.unwrap().and_then(|b| vlpds::nodelog::decode_marker(&b)));
+        v.push(p.db.get(vlpds::nodelog::META_APPLIED).await.unwrap().map(|b| vlpds::nodelog::decode_marker(&b).unwrap()));
     }
     v
 }
