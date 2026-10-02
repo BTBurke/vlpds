@@ -61,13 +61,12 @@ thread_local! {
     static TEST_SKEW_US: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
 }
 
-/// Test seam: shifts this thread's wall clock (e.g. a backward NTP step).
+/// Shifts this thread's wall clock (e.g. a backward NTP step).
 #[cfg(test)]
 pub fn set_test_skew_us(us: i64) {
     TEST_SKEW_US.with(|s| s.set(us));
 }
 
-/// Process-wide monotonic TID source (record keys).
 pub struct TidClock {
     last: AtomicU64,
     clock_id: u64,
@@ -103,7 +102,7 @@ impl Default for TidClock {
     }
 }
 
-/// Next repo rev: the current time, but strictly after `prev`.
+/// The current time, but strictly after `prev`.
 pub fn next_rev(prev: Option<Tid>, clock_id: u64) -> Tid {
     let now = Tid::from_parts(now_micros(), clock_id);
     match prev {

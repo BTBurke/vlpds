@@ -1,50 +1,29 @@
-//! Entry caps of the in-memory caches (verified tokens, proxy accounts and
-//! service JWTs, DID documents, resolved lexicons, OAuth clients, per-DID
-//! revocations and takedowns), sized from
-//! one memory budget: by default [`DEFAULT_BUDGET_FRACTION`] of the memory
-//! this process may use (physical RAM, or the cgroup limit when lower),
-//! split between the caches by weight and divided by each one's approximate
-//! entry size. `--cache-budget-mb` sets the budget, `--cache-entries`
-//! overrides single caps. The caps are process-wide (most caches are
-//! statics): [`apply`] sets them at startup and every cache reads its cap
-//! when it inserts, so a lowered cap applies on the next insert into a full
-//! shard. Entry counts are exported per cache, with approximate bytes
-//! (entries × the estimate), at /metrics.
+//! Entry caps of the in-memory caches, sized from one memory budget (by
+//! default a fraction of the process's memory) split by weight and divided
+//! by each cache's approximate entry size. The caps are process-wide (most
+//! caches are statics) and read on every insert, so a lowered cap applies
+//! on the next insert into a full shard.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 
-/// Default cache budget: this fraction of the memory available to the process.
 pub const DEFAULT_BUDGET_FRACTION: f64 = 0.10;
-/// Assumed memory when neither RAM nor a cgroup limit can be read.
 const FALLBACK_MEMORY: u64 = 4 << 30;
-/// No cap goes below this (a tiny budget still caches something).
 const MIN_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cache {
-    /// Legacy session access tokens, verified (src/auth.rs).
     SessionTokens,
-    /// OAuth access tokens, verified and decoded (xrpc/authn.rs).
     OAuthTokens,
-    /// Proxy fast path: account signing key + status (xrpc/proxy.rs).
     ProxyAccounts,
-    /// Proxy fast path: minted service JWTs.
     ProxyJwts,
-    /// Resolved DID documents (did_resolver.rs).
     DidDocs,
-    /// Dynamically resolved record lexicons, compiled (lexicon.rs).
     Lexicons,
-    /// OAuth client metadata + JWKS (oauth/client.rs).
     OAuthClients,
-    /// Permission-set lexicons for `include:` scopes (oauth/lexicon.rs).
     PermissionSets,
-    /// Per-DID session revocations + record/blob takedowns (xrpc/server.rs `ctl`).
     SecurityControls,
-    /// Unwrapped repo signing keys (secrets.rs): a miss is a KEK unwrap
-    /// (a Cloud KMS round trip in production).
+    /// A miss is a KEK unwrap (a Cloud KMS round trip in production).
     SigningKeys,
-    /// Per-repo recent writes for proxied read-after-write (recent_writes.rs).
     RecentWrites,
 }
 
@@ -109,7 +88,7 @@ impl Cache {
         }
     }
 
-    /// Share of the budget, in percent (the weights sum to 100).
+    /// Percent of the budget; the weights sum to 100.
     fn weight(self) -> u64 {
         match self {
             Cache::SessionTokens => 25,
@@ -141,12 +120,10 @@ impl std::str::FromStr for Cache {
     }
 }
 
-/// Entry caps, one per [`Cache`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Caps([usize; N]);
 
 impl Caps {
-    /// Caps for a total budget of `bytes`, split by weight.
     pub fn from_budget(bytes: u64) -> Caps {
         Caps(Cache::ALL.map(|c| ((bytes / 100 * c.weight()) as usize / c.entry_bytes()).max(MIN_ENTRIES)))
     }
@@ -159,7 +136,6 @@ impl Caps {
         self.0[c.idx()] = entries.max(1);
     }
 
-    /// Approximate bytes of all caches when full.
     pub fn total_bytes(&self) -> u64 {
         Cache::ALL.iter().map(|c| (self.get(*c) * c.entry_bytes()) as u64).sum()
     }
@@ -187,8 +163,7 @@ pub fn parse_overrides(v: &[String]) -> anyhow::Result<Vec<(Cache, usize)>> {
         .collect()
 }
 
-/// The memory this process may use: physical RAM, or the cgroup limit when
-/// lower. None if neither can be read.
+/// Physical RAM, or the cgroup limit when lower.
 pub fn memory_bytes() -> Option<u64> {
     match (sys::physical_memory(), sys::cgroup_limit()) {
         (Some(p), Some(c)) => Some(p.min(c)),
@@ -196,8 +171,7 @@ pub fn memory_bytes() -> Option<u64> {
     }
 }
 
-/// Caps for `budget` bytes (None: [`DEFAULT_BUDGET_FRACTION`] of
-/// [`memory_bytes`]) with `overrides` applied. Also returns the budget.
+/// Also returns the budget (None: [`DEFAULT_BUDGET_FRACTION`] of [`memory_bytes`]).
 pub fn resolve(budget: Option<u64>, overrides: &[(Cache, usize)]) -> (Caps, u64) {
     let budget = budget.unwrap_or_else(|| (memory_bytes().unwrap_or(FALLBACK_MEMORY) as f64 * DEFAULT_BUDGET_FRACTION) as u64);
     let mut caps = Caps::from_budget(budget);
@@ -209,24 +183,20 @@ pub fn resolve(budget: Option<u64>, overrides: &[(Cache, usize)]) -> (Caps, u64)
 
 static CAPS: LazyLock<[AtomicUsize; N]> = LazyLock::new(|| resolve(None, &[]).0 .0.map(AtomicUsize::new));
 
-/// Sets the process-wide caps (server startup).
 pub fn apply(caps: &Caps) {
     for (a, n) in CAPS.iter().zip(caps.0) {
         a.store(n, Ordering::Relaxed);
     }
 }
 
-/// The current cap of `c` (entries).
 pub fn cap(c: Cache) -> usize {
     CAPS[c.idx()].load(Ordering::Relaxed)
 }
 
-/// The caps in force.
 pub fn current() -> Caps {
     Caps(Cache::ALL.map(cap))
 }
 
-/// A cache whose entries can be counted (for metrics).
 pub trait Len: Send + Sync {
     fn len(&self) -> usize;
 }
@@ -245,8 +215,7 @@ impl<K: Send + Sync, V: Send + Sync> Len for parking_lot::RwLock<std::collection
 
 static TRACKED: LazyLock<parking_lot::Mutex<Vec<(Cache, Weak<dyn Len>)>>> = LazyLock::new(Default::default);
 
-/// Registers `cache` for the entry-count metrics (until it is dropped) and
-/// returns it.
+/// Registers `cache` for the entry-count metrics until it is dropped.
 pub fn track<T: Len + 'static>(kind: Cache, cache: Arc<T>) -> Arc<T> {
     let w: Weak<dyn Len> = Arc::downgrade(&cache) as Weak<dyn Len>;
     let mut t = TRACKED.lock();
@@ -255,7 +224,7 @@ pub fn track<T: Len + 'static>(kind: Cache, cache: Arc<T>) -> Arc<T> {
     cache
 }
 
-/// Entries per cache, summed over its live instances.
+/// Summed over each cache's live instances.
 pub fn entries() -> Caps {
     let live: Vec<(Cache, Arc<dyn Len>)> = TRACKED.lock().iter().filter_map(|(c, w)| Some((*c, w.upgrade()?))).collect();
     let mut n = [0usize; N];
@@ -265,7 +234,6 @@ pub fn entries() -> Caps {
     Caps(n)
 }
 
-/// Updates the `vlpds_cache_*` gauges (called by /metrics).
 pub fn refresh_metrics() {
     let n = entries();
     for c in Cache::ALL {

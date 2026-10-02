@@ -24,9 +24,7 @@ use crate::tid::Tid;
 use bytes::{BufMut, Bytes};
 use sha2::{Digest, Sha256};
 
-/// First byte of every slot-major key.
 pub const SLOT_TAG: u8 = 0x01;
-/// Tag + slot bytes in front of a key's family.
 pub const SLOT_PREFIX_LEN: usize = 3;
 
 pub fn slot_prefix(slot: u16) -> [u8; SLOT_PREFIX_LEN] {
@@ -34,8 +32,8 @@ pub fn slot_prefix(slot: u16) -> [u8; SLOT_PREFIX_LEN] {
     [SLOT_TAG, a, b]
 }
 
-/// `slots::slot_of`, remembering the last DID per thread: a commit builds
-/// ~10 keys of one repo, and the slot is a SHA-256 of the DID.
+/// Remembers the last DID per thread: a commit builds ~10 keys of one
+/// repo, and the slot is a SHA-256 of the DID.
 fn slot_cached(routing: &str) -> u16 {
     thread_local! {
         static LAST: std::cell::RefCell<(String, u16)> = const { std::cell::RefCell::new((String::new(), 0)) };
@@ -51,7 +49,6 @@ fn slot_cached(routing: &str) -> u16 {
     })
 }
 
-/// `0x01 ‖ slot(routing) ‖ fam ‖ parts...`
 fn keyed(routing: &str, fam: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     let len = SLOT_PREFIX_LEN + fam.len() + parts.iter().map(|p| p.len()).sum::<usize>();
     let mut k = Vec::with_capacity(len);
@@ -63,22 +60,20 @@ fn keyed(routing: &str, fam: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     k
 }
 
-/// Where family `fam` starts inside `slot`.
 pub fn slot_family(slot: u16, fam: &[u8]) -> Vec<u8> {
     [&slot_prefix(slot)[..], fam].concat()
 }
 
-/// The slot of a slot-major key.
 pub fn key_slot(key: &[u8]) -> Option<u16> {
     (key.len() >= SLOT_PREFIX_LEN && key[0] == SLOT_TAG).then(|| u16::from_be_bytes([key[1], key[2]]))
 }
 
-/// A slot-major key without its tag and slot: family ‖ rest.
+/// family ‖ rest.
 pub fn key_body(key: &[u8]) -> &[u8] {
     key.get(SLOT_PREFIX_LEN..).unwrap_or_default()
 }
 
-/// The key range holding slots [lo, hi) (hi <= 65,536): a shard's state.
+/// Slots [lo, hi), hi <= 65,536.
 pub fn slot_range_keys(lo: u32, hi: u32) -> (Bytes, Bytes) {
     let at = |s: u32| -> Bytes {
         if s >= crate::slots::SLOTS {
@@ -98,7 +93,7 @@ pub fn account_key(did: &str) -> Vec<u8> {
     keyed(did, b"a/", &[did.as_bytes()])
 }
 
-/// Handle index entry of `did`'s account (in `did`'s slot).
+/// In `did`'s slot.
 pub fn handle_key(did: &str, handle: &str) -> Vec<u8> {
     keyed(did, b"n/", &[handle.as_bytes()])
 }
@@ -107,17 +102,15 @@ pub const HEAD_FAMILY: &[u8] = b"h/";
 pub const ACCOUNT_FAMILY: &[u8] = b"a/";
 pub const PRIVATE_FAMILY: &[u8] = b"p/";
 
-/// Collection index: which repos have records in a collection.
 pub fn collection_key(collection: &str, did: &str) -> Vec<u8> {
     keyed(did, b"C/", &[collection.as_bytes(), b"\0", did.as_bytes()])
 }
 
-/// The family (for [`FamilyScan`]) of a collection's index entries.
+/// For [`FamilyScan`].
 pub fn collection_family(collection: &str) -> Vec<u8> {
     [b"C/", collection.as_bytes(), b"\0"].concat()
 }
 
-/// Blob refs: b/{did}\0{blob cid}\0{record path}
 pub fn blob_ref_key(did: &str, blob: &crate::cid::Cid, path: &str) -> Vec<u8> {
     keyed(did, b"b/", &[did.as_bytes(), b"\0", blob.to_string().as_bytes(), b"\0", path.as_bytes()])
 }
@@ -126,7 +119,6 @@ pub fn blob_ref_prefix(did: &str) -> Vec<u8> {
     keyed(did, b"b/", &[did.as_bytes(), b"\0"])
 }
 
-/// Private (non-repo) per-account state: p/{did}\0{name}
 pub fn private_key(did: &str, name: &str) -> Vec<u8> {
     keyed(did, b"p/", &[did.as_bytes(), b"\0", name.as_bytes()])
 }
@@ -135,38 +127,31 @@ pub fn private_prefix(did: &str) -> Vec<u8> {
     keyed(did, b"p/", &[did.as_bytes(), b"\0"])
 }
 
-/// A persisted interior MST node of `did`'s current tree: the
-/// node block, keyed by its CID's digest (every node is dag-cbor sha-256).
+/// Keyed by the CID's digest alone: every node is dag-cbor sha-256.
 /// Written and deleted in the commit's state batch, so `M/{did}` holds
 /// exactly the interior nodes of the tree at `h/{did}`'s data root.
 pub fn mst_node_key(did: &str, cid: &Cid) -> Vec<u8> {
     keyed(did, MST_NODE_FAMILY, &[did.as_bytes(), b"\0", &cid.digest])
 }
 
-/// Where `did`'s persisted MST nodes start (one contiguous range).
 pub fn mst_node_prefix(did: &str) -> Vec<u8> {
     keyed(did, MST_NODE_FAMILY, &[did.as_bytes(), b"\0"])
 }
 
 pub const MST_NODE_FAMILY: &[u8] = b"M/";
 
-/// Marks `did` as having a signing-key rotation pending (set and cleared
-/// with `Account::pending_signing_key`), so recovery finds them with one
-/// family scan instead of reading every account row.
+/// Set and cleared with `Account::pending_signing_key`, so recovery finds
+/// pending rotations with one family scan instead of reading every account.
 pub fn key_rotation_key(did: &str) -> Vec<u8> {
     keyed(did, KEY_ROTATION_FAMILY, &[did.as_bytes()])
 }
 
 pub const KEY_ROTATION_FAMILY: &[u8] = b"K/";
 
-/// Backlink index entry: bl/{did}\0{link}, `link` = collection code ‖
-/// subject ([`crate::backlinks::link`]); the value is the rkeys of the
-/// repo's records in that collection with that subject.
 pub fn backlink_key(did: &str, link: &[u8]) -> Vec<u8> {
     keyed(did, b"bl/", &[did.as_bytes(), b"\0", link])
 }
 
-/// Where `did`'s backlink index starts (one contiguous range).
 pub fn backlink_prefix(did: &str) -> Vec<u8> {
     keyed(did, b"bl/", &[did.as_bytes(), b"\0"])
 }
@@ -184,9 +169,8 @@ pub fn record_key(did: &str, path: &str) -> Vec<u8> {
 /// to keep the extra key per record small.
 const RECORD_CID_KEY_BYTES: usize = 8;
 
-/// Record CID index: c/{did}\0{first digest bytes of the cid}{path}. Kept
-/// next to the R/ key in the same batch; the same CID can sit at several
-/// paths (one key each), so lookups scan [`record_cid_prefix`].
+/// The same CID can sit at several paths (one key each), so lookups scan
+/// [`record_cid_prefix`].
 pub fn record_cid_key(did: &str, cid: &Cid, path: &str) -> Vec<u8> {
     [&record_cid_prefix(did, cid)[..], path.as_bytes()].concat()
 }
@@ -195,14 +179,11 @@ pub fn record_cid_prefix(did: &str, cid: &Cid) -> Vec<u8> {
     keyed(did, b"c/", &[did.as_bytes(), b"\0", &cid.digest[..RECORD_CID_KEY_BYTES]])
 }
 
-/// Rows a [`BatchedScan`] reads per `next_batch`.
-pub const SCAN_BATCH: usize = 256;
+const SCAN_BATCH: usize = 256;
 
-/// A scan read [`SCAN_BATCH`] rows at a time with SlateDB's
-/// `DbIterator::next_batch`: rows in loaded blocks come without an await
-/// (or a tracing span) per row down SlateDB's iterator stack, ~half the
-/// instructions per row of `next`. For scans read to (near) their end:
-/// it reads up to a batch ahead of what the caller takes.
+/// `DbIterator::next_batch` skips the await (and tracing span) per row down
+/// SlateDB's iterator stack. For scans read to (near) their end: it reads up
+/// to a batch ahead of what the caller takes.
 pub struct BatchedScan {
     iter: slatedb::DbIterator,
     rows: std::vec::IntoIter<slatedb::KeyValue>,
@@ -213,7 +194,6 @@ impl BatchedScan {
         BatchedScan { iter, rows: Vec::new().into_iter() }
     }
 
-    /// The next row, as `DbIterator::next`.
     pub async fn next(&mut self) -> Result<Option<slatedb::KeyValue>, slatedb::Error> {
         if let Some(kv) = self.rows.next() {
             return Ok(Some(kv));
@@ -222,26 +202,24 @@ impl BatchedScan {
         Ok(self.rows.next())
     }
 
-    /// The next row if it has already been read (no await).
     pub fn next_buffered(&mut self) -> Option<slatedb::KeyValue> {
         self.rows.next()
     }
 }
 
-/// The keys of one family (`b"h/"`, or a narrower prefix such as
+/// The keys of one family (or a narrower prefix such as
 /// [`collection_family`]) across slots, in (slot, key) order. Slot-major
-/// keys interleave families, so one iterator over the whole slot space
-/// `seek`s from the end of a slot's run of the family to the next slot's:
-/// an empty slot costs nothing (the seek lands on the next key that exists)
-/// and a populated one one seek. A shard's DB holds only its own slots
-/// (a projection hides the rest), so no slot bounds are needed.
+/// keys interleave families, so the scan seeks from the end of one slot's
+/// run to the next slot's: an empty slot costs nothing (the seek lands on
+/// the next key that exists). A shard's DB holds only its own slots (a
+/// projection hides the rest), so no slot bounds are needed.
 pub struct FamilyScan {
     iter: slatedb::DbIterator,
     fam: Vec<u8>,
 }
 
 impl FamilyScan {
-    /// From `start` (a full slot-major key, inclusive) or slot 0.
+    /// `start` is a full slot-major key, inclusive; None starts at slot 0.
     pub async fn new<R: slatedb::DbReadOps + ?Sized>(
         db: &R,
         fam: &[u8],
@@ -280,7 +258,6 @@ pub fn slot_did(key: &[u8], fam_len: usize) -> (&[u8], &[u8]) {
     (key.get(1..SLOT_PREFIX_LEN).unwrap_or_default(), key.get(SLOT_PREFIX_LEN + fam_len..).unwrap_or_default())
 }
 
-/// Smallest key greater than every key with this prefix.
 pub fn prefix_end(prefix: &[u8]) -> Vec<u8> {
     let mut end = prefix.to_vec();
     while let Some(last) = end.pop() {
@@ -323,8 +300,7 @@ impl Head {
     }
 }
 
-/// Record value: cid | rev (u64, the commit that last wrote it; drives
-/// getRepo/listBlobs `since`) | record bytes.
+/// cid | rev of the commit that last wrote it (getRepo/listBlobs `since`) | bytes.
 pub fn record_value(cid: &Cid, rev: u64, bytes: &[u8]) -> Bytes {
     let mut b = Vec::with_capacity(CID_BYTES_LEN + 8 + bytes.len());
     b.put_slice(&cid.to_bytes());
@@ -341,13 +317,11 @@ pub fn decode_record_value(v: &Bytes) -> anyhow::Result<(Cid, Bytes)> {
     ))
 }
 
-/// [`decode_record_value`], borrowing the record's bytes.
 pub fn record_value_parts(v: &[u8]) -> anyhow::Result<(Cid, &[u8])> {
     anyhow::ensure!(v.len() >= CID_BYTES_LEN + 8, "short record value");
     Ok((Cid::from_bytes(&v[..CID_BYTES_LEN])?, &v[CID_BYTES_LEN + 8..]))
 }
 
-/// Rev of the commit that last wrote a record value.
 pub fn record_value_rev(v: &[u8]) -> u64 {
     v.get(CID_BYTES_LEN..CID_BYTES_LEN + 8).map(|b| u64::from_be_bytes(b.try_into().unwrap())).unwrap_or(0)
 }
@@ -356,13 +330,11 @@ pub fn record_value_rev(v: &[u8]) -> u64 {
 pub struct Account {
     pub did: String,
     pub handle: String,
-    /// The repo signing key (secp256k1 secret), wrapped under the KEK
-    /// (`secrets::Purpose::SigningKey`, bound to this DID). Never plaintext
-    /// at rest: rows reach the log and SSTs as-is. Unwrap through
+    /// Wrapped under the KEK (`secrets::Purpose::SigningKey`, bound to this
+    /// DID): rows reach the log and SSTs as-is. Unwrap through
     /// `Secrets::account_signing_key` (cached).
     pub wrapped_signing_key: String,
-    /// Its public key (multibase multikey, as in the DID document): readers
-    /// that only need the public half never unwrap.
+    /// Multibase multikey, so readers that only need the public half never unwrap.
     pub signing_pubkey: String,
     pub password_hash: String,
     pub created_at: String,
@@ -373,37 +345,29 @@ pub struct Account {
     pub email: Option<String>,
     #[serde(default)]
     pub email_confirmed: bool,
-    /// A signing key being rotated to (admin.updateAccountSigningKey):
-    /// recorded before the DID document changes and cleared when the repo is
-    /// re-signed with it, or when the rotation is abandoned. Repo writes are
+    /// Recorded before the DID document changes and cleared when the repo is
+    /// re-signed with it or the rotation is abandoned; repo writes are
     /// refused meanwhile (DESIGN.md "Signing-key rotation").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_signing_key: Option<PendingSigningKey>,
-    /// Extension fields owned by individual XRPC modules.
     #[serde(default, flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-/// A rotation's new signing key, as the account row keeps its current one.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingSigningKey {
-    /// Wrapped under the KEK like `Account::wrapped_signing_key`.
     pub wrapped: String,
-    /// Public multibase multikey.
     pub pubkey: String,
 }
 
-/// Concurrent Argon2 hashes and verifications, process-wide: as many as
-/// there are pooled block buffers (one per core, at most 16). Each takes
+/// As many Argon2 runs at once as there are pooled block buffers: each takes
 /// ~20 ms of a core and 19 MiB, so more at once only adds memory and
-/// blocking-pool threads (a login flood used to take up to the whole
-/// 512-thread pool and ~10 GB); the rest wait their turn.
+/// blocking-pool threads.
 static ARGON2_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> = std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*ARGON2_POOL_MAX));
 
-/// How long the `try_` variants wait for an Argon2 permit before shedding.
 pub const ARGON2_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Every Argon2 permit stayed busy for [`ARGON2_MAX_WAIT`]: answer 503.
+/// Answer 503.
 #[derive(Debug, thiserror::Error)]
 #[error("password hashing is saturated; retry shortly")]
 pub struct Argon2Busy;
@@ -417,23 +381,20 @@ async fn argon2_permit(wait: Option<std::time::Duration>) -> Result<tokio::sync:
     Ok(p.expect("the Argon2 semaphore is never closed"))
 }
 
-/// Takes every Argon2 permit until the guard drops: a saturated pool, for
-/// tests of the `try_` variants' shedding (tests/argon2_shed.rs).
+/// Saturates the pool until the guard drops (tests/argon2_shed.rs).
 #[doc(hidden)]
 pub async fn hold_all_argon2_permits() -> tokio::sync::SemaphorePermit<'static> {
     ARGON2_PERMITS.acquire_many(*ARGON2_POOL_MAX as u32).await.expect("the Argon2 semaphore is never closed")
 }
 
-/// Argon2id (OWASP baseline: m=19 MiB, t=2, p=1) PHC string. ~20 ms of CPU,
-/// so it runs on the blocking pool, at most [`ARGON2_PERMITS`] at once
-/// (waits for a turn).
+/// Argon2id PHC string, OWASP baseline parameters. Waits for a permit.
 pub async fn hash_password(password: &str) -> String {
     let _p = argon2_permit(None).await.expect("unbounded wait");
     let pw = password.to_string();
     tokio::task::spawn_blocking(move || hash_password_blocking(&pw)).await.expect("argon2 task")
 }
 
-/// [`hash_password`], shedding ([`Argon2Busy`]) after [`ARGON2_MAX_WAIT`].
+/// Sheds ([`Argon2Busy`]) after [`ARGON2_MAX_WAIT`].
 pub async fn try_hash_password(password: &str) -> Result<String, Argon2Busy> {
     let _p = argon2_permit(Some(ARGON2_MAX_WAIT)).await?;
     let pw = password.to_string();
@@ -449,14 +410,7 @@ pub fn hash_password_blocking(password: &str) -> String {
         .to_string()
 }
 
-/// Checks `password` against a PHC string (waits for an Argon2 permit).
-pub async fn verify_password_hash(phc: &str, password: &str) -> bool {
-    let _p = argon2_permit(None).await.expect("unbounded wait");
-    verify_blocking(phc, password).await
-}
-
-/// [`verify_password_hash`], shedding ([`Argon2Busy`]) after
-/// [`ARGON2_MAX_WAIT`].
+/// Sheds ([`Argon2Busy`]) after [`ARGON2_MAX_WAIT`].
 pub async fn try_verify_password_hash(phc: &str, password: &str) -> Result<bool, Argon2Busy> {
     let _p = argon2_permit(Some(ARGON2_MAX_WAIT)).await?;
     Ok(verify_blocking(phc, password).await)
@@ -476,17 +430,13 @@ fn argon2_params() -> argon2::Params {
     argon2::Params::new(19 * 1024, 2, 1, None).expect("argon2 params")
 }
 
-/// Argon2 with its 19 MiB of block memory reused across hashes. Each hash
-/// used to allocate and free it: with jemalloc that's a fresh mapping
-/// (page faults, zeroing) and an unmap per hash, ~1/3 of createAccount's
-/// CPU at 64 in flight (laptop profile: `RawVec<Block>::drop` 31 %), and on
-/// Linux every unmap takes the process's mmap lock. Same PHC strings as
+/// Argon2 with its 19 MiB of block memory reused across hashes: a fresh
+/// allocation per hash is a new mapping (page faults, zeroing) and an unmap,
+/// which takes the process's mmap lock on Linux. Same PHC strings as
 /// `argon2::Argon2` (`PasswordVerifier` is the blanket impl over this).
 struct PooledArgon2;
 
-/// Idle argon2 block buffers (19 MiB each): one per core, at most 16, so
-/// they hold at most ~300 MiB. Hashing is CPU-bound, so more concurrent
-/// hashes than cores (they allocate their own) gain nothing anyway.
+/// One per core, at most 16 (~300 MiB): hashing is CPU-bound.
 static ARGON2_MEMORY: parking_lot::Mutex<Vec<Vec<argon2::Block>>> = parking_lot::Mutex::new(Vec::new());
 static ARGON2_POOL_MAX: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| std::thread::available_parallelism().map_or(8, |n| n.get()).min(16));
@@ -512,8 +462,7 @@ impl argon2::password_hash::PasswordHasher for PooledArgon2 {
         let output = argon2::password_hash::Output::init_with(params.output_len().unwrap_or(argon2::Params::DEFAULT_OUTPUT_LEN), |out| {
             let mut mem = ARGON2_MEMORY.lock().pop().unwrap_or_default();
             if mem.len() < blocks {
-                // every block is written before it is read: no zeroing needed
-                // beyond what a fresh allocation does
+                // every block is written before it is read
                 mem.resize(blocks, argon2::Block::default());
             }
             let r = ctx.hash_password_into_with_memory(password, salt_bytes, out, &mut mem[..blocks]);
@@ -533,11 +482,10 @@ impl argon2::password_hash::PasswordHasher for PooledArgon2 {
     }
 }
 
-/// Stable across processes and nodes (partition assignment must agree everywhere).
+/// Stable across processes and nodes: partition assignment must agree everywhere.
 pub fn did_hash(did: &str) -> u64 {
     u64::from_be_bytes(Sha256::digest(did.as_bytes())[..8].try_into().unwrap())
 }
-
 
 /// Shard of `did` in the initial uniform layout of `shards` (layout v1).
 /// Splits and merges change it: route with `PartitionTable::shard_of`.
@@ -545,8 +493,7 @@ pub fn partition_of(did: &str, shards: u32) -> crate::slots::ShardId {
     crate::slots::shard_of(did, shards)
 }
 
-/// Deterministic DIDs for bulk-created simulation accounts, so load generators
-/// can address account `i` without a lookup.
+/// Deterministic, so load generators can address bulk account `i` without a lookup.
 pub fn bulk_did(i: u64) -> String {
     let h = Sha256::digest(format!("vlpds-bulk:{i}").as_bytes());
     format!("did:plc:{}", &crate::cid::base32_encode(&h)[..24])
@@ -561,8 +508,6 @@ mod tests {
     use super::*;
     use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 
-    /// Pooled hashing is argon2's hashing: same PHC string for the same
-    /// salt, and each verifies the other's (buffers reused across calls).
     #[test]
     fn pooled_argon2_matches_argon2() {
         let stock = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, argon2_params());
@@ -586,14 +531,15 @@ mod tests {
         assert!(PooledArgon2.verify_password(b"pw", &PasswordHash::new(&h).unwrap()).is_ok());
     }
 
-    /// Argon2 runs at most ARGON2_POOL_MAX at once; with every permit
-    /// taken, a bounded wait sheds and an unbounded one waits its turn.
     #[tokio::test]
     async fn argon2_concurrency_is_bounded() {
         let held = ARGON2_PERMITS.acquire_many(*ARGON2_POOL_MAX as u32).await.unwrap();
         assert!(argon2_permit(Some(std::time::Duration::from_millis(20))).await.is_err());
         let phc = hash_password_blocking("pw");
-        let waiting = tokio::spawn(async move { verify_password_hash(&phc, "pw").await });
+        let waiting = tokio::spawn(async move {
+            let _p = argon2_permit(None).await.unwrap();
+            verify_blocking(&phc, "pw").await
+        });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!waiting.is_finished(), "verified without a permit");
         drop(held);

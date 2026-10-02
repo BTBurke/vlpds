@@ -106,8 +106,7 @@ pub fn spawn_reporter(every: Duration) {
     });
 }
 
-/// Logs when the tokio runtime fails to wake a 10ms ticker on time
-/// (a sign that something is blocking worker threads).
+/// A late 10 ms ticker means something is blocking runtime threads.
 pub fn spawn_stall_detector() {
     tokio::spawn(async {
         let mut last = std::time::Instant::now();

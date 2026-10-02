@@ -1,19 +1,13 @@
-//! The backlink index: reference parity with the reference PDS's `backlink`
-//! table (actor-store/record: `getBacklinks`, `getBacklinkConflicts`), which
-//! createRecord uses to delete a repo's earlier like / repost / follow /
-//! block of the same subject in the same commit as the new one.
+//! The backlink index, for parity with the reference PDS's `backlink` table:
+//! createRecord deletes a repo's earlier like / repost / follow / block of
+//! the same subject in the new record's commit.
 //!
-//! `bl/{did}\0{link}` -> the rkeys (sorted, `\0`-separated) of the repo's
-//! records in the link's collection whose subject is the link's, where
-//! `link` = collection code ‖ subject ([`link`]). One key per (collection,
-//! subject), so the no-conflict check on create is one point read (bloom
-//! filtered: a missing key rarely reads a block).
-//!
-//! The worker writes it in each commit's state batch. A record's put is
-//! derived at replay from the #commit frame (`segment::derive_commit_muts`:
-//! `[rkey]`, the value whenever the subject has one record); the rest
-//! (removals, which need the old record, and keys holding several rkeys)
-//! are stored muts that follow and win. See DESIGN.md "Backlinks".
+//! `bl/{did}\0{link}` -> the rkeys (sorted, `\0`-separated) with that link.
+//! One key per (collection, subject), so the no-conflict check on create is
+//! one bloom-filtered point read. A record's put is derived at replay from
+//! the #commit frame; removals (which need the old record) and keys holding
+//! several rkeys are stored muts that follow and win. See DESIGN.md
+//! "Backlinks".
 
 use crate::cbor::ValueRef;
 use bytes::Bytes;
@@ -21,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// The linked collections: (collection, key code, subject is `subject.uri`
-/// (an AT-URI) rather than `subject` (a DID)).
+/// (collection, key code, subject is `subject.uri` (an AT-URI) rather than
+/// `subject` (a DID)).
 const LINKED: [(&str, u8, bool); 4] = [
     ("app.bsky.feed.like", b'l', true),
     ("app.bsky.feed.repost", b'r', true),
@@ -30,15 +24,15 @@ const LINKED: [(&str, u8, bool); 4] = [
     ("app.bsky.graph.block", b'b', false),
 ];
 
-/// Whether records of `collection` can carry a backlink.
 pub fn linked(collection: &str) -> bool {
     LINKED.iter().any(|(c, ..)| *c == collection)
 }
 
-/// A record's backlink (collection code ‖ subject), as the reference's
-/// `getBacklinks`: a follow or block whose `subject` is a valid DID, a like
-/// or repost whose `subject.uri` is a valid AT-URI, and whose `$type` is
-/// its collection. None for every other record (or bytes that don't decode).
+/// Collection code ‖ subject, as the reference's `getBacklinks`: a follow
+/// or block whose `subject` is a valid DID, a like or repost whose
+/// `subject.uri` is a valid AT-URI, and whose `$type` is its collection.
+/// The validators' verdicts are part of the segment format (replay derives
+/// with them).
 pub fn link(collection: &str, record: &[u8]) -> Option<Vec<u8>> {
     let &(_, code, uri) = LINKED.iter().find(|(c, ..)| *c == collection)?;
     let v = ValueRef::decode(record).ok()?;
@@ -56,13 +50,12 @@ pub fn link(collection: &str, record: &[u8]) -> Option<Vec<u8>> {
     Some(l)
 }
 
-/// The collection of a link's code.
 pub fn collection_of(link: &[u8]) -> Option<&'static str> {
     let code = *link.first()?;
     LINKED.iter().find(|(_, c, _)| *c == code).map(|(c, ..)| *c)
 }
 
-/// Rkeys, sorted.
+/// Sorted.
 pub type Rkeys = Vec<Box<str>>;
 
 pub fn encode(rkeys: &[Box<str>]) -> Bytes {
@@ -88,31 +81,25 @@ fn settled(t: &Tag) -> bool {
     t.as_ref().is_none_or(|f| f.load(Ordering::Acquire))
 }
 
-/// A link (collection code ‖ subject).
+/// Collection code ‖ subject.
 pub type Link = Box<[u8]>;
 
-/// What a repo's worker knows of its backlink index beyond durable state:
-/// the entries its commits in flight wrote (durable state doesn't have
-/// them yet), and those read for the requests it is about to run. The
-/// worker reads the rest from durable state before running a request that
-/// needs it (`worker::Need`), and drops what durable state has again after
-/// each run ([`prune`](Self::prune)), so this holds only in-flight entries
-/// between runs.
+/// A repo worker's backlink entries beyond durable state: those its
+/// in-flight commits wrote (durable state lags them) and those read for the
+/// requests it is about to run. [`prune`](Self::prune) after each run leaves
+/// only in-flight entries.
 #[derive(Default)]
 pub struct Cache {
-    /// Index values by link (empty = no key).
+    /// Empty = no key.
     pub vals: HashMap<Link, (Rkeys, Tag)>,
-    /// The link of the record at a path of a linked collection (None: no
-    /// record, or one without a link).
+    /// The link of the record at a path (None: no record, or no link).
     pub paths: HashMap<Box<str>, (Option<Link>, Tag)>,
-    /// `vals` holds every link with records (the whole index was read:
-    /// an import or account delete replaces or clears it).
+    /// `vals` holds the whole index (an import or account delete read it).
     pub all: bool,
 }
 
 impl Cache {
-    /// Drops the entries durable state holds (read from it, or written by
-    /// commits since applied).
+    /// Drops the entries durable state holds.
     pub fn prune(&mut self) {
         if self.vals.is_empty() && self.paths.is_empty() {
             return;
@@ -122,8 +109,7 @@ impl Cache {
         self.all = false;
     }
 
-    /// Adds what a read of durable state found, under the entries
-    /// already held (newer: written by commits in flight).
+    /// Entries already held are newer (written by commits in flight) and win.
     pub fn install(&mut self, f: Fetched) {
         for (l, v) in f.vals {
             self.vals.entry(l).or_insert((v, None));
@@ -134,13 +120,11 @@ impl Cache {
         self.all |= f.all;
     }
 
-    /// Approximate heap (the worker's cache budget).
     pub fn heap_bytes(&self) -> usize {
         (self.vals.len() + self.paths.len()) * 128
     }
 }
 
-/// Backlink state read from durable state for a repo's queued requests.
 #[derive(Default)]
 pub struct Fetched {
     pub vals: Vec<(Link, Rkeys)>,
