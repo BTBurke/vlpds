@@ -1,40 +1,11 @@
-//! Secrets at rest (DESIGN.md "Secrets at rest"): key material that must be
-//! recoverable (repo signing keys, reserved signing keys, TOTP secrets) is
-//! stored in the bucket only wrapped under a key-encryption key (KEK).
+//! Secrets at rest (DESIGN.md "Secrets at rest"): recoverable key material
+//! is stored only wrapped under a key-encryption key (KEK), with its purpose
+//! and subject as authenticated data so a blob copied into another row or
+//! used for another purpose does not unwrap. Wrapped form: `vw1.{kid}.{b64url}`.
 //!
-//! A [`KeyWrapper`] holds one KEK and wraps/unwraps a secret with
-//! authenticated data binding it to its purpose and subject (a DID or
-//! did:key), so a wrapped blob copied into another account's row, or used
-//! for another purpose, does not unwrap. Backends:
-//! - [`LocalKek`]: 32 random bytes from `--kek-file` / `VLPDS_KEK`,
-//!   XChaCha20-Poly1305 with a random 192-bit nonce per wrap. Dev mode
-//!   falls back to a well-known [`dev_kek`] (refused outside dev mode).
-//! - [`GcpKms`]: Google Cloud KMS `encrypt`/`decrypt` over its REST API
-//!   with the node's service-account token (metadata server), or one
-//!   exchanged for a service-account key file's signed JWT
-//!   ([`ServiceAccount`]; off GCE). The secret
-//!   itself is the KMS plaintext (32 bytes), so a bucket copy is useless
-//!   without KMS decrypt permission, and every unwrap is in KMS audit logs.
-//!
-//! Wrapped form (a string, so it sits in JSON rows): `vw1.{kid}.{b64url}`.
-//! `kid` names the KEK (`L` + 16 hex for a local key: a hash of it; `G` +
-//! 16 hex for a Cloud KMS CryptoKey: a hash of its resource name). The
-//! [`Secrets`] keyring wraps under its first (current) KEK and unwraps under
-//! any configured one, so a KEK rotates by adding the new key as current,
-//! keeping the old one for unwrap, and rewrapping (`vlpds.admin.rewrapSecrets`).
-//!
-//! Unwrapped signing keys are cached per DID ([`Secrets::signing_key`];
-//! bounded by the `signing_keys` cache cap, validated by the account's
-//! public key, zeroized when the last reference drops), so a KMS round trip
-//! happens at most once per account per cache lifetime and never on the
-//! commit path of a loaded repo. Remote unwraps are limited
-//! (`--kms-concurrency`), coalesced per DID, time out after
-//! [`KMS_TIMEOUT`], and fail fast for [`KMS_BACKOFF`] after an outage is
-//! seen: the caller gets [`SecretError::Unavailable`] (a retryable 503).
-//! Wraps (new accounts, reserved keys, TOTP secrets: some reachable
-//! without an account) have their own, smaller permit pool and never start
-//! the fail-fast window, so a flood of them can't starve or fail-fast the
-//! cold-signing-key unwraps.
+//! Wraps (some reachable without an account) have their own, smaller permit
+//! pool and never start the unwraps' fail-fast window, so a flood of them
+//! can't starve or fail-fast cold signing-key unwraps.
 
 use crate::crypto::Keypair;
 use async_trait::async_trait;
@@ -48,19 +19,16 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
-/// Version tag of the wrapped form.
 const WRAP_VERSION: &str = "vw1";
-/// One KMS request (token fetch included) gives up after this.
-pub const KMS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per KMS request, token fetch included.
+const KMS_TIMEOUT: Duration = Duration::from_secs(5);
 /// After a KMS request fails as unavailable, remote unwraps fail at once for
 /// this long (one probe per interval goes through), so an outage doesn't
 /// queue every cold write behind a timeout.
-pub const KMS_BACKOFF: Duration = Duration::from_secs(1);
-/// Default remote (KMS) unwraps in flight per node (`--kms-concurrency`).
+const KMS_BACKOFF: Duration = Duration::from_secs(1);
 pub const DEFAULT_KMS_CONCURRENCY: usize = 64;
 
-/// Remote wraps in flight per node, for `n` unwraps: a quarter, at least 1.
-pub fn wrap_concurrency(n: usize) -> usize {
+fn wrap_concurrency(n: usize) -> usize {
     (n / 4).max(1)
 }
 
@@ -92,13 +60,12 @@ static KEY_CACHE: LazyLock<IntCounterVec> = LazyLock::new(|| {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SecretError {
-    /// The KEK's service can't be reached (timeout, 5xx, auth): retry later.
+    /// Timeout, 5xx or auth failure: retry later.
     #[error("key service unavailable: {0}")]
     Unavailable(String),
-    /// Authentication failed: wrong KEK, wrong purpose/subject, or corrupt.
+    /// Wrong KEK, wrong purpose/subject, or corrupt.
     #[error("wrapped secret rejected: {0}")]
     Rejected(String),
-    /// Wrapped under a KEK this node isn't configured with.
     #[error("wrapped under unknown key-encryption key {0}")]
     UnknownKek(String),
     #[error("malformed wrapped secret")]
@@ -111,17 +78,14 @@ impl SecretError {
     }
 }
 
-/// What a wrapped secret is for; part of its authenticated data.
+/// Part of the authenticated data.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Purpose {
-    /// An account's repo signing key (subject: the account DID).
     SigningKey,
-    /// A key reserved with `server.reserveSigningKey` (subject: its did:key).
+    /// Subject: its did:key.
     ReservedKey,
-    /// A TOTP shared secret (subject: the account DID).
     Totp,
-    /// The server's PLC rotation key (subject: `plc::ROTATION_KEY_SUBJECT`;
-    /// in `--plc-rotation-key-file`, never in the bucket).
+    /// Subject: `plc::ROTATION_KEY_SUBJECT`.
     PlcRotationKey,
 }
 
@@ -136,37 +100,28 @@ impl Purpose {
     }
 }
 
-/// Authenticated data of a wrapped secret: version, purpose and subject.
-pub fn aad(purpose: Purpose, subject: &str) -> Vec<u8> {
+fn aad(purpose: Purpose, subject: &str) -> Vec<u8> {
     [b"vlpds-secret-v1\0", purpose.label().as_bytes(), b"\0", subject.as_bytes()].concat()
 }
 
-/// An unwrapped secret. `stale`: wrapped under a KEK (or KEK version) other
-/// than the current one, so a rewrap would change it.
+/// `stale`: wrapped under a KEK (or KMS key version) other than the current
+/// one.
 pub struct Unwrapped {
     pub plaintext: Zeroizing<Vec<u8>>,
     pub stale: bool,
 }
 
-/// One key-encryption key.
 #[async_trait]
 pub trait KeyWrapper: Send + Sync {
-    /// Short id stored with every blob it wraps.
     fn kid(&self) -> &str;
-    /// Metrics label.
     fn backend(&self) -> &'static str;
-    /// Whether wrap/unwrap is a network round trip (limited and cached).
+    /// A network round trip: limited and failing fast.
     fn remote(&self) -> bool;
     async fn wrap(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SecretError>;
-    /// `stale` = the KEK has a newer primary version than the one used.
     async fn unwrap(&self, aad: &[u8], ciphertext: &[u8]) -> Result<Unwrapped, SecretError>;
 }
 
-// ---------------------------------------------------------------------------
-// local KEK
-// ---------------------------------------------------------------------------
-
-/// A 32-byte key-encryption key, zeroized on drop; never printed.
+/// Never printed.
 #[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct KekBytes([u8; 32]);
 
@@ -191,8 +146,7 @@ impl KekBytes {
         KekBytes(rand::random())
     }
 
-    /// 64 hex chars or base64 (standard or url-safe, padded or not) of 32
-    /// bytes; surrounding whitespace ignored.
+    /// 64 hex chars or any base64 flavour.
     pub fn parse(s: &str) -> anyhow::Result<KekBytes> {
         let s = Zeroizing::new(s.trim().to_string());
         let mut raw = Zeroizing::new(
@@ -213,7 +167,7 @@ impl KekBytes {
         Ok(KekBytes(k))
     }
 
-    /// A KEK file: exactly 32 raw bytes, or the text forms of [`parse`](Self::parse).
+    /// 32 raw bytes, or the text forms of [`parse`](Self::parse).
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<KekBytes> {
         let b = Zeroizing::new(std::fs::read(path).map_err(|e| anyhow::anyhow!("reading KEK file {}: {e}", path.display()))?);
         if b.len() == 32 {
@@ -235,13 +189,13 @@ fn local_kid(k: &[u8; 32]) -> String {
     format!("L{}", hex::encode(&h[..8]))
 }
 
-/// The well-known dev-mode KEK (derived from a public string: it protects
-/// nothing, and is refused outside dev mode).
+/// Derived from a public string: it protects nothing, and is refused
+/// outside dev mode.
 pub fn dev_kek() -> KekBytes {
     KekBytes(Sha256::digest(b"vlpds dev-mode KEK: not a secret").into())
 }
 
-/// XChaCha20-Poly1305 under a local KEK: `nonce (24) ‖ ciphertext ‖ tag`.
+/// XChaCha20-Poly1305, random 192-bit nonce: `nonce (24) ‖ ciphertext ‖ tag`.
 pub struct LocalKek {
     kid: String,
     aead: XChaCha20Poly1305,
@@ -293,25 +247,16 @@ impl KeyWrapper for LocalKek {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Google Cloud KMS
-// ---------------------------------------------------------------------------
-
-/// Where [`GcpKms`] gets OAuth access tokens.
 #[derive(Clone)]
 pub enum GcpToken {
-    /// The GCE/GKE metadata server (the node's service account). The URL is
-    /// the token endpoint; `GCE_METADATA_HOST` overrides its host.
+    /// The metadata server's token endpoint.
     Metadata(String),
-    /// A service-account key file (`--gcp-credentials-file`,
-    /// `GOOGLE_APPLICATION_CREDENTIALS`): tokens from the JWT bearer grant.
     ServiceAccount(Arc<ServiceAccount>),
-    /// A fixed bearer token (tests, or a short-lived token for an operator
-    /// running an admin task off-cluster).
+    /// Tests, or an operator running an admin task off-cluster.
     Static(String),
 }
 
-/// A static token redacted.
+/// Redacts a static token.
 impl std::fmt::Debug for GcpToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -323,8 +268,7 @@ impl std::fmt::Debug for GcpToken {
 }
 
 impl GcpToken {
-    /// The token source for the KMS flags: `file` (`--gcp-credentials-file`),
-    /// else `GOOGLE_APPLICATION_CREDENTIALS`, else the metadata server.
+    /// `file`, else `GOOGLE_APPLICATION_CREDENTIALS`, else the metadata server.
     pub fn from_credentials(file: Option<&std::path::Path>) -> anyhow::Result<GcpToken> {
         let env = std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
         match file.map(std::path::Path::to_path_buf).or(env) {
@@ -334,16 +278,13 @@ impl GcpToken {
     }
 }
 
-/// OAuth scope of Cloud KMS tokens minted from a service-account key.
-pub const CLOUD_KMS_SCOPE: &str = "https://www.googleapis.com/auth/cloudkms";
-/// Google's token endpoint, when the key file names none.
-pub const GOOGLE_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
+const CLOUD_KMS_SCOPE: &str = "https://www.googleapis.com/auth/cloudkms";
+/// When the key file names none.
+const GOOGLE_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 
-/// A service-account JSON key (`"type": "service_account"`): its RSA key
-/// signs a JWT assertion (RS256, 1 h) that the token endpoint exchanges
-/// for an access token (RFC 7523 JWT bearer grant). Tokens are cached,
-/// shared by every Cloud KMS key using this account, and refreshed a minute
-/// before they expire or when KMS answers 401.
+/// A service-account JSON key, exchanged for access tokens with the RFC 7523
+/// JWT bearer grant. The token cache is shared by every Cloud KMS key using
+/// this account.
 pub struct ServiceAccount {
     pub client_email: String,
     pub token_uri: String,
@@ -396,9 +337,8 @@ impl ServiceAccount {
         }))
     }
 
-    /// The signed JWT assertion for the token request, issued at `now`
-    /// (Unix seconds).
-    pub fn assertion(&self, now: u64) -> anyhow::Result<String> {
+    /// `now`: Unix seconds.
+    fn assertion(&self, now: u64) -> anyhow::Result<String> {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let mut header = serde_json::json!({"alg": "RS256", "typ": "JWT"});
         if let Some(kid) = &self.key_id {
@@ -417,11 +357,6 @@ impl ServiceAccount {
             .sign(&ring::signature::RSA_PKCS1_SHA256, &ring::rand::SystemRandom::new(), msg.as_bytes(), &mut sig)
             .map_err(|_| anyhow::anyhow!("RS256 signing failed"))?;
         Ok(format!("{msg}.{}", b64.encode(sig)))
-    }
-
-    /// The public key (DER RSAPublicKey), for verifying assertions in tests.
-    pub fn public_key_der(&self) -> Vec<u8> {
-        self.key.public().as_ref().to_vec()
     }
 
     async fn fetch(&self, http: &reqwest::Client) -> Result<(String, u64), SecretError> {
@@ -453,8 +388,7 @@ struct Tok {
     expires_in: u64,
 }
 
-/// The cached token, else (or with `refresh`) a fresh one from `fetch`,
-/// kept until a minute before it expires (tokens last ~1 h).
+/// Kept until a minute before it expires.
 async fn cached_token<F>(cache: &tokio::sync::Mutex<Option<(String, Instant)>>, refresh: bool, fetch: F) -> Result<String, SecretError>
 where
     F: std::future::Future<Output = Result<(String, u64), SecretError>>,
@@ -480,11 +414,10 @@ impl Default for GcpToken {
 
 pub const GCP_KMS_ENDPOINT: &str = "https://cloudkms.googleapis.com";
 
-/// Cloud KMS symmetric `encrypt`/`decrypt` on one CryptoKey
-/// (`projects/P/locations/L/keyRings/R/cryptoKeys/K`). KMS picks the
-/// primary version to encrypt and finds the version from the ciphertext to
-/// decrypt, so rotating versions inside the CryptoKey needs no config
-/// change; `usedPrimary: false` on decrypt marks the blob stale.
+/// Symmetric `encrypt`/`decrypt` on one CryptoKey. The secret itself is the
+/// KMS plaintext, so a bucket copy is useless without decrypt permission and
+/// every unwrap is audited. KMS picks the version itself, so version
+/// rotation needs no config change; `usedPrimary: false` marks a blob stale.
 pub struct GcpKms {
     kid: String,
     name: String,
@@ -573,8 +506,8 @@ fn b64(b: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(b)
 }
 
+/// Castagnoli, bitwise: tiny inputs only.
 fn crc32c(b: &[u8]) -> u32 {
-    // Castagnoli, bitwise (tiny inputs only)
     let mut c = !0u32;
     for &x in b {
         c ^= x as u32;
@@ -636,32 +569,23 @@ impl KeyWrapper for GcpKms {
     }
 }
 
-// ---------------------------------------------------------------------------
-// configuration
-// ---------------------------------------------------------------------------
-
-/// KEK configuration (flags in main.rs). The current KEK wraps; every
-/// configured one unwraps. Current = the Cloud KMS key if set, else the
-/// local KEK, else (dev mode only) [`dev_kek`].
+/// The current KEK wraps (the Cloud KMS key if set, else the local KEK,
+/// else [`dev_kek`]); every configured one unwraps.
 #[derive(Clone, Debug, Default)]
 pub struct KekConfig {
-    /// `--kek-file` / `VLPDS_KEK`.
     pub local: Option<KekBytes>,
-    /// `--kek-old-file` / `VLPDS_KEK_OLD`: unwrap only (rotation).
+    /// Unwrap only.
     pub local_old: Vec<KekBytes>,
-    /// `--gcp-kms-key`: a CryptoKey resource name.
     pub gcp_key: Option<String>,
-    /// `--gcp-kms-old-key`: unwrap only (moving to another CryptoKey).
+    /// Unwrap only.
     pub gcp_old_keys: Vec<String>,
-    /// Cloud KMS API base (`--gcp-kms-endpoint`; tests point it at a mock).
     pub gcp_endpoint: Option<String>,
     pub gcp_token: Option<GcpToken>,
-    /// Remote KEK calls in flight (`--kms-concurrency`; 0 = default).
+    /// 0: default.
     pub kms_concurrency: usize,
 }
 
 impl KekConfig {
-    /// Startup check: outside dev mode a real KEK must be configured.
     pub fn check(&self, dev_mode: bool) -> anyhow::Result<()> {
         if dev_mode {
             return Ok(());
@@ -679,14 +603,10 @@ impl KekConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// keyring + signing-key cache
-// ---------------------------------------------------------------------------
-
 const CACHE_SHARDS: usize = 16;
 
-/// Unwrapped signing keys by DID, with the public key they were validated
-/// against. Bounded by `caches::cap(Cache::SigningKeys)` (LRU per shard).
+/// An entry is valid only for the public key it was validated against, so a
+/// key rotation misses.
 struct KeyCache {
     shards: Vec<KeyShard>,
 }
@@ -724,6 +644,7 @@ impl KeyCache {
         self.shard(did).lock().pop(did);
     }
 
+    #[cfg(test)]
     fn clear(&self) {
         for s in &self.shards {
             s.lock().clear();
@@ -737,18 +658,14 @@ impl crate::caches::Len for KeyCache {
     }
 }
 
-/// The node's keyring: the KEKs, the signing-key cache, and the limits on
-/// remote calls. One per server (`App::secrets`, the repo workers).
 pub struct Secrets {
     /// `[0]` wraps; all unwrap (by kid).
     wrappers: Vec<Arc<dyn KeyWrapper>>,
     dev_kek: bool,
     keys: Arc<KeyCache>,
-    /// Remote unwraps in flight.
     permits: tokio::sync::Semaphore,
-    /// Remote wraps in flight (a separate pool: see the module notes).
     wrap_permits: tokio::sync::Semaphore,
-    /// Coalesces concurrent cold unwraps of one DID (striped).
+    /// Coalesce concurrent cold unwraps of one DID.
     stripes: Vec<tokio::sync::Mutex<()>>,
     /// Remote unwraps fail fast until this (micros since `epoch`).
     down_until: AtomicU64,
@@ -767,8 +684,7 @@ impl Secrets {
         anyhow::ensure!(!wrappers.is_empty(), "no key-encryption key");
         let n = if kms_concurrency == 0 { DEFAULT_KMS_CONCURRENCY } else { kms_concurrency };
         let keys = crate::caches::track(crate::caches::Cache::SigningKeys, Arc::new(KeyCache::new()));
-        // exported at 0, so the alerts' rate() / increase() see the first
-        // unavailable or rejected call (metrics::init_counters)
+        // exported at 0 so the alerts' increase() sees the first failure
         for w in &wrappers {
             for op in ["wrap", "unwrap"] {
                 for r in ["ok", "unavailable", "rejected"] {
@@ -788,10 +704,9 @@ impl Secrets {
         })
     }
 
-    /// The keyring `cfg` describes (see [`KekConfig`]). With no KEK
-    /// configured it wraps under [`dev_kek`]: the binary refuses that
-    /// outside dev mode first (`Config::check_secrets` -> [`KekConfig::check`]);
-    /// in-process tests may run non-dev servers without a KEK.
+    /// With no KEK configured it wraps under [`dev_kek`]: the binary refuses
+    /// that outside dev mode first ([`KekConfig::check`]); in-process tests
+    /// may run non-dev servers without a KEK.
     pub fn from_config(cfg: &KekConfig, dev_mode: bool) -> anyhow::Result<Secrets> {
         let endpoint = cfg.gcp_endpoint.as_deref().unwrap_or(GCP_KMS_ENDPOINT);
         let token = cfg.gcp_token.clone().unwrap_or_default();
@@ -825,7 +740,6 @@ impl Secrets {
         Ok(s)
     }
 
-    /// A keyring with only the dev KEK (tests, tools).
     pub fn dev() -> Arc<Secrets> {
         static DEV: LazyLock<Arc<Secrets>> = LazyLock::new(|| {
             let mut s = Secrets::new(vec![Arc::new(LocalKek::new(&dev_kek()))], 0).expect("dev keyring");
@@ -835,7 +749,6 @@ impl Secrets {
         DEV.clone()
     }
 
-    /// Whether this keyring wraps under the well-known dev KEK.
     pub fn is_dev(&self) -> bool {
         self.dev_kek
     }
@@ -856,9 +769,6 @@ impl Secrets {
         self.epoch.elapsed().as_micros() as u64
     }
 
-    /// Runs one KEK operation with metrics; remote ones under their permit
-    /// pool (wraps and unwraps apart) and the outage backoff, which only an
-    /// unwrap's failure starts.
     async fn run<T>(
         &self,
         w: &Arc<dyn KeyWrapper>,
@@ -866,8 +776,8 @@ impl Secrets {
         f: impl std::future::Future<Output = Result<T, SecretError>>,
     ) -> Result<T, SecretError> {
         let t = Instant::now();
-        // whether the key service itself answered (or timed out): only that
-        // starts a backoff window, never a fast-fail or a full queue
+        // only a failure of the key service itself starts a backoff window,
+        // never a fast-fail or a full queue
         let mut called = false;
         let r = if w.remote() {
             let now = self.now_us();
@@ -914,7 +824,6 @@ impl Secrets {
         r
     }
 
-    /// Wraps `plaintext` for `purpose`/`subject` under the current KEK.
     pub async fn wrap(&self, purpose: Purpose, subject: &str, plaintext: &[u8]) -> Result<String, SecretError> {
         let w = &self.wrappers[0];
         let a = aad(purpose, subject);
@@ -922,8 +831,6 @@ impl Secrets {
         Ok(format!("{WRAP_VERSION}.{}.{}", w.kid(), base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ct)))
     }
 
-    /// Unwraps a blob from [`wrap`](Self::wrap) under whichever configured
-    /// KEK made it.
     pub async fn unwrap(&self, purpose: Purpose, subject: &str, blob: &str) -> Result<Unwrapped, SecretError> {
         let (kid, ct) = parse_blob(blob)?;
         let w = self.wrapper(kid).ok_or_else(|| SecretError::UnknownKek(kid.to_string()))?;
@@ -933,14 +840,13 @@ impl Secrets {
         Ok(u)
     }
 
-    /// Whether `blob` is under the current KEK's id (a cheap pre-filter for
-    /// rewraps; a Cloud KMS version rotation only shows on unwrap).
+    /// A cheap pre-filter for rewraps: a Cloud KMS version rotation only
+    /// shows on unwrap.
     pub fn is_current(&self, blob: &str) -> bool {
         parse_blob(blob).is_ok_and(|(kid, _)| kid == self.current_kid())
     }
 
-    /// Unwrap + wrap under the current KEK. None if already current
-    /// (and, for Cloud KMS, under the primary version).
+    /// None if already current.
     pub async fn rewrap(&self, purpose: Purpose, subject: &str, blob: &str) -> Result<Option<String>, SecretError> {
         let u = self.unwrap(purpose, subject, blob).await?;
         if !u.stale {
@@ -949,9 +855,7 @@ impl Secrets {
         Ok(Some(self.wrap(purpose, subject, &u.plaintext).await?))
     }
 
-    // ---- signing keys ----
-
-    /// Wraps a new or rotated signing key of `did` and caches it: (wrapped,
+    /// Also caches it, so new accounts never unwrap. Returns (wrapped,
     /// public multibase).
     pub async fn wrap_signing_key(&self, did: &str, key: &Arc<Keypair>) -> Result<(String, String), SecretError> {
         let raw = Zeroizing::new(key.to_bytes());
@@ -961,13 +865,7 @@ impl Secrets {
         Ok((wrapped, pubkey))
     }
 
-    /// The cached signing key of `did` if it matches `pubkey` (no unwrap).
-    pub fn cached_signing_key(&self, did: &str, pubkey: &str) -> Option<Arc<Keypair>> {
-        self.keys.get(did, pubkey)
-    }
-
-    /// `did`'s signing key: from the cache, else unwrapped (one call per DID
-    /// at a time) and checked against `pubkey`.
+    /// Unwrapped at most once per DID at a time, and checked against `pubkey`.
     pub async fn signing_key(&self, did: &str, wrapped: &str, pubkey: &str) -> Result<Arc<Keypair>, SecretError> {
         if let Some(k) = self.keys.get(did, pubkey) {
             KEY_CACHE.with_label_values(&["hit"]).inc();
@@ -997,25 +895,12 @@ impl Secrets {
         Ok(key)
     }
 
-    /// [`signing_key`](Self::signing_key) of an account row.
     pub async fn account_signing_key(&self, a: &crate::state::Account) -> Result<Arc<Keypair>, SecretError> {
         self.signing_key(&a.did, &a.wrapped_signing_key, &a.signing_pubkey).await
     }
 
-    /// Drops `did`'s cached key (account deleted).
     pub fn forget(&self, did: &str) {
         self.keys.remove(did);
-    }
-
-    /// Drops every cached key (tests: simulate a restart).
-    pub fn clear_cache(&self) {
-        self.keys.clear();
-    }
-
-    /// Cached signing keys.
-    pub fn cached_keys(&self) -> usize {
-        use crate::caches::Len;
-        self.keys.len()
     }
 }
 
@@ -1094,21 +979,21 @@ mod tests {
         let (w, pk) = s.wrap_signing_key("did:plc:c", &key).await.unwrap();
         assert_eq!(pk, key.public_multibase());
         // cached by wrap: same Arc, no unwrap
-        assert!(Arc::ptr_eq(&s.cached_signing_key("did:plc:c", &pk).unwrap(), &key));
-        s.clear_cache();
-        assert!(s.cached_signing_key("did:plc:c", &pk).is_none());
+        assert!(Arc::ptr_eq(&s.keys.get("did:plc:c", &pk).unwrap(), &key));
+        s.keys.clear();
+        assert!(s.keys.get("did:plc:c", &pk).is_none());
         let k1 = s.signing_key("did:plc:c", &w, &pk).await.unwrap();
         assert_eq!(k1.to_bytes(), key.to_bytes());
         let k2 = s.signing_key("did:plc:c", &w, &pk).await.unwrap();
         assert!(Arc::ptr_eq(&k1, &k2), "second lookup is a cache hit");
         // a row whose public key doesn't match the wrapped secret
-        s.clear_cache();
+        s.keys.clear();
         let other = Keypair::generate().public_multibase();
         assert!(matches!(s.signing_key("did:plc:c", &w, &other).await, Err(SecretError::Rejected(_))));
         assert!(matches!(s.signing_key("did:plc:c", &w, "").await, Err(SecretError::Rejected(_))), "no expected key: refused");
         // a cached key isn't served for another public key (rotated)
         let _ = s.signing_key("did:plc:c", &w, &pk).await.unwrap();
-        assert!(s.cached_signing_key("did:plc:c", &other).is_none());
+        assert!(s.keys.get("did:plc:c", &other).is_none());
     }
 
     #[test]
@@ -1155,7 +1040,7 @@ mod tests {
             std::hint::black_box(s.signing_key(d, w, pk).await.unwrap());
         }
         let hit = t.elapsed().as_nanos() as f64 / dids.len() as f64;
-        s.clear_cache();
+        s.keys.clear();
         let t = Instant::now();
         for (d, (w, pk)) in dids.iter().zip(&rows) {
             std::hint::black_box(s.signing_key(d, w, pk).await.unwrap());
@@ -1282,7 +1167,7 @@ mod tests {
     #[tokio::test]
     async fn service_account_tokens_are_cached_and_refreshed() {
         let probe = ServiceAccount::from_json(&sa_json("http://unused/token")).unwrap();
-        let m = mock_google(probe.public_key_der()).await;
+        let m = mock_google(probe.key.public().as_ref().to_vec()).await;
         let path = std::env::temp_dir().join(format!("vlpds-sa-{}.json", std::process::id()));
         std::fs::write(&path, sa_json(&format!("{}/token", m.url))).unwrap();
         let token = GcpToken::from_credentials(Some(&path)).unwrap();

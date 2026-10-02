@@ -1,42 +1,33 @@
-//! Account email templates: HTML + plain-text alternatives (DESIGN.md
-//! "Email").
-//!
-//! `layout.html` and each email's wording are adapted from the reference
+//! Account email templates (HTML + plain text), adapted from the reference
 //! PDS's mailer templates (bluesky-social/atproto,
 //! packages/pds/src/mailer/templates/*.hbs; Copyright (c) 2022-2026 Bluesky
 //! Social PBC, and Contributors; MIT, see `NOTICE` beside this file). The
-//! six reference templates share one layout and differ only in title,
-//! preheader, intro, outro and token, so vlpds keeps the layout once and
-//! fills those slots. Subjects match the reference's `ServerMailer`.
+//! six share one layout and differ only in a few slots.
 //!
-//! Rendering is plain `{{name}}` substitution in a single pass (a value is
-//! never re-scanned for placeholders). Every value is HTML-escaped unless it
-//! is one of the intro/outro fragments built here from escaped pieces;
-//! handles, tokens and the operator's branding never reach the HTML raw.
+//! Substitution is single-pass, so a value is never re-scanned for
+//! placeholders. Every value is HTML-escaped except the intro/outro
+//! fragments, which are built here from escaped pieces.
 
 use std::borrow::Cow;
 
 const LAYOUT: &str = include_str!("layout.html");
 
 /// The reference's defaults (`packages/pds/src/mailer/index.ts`).
-pub const DEFAULT_LOGO_URL: &str = "https://bsky.social/about/images/email/email_logo_default.png";
-pub const DEFAULT_MARK_URL: &str = "https://bsky.social/about/images/email/email_mark_dark.png";
-pub const DEFAULT_HOME_URL: &str = "https://bsky.app";
-pub const DEFAULT_PRIMARY_COLOR: &str = "#067df7";
+const DEFAULT_LOGO_URL: &str = "https://bsky.social/about/images/email/email_logo_default.png";
+const DEFAULT_MARK_URL: &str = "https://bsky.social/about/images/email/email_mark_dark.png";
+const DEFAULT_HOME_URL: &str = "https://bsky.app";
+const DEFAULT_PRIMARY_COLOR: &str = "#067df7";
 
 const LINK_STYLE: &str = "color:hsl(211, 20%, 53%);text-decoration:none;text-decoration-line:underline;font-family:-apple-system, BlinkMacSystemFont, &#x27;Roboto&#x27;, &#x27;Oxygen&#x27;, &#x27;Ubuntu&#x27;, &#x27;Cantarell&#x27;, &#x27;Fira Sans&#x27;, &#x27;Droid Sans&#x27;, &#x27;Helvetica Neue&#x27;, sans-serif;margin:0px 0px;line-height:1.0;font-size:14px;letter-spacing:0.25px";
 const PAD_RIGHT: &str = ";padding-right:32px";
 
-/// Email branding, as the reference's `BrandingConfig` (PDS_SERVICE_NAME,
-/// PDS_HOME_URL, PDS_LOGO_URL, PDS_PRIMARY_COLOR) plus
-/// PDS_EMAIL_DISABLE_CONFIRMATION_LINK. Unset fields take the reference's
-/// defaults; the name defaults to "{hostname} PDS".
+/// The reference's `BrandingConfig`; unset fields take its defaults.
 #[derive(Clone, Debug, Default)]
 pub struct Branding {
     pub name: Option<String>,
     pub home_url: Option<String>,
-    /// Header logo and footer mark (the reference uses the one logo for both
-    /// once it is set).
+    /// Header logo and footer mark: the reference uses one logo for both
+    /// once it is set.
     pub logo_url: Option<String>,
     pub primary_color: Option<String>,
     /// Drops confirm-email's "click here" link to bsky.app/intent/verify-email.
@@ -44,7 +35,7 @@ pub struct Branding {
 }
 
 impl Branding {
-    /// `--email-*` flags, each falling back to the reference PDS's variable.
+    /// Each flag falls back to the reference PDS's variable.
     pub fn from_flags(
         name: Option<String>,
         home_url: Option<String>,
@@ -68,8 +59,7 @@ impl Branding {
         }
     }
 
-    /// Service name: the configured one, else "{hostname} PDS" (the
-    /// reference's default) from `public_url`.
+    /// Defaults to "{hostname} PDS", as the reference.
     pub fn service_name(&self, public_url: &str) -> String {
         if let Some(n) = &self.name {
             return n.clone();
@@ -90,25 +80,17 @@ impl Branding {
     }
 }
 
-/// One account email. Constructed at the call sites in `xrpc::server` /
-/// `xrpc::email2fa` and rendered by [`Email::render`].
 #[derive(Clone, Copy, Debug)]
 pub enum Email<'a> {
-    /// requestPasswordReset.
     ResetPassword { handle: &'a str, token: &'a str },
-    /// requestAccountDelete.
     DeleteAccount { token: &'a str },
-    /// requestEmailConfirmation.
     ConfirmEmail { token: &'a str },
-    /// requestEmailUpdate (and turning email 2FA off).
+    /// Also sent to turn email 2FA off.
     UpdateEmail { token: &'a str },
-    /// requestPlcOperationSignature.
     PlcOperation { token: &'a str },
-    /// Sign-in with email 2FA on (createSession / OAuth sign-in).
     SignInAuthFactor { handle: Option<&'a str>, token: &'a str },
 }
 
-/// A rendered email.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rendered {
     pub subject: String,
@@ -117,8 +99,7 @@ pub struct Rendered {
 }
 
 impl Email<'_> {
-    /// The `Mail::purpose` (also the email-token purpose and the metrics
-    /// label).
+    /// Also the email-token purpose and the metrics label.
     pub fn purpose(&self) -> &'static str {
         match self {
             Email::ResetPassword { .. } => "reset_password",
@@ -153,9 +134,8 @@ impl Email<'_> {
         }
     }
 
-    /// Renders the HTML (the reference's layout) and its plain-text
-    /// alternative. `public_url` is the PDS's own URL: the default service
-    /// name's hostname and the sign-in mail's change-password link.
+    /// `public_url` is this PDS's: the default service name and the sign-in
+    /// mail's change-password link come from it.
     pub fn render(&self, b: &Branding, public_url: &str) -> Rendered {
         let token = self.token();
         let t = esc(token);
@@ -164,37 +144,27 @@ impl Email<'_> {
         let change_pw = format!("{}/.well-known/change-password", public_url.trim_end_matches('/'));
         let verify_link = format!("https://bsky.app/intent/verify-email?code={token}");
 
-        // (title, preheader, intro html, intro style, outro html, outro style, intro text, outro text)
-        let (title, preheader, intro, intro_style, outro, outro_style, intro_txt, outro_txt): (
-            &str,
-            String,
-            String,
-            &str,
-            String,
-            &str,
-            String,
-            String,
-        ) = match *self {
-            Email::ResetPassword { handle, .. } => (
-                "Reset password",
-                format!("We received a request to reset the password for the account @{handle}."),
-                format!("We received a request to reset the password for the account<!-- -->\n                      {}", at_handle(handle)),
-                "",
-                "To choose a new password, please enter the code above in\n                      the app along with your new password.".into(),
-                "",
-                format!("We received a request to reset the password for the account @{handle}."),
-                "To choose a new password, please enter the code above in the app along with your new password.".into(),
-            ),
-            Email::DeleteAccount { .. } => (
-                "Delete your account",
-                "To permanently delete your account, please enter the code provided in the app along with your password.".into(),
-                "<span style='font-weight:600'>To permanently delete your\n                        account,</span>\n                      <!-- -->please enter the code below in the app along with\n                      your password.".into(),
-                PAD_RIGHT,
-                "👉 If you didn&#x27;t request an account deletion,<!-- -->\n                      <span style='font-weight:600'>you should update your\n                        password immediately.</span>".into(),
-                PAD_RIGHT,
-                "To permanently delete your account, please enter the code below in the app along with your password.".into(),
-                "👉 If you didn't request an account deletion, you should update your password immediately.".into(),
-            ),
+        let Slots { title, preheader, intro, intro_style, outro, outro_style, intro_txt, outro_txt } = match *self {
+            Email::ResetPassword { handle, .. } => Slots {
+                title: "Reset password",
+                preheader: format!("We received a request to reset the password for the account @{handle}."),
+                intro: format!("We received a request to reset the password for the account<!-- -->\n                      {}", at_handle(handle)),
+                intro_style: "",
+                outro: "To choose a new password, please enter the code above in\n                      the app along with your new password.".into(),
+                outro_style: "",
+                intro_txt: format!("We received a request to reset the password for the account @{handle}."),
+                outro_txt: "To choose a new password, please enter the code above in the app along with your new password.".into(),
+            },
+            Email::DeleteAccount { .. } => Slots {
+                title: "Delete your account",
+                preheader: "To permanently delete your account, please enter the code provided in the app along with your password.".into(),
+                intro: "<span style='font-weight:600'>To permanently delete your\n                        account,</span>\n                      <!-- -->please enter the code below in the app along with\n                      your password.".into(),
+                intro_style: PAD_RIGHT,
+                outro: "👉 If you didn&#x27;t request an account deletion,<!-- -->\n                      <span style='font-weight:600'>you should update your\n                        password immediately.</span>".into(),
+                outro_style: PAD_RIGHT,
+                intro_txt: "To permanently delete your account, please enter the code below in the app along with your password.".into(),
+                outro_txt: "👉 If you didn't request an account deletion, you should update your password immediately.".into(),
+            },
             Email::ConfirmEmail { .. } => {
                 let (link, link_txt) = if b.disable_confirmation_link {
                     (String::new(), String::new())
@@ -207,37 +177,37 @@ impl Email<'_> {
                         format!(" or open {verify_link}"),
                     )
                 };
-                (
-                    "Confirm your email",
-                    format!("{token} is your verification code."),
-                    format!("To confirm this email for your account, please enter the\n                      code below in the app{link}."),
-                    PAD_RIGHT,
-                    "If you didn&#x27;t request an email confirmation, you can\n                      safely ignore this email.".into(),
-                    "",
-                    format!("To confirm this email for your account, please enter the code below in the app{link_txt}."),
-                    "If you didn't request an email confirmation, you can safely ignore this email.".into(),
-                )
+                Slots {
+                    title: "Confirm your email",
+                    preheader: format!("{token} is your verification code."),
+                    intro: format!("To confirm this email for your account, please enter the\n                      code below in the app{link}."),
+                    intro_style: PAD_RIGHT,
+                    outro: "If you didn&#x27;t request an email confirmation, you can\n                      safely ignore this email.".into(),
+                    outro_style: "",
+                    intro_txt: format!("To confirm this email for your account, please enter the code below in the app{link_txt}."),
+                    outro_txt: "If you didn't request an email confirmation, you can safely ignore this email.".into(),
+                }
             }
-            Email::UpdateEmail { .. } => (
-                "Update your email",
-                "To update the email for your account, enter the code provided in the app along with your new email.".into(),
-                "To update the email for your account, enter the code below\n                      in the app along with your new email.".into(),
-                PAD_RIGHT,
-                "If you didn&#x27;t request an email update, you can safely\n                      ignore this email.".into(),
-                "",
-                "To update the email for your account, enter the code below in the app along with your new email.".into(),
-                "If you didn't request an email update, you can safely ignore this email.".into(),
-            ),
-            Email::PlcOperation { .. } => (
-                "PLC update requested",
-                "We received a request to update your PLC.".into(),
-                "We received a request to update your PLC identity. Your\n                      confirmation code is:".into(),
-                "",
-                "Updating your PLC identity is a very sensitive operation.\n                      Please only proceed if you are confident in what you are\n                      doing.".into(),
-                "",
-                "We received a request to update your PLC identity. Your confirmation code is:".into(),
-                "Updating your PLC identity is a very sensitive operation. Please only proceed if you are confident in what you are doing.".into(),
-            ),
+            Email::UpdateEmail { .. } => Slots {
+                title: "Update your email",
+                preheader: "To update the email for your account, enter the code provided in the app along with your new email.".into(),
+                intro: "To update the email for your account, enter the code below\n                      in the app along with your new email.".into(),
+                intro_style: PAD_RIGHT,
+                outro: "If you didn&#x27;t request an email update, you can safely\n                      ignore this email.".into(),
+                outro_style: "",
+                intro_txt: "To update the email for your account, enter the code below in the app along with your new email.".into(),
+                outro_txt: "If you didn't request an email update, you can safely ignore this email.".into(),
+            },
+            Email::PlcOperation { .. } => Slots {
+                title: "PLC update requested",
+                preheader: "We received a request to update your PLC.".into(),
+                intro: "We received a request to update your PLC identity. Your\n                      confirmation code is:".into(),
+                intro_style: "",
+                outro: "Updating your PLC identity is a very sensitive operation.\n                      Please only proceed if you are confident in what you are\n                      doing.".into(),
+                outro_style: "",
+                intro_txt: "We received a request to update your PLC identity. Your confirmation code is:".into(),
+                outro_txt: "Updating your PLC identity is a very sensitive operation. Please only proceed if you are confident in what you are doing.".into(),
+            },
             Email::SignInAuthFactor { handle, .. } => {
                 let (who, who_txt) = match handle {
                     Some(h) => (
@@ -249,19 +219,19 @@ impl Email<'_> {
                     ),
                     None => ("your\n                        account.".into(), "your account.".into()),
                 };
-                (
-                    "Confirm your sign-in",
-                    "We received a sign in request for your account.".into(),
-                    format!("We received a sign-in request for\n                      {who}\n                      <!-- -->Use the code below to sign in."),
-                    PAD_RIGHT,
-                    format!(
+                Slots {
+                    title: "Confirm your sign-in",
+                    preheader: "We received a sign in request for your account.".into(),
+                    intro: format!("We received a sign-in request for\n                      {who}\n                      <!-- -->Use the code below to sign in."),
+                    intro_style: PAD_RIGHT,
+                    outro: format!(
                         "If this wasn&#x27;t you, we recommend taking steps to\n                      protect your account by<!-- -->\n                      <a\n                        href='{}'\n                        style='{LINK_STYLE}'\n                        target='_blank'\n                      >changing your password.</a>",
                         esc(&change_pw)
                     ),
-                    "",
-                    format!("We received a sign-in request for {who_txt} Use the code below to sign in."),
-                    format!("If this wasn't you, we recommend taking steps to protect your account by changing your password: {change_pw}"),
-                )
+                    outro_style: "",
+                    intro_txt: format!("We received a sign-in request for {who_txt} Use the code below to sign in."),
+                    outro_txt: format!("If this wasn't you, we recommend taking steps to protect your account by changing your password: {change_pw}"),
+                }
             }
         };
 
@@ -288,7 +258,18 @@ impl Email<'_> {
     }
 }
 
-/// HTML-escapes text for element content and quoted attributes.
+struct Slots {
+    title: &'static str,
+    preheader: String,
+    intro: String,
+    intro_style: &'static str,
+    outro: String,
+    outro_style: &'static str,
+    intro_txt: String,
+    outro_txt: String,
+}
+
+/// For element content and quoted attributes.
 pub fn esc(s: &str) -> Cow<'_, str> {
     if !s.contains(['&', '<', '>', '"', '\'']) {
         return Cow::Borrowed(s);
@@ -307,8 +288,7 @@ pub fn esc(s: &str) -> Cow<'_, str> {
     Cow::Owned(o)
 }
 
-/// Single-pass `{{name}}` substitution. Unknown names stay as they are
-/// (a test asserts none are left).
+/// Unknown names stay as they are (a test asserts none are left).
 fn fill<'a>(tpl: &str, val: impl Fn(&str) -> Option<Cow<'a, str>>) -> String {
     let mut out = String::with_capacity(tpl.len() + 512);
     let mut rest = tpl;
@@ -330,10 +310,8 @@ fn fill<'a>(tpl: &str, val: impl Fn(&str) -> Option<Cow<'a, str>>) -> String {
     out
 }
 
-/// Plain-text alternative for an HTML body (admin sendEmail content is HTML,
-/// as in the reference's ModerationMailer, which runs nodemailer's
-/// html-to-text). Block tags and `<br>` become line breaks, other tags are
-/// dropped, the common entities are decoded and blank-line runs collapse.
+/// For admin sendEmail, whose content is HTML (the reference's
+/// ModerationMailer runs nodemailer's html-to-text).
 pub fn html_to_text(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut rest = html;
