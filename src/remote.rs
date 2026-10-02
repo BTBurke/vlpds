@@ -11,45 +11,39 @@
 //! "Rolling upgrades and format versioning").
 //!
 //! Every node follows every peer's log. A follower owes the merger every
-//! event of the log above its floor (the merger's position when it started,
-//! see firehose.rs), in ordinal order with no gaps. Its first ordinal is the
-//! first segment in S3 past the floor. On every (re)connect, once the owner
-//! has subscribed us, it catches up from S3 after the last ordinal it
-//! delivered, then dedupes against the stream. When the peer dies, the
-//! follower drains the log from S3 up to its fence object and then retires
-//! (the host removes its firehose source). A stream ends when its log does:
-//! the owner closes it (and refuses new ones) once its graceful shutdown
-//! fenced the log, and the follower leaves it as soon as the log's lease is
-//! no longer live (gone, presumed dead, fenced), whatever the owner still
+//! event of the log above its floor (the merger's position when it started),
+//! in ordinal order with no gaps. On every (re)connect, once the owner has
+//! subscribed us, it catches up from S3 after the last ordinal it delivered,
+//! then dedupes against the stream. When the peer dies, the follower drains
+//! the log from S3 up to its fence and retires. The follower leaves a stream
+//! as soon as the log's lease is no longer live, whatever the owner still
 //! sends: a process outliving its lease must not hold every merger at its
-//! frozen watermark. S3 reads are sequential and stop
-//! at the first missing ordinal or the fence, so they only ever deliver the
-//! log's gap-free durable prefix, never segments a crash left past a hole.
+//! frozen watermark. S3 reads stop at the first missing ordinal or the
+//! fence, so they only deliver the log's gap-free durable prefix.
 
 use crate::firehose::Firehose;
-use crate::nodelog::{segment_path, LiveRecv, LogBatch, NodeLog};
+use crate::nodelog::{read_object, LiveRecv, LogBatch, NodeLog};
 use crate::segment::{self, LogObject};
 use crate::store::Store;
 use axum::extract::ws::{Message, WebSocket};
 use bytes::{Buf, BufMut, Bytes};
 use futures::{SinkExt, StreamExt};
-use object_store::ObjectStoreExt;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 const HEARTBEAT: Duration = Duration::from_millis(5);
-/// A live log stream (or its connect) silent this long is presumed dead.
+/// A live log stream (or its connect) silent this long is presumed dead: a
+/// half-open connection to a dead peer never delivers a FIN or RST.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
-/// Owner side: a send (batch, heartbeat, close) that makes no progress for
-/// this long drops the stream. The follower presumed it dead long before
-/// (`STREAM_IDLE_TIMEOUT`) and reconnects; a stuck peer socket mustn't pin
-/// the task and its live-ring subscription.
+/// Owner side: the follower presumed a stuck stream dead long before this
+/// and reconnected; a stuck socket mustn't pin the task and its live-ring
+/// subscription.
 const STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+const LEASE_CHECK: Duration = Duration::from_millis(50);
 
-/// One owner-side send, bounded by [`STREAM_SEND_TIMEOUT`]; false = drop
-/// the stream.
+/// False = drop the stream.
 async fn send_bounded(ws: &mut WebSocket, m: Message) -> bool {
     matches!(tokio::time::timeout(STREAM_SEND_TIMEOUT, ws.send(m)).await, Ok(Ok(())))
 }
@@ -57,8 +51,6 @@ async fn send_bounded(ws: &mut WebSocket, m: Message) -> bool {
 async fn close_bounded(ws: &mut WebSocket) {
     let _ = tokio::time::timeout(STREAM_SEND_TIMEOUT, ws.close()).await;
 }
-/// How often a live stream checks that its log's lease is still live.
-const LEASE_CHECK: Duration = Duration::from_millis(50);
 
 pub fn encode_batch(b: &LogBatch) -> Bytes {
     let size: usize = b.events.iter().map(|(_, f)| f.len() + 12).sum();
@@ -74,7 +66,6 @@ pub fn encode_batch(b: &LogBatch) -> Bytes {
     out.into()
 }
 
-/// A watermark heartbeat (message type 1).
 pub fn encode_watermark(w: i64) -> Bytes {
     let mut m = Vec::with_capacity(9);
     m.put_u8(1);
@@ -85,7 +76,6 @@ pub fn encode_watermark(w: i64) -> Bytes {
 pub enum StreamMsg {
     Batch(LogBatch),
     Watermark(i64),
-    /// A message type this build doesn't know (skipped by followers).
     Unknown(u8),
 }
 
@@ -126,8 +116,6 @@ pub async fn serve_stream(mut ws: WebSocket, log: Arc<NodeLog>) {
     loop {
         tick.tick().await;
         if log.closed.load(Ordering::Acquire) {
-            // fenced by our shutdown (or a halted test node): the follower
-            // drains the rest from S3 up to the fence
             close_bounded(&mut ws).await;
             return;
         }
@@ -143,7 +131,6 @@ pub async fn serve_stream(mut ws: WebSocket, log: Arc<NodeLog>) {
                 }
                 LiveRecv::Empty => break,
                 LiveRecv::Lagged => {
-                    // the peer catches up from S3 when it reconnects
                     crate::metrics::LOG_STREAM_LAGGED.inc();
                     tracing::warn!(log_id = %log.log_id, "peer fell behind our live ring: dropping its stream (it catches up from S3)");
                     close_bounded(&mut ws).await;
@@ -160,8 +147,7 @@ pub async fn serve_stream(mut ws: WebSocket, log: Arc<NodeLog>) {
 /// A follower of one peer log feeding our merger.
 pub struct Follower {
     pub log_id: Arc<str>,
-    /// Every event of the log above this is delivered to the merger (its
-    /// position when the follower started, see `Firehose::add_remote`).
+    /// Every event of the log above this is delivered to the merger.
     pub floor: i64,
     pub watermark: Arc<AtomicI64>,
     pub stop: Arc<AtomicBool>,
@@ -171,8 +157,7 @@ pub struct Follower {
 
 /// Registers the log as a firehose source of `fh` and follows it. `addr`
 /// returns the peer's base URL while it is alive, None once it's dead.
-/// `tls`: peer mTLS (`wss://`), checking the server is the log's node (None
-/// on a lone node: nothing streams).
+/// `tls`: peer mTLS (None on a lone node: nothing streams).
 pub fn follow_log(
     log_id: &str,
     fh: &Firehose,
@@ -232,30 +217,18 @@ async fn catch_up(
         None => next.insert(crate::backfill::seek(store, log_id, floor).await?),
     };
     loop {
-        let data = match store.raw.get(&segment_path(store, log_id, *next)).await {
-            Ok(r) => r.bytes().await?,
-            Err(object_store::Error::NotFound { .. }) => match crate::backfill::first_ordinal(store, log_id).await? {
+        match read_object(store, log_id, *next).await? {
+            None => match crate::backfill::first_ordinal(store, log_id).await? {
                 // log retention deleted it (we are a whole window behind)
                 Some(first) if first > *next => {
                     tracing::warn!(%log_id, from = *next, to = first, "log pruned ahead of its follower; skipping");
                     *next = first;
-                    continue;
                 }
                 _ => return Ok(false),
             },
-            Err(e) => return Err(e.into()),
-        };
-        match segment::parse(data, false, None)? {
-            LogObject::Fence { .. } => return Ok(true),
-            LogObject::Segment(h, entries) => {
-                anyhow::ensure!(
-                    *h.log_id == **log_id && h.ordinal == *next,
-                    "log object {log_id}/{next} has header {}/{}",
-                    h.log_id,
-                    h.ordinal
-                );
-                let events: Vec<_> = entries.into_iter().filter(|e| !e.frame.is_empty()).map(|e| (e.seq, e.frame)).collect();
-                let _ = merger_tx.send(LogBatch { log_id: log_id.clone(), ordinal: *next, events });
+            Some(LogObject::Fence { .. }) => return Ok(true),
+            Some(LogObject::Segment(h, entries)) => {
+                let _ = merger_tx.send(LogBatch { log_id: log_id.clone(), ordinal: *next, events: segment::events(entries) });
                 wm.fetch_max(h.last_seq, Ordering::AcqRel);
                 *next += 1;
             }
@@ -277,7 +250,6 @@ async fn stream_live(
     addr: &(dyn Fn() -> Option<String> + Send + Sync),
     tls: Option<tokio_tungstenite::Connector>,
 ) -> anyhow::Result<()> {
-    // peer mTLS only: wss:// to the peer listener, checking it is the log's node
     let tls = tls.ok_or_else(|| anyhow::anyhow!("no peer TLS on this node (a lone node): can't stream {base}'s log"))?;
     let Some(rest) = base.strip_prefix("https://") else {
         anyhow::bail!("peer address {base:?} isn't https:// (peers talk mTLS only)");
@@ -301,12 +273,6 @@ async fn stream_live(
         return Ok(());
     }
     let n = next.as_mut().expect("resolved by catch_up");
-    // HA fix: an idle timeout. The owner heartbeats every 5 ms, so silence
-    // means a dead or partitioned peer. Without it, a half-open connection
-    // (peer cut off by the network, then dead: no FIN/RST ever arrives) kept
-    // us in ws.next() forever. We never noticed the peer's lease was gone, so
-    // we never drained its log to the fence, and every survivor's merged
-    // firehose stalled for good (bench/ha ctr-partition).
     let mut checked = Instant::now();
     loop {
         let msg = match first.take() {
@@ -319,12 +285,9 @@ async fn stream_live(
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
-        // The stream is trusted only while the log's lease is live: once
-        // it is gone or dead (fenced, presumed dead), its watermark is no
-        // promise of anything. A process whose lease is gone but whose
-        // server still answers (stuck past its shutdown, or a zombie)
-        // would otherwise heartbeat a frozen watermark forever and stall
-        // our merger. Drain the log from S3 to its fence instead.
+        // The stream is trusted only while the log's lease is live: a zombie
+        // whose server still answers would heartbeat a frozen watermark
+        // forever and stall our merger. Drain the log from S3 instead.
         if checked.elapsed() >= LEASE_CHECK {
             checked = Instant::now();
             if addr().is_none() {
@@ -353,8 +316,8 @@ async fn stream_live(
     Ok(())
 }
 
-/// A log stream message of a type this build doesn't know: skipped (a
-/// reconnect would only meet it again), counted, logged.
+/// Skipped rather than failing the stream: a reconnect would only meet it
+/// again.
 fn skip_unknown(log_id: &str, t: u8) {
     crate::version::format_error("log_stream");
     tracing::warn!(%log_id, message_type = t, "skipping a log stream message of an unknown type (a peer of a newer feature level?)");
@@ -378,8 +341,9 @@ async fn next_msg(ws: &mut Ws, log_id: &str, base: &str) -> anyhow::Result<Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nodelog::segment_path;
     use crate::segment::SegmentBuilder;
-    use object_store::PutPayload;
+    use object_store::{ObjectStoreExt, PutPayload};
 
     /// A batch claiming 4G events in a few bytes is an error, without
     /// reserving room for them first; a real one round-trips.

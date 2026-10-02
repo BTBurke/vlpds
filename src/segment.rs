@@ -1,8 +1,8 @@
 //! Log segment object format (one log per node incarnation).
 //!
-//! Segments carry the finished firehose frames (what subscribers receive) plus
-//! the materialized-state mutations (SlateDB puts/deletes) used to apply and
-//! replay them, each entry tagged with its shard and ownership epoch.
+//! Segments carry the finished firehose frames plus the state mutations used
+//! to apply and replay them, each entry tagged with its shard and ownership
+//! epoch.
 
 use crate::slots::ShardId;
 use bytes::{BufMut, Bytes};
@@ -14,10 +14,8 @@ pub struct Mutation {
 }
 
 // ---------------------------------------------------------------------------
-// Per-node logs. One log per node incarnation (`log_id`), entries tagged
-// with the shard (and its ownership epoch) they belong to. A log is closed by
-// a *fence* object written at its next ordinal (If-None-Match), after which
-// the writer can never append again.
+// A log is closed by a *fence* object written at its next ordinal
+// (If-None-Match), after which the writer can never append again.
 //
 // "VLSEG06\n"
 // header: log_id_len u16 | log_id | ordinal u64 | prefix_end u64
@@ -26,15 +24,12 @@ pub struct Mutation {
 // entry:  seq i64 | shard u32 | epoch u64 | frame_len u32 | frame
 //         | mut_count u32 | (key_len u16 | key | val_len u32 (MAX = delete) | val)*
 //
-// The header is never compressed, so header-only reads (`parse_header` on
-// a small range GET: prefix_end, seq ranges) work on either codec.
-// `body_len` is the uncompressed body length. The writer keeps the
-// uncompressed object in memory (codec 0: the live ring and the merger
-// slice frames out of it) and stores `compress(obj)`; readers `decode` the
-// stored object back to exactly those bytes (codec byte reset to 0), so
-// entry offsets are the same in both. Real commits compress ~1.9-2.7x at
-// zstd level 1 in segments of 256 KiB and up (DESIGN.md "Log compression").
-// VLSEG06 widened the entry's shard tag to 32 bits (`slots::ShardId`).
+// The header is never compressed, so header-only range reads work on either
+// codec. `body_len` is the uncompressed body length. The writer keeps the
+// uncompressed object in memory (the live ring and the merger slice frames
+// out of it) and stores `compress(obj)`; readers `decode` the stored object
+// back to exactly those bytes (codec byte reset to 0), so entry offsets are
+// the same in both (DESIGN.md "Log compression").
 //
 // The test feature level (cargo feature `test-level`, `version::TEST_LEVEL`,
 // never in a release build) writes "VLSEGT1\n" with one more header field,
@@ -44,9 +39,8 @@ pub struct Mutation {
 //
 // mut_count with its top bit set: bits 0-15 count the muts stored, bits
 // 16-30 the muts *derived* from the #commit frame, which come first (see
-// `derive_commit_muts`). A commit's record and head values repeat the record
-// blocks and the signed commit its CAR already carries; storing them again
-// cost ~20% of a single-record commit's segment bytes.
+// `derive_commit_muts`): a commit's record and head values repeat blocks its
+// CAR already carries.
 //
 // "VLFENCE\n" | fenced_by (utf8)
 //
@@ -55,7 +49,7 @@ pub struct Mutation {
 // it sealed the segment: every ordinal below it was already durable. Holes
 // can therefore only sit in [prefix_end, ordinal), at most K - 1 ordinals,
 // which lets a reader prove a segment is inside the log's gap-free prefix
-// with a bounded number of probes (see `nodelog::in_prefix`).
+// with a bounded number of probes (see `nodelog::prefix_hole`).
 // ---------------------------------------------------------------------------
 
 /// The newest segment magic (level 1's). Writers emit
@@ -65,16 +59,13 @@ pub const MAGIC: &[u8; 8] = b"VLSEG06\n";
 /// Bytes of an entry before its frame: seq, shard, epoch, frame_len.
 const ENTRY_HEAD: usize = 8 + 4 + 8 + 4;
 
-/// Body codecs (the header's codec byte).
 pub const CODEC_NONE: u8 = 0;
 pub const CODEC_ZSTD: u8 = 1;
 
-/// zstd level for stored segment bodies (`--log-compression`); 0 = off.
+/// 0 = store segments uncompressed.
 static ZSTD_LEVEL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(DEFAULT_ZSTD_LEVEL);
 pub const DEFAULT_ZSTD_LEVEL: i32 = 1;
 
-/// Sets the zstd level segments are stored with from now on (0 = store
-/// them uncompressed). Readers handle either.
 pub fn set_compression_level(level: i32) {
     ZSTD_LEVEL.store(level, std::sync::atomic::Ordering::Relaxed);
 }
@@ -96,15 +87,12 @@ pub struct SegHeader {
     pub first_seq: i64,
     pub last_seq: i64,
     pub count: u32,
-    /// Body codec ([`CODEC_NONE`] or [`CODEC_ZSTD`]).
     pub codec: u8,
     /// Uncompressed body length.
     pub body_len: u32,
-    /// Feature level of the segment's magic (its entry layout and how its
-    /// derived muts are derived).
+    /// Feature level of the segment's magic.
     pub level: u32,
-    /// The test feature level's header field (`version::TEST_LEVEL`): the
-    /// first 8 bytes of sha256(uncompressed body), checked by [`parse`].
+    /// The test level's sha256(uncompressed body)[..8], checked by [`parse`].
     pub checksum: Option<u64>,
 }
 
@@ -115,7 +103,7 @@ pub struct SegEntry {
     pub frame: Bytes,
     pub muts: Vec<Mutation>,
     /// How many of `muts` (the first ones) were derived from the #commit
-    /// frame rather than stored (0 when parsed without muts).
+    /// frame (0 when parsed without muts).
     pub derived: usize,
 }
 
@@ -131,9 +119,8 @@ pub struct SegmentBuilder {
     pub count: u32,
     /// Bytes reserved at the start of `body` for the header (`for_log`).
     header_room: usize,
-    /// The feature level the segment is written at: the active level when
-    /// the builder was made, so a segment is homogeneous and a level change
-    /// takes effect at the next segment (the header length depends on it).
+    /// Fixed when the builder is made, so a segment is homogeneous and a
+    /// level change takes effect at the next one.
     level: u32,
 }
 
@@ -155,8 +142,7 @@ impl SegmentBuilder {
         Self::for_log_at(log_id, crate::version::active())
     }
 
-    /// [`for_log`](Self::for_log) writing the formats of `level` (golden
-    /// fixtures of an older level; writers use the active one).
+    /// Golden fixtures of an older level; writers use the active one.
     pub fn for_log_at(log_id: &str, level: u32) -> Self {
         let room = header_len(log_id, level);
         let mut body = Vec::with_capacity(1 << 20);
@@ -164,7 +150,6 @@ impl SegmentBuilder {
         SegmentBuilder { body, first_seq: 0, last_seq: 0, count: 0, header_room: room, level }
     }
 
-    /// The feature level this segment is written at.
     pub fn level(&self) -> u32 {
         self.level
     }
@@ -277,7 +262,7 @@ impl SegmentBuilder {
     }
 }
 
-/// Header bytes after the log id (level 1).
+/// Header bytes after the log id.
 const HEADER_TAIL: usize = 41;
 
 /// Whether segments of `level` carry the test level's body checksum (between
@@ -294,7 +279,6 @@ fn header_len(log_id: &str, level: u32) -> usize {
     MAGIC.len() + 2 + log_id.len() + header_tail(level)
 }
 
-/// The test level's segment checksum: sha256(body)[..8].
 fn body_checksum(body: &[u8]) -> u64 {
     use sha2::Digest;
     u64::from_be_bytes(sha2::Sha256::digest(body)[..8].try_into().unwrap())
@@ -425,10 +409,9 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<Option<(SegHeader, usize)>> {
     Ok(Some((h, pos + tail)))
 }
 
-/// Parses a stored log object (segment or fence), decompressing it if
-/// needed ([`decode`]): frames and values are slices of the uncompressed
-/// object. With `shard` set, only that shard's entries are returned
-/// (handoff replay).
+/// Parses a stored log object; frames and values are slices of the
+/// uncompressed object. With `shard` set, only that shard's entries are
+/// returned.
 pub fn parse(data: Bytes, with_muts: bool, shard: Option<ShardId>) -> anyhow::Result<LogObject> {
     let data = decode(data)?;
     let Some((h, mut pos)) = parse_header(&data)? else {
@@ -491,19 +474,23 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<ShardId>) -> anyhow::Re
     Ok(LogObject::Segment(h, out))
 }
 
+/// The firehose events of parsed entries (private-state entries, with an
+/// empty frame, dropped).
+pub fn events(entries: Vec<SegEntry>) -> Vec<(i64, Bytes)> {
+    entries.into_iter().filter(|e| !e.frame.is_empty()).map(|e| (e.seq, e.frame)).collect()
+}
+
 /// The state mutations of a #commit, rebuilt from its frame: for each op,
-/// the record CID index keys (delete the previous, put the new), the record
-/// (`R/`: cid | rev | the block from the commit's CAR) or its delete, and
-/// the record's backlink put (`bl/`, crate::backlinks); then the head (`h/`). Exactly what the repo worker writes for a commit, in
-/// the same order; the worker checks the two agree (debug builds).
+/// the record CID index keys, the record or its delete, and the record's
+/// backlink put; then the head. Exactly what the repo worker writes for a
+/// commit, in the same order (checked in debug builds).
 pub fn derive_commit_muts(frame: &[u8]) -> anyhow::Result<Vec<Mutation>> {
     derive(frame, None)
 }
 
 /// The `n` muts an entry derives from its #commit frame: those of
-/// [`derive_commit_muts`], followed (when `n` is larger: the commit wrote
-/// interior MST nodes) by the `M/` puts of the commit's interior MST nodes
-/// (`mst_lazy::persisted_blocks`, in CAR order).
+/// [`derive_commit_muts`], then (when `n` is larger) the `M/` puts of the
+/// commit's interior MST nodes in CAR order.
 pub fn derive_commit_muts_n(frame: &[u8], n: usize) -> anyhow::Result<Vec<Mutation>> {
     let muts = derive(frame, Some(n))?;
     anyhow::ensure!(muts.len() == n, "{} muts derived from the #commit frame, {n} expected", muts.len());
@@ -511,8 +498,7 @@ pub fn derive_commit_muts_n(frame: &[u8], n: usize) -> anyhow::Result<Vec<Mutati
 }
 
 fn derive(frame: &[u8], want: Option<usize>) -> anyhow::Result<Vec<Mutation>> {
-    // borrowed decoding: the frame's strings and the CAR stay in `frame`
-    // (replay runs this for every #commit it applies)
+    // borrowed decoding: replay runs this for every #commit it applies
     use crate::cbor::ValueRef as Value;
     use crate::cid::Cid;
     use crate::state;

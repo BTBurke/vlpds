@@ -12,7 +12,7 @@
 //! first ordinal that isn't a segment (the hole rule, DESIGN.md).
 
 use crate::metrics;
-use crate::nodelog::{prefix_hole, read_head, segment_path, Head};
+use crate::nodelog::{check_header, prefix_hole, read_head, segment_path, Head};
 use crate::segment::{self, LogObject};
 use crate::slots::SlotRange;
 use crate::store::Store;
@@ -33,16 +33,13 @@ async fn seg_header(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result
     })
 }
 
-/// Every log id under `{prefix}/log/`.
 pub async fn list_logs(store: &Store) -> anyhow::Result<Vec<String>> {
     let prefix = Path::from(format!("{}/log", store.prefix));
     let r = store.raw.list_with_delimiter(Some(&prefix)).await?;
     Ok(r.common_prefixes.iter().filter_map(|p| p.filename().map(String::from)).collect())
 }
 
-/// Retention deleted segments a reader was about to read (the reader is
-/// behind the retained floor: per the protocol it gets `OutdatedCursor` and
-/// continues from the oldest event still stored).
+/// Retention deleted segments a reader was about to read.
 #[derive(Debug, thiserror::Error)]
 #[error("log {log_id} was pruned past ordinal {ordinal} while being read")]
 pub struct Pruned {
@@ -82,8 +79,7 @@ async fn first_ordinal_after(store: &Store, log_id: &str, after: i64) -> anyhow:
     }
 }
 
-/// Seeks retried after retention pruned a log's head under them (each needs
-/// a new delete, so this is a bound, not a budget).
+/// Each retry needs a new delete, so this is a bound, not a budget.
 const MAX_SEEK_RETRIES: u32 = 16;
 
 async fn seek_once(store: &Store, log_id: &str, after: i64) -> anyhow::Result<Option<u64>> {
@@ -98,9 +94,8 @@ async fn seek_once(store: &Store, log_id: &str, after: i64) -> anyhow::Result<Op
 }
 
 /// The lowest ordinal of `log_id` still in the store (None = no objects).
-/// Retention may have pruned the head of a log, so it needn't be 0. Object
-/// listings are lexicographic (S3, in-memory) and ordinals zero-padded, so
-/// the first key listed is the lowest.
+/// Listings are lexicographic and ordinals zero-padded, so the first key
+/// listed is the lowest.
 pub async fn first_ordinal(store: &Store, log_id: &str) -> anyhow::Result<Option<u64>> {
     use futures::StreamExt;
     let prefix = Path::from(format!("{}/log/{}", store.prefix, log_id));
@@ -168,13 +163,12 @@ async fn seek_unchecked(store: &Store, log_id: &str, base: u64, after: i64) -> a
     Ok(hi)
 }
 
-/// A parsed segment's events (empty frames dropped), sharing the GET body.
+/// A parsed segment's events, sharing the GET body.
 pub struct Seg {
     pub events: Vec<(i64, Bytes)>,
-    /// object size
+    /// decompressed object size
     pub bytes: usize,
-    /// Each event's repo hash slot, computed by the first sharded reader and
-    /// cached with the segment.
+    /// Computed by the first sharded reader.
     slots: std::sync::OnceLock<Vec<u16>>,
 }
 
@@ -184,7 +178,6 @@ impl Seg {
     }
 }
 
-/// What occupies an ordinal, as a sequential reader sees it.
 #[derive(Clone)]
 enum Fetched {
     Seg(Arc<Seg>),
@@ -194,12 +187,11 @@ enum Fetched {
 }
 
 /// Recently read segments, shared by every backfill reader of one store so
-/// subscribers replaying the same range GET each segment once. Keyed by
-/// (log, ordinal); segments are immutable once written (conditional
-/// creates), so a cached one never goes stale. Missing ordinals and fences
-/// aren't cached (a missing one may still land). Concurrent readers of the
-/// same segment share one GET. Bounded by (decompressed) object bytes, evicted oldest first
-/// (replays are sequential).
+/// subscribers replaying the same range GET each segment once. Segments are
+/// immutable once written, so a cached one never goes stale; missing
+/// ordinals and fences aren't cached (a missing one may still land).
+/// Bounded by decompressed bytes, evicted oldest first (replays are
+/// sequential).
 pub struct SegCache {
     max_bytes: usize,
     inner: parking_lot::Mutex<CacheInner>,
@@ -221,7 +213,6 @@ impl SegCache {
         Arc::new(SegCache { max_bytes, inner: Default::default() })
     }
 
-    /// Bytes of loaded segments held.
     pub fn bytes(&self) -> usize {
         self.inner.lock().bytes
     }
@@ -279,8 +270,6 @@ impl SegCache {
                 }
             }
         }
-        // (cells of cancelled reads stay empty in the map until someone
-        // reads that ordinal again; purge() drops them)
     }
 
     /// Drops empty cells nobody is loading (reads cancelled mid-GET).
@@ -292,7 +281,6 @@ impl SegCache {
     }
 }
 
-/// GETs and parses one log object, checked against the path it was read from.
 async fn fetch(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result<Fetched> {
     let data = match store.raw.get(&segment_path(store, log_id, ordinal)).await {
         Ok(r) => r.bytes().await?,
@@ -307,21 +295,19 @@ async fn fetch(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result<Fetc
     match segment::parse(data, false, None)? {
         LogObject::Fence { .. } => Ok(Fetched::End),
         LogObject::Segment(h, entries) => {
-            anyhow::ensure!(h.log_id == log_id && h.ordinal == ordinal, "log object {log_id}/{ordinal} has header {}/{}", h.log_id, h.ordinal);
-            let events = entries.into_iter().filter(|e| !e.frame.is_empty()).map(|e| (e.seq, e.frame)).collect();
-            Ok(Fetched::Seg(Arc::new(Seg { events, bytes, slots: Default::default() })))
+            check_header(&h, log_id, ordinal)?;
+            Ok(Fetched::Seg(Arc::new(Seg { events: segment::events(entries), bytes, slots: Default::default() })))
         }
     }
 }
 
-/// Backfill read settings.
 #[derive(Clone)]
 pub struct Reader {
     pub store: Store,
     pub cache: Arc<SegCache>,
-    /// Read-ahead budget per backfill (all logs together), in decompressed object bytes.
+    /// Per backfill (all logs together), in decompressed object bytes.
     pub readahead_bytes: usize,
-    /// Only events whose repo is in this slot range (a sharded subscriber).
+    /// Only events whose repo is in this slot range.
     pub shard: Option<SlotRange>,
 }
 
@@ -335,7 +321,7 @@ impl Reader {
 pub const DEFAULT_READAHEAD_BYTES: usize = 64 << 20;
 pub const DEFAULT_CACHE_BYTES: usize = 256 << 20;
 
-/// Most segment GETs in flight per log, however small its segments.
+/// GETs in flight per log, however small its segments.
 const MAX_AHEAD: usize = 32;
 
 /// Aborts a read-ahead GET nobody will consume.
@@ -355,7 +341,6 @@ struct LogCursor {
     log_id: Arc<str>,
     /// next ordinal to request
     next: u64,
-    /// (ordinal, its GET)
     ahead: VecDeque<(u64, Ahead)>,
     seg: Option<Arc<Seg>>,
     pos: usize,
@@ -375,7 +360,6 @@ impl LogCursor {
         self.seg.as_ref().and_then(|s| s.events.get(self.pos))
     }
 
-    /// The current event is one the reader wants (its shard filter).
     fn wanted(&self, r: &Reader) -> bool {
         match (&r.shard, &self.seg) {
             (Some(range), Some(s)) => range.contains(s.slot(self.pos)),
@@ -435,15 +419,10 @@ impl LogCursor {
 /// Sends every event with `after < seq <= until`, in seq order, across all
 /// logs (a seq seen twice is sent once). Returns the last seq sent (or
 /// `after`).
-///
-/// Each log reads ahead: its next segments are fetched concurrently (up to
-/// `readahead_bytes` across all logs, at most [`MAX_AHEAD`] per log) while
-/// the k-way merge consumes them in order, through the shared segment cache.
 pub async fn backfill(store: &Store, after: i64, until: i64, tx: &mpsc::Sender<(i64, Bytes)>) -> anyhow::Result<i64> {
     backfill_with(&Reader::new(store.clone()), after, until, tx).await
 }
 
-/// [`backfill`] through `r`'s cache and read-ahead.
 pub async fn backfill_with(r: &Reader, after: i64, until: i64, tx: &mpsc::Sender<(i64, Bytes)>) -> anyhow::Result<i64> {
     r.cache.purge();
     let mut cursors = Vec::new();
@@ -499,7 +478,7 @@ mod tests {
 
     /// A crashed K-in-flight log: 0..=2, a fence at the hole 3, and garbage
     /// 4..=6 sealed while 3 was pending (prefix_end 3). The probes see 4 as
-    /// "present, <= after" and used to land on 5, serving a garbage event.
+    /// "present, <= after" and must not land past the hole.
     #[tokio::test]
     async fn seek_never_lands_past_a_hole() {
         let store = Store::memory(None);

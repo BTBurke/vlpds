@@ -38,11 +38,11 @@ use tokio::sync::mpsc;
 
 pub type AckFn = Box<dyn FnOnce(Result<(), Arc<anyhow::Error>>) + Send>;
 
-/// The error an entry is acked with when the log refused it (its shard isn't
-/// held here, or is closing): nothing of it is applied or replayed, so the
-/// write can be resent to the shard's owner.
+/// The error an entry is acked with when its shard isn't held here or is
+/// closing: nothing of it is applied or replayed, so the write can be resent
+/// to the shard's owner.
 pub const NOT_HELD: &str = "partition not owned by this node (moved)";
-/// Returns false once this node may no longer act as an owner (lease lapsed).
+/// False once this node may no longer act as an owner (lease lapsed).
 pub type LeaseCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Per-shard applied marker: everything for this shard in `log_id` up to and
@@ -57,7 +57,7 @@ pub struct LogEntry {
     pub frames: Vec<Frame>,
     pub muts: Vec<Mutation>,
     pub ack: Option<AckFn>,
-    /// Per-repo in-flight counter (repos with pending commits aren't evicted).
+    /// Per-repo in-flight counter, decremented once durable.
     pub pending: Option<Arc<AtomicU32>>,
     pub enqueued: Instant,
 }
@@ -70,14 +70,13 @@ pub struct LogBatch {
     pub events: Vec<(i64, Bytes)>,
 }
 
-/// Default byte budget of a log's live ring (see `LiveRing`).
 pub const DEFAULT_LIVE_RING_BYTES: usize = 128 << 20;
 
 /// This log's recent durable batches, for peers following it (remote.rs).
-/// A batch is kept until every subscriber has read it, up to a byte budget:
-/// each batch pins its whole segment, so the old 1024-batch broadcast let one
-/// slow follower pin GBs. A subscriber the budget evicts batches from is told
-/// it lagged and catches up from S3 instead.
+/// A batch is kept until every subscriber has read it, up to a byte budget
+/// (each batch pins its whole segment, so a count bound would let one slow
+/// follower pin GBs). A subscriber the budget evicts batches from is told it
+/// lagged and catches up from S3 instead.
 pub struct LiveRing {
     inner: Mutex<LiveInner>,
     max_bytes: AtomicUsize,
@@ -133,7 +132,6 @@ impl LiveRing {
         self.max_bytes.store(n, Ordering::Relaxed);
     }
 
-    /// Bytes currently pinned by the ring.
     pub fn bytes(&self) -> usize {
         self.inner.lock().bytes
     }
@@ -184,7 +182,6 @@ impl Drop for LiveSub {
     }
 }
 
-/// Default segment PUTs in flight per log (`--log-inflight`).
 pub const DEFAULT_LOG_INFLIGHT: usize = 4;
 
 pub fn seq_floor(now_us: u64) -> i64 {
@@ -267,18 +264,15 @@ pub struct ShardSink {
     pub applied: AtomicU64,
     /// Shared with the shard's `Partition`; persisted by its checkpoints.
     pub recent: Arc<crate::partition::RecentRepos>,
-    /// The shard's close barrier, as the sequencer saw it.
     pub barrier: Barrier,
 }
 
-/// A close barrier (`ShardSink::barrier_entry`) is marked by carrying the
-/// sink's own token as its `pending` counter, which no other entry holds.
-/// Once the sequencer takes it, it refuses every later entry for the sink:
-/// one logged behind the barrier lands past the span end the close
-/// publishes (read once the barrier is durable), where no successor replays
-/// it, so acking it would lose it. (`put_private` looks its Partition up
-/// and sends later, outside the repo workers a close purges: it could slip
-/// in after the barrier.)
+/// A close barrier (`ShardSink::barrier_entry`) carries the sink's own token
+/// as its `pending` counter, which no other entry holds. Once the sequencer
+/// takes it, it refuses every later entry for the sink: one logged behind the
+/// barrier lands past the span end the close publishes, where no successor
+/// replays it, so acking it would lose it. (`put_private` sends from outside
+/// the repo workers a close purges, so it could slip in after the barrier.)
 #[derive(Default)]
 pub struct Barrier {
     token: Arc<AtomicU32>,
@@ -293,7 +287,6 @@ impl ShardSink {
         LogEntry { shard: self.id, frames: Vec::new(), muts: Vec::new(), ack: Some(ack), pending: Some(self.barrier.token.clone()), enqueued: Instant::now() }
     }
 
-    /// Whether the sequencer has taken this shard's close barrier.
     pub fn barrier_taken(&self) -> bool {
         self.barrier.taken.load(Ordering::Acquire)
     }
@@ -301,7 +294,7 @@ impl ShardSink {
 
 pub struct ShardSinks {
     map: RwLock<HashMap<ShardId, Arc<ShardSink>>>,
-    /// The log's last durable ordinal (`NodeLog::durable_ordinal`).
+    /// `NodeLog::durable_ordinal`
     durable: Arc<AtomicU64>,
     retain: Mutex<Retain>,
 }
@@ -384,7 +377,6 @@ impl ShardSinks {
         self.map.read().values().cloned().collect()
     }
 
-    /// State mutations applied into `id` since it opened here.
     pub fn applied_entries(&self, id: ShardId) -> u64 {
         self.get(id).map_or(0, |s| s.applied.load(Ordering::Relaxed))
     }
@@ -396,12 +388,10 @@ impl ShardSinks {
         self.retain.lock().floors.get(&shard).map(|f| f.1)
     }
 
-    /// Whether a checkpoint of `shard` at `ordinal` is already durable.
     fn checkpointed_at(&self, shard: ShardId, ordinal: u64) -> bool {
         self.retain.lock().floors.get(&shard).is_some_and(|f| ordinal >= f.1 && f.0 == ordinal + 1)
     }
 
-    /// A checkpoint marker at `ordinal` is durable for `shard`.
     fn checkpointed(&self, shard: ShardId, ordinal: u64) {
         if let Some(f) = self.retain.lock().floors.get_mut(&shard) {
             if ordinal >= f.1 {
@@ -424,7 +414,7 @@ impl ShardSinks {
         r.floors.values().map(|f| f.0).chain(r.closing.values().copied()).chain(r.retired.iter().map(|f| f.0)).fold(durable, u64::min)
     }
 
-    /// shard -> highest epoch this log's owner has opened it at.
+    /// shard -> highest epoch this log's owner opened it at.
     pub fn opened(&self) -> std::collections::BTreeMap<ShardId, u64> {
         self.retain.lock().opened.clone()
     }
@@ -446,11 +436,9 @@ pub struct NodeLog {
     /// Last durable+applied ordinal (u64::MAX = none yet).
     pub durable_ordinal: Arc<AtomicU64>,
     pub sinks: Arc<ShardSinks>,
-    /// Nothing more is streamed to peers (`remote::serve_stream` ends, new
-    /// streams are refused): a graceful shutdown fenced this log
-    /// (`Node::leaving`), or an in-process test node "crashed"
-    /// (`Node::halt`), as a dead process's connections would drop. Peers
-    /// then drain the log from S3 to its fence.
+    /// Nothing more is streamed to peers: a graceful shutdown fenced this
+    /// log, or an in-process test node "crashed" (`Node::halt`). Peers then
+    /// drain the log from S3 to its fence.
     pub closed: std::sync::atomic::AtomicBool,
 }
 
@@ -466,14 +454,13 @@ pub enum Head {
     Segment(segment::SegHeader),
 }
 
-impl Head {
-    pub fn is_segment(&self) -> bool {
-        matches!(self, Head::Segment(_))
-    }
+/// Errs unless a segment header names the log and ordinal it was read from.
+pub fn check_header(h: &segment::SegHeader, log_id: &str, ordinal: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(h.log_id == log_id && h.ordinal == ordinal, "log object {log_id}/{ordinal} has header {}/{}", h.log_id, h.ordinal);
+    Ok(())
 }
 
-/// The header of the object at `log_id/ordinal`, via one small range GET. A
-/// segment's header must name the log and ordinal it was read from.
+/// The header of the object at `log_id/ordinal`, via one small range GET.
 pub async fn read_head(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result<Head> {
     use object_store::{GetOptions, GetRange};
     let opts = GetOptions { range: Some(GetRange::Bounded(0..4096)), ..Default::default() };
@@ -483,13 +470,22 @@ pub async fn read_head(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Res
         Err(e) => return Err(e.into()),
     };
     let Some((h, _)) = segment::parse_header(&data)? else { return Ok(Head::Fence) };
-    anyhow::ensure!(
-        h.log_id == log_id && h.ordinal == ordinal,
-        "log object {log_id}/{ordinal} has header {}/{}",
-        h.log_id,
-        h.ordinal
-    );
+    check_header(&h, log_id, ordinal)?;
     Ok(Head::Segment(h))
+}
+
+/// The object at `log_id/ordinal`, parsed without muts (None = missing).
+pub async fn read_object(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result<Option<LogObject>> {
+    let data = match store.raw.get(&segment_path(store, log_id, ordinal)).await {
+        Ok(r) => r.bytes().await?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let obj = segment::parse(data, false, None)?;
+    if let LogObject::Segment(h, _) = &obj {
+        check_header(h, log_id, ordinal)?;
+    }
+    Ok(Some(obj))
 }
 
 /// The first ordinal below segment `h` that isn't a segment (missing, or a
@@ -501,7 +497,7 @@ pub async fn read_head(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Res
 /// lowest still stored: retention prunes a log's head) aren't probed.
 pub async fn prefix_hole(store: &Store, h: &segment::SegHeader, floor: u64) -> anyhow::Result<Option<u64>> {
     for ord in h.prefix_end.max(floor)..h.ordinal {
-        if !read_head(store, &h.log_id, ord).await?.is_segment() {
+        if !matches!(read_head(store, &h.log_id, ord).await?, Head::Segment(_)) {
             return Ok(Some(ord));
         }
     }
@@ -568,7 +564,6 @@ impl NodeLog {
         Self::start_with_inflight(store, cfg, DEFAULT_LOG_INFLIGHT, merger_tx)
     }
 
-    /// [`NodeLog::start`] with `inflight` segment PUTs at once.
     pub fn start_with_inflight(store: Store, cfg: NodeLogConfig, inflight: usize, merger_tx: mpsc::UnboundedSender<LogBatch>) -> Arc<NodeLog> {
         let wm = Arc::new(Watermark::new(cfg.writer, seq_floor(crate::tid::now_micros())));
         let (tx, rx) = mpsc::channel(64 * 1024);
@@ -595,10 +590,7 @@ impl NodeLog {
 
     /// Writes an applied marker for every shard and flushes their memtables,
     /// bounding how much of this log a successor must replay after a crash.
-    /// Shards already checkpointed at the current durable ordinal are
-    /// skipped (`checkpoint_shard`): an idle node flushes nothing.
-    /// One shard after another: the background loop
-    /// ([`NodeLog::spawn_checkpoints`]) spreads them over its interval instead.
+    /// One shard after another; `spawn_checkpoints` can spread them out.
     pub async fn checkpoint_all(&self) {
         let ord = self.durable_ordinal.load(Ordering::Acquire);
         if ord == u64::MAX {
@@ -625,29 +617,21 @@ impl NodeLog {
         if self.sinks.insert_floor(s.id).is_none_or(|f| ord < f) {
             return;
         }
-        // Nothing new since its last checkpoint, which was at this same
-        // ordinal: every write into the shard comes from a segment <= ord
-        // (or a checkpoint), so its marker and memtable are durable as of
-        // ord already, and its replay floor is ord + 1. Another flush would
-        // only rewrite the marker: an L0 SST PUT, a manifest CAS and later
-        // compactions per shard per interval on an idle node (cost model
-        // 2026-10-02). A shard with no entries while the log moves is still
-        // checkpointed, so a successor's replay stays as short as before.
+        // Already checkpointed at this ordinal: every write into the shard
+        // comes from a segment <= ord, so its marker and memtable are durable
+        // as of ord, and another flush would only cost an L0 SST PUT and a
+        // manifest CAS. A shard with no entries while the log moves is still
+        // checkpointed, so a successor's replay stays short.
         if self.sinks.checkpointed_at(s.id, ord) && !s.recent.is_dirty() {
             return;
         }
         let t = Instant::now();
-        // The lock orders this marker with the finalizer's own (a marker
-        // older than one already written would only lengthen a replay, but
-        // the finalizer's per-segment markers stay monotonic this way). It
-        // covers no store call: SlateDB's `write` returns once the batch is
-        // in the memtable (0.17 has no durable writes; the WAL is off), and
-        // the flush that makes it durable runs after the guard is dropped. A
-        // shard in memtable backpressure would block the finalizer's write
-        // to it anyway.
+        // The lock keeps the markers monotonic with the finalizer's. It
+        // covers no store call: `write` returns once the batch is in the
+        // memtable (the WAL is off), and the flush runs after the guard is
+        // dropped. The finalizer has applied every segment <= ord (it
+        // updates durable_ordinal only after applying).
         let _g = s.apply_lock.write().await;
-        // the finalizer has applied every segment <= ord (it updates
-        // durable_ordinal only after applying)
         let mut wb = WriteBatch::new();
         wb.put(META_APPLIED, encode_marker(&self.log_id, ord));
         if let Some(r) = s.recent.take_dirty() {
@@ -662,11 +646,9 @@ impl NodeLog {
         crate::metrics::CHECKPOINT_SHARD.observe(t.elapsed().as_secs_f64());
     }
 
-    /// Checkpoints every shard once per `every` (bounds a successor's replay
-    /// to about `every` of log). `stagger`: one shard every `every / shards`,
-    /// so the flushes (SST encode + zstd on the runtime, two store PUTs
-    /// each) spread over the interval instead of arriving as one burst of
-    /// `shards` flushes; otherwise all of them back to back every `every`.
+    /// Checkpoints every shard once per `every`. `stagger`: one shard every
+    /// `every / shards`, so the flushes (SST encode on the runtime, two
+    /// store PUTs each) don't arrive as one burst.
     pub fn spawn_checkpoints(self: &Arc<Self>, every: Duration, stagger: bool) {
         let log = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -677,7 +659,6 @@ impl NodeLog {
                     l.checkpoint_all().await;
                     continue;
                 }
-                // one pass takes `every` (plus the checkpoints' own time)
                 let Some(l) = log.upgrade() else { return };
                 let mut shards = l.sinks.all();
                 drop(l);
@@ -705,9 +686,8 @@ struct Sealed {
     ordinal: u64,
     data: Bytes,
     frames: Vec<(i64, std::ops::Range<usize>)>,
-    /// muts grouped by shard, in log order
+    /// in log order per shard
     muts: BTreeMap<ShardId, Vec<Mutation>>,
-    /// per entry: (its shard, ack, pending counter, enqueued)
     acks: Vec<PendingAck>,
     last_seq: i64,
     put_secs: f64,
@@ -715,6 +695,7 @@ struct Sealed {
     stored_bytes: usize,
 }
 
+/// (shard, ack, pending counter, enqueued)
 type PendingAck = (ShardId, Option<AckFn>, Option<Arc<AtomicU32>>, Instant);
 
 struct Open {
@@ -730,10 +711,9 @@ impl Open {
     }
 
     fn push(&mut self, wm: &Watermark, sinks: &ShardSinks, mut e: LogEntry) {
-        // HA fix: an entry for a shard we no longer hold (a worker's repo load or
-        // cached repo that outlived close()) used to be logged with epoch 0 and
-        // *acked*. But replay only applies entries whose epoch matches a span,
-        // so the successor never saw it: an acked write lost. Refuse it.
+        // An entry for a shard we no longer hold (a repo load or cached repo
+        // that outlived close()) matches no span, so no successor would
+        // replay it: acking it would lose it.
         let reject = |e: LogEntry, why: &str| {
             tracing::warn!(shard = e.shard.0, "log entry for a shard this node {why}: rejected");
             if let Some(p) = e.pending {
@@ -744,8 +724,6 @@ impl Open {
             }
         };
         let Some(sink) = sinks.get(e.shard) else { return reject(e, "no longer holds") };
-        // Behind the shard's close barrier: past the span end its close
-        // publishes, so nobody would replay it (see `Barrier`).
         if sink.barrier.taken.load(Ordering::Acquire) {
             return reject(e, "is closing");
         }
@@ -755,7 +733,7 @@ impl Open {
         }
         let epoch = sink.epoch;
         if e.frames.is_empty() {
-            // private-state write: an entry with an empty frame (skipped by the firehose)
+            // private-state write: an empty frame, skipped by the firehose
             e.frames.push(Frame { prefix: Vec::new(), suffix: Vec::new(), derived_muts: 0 });
         }
         let n = e.frames.len();
@@ -774,7 +752,7 @@ impl Open {
 struct SeqConfig {
     log_id: String,
     max_segment_bytes: usize,
-    /// K: segment PUTs in flight at once.
+    /// K
     inflight: usize,
     hedge_after: Duration,
 }
@@ -804,8 +782,7 @@ async fn run_sequencer(
     let SeqConfig { log_id, max_segment_bytes, inflight: k, hedge_after } = cfg;
     let concurrent_fill = (max_segment_bytes / k).max(1);
     let mut ordinal = 0u64;
-    // Every ordinal below this has been PUT (the oldest PUT not yet taken
-    // from `inflight`): the `prefix_end` recorded in each sealed header.
+    // every ordinal below this has been PUT: each sealed header's prefix_end
     let mut prefix_end = 0u64;
     let mut open = Open::new(&log_id);
     let mut inflight: FuturesOrdered<tokio::task::JoinHandle<Sealed>> = FuturesOrdered::new();
@@ -870,8 +847,6 @@ async fn run_sequencer(
             if inflight.is_empty() {
                 prefix_end = ordinal;
             }
-            // the header goes into the room the builder left: no copy of
-            // the body, and entry ranges are already object offsets
             let last_seq = o.seg.last_seq;
             let data = o.seg.seal(&log_id, ordinal, prefix_end);
             let sealed = Sealed {
@@ -893,8 +868,7 @@ async fn run_sequencer(
             let (store, log_id) = (store.clone(), log_id.clone());
             inflight.push_back(tokio::spawn(async move {
                 let mut sealed = sealed;
-                // the stored form: body zstd-compressed off the runtime (a
-                // few ms for a full segment); the finalizer keeps slicing
+                // compressed off the runtime; the finalizer keeps slicing
                 // frames out of the uncompressed `data`
                 let raw = sealed.data.clone();
                 let put = commit_pool().run(move || {
@@ -926,17 +900,15 @@ async fn run_sequencer(
 }
 
 /// A small fixed pool of threads for CPU work on the commit path (segment
-/// compression), apart from tokio's shared blocking pool. That pool also runs
-/// request-driven work (getRepo walks, cold repo loads, Argon2): with its
-/// threads all busy or parked on slow clients, a `spawn_blocking` queues
-/// behind them, and a compression stuck there stalls every write's ack.
-/// Nothing a request can start runs here.
+/// compression), apart from tokio's blocking pool. That pool also runs
+/// request-driven work (getRepo walks, cold loads, Argon2), and a compression
+/// queued behind it would stall every write's ack. Nothing a request can
+/// start runs here.
 pub struct BlockingPool {
     tx: crossbeam_channel::Sender<Box<dyn FnOnce() + Send>>,
 }
 
 impl BlockingPool {
-    /// `threads` threads named `{name}-{i}`.
     pub fn new(name: &str, threads: usize) -> BlockingPool {
         let (tx, rx) = crossbeam_channel::unbounded::<Box<dyn FnOnce() + Send>>();
         for i in 0..threads.max(1) {
@@ -945,8 +917,7 @@ impl BlockingPool {
                 .name(format!("{name}-{i}"))
                 .spawn(move || {
                     while let Ok(job) = rx.recv() {
-                        // a panicking job fails its caller (its reply is
-                        // dropped), not the pool
+                        // a panicking job fails its caller, not the pool
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                     }
                 })
@@ -968,8 +939,7 @@ impl BlockingPool {
     }
 }
 
-/// The commit-path pool: a quarter of the cores, 2 to 8 threads (a full
-/// segment compresses in a few ms; K PUTs in flight need at most K).
+/// A quarter of the cores, 2 to 8 threads: K PUTs in flight need at most K.
 pub fn commit_pool() -> &'static BlockingPool {
     static POOL: std::sync::LazyLock<BlockingPool> = std::sync::LazyLock::new(|| {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -1001,9 +971,8 @@ async fn upload(store: &Store, log_id: &str, ordinal: u64, data: Bytes, hedge_af
     let path = segment_path(store, log_id, ordinal);
     let t = Instant::now();
     let mut backoff = Duration::from_millis(20);
-    // At most one hedge per ordinal: with K segments in flight, hedging every
-    // retry round of every segment could multiply PUT load K-fold just when
-    // S3 is slow.
+    // at most one hedge per ordinal: hedging every retry round of K segments
+    // would multiply PUT load just when S3 is slow
     let mut hedged = false;
     loop {
         let mut attempts = FuturesUnordered::new();
@@ -1045,8 +1014,7 @@ async fn upload(store: &Store, log_id: &str, ordinal: u64, data: Bytes, hedge_af
                 }
                 Conflict::Missing => {
                     // S3 answers 409 (mapped to AlreadyExists) on conditional
-                    // write conflicts too, e.g. our own hedge racing: nothing
-                    // is there (yet), so PUT again.
+                    // write conflicts too, e.g. our own hedge racing
                     tracing::warn!(log_id, ordinal, "segment PUT conflicted but no object is there; retrying");
                     tokio::time::sleep(jittered(backoff)).await;
                     backoff = (backoff * 2).min(Duration::from_secs(2));
@@ -1061,21 +1029,17 @@ async fn upload(store: &Store, log_id: &str, ordinal: u64, data: Bytes, hedge_af
     }
 }
 
-/// `d` scaled by a random factor in [0.5, 1.5): K segments failing on the
-/// same S3 hiccup retry spread out instead of in lockstep.
+/// K segments failing on the same S3 hiccup retry spread out, not in lockstep.
 fn jittered(d: Duration) -> Duration {
     d.mul_f64(rand::Rng::gen_range(&mut rand::thread_rng(), 0.5..1.5))
 }
 
 #[derive(Debug, PartialEq)]
 enum Conflict {
-    /// Our bytes are there (a hedge or an earlier attempt won).
+    /// A hedge or an earlier attempt won.
     Ours,
-    /// A fence object: a successor closed this log.
     Fenced,
-    /// A different segment: another writer.
     Other,
-    /// Nothing there: the conflict was transient.
     Missing,
 }
 
@@ -1120,9 +1084,8 @@ async fn run_finalizer(
 ) {
     let mut expect = 0u64;
     while let Some(mut s) = rx.recv().await {
-        // The sequencer hands segments over in ordinal order: everything this
-        // does (apply, live ring, merger, watermark, acks) covers a gap-free
-        // prefix of the log.
+        // everything below (apply, live ring, merger, watermark, acks) must
+        // cover a gap-free prefix of the log
         assert_eq!(s.ordinal, expect, "log {log_id}: finalizer got ordinal {} out of order", s.ordinal);
         expect += 1;
         let t_lock = Instant::now();
@@ -1151,9 +1114,8 @@ async fn run_finalizer(
         }
         let t = Instant::now();
         metrics::COMMIT_STAGE.with_label_values(&["apply_lock"]).observe((t - t_lock).as_secs_f64());
-        // Shards are independent DBs: apply them concurrently, so one shard
-        // stalled on memtable backpressure doesn't serialize the rest (a
-        // segment touches up to every owned shard).
+        // concurrently: one shard stalled on memtable backpressure mustn't
+        // serialize the rest
         let writes = targets.into_iter().map(|(sink, muts)| {
             let mut wb = WriteBatch::new();
             let n = muts.len();
@@ -1232,9 +1194,8 @@ pub struct Span {
 /// The span an applied marker `(log, ord)` was written in: the *earliest* span
 /// of `log` that covers it (start - 1 <= ord < end; start - 1 = nothing of the
 /// span applied yet). A node can hold a shard twice in one log (A -> B -> A),
-/// so the log id alone is ambiguous: matching its last span skipped every
-/// span in between (B's acked writes). Where the marker sits on the boundary
-/// of two spans of the same log, the earlier one wins: replaying more than
+/// so the log id alone is ambiguous, and matching a later span would skip the
+/// spans in between. On a boundary the earlier span wins: replaying more than
 /// needed is safe (absolute puts/deletes, in log order), replaying less is not.
 fn marker_span(history: &[Span], log: &str, ord: u64) -> Option<usize> {
     history.iter().position(|s| s.log_id == log && s.start <= ord.saturating_add(1) && s.end.is_none_or(|e| ord < e))
@@ -1246,9 +1207,9 @@ pub async fn replay_shard(store: &Store, shard: ShardId, db: &Db, history: &[Spa
     replay_many(store, &[(shard, db, history)]).await
 }
 
-/// Replays many shards at once (e.g. taking over a dead node's shards): each
-/// log segment is fetched once (16 in flight, applied in order) and its
-/// entries dispatched to every shard whose span covers it. Returns segments read.
+/// Replays many shards at once: each log segment is fetched once (16 in
+/// flight, applied in order) and its entries dispatched to every shard whose
+/// span covers it. Returns segments read.
 pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> anyhow::Result<u64> {
     use futures::StreamExt;
     // per shard: the spans still to apply, with the ordinal to start from,
@@ -1259,11 +1220,10 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
             Some(b) => Some(decode_marker(&b).map_err(|e| e.context(format!("shard {shard}")))?),
             None => None,
         };
-        // A marker always names a span of the history: spans leave it only
-        // below `Assignment::applied_epoch`, before every marker's span. One
-        // that names none means a span the shard still needs was dropped:
-        // replaying from the oldest one left (as this once did) would serve
-        // without that span's acked writes, and let retention delete them.
+        // A marker always names a span of the history (spans leave it only
+        // below `Assignment::applied_epoch`). One that names none means a
+        // span the shard still needs was dropped: replaying from the oldest
+        // one left would serve without that span's acked writes.
         let first = match &marker {
             Some((log, ord)) => marker_span(history, log, *ord).ok_or_else(|| {
                 anyhow::anyhow!("shard {shard}: its applied marker ({log}, {ord}) names no span of its history {history:?}: a span it needs is missing; refusing to replay")
@@ -1298,22 +1258,19 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
         }
         for (log_id, members) in by_log {
             let mut lo = members.iter().map(|m| m.2).min().unwrap_or(0);
-            // Retention may have pruned the log's head. What it pruned holds
-            // nothing these spans still need (no entries of their shard and
-            // epoch, or entries already durable): DESIGN.md "Log retention".
-            // Except never past a resume point (a marker inside its span:
-            // the shard's next entries may be right after it): that is an
-            // entry it needs, gone.
+            // Retention may have pruned the log's head, which holds nothing
+            // these spans still need (DESIGN.md "Log retention"), but never
+            // past a resume point: the shard's next entries may be right
+            // after its marker.
             let head = crate::backfill::first_ordinal(store, &log_id).await?;
             if let Some((_, from, span)) = resumes.iter().find(|(l, from, _)| *l == log_id && head.is_none_or(|h| h > *from)) {
                 anyhow::bail!("log {log_id} is pruned to {head:?}, past ordinal {from} where replay of {span:?} resumes after its applied marker");
             }
             match head {
                 Some(first) => lo = lo.max(first),
-                // Nothing left at all: retention pruned a dead log to its
-                // fence and later deleted the fence (--fence-retention),
-                // which it does only once no replay needs the log. A span
-                // still open has no fence yet, so it is never this case.
+                // nothing left: retention deleted a dead log's fence, which it
+                // does only once no replay needs the log (an open span has
+                // no fence yet)
                 None if members.iter().all(|m| m.1.end.is_some()) => continue,
                 None => {}
             }
@@ -1322,8 +1279,7 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
                 let (store, path) = (store.clone(), segment_path(store, &log_id, ord));
                 async move {
                     match store.raw.get(&path).await {
-                        // decompress here, so the 16 reads in flight
-                        // decompress in parallel ahead of the apply loop
+                        // decompressed here, in parallel ahead of the apply loop
                         Ok(r) => {
                             let data = r.bytes().await?;
                             tokio::task::spawn_blocking(move || segment::decode(data)).await?.map(Some)
@@ -1335,15 +1291,13 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
             };
             let mut objs = futures::stream::iter(lo..hi).map(fetch).buffered(16);
             let mut ord = lo;
-            // per member: the last ordinal read for it whose marker isn't
-            // written yet (segments with none of its entries only move the
-            // marker; one write at the end instead of one per segment per
-            // shard: 85 shards x 342 segments were 29k writes)
+            // per member: the last ordinal read whose marker isn't written
+            // yet (segments with none of its entries only move the marker,
+            // written once at the end rather than per segment per shard)
             let mut marker_due: Vec<Option<u64>> = vec![None; members.len()];
             while let Some(obj) = objs.next().await {
-                // The end of the log (missing object or its fence) is only
-                // legitimate past every closed span: a closed span's end is the
-                // fence ordinal, so every segment before it exists.
+                // The end of the log is only legitimate past every closed span:
+                // a closed span's end is the fence ordinal.
                 let seg = match obj? {
                     Some(data) => match segment::parse(data, true, None)? {
                         LogObject::Segment(h, entries) => Some((h, entries)),
@@ -1357,12 +1311,7 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
                     }
                     break;
                 };
-                anyhow::ensure!(
-                    h.log_id == log_id && h.ordinal == ord,
-                    "log object {log_id}/{ord} has header {}/{}",
-                    h.log_id,
-                    h.ordinal
-                );
+                check_header(&h, &log_id, ord)?;
                 read += 1;
                 for (j, (i, span, from)) in members.iter().enumerate() {
                     if ord < *from || span.end.is_some_and(|e| ord >= e) {
@@ -1669,7 +1618,7 @@ mod tests {
     }
 
     async fn exists(store: &Store, ord: u64) -> bool {
-        read_head(store, "L", ord).await.unwrap().is_segment()
+        matches!(read_head(store, "L", ord).await.unwrap(), Head::Segment(_))
     }
 
     /// A checkpoint on a slow state store doesn't hold the apply lock

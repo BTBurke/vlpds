@@ -55,19 +55,18 @@ pub struct MergedBatch {
     pub last: i64,
     /// (seq, frame); each frame is a slice of `wire`
     pub events: Vec<(i64, Bytes)>,
-    /// `wire` bytes
+    /// `wire.len()`
     pub bytes: usize,
     /// Wire bytes emitted through this batch since startup (subscriber lag
     /// is measured in these).
     pub end: u64,
     /// The events as consecutive binary websocket messages, written as-is
-    /// to every subscriber. Built once by the merger; the frames are copied
-    /// out of their segments, so the ring doesn't pin whole segment bodies.
+    /// to every subscriber. The frames are copied out of their segments, so
+    /// the ring doesn't pin whole segment bodies.
     wire: Bytes,
     /// start of each event's message in `wire`
     offs: Vec<usize>,
-    /// Each event's repo hash slot, computed by the first sharded subscriber
-    /// to read the batch and shared by the rest (see [`event_slot`]).
+    /// Computed by the first sharded subscriber to read the batch.
     slots: OnceLock<Vec<u16>>,
 }
 
@@ -100,7 +99,6 @@ impl MergedBatch {
         self.end - self.bytes as u64
     }
 
-    /// The websocket messages of the events from index `i` on.
     fn wire_from(&self, i: usize) -> Bytes {
         self.wire.slice(self.offs[i]..)
     }
@@ -140,7 +138,6 @@ pub fn event_slot(frame: &[u8]) -> u16 {
     frame_did(frame).map(crate::slots::slot_of_bytes).unwrap_or(0)
 }
 
-/// `repo` / `did` of the body map following the header map.
 fn frame_did(f: &[u8]) -> Option<&[u8]> {
     let mut i = 0;
     cbor_skip(f, &mut i, 0)?; // header
@@ -214,7 +211,6 @@ fn cbor_skip(f: &[u8], i: &mut usize, depth: u32) -> Option<()> {
     Some(())
 }
 
-/// Subscriber serving settings.
 #[derive(Clone)]
 pub struct Options {
     /// Bytes of merged batches kept in memory for cursors and slow readers.
@@ -224,17 +220,16 @@ pub struct Options {
     pub max_lag_bytes: usize,
     /// Read-ahead per cursor backfill, across all logs.
     pub readahead_bytes: usize,
-    /// Segments cached for backfills replaying the same range.
     pub backfill_cache_bytes: usize,
-    /// Cursor backfills running at once; more wait for a slot. Read-ahead
-    /// memory is at most this x `readahead_bytes`.
+    /// More wait for a slot: read-ahead memory is at most this x
+    /// `readahead_bytes`.
     pub max_backfills: usize,
-    /// Subscriber connections per client IP (IPv6: per /64); 0 = no cap.
+    /// Per client IP (IPv6: per /64); 0 = no cap.
     pub max_per_ip: usize,
-    /// A write to a subscriber outside the live path (backfill, info
-    /// frames, pongs) that makes no progress for this long drops it.
+    /// A write outside the live path (backfill, info frames, pongs) that
+    /// makes no progress for this long drops the subscriber.
     pub write_idle: Duration,
-    /// Runtime subscriber connections run on (None = the caller's).
+    /// None = the caller's runtime.
     pub runtime: Option<tokio::runtime::Handle>,
 }
 
@@ -253,16 +248,10 @@ impl Default for Options {
     }
 }
 
-/// Default bound on cursor backfills running at once (x 64 MiB read-ahead
-/// each: 1 GiB).
 pub const DEFAULT_MAX_BACKFILLS: usize = 16;
-/// Default bound on subscriber connections per client IP (a relay may open
-/// one per `?shard=k/n` slice).
+/// A relay may open one per `?shard=k/n` slice.
 pub const DEFAULT_MAX_PER_IP: usize = 256;
-/// Default [`Options::write_idle`].
 pub const DEFAULT_WRITE_IDLE: Duration = Duration::from_secs(30);
-
-/// Default bound on a live subscriber's lag behind the head.
 pub const DEFAULT_MAX_LAG_BYTES: usize = 128 << 20;
 
 /// The process-wide runtime for subscriber connections (subscribeRepos
@@ -290,7 +279,6 @@ pub struct Firehose {
     ring_bytes: AtomicI64,
     max_ring_bytes: i64,
     pub last_emitted: AtomicI64,
-    /// Watermark source per log id.
     pub sources: RwLock<HashMap<Arc<str>, Source>>,
     /// The ring holds every event with seq > ring_floor (the start floor
     /// until the ring evicts). Older cursors are backfilled from S3.
@@ -301,7 +289,7 @@ pub struct Firehose {
     /// Highest min watermark the merger has acted on: every event <= it (and
     /// > start_floor) of every followed log has been emitted.
     settled: AtomicI64,
-    /// Object store for S3 backfill (set once the node log is known).
+    /// Set once the node log is known.
     pub store: RwLock<Option<crate::store::Store>>,
     max_queue_bytes: AtomicUsize,
     queued_bytes: AtomicUsize,
@@ -312,10 +300,8 @@ pub struct Firehose {
     max_lag_bytes: u64,
     readahead_bytes: usize,
     backfill_cache: Arc<SegCache>,
-    /// Running backfills (`Options::max_backfills`).
     backfill_slots: Arc<tokio::sync::Semaphore>,
     max_per_ip: usize,
-    /// Subscriber connections per client IP key ([`ip_key`]).
     per_ip: parking_lot::Mutex<HashMap<std::net::IpAddr, usize>>,
     write_idle: Duration,
     /// `settled`, for backfills waiting on it.
@@ -371,14 +357,12 @@ impl Firehose {
     /// below it). Taken under the sources lock, so no merger tick that
     /// ignored this log can settle past the floor afterwards.
     ///
-    /// The watermark starts *below* the floor, not at it: the merger isn't
-    /// owed the log's events <= floor, but at startup (floor = the start
-    /// floor) the S3 backfill serves them, and it waits for `settled` to
-    /// reach the floor as proof that every log is durable up to it. Only
-    /// the peer can vouch for that (its first heartbeat, or a segment read
-    /// back from S3). Starting at the floor let a backfill run while the
-    /// peer still had segments in flight with seqs <= floor and skip them
-    /// for good (the merger drops them as the backfill's).
+    /// The watermark starts *below* the floor: at startup the S3 backfill
+    /// serves events <= floor and waits for `settled` to reach the floor as
+    /// proof that every log is durable up to it, which only the peer can
+    /// vouch for (its first heartbeat, or a segment read back from S3).
+    /// Otherwise a backfill could run while the peer still had segments in
+    /// flight with seqs <= floor and skip them for good.
     pub fn add_remote(&self, log_id: &str) -> (i64, Arc<AtomicI64>) {
         let mut s = self.sources.write();
         let floor = self.position();
@@ -411,13 +395,11 @@ impl Firehose {
         self.frozen.store(true, Ordering::Release);
     }
 
-    /// Byte budget of the merger's queues (events waiting for the min
-    /// watermark). Over it, logs are spilled: see `spawn_merger`.
+    /// Over this many queued bytes, logs are spilled (see `spawn_merger`).
     pub fn set_max_queue_bytes(&self, n: usize) {
         self.max_queue_bytes.store(n, Ordering::Relaxed);
     }
 
-    /// Frame bytes currently queued in the merger.
     pub fn queued_bytes(&self) -> usize {
         self.queued_bytes.load(Ordering::Relaxed)
     }
@@ -502,73 +484,11 @@ impl Firehose {
                     }
                     total += lq.accept(b.events, emitted, fh.start_floor, &mut late);
                 }
-                // Read spilled logs back, up to w, a chunk at a time: emit only
-                // up to what every spilled log has loaded.
                 let mut bound = w;
                 if let Some(store) = &store {
-                    let chunk = (max / 16).max(1);
-                    for (log_id, lq) in logs.iter_mut() {
-                        let Some(sp) = &mut lq.spill else { continue };
-                        let mut caught_up = sp.end || sp.loaded >= w;
-                        let mut failed = false;
-                        while !caught_up && lq.bytes < chunk {
-                            match read_segment(store, log_id, sp.next).await {
-                                Ok(Some(LogObject::Segment(_, entries))) => {
-                                    metrics::FIREHOSE_SPILL_SEGMENTS.inc();
-                                    sp.next += 1;
-                                    let last = entries.last().map(|e| e.seq);
-                                    let events = entries.into_iter().filter(|e| !e.frame.is_empty()).map(|e| (e.seq, e.frame)).collect();
-                                    let LogQ { q, bytes, high, .. } = lq;
-                                    let n = accept_into(q, bytes, high, events, emitted, fh.start_floor, &mut late);
-                                    total += n;
-                                    if let Some(l) = last {
-                                        sp.loaded = sp.loaded.max(l);
-                                    }
-                                    caught_up = sp.loaded >= w;
-                                }
-                                // the fence: the log is complete
-                                Ok(Some(LogObject::Fence { .. })) => {
-                                    sp.end = true;
-                                    caught_up = true;
-                                }
-                                // not written: every event <= w of this log was
-                                // PUT before w was published, so all are loaded
-                                // (w only covers the log's gap-free prefix: a
-                                // later ordinal that landed early is past it).
-                                // Unless retention deleted it (the read-back is
-                                // a whole window behind): then it never appears
-                                // and the log would be ignored for good (live
-                                // batches only rejoin at `next`). Skip to the
-                                // log's first segment, as remote::catch_up does.
-                                Ok(None) => {
-                                    if sp.checked.is_none_or(|t| t.elapsed() >= SPILL_PRUNE_CHECK) {
-                                        sp.checked = Some(std::time::Instant::now());
-                                        match crate::backfill::first_ordinal(store, log_id).await {
-                                            Ok(Some(first)) if first > sp.next => {
-                                                tracing::warn!(%log_id, from = sp.next, to = first, "firehose merger: spilled log pruned ahead of its read-back; skipping");
-                                                sp.next = first;
-                                                continue;
-                                            }
-                                            Ok(_) => {}
-                                            Err(e) => tracing::warn!(%log_id, "firehose merger: listing a spilled log failed: {e:#}"),
-                                        }
-                                    }
-                                    caught_up = true;
-                                }
-                                Err(e) => {
-                                    tracing::warn!(%log_id, ordinal = sp.next, "firehose merger: reading back a spilled log failed: {e:#}");
-                                    failed = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if !caught_up {
-                            bound = bound.min(sp.loaded);
-                            // more to read once this round is emitted (errors
-                            // wait for the next tick)
-                            behind |= !failed;
-                        }
-                    }
+                    let more;
+                    (bound, more) = read_back(store, &mut logs, w, (max / 16).max(1), emitted, fh.start_floor, &mut total, &mut late).await;
+                    behind |= more;
                 }
                 if late > 0 {
                     tracing::warn!(late, emitted, "firehose merger: dropped late events below the emitted watermark");
@@ -598,9 +518,7 @@ impl Firehose {
                 out.sort_unstable_by_key(|(s, _)| *s);
                 let batch = Arc::new(MergedBatch::new(out, pushed));
                 pushed = batch.end;
-                STATS
-                    .firehose_events
-                    .fetch_add(batch.events.len() as u64, Ordering::Relaxed);
+                STATS.firehose_events.fetch_add(batch.events.len() as u64, Ordering::Relaxed);
                 metrics::FIREHOSE_EVENTS.inc_by(batch.events.len() as u64);
                 metrics::FIREHOSE_BATCH.observe(batch.events.len() as f64);
                 metrics::FIREHOSE_EMIT_DELAY.observe(crate::tid::now_micros().saturating_sub((batch.first >> 8) as u64) as f64 / 1e6);
@@ -685,7 +603,7 @@ impl Firehose {
             .into_response()
     }
 
-    /// A connection slot for `ip`'s key (None = at the cap).
+    /// None = at the cap.
     fn ip_slot(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<IpSlot> {
         if self.max_per_ip == 0 {
             return Some(IpSlot { fh: None, key: ip });
@@ -700,7 +618,6 @@ impl Firehose {
         Some(IpSlot { fh: Some(self.clone()), key })
     }
 
-    /// Subscriber connections held by `ip`'s key.
     pub fn connections_from(&self, ip: std::net::IpAddr) -> usize {
         self.per_ip.lock().get(&ip_key(ip)).copied().unwrap_or(0)
     }
@@ -842,7 +759,7 @@ impl Firehose {
     async fn catch_up<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>, last: &mut i64, shard: Option<SlotRange>) -> Result<(), &'static str> {
         loop {
             if !self.backfill_to_ring(out, last, shard).await? {
-                out.send(&info_frame("OutdatedCursor", "cursor is older than the retained history; starting from the oldest available event")).await?;
+                out.send(&info_frame("OutdatedCursor", OUTDATED_CURSOR)).await?;
                 *last = (*last).max(self.ring_floor.load(Ordering::Acquire));
             }
             if *last >= self.ring_floor.load(Ordering::Acquire) {
@@ -888,7 +805,7 @@ impl Firehose {
             // oldest events left (retention.rs raises this before deleting)
             match crate::retention::retained_floor(&reader.store).await {
                 Ok(pruned) if *last < pruned => {
-                    out.send(&info_frame("OutdatedCursor", "cursor is older than the retained history; starting from the oldest available event")).await?;
+                    out.send(&info_frame("OutdatedCursor", OUTDATED_CURSOR)).await?;
                     *last = pruned;
                     continue;
                 }
@@ -952,13 +869,11 @@ impl Firehose {
     }
 }
 
-/// Tries per backfill before a subscriber is disconnected (S3 errors).
 const BACKFILL_ATTEMPTS: u32 = 3;
 /// Frames between a backfill reader and its subscriber's writer (they are
 /// slices of segments the reader holds anyway).
 const BACKFILL_CHANNEL: usize = 1024;
 
-/// A running backfill's slot (`Options::max_backfills`).
 struct BackfillSlot(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
 
 impl Drop for BackfillSlot {
@@ -968,8 +883,7 @@ impl Drop for BackfillSlot {
 }
 
 impl Firehose {
-    /// Waits for a backfill slot, answering the client meanwhile (Err: it
-    /// left).
+    /// Waits for a backfill slot, answering the client meanwhile.
     async fn backfill_slot<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>) -> Result<BackfillSlot, &'static str> {
         let p = match self.backfill_slots.clone().try_acquire_owned() {
             Ok(p) => p,
@@ -997,7 +911,6 @@ impl Firehose {
     }
 }
 
-/// A subscriber connection counted against its address ([`ip_key`]).
 struct IpSlot {
     fh: Option<Arc<Firehose>>,
     key: std::net::IpAddr,
@@ -1016,18 +929,18 @@ impl Drop for IpSlot {
     }
 }
 
-/// What subscriber connections are counted by: the IPv4 address, or the
-/// IPv6 /64 (one host's usual allocation).
+/// The IPv4 address, or the IPv6 /64 (one host's usual allocation).
 fn ip_key(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip.to_canonical() {
         std::net::IpAddr::V6(v6) => std::net::IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
         v4 => v4,
     }
 }
-/// Re-reads after retention overtook a backfill, before it's an error.
+
 const MAX_PRUNED_RETRIES: u32 = 64;
 
-/// Default byte budget of the merger's queues (see `Firehose::spawn_merger`).
+const OUTDATED_CURSOR: &str = "cursor is older than the retained history; starting from the oldest available event";
+
 pub const DEFAULT_MERGE_QUEUE_BYTES: usize = 256 << 20;
 
 /// One log's events waiting in the merger.
@@ -1035,15 +948,14 @@ pub const DEFAULT_MERGE_QUEUE_BYTES: usize = 256 << 20;
 struct LogQ {
     q: VecDeque<(i64, Bytes)>,
     bytes: usize,
-    /// Highest seq accepted: drops duplicates when a log's events arrive
-    /// twice (S3 catch-up overlapping a live stream).
+    /// Highest seq accepted: drops duplicates (S3 catch-up overlapping a
+    /// live stream).
     high: i64,
     spill: Option<Spill>,
 }
 
 /// A log the merger stopped queueing: its batches are read back from S3.
 struct Spill {
-    /// next ordinal to read
     next: u64,
     /// every event of the log <= this is queued or emitted
     loaded: i64,
@@ -1053,62 +965,107 @@ struct Spill {
     checked: Option<std::time::Instant>,
 }
 
-/// How often a spilled log's missing next segment is checked for having
-/// been pruned (one LIST).
+/// How often a spilled log's missing next segment is checked (one LIST) for
+/// having been pruned.
 const SPILL_PRUNE_CHECK: Duration = Duration::from_secs(1);
 
 impl LogQ {
+    /// Queues a log's events in seq order; returns the bytes added.
     fn accept(&mut self, events: Vec<(i64, Bytes)>, emitted: i64, start_floor: i64, late: &mut usize) -> usize {
-        accept_into(&mut self.q, &mut self.bytes, &mut self.high, events, emitted, start_floor, late)
+        let mut added = 0;
+        for (seq, frame) in events {
+            if seq <= self.high {
+                continue;
+            }
+            self.high = seq;
+            // At or below what we already emitted: the start of a follower's
+            // S3 catch-up (<= the start floor, backfill serves it), or a late
+            // event (a log we weren't following yet, or a watermark that
+            // overpromised), which live order can't take.
+            if seq <= emitted {
+                if seq > start_floor {
+                    *late += 1;
+                }
+                continue;
+            }
+            added += frame.len();
+            self.q.push_back((seq, frame));
+        }
+        self.bytes += added;
+        added
     }
 }
 
-/// Queues a log's events in seq order; returns the bytes added.
-fn accept_into(
-    q: &mut VecDeque<(i64, Bytes)>,
-    bytes: &mut usize,
-    high: &mut i64,
-    events: Vec<(i64, Bytes)>,
+/// Reads spilled logs back from S3 up to `w`, a `chunk` of queued bytes at a
+/// time. Returns the bound the merger may emit up to (what every spilled log
+/// has loaded) and whether more is to be read once that is emitted.
+#[allow(clippy::too_many_arguments)]
+async fn read_back(
+    store: &crate::store::Store,
+    logs: &mut HashMap<Arc<str>, LogQ>,
+    w: i64,
+    chunk: usize,
     emitted: i64,
     start_floor: i64,
+    total: &mut usize,
     late: &mut usize,
-) -> usize {
-    let mut added = 0;
-    for (seq, frame) in events {
-        if seq <= *high {
-            continue;
-        }
-        *high = seq;
-        // At or below what we already emitted: the start of a follower's S3
-        // catch-up (<= the start floor, backfill serves it), or a late event
-        // (a log we weren't following yet, or a watermark that overpromised),
-        // which live order can't take.
-        if seq <= emitted {
-            if seq > start_floor {
-                *late += 1;
+) -> (i64, bool) {
+    let (mut bound, mut more) = (w, false);
+    for (log_id, lq) in logs.iter_mut() {
+        let Some(mut sp) = lq.spill.take() else { continue };
+        let mut caught_up = sp.end || sp.loaded >= w;
+        let mut failed = false;
+        while !caught_up && lq.bytes < chunk {
+            match crate::nodelog::read_object(store, log_id, sp.next).await {
+                Ok(Some(LogObject::Segment(_, entries))) => {
+                    metrics::FIREHOSE_SPILL_SEGMENTS.inc();
+                    sp.next += 1;
+                    if let Some(l) = entries.last().map(|e| e.seq) {
+                        sp.loaded = sp.loaded.max(l);
+                    }
+                    *total += lq.accept(segment::events(entries), emitted, start_floor, late);
+                    caught_up = sp.loaded >= w;
+                }
+                Ok(Some(LogObject::Fence { .. })) => {
+                    sp.end = true;
+                    caught_up = true;
+                }
+                // Not written: every event <= w of this log was PUT before w
+                // was published, so all are loaded (w only covers the log's
+                // gap-free prefix). Unless retention deleted it (the read-back
+                // is a whole window behind): then it never appears, and live
+                // batches only rejoin at `next`, so skip to the log's first
+                // segment.
+                Ok(None) => {
+                    if sp.checked.is_none_or(|t| t.elapsed() >= SPILL_PRUNE_CHECK) {
+                        sp.checked = Some(std::time::Instant::now());
+                        match crate::backfill::first_ordinal(store, log_id).await {
+                            Ok(Some(first)) if first > sp.next => {
+                                tracing::warn!(%log_id, from = sp.next, to = first, "firehose merger: spilled log pruned ahead of its read-back; skipping");
+                                sp.next = first;
+                                continue;
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(%log_id, "firehose merger: listing a spilled log failed: {e:#}"),
+                        }
+                    }
+                    caught_up = true;
+                }
+                Err(e) => {
+                    tracing::warn!(%log_id, ordinal = sp.next, "firehose merger: reading back a spilled log failed: {e:#}");
+                    failed = true;
+                    break;
+                }
             }
-            continue;
         }
-        added += frame.len();
-        q.push_back((seq, frame));
+        if !caught_up {
+            bound = bound.min(sp.loaded);
+            // errors wait for the next tick
+            more |= !failed;
+        }
+        lq.spill = Some(sp);
     }
-    *bytes += added;
-    added
-}
-
-/// A log object, checked against the path it was read from (None = missing).
-async fn read_segment(store: &crate::store::Store, log_id: &str, ordinal: u64) -> anyhow::Result<Option<LogObject>> {
-    use object_store::ObjectStoreExt;
-    let data = match store.raw.get(&crate::nodelog::segment_path(store, log_id, ordinal)).await {
-        Ok(r) => r.bytes().await?,
-        Err(object_store::Error::NotFound { .. }) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let obj = segment::parse(data, false, None)?;
-    if let LogObject::Segment(h, _) = &obj {
-        anyhow::ensure!(h.log_id == log_id && h.ordinal == ordinal, "log object {log_id}/{ordinal} has header {}/{}", h.log_id, h.ordinal);
-    }
-    Ok(Some(obj))
+    (bound, more)
 }
 
 // ---- subscriber connections (a minimal RFC 6455 server) ----
@@ -1121,7 +1078,7 @@ const OP_PONG: u8 = 0xa;
 /// How long a subscriber being dropped gets to take its final frames.
 const FINAL_GRACE: Duration = Duration::from_secs(10);
 
-/// Largest client data message we skip over (subscribeRepos takes none).
+/// subscribeRepos takes no client data messages; larger ones are refused.
 const MAX_CLIENT_MESSAGE: u64 = 1 << 20;
 
 /// Appends one unmasked, final websocket message (server to client).
@@ -1141,7 +1098,7 @@ fn push_message(out: &mut Vec<u8>, op: u8, payload: &[u8]) {
     out.extend_from_slice(payload);
 }
 
-/// Validates a websocket upgrade request; returns the Sec-WebSocket-Accept value.
+/// Returns the Sec-WebSocket-Accept value.
 fn handshake(h: &HeaderMap) -> Result<String, (StatusCode, &'static str)> {
     let has = |name: header::HeaderName, token: &str| {
         h.get_all(name).iter().any(|v| v.to_str().is_ok_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token))))
@@ -1156,15 +1113,13 @@ fn handshake(h: &HeaderMap) -> Result<String, (StatusCode, &'static str)> {
     Ok(tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes()))
 }
 
-/// What the client sent that the writer must answer.
 enum Ctl {
     Ping(Vec<u8>),
     Close,
 }
 
-/// Reads the client's side: answers pings (via the writer), ends on a close
-/// frame, EOF or a protocol error. Dropping `ctl` tells the writer the
-/// client is gone.
+/// Ends on a close frame, EOF or a protocol error; dropping `ctl` tells the
+/// writer the client is gone.
 async fn read_client<R: AsyncRead + Unpin>(mut r: R, ctl: mpsc::Sender<Ctl>) {
     let res: std::io::Result<()> = async {
         loop {
@@ -1213,7 +1168,6 @@ async fn read_client<R: AsyncRead + Unpin>(mut r: R, ctl: mpsc::Sender<Ctl>) {
     }
 }
 
-/// A subscriber's write side plus what its read side asks of it.
 struct Out<W> {
     w: W,
     ctl: mpsc::Receiver<Ctl>,
@@ -1237,7 +1191,6 @@ impl<W: AsyncWrite + Unpin> Out<W> {
         Ok(())
     }
 
-    /// One binary message.
     async fn send(&mut self, payload: &[u8]) -> Result<(), &'static str> {
         let mut m = Vec::with_capacity(payload.len() + 10);
         push_message(&mut m, OP_BINARY, payload);
@@ -1291,11 +1244,7 @@ impl<W: AsyncWrite + Unpin> Out<W> {
     async fn close(&mut self, code: u16) {
         let mut m = Vec::with_capacity(4);
         push_message(&mut m, OP_CLOSE, &code.to_be_bytes());
-        let _ = tokio::time::timeout(FINAL_GRACE, async {
-            self.w.write_all(&m).await?;
-            self.w.shutdown().await
-        })
-        .await;
+        self.write_final(&m).await;
     }
 
     /// Best effort: a last message and a close frame, then the caller drops
@@ -1304,8 +1253,12 @@ impl<W: AsyncWrite + Unpin> Out<W> {
         let mut m = Vec::with_capacity(payload.len() + 12);
         push_message(&mut m, OP_BINARY, payload);
         push_message(&mut m, OP_CLOSE, &1000u16.to_be_bytes());
+        self.write_final(&m).await;
+    }
+
+    async fn write_final(&mut self, m: &[u8]) {
         let _ = tokio::time::timeout(FINAL_GRACE, async {
-            self.w.write_all(&m).await?;
+            self.w.write_all(m).await?;
             self.w.shutdown().await
         })
         .await;
@@ -1347,7 +1300,6 @@ async fn write_all_vectored<W: AsyncWrite + Unpin>(w: &mut W, mut bufs: &mut [st
     Ok(())
 }
 
-/// Aborts a task when its handle is dropped (a subscriber that went away).
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<T> {
