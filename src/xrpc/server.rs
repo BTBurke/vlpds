@@ -25,12 +25,8 @@
 //!
 //! Access tokens carry `jti` = session family id (`{issue micros:016x}{rand}`),
 //! refresh tokens `jti` = refresh id. Revocations and takedowns live in the
-//! account's own partition (`sec/`), so the node that owns the DID (where
-//! forwarding sends its requests) enforces them, and a successor owner reads
-//! them back after a failover. `verify_bearer` and the takedown checks use a
-//! per-DID in-memory view ([`ctl`]): loaded once from the owned partition and
-//! kept until a change or an ownership move (re-read from the owner every
-//! few seconds on other nodes), so the hot path does no storage reads.
+//! account's own partition (`sec/`) so its owner enforces them and a successor
+//! reads them back after a failover; the hot path checks a cached view ([`ctl`]).
 
 use super::authn::Credentials;
 use super::*;
@@ -42,152 +38,64 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicU64;
 
 pub fn routes() -> Router<Arc<App>> {
-    let r = Router::new()
-        .route(
-            "/xrpc/com.atproto.server.describeServer",
-            get(describe_server),
-        )
-        .route(
-            "/xrpc/com.atproto.server.createAccount",
-            post(create_account),
-        )
-        .route(
-            "/xrpc/com.atproto.server.createSession",
-            post(create_session),
-        )
+    Router::new()
+        .route("/xrpc/com.atproto.server.describeServer", get(describe_server))
+        .route("/xrpc/com.atproto.server.createAccount", post(create_account))
+        .route("/xrpc/com.atproto.server.createSession", post(create_session))
         .route("/xrpc/com.atproto.server.getSession", get(get_session))
-        .route(
-            "/xrpc/com.atproto.server.refreshSession",
-            post(refresh_session),
-        )
-        .route(
-            "/xrpc/com.atproto.server.deleteSession",
-            post(delete_session),
-        )
-        .route(
-            "/xrpc/com.atproto.server.createAppPassword",
-            post(create_app_password),
-        )
-        .route(
-            "/xrpc/com.atproto.server.listAppPasswords",
-            get(list_app_passwords),
-        )
-        .route(
-            "/xrpc/com.atproto.server.revokeAppPassword",
-            post(revoke_app_password),
-        )
-        .route(
-            "/xrpc/com.atproto.server.deactivateAccount",
-            post(deactivate_account),
-        )
-        .route(
-            "/xrpc/com.atproto.server.activateAccount",
-            post(activate_account),
-        )
-        .route(
-            "/xrpc/com.atproto.server.checkAccountStatus",
-            get(check_account_status),
-        )
-        .route(
-            "/xrpc/com.atproto.server.requestAccountDelete",
-            post(request_account_delete),
-        )
-        .route(
-            "/xrpc/com.atproto.server.deleteAccount",
-            post(delete_account),
-        )
-        .route(
-            "/xrpc/com.atproto.server.reserveSigningKey",
-            post(reserve_signing_key),
-        )
-        .route(
-            "/xrpc/com.atproto.server.requestEmailConfirmation",
-            post(request_email_confirmation),
-        )
+        .route("/xrpc/com.atproto.server.refreshSession", post(refresh_session))
+        .route("/xrpc/com.atproto.server.deleteSession", post(delete_session))
+        .route("/xrpc/com.atproto.server.createAppPassword", post(create_app_password))
+        .route("/xrpc/com.atproto.server.listAppPasswords", get(list_app_passwords))
+        .route("/xrpc/com.atproto.server.revokeAppPassword", post(revoke_app_password))
+        .route("/xrpc/com.atproto.server.deactivateAccount", post(deactivate_account))
+        .route("/xrpc/com.atproto.server.activateAccount", post(activate_account))
+        .route("/xrpc/com.atproto.server.checkAccountStatus", get(check_account_status))
+        .route("/xrpc/com.atproto.server.requestAccountDelete", post(request_account_delete))
+        .route("/xrpc/com.atproto.server.deleteAccount", post(delete_account))
+        .route("/xrpc/com.atproto.server.reserveSigningKey", post(reserve_signing_key))
+        .route("/xrpc/com.atproto.server.requestEmailConfirmation", post(request_email_confirmation))
         .route("/xrpc/com.atproto.server.confirmEmail", post(confirm_email))
-        .route(
-            "/xrpc/com.atproto.server.requestEmailUpdate",
-            post(request_email_update),
-        )
+        .route("/xrpc/com.atproto.server.requestEmailUpdate", post(request_email_update))
         .route("/xrpc/com.atproto.server.updateEmail", post(update_email))
-        .route(
-            "/xrpc/com.atproto.server.requestPasswordReset",
-            post(request_password_reset),
-        )
-        .route(
-            "/xrpc/com.atproto.server.resetPassword",
-            post(reset_password),
-        )
-        .route(
-            "/xrpc/com.atproto.server.createInviteCode",
-            post(create_invite_code),
-        )
-        .route(
-            "/xrpc/com.atproto.server.createInviteCodes",
-            post(create_invite_codes),
-        )
-        .route(
-            "/xrpc/com.atproto.server.getAccountInviteCodes",
-            get(get_account_invite_codes),
-        )
-        .route(
-            "/xrpc/com.atproto.server.getServiceAuth",
-            get(get_service_auth),
-        )
-        .route(
-            "/xrpc/com.atproto.temp.checkSignupQueue",
-            get(check_signup_queue),
-        )
-        .route(
-            "/xrpc/com.atproto.temp.checkHandleAvailability",
-            get(check_handle_availability),
-        )
+        .route("/xrpc/com.atproto.server.requestPasswordReset", post(request_password_reset))
+        .route("/xrpc/com.atproto.server.resetPassword", post(reset_password))
+        .route("/xrpc/com.atproto.server.createInviteCode", post(create_invite_code))
+        .route("/xrpc/com.atproto.server.createInviteCodes", post(create_invite_codes))
+        .route("/xrpc/com.atproto.server.getAccountInviteCodes", get(get_account_invite_codes))
+        .route("/xrpc/com.atproto.server.getServiceAuth", get(get_service_auth))
+        .route("/xrpc/com.atproto.temp.checkSignupQueue", get(check_signup_queue))
+        .route("/xrpc/com.atproto.temp.checkHandleAvailability", get(check_handle_availability))
         .route("/xrpc/vlpds.server.setupTotp", post(setup_totp))
         .route("/xrpc/vlpds.server.confirmTotp", post(confirm_totp))
         .route("/xrpc/vlpds.server.disableTotp", post(disable_totp))
-        .route("/xrpc/vlpds.server.getTotpStatus", get(get_totp_status));
-    r
+        .route("/xrpc/vlpds.server.getTotpStatus", get(get_totp_status))
 }
-
-// ---------------------------------------------------------------------------
-// constants, small helpers
-// ---------------------------------------------------------------------------
 
 const ACCESS_TTL: u64 = 2 * 3600;
 const REFRESH_TTL: u64 = 90 * 86400;
 /// A rotated refresh token stays usable this long (reference REFRESH_GRACE_MS).
 const REFRESH_GRACE: u64 = 2 * 3600;
-/// How long a revocation must be remembered for access tokens: their lifetime + slack.
 const REVOKE_TTL: u64 = ACCESS_TTL + 600;
-/// How long a revoke-all row (`sec/rvk/d/`) is kept: past every refresh
-/// token it covers, not just the access tokens. Defense in depth: the
-/// refresh rows are deleted in the same conditional write
-/// ([`revoke_all_sessions`]), and a rotation can't recreate them
-/// ([`refresh_session`]), but even a row that did come back stays refused
-/// (`is_revoked` of its family) for as long as it could be used.
+/// Revoke-all rows outlive every refresh token they cover, not just the
+/// access tokens: defense in depth should a refresh row ever come back.
 const REVOKE_ALL_TTL: u64 = REFRESH_TTL + 600;
-/// Rounds of a read / conditional-write loop before giving up (each lost
-/// round means a concurrent change of the same rows).
 const CAS_ROUNDS: usize = 8;
-/// Private name of the account's credential epoch ([`auth_epoch`]).
 pub const AUTH_EPOCH: &str = "auth_epoch";
-/// A DID's revocations/takedowns read from another node (its owner) are
-/// re-read this often.
+/// Re-read period of a DID's revocations/takedowns cached from its owner.
 const RELOAD_SECS: u64 = 10;
-/// ... and when read from a partition this node owns (changes made here or
-/// forwarded here invalidate it at once; this only bounds a missed one).
+/// ... and when read locally: local changes invalidate it at once, so this
+/// only bounds a missed one.
 const LOCAL_RELOAD_SECS: u64 = 60;
-/// When the owner can't be reached, a cached view at most this old is still
-/// used (so a revocation/takedown made during an owner outage is enforced
-/// here at most this late); older or none fails the request closed (503).
+/// An unreachable owner's cached view is used while at most this old (how
+/// late a revocation made during an owner outage can be enforced here);
+/// older fails closed.
 const STALE_MAX_SECS: u64 = 300;
-/// How long [`ctl`] retries an unreadable owner before falling back.
 const CTL_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(3);
 const EMAIL_TOKEN_TTL_MS: u64 = 15 * 60 * 1000;
 pub(super) const NEW_PASSWORD_MAX_LENGTH: usize = 256;
 pub(super) const OLD_PASSWORD_MAX_LENGTH: usize = 512;
 
-/// Private-name prefix of an account's revocations and takedowns.
 pub(super) const SEC: &str = "sec/";
 /// `sec/rvk/d/{before:016x}`: every session issued at or before `before`
 /// (micros) is revoked until `exp`. One immutable row per revocation (the
@@ -195,14 +103,13 @@ pub(super) const SEC: &str = "sec/";
 /// newer revocation.
 const REVOKED_ALL: &str = "sec/rvk/d/";
 const REVOKED_FAMILY: &str = "sec/rvk/f/";
-/// Takedown entries: `sec/td/rec/{collection}/{rkey}`, `sec/td/blob/{cid}`.
+/// `sec/td/rec/{collection}/{rkey}`, `sec/td/blob/{cid}`.
 pub(super) const TAKEDOWN: &str = "sec/td/";
 
 pub(super) const SCOPE_ACCESS: &str = "com.atproto.access";
 pub(super) const SCOPE_APP_PASS: &str = "com.atproto.appPass";
 pub(super) const SCOPE_APP_PASS_PRIVILEGED: &str = "com.atproto.appPassPrivileged";
 pub(super) const SCOPE_REFRESH: &str = "com.atproto.refresh";
-/// Access scope of a taken-down account's restricted session.
 pub(super) const SCOPE_TAKENDOWN: &str = "com.atproto.takendown";
 
 pub(super) fn now_secs() -> u64 {
@@ -214,11 +121,7 @@ pub(super) fn now_ms() -> u64 {
 }
 
 fn err(status: StatusCode, error: &str, message: impl Into<String>) -> XrpcError {
-    XrpcError {
-        status,
-        error: error.into(),
-        message: message.into(),
-    }
+    XrpcError { status, error: error.into(), message: message.into() }
 }
 
 pub(super) fn invalid_request(message: impl Into<String>) -> XrpcError {
@@ -238,19 +141,11 @@ fn auth_required(message: &str) -> XrpcError {
 }
 
 pub(super) fn takedown_error() -> XrpcError {
-    err(
-        StatusCode::UNAUTHORIZED,
-        "AccountTakedown",
-        "Account has been taken down",
-    )
+    err(StatusCode::UNAUTHORIZED, "AccountTakedown", "Account has been taken down")
 }
 
 fn oauth_forbidden() -> XrpcError {
-    err(
-        StatusCode::FORBIDDEN,
-        "Forbidden",
-        "OAuth credentials are not supported for this endpoint",
-    )
+    err(StatusCode::FORBIDDEN, "Forbidden", "OAuth credentials are not supported for this endpoint")
 }
 
 fn bad_scope() -> XrpcError {
@@ -258,8 +153,7 @@ fn bad_scope() -> XrpcError {
 }
 
 fn random_hex(n: usize) -> String {
-    let b: Vec<u8> = (0..n).map(|_| rand::random::<u8>()).collect();
-    hex::encode(b)
+    hex::encode((0..n).map(|_| rand::random::<u8>()).collect::<Vec<u8>>())
 }
 
 /// TS getRandomToken(): `xxxxx-xxxxx` in base32.
@@ -269,36 +163,20 @@ pub(super) fn random_token() -> String {
 }
 
 pub(super) fn pmut(routing: &str, name: &str, val: Option<Vec<u8>>) -> Mutation {
-    Mutation {
-        key: state::private_key(routing, name).into(),
-        val: val.map(Bytes::from),
-    }
+    Mutation { key: state::private_key(routing, name).into(), val: val.map(Bytes::from) }
 }
 
 pub(super) fn to_json_bytes<T: serde::Serialize>(v: &T) -> Vec<u8> {
     serde_json::to_vec(v).expect("serializable")
 }
 
-pub(super) async fn get_json<T: serde::de::DeserializeOwned>(
-    app: &App,
-    routing: &str,
-    name: &str,
-) -> XResult<Option<T>> {
-    match app.get_private(routing, name).await? {
-        Some(v) => Ok(Some(
-            serde_json::from_slice(&v).map_err(XrpcError::from_err)?,
-        )),
-        None => Ok(None),
-    }
+pub(super) async fn get_json<T: serde::de::DeserializeOwned>(app: &App, routing: &str, name: &str) -> XResult<Option<T>> {
+    app.get_private(routing, name).await?.map(|v| serde_json::from_slice(&v).map_err(XrpcError::from_err)).transpose()
 }
 
-/// All private entries of `routing` whose name starts with `name_prefix`:
-/// (name, value) pairs.
-pub(super) async fn scan_private(
-    app: &App,
-    routing: &str,
-    name_prefix: &str,
-) -> XResult<Vec<(String, Bytes)>> {
+/// (name, value) of `routing`'s private rows under `name_prefix`, from this
+/// node's partition.
+pub(super) async fn scan_private(app: &App, routing: &str, name_prefix: &str) -> XResult<Vec<(String, Bytes)>> {
     let p = app.partition(routing)?;
     let base = state::private_prefix(routing);
     let lo = [base.as_slice(), name_prefix.as_bytes()].concat();
@@ -306,20 +184,14 @@ pub(super) async fn scan_private(
     let mut iter = p.db.scan(lo..hi).await.map_err(XrpcError::from_err)?;
     let mut out = Vec::new();
     while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
-        out.push((
-            String::from_utf8_lossy(&kv.key[base.len()..]).to_string(),
-            kv.value,
-        ));
+        out.push((String::from_utf8_lossy(&kv.key[base.len()..]).to_string(), kv.value));
     }
     Ok(out)
 }
 
-/// Every private entry whose routing key starts with `routing_prefix`,
-/// across all partitions this node owns: (routing key, name, value).
-pub(super) async fn scan_private_routing(
-    app: &App,
-    routing_prefix: &str,
-) -> XResult<Vec<(String, String, Bytes)>> {
+/// (routing key, name, value) of every private row whose routing key starts
+/// with `routing_prefix`, across the partitions this node owns.
+pub(super) async fn scan_private_routing(app: &App, routing_prefix: &str) -> XResult<Vec<(String, String, Bytes)>> {
     // keys are slot-major: walk each slot's run of p/{routing_prefix}
     let fam = [state::PRIVATE_FAMILY, routing_prefix.as_bytes()].concat();
     let mut out = Vec::new();
@@ -345,8 +217,8 @@ pub(super) fn set_extra(a: &mut Account, k: &str, v: J) {
     }
 }
 
-/// Derives `Account.status` from the flags owned here: a takedown wins over a
-/// deactivation; other statuses (e.g. "suspended") set elsewhere are kept.
+/// A takedown wins over a deactivation; statuses set elsewhere (e.g.
+/// "suspended") are kept.
 pub(super) fn recompute_status(a: &mut Account) {
     if a.extra.get("takedownRef").is_some_and(|v| !v.is_null()) {
         a.status = Some("takendown".into());
@@ -361,13 +233,7 @@ pub(super) fn is_takendown_account(a: &Account) -> bool {
     matches!(a.status.as_deref(), Some("takendown") | Some("suspended"))
 }
 
-/// (active, status) as in the reference's formatAccountStatus.
-fn account_status(a: &Account) -> (bool, Option<String>) {
-    (a.status.is_none(), a.status.clone())
-}
-
-/// Checks an account password on a request path: 503 `Overloaded` (+
-/// Retry-After) instead of queueing when every Argon2 permit stays busy.
+/// 503 `Overloaded` instead of queueing when every Argon2 permit stays busy.
 pub(super) async fn verify_password(a: &Account, password: &str) -> XResult<bool> {
     if password.len() > OLD_PASSWORD_MAX_LENGTH || a.password_hash.is_empty() {
         return Ok(false);
@@ -400,16 +266,13 @@ pub(super) fn email_supported(e: &str) -> bool {
 }
 
 fn user_did(creds: &Credentials) -> XResult<String> {
-    creds
-        .did()
-        .map(str::to_string)
-        .ok_or_else(|| auth_required("user credentials required"))
+    creds.did().map(str::to_string).ok_or_else(|| auth_required("user credentials required"))
 }
 
-/// Full-access session only (the reference's ACCESS_FULL; OAuth refused).
+/// The reference's ACCESS_FULL (OAuth refused).
 fn full_access(creds: &Credentials) -> XResult<String> {
     match creds {
-        // (takendown tokens only reach the methods that accept them)
+        // takendown tokens only reach the methods that accept them
         Credentials::Session { did } | Credentials::Takendown { did } => Ok(did.clone()),
         Credentials::AppPassword { .. } => Err(bad_scope()),
         Credentials::OAuth { .. } => Err(oauth_forbidden()),
@@ -419,7 +282,7 @@ fn full_access(creds: &Credentials) -> XResult<String> {
     }
 }
 
-/// Session or app password (the reference's ACCESS_STANDARD; OAuth refused).
+/// The reference's ACCESS_STANDARD (OAuth refused).
 fn standard_no_oauth(creds: &Credentials) -> XResult<String> {
     match creds {
         Credentials::Session { did }
@@ -432,41 +295,29 @@ fn standard_no_oauth(creds: &Credentials) -> XResult<String> {
     }
 }
 
-/// Full session, or OAuth holding `account:{attr}?action={action}`.
+/// `full_access`, or OAuth holding `account:{attr}?action={action}`.
 fn full_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> XResult<String> {
     match creds {
-        Credentials::OAuth { did, .. } => {
-            creds.need_account(attr, action)?;
-            Ok(did.clone())
-        }
+        Credentials::OAuth { did, .. } => creds.need_account(attr, action).map(|_| did.clone()),
         _ => full_access(creds),
     }
 }
 
-/// Session/app password, or OAuth holding `account:{attr}?action={action}`.
+/// `standard_no_oauth`, or OAuth holding `account:{attr}?action={action}`.
 fn standard_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> XResult<String> {
     match creds {
-        Credentials::OAuth { did, .. } => {
-            creds.need_account(attr, action)?;
-            Ok(did.clone())
-        }
+        Credentials::OAuth { did, .. } => creds.need_account(attr, action).map(|_| did.clone()),
         _ => standard_no_oauth(creds),
     }
 }
 
-// ---------------------------------------------------------------------------
-// per-App in-memory state: revocations, takedowns, dev mailbox, locks
-// ---------------------------------------------------------------------------
-
+/// Per-App in-memory state.
 pub(super) struct Ext {
-    /// did -> its revocations and takedowns ([`ctl`]), at most the
-    /// `security_controls` cap (src/caches.rs)
     ctl: Arc<RwLock<HashMap<String, Arc<Ctl>>>>,
-    /// bumped by every change, so a load racing one is not cached
+    /// Bumped by every change, so a load racing one is not cached.
     gen: AtomicU64,
     pub(super) dev_mail: PMutex<HashMap<String, Vec<Mail>>>,
     locks: Vec<tokio::sync::Mutex<()>>,
-    /// [`STALE_CLAIM_GRACE`] (tests shorten it: [`set_stale_claim_grace`])
     claim_grace_ms: AtomicU64,
 }
 
@@ -493,7 +344,7 @@ pub(super) fn ext(app: &App) -> Arc<Ext> {
 }
 
 impl Ext {
-    /// Serializes read-modify-write of one account/key on this node.
+    /// Node-local only: cross-node races need `private_cas`.
     pub(super) async fn lock(&self, key: &str) -> tokio::sync::MutexGuard<'_, ()> {
         self.locks[(state::did_hash(key) % self.locks.len() as u64) as usize]
             .lock()
@@ -501,20 +352,19 @@ impl Ext {
     }
 }
 
-/// One account's session revocations and record/blob takedowns, as read from
-/// its partition (`p/{did}\0sec/...`).
+/// One account's session revocations and record/blob takedowns
+/// (`p/{did}\0sec/...`).
 #[derive(Default)]
 pub(super) struct Ctl {
-    /// when it was read (unix secs)
+    /// Unix secs.
     at: u64,
-    /// (partition, epoch) when read from a partition this node owns; None =
-    /// read from the owning node
+    /// (partition, epoch) when read locally; None = read from the owner.
     local: Option<(crate::slots::ShardId, u64)>,
-    /// sessions issued at or before these micros are revoked (until exp secs)
+    /// Sessions issued at or before these micros are revoked until exp secs.
     before: Option<(u64, u64)>,
-    /// revoked session family -> expiry (unix secs)
+    /// Family -> expiry (unix secs).
     families: HashMap<String, u64>,
-    /// takedown names below [`TAKEDOWN`]: `rec/{collection}/{rkey}`, `blob/{cid}`
+    /// Names below [`TAKEDOWN`].
     takedowns: HashSet<String>,
 }
 
@@ -530,13 +380,12 @@ impl Ctl {
         jti.is_some_and(|j| self.families.get(j).is_some_and(|exp| *exp >= now))
     }
 
-    /// `name` relative to [`TAKEDOWN`] (`rec/{collection}/{rkey}` or `blob/{cid}`).
+    /// `name` relative to [`TAKEDOWN`].
     pub(super) fn has_takedown(&self, name: &str) -> bool {
         !self.takedowns.is_empty() && self.takedowns.contains(name)
     }
 }
 
-/// Issue time (micros) encoded in a session family id.
 fn family_micros(jti: &str) -> Option<u64> {
     if jti.len() < 16 {
         return None;
@@ -561,9 +410,7 @@ async fn load_sets(app: &App, did: &str, local: Option<(crate::slots::ShardId, u
             c.takedowns.insert(td.to_string());
             continue;
         }
-        let Ok(j) = serde_json::from_slice::<J>(&v) else {
-            continue;
-        };
+        let Ok(j) = serde_json::from_slice::<J>(&v) else { continue };
         let exp = j["exp"].as_u64().unwrap_or(0);
         if exp < now {
             continue;
@@ -580,13 +427,11 @@ async fn load_sets(app: &App, did: &str, local: Option<(crate::slots::ShardId, u
     Ok(c)
 }
 
-/// `did`'s revocations and takedowns. Read from its partition and cached:
-/// on the owning node until a change ([`ctl_changed`], also called for
-/// changes forwarded here) or an ownership move; elsewhere re-read from the
-/// owner every [`RELOAD_SECS`]. If the owner can't be reached the last view
-/// (after retrying for [`CTL_RETRY_FOR`]) is used while at most
-/// [`STALE_MAX_SECS`] old; otherwise this fails closed
-/// (503) rather than letting revoked sessions or taken-down records through.
+/// `did`'s revocations and takedowns, cached: on the owner until a change
+/// ([`ctl_changed`]) or an ownership move, elsewhere for [`RELOAD_SECS`]. An
+/// unreadable owner falls back to a view at most [`STALE_MAX_SECS`] old, else
+/// fails closed (503) rather than let revoked sessions or taken-down records
+/// through.
 pub(super) async fn ctl(app: &App, did: &str) -> XResult<Arc<Ctl>> {
     let e = ext(app);
     let now = now_secs();
@@ -644,8 +489,6 @@ pub(super) async fn ctl(app: &App, did: &str) -> XResult<Arc<Ctl>> {
     }
 }
 
-/// The fallback of [`ctl`] when its sets can't be read: a cached view no
-/// older than [`STALE_MAX_SECS`], else 503 (fail closed).
 fn stale_or_unavailable(cached: Option<Arc<Ctl>>, now: u64) -> XResult<Arc<Ctl>> {
     match cached {
         Some(c) if now.saturating_sub(c.at) <= STALE_MAX_SECS => Ok(c),
@@ -653,33 +496,25 @@ fn stale_or_unavailable(cached: Option<Arc<Ctl>>, now: u64) -> XResult<Arc<Ctl>>
     }
 }
 
-/// Drops the cached view of `did` after a change to its `sec/` entries.
 pub(super) fn ctl_changed(app: &App, did: &str) {
     let e = ext(app);
     e.gen.fetch_add(1, Ordering::SeqCst);
     e.ctl.write().remove(did);
 }
 
-/// Writes `did`'s `sec/` entries (in its partition, forwarded to the owner if
-/// need be) and drops the cached view.
 pub(super) async fn put_sec(app: &App, did: &str, muts: Vec<Mutation>) -> XResult<()> {
     let r = app.put_private(did, muts).await;
     ctl_changed(app, did);
     r
 }
 
-// ---------------------------------------------------------------------------
-// mail
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Mail {
     pub to: String,
     pub subject: String,
-    /// The plain-text part (the whole mail when `html` is None).
+    /// Plain text; with `html`, sent as multipart/alternative.
     pub body: String,
-    /// The HTML part: sent as multipart/alternative with `body`.
     pub html: Option<String>,
     /// confirm_email | update_email | reset_password | delete_account | plc_operation | auth_factor | admin
     pub purpose: String,
@@ -687,8 +522,6 @@ pub struct Mail {
     pub sent_at: String,
 }
 
-/// Outbound email. The default logs; a real SMTP/API mailer can be installed
-/// once at startup with `set_mailer`.
 pub trait Mailer: Send + Sync {
     fn send(&self, mail: &Mail);
 }
@@ -698,21 +531,11 @@ pub struct LogMailer;
 impl Mailer for LogMailer {
     fn send(&self, m: &Mail) {
         // Never the token or body, at any level: they are credentials (a
-        // debug log is still shipped to log storage). Dev mode keeps them
-        // in the dev mailbox (vlpds.admin.getDevMail).
+        // debug log is still shipped to log storage).
         tracing::info!(to = %m.to, subject = %m.subject, purpose = %m.purpose, has_token = m.token.is_some(), body_bytes = m.body.len(), "mail (log mailer: email disabled, not sent)");
     }
 }
 
-static MAILER: std::sync::OnceLock<Box<dyn Mailer>> = std::sync::OnceLock::new();
-
-#[allow(dead_code)]
-pub fn set_mailer(m: Box<dyn Mailer>) -> bool {
-    MAILER.set(m).is_ok()
-}
-
-/// Renders an account email (crate::mail::Email: HTML + text, the node's
-/// branding) and sends it through the node's mailer; see [`send_mail`].
 pub(super) fn deliver(app: &App, to: &str, email: crate::mail::Email<'_>) {
     let r = email.render(&app.config.email_branding, &app.public_url);
     let mail = Mail {
@@ -727,9 +550,7 @@ pub(super) fn deliver(app: &App, to: &str, email: crate::mail::Email<'_>) {
     send_mail(app, mail, app.config.mailer.as_ref());
 }
 
-/// admin sendEmail: `content` is HTML (as in the reference's
-/// ModerationMailer), sent with a derived plain-text part through the
-/// moderation mailer (`--moderation-email-smtp-url`), else the main one.
+/// `content` is HTML, as in the reference's ModerationMailer.
 pub(super) fn deliver_moderation(app: &App, to: &str, subject: &str, content: &str) {
     let mail = Mail {
         to: to.to_string(),
@@ -744,20 +565,16 @@ pub(super) fn deliver_moderation(app: &App, to: &str, subject: &str, content: &s
     send_mail(app, mail, m);
 }
 
-/// Sends through `mailer`; in dev mode also keeps it in the per-address dev
-/// mailbox (vlpds.admin.getDevMail).
+/// Dev mode also keeps the mail for vlpds.admin.getDevMail.
 fn send_mail(app: &App, mail: Mail, mailer: Option<&crate::mail::SharedMailer>) {
-    let to = mail.to.clone();
-    // The node's own mailer (--email-smtp-url, crate::mail; queues, never
-    // blocks), else the process-wide one (LogMailer unless `set_mailer`).
     match mailer {
         Some(m) => m.send(&mail),
-        None => MAILER.get_or_init(|| Box::new(LogMailer)).send(&mail),
+        None => LogMailer.send(&mail),
     }
     if app.config.dev_mode {
         let e = ext(app);
         let mut box_ = e.dev_mail.lock();
-        let v = box_.entry(to.to_ascii_lowercase()).or_default();
+        let v = box_.entry(mail.to.to_ascii_lowercase()).or_default();
         v.push(mail);
         if v.len() > 50 {
             v.remove(0);
@@ -765,21 +582,16 @@ fn send_mail(app: &App, mail: Mail, mailer: Option<&crate::mail::SharedMailer>) 
     }
 }
 
-// ---------------------------------------------------------------------------
-// email tokens
-// ---------------------------------------------------------------------------
-
-/// Only a keyed digest of the token is stored (bucket readers can't use a
-/// live one): `token_hash` = [`email_token_digest`].
+/// Only a keyed digest of the token is stored, so bucket readers can't use a
+/// live one.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EmailToken {
     token_hash: String,
     requested_at: u64,
 }
 
-/// HMAC-SHA256 of an (uppercased) email token under a key derived from the
-/// server secret, which isn't in the bucket. Tokens have ~50 bits and live
-/// 15 minutes; an unkeyed hash of one could be brute-forced offline.
+/// Keyed by the server secret (not in the bucket): tokens have ~50 bits, so
+/// an unkeyed hash could be brute-forced offline within their 15 minutes.
 fn email_token_digest(app: &App, token: &str) -> String {
     let key = crate::oauth::util::derive_secret(&app.config.jwt_secret, "email-token");
     hex::encode(crate::oauth::util::hmac_sha256(&key, &[token.trim().to_ascii_uppercase().as_bytes()]))
@@ -794,47 +606,24 @@ pub(super) const EMAIL_PURPOSES: &[&str] = &[
     super::email2fa::PURPOSE,
 ];
 
-/// Creates (replacing any previous) the account's token for `purpose`.
+/// Replaces any previous token for `purpose`.
 pub(super) async fn create_email_token(app: &App, did: &str, purpose: &str) -> XResult<String> {
     let token = random_token().to_ascii_uppercase();
     let digest = email_token_digest(app, &token);
-    let rec = EmailToken {
-        token_hash: digest.clone(),
-        requested_at: now_ms(),
-    };
-    app.put_private(
-        did,
-        vec![pmut(
-            did,
-            &format!("etok/{purpose}"),
-            Some(to_json_bytes(&rec)),
-        )],
-    )
-    .await?;
+    let rec = EmailToken { token_hash: digest.clone(), requested_at: now_ms() };
+    app.put_private(did, vec![pmut(did, &format!("etok/{purpose}"), Some(to_json_bytes(&rec)))]).await?;
     if purpose == "reset_password" {
         let routing = format!("_reset:{digest}");
-        app.put_private(
-            &routing,
-            vec![pmut(&routing, "t", Some(did.as_bytes().to_vec()))],
-        )
-        .await?;
+        app.put_private(&routing, vec![pmut(&routing, "t", Some(did.as_bytes().to_vec()))]).await?;
     }
     Ok(token)
 }
 
-pub(super) async fn assert_email_token(
-    app: &App,
-    did: &str,
-    purpose: &str,
-    token: &str,
-) -> XResult<()> {
+pub(super) async fn assert_email_token(app: &App, did: &str, purpose: &str, token: &str) -> XResult<()> {
     let rec: Option<EmailToken> = get_json(app, did, &format!("etok/{purpose}")).await?;
-    let Some(rec) = rec else {
+    let Some(rec) = rec.filter(|r| crate::auth::token_eq(&r.token_hash, &email_token_digest(app, token))) else {
         return Err(invalid_token("Token is invalid"));
     };
-    if !crate::auth::token_eq(&rec.token_hash, &email_token_digest(app, token)) {
-        return Err(invalid_token("Token is invalid"));
-    }
     if now_ms().saturating_sub(rec.requested_at) > EMAIL_TOKEN_TTL_MS {
         return Err(expired_token("Token is expired"));
     }
@@ -842,16 +631,9 @@ pub(super) async fn assert_email_token(
 }
 
 pub(super) async fn delete_email_tokens(app: &App, did: &str, purposes: &[&str]) -> XResult<()> {
-    let muts = purposes
-        .iter()
-        .map(|p| pmut(did, &format!("etok/{p}"), None))
-        .collect();
+    let muts = purposes.iter().map(|p| pmut(did, &format!("etok/{p}"), None)).collect();
     app.put_private(did, muts).await
 }
-
-// ---------------------------------------------------------------------------
-// email claims (global uniqueness via conditional create, like handles)
-// ---------------------------------------------------------------------------
 
 fn email_path(app: &App, email: &str) -> object_store::path::Path {
     let h = hex::encode(Sha256::digest(email.to_ascii_lowercase().as_bytes()));
@@ -868,7 +650,7 @@ pub(super) async fn did_by_email(app: &App, email: &str) -> XResult<Option<Strin
     }
 }
 
-/// Claims `email` for `did`. Ok(false) when another account holds it.
+/// Ok(false) when another account holds it.
 pub(super) async fn claim_email(app: &App, email: &str, did: &str) -> XResult<bool> {
     let email = email.to_ascii_lowercase();
     claim(app, &email_path(app, &email), did, move |a: &Account| a.email.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(&email))).await
@@ -880,13 +662,12 @@ pub(super) async fn claim_email(app: &App, email: &str, did: &str) -> XResult<bo
 /// its account write (the account doesn't exist yet while it's created).
 pub const STALE_CLAIM_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// Test hook: this server's [`STALE_CLAIM_GRACE`].
 #[doc(hidden)]
 pub fn set_stale_claim_grace(app: &App, grace: std::time::Duration) {
     ext(app).claim_grace_ms.store(grace.as_millis() as u64, Ordering::Relaxed);
 }
 
-/// The claim object at `path`: its holder, version and age.
+/// (holder, version, age)
 async fn read_claim(app: &App, path: &object_store::path::Path) -> XResult<Option<(String, object_store::UpdateVersion, std::time::Duration)>> {
     match app.store.raw.get(path).await {
         Ok(r) => {
@@ -948,7 +729,6 @@ async fn claim(app: &App, path: &object_store::path::Path, did: &str, holds: imp
     Ok(false)
 }
 
-/// Releases `email` if `did` holds it.
 pub(super) async fn release_email(app: &App, email: &str, did: &str) {
     if did_by_email(app, email).await.ok().flatten().as_deref() == Some(did) {
         if let Err(e) = app.store.raw.delete(&email_path(app, email)).await {
@@ -961,7 +741,7 @@ fn handle_path(app: &App, handle: &str) -> object_store::path::Path {
     object_store::path::Path::from(format!("{}/handle/{}", app.store.prefix, handle))
 }
 
-/// Claims `handle` for `did` ([`claim`]). Ok(false) when taken.
+/// Ok(false) when taken.
 pub(super) async fn claim_handle(app: &App, handle: &str, did: &str) -> XResult<bool> {
     let h = handle.to_string();
     claim(app, &handle_path(app, handle), did, move |a: &Account| a.handle == h).await
@@ -975,43 +755,20 @@ pub(super) async fn release_handle(app: &App, handle: &str, did: &str) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// handles
-// ---------------------------------------------------------------------------
-
 pub(super) fn normalize_handle(h: &str) -> XResult<String> {
     let h = h.trim().to_ascii_lowercase();
     if !super::syntax::valid_handle(&h) {
-        return Err(XrpcError::bad(
-            "InvalidHandle",
-            "Input/handle must be a valid handle",
-        ));
+        return Err(XrpcError::bad("InvalidHandle", "Input/handle must be a valid handle"));
     }
-    const DISALLOWED_TLDS: &[&str] = &[
-        ".local",
-        ".arpa",
-        ".invalid",
-        ".localhost",
-        ".internal",
-        ".example",
-        ".alt",
-        ".onion",
-    ];
+    const DISALLOWED_TLDS: &[&str] = &[".local", ".arpa", ".invalid", ".localhost", ".internal", ".example", ".alt", ".onion"];
     if DISALLOWED_TLDS.iter().any(|t| h.ends_with(t)) {
-        return Err(XrpcError::bad(
-            "InvalidHandle",
-            "Handle TLD is invalid or disallowed",
-        ));
+        return Err(XrpcError::bad("InvalidHandle", "Handle TLD is invalid or disallowed"));
     }
     Ok(h)
 }
 
-fn is_reserved(front: &str) -> bool {
-    crate::handle_policy::is_reserved(front)
-}
-
-/// Reference slur check on a user-chosen handle (service or custom domain;
-/// admins skip it). Runs after normalization, before the domain checks.
+/// Admins skip it. Runs after normalization, before the domain checks (the
+/// reference's order).
 pub(super) fn ensure_no_slur(handle: &str) -> XResult<()> {
     if crate::handle_policy::has_explicit_slur(handle) {
         return Err(XrpcError::bad("InvalidHandle", "Inappropriate language in handle"));
@@ -1019,22 +776,14 @@ pub(super) fn ensure_no_slur(handle: &str) -> XResult<()> {
     Ok(())
 }
 
-/// Constraints for a handle under our service domain (reference
-/// ensureHandleServiceConstraints). Non-service domains are refused
-/// (UnsupportedDomain) for new accounts.
+/// The reference's ensureHandleServiceConstraints.
 pub(super) fn ensure_service_handle(app: &App, handle: &str, allow_reserved: bool) -> XResult<()> {
     let suffix = format!(".{}", app.handle_domain);
     let Some(front) = handle.strip_suffix(&suffix) else {
-        return Err(XrpcError::bad(
-            "UnsupportedDomain",
-            "Not a supported handle domain",
-        ));
+        return Err(XrpcError::bad("UnsupportedDomain", "Not a supported handle domain"));
     };
     if front.contains('.') {
-        return Err(XrpcError::bad(
-            "InvalidHandle",
-            "Invalid characters in handle",
-        ));
+        return Err(XrpcError::bad("InvalidHandle", "Invalid characters in handle"));
     }
     if front.len() < 3 {
         return Err(XrpcError::bad("InvalidHandle", "Handle too short"));
@@ -1042,15 +791,11 @@ pub(super) fn ensure_service_handle(app: &App, handle: &str, allow_reserved: boo
     if front.len() > 18 {
         return Err(XrpcError::bad("InvalidHandle", "Handle too long"));
     }
-    if !allow_reserved && is_reserved(front) {
+    if !allow_reserved && crate::handle_policy::is_reserved(front) {
         return Err(XrpcError::bad("HandleNotAvailable", "Reserved handle"));
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// sessions
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct AppPassRef {
@@ -1078,81 +823,50 @@ fn access_scope(ap: &Option<AppPassRef>) -> &'static str {
     }
 }
 
-fn issue_pair(
-    app: &App,
-    did: &str,
-    family: &str,
-    refresh_id: &str,
-    ap: &Option<AppPassRef>,
-) -> (String, String) {
+fn issue_pair(app: &App, did: &str, scope: &str, family: &str, refresh_id: &str) -> (String, String) {
     (
-        app.jwt
-            .issue_with_jti(did, access_scope(ap), ACCESS_TTL, "at+jwt", Some(family)),
-        app.jwt.issue_with_jti(
-            did,
-            SCOPE_REFRESH,
-            REFRESH_TTL,
-            "refresh+jwt",
-            Some(refresh_id),
-        ),
+        app.jwt.issue_with_jti(did, scope, ACCESS_TTL, "at+jwt", Some(family)),
+        app.jwt.issue_with_jti(did, SCOPE_REFRESH, REFRESH_TTL, "refresh+jwt", Some(refresh_id)),
     )
 }
 
-/// The account's credential epoch: a random value replaced by every
-/// revoke-all (password change or reset, takedown, deletion, OAuth
-/// credential deletion); None = never revoked. A login reads it *before*
-/// re-reading the account it checked the password against
-/// ([`epoch_for_login`]), and the session it then creates (a `sess/` row,
-/// an OAuth device login, an authorization code's session) is written only
-/// if the epoch is still that value (a conditional write at the owner,
-/// src/xrpc/cas.rs). A revoke-all replaces the epoch and deletes the
-/// sessions in one such write, so a login racing it either lands first (and
-/// is deleted) or fails: no node's clock is involved. "" = never revoked
-/// (no row).
+/// The account's credential epoch, "" if never revoked. Every revoke-all
+/// replaces it in the same conditional write that deletes the sessions, and
+/// a login creates its session only on condition that the epoch it read
+/// ([`epoch_for_login`]) is unchanged, so a login racing a revocation either
+/// lands first (and is deleted) or fails, with no clocks involved. DESIGN.md
+/// "Auth state under concurrency".
 pub async fn auth_epoch(app: &App, did: &str) -> XResult<String> {
     Ok(get_json::<String>(app, did, AUTH_EPOCH).await?.unwrap_or_default())
 }
 
-/// Condition: the credential epoch is still `epoch` ("" = no row).
 pub fn auth_epoch_cond(epoch: &str) -> super::cas::Cond {
     super::cas::Cond::eq(AUTH_EPOCH, (!epoch.is_empty()).then(|| Bytes::from(to_json_bytes(&epoch))))
 }
 
-/// Write: a new credential epoch (part of every revoke-all).
 pub fn new_auth_epoch_op() -> super::cas::Op {
     super::cas::Op::put(AUTH_EPOCH, Some(Bytes::from(to_json_bytes(&random_hex(16)))))
 }
 
-/// After a password check against `checked` (an account record read before
-/// it): the credential epoch to create the session under, or None if the
-/// password changed since `checked` was read (the login must fail). The
-/// epoch is read first, so a password change that the re-read misses
-/// replaces the epoch after it was read (see [`auth_epoch`]).
+/// The epoch to create a session under after a password check against
+/// `checked`, or None if the password changed since (the login must fail).
+/// The epoch is read first, so a password change the re-read misses
+/// replaced the epoch after it was read.
 pub async fn epoch_for_login(app: &App, checked: &Account) -> XResult<Option<String>> {
     let epoch = auth_epoch(app, &checked.did).await?;
     let now = super::internal::account_anywhere(app, &checked.did).await?;
     Ok((now.password_hash == checked.password_hash).then_some(epoch))
 }
 
-/// A read / conditional-write loop lost [`CAS_ROUNDS`] times in a row.
 pub(super) fn cas_conflict() -> XrpcError {
     err(StatusCode::SERVICE_UNAVAILABLE, "TemporarilyUnavailable", "concurrent update; retry")
 }
 
-/// Starts a new session family and returns (accessJwt, refreshJwt).
-pub(super) async fn create_session_tokens(
-    app: &App,
-    did: &str,
-    ap: Option<AppPassRef>,
-) -> XResult<(String, String)> {
-    create_session_tokens_scoped(app, did, ap, false, None).await
-}
-
-/// `takendown`: the access token gets the restricted `com.atproto.takendown`
-/// scope (reference createSession for a soft-deleted account). `epoch`: the
-/// credential epoch the login was checked under ([`epoch_for_login`]); the
-/// session is created only if it is still current.
-async fn create_session_tokens_scoped(
+/// Starts a new session family: (accessJwt, refreshJwt). `takendown` gives
+/// the access token the restricted scope (the reference's createSession for
+/// a soft-deleted account). `epoch` ([`epoch_for_login`]) must still be
+/// current for the session to be created.
+async fn create_session_tokens(
     app: &App,
     did: &str,
     ap: Option<AppPassRef>,
@@ -1162,10 +876,11 @@ async fn create_session_tokens_scoped(
     use super::cas::{Cond, Op};
     let family = new_family_id();
     let rid = random_hex(24);
+    let scope = if takendown { SCOPE_TAKENDOWN } else { access_scope(&ap) };
     let st = RefreshState {
         family: family.clone(),
         exp: now_secs() + REFRESH_TTL,
-        app_password: ap.clone(),
+        app_password: ap,
         created_at: now_secs(),
         next_id: None,
     };
@@ -1176,18 +891,10 @@ async fn create_session_tokens_scoped(
     if !out.applied {
         return Err(auth_required("Credentials were revoked during sign-in"));
     }
-    let (access, refresh) = issue_pair(app, did, &family, &rid, &ap);
-    if takendown {
-        let access =
-            app.jwt
-                .issue_with_jti(did, SCOPE_TAKENDOWN, ACCESS_TTL, "at+jwt", Some(&family));
-        return Ok((access, refresh));
-    }
-    Ok((access, refresh))
+    Ok(issue_pair(app, did, scope, &family, &rid))
 }
 
-/// Revokes session families of `did` (their access tokens), durably in its
-/// partition.
+/// Revokes the families' access tokens.
 async fn revoke_families(app: &App, did: &str, families: &[String]) -> XResult<()> {
     if families.is_empty() {
         return Ok(());
@@ -1195,22 +902,15 @@ async fn revoke_families(app: &App, did: &str, families: &[String]) -> XResult<(
     let exp = now_secs() + REVOKE_TTL;
     let muts = families
         .iter()
-        .map(|fam| {
-            pmut(
-                did,
-                &format!("{REVOKED_FAMILY}{fam}"),
-                Some(to_json_bytes(&json!({"exp": exp}))),
-            )
-        })
+        .map(|fam| pmut(did, &format!("{REVOKED_FAMILY}{fam}"), Some(to_json_bytes(&json!({"exp": exp})))))
         .collect();
     put_sec(app, did, muts).await
 }
 
-/// Revokes every session of `did` (refresh tokens deleted, outstanding access
-/// tokens rejected) and replaces its credential epoch, in one conditional
-/// write at the owner: a refresh racing it either rotated first (its rows
-/// are deleted here) or finds its row gone, and a login racing it fails
-/// ([`auth_epoch`]). Used on password change, takedown and deletion.
+/// Deletes the refresh rows, rejects outstanding access tokens and replaces
+/// the credential epoch in one conditional write at the owner: a refresh
+/// racing it either rotated first (its rows are deleted here) or finds its
+/// row gone, and a login racing it fails ([`auth_epoch`]).
 pub(super) async fn revoke_all_sessions(app: &App, did: &str) -> XResult<()> {
     use super::cas::Op;
     let before = crate::tid::now_micros();
@@ -1224,13 +924,9 @@ pub(super) async fn revoke_all_sessions(app: &App, did: &str) -> XResult<()> {
     Ok(())
 }
 
-/// For the private-row GC (`crate::oauth::gc`, which sweeps every `p/` row
-/// of the partitions this node owns): Some(expired) for a session
-/// revocation row (`sec/rvk/...`) of `routing`, None for any other row. A
-/// revocation is expired once every token it revokes has (`exp`: issued
-/// before it, so access-token lifetime + slack); unparseable rows count as
-/// expired. Deleted accounts keep these rows until then, so a DID that comes
-/// back can't revive old tokens; past it they are dropped like any other.
+/// For the private-row GC: Some(expired) for a revocation row, None for any
+/// other. Unparseable rows count as expired. Deleted accounts keep these
+/// rows until they expire, so a DID that comes back can't revive old tokens.
 pub fn revocation_expired(routing: &str, name: &str, val: &[u8], now: u64) -> Option<bool> {
     if !routing.starts_with("did:") || !(name.starts_with(REVOKED_ALL) || name.starts_with(REVOKED_FAMILY)) {
         return None;
@@ -1238,36 +934,30 @@ pub fn revocation_expired(routing: &str, name: &str, val: &[u8], now: u64) -> Op
     Some(serde_json::from_slice::<J>(val).ok().and_then(|j| j["exp"].as_u64()).is_none_or(|exp| exp < now))
 }
 
-/// Deletes an expired revocation row (see [`revocation_expired`]). Rows are
-/// never rewritten once expired (a new revocation is a new `d/` row; a family
-/// is revoked once, after its sessions are gone), so no lock is needed.
+/// No lock needed: a revocation row is never rewritten once expired (a new
+/// revocation is a new `d/` row; a family is revoked once).
 pub async fn drop_revocation(app: &App, did: &str, name: &str) -> XResult<()> {
     put_sec(app, did, vec![pmut(did, name, None)]).await
 }
 
-/// Deletes every refresh token (session) of `did`; outstanding access tokens
-/// stay valid until they expire. What the reference does on takedown
-/// (`revokeRefreshTokensByDid`), so the owner can still use the access token
-/// for what a taken-down account may do (e.g. sync its own repo).
+/// Access tokens stay valid until they expire, as the reference's takedown
+/// (`revokeRefreshTokensByDid`): a taken-down account may still e.g. sync its
+/// own repo. A conditional write, so no rotation lands between the listing
+/// and the delete.
 pub(super) async fn revoke_refresh_tokens(app: &App, did: &str) -> XResult<()> {
-    // at the owner, under the lock of every conditional `sess/` write: no
-    // rotation lands between the listing and the delete
     app.private_cas(did, Vec::new(), vec![super::cas::Op::DeletePrefix { prefix: "sess/".into() }]).await?;
     Ok(())
 }
 
-/// Deletes the refresh rows matching `pred`, each on condition that it
-/// still holds what was read: a rotation racing this changes the row it
-/// rotates, so the delete is redone over the new rows and no rotation of a
-/// matched session survives. Returns the matched states.
+/// Deletes the refresh rows matching `pred`, each on condition that it is
+/// unchanged: a racing rotation changes its row, so the delete is redone
+/// over the new rows and no rotation of a matched session survives.
 async fn delete_sessions_where(app: &App, did: &str, pred: impl Fn(&str, &RefreshState) -> bool) -> XResult<Vec<RefreshState>> {
     use super::cas::{Cond, Op};
     for _ in 0..CAS_ROUNDS {
         let (mut conds, mut ops, mut out) = (Vec::new(), Vec::new(), Vec::new());
         for (name, v) in super::internal::scan_private_anywhere(app, did, "sess/").await? {
-            let Ok(st) = serde_json::from_slice::<RefreshState>(&v) else {
-                continue;
-            };
+            let Ok(st) = serde_json::from_slice::<RefreshState>(&v) else { continue };
             if pred(&name, &st) {
                 conds.push(Cond::eq(&name, Some(v)));
                 ops.push(Op::put(&name, None));
@@ -1281,16 +971,13 @@ async fn delete_sessions_where(app: &App, did: &str, pred: impl Fn(&str, &Refres
     Err(cas_conflict())
 }
 
-/// Revokes the sessions created with app password `name`.
 async fn revoke_app_password_sessions(app: &App, did: &str, name: &str) -> XResult<()> {
     let gone = delete_sessions_where(app, did, |_, st| st.app_password.as_ref().is_some_and(|a| a.name == name)).await?;
     let fams: Vec<String> = gone.into_iter().map(|st| st.family).collect();
     revoke_families(app, did, &fams).await
 }
 
-/// Verifies a legacy Bearer token (session or app-password access JWT).
-/// Hot path: cached signature check + claims ([`crate::auth::TokenCache`])
-/// and the in-memory revocation check on every request, no storage reads.
+/// Legacy (non-OAuth) access JWTs. Hot path: no storage reads.
 pub async fn verify_bearer(app: &App, token: &str) -> XResult<Credentials> {
     let c = app
         .jwt
@@ -1304,14 +991,8 @@ pub async fn verify_bearer(app: &App, token: &str) -> XResult<Credentials> {
     }
     let creds = match c.scope.as_str() {
         SCOPE_ACCESS => Credentials::Session { did: c.sub.clone() },
-        SCOPE_APP_PASS => Credentials::AppPassword {
-            did: c.sub.clone(),
-            privileged: false,
-        },
-        SCOPE_APP_PASS_PRIVILEGED => Credentials::AppPassword {
-            did: c.sub.clone(),
-            privileged: true,
-        },
+        SCOPE_APP_PASS => Credentials::AppPassword { did: c.sub.clone(), privileged: false },
+        SCOPE_APP_PASS_PRIVILEGED => Credentials::AppPassword { did: c.sub.clone(), privileged: true },
         SCOPE_TAKENDOWN => Credentials::Takendown { did: c.sub.clone() },
         _ => return Err(bad_scope()),
     };
@@ -1321,27 +1002,13 @@ pub async fn verify_bearer(app: &App, token: &str) -> XResult<Credentials> {
     Ok(creds)
 }
 
-/// Verifies the refresh token in the Authorization header.
-fn refresh_claims(
-    app: &App,
-    headers: &HeaderMap,
-    allow_expired: bool,
-) -> XResult<crate::auth::Claims> {
+fn refresh_claims(app: &App, headers: &HeaderMap, allow_expired: bool) -> XResult<crate::auth::Claims> {
     let tok = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| {
-            err(
-                StatusCode::UNAUTHORIZED,
-                "AuthMissing",
-                "Authentication Required",
-            )
-        })?;
-    let c = app
-        .jwt
-        .verify_signature(tok.trim())
-        .ok_or_else(|| invalid_token("Token could not be verified"))?;
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "AuthMissing", "Authentication Required"))?;
+    let c = app.jwt.verify_signature(tok.trim()).ok_or_else(|| invalid_token("Token could not be verified"))?;
     // the reference's jose typ check (refresh+jwt) fails first for an
     // access token: "Token could not be verified", not "Bad token scope"
     if c.scope != SCOPE_REFRESH {
@@ -1357,17 +1024,12 @@ fn refresh_claims(
 }
 
 async fn session_info(app: &App, a: &Account, include_email: bool) -> J {
-    let (active, status) = account_status(a);
-    let mut out = json!({
-        "did": a.did,
-        "handle": a.handle,
-        "active": active,
-    });
+    let mut out = json!({"did": a.did, "handle": a.handle, "active": a.status.is_none()});
     // reference safeResolveDidDoc: omitted when it doesn't resolve
     if let Ok(doc) = super::identity::account_did_doc(app, a).await {
         out["didDoc"] = (*doc).clone();
     }
-    if let Some(s) = status {
+    if let Some(s) = &a.status {
         out["status"] = json!(s);
     }
     if include_email {
@@ -1378,14 +1040,6 @@ async fn session_info(app: &App, a: &Account, include_email: bool) -> J {
         out["emailAuthFactor"] = json!(super::email2fa::enabled(a));
     }
     out
-}
-
-// ---------------------------------------------------------------------------
-// describeServer / createAccount
-// ---------------------------------------------------------------------------
-
-pub(super) fn invites_required(app: &App) -> bool {
-    app.config.invite_required
 }
 
 async fn describe_server(State(app): AppState) -> Json<J> {
@@ -1404,7 +1058,7 @@ async fn describe_server(State(app): AppState) -> Json<J> {
     Json(json!({
         "did": app.jwt.service_did,
         "availableUserDomains": [format!(".{}", app.handle_domain)],
-        "inviteCodeRequired": invites_required(&app),
+        "inviteCodeRequired": app.config.invite_required,
         "blobUploadLimit": app.config.max_blob_size,
         "links": links,
         "contact": contact,
@@ -1420,14 +1074,12 @@ pub(super) struct CreateAccountIn {
     pub invite_code: Option<String>,
     pub did: Option<String>,
     pub plc_op: Option<J>,
-    /// A did:key put first in the new DID's rotation keys (PLC
-    /// registration on; reference `recoveryKey`).
+    /// Put first in the new DID's rotation keys.
     pub recovery_key: Option<String>,
 }
 
-/// Account extension flag: the DID was brought from elsewhere (migration
-/// in), so its document is not ours to generate: activation and
-/// checkAccountStatus check the resolved one.
+/// Account flag: the DID was migrated in, so its document is not ours to
+/// generate; activation and checkAccountStatus check the resolved one.
 pub(super) const EXTERNAL_DID: &str = "externalDid";
 
 pub(super) fn has_external_did(a: &Account) -> bool {
@@ -1437,11 +1089,7 @@ pub(super) fn has_external_did(a: &Account) -> bool {
 /// createAccount, with the reference's optional service auth
 /// (`userServiceAuthOptional`): a Bearer token must be a service JWT for
 /// this method, and its issuer may then bring its own DID (migration in).
-async fn create_account(
-    State(app): AppState,
-    headers: HeaderMap,
-    Json(inp): Json<CreateAccountIn>,
-) -> XResult<Json<J>> {
+async fn create_account(State(app): AppState, headers: HeaderMap, Json(inp): Json<CreateAccountIn>) -> XResult<Json<J>> {
     const LXM: &str = "com.atproto.server.createAccount";
     let requester = super::authn::optional_service_auth(&app, &headers, LXM).await?;
     // The requester is the token's whole `iss` (the reference's
@@ -1450,22 +1098,15 @@ async fn create_account(
     // service of the DID, never the account holder, so it can't bring the DID.
     let requester = requester.filter(|r| !r.iss.contains('#'));
     let acct = create_account_inner(&app, inp, requester.as_ref().map(|r| r.iss.as_str())).await?;
-    let (access, refresh) = create_session_tokens(&app, &acct.did, None).await?;
-    let mut out = json!({
-        "handle": acct.handle,
-        "did": acct.did,
-        "accessJwt": access,
-        "refreshJwt": refresh,
-    });
+    let (access, refresh) = create_session_tokens(&app, &acct.did, None, false, None).await?;
+    let mut out = json!({"handle": acct.handle, "did": acct.did, "accessJwt": access, "refreshJwt": refresh});
     if let Some(doc) = account_did_doc(&app, &acct).await {
         out["didDoc"] = doc;
     }
     Ok(Json(out))
 }
 
-/// The DID document to report for an account (reference safeResolveDidDoc
-/// with a forced refresh): the resolved one for a DID brought here, ours
-/// otherwise.
+/// The reference's safeResolveDidDoc with a forced refresh.
 async fn account_did_doc(app: &App, a: &Account) -> Option<J> {
     if has_external_did(a) {
         app.did_resolver.invalidate(&a.did);
@@ -1474,29 +1115,17 @@ async fn account_did_doc(app: &App, a: &Account) -> Option<J> {
     Some(super::identity::did_doc(app, a))
 }
 
-/// Account creation (createAccount, which then starts a session, and the
-/// OAuth sign-up page), as the reference's local-PDS path
+/// createAccount and the OAuth sign-up page; the reference's local-PDS path
 /// (validateInputsForLocalPds + createAccount):
 /// - `plcOp` is refused (no entryway mode).
-/// - Without `did`, a DID is minted and the handle must be under our domain.
-///   With PLC registration on (src/plc), the DID is the hash of a genesis op
-///   signed with the server rotation key, and the account is created only
-///   after the PLC directory accepted that op (its failure leaves nothing
-///   behind here; a local failure after it tombstones the DID, as the
-///   reference does). Off (dev only), the DID is random and unregistered.
+/// - Without `did`, the DID is minted; with PLC registration on, the account
+///   is written only after the directory accepted its genesis op (a local
+///   failure after that tombstones the DID, as the reference does).
 /// - With `did` (migration in), `requester` (the verified service-auth
 ///   issuer) must be that DID. The account starts deactivated with an empty
-///   repo, a fresh signing key and no firehose events; the user then imports
-///   the repo and blobs, points the DID document here and activates it
-///   (activateAccount checks the document). The handle may be external
-///   (checked to resolve to the DID).
-/// - An invite code, when given, must be available and its use is recorded,
-///   whether or not invites are required.
-pub(super) async fn create_account_inner(
-    app: &App,
-    inp: CreateAccountIn,
-    requester: Option<&str>,
-) -> XResult<Account> {
+///   repo and no firehose events until activateAccount.
+/// - A given invite code is checked and recorded even if not required.
+pub(super) async fn create_account_inner(app: &App, inp: CreateAccountIn, requester: Option<&str>) -> XResult<Account> {
     let r = create_account_checked(app, inp, requester).await;
     let result = match &r {
         Ok(_) => "created",
@@ -1509,7 +1138,7 @@ pub(super) async fn create_account_inner(
     r
 }
 
-/// `vlpds_signups_total` result of a refused sign-up.
+/// The `vlpds_signups_total` result.
 fn signup_refusal(e: &XrpcError) -> &'static str {
     if e.status.is_server_error() {
         return "error";
@@ -1524,54 +1153,29 @@ fn signup_refusal(e: &XrpcError) -> &'static str {
     }
 }
 
-async fn create_account_checked(
-    app: &App,
-    inp: CreateAccountIn,
-    requester: Option<&str>,
-) -> XResult<Account> {
+async fn create_account_checked(app: &App, inp: CreateAccountIn, requester: Option<&str>) -> XResult<Account> {
     if inp.plc_op.is_some() {
         return Err(invalid_request("Unsupported input: \"plcOp\""));
     }
-    let password = inp
-        .password
-        .ok_or_else(|| invalid_request("Password is required"))?;
+    let password = inp.password.ok_or_else(|| invalid_request("Password is required"))?;
     if password.len() > NEW_PASSWORD_MAX_LENGTH {
         return Err(invalid_request(format!(
             "Password too long. Maximum length is {NEW_PASSWORD_MAX_LENGTH} characters."
         )));
     }
-    let invite = inp
-        .invite_code
-        .as_deref()
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .map(str::to_string);
-    if invites_required(app) && invite.is_none() {
-        return Err(XrpcError::bad(
-            "InvalidInviteCode",
-            "No invite code provided",
-        ));
+    let invite = inp.invite_code.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
+    if app.config.invite_required && invite.is_none() {
+        return Err(XrpcError::bad("InvalidInviteCode", "No invite code provided"));
     }
     // the request's spelling, echoed in "Email already taken" as the reference does
     let email_input = inp.email.as_deref().map(str::trim).unwrap_or_default().to_string();
-    let email = match inp
-        .email
-        .as_deref()
-        .map(str::trim)
-        .filter(|e| !e.is_empty())
-    {
-        // required, as in the reference (no self-delete / password reset without one)
-        None => return Err(invalid_request("Email is required")),
-        Some(e) => {
-            let e = e.to_ascii_lowercase();
-            if !email_supported(&e) {
-                return Err(invalid_request(
-                    "This email address is not supported, please use a different email.",
-                ));
-            }
-            e
-        }
-    };
+    if email_input.is_empty() {
+        return Err(invalid_request("Email is required"));
+    }
+    let email = email_input.to_ascii_lowercase();
+    if !email_supported(&email) {
+        return Err(invalid_request("This email address is not supported, please use a different email."));
+    }
     let handle = normalize_handle(&inp.handle)?;
     ensure_no_slur(&handle)?;
 
@@ -1582,20 +1186,16 @@ async fn create_account_checked(
         }
     }
     let key = Arc::new(Keypair::generate());
-    // the genesis op this request registers (PLC registration on, new DID)
     let mut genesis: Option<(Arc<crate::plc::Plc>, J)> = None;
     let (did, external) = match inp.did.as_deref() {
         Some(d) => {
-            // (checked before the handle, whose proof may be fetched)
+            // checked before the handle, whose proof may be fetched
             if requester != Some(d) {
-                return Err(auth_required(&format!(
-                    "Missing auth to create account with did: {d}"
-                )));
+                return Err(auth_required(&format!("Missing auth to create account with did: {d}")));
             }
             if !is_atproto_did(d) {
                 return Err(invalid_request("Invalid DID"));
             }
-            // the handle may be external if it resolves to the DID
             super::identity::check_new_handle(app, &handle, d).await?;
             if account_if_exists(app, d).await?.is_some() {
                 return Err(invalid_request("Account already exists"));
@@ -1614,22 +1214,26 @@ async fn create_account_checked(
             }
         }
     };
-    // Atomic use of the invite code (a conditional-create claim per use).
     let claim = match &invite {
         Some(code) => Some(super::admin::claim_invite_use(app, code, &did).await?),
         None => None,
     };
-    let release = |claim: Option<super::admin::InviteClaim>| async move {
-        if let Some(c) = claim {
-            super::admin::release_invite_use(app, c).await;
+    let release = |handle_ok: bool, email_ok: bool, claim: Option<super::admin::InviteClaim>| {
+        let (handle, email, did) = (&handle, &email, &did);
+        async move {
+            if handle_ok {
+                release_handle(app, handle, did).await;
+            }
+            if email_ok {
+                release_email(app, email, did).await;
+            }
+            if let Some(c) = claim {
+                super::admin::release_invite_use(app, c).await;
+            }
         }
     };
-    // Global handle and email uniqueness across nodes: conditional creates
-    // of handle/{handle} and the email claim. Both store round trips and the
-    // password hash (~20 ms of CPU on the blocking pool) run concurrently:
-    // one after the other they were most of createAccount's latency, and at
-    // a fixed concurrency its rate.
-    // The signing key is wrapped (a KMS call in production) alongside.
+    // Concurrent: run one after the other, the claims' store round trips, the
+    // password hash and the key wrap (KMS) were most of the latency.
     let (h, e, password_hash, wrapped) = tokio::join!(
         claim_handle(app, &handle, &did),
         claim_email(app, &email, &did),
@@ -1645,37 +1249,22 @@ async fn create_account_checked(
     let (wrapped_signing_key, signing_pubkey) = match wrapped {
         Ok(w) => w,
         Err(err) => {
-            if h_ok {
-                release_handle(app, &handle, &did).await;
-            }
-            if e_ok {
-                release_email(app, &email, &did).await;
-            }
-            release(claim).await;
-            return Err(err.into());
+            release(h_ok, e_ok, claim).await;
+            return Err(err);
         }
     };
     if !(h_ok && e_ok) {
-        if h_ok {
-            release_handle(app, &handle, &did).await;
-        }
-        if e_ok {
-            release_email(app, &email, &did).await;
-        }
-        release(claim).await;
+        release(h_ok, e_ok, claim).await;
         if !h? {
             return Err(XrpcError::bad("HandleNotAvailable", format!("Handle already taken: {handle}")));
         }
         e?;
         return Err(invalid_request(format!("Email already taken: {email_input}")));
     }
-    // Register the DID before anything about the account is written (the
-    // reference sends the genesis op before creating the account row).
+    // the reference too registers the DID before writing the account
     if let Some((plc, op)) = &genesis {
         if let Err(err) = plc.create(&did, op).await {
-            release_handle(app, &handle, &did).await;
-            release_email(app, &email, &did).await;
-            release(claim).await;
+            release(true, true, claim).await;
             if matches!(err, crate::plc::PlcError::Unavailable(_)) {
                 // maybe registered (a timeout after the directory applied
                 // it); a retry mints another DID, so this one is an orphan
@@ -1709,38 +1298,7 @@ async fn create_account_checked(
         set_extra(&mut acct, "deactivatedAt", json!(crate::events::now_rfc3339()));
         recompute_status(&mut acct);
     }
-    let did_arc: Arc<str> = did.clone().into();
-    let (tx, rx) = oneshot::channel();
-    let sent = app
-        .workers
-        .route(&did)
-        .send(WorkerMsg::CreateRepo(CreateRepoReq {
-            did: did_arc,
-            handle: handle.clone(),
-            key,
-            account_json: Bytes::from(serde_json::to_vec(&acct).unwrap()),
-            records: Vec::new(),
-            reply: tx,
-        }));
-    // (error, definite): definite failures applied nothing
-    let created: Result<(), (XrpcError, bool)> = match sent {
-        Ok(()) => match rx.await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => {
-                let definite = match &e {
-                    WriteError::Unavailable(_) | WriteError::KeyUnavailable(_) | WriteError::SignatureFault(_) => true,
-                    // "repo already exists": maybe an earlier attempt of ours
-                    WriteError::Invalid(m) => m != crate::worker::REPO_EXISTS,
-                    // incl. the log write failing or timing out: maybe durable
-                    _ => false,
-                };
-                Err((e.into(), definite))
-            }
-            Err(_) => Err((XrpcError::internal("worker dropped request"), false)),
-        },
-        // never reached the worker
-        Err(e) => Err((XrpcError::from_err(e), true)),
-    };
+    let created = create_repo(app, &did, &handle, key, &acct).await;
     if let Err((e, false)) = &created {
         // Ambiguous: the account may exist (or still appear). Ours if it
         // carries this request's password hash (salted: unique per request).
@@ -1759,9 +1317,7 @@ async fn create_account_checked(
         }
     }
     if let Err((e, true)) = created {
-        release_handle(app, &handle, &did).await;
-        release_email(app, &email, &did).await;
-        release(claim).await;
+        release(true, true, claim).await;
         if let Some((plc, _)) = &genesis {
             // the DID was registered for an account that doesn't exist
             if let Err(t) = plc.tombstone(&did).await {
@@ -1778,10 +1334,39 @@ async fn create_account_checked(
     Ok(acct)
 }
 
-/// After a genesis op's submission timed out or failed ambiguously: in the
-/// background, a few times, looks the DID up in the directory and
-/// tombstones it if it was registered after all (best effort: the account
-/// was never created, and a retry of createAccount mints another DID).
+/// Err((error, definite)): a definite failure applied nothing.
+async fn create_repo(app: &App, did: &str, handle: &str, key: Arc<Keypair>, acct: &Account) -> Result<(), (XrpcError, bool)> {
+    let (tx, rx) = oneshot::channel();
+    let req = CreateRepoReq {
+        did: did.into(),
+        handle: handle.to_string(),
+        key,
+        account_json: Bytes::from(serde_json::to_vec(acct).unwrap()),
+        records: Vec::new(),
+        reply: tx,
+    };
+    if let Err(e) = app.workers.route(did).send(WorkerMsg::CreateRepo(req)) {
+        return Err((XrpcError::from_err(e), true));
+    }
+    match rx.await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => {
+            let definite = match &e {
+                WriteError::Unavailable(_) | WriteError::KeyUnavailable(_) | WriteError::SignatureFault(_) => true,
+                // "repo already exists": maybe an earlier attempt of ours
+                WriteError::Invalid(m) => m != crate::worker::REPO_EXISTS,
+                // incl. the log write failing or timing out: maybe durable
+                _ => false,
+            };
+            Err((e.into(), definite))
+        }
+        Err(_) => Err((XrpcError::internal("worker dropped request"), false)),
+    }
+}
+
+/// Best effort, in the background: tombstones a DID whose genesis op landed
+/// after all, after its submission failed ambiguously (the account was never
+/// created, and a retried createAccount mints another DID).
 fn tombstone_if_registered(plc: Arc<crate::plc::Plc>, did: String) {
     tokio::spawn(async move {
         for wait in [5u64, 30, 120] {
@@ -1803,10 +1388,6 @@ fn tombstone_if_registered(plc: Arc<crate::plc::Plc>, did: String) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// createSession / getSession / refreshSession / deleteSession
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateSessionIn {
@@ -1817,11 +1398,9 @@ struct CreateSessionIn {
     allow_takendown: bool,
 }
 
-/// Resolves a login identifier (handle, DID or email) to a local account.
-/// The account a login identifier names; Ok(None) if there is none.
-/// Unavailability (the account's shard moving between nodes) is an error,
-/// not "no such account", so a client retries instead of being told its
-/// credentials are wrong.
+/// The account a login identifier (handle, DID or email) names. A moving
+/// shard is an error, not Ok(None), so a client retries instead of being
+/// told its credentials are wrong.
 pub(super) async fn login_account(app: &App, identifier: &str) -> XResult<Option<Account>> {
     let ident = identifier.trim().to_ascii_lowercase();
     let did = if ident.contains('@') {
@@ -1845,8 +1424,6 @@ pub(super) async fn login_account(app: &App, identifier: &str) -> XResult<Option
     Ok(Some(a))
 }
 
-/// `app.account`, with "no such account" as Ok(None) and every other error
-/// (e.g. 503 while the shard moves) passed on.
 pub(super) async fn account_if_exists(app: &App, did: &str) -> XResult<Option<Account>> {
     match app.account(did).await {
         Ok(a) => Ok(Some(a)),
@@ -1856,12 +1433,10 @@ pub(super) async fn account_if_exists(app: &App, did: &str) -> XResult<Option<Ac
 }
 
 /// App passwords are server-generated with ~80 bits of randomness, so a fast
-/// deterministic hash is safe here (no dictionary to attack) and lets us look
-/// them up by hash. User-chosen account passwords use Argon2id instead.
+/// deterministic hash is safe (no dictionary to attack) and lets us look
+/// them up by hash.
 fn app_password_hash(did: &str, password: &str) -> String {
-    hex::encode(Sha256::digest(
-        format!("vlpds-app-password:{did}:{password}").as_bytes(),
-    ))
+    hex::encode(Sha256::digest(format!("vlpds-app-password:{did}:{password}").as_bytes()))
 }
 
 async fn verify_app_password(app: &App, did: &str, password: &str) -> XResult<Option<AppPassRef>> {
@@ -1871,22 +1446,16 @@ async fn verify_app_password(app: &App, did: &str, password: &str) -> XResult<Op
     };
     let name = String::from_utf8_lossy(&name).to_string();
     let meta: Option<J> = get_json(app, did, &format!("apppass/{name}")).await?;
-    Ok(meta.map(|m| AppPassRef {
-        name,
-        privileged: m["privileged"].as_bool().unwrap_or(false),
-    }))
+    Ok(meta.map(|m| AppPassRef { name, privileged: m["privileged"].as_bool().unwrap_or(false) }))
 }
 
-/// How far a createSession got, for `vlpds_logins_total`.
+/// For `vlpds_logins_total`.
 struct LoginStep {
     method: &'static str,
     second_factor: bool,
 }
 
-async fn create_session(
-    State(app): AppState,
-    Json(inp): Json<CreateSessionIn>,
-) -> XResult<Json<J>> {
+async fn create_session(State(app): AppState, Json(inp): Json<CreateSessionIn>) -> XResult<Json<J>> {
     let mut step = LoginStep { method: "password", second_factor: false };
     let r = create_session_inner(&app, inp, &mut step).await;
     let result = match &r {
@@ -1902,33 +1471,22 @@ async fn create_session(
     r
 }
 
-async fn create_session_inner(
-    app: &Arc<App>,
-    inp: CreateSessionIn,
-    step: &mut LoginStep,
-) -> XResult<Json<J>> {
-    let app = app.clone();
+async fn create_session_inner(app: &App, inp: CreateSessionIn, step: &mut LoginStep) -> XResult<Json<J>> {
     if inp.password.len() > OLD_PASSWORD_MAX_LENGTH {
-        return Err(auth_required(
-            "Password too long. Consider resetting your password.",
-        ));
+        return Err(auth_required("Password too long. Consider resetting your password."));
     }
     // reference: 300/day and 30/5min per `${identifier}-${ip}`, normalized
     // like the OAuth sign-in's key (whose buckets these are too), so case
-    // variants of one handle or email share a bucket instead of each
-    // getting a fresh one
+    // variants of one handle or email share a bucket
     {
         use crate::ratelimit::*;
         let key = inp.identifier.trim().trim_start_matches('@').to_lowercase();
         check_with_ip(&[&CREATE_SESSION_DAY, &CREATE_SESSION_5MIN], &key, 1)?;
     }
     let invalid = || auth_required("Invalid identifier or password");
-    let acct = login_account(&app, &inp.identifier)
-        .await?
-        .ok_or_else(invalid)?;
+    let acct = login_account(app, &inp.identifier).await?.ok_or_else(invalid)?;
     // vlpds: a per-account cap from any IP (shared with the OAuth sign-in),
-    // before the password hash; counted on the account's owner, where
-    // routing sends createSession by its identifier
+    // before the password hash
     crate::ratelimit::check(&[&crate::ratelimit::SIGN_IN_ACCOUNT], &acct.did, 1)?;
     let soft_deleted = is_takendown_account(&acct);
     let mut app_pass = None;
@@ -1937,29 +1495,19 @@ async fn create_session_inner(
         if soft_deleted {
             return Err(invalid());
         }
-        app_pass = Some(
-            verify_app_password(&app, &acct.did, &inp.password)
-                .await?
-                .ok_or_else(invalid)?,
-        );
+        app_pass = Some(verify_app_password(app, &acct.did, &inp.password).await?.ok_or_else(invalid)?);
         step.method = "app_password";
     }
     if soft_deleted && !inp.allow_takendown {
         return Err(takedown_error());
     }
-    // second factor for password logins (app passwords bypass it): TOTP,
-    // else the email factor (src/xrpc/email2fa.rs); a code sent anyway is
-    // still checked, as in the reference
     step.second_factor = true;
-    super::email2fa::check_second_factor(&app, &acct, inp.auth_factor_token.as_deref(), app_pass.is_some()).await?;
+    super::email2fa::check_second_factor(app, &acct, inp.auth_factor_token.as_deref(), app_pass.is_some()).await?;
     step.second_factor = false;
-    // the session is created only if no revocation (a password change) hit
-    // the account since its password was checked (see auth_epoch)
-    let epoch = epoch_for_login(&app, &acct).await?.ok_or_else(invalid)?;
+    let epoch = epoch_for_login(app, &acct).await?.ok_or_else(invalid)?;
     super::cas::pause_point("legacy_login", &acct.did).await;
-    let (access, refresh) =
-        create_session_tokens_scoped(&app, &acct.did, app_pass, soft_deleted, Some(epoch.as_str())).await?;
-    let mut out = session_info(&app, &acct, true).await;
+    let (access, refresh) = create_session_tokens(app, &acct.did, app_pass, soft_deleted, Some(epoch.as_str())).await?;
+    let mut out = session_info(app, &acct, true).await;
     out["accessJwt"] = json!(access);
     out["refreshJwt"] = json!(refresh);
     Ok(Json(out))
@@ -1971,8 +1519,7 @@ async fn get_session(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>
         .account(&did)
         .await
         .map_err(|_| invalid_request(format!("Could not find user info for account: {did}")))?;
-    let include_email =
-        !matches!(creds, Credentials::OAuth { .. }) || creds.allows_account("email", "read");
+    let include_email = !matches!(creds, Credentials::OAuth { .. }) || creds.allows_account("email", "read");
     Ok(Json(session_info(&app, &acct, include_email).await))
 }
 
@@ -1988,30 +1535,24 @@ async fn refresh_session(State(app): AppState, headers: HeaderMap) -> XResult<Js
         return Err(takedown_error());
     }
     let e = ext(&app);
-    // serializes racing refreshes of one account on this node (an economy:
-    // the conditional write below is what is correct across nodes)
+    // an economy: the conditional write is what is correct across nodes
     let _g = e.lock(&did).await;
     let (st, next) = rotate_refresh(&app, &did, &rid).await?;
-    let (access, refresh) = issue_pair(&app, &did, &st.family, &next, &st.app_password);
+    let (access, refresh) = issue_pair(&app, &did, access_scope(&st.app_password), &st.family, &next);
     let mut out = session_info(&app, &acct, true).await;
     out["accessJwt"] = json!(access);
     out["refreshJwt"] = json!(refresh);
     Ok(Json(out))
 }
 
-/// Rotates refresh token `rid` of `did`: (its session, the next refresh id).
-/// The rows are read, checked and rewritten on condition that they still
-/// hold what was read, at the owner (src/xrpc/cas.rs), so a revocation that
-/// lands meanwhile (deleteSession, password change, takedown: they delete
-/// the rows the same way) is never undone by the rewrite; a lost round
-/// re-reads.
+/// (the session, the next refresh id). Rewritten on condition the rows are
+/// unchanged, so a revocation landing meanwhile is never undone.
 async fn rotate_refresh(app: &App, did: &str, rid: &str) -> XResult<(RefreshState, String)> {
     use super::cas::{Cond, Op};
     let name = format!("sess/{rid}");
     for _ in 0..CAS_ROUNDS {
         let raw = app.get_private(did, &name).await?;
         let st: Option<RefreshState> = raw.as_deref().map(serde_json::from_slice).transpose().map_err(XrpcError::from_err)?;
-        // revoked (deleteSession, password change, ...) or past its grace period
         let now = now_secs();
         let st = st.filter(|s| s.exp >= now).ok_or_else(|| expired_token("Token has been revoked"))?;
         if ctl(app, did).await?.is_revoked(Some(&st.family), 0) {
@@ -2053,10 +1594,6 @@ async fn delete_session(State(app): AppState, headers: HeaderMap) -> XResult<Sta
     Ok(StatusCode::OK)
 }
 
-// ---------------------------------------------------------------------------
-// app passwords
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize)]
 struct CreateAppPasswordIn {
     name: String,
@@ -2064,11 +1601,7 @@ struct CreateAppPasswordIn {
     privileged: Option<bool>,
 }
 
-async fn create_app_password(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<CreateAppPasswordIn>,
-) -> XResult<Json<J>> {
+async fn create_app_password(State(app): AppState, Auth(creds): Auth, Json(inp): Json<CreateAppPasswordIn>) -> XResult<Json<J>> {
     let did = full_access(&creds)?;
     let acct = app.account(&did).await?;
     if is_takendown_account(&acct) {
@@ -2081,11 +1614,7 @@ async fn create_app_password(
     let privileged = inp.privileged.unwrap_or(false);
     let e = ext(&app);
     let _g = e.lock(&did).await;
-    if app
-        .get_private(&did, &format!("apppass/{name}"))
-        .await?
-        .is_some()
-    {
+    if app.get_private(&did, &format!("apppass/{name}")).await?.is_some() {
         return Err(invalid_request("could not create app-specific password"));
     }
     let s = crate::cid::base32_encode(&rand::random::<[u8; 10]>());
@@ -2093,21 +1622,12 @@ async fn create_app_password(
     let created_at = crate::events::now_rfc3339();
     let h = app_password_hash(&did, &password);
     let meta = json!({"name": name, "createdAt": created_at, "privileged": privileged, "hash": h});
-    app.put_private(
-        &did,
-        vec![
-            pmut(&did, &format!("apppass/{name}"), Some(to_json_bytes(&meta))),
-            pmut(
-                &did,
-                &format!("apphash/{h}"),
-                Some(name.as_bytes().to_vec()),
-            ),
-        ],
-    )
-    .await?;
-    Ok(Json(
-        json!({"name": name, "password": password, "createdAt": created_at, "privileged": privileged}),
-    ))
+    let muts = vec![
+        pmut(&did, &format!("apppass/{name}"), Some(to_json_bytes(&meta))),
+        pmut(&did, &format!("apphash/{h}"), Some(name.as_bytes().to_vec())),
+    ];
+    app.put_private(&did, muts).await?;
+    Ok(Json(json!({"name": name, "password": password, "createdAt": created_at, "privileged": privileged})))
 }
 
 async fn list_app_passwords(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
@@ -2127,11 +1647,7 @@ struct RevokeAppPasswordIn {
     name: String,
 }
 
-async fn revoke_app_password(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<RevokeAppPasswordIn>,
-) -> XResult<StatusCode> {
+async fn revoke_app_password(State(app): AppState, Auth(creds): Auth, Json(inp): Json<RevokeAppPasswordIn>) -> XResult<StatusCode> {
     // app passwords can't revoke app passwords (stricter than the reference)
     let did = full_access(&creds)?;
     let e = ext(&app);
@@ -2148,25 +1664,12 @@ async fn revoke_app_password(
     Ok(StatusCode::OK)
 }
 
-// ---------------------------------------------------------------------------
-// account lifecycle
-// ---------------------------------------------------------------------------
-
-/// Read-modify-write of an account, applied by the repo's worker to its
-/// current state (App::mutate_account). Returns the account as written.
-pub(super) async fn update_account<F>(
-    app: &App,
-    did: &str,
-    identity_event: bool,
-    account_event: bool,
-    f: F,
-) -> XResult<Account>
+/// [`App::mutate_account`] that always writes; returns the account as written.
+pub(super) async fn update_account<F>(app: &App, did: &str, identity_event: bool, account_event: bool, f: F) -> XResult<Account>
 where
     F: FnOnce(&mut Account) -> XResult<()> + Send + 'static,
 {
-    let (_, a) = app
-        .mutate_account(did, identity_event, account_event, false, |a| f(a).map(|_| true))
-        .await?;
+    let (_, a) = app.mutate_account(did, identity_event, account_event, false, |a| f(a).map(|_| true)).await?;
     Ok(a)
 }
 
@@ -2176,22 +1679,13 @@ struct DeactivateIn {
     delete_after: Option<String>,
 }
 
-pub(super) async fn set_deactivated(
-    app: &App,
-    did: &str,
-    deactivated: bool,
-    delete_after: Option<String>,
-) -> XResult<Account> {
+pub(super) async fn set_deactivated(app: &App, did: &str, deactivated: bool, delete_after: Option<String>) -> XResult<Account> {
     update_account(app, did, !deactivated, true, move |a| {
         if deactivated {
             if a.extra.get("deactivatedAt").is_none_or(|v| v.is_null()) {
                 set_extra(a, "deactivatedAt", json!(crate::events::now_rfc3339()));
             }
-            set_extra(
-                a,
-                "deleteAfter",
-                delete_after.map(J::String).unwrap_or(J::Null),
-            );
+            set_extra(a, "deleteAfter", delete_after.map(J::String).unwrap_or(J::Null));
         } else {
             if a.extra.get("takedownRef").is_some_and(|v| !v.is_null()) {
                 return Err(XrpcError::bad("AccountNotFound", "user not found"));
@@ -2212,11 +1706,7 @@ pub(super) async fn set_deactivated(
     })
 }
 
-async fn deactivate_account(
-    State(app): AppState,
-    Auth(creds): Auth,
-    body: Option<Json<DeactivateIn>>,
-) -> XResult<StatusCode> {
+async fn deactivate_account(State(app): AppState, Auth(creds): Auth, body: Option<Json<DeactivateIn>>) -> XResult<StatusCode> {
     let did = full_or_oauth_account(&creds, "status", "manage")?;
     let inp = body.map(|Json(b)| b).unwrap_or_default();
     if let Some(d) = &inp.delete_after {
@@ -2224,9 +1714,7 @@ async fn deactivate_account(
             return Err(invalid_request("deleteAfter must be a valid datetime"));
         }
     }
-    app.account(&did)
-        .await
-        .map_err(|_| invalid_request("Account not found"))?;
+    app.account(&did).await.map_err(|_| invalid_request("Account not found"))?;
     // the reference's `deleteCredentials` for OAuth callers
     if matches!(creds, Credentials::OAuth { .. }) {
         delete_delegated_credentials(&app, &did).await?;
@@ -2235,18 +1723,11 @@ async fn deactivate_account(
     Ok(StatusCode::OK)
 }
 
-/// What the reference's `deactivateAccount({deleteCredentials: true})` drops
-/// (OAuth deactivation and the account page): every OAuth session, the
-/// remembered client authorizations and every app password with its
-/// sessions. Password sessions stay.
+/// The reference's `deactivateAccount({deleteCredentials: true})`: OAuth
+/// sessions, client authorizations and app passwords with their sessions.
+/// Password sessions stay.
 pub(super) async fn delete_delegated_credentials(app: &App, did: &str) -> XResult<()> {
-    crate::oauth::store::revoke_all_sessions(app, did)
-        .await
-        .map_err(|e| XrpcError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            error: "InternalServerError".into(),
-            message: e.description,
-        })?;
+    crate::oauth::store::revoke_all_sessions(app, did).await.map_err(|e| XrpcError::internal(e.description))?;
     let mut dels: Vec<_> = scan_private(app, did, "oauth/authz/")
         .await?
         .into_iter()
@@ -2272,24 +1753,18 @@ pub(super) async fn delete_delegated_credentials(app: &App, did: &str) -> XResul
 }
 
 async fn activate_account(State(app): AppState, Auth(creds): Auth) -> XResult<StatusCode> {
-    let did = match &creds {
-        Credentials::OAuth { .. } => {
-            return Err(err(
-                StatusCode::FORBIDDEN,
-                "Forbidden",
-                "Account reactivation is not available with OAuth credentials. Sign in to your account management page to reactivate.",
-            ))
-        }
-        _ => full_access(&creds)?,
-    };
-    let acct = app
-        .account(&did)
-        .await
-        .map_err(|_| XrpcError::bad("AccountNotFound", "user not found"))?;
+    if matches!(creds, Credentials::OAuth { .. }) {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "Account reactivation is not available with OAuth credentials. Sign in to your account management page to reactivate.",
+        ));
+    }
+    let did = full_access(&creds)?;
+    let acct = app.account(&did).await.map_err(|_| XrpcError::bad("AccountNotFound", "user not found"))?;
     assert_valid_did_doc(&app, &acct).await?;
     // #account, #identity and #sync (reference sequenceAccountActivation)
     app.mutate_account(&did, true, true, true, |a| {
-        // a taken-down account can't be activated
         if a.extra.get("takedownRef").is_some_and(|v| !v.is_null()) {
             return Err(XrpcError::bad("AccountNotFound", "user not found"));
         }
@@ -2303,12 +1778,13 @@ async fn activate_account(State(app): AppState, Auth(creds): Auth) -> XResult<St
     Ok(StatusCode::OK)
 }
 
-/// Reference assertValidDidDocumentForService: the account's DID document
-/// names this PDS and the account's signing key. With PLC registration on,
-/// a did:plc (minted here or brought here) is checked against the
-/// directory's data, which must also keep the server rotation key; a DID
-/// minted here without registration is documented by this server only, so
-/// then only a DID brought here (migration in) is resolved and checked.
+const WRONG_PDS: &str = "DID document atproto_pds service endpoint does not match PDS public url";
+const WRONG_SIGNING_KEY: &str = "DID document verification method does not match expected signing key";
+
+/// The reference's assertValidDidDocumentForService. With PLC registration
+/// on, a did:plc is checked against the directory, which must also keep the
+/// server rotation key. Without it, a DID minted here is documented by this
+/// server only, so only a migrated-in DID is checked.
 async fn assert_valid_did_doc(app: &App, a: &Account) -> XResult<()> {
     if let (Some(plc), true) = (&app.plc, a.did.starts_with("did:plc:")) {
         let data = plc.client.document_data(&a.did).await?;
@@ -2319,14 +1795,10 @@ async fn assert_valid_did_doc(app: &App, a: &Account) -> XResult<()> {
         }
         let pds = data["services"]["atproto_pds"]["endpoint"].as_str();
         if pds != Some(app.public_url.as_str()) {
-            return Err(invalid_request(
-                "DID document atproto_pds service endpoint does not match PDS public url",
-            ));
+            return Err(invalid_request(WRONG_PDS));
         }
         if data["verificationMethods"]["atproto"] != format!("did:key:{}", a.signing_pubkey).as_str() {
-            return Err(invalid_request(
-                "DID document verification method does not match expected signing key",
-            ));
+            return Err(invalid_request(WRONG_SIGNING_KEY));
         }
         return Ok(());
     }
@@ -2334,34 +1806,23 @@ async fn assert_valid_did_doc(app: &App, a: &Account) -> XResult<()> {
         return Ok(());
     }
     app.did_resolver.invalidate(&a.did);
-    let doc = app
-        .did_resolver
-        .resolve(&a.did)
-        .await
-        .map_err(|_| invalid_request("Could not resolve DID"))?;
+    let doc = app.did_resolver.resolve(&a.did).await.map_err(|_| invalid_request("Could not resolve DID"))?;
     let pds = crate::did_resolver::service_endpoint(&doc, "atproto_pds");
     if pds.as_deref().map(|p| p.trim_end_matches('/')) != Some(app.public_url.trim_end_matches('/')) {
-        return Err(invalid_request(
-            "DID document atproto_pds service endpoint does not match PDS public url",
-        ));
+        return Err(invalid_request(WRONG_PDS));
     }
     if crate::did_resolver::signing_key_multibase(&doc).as_deref() != Some(a.signing_pubkey.as_str()) {
-        return Err(invalid_request(
-            "DID document verification method does not match expected signing key",
-        ));
+        return Err(invalid_request(WRONG_SIGNING_KEY));
     }
     Ok(())
 }
 
-/// Migration progress (reference checkAccountStatus): `repoBlocks` counts
-/// the commit, the MST nodes and the distinct record blocks; `expectedBlobs`
-/// the distinct blobs the records reference; `importedBlobs` the blobs
-/// stored for the account (uploaded, referenced or not yet).
+/// Migration progress. `importedBlobs` counts every stored blob, referenced
+/// or not yet.
 async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let did = user_did(&creds)?;
     let acct = app.account(&did).await?;
     let (view, snap) = app.repo_view(&did).await?;
-    // the whole tree, streamed from the snapshot (`M/` + one `R/` scan)
     let (d, root) = (did.clone(), view.head.data);
     let nodes = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
@@ -2380,10 +1841,7 @@ async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResul
     .map_err(XrpcError::from_err)?;
     let p = app.partition(&did)?;
     let prefix = state::record_prefix(&did);
-    let mut iter =
-        p.db.scan(prefix.clone()..state::prefix_end(&prefix))
-            .await
-            .map_err(XrpcError::from_err)?;
+    let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await.map_err(XrpcError::from_err)?;
     let mut records = 0u64;
     let mut record_blocks = HashSet::new();
     while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
@@ -2393,10 +1851,7 @@ async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResul
         }
     }
     let bprefix = state::blob_ref_prefix(&did);
-    let mut iter =
-        p.db.scan(bprefix.clone()..state::prefix_end(&bprefix))
-            .await
-            .map_err(XrpcError::from_err)?;
+    let mut iter = p.db.scan(bprefix.clone()..state::prefix_end(&bprefix)).await.map_err(XrpcError::from_err)?;
     let mut expected = HashSet::new();
     while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
         let rest = String::from_utf8_lossy(&kv.key[bprefix.len()..]).to_string();
@@ -2423,33 +1878,32 @@ async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResul
     })))
 }
 
+/// The account to mail a token to: not taken down, with an email.
+async fn mailable_account(app: &App, did: &str) -> XResult<(Account, String)> {
+    let acct = app.account(did).await.map_err(|_| invalid_request("account not found"))?;
+    if is_takendown_account(&acct) {
+        return Err(takedown_error());
+    }
+    let email = acct.email.clone().ok_or_else(|| invalid_request("account does not have an email address"))?;
+    Ok((acct, email))
+}
+
 async fn request_account_delete(State(app): AppState, Auth(creds): Auth) -> XResult<StatusCode> {
     let did = full_access(&creds)?;
     {
         use crate::ratelimit::*;
         check(&[&REQUEST_ACCOUNT_DELETE_DAY, &REQUEST_ACCOUNT_DELETE_HOUR], &did, 1)?;
     }
-    let acct = app
-        .account(&did)
-        .await
-        .map_err(|_| invalid_request("account not found"))?;
-    if is_takendown_account(&acct) {
-        return Err(takedown_error());
-    }
-    let email = acct
-        .email
-        .clone()
-        .ok_or_else(|| invalid_request("account does not have an email address"))?;
+    let (_, email) = mailable_account(&app, &did).await?;
     let token = create_email_token(&app, &did, "delete_account").await?;
     deliver(&app, &email, crate::mail::Email::DeleteAccount { token: &token });
     Ok(StatusCode::OK)
 }
 
-/// Deletes an account entirely: sessions, repo + account (#account deleted
-/// event), handle and email claims, private state.
+/// Sessions, repo and account (#account deleted event), handle and email
+/// claims, private state.
 pub(super) async fn delete_account_fully(app: &App, did: &str) -> XResult<()> {
-    // (from the owner wherever it is; an unreadable account leaves its claims
-    // to be taken over once stale: `claim`)
+    // an unreadable account leaves its claims to be taken over once stale
     let acct = super::internal::account_anywhere(app, did).await.ok();
     revoke_all_sessions(app, did).await?;
     app.account_op(did, AccountOp::Delete).await?;
@@ -2465,14 +1919,7 @@ pub(super) async fn delete_account_fully(app: &App, did: &str) -> XResult<()> {
     let mut private = scan_private(app, did, "").await?;
     private.retain(|(name, _)| !name.starts_with(REVOKED_ALL) && !name.starts_with(REVOKED_FAMILY) && name != AUTH_EPOCH);
     for chunk in private.chunks(500) {
-        app.put_private(
-            did,
-            chunk
-                .iter()
-                .map(|(name, _)| pmut(did, name, None))
-                .collect(),
-        )
-        .await?;
+        app.put_private(did, chunk.iter().map(|(name, _)| pmut(did, name, None)).collect()).await?;
     }
     ctl_changed(app, did);
     crate::metrics::ACCOUNT_EVENTS.with_label_values(&["deleted"]).inc();
@@ -2486,19 +1933,11 @@ struct DeleteAccountIn {
     token: String,
 }
 
-async fn delete_account(
-    State(app): AppState,
-    Json(inp): Json<DeleteAccountIn>,
-) -> XResult<StatusCode> {
+async fn delete_account(State(app): AppState, Json(inp): Json<DeleteAccountIn>) -> XResult<StatusCode> {
     if inp.password.len() > OLD_PASSWORD_MAX_LENGTH {
-        return Err(auth_required(
-            "Password too long. Consider resetting your password.",
-        ));
+        return Err(auth_required("Password too long. Consider resetting your password."));
     }
-    let acct = app
-        .account(&inp.did)
-        .await
-        .map_err(|_| invalid_request("account not found"))?;
+    let acct = app.account(&inp.did).await.map_err(|_| invalid_request("account not found"))?;
     if !verify_password(&acct, &inp.password).await? {
         return Err(auth_required("Invalid did or password"));
     }
@@ -2512,34 +1951,24 @@ struct ReserveSigningKeyIn {
     did: Option<String>,
 }
 
-/// Unclaimed reserved signing keys expire after this long (swept by
-/// [`spawn_reserved_key_gc`]; an expired reservation can't be taken).
 pub const RESERVED_KEY_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
-/// Private-state routing key of a reservation: by did:key for the key
-/// itself, by DID for the per-DID index (`{"signingKey", "createdAt"}`).
+/// By did:key for the key itself, by DID for the per-DID index.
 fn reserved_routing(id: &str) -> String {
     format!("_reserved:{id}")
 }
 
 fn reservation_expired(rec: &J, ttl: std::time::Duration) -> bool {
-    let created = rec["createdAt"]
-        .as_str()
-        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+    let created = rec["createdAt"].as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
     match created {
         Some(t) => chrono::Utc::now().signed_duration_since(t).to_std().unwrap_or_default() >= ttl,
         None => true,
     }
 }
 
-/// Reserves a signing key; `admin.updateAccountSigningKey` can later
-/// install it (the PDS must hold the private key to sign commits). With
-/// `did`, the same key comes back while its reservation is live (reference
-/// actorStore.reserveKeypair keys the reservation by DID).
-async fn reserve_signing_key(
-    State(app): AppState,
-    body: Option<Json<ReserveSigningKeyIn>>,
-) -> XResult<Json<J>> {
+/// With `did`, the same key comes back while its reservation is live (the
+/// reference's actorStore.reserveKeypair keys the reservation by DID).
+async fn reserve_signing_key(State(app): AppState, body: Option<Json<ReserveSigningKeyIn>>) -> XResult<Json<J>> {
     let inp = body.map(|Json(b)| b).unwrap_or_default();
     let did = inp.did.filter(|d| !d.is_empty());
     if let Some(did) = &did {
@@ -2563,25 +1992,18 @@ async fn reserve_signing_key(
     let did_key = key.did_key();
     let routing = reserved_routing(&did_key);
     let now = crate::events::now_rfc3339();
-    // wrapped, bound to the did:key it is reserved under
     let wrapped = app.secrets.wrap(crate::secrets::Purpose::ReservedKey, &did_key, &key.to_bytes()).await?;
     let rec = json!({"key": wrapped, "did": did, "createdAt": now});
-    app.put_private(
-        &routing,
-        vec![pmut(&routing, "k", Some(to_json_bytes(&rec)))],
-    )
-    .await?;
+    app.put_private(&routing, vec![pmut(&routing, "k", Some(to_json_bytes(&rec)))]).await?;
     if let Some(did) = &did {
         let idx = reserved_routing(did);
         let rec = json!({"signingKey": did_key, "createdAt": now});
-        app.put_private(&idx, vec![pmut(&idx, "k", Some(to_json_bytes(&rec)))])
-            .await?;
+        app.put_private(&idx, vec![pmut(&idx, "k", Some(to_json_bytes(&rec)))]).await?;
     }
     Ok(Json(json!({"signingKey": did_key})))
 }
 
-/// Takes a key reserved with reserveSigningKey (by its did:key), clearing
-/// the reservation and its per-DID index. Expired reservations are gone.
+/// Clears the reservation and its per-DID index; an expired one yields None.
 pub(super) async fn take_reserved_key(app: &App, did_key: &str) -> XResult<Option<Keypair>> {
     let routing = reserved_routing(did_key);
     let Some(rec) = get_json::<J>(app, &routing, "k").await? else {
@@ -2595,37 +2017,27 @@ pub(super) async fn take_reserved_key(app: &App, did_key: &str) -> XResult<Optio
         let blob = rec["key"].as_str().unwrap_or("");
         Some(app.secrets.unwrap(crate::secrets::Purpose::ReservedKey, did_key, blob).await?.plaintext)
     };
-    app.put_private(&routing, vec![pmut(&routing, "k", None)])
-        .await?;
+    app.put_private(&routing, vec![pmut(&routing, "k", None)]).await?;
     if let Some(did) = rec["did"].as_str() {
         let idx = reserved_routing(did);
         app.put_private(&idx, vec![pmut(&idx, "k", None)]).await?;
     }
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let key = Keypair::from_bytes(&raw).map_err(XrpcError::from_err)?;
-    Ok(Some(key))
+    raw.map(|raw| Keypair::from_bytes(&raw).map_err(XrpcError::from_err)).transpose()
 }
 
-/// Deletes reservations (keys and per-DID indexes) older than `ttl` in the
-/// partitions this node owns. Returns how many were removed.
+/// Sweeps this node's partitions; returns how many rows were removed.
 pub async fn sweep_reserved_keys(app: &App, ttl: std::time::Duration) -> Result<usize, XrpcError> {
     let mut n = 0;
     for (routing, name, val) in scan_private_routing(app, "_reserved:").await? {
-        let expired = serde_json::from_slice::<J>(&val)
-            .map(|rec| reservation_expired(&rec, ttl))
-            .unwrap_or(true);
+        let expired = serde_json::from_slice::<J>(&val).map(|rec| reservation_expired(&rec, ttl)).unwrap_or(true);
         if expired {
-            app.put_private(&routing, vec![pmut(&routing, &name, None)])
-                .await?;
+            app.put_private(&routing, vec![pmut(&routing, &name, None)]).await?;
             n += 1;
         }
     }
     Ok(n)
 }
 
-/// Background sweep of expired signing-key reservations (hourly).
 pub fn spawn_reserved_key_gc(app: Arc<App>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -2641,30 +2053,13 @@ pub fn spawn_reserved_key_gc(app: Arc<App>) -> tokio::task::JoinHandle<()> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// email flows
-// ---------------------------------------------------------------------------
-
-async fn request_email_confirmation(
-    State(app): AppState,
-    Auth(creds): Auth,
-) -> XResult<StatusCode> {
+async fn request_email_confirmation(State(app): AppState, Auth(creds): Auth) -> XResult<StatusCode> {
     let did = standard_or_oauth_account(&creds, "email", "manage")?;
     {
         use crate::ratelimit::*;
         check(&[&REQUEST_EMAIL_CONFIRMATION_DAY, &REQUEST_EMAIL_CONFIRMATION_HOUR], &did, 1)?;
     }
-    let acct = app
-        .account(&did)
-        .await
-        .map_err(|_| invalid_request("account not found"))?;
-    if is_takendown_account(&acct) {
-        return Err(takedown_error());
-    }
-    let email = acct
-        .email
-        .clone()
-        .ok_or_else(|| invalid_request("account does not have an email address"))?;
+    let (_, email) = mailable_account(&app, &did).await?;
     let token = create_email_token(&app, &did, "confirm_email").await?;
     deliver(&app, &email, crate::mail::Email::ConfirmEmail { token: &token });
     Ok(StatusCode::OK)
@@ -2676,16 +2071,9 @@ struct ConfirmEmailIn {
     token: String,
 }
 
-async fn confirm_email(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<ConfirmEmailIn>,
-) -> XResult<StatusCode> {
+async fn confirm_email(State(app): AppState, Auth(creds): Auth, Json(inp): Json<ConfirmEmailIn>) -> XResult<StatusCode> {
     let did = standard_or_oauth_account(&creds, "email", "manage")?;
-    let acct = app
-        .account(&did)
-        .await
-        .map_err(|_| XrpcError::bad("AccountNotFound", "user not found"))?;
+    let acct = app.account(&did).await.map_err(|_| XrpcError::bad("AccountNotFound", "user not found"))?;
     if is_takendown_account(&acct) {
         return Err(takedown_error());
     }
@@ -2709,17 +2097,7 @@ async fn request_email_update(State(app): AppState, Auth(creds): Auth) -> XResul
         use crate::ratelimit::*;
         check(&[&REQUEST_EMAIL_UPDATE_DAY, &REQUEST_EMAIL_UPDATE_HOUR], &did, 1)?;
     }
-    let acct = app
-        .account(&did)
-        .await
-        .map_err(|_| invalid_request("account not found"))?;
-    if is_takendown_account(&acct) {
-        return Err(takedown_error());
-    }
-    let email = acct
-        .email
-        .clone()
-        .ok_or_else(|| invalid_request("account does not have an email address"))?;
+    let (acct, email) = mailable_account(&app, &did).await?;
     let token_required = acct.email_confirmed;
     if token_required {
         let token = create_email_token(&app, &did, "update_email").await?;
@@ -2728,23 +2106,19 @@ async fn request_email_update(State(app): AppState, Auth(creds): Auth) -> XResul
     Ok(Json(json!({"tokenRequired": token_required})))
 }
 
-/// Sets a new (unconfirmed) email: claims it globally, releases the old one,
-/// clears email tokens.
+/// Sets a new, unconfirmed email: claims it, releases the old one, clears
+/// email tokens.
 pub(super) async fn set_email(app: &App, did: &str, email: &str) -> XResult<()> {
     let email = email.trim().to_ascii_lowercase();
     if !valid_email(&email) {
-        return Err(invalid_request(
-            "This email address is not supported, please use a different email.",
-        ));
+        return Err(invalid_request("This email address is not supported, please use a different email."));
     }
     let acct = app.account(did).await?;
     if acct.email.as_deref() == Some(email.as_str()) {
         return Ok(());
     }
     if !claim_email(app, &email, did).await? {
-        return Err(invalid_request(
-            "This email address is already in use, please use a different email.",
-        ));
+        return Err(invalid_request("This email address is already in use, please use a different email."));
     }
     let new = email.clone();
     let res = app
@@ -2755,7 +2129,7 @@ pub(super) async fn set_email(app: &App, did: &str, email: &str) -> XResult<()> 
             a.email = Some(new);
             a.email_confirmed = false;
             set_extra(a, "emailConfirmedAt", J::Null);
-            // codes must not go to an unconfirmed inbox (reference parity)
+            // codes must not go to an unconfirmed inbox (as the reference)
             a.extra.remove(super::email2fa::FLAG);
             Ok(true)
         })
@@ -2782,11 +2156,7 @@ struct UpdateEmailIn {
     email_auth_factor: Option<bool>,
 }
 
-async fn update_email(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<UpdateEmailIn>,
-) -> XResult<StatusCode> {
+async fn update_email(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdateEmailIn>) -> XResult<StatusCode> {
     // app passwords can't change the email (stricter than the reference)
     let did = full_or_oauth_account(&creds, "email", "manage")?;
     let acct = app
@@ -2814,18 +2184,11 @@ async fn update_email(
         // disabling while changing the address: the change clears it
     }
     if !email_supported(&email) {
-        return Err(invalid_request(
-            "This email address is not supported, please use a different email.",
-        ));
+        return Err(invalid_request("This email address is not supported, please use a different email."));
     }
     match inp.token.as_deref().filter(|t| !t.is_empty()) {
         Some(t) => assert_email_token(&app, &did, "update_email", t).await?,
-        None if acct.email_confirmed => {
-            return Err(XrpcError::bad(
-                "TokenRequired",
-                "confirmation token required",
-            ))
-        }
+        None if acct.email_confirmed => return Err(XrpcError::bad("TokenRequired", "confirmation token required")),
         None => {}
     }
     set_email(&app, &did, &email).await?;
@@ -2837,15 +2200,10 @@ struct RequestPasswordResetIn {
     email: String,
 }
 
-async fn request_password_reset(
-    State(app): AppState,
-    Json(inp): Json<RequestPasswordResetIn>,
-) -> XResult<StatusCode> {
+async fn request_password_reset(State(app): AppState, Json(inp): Json<RequestPasswordResetIn>) -> XResult<StatusCode> {
     let email = inp.email.trim().to_ascii_lowercase();
     let acct = match did_by_email(&app, &email).await? {
-        Some(did) => account_if_exists(&app, &did)
-            .await?
-            .filter(|a| a.email.as_deref() == Some(email.as_str())),
+        Some(did) => account_if_exists(&app, &did).await?.filter(|a| a.email.as_deref() == Some(email.as_str())),
         None => None,
     };
     let Some(acct) = acct else {
@@ -2863,25 +2221,20 @@ struct ResetPasswordIn {
     password: String,
 }
 
-/// The account a password-reset token was issued for (a global lookup; HA
-/// routing sends resetPassword to that account's owner).
+/// The account a password-reset token was issued for (HA routing sends
+/// resetPassword to its owner).
 pub async fn reset_token_did(app: &App, token: &str) -> XResult<Option<String>> {
     let routing = format!("_reset:{}", email_token_digest(app, token));
-    Ok(app
-        .get_private(&routing, "t")
-        .await?
-        .map(|v| String::from_utf8_lossy(&v).to_string()))
+    Ok(app.get_private(&routing, "t").await?.map(|v| String::from_utf8_lossy(&v).to_string()))
 }
 
 /// Sets a new password and revokes every session, OAuth grants included.
-/// Waits for an Argon2 permit (admin updateAccountPassword); request paths
-/// hash with [`state::try_hash_password`] and call
-/// [`change_password_hashed`].
+/// Waits for an Argon2 permit: request paths shed instead, with
+/// [`state::try_hash_password`] and [`change_password_hashed`].
 pub(super) async fn change_password(app: &App, did: &str, password: &str) -> XResult<()> {
     change_password_hashed(app, did, state::hash_password(password).await).await
 }
 
-/// [`change_password`] with the new password already hashed.
 pub(super) async fn change_password_hashed(app: &App, did: &str, hash: String) -> XResult<()> {
     update_account(app, did, false, false, move |a| {
         a.password_hash = hash.clone();
@@ -2889,37 +2242,25 @@ pub(super) async fn change_password_hashed(app: &App, did: &str, hash: String) -
     })
     .await?;
     delete_email_tokens(app, did, &["reset_password"]).await?;
-    crate::oauth::store::revoke_all_sessions(app, did)
-        .await
-        .map_err(|e| XrpcError::from_err(e.description))?;
+    crate::oauth::store::revoke_all_sessions(app, did).await.map_err(|e| XrpcError::internal(e.description))?;
     revoke_all_sessions(app, did).await
 }
 
-async fn reset_password(
-    State(app): AppState,
-    Json(inp): Json<ResetPasswordIn>,
-) -> XResult<StatusCode> {
+async fn reset_password(State(app): AppState, Json(inp): Json<ResetPasswordIn>) -> XResult<StatusCode> {
     if inp.password.len() > NEW_PASSWORD_MAX_LENGTH {
         return Err(invalid_request("Invalid password length."));
     }
     let token = inp.token.trim().to_ascii_uppercase();
     let routing = format!("_reset:{}", email_token_digest(&app, &token));
-    let did = reset_token_did(&app, &token)
-        .await?
-        .ok_or_else(|| invalid_token("Token is invalid"))?;
+    let did = reset_token_did(&app, &token).await?.ok_or_else(|| invalid_token("Token is invalid"))?;
     assert_email_token(&app, &did, "reset_password", &token).await?;
     // shed (503, token still valid) rather than queue behind a login flood
     let hash = state::try_hash_password(&inp.password).await?;
     change_password_hashed(&app, &did, hash).await?;
-    app.put_private(&routing, vec![pmut(&routing, "t", None)])
-        .await?;
+    app.put_private(&routing, vec![pmut(&routing, "t", None)]).await?;
     crate::metrics::PASSWORD_RESETS.with_label_values(&["completed"]).inc();
     Ok(StatusCode::OK)
 }
-
-// ---------------------------------------------------------------------------
-// invites (user side + admin creation)
-// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2928,29 +2269,11 @@ struct CreateInviteCodeIn {
     for_account: Option<String>,
 }
 
-fn require_admin(creds: &Credentials) -> XResult<()> {
-    match creds {
-        Credentials::Admin => Ok(()),
-        _ => Err(auth_required("admin credentials required")),
-    }
-}
-
-async fn create_invite_code(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<CreateInviteCodeIn>,
-) -> XResult<Json<J>> {
-    require_admin(&creds)?;
+async fn create_invite_code(State(app): AppState, Auth(creds): Auth, Json(inp): Json<CreateInviteCodeIn>) -> XResult<Json<J>> {
+    super::admin::require_admin(&creds)?;
     let account = inp.for_account.unwrap_or_else(|| "admin".into());
     let code = super::admin::gen_invite_code(&app);
-    super::admin::create_invites(
-        &app,
-        &account,
-        std::slice::from_ref(&code),
-        inp.use_count,
-        false,
-    )
-    .await?;
+    super::admin::create_invites(&app, &account, std::slice::from_ref(&code), inp.use_count, false).await?;
     Ok(Json(json!({"code": code})))
 }
 
@@ -2967,18 +2290,12 @@ fn one() -> usize {
     1
 }
 
-async fn create_invite_codes(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<CreateInviteCodesIn>,
-) -> XResult<Json<J>> {
-    require_admin(&creds)?;
+async fn create_invite_codes(State(app): AppState, Auth(creds): Auth, Json(inp): Json<CreateInviteCodesIn>) -> XResult<Json<J>> {
+    super::admin::require_admin(&creds)?;
     let accounts = inp.for_accounts.unwrap_or_else(|| vec!["admin".into()]);
     let mut out = Vec::new();
     for account in accounts {
-        let codes: Vec<String> = (0..inp.code_count.min(1000))
-            .map(|_| super::admin::gen_invite_code(&app))
-            .collect();
+        let codes: Vec<String> = (0..inp.code_count.min(1000)).map(|_| super::admin::gen_invite_code(&app)).collect();
         super::admin::create_invites(&app, &account, &codes, inp.use_count, false).await?;
         out.push(json!({"account": account, "codes": codes}));
     }
@@ -2996,12 +2313,9 @@ fn rfc3339_ms(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.timestamp_millis())
 }
 
-/// How many invite codes an account has earned and not yet been given, and
-/// its routine-code total once they are created: the reference's
-/// `calculateCodesToCreate`, unchanged. One code per `interval_ms` of account
-/// age (only the age after `epoch_ms` when the account predates it), minus
-/// the codes it created since the epoch, and at most 5 unused routine codes
-/// at a time. Admin-gifted codes don't count. May be <= 0 (nothing to create).
+/// The reference's `calculateCodesToCreate`: (codes earned and not yet
+/// given, possibly <= 0; the routine-code total once they are created).
+/// Admin-gifted codes don't count.
 pub(super) fn codes_to_create(
     now_ms: i64,
     created_at_ms: i64,
@@ -3011,34 +2325,22 @@ pub(super) fn codes_to_create(
 ) -> (i64, i64) {
     let interval_ms = interval_ms.max(1);
     let routine: Vec<_> = codes.iter().filter(|c| c.created_by != "admin").collect();
-    let unused = routine
-        .iter()
-        .filter(|c| !c.disabled && c.available > c.uses.len() as i64)
-        .count() as i64;
+    let unused = routine.iter().filter(|c| !c.disabled && c.available > c.uses.len() as i64).count() as i64;
     let lifespan = now_ms - created_at_ms;
     let could_create = if created_at_ms >= epoch_ms {
         lifespan.div_euclid(interval_ms)
     } else {
         lifespan.div_euclid(interval_ms) - (epoch_ms - created_at_ms).div_euclid(interval_ms)
     };
-    let epoch_codes = routine
-        .iter()
-        .filter(|c| rfc3339_ms(&c.created_at).is_some_and(|t| t > epoch_ms))
-        .count() as i64;
+    let epoch_codes = routine.iter().filter(|c| rfc3339_ms(&c.created_at).is_some_and(|t| t > epoch_ms)).count() as i64;
     let to_create = (5 - unused).min(could_create - epoch_codes);
     (to_create, routine.len() as i64 + to_create)
 }
 
-/// With `--invite-interval` (and invites required), creates the codes
-/// `did` has earned ([`codes_to_create`]), disabled if the account's invites
-/// are; returns all its codes. Serialized per account on this node; a
-/// concurrent creation elsewhere is caught afterwards, as the reference does
-/// (`DuplicateCreate`).
-async fn create_earned_invites(
-    app: &App,
-    acct: &Account,
-    codes: Vec<super::admin::InviteCode>,
-) -> XResult<Vec<super::admin::InviteCode>> {
+/// With `--invite-interval` (and invites required), creates the codes the
+/// account has earned; returns all its codes. A concurrent creation on
+/// another node is caught afterwards (`DuplicateCreate`), as the reference.
+async fn create_earned_invites(app: &App, acct: &Account, codes: Vec<super::admin::InviteCode>) -> XResult<Vec<super::admin::InviteCode>> {
     let Some(interval) = app.config.invite_interval.filter(|_| app.config.invite_required) else {
         return Ok(codes);
     };
@@ -3058,24 +2360,14 @@ async fn create_earned_invites(
     super::admin::create_invites_by(app, did, &new, 1, disabled, did).await?;
     let after = super::admin::account_invites(app, did).await?;
     if after.iter().filter(|c| c.created_by != "admin").count() as i64 > total {
-        return Err(XrpcError::bad(
-            "DuplicateCreate",
-            "attempted to create additional codes in another request",
-        ));
+        return Err(XrpcError::bad("DuplicateCreate", "attempted to create additional codes in another request"));
     }
     Ok(after)
 }
 
-async fn get_account_invite_codes(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Query(q): Query<AccountInviteCodesQ>,
-) -> XResult<Json<J>> {
+async fn get_account_invite_codes(State(app): AppState, Auth(creds): Auth, Query(q): Query<AccountInviteCodesQ>) -> XResult<Json<J>> {
     let did = full_access(&creds)?;
-    let acct = app
-        .account(&did)
-        .await
-        .map_err(|_| XrpcError::bad("NotFound", "Account not found"))?;
+    let acct = app.account(&did).await.map_err(|_| XrpcError::bad("NotFound", "Account not found"))?;
     if is_takendown_account(&acct) {
         return Err(takedown_error());
     }
@@ -3092,11 +2384,7 @@ async fn get_account_invite_codes(
     Ok(Json(json!({"codes": codes})))
 }
 
-// ---------------------------------------------------------------------------
-// getServiceAuth
-// ---------------------------------------------------------------------------
-
-/// Methods that must be called directly, never via service auth (reference PROTECTED_METHODS).
+/// Never via service auth (the reference's PROTECTED_METHODS).
 const PROTECTED_METHODS: &[&str] = &[
     "com.atproto.admin.sendEmail",
     "com.atproto.identity.requestPlcOperationSignature",
@@ -3116,9 +2404,7 @@ const PROTECTED_METHODS: &[&str] = &[
     "com.atproto.server.updateEmail",
 ];
 
-/// Methods that need a privileged credential (reference PRIVILEGED_METHODS:
-/// chat.bsky.* and createAccount).
-/// (Matched case-insensitively, like the reference's LxmSet.)
+/// The reference's PRIVILEGED_METHODS, case-insensitive like its LxmSet.
 fn privileged_method(lxm: &str) -> bool {
     let l = lxm.to_ascii_lowercase();
     l.starts_with("chat.bsky.") || l == "com.atproto.server.createaccount"
@@ -3135,11 +2421,7 @@ struct ServiceAuthQ {
     lxm: Option<String>,
 }
 
-async fn get_service_auth(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Query(q): Query<ServiceAuthQ>,
-) -> XResult<Json<J>> {
+async fn get_service_auth(State(app): AppState, Auth(creds): Auth, Query(q): Query<ServiceAuthQ>) -> XResult<Json<J>> {
     let did = user_did(&creds)?;
     let lxm = q.lxm.as_deref().filter(|l| !l.is_empty());
     let (aud_did, fragment) = match q.aud.split_once('#') {
@@ -3147,15 +2429,11 @@ async fn get_service_auth(
         None => (q.aud.as_str(), None),
     };
     if !is_atproto_did(aud_did) || fragment.is_some_and(|f| f.is_empty()) {
-        return Err(invalid_request(
-            "aud must be a valid atproto DID or did#serviceId reference",
-        ));
+        return Err(invalid_request("aud must be a valid atproto DID or did#serviceId reference"));
     }
     match &creds {
         Credentials::OAuth { .. } => creds.need_rpc(lxm.unwrap_or("*"), &q.aud)?,
-        Credentials::AppPassword {
-            privileged: false, ..
-        } => {
+        Credentials::AppPassword { privileged: false, .. } => {
             if let Some(l) = lxm.filter(|l| privileged_method(l)) {
                 return Err(invalid_request(format!("insufficient access to request a service auth token for the following method: {l}")));
             }
@@ -3173,10 +2451,7 @@ async fn get_service_auth(
             if diff < 0 {
                 return Err(XrpcError::bad("BadExpiration", "expiration is in past"));
             } else if diff > 3600 {
-                return Err(XrpcError::bad(
-                    "BadExpiration",
-                    "cannot request a token with an expiration more than an hour in the future",
-                ));
+                return Err(XrpcError::bad("BadExpiration", "cannot request a token with an expiration more than an hour in the future"));
             } else if lxm.is_none() && diff > 60 {
                 return Err(XrpcError::bad("BadExpiration", "cannot request a method-less token with an expiration more than a minute in the future"));
             }
@@ -3185,17 +2460,14 @@ async fn get_service_auth(
         None => 60,
     };
     if let Some(l) = lxm.filter(|l| protected_method(l)) {
-        return Err(invalid_request(format!(
-            "cannot request a service auth token for the following protected method: {l}"
-        )));
+        return Err(invalid_request(format!("cannot request a service auth token for the following protected method: {l}")));
     }
     let key = app.secrets.account_signing_key(&acct).await?;
     let token = crate::auth::service_auth_jwt(&key, &did, &q.aud, lxm, ttl)?;
     Ok(Json(json!({"token": token})))
 }
 
-/// did:plc (24 base32 chars) or did:web without a path; a port only for
-/// localhost (reference @atproto/did isAtprotoDid).
+/// The reference's @atproto/did isAtprotoDid.
 pub(super) fn is_atproto_did(s: &str) -> bool {
     if let Some(id) = s.strip_prefix("did:plc:") {
         return id.len() == 24 && id.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'));
@@ -3207,10 +2479,6 @@ pub(super) fn is_atproto_did(s: &str) -> bool {
     }
     false
 }
-
-// ---------------------------------------------------------------------------
-// temp.*
-// ---------------------------------------------------------------------------
 
 async fn check_signup_queue(Auth(creds): Auth) -> XResult<Json<J>> {
     standard_no_oauth(&creds)?;
@@ -3230,16 +2498,10 @@ async fn handle_available(app: &App, handle: &str) -> XResult<bool> {
     Ok(app.resolve_handle(handle).await?.is_none())
 }
 
-async fn check_handle_availability(
-    State(app): AppState,
-    Query(q): Query<HandleAvailabilityQ>,
-) -> XResult<Json<J>> {
+async fn check_handle_availability(State(app): AppState, Query(q): Query<HandleAvailabilityQ>) -> XResult<Json<J>> {
     if let Some(e) = q.email.as_deref().filter(|e| !e.is_empty()) {
         if !valid_email(&e.to_ascii_lowercase()) {
-            return Err(XrpcError::bad(
-                "InvalidEmail",
-                "An invalid email was provided.",
-            ));
+            return Err(XrpcError::bad("InvalidEmail", "An invalid email was provided."));
         }
     }
     let handle = normalize_handle(&q.handle)?;
@@ -3249,30 +2511,16 @@ async fn check_handle_availability(
             "result": {"$type": "com.atproto.temp.checkHandleAvailability#resultAvailable"},
         })));
     }
-    // suggestions: the first label plus random digits, under our domain
     let suffix = format!(".{}", app.handle_domain);
-    let base: String = handle
-        .split('.')
-        .next()
-        .unwrap_or("user")
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(14)
-        .collect();
-    let base = if base.len() < 3 {
-        format!("{base}user")
-    } else {
-        base
-    };
+    let base: String = handle.split('.').next().unwrap_or("user").chars().filter(|c| c.is_ascii_alphanumeric()).take(14).collect();
+    let base = if base.len() < 3 { format!("{base}user") } else { base };
     let mut suggestions = Vec::new();
     for _ in 0..12 {
         if suggestions.len() >= 3 {
             break;
         }
         let cand = format!("{base}{}{suffix}", rand::random::<u16>() % 10_000);
-        if handle_available(&app, &cand).await?
-            && !suggestions.iter().any(|s: &J| s["handle"] == cand)
-        {
+        if handle_available(&app, &cand).await? && !suggestions.iter().any(|s: &J| s["handle"] == cand) {
             suggestions.push(json!({"handle": cand, "method": "random_digits"}));
         }
     }
@@ -3280,14 +2528,6 @@ async fn check_handle_availability(
         "handle": handle,
         "result": {"$type": "com.atproto.temp.checkHandleAvailability#resultUnavailable", "suggestions": suggestions},
     })))
-}
-
-// ---------------------------------------------------------------------------
-// TOTP (vlpds.server.*Totp)
-// ---------------------------------------------------------------------------
-
-fn session_only(creds: &Credentials) -> XResult<String> {
-    full_access(creds)
 }
 
 async fn set_totp_flag(app: &App, did: &str, enabled: bool) -> XResult<()> {
@@ -3300,34 +2540,24 @@ async fn set_totp_flag(app: &App, did: &str, enabled: bool) -> XResult<()> {
 }
 
 async fn setup_totp(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
-    let did = session_only(&creds)?;
+    let did = full_access(&creds)?;
     let acct = app.account(&did).await?;
     let _g = crate::totp::lock(&did).await;
     let secret = crate::totp::base32_encode(&crate::totp::generate_secret());
-    let mut saved = false;
-    for _ in 0..crate::totp::CAS_ROUNDS {
-        let (mut st, raw) = crate::totp::load_raw(&app, &did).await?;
-        if st.enabled() {
-            return Err(invalid_request("TOTP is already enabled; disable it first"));
+    'cas: {
+        for _ in 0..crate::totp::CAS_ROUNDS {
+            let (mut st, raw) = crate::totp::load_raw(&app, &did).await?;
+            if st.enabled() {
+                return Err(invalid_request("TOTP is already enabled; disable it first"));
+            }
+            st.pending = Some(secret.clone());
+            if crate::totp::save_if(&app, &did, &st, raw).await? {
+                break 'cas;
+            }
         }
-        st.pending = Some(secret.clone());
-        if crate::totp::save_if(&app, &did, &st, raw).await? {
-            saved = true;
-            break;
-        }
-    }
-    if !saved {
         return Err(crate::totp::conflict());
     }
-    let issuer = app
-        .public_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(&app.public_url)
-        .split(['/', ':'])
-        .next()
-        .unwrap_or("vlpds")
-        .to_string();
+    let issuer = app.public_url.split("://").nth(1).unwrap_or(&app.public_url).split(['/', ':']).next().unwrap_or("vlpds").to_string();
     let uri = crate::totp::otpauth_uri(&secret, &issuer, &acct.handle);
     Ok(Json(json!({"secret": secret, "uri": uri})))
 }
@@ -3337,12 +2567,8 @@ struct ConfirmTotpIn {
     code: String,
 }
 
-async fn confirm_totp(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<ConfirmTotpIn>,
-) -> XResult<Json<J>> {
-    let did = session_only(&creds)?;
+async fn confirm_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<ConfirmTotpIn>) -> XResult<Json<J>> {
+    let did = full_access(&creds)?;
     let codes = 'cas: {
         let _g = crate::totp::lock(&did).await;
         for _ in 0..crate::totp::CAS_ROUNDS {
@@ -3350,21 +2576,16 @@ async fn confirm_totp(
             if st.enabled() {
                 return Err(invalid_request("TOTP is already enabled"));
             }
-            let pending = st.pending.clone().ok_or_else(|| {
-                invalid_request("No pending TOTP setup; call vlpds.server.setupTotp first")
-            })?;
-            let secret = crate::totp::base32_decode(&pending)
-                .ok_or_else(|| XrpcError::internal("corrupt pending TOTP secret"))?;
+            let pending =
+                st.pending.clone().ok_or_else(|| invalid_request("No pending TOTP setup; call vlpds.server.setupTotp first"))?;
+            let secret = crate::totp::base32_decode(&pending).ok_or_else(|| XrpcError::internal("corrupt pending TOTP secret"))?;
             let step = crate::totp::verify_code(&secret, &inp.code, crate::totp::now_secs(), 0)
                 .ok_or_else(|| invalid_token("Token is invalid"))?;
             let codes = crate::totp::generate_recovery_codes();
             st.secret = Some(pending);
             st.pending = None;
             st.last_step = step;
-            st.recovery = codes
-                .iter()
-                .map(|c| crate::totp::hash_recovery_code(&secret, c))
-                .collect();
+            st.recovery = codes.iter().map(|c| crate::totp::hash_recovery_code(&secret, c)).collect();
             st.enabled_at = Some(crate::events::now_rfc3339());
             // flag first: a crash between the two writes must not leave TOTP
             // enabled with the login fast path (totpEnabled=false) skipping it
@@ -3386,12 +2607,8 @@ struct DisableTotpIn {
     password: String,
 }
 
-async fn disable_totp(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Json(inp): Json<DisableTotpIn>,
-) -> XResult<StatusCode> {
-    let did = session_only(&creds)?;
+async fn disable_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<DisableTotpIn>) -> XResult<StatusCode> {
+    let did = full_access(&creds)?;
     let acct = app.account(&did).await?;
     if !verify_password(&acct, &inp.password).await? {
         return Err(auth_required("Invalid password"));
@@ -3426,19 +2643,15 @@ async fn disable_totp(
 async fn get_totp_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let did = standard_no_oauth(&creds)?;
     let st = crate::totp::load(&app, &did).await?;
-    let mut out = json!({
-        "enabled": st.enabled(),
-        "pending": st.pending.is_some(),
-        "recoveryCodesRemaining": st.recovery.len(),
-    });
+    let mut out = json!({"enabled": st.enabled(), "pending": st.pending.is_some(), "recoveryCodesRemaining": st.recovery.len()});
     if let Some(at) = &st.enabled_at {
         out["enabledAt"] = json!(at);
     }
     Ok(Json(out))
 }
 
-/// This module's private rows with fixed values (golden fixtures,
-/// `super::private_rows`); the `json!` rows repeat their writers' shapes.
+/// Golden fixtures (`super::private_rows`); the `json!` rows repeat their
+/// writers' shapes.
 pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
     use super::private_rows::enc;
     let fam = "0006439b2a1c0000aabbccddeeff0011";
@@ -3462,10 +2675,7 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
         r("etok/update_email".into(), enc(&et)),
         r(format!("{REVOKED_ALL}{before:016x}"), enc(&json!({"before": before, "exp": 1_790_007_200u64}))),
         r(format!("{REVOKED_FAMILY}{fam}"), enc(&json!({"exp": 1_790_007_200u64}))),
-        // AUTH_EPOCH (a JSON string, check_row) came after L1 was released:
-        // its fixture belongs to the next level (L1's rows.json is frozen;
-        // the epoch fields of the OAuth rows are omitted when empty, so
-        // their L1 bytes are unchanged)
+        // no AUTH_EPOCH row: it postdates L1, whose rows.json is frozen
         r(
             format!("{TAKEDOWN}rec/app.bsky.feed.post/3l3qo2vutsw2b"),
             enc(&json!({"uri": format!("at://{did}/app.bsky.feed.post/3l3qo2vutsw2b"), "did": did, "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm", "ref": "mod-1"})),
@@ -3477,8 +2687,7 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
     ]
 }
 
-/// Decodes one of this module's private rows as its readers do (None: not
-/// one of them).
+/// None: not one of this module's rows.
 pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow::Result<&'static str>> {
     use super::private_rows::{json_row, typed_row, utf8_row};
     if routing.starts_with("_reset:") && name == "t" {
