@@ -487,7 +487,7 @@ load it should stay flat (a rising rate means pool churn).
 | public | PLC, requestCrawl, Cloud KMS (5 s per call) | h2 by ALPN on https, HTTP/1.1 on http with 1,024 idle per host; idle close 60 s; h2 PING 20 s / 10 s; TCP keepalive; connect 5 s, read 30 s |
 | proxy | configured AppView / report service | `http://`: hyper HTTP/1.1 connections, one pool per host with a slot per IO thread: a connection goes back to the slot of the thread that finished its body, a request takes from its own slot, else from another slot, else connects; at most 1,024 connections per host (idle + busy; past that a request waits for one, `vlpds_http_client_pool_waits_total`); idle close 60 s, retry once if a reused connection was closed before the request went out; `https://`: public's settings as one client per IO thread. No read timeout: the proxy arms a 10 s head deadline and a 30 s body-idle timer only while the upstream makes it wait. Responses up to 128 KiB (by Content-Length) are read whole before the client gets them (the connection goes back at once); larger ones stream through unbuffered under the write-stall deadline (below); compressed ones as the upstream encoded them (Content-Encoding/-Length kept, never decoded or re-compressed; the client's Accept-Encoding is forwarded, for the read-after-write methods only its decodable codings: §8); a client that goes away mid-body closes the upstream connection. Request bodies go upstream as the client encoded them (the server's request decompression covers local routes only), and an h1 connection whose upload is still going when its response ends is not pooled. At most 64 proxied requests per account in flight on its owner (until each body is done); more are 429 `RateLimitExceeded`. CORS preflights are answered locally (no auth, no upstream) |
 | guarded | user-derived URLs: did:web, handle `.well-known`, OAuth client metadata, lexicons, DID-doc service endpoints | public's settings, 32 idle per host, plus a resolver that drops non-public addresses (outside dev mode); pair with `check_outbound_url` |
-| S3 (object_store) | log and state stores (separate pools) | HTTP/1.1 only, 256 idle per host, idle close 15 s (S3 closes at ~20 s), connect 2 s, 30 s total |
+| S3 (object_store) | log, state and control-plane stores (three clients, separate pools) | HTTP/1.1 only; requests in flight bounded per client (`src/objlimit.rs`, below) and as many connections kept idle, so they are reused, never churned; idle close 15 s (S3 closes at ~20 s), connect 2 s, 30 s total |
 
 Why: an HTTP/1.1 peer pool smaller than the forwarding concurrency opened a
 connection per request and collapsed a 3-node cluster at 50k/s; one h2
@@ -505,6 +505,49 @@ purely per-thread pools (+ a shared overflow) drifted to 1.45-3x the
 concurrency in connections as tasks hopped threads (laptop A/B, 6 IO
 threads: 369-398 connections at 256 in flight, 185-202 at 64; now exactly
 256 and 64-65), at the same ~39-40 µs CPU per proxied request.
+
+**Object-store clients: bounded in flight (`src/objlimit.rs`).** An HTTP
+client opens a connection whenever every pooled one is busy and keeps only
+its idle cap afterwards; the rest close into TIME_WAIT. Unbounded, a
+takeover at 12k writes/s (shard opens, replay, then a cold repo load for
+every write to the moved shards) took two survivors from ~30-55 S3 sockets
+to 21,500 + 8,255 in 10 s, the host's whole ephemeral port range; every new
+connection then failed (`transport error of kind Connect`), the lease
+renewals with them, both survivors fail-stopped, and the restarted victim
+ended up with all 64 shards (bench/results/benchbox-2026-10-02-head,
+"Failover"). Now every request takes a permit of its client first (a
+semaphore; uncontended one atomic op, so steady state never waits) and the
+pool keeps as many connections idle as there are permits: a client never
+holds more connections than permits, and a burst queues instead of
+connecting.
+
+| Client | Carries | Permits (main lane) | Reserved lane |
+|---|---|---|---|
+| `log` | segment PUTs and hedges, fences, replay, firehose backfill, peer followers, retention | `--log-store-inflight` (256) | writes (PUT / multipart / copy): max(64, 4 x `--log-inflight`), so replay and backfill reads never delay a commit |
+| `state` | SlateDB (opens, reads, flushes, compaction, GC), blobs, account indexes | `--store-inflight` (1,024) | none |
+| `ctl` | the control plane (`Cluster`: leases, assignments, writer claims, fence scans) | 64 (a step fans out to at most 32 calls) | node-lease PUTs (renewals): 8 |
+
+The control plane has its own client so a data-plane storm can neither take
+its connections nor its permits, and keeps a warm connection (renewals every
+TTL / 5, idle close 15 s) where a new one might not be had. A permit is
+held for the whole request (the client's retries and backoff included) and
+for a GET until its body is read or dropped, since the connection is busy
+until then; except blob GETs (their bodies stream to HTTP clients at the
+client's pace: released at the response head) and LIST / bulk-DELETE
+streams (released at their first response: a caller may issue requests
+while it walks a listing, which could otherwise deadlock a saturated
+client). Steady state at 20k writes/s was under 100 S3 sockets per node
+(xh3g), so the defaults are headroom, not a throttle; at most ~1.4k
+connections per node. Resends of not-applied writes already back off
+(doubling to 1 s, "Forwarding deadlines") and a repo has at most one cold
+load in flight, so the bound needs nothing else. Metrics:
+`vlpds_object_store_inflight{client,lane}`, `_inflight_limit`,
+`_permit_waits_total` and `_permit_wait_seconds`; `vlpds_object_store_*`
+request counters gained `client="ctl"`. Tested by
+`tests/all/objstore_pressure.rs`: 400 cold writes right after a takeover
+against a store with 15 ms latency and a 160-request "port budget": state
+requests in flight peak at the bound (8 per node in the test) and nothing
+is refused; unbounded, they peaked at 165 and 994 requests were refused.
 
 **Exposure.** One listener serves the public XRPC/OAuth surface and the
 node-to-node `/internal/*` routes (and forwarded requests); peers call each
@@ -1739,7 +1782,9 @@ recipient, or a peer that left).
   SlateDB local disk cache (cache-on-flush/compaction). 20k cold loads/s at
   p99 < 1 ms on 5-record repos.
 - **Separate HTTP pools** for the commit log and state reads, so a read storm
-  never queues in front of commit PUTs.
+  never queues in front of commit PUTs (and, since the cross-host failover
+  runs, a third for the control plane, with requests in flight bounded per
+  pool: §7).
 - **HTTP/2** (h2c) with large flow-control windows (4 MiB stream / 64 MiB
   connection); default 64 KiB windows split request bodies into tiny DATA
   frames and trip h2's flood guard.

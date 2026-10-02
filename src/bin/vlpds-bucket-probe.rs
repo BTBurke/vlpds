@@ -668,7 +668,7 @@ async fn run(args: Args) -> anyhow::Result<bool> {
         None => format!("vlpds-probe/{:032x}", rand::random::<u128>()),
     };
     anyhow::ensure!(!root.is_empty(), "--prefix must not be the bucket root");
-    let store = Store::s3(&cfg, &root, None)?;
+    let store = Store::s3(&cfg, &root, None, 256)?;
     let probe = Probe { store: store.raw.clone(), root: root.clone() };
     let json_stdout = args.json.as_deref() == Some("-");
     let progress = !json_stdout;

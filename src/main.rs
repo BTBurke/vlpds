@@ -141,6 +141,16 @@ struct Args {
     /// Segment PUTs in flight per node log (finalized in ordinal order).
     #[arg(long, env = "VLPDS_LOG_INFLIGHT", default_value_t = vlpds::nodelog::DEFAULT_LOG_INFLIGHT)]
     log_inflight: usize,
+    /// Object-store requests in flight on the state client (SlateDB, blobs,
+    /// account indexes); more queue for a permit. The pool keeps as many
+    /// connections idle, so they are reused, never churned.
+    #[arg(long, env = "VLPDS_STORE_INFLIGHT", default_value_t = vlpds::objlimit::DEFAULT_STATE_INFLIGHT)]
+    store_inflight: usize,
+    /// Object-store reads in flight on the log client (replay, firehose
+    /// backfill, peer followers, retention). Segment PUTs have their own
+    /// permits: max(64, 4 x --log-inflight).
+    #[arg(long, env = "VLPDS_LOG_STORE_INFLIGHT", default_value_t = vlpds::objlimit::DEFAULT_LOG_INFLIGHT)]
+    log_store_inflight: usize,
     /// Byte budget of the node log's live ring of sealed segments (MiB); a
     /// peer follower that falls behind it catches up from S3.
     #[arg(long, env = "VLPDS_LIVE_RING_MB", default_value_t = 128.0)]
@@ -915,6 +925,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         }),
         prefix: args.prefix.clone(),
         inject_latency: args.inject_put_ms.map(|m| (m, args.inject_sigma)),
+        store_inflight: args.store_inflight.max(1),
+        log_store_inflight: args.log_store_inflight.max(1),
         shards: args.shards,
         workers: args.workers.unwrap_or_else(default_workers).max(1),
         cache_per_worker: args.cache_per_worker,

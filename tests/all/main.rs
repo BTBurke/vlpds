@@ -76,6 +76,7 @@ mod migration;
 mod moderation;
 mod mst_lazy;
 mod oauth;
+mod objstore_pressure;
 mod ops_metrics;
 mod oauth_replay_durable;
 mod plc;

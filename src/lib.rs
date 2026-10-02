@@ -27,6 +27,7 @@ pub mod mst_store;
 pub mod node;
 pub mod nodelog;
 pub mod oauth;
+pub mod objlimit;
 pub mod objstats;
 pub mod partition;
 pub mod partitions;

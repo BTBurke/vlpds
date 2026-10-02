@@ -7,8 +7,8 @@
 //! Exported as `vlpds_object_store_requests_total{op,component,client,result}`
 //! and `vlpds_object_store_bytes_total{dir,component,client}` (dir = up |
 //! down). `client` is the connection pool (`log`: segment PUTs, fences,
-//! retention, replay and firehose reads; `state`: SlateDB, control plane,
-//! blobs). `result` is `ok`, `not_found`, `precondition` (If-Match /
+//! retention, replay and firehose reads; `state`: SlateDB, blobs, account
+//! indexes; `ctl`: the control plane, see `objlimit`). `result` is `ok`, `not_found`, `precondition` (If-Match /
 //! If-None-Match failed), `timeout`, `error`, or `cancelled` (the caller
 //! dropped the request unanswered: a control-plane deadline, a lost hedge);
 //! a request is counted when it is answered (or dropped).
@@ -23,7 +23,8 @@
 //! per 1,000 objects of a stream), `copy`, `mpu_create`, `mpu_part`,
 //! `mpu_complete`, `mpu_abort`.
 //!
-//! `VLPDS_INJECT_STATE_MS` / `VLPDS_INJECT_LOG_MS` (bench only) add S3-like
+//! `VLPDS_INJECT_STATE_MS` / `VLPDS_INJECT_LOG_MS` / `VLPDS_INJECT_CTL_MS`
+//! (bench only; the control plane had the state client's before) add S3-like
 //! latency per request of that client; see `Latency`.
 
 use async_trait::async_trait;

@@ -612,6 +612,21 @@ groups:
           summary: "{{ $labels.instance }}: {{ $value | humanize }} failed object-store requests/s on {{ $labels.component }}"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorerequesterrors"
 
+      # Object-store requests queued for an in-flight permit of their client
+      # (objlimit.rs: log / state / ctl, lane main / reserved). A takeover's
+      # burst queues briefly by design; sustained queueing is a pool too
+      # small for the load or a store slowing down (every permit held
+      # longer). Waits on ctl's reserved lane are lease renewals queueing
+      # behind each other (guess: 1/s for 10 minutes).
+      - alert: VlpdsObjectStorePermitsSaturated
+        expr: sum by (instance, client, lane) (rate(vlpds_object_store_permit_waits_total{job="vlpds"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | humanize }} object-store requests/s queue for a {{ $labels.client }} permit ({{ $labels.lane }} lane)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorepermitssaturated"
+
       # Control-plane requests (leases, assignments, writer claims) are small
       # GET/PUT/LISTs: ~10-50 ms. p99 over 1 s is a quarter of the renewal
       # ceiling at the default TTL and slows every takeover step (guess).

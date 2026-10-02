@@ -37,7 +37,11 @@ impl std::fmt::Debug for S3Config {
 }
 
 impl Store {
-    pub fn s3(cfg: &S3Config, prefix: &str, latency: Option<(f64, f64)>) -> anyhow::Result<Store> {
+    /// An S3 client (its own connection pool) keeping up to `connections`
+    /// idle: the in-flight bound [`limited`](Self::limited) puts on it, so
+    /// connections are reused rather than closed and reopened (each close
+    /// leaves a TIME_WAIT socket on an ephemeral port; see `objlimit`).
+    pub fn s3(cfg: &S3Config, prefix: &str, latency: Option<(f64, f64)>, connections: usize) -> anyhow::Result<Store> {
         let s3 = AmazonS3Builder::new()
             .with_endpoint(&cfg.endpoint)
             .with_bucket_name(&cfg.bucket)
@@ -54,7 +58,7 @@ impl Store {
                 // busy pool doesn't need it and an idle one is closed at 15 s.
                 object_store::ClientOptions::new()
                     .with_http1_only()
-                    .with_pool_max_idle_per_host(256)
+                    .with_pool_max_idle_per_host(connections.max(1))
                     .with_pool_idle_timeout(Duration::from_secs(15))
                     .with_connect_timeout(Duration::from_secs(2))
                     .with_timeout(Duration::from_secs(30))
@@ -81,6 +85,13 @@ impl Store {
     /// underlying client once.
     pub fn counted(self, client: &'static str) -> Store {
         Store { raw: crate::objstats::counted(self.raw, &self.prefix, client), ..self }
+    }
+
+    /// Bounds this handle's requests in flight (`objlimit`) under
+    /// `client`. Wrap each underlying client once, after `counted` (so the
+    /// request metrics time the wire, not the wait for a permit).
+    pub fn limited(self, client: &'static str, limits: crate::objlimit::Limits) -> Store {
+        Store { raw: crate::objlimit::limited(self.raw, &self.prefix, client, limits), ..self }
     }
 
     pub async fn inject_latency(&self) {

@@ -596,6 +596,11 @@ lapse it. `kind="conflict"` (someone rewrote our lease) and `kind="lapsed"`
 
 **Confirm:** `node lease renew error (will retry)` warnings with the error text;
 [VlpdsObjectStoreRequestErrors](#vlpdsobjectstorerequesterrors) for `ctl_lease`.
+`transport error of kind Connect` on every client at once is the host out of
+ephemeral ports (`ss -s`: thousands in TIME_WAIT). vlpds' object-store clients
+bound their connections (see
+[VlpdsObjectStorePermitsSaturated](#vlpdsobjectstorepermitssaturated)), so
+look for another process on the host churning connections.
 
 **Do:** credentials, throttling, network, provider status.
 
@@ -859,6 +864,41 @@ and follower catch-up), `retention_report`, `account_index`, `blob`.
 the matching warn/error log lines.
 
 **Do:** credentials, permissions, throttling (S3 503 SlowDown), provider status.
+
+### VlpdsObjectStorePermitsSaturated
+
+**Means:** for 10 minutes, over 1/s of this node's object-store requests found
+every in-flight permit of their client taken and queued
+(`vlpds_object_store_permit_waits_total{client,lane}`). Each client (`log`,
+`state`, `ctl`) bounds its requests in flight and keeps as many connections
+pooled (DESIGN.md §7, "Object-store clients"), so a burst (a takeover's shard
+opens, replay and cold loads) queues instead of opening a connection per
+request: unbounded, that once took a host's every ephemeral port, failed the
+lease renewals and fail-stopped the survivors of a kill -9. Brief waits
+during a takeover are by design; sustained ones mean the pool is too small for
+the load, or the store got slower (permits are held longer).
+
+**Confirm:** `vlpds_object_store_inflight` against
+`vlpds_object_store_inflight_limit` by `client` and `lane` (pinned at the
+limit = saturated); `vlpds_object_store_permit_wait_seconds` p99; whether
+`vlpds_object_store_request_seconds` rose at the same time
+([VlpdsObjectStoreLatencyHigh](#vlpdsobjectstorelatencyhigh): the store is
+slow, and more permits won't help). On the host, `ss -tn dst <store addr> | wc -l`
+for the store connections and `ss -s` for TIME_WAIT: with the bound,
+connections stay at or under the permits and TIME_WAIT stays flat.
+
+**Do:**
+- `state` main lane at its limit while the store is healthy: raise
+  `--store-inflight` (default 1,024); `log` main lane: `--log-store-inflight`
+  (default 256). A node holds at most about the sum of its permits in
+  connections, so keep (nodes per host x permits) well under the ephemeral
+  port range (`net.ipv4.ip_local_port_range`, 28k ports by default).
+- `log` reserved lane (segment PUTs): it is max(64, 4 x `--log-inflight`);
+  waits there mean PUTs are slow, see
+  [VlpdsSegmentPutLatencyHigh](#vlpdssegmentputlatencyhigh).
+- `ctl` reserved lane (lease renewals, 8 permits): renewals stuck behind each
+  other mean the store is not answering lease PUTs; treat as
+  [VlpdsLeaseRenewalSlow](#vlpdsleaserenewalslow).
 
 ### VlpdsControlPlaneLatencyHigh
 

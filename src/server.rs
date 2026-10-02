@@ -27,6 +27,13 @@ pub struct Config {
     pub prefix: String,
     /// (median ms, lognormal sigma) injected on segment PUTs.
     pub inject_latency: Option<(f64, f64)>,
+    /// Object-store requests in flight on the state client (SlateDB, blobs,
+    /// account indexes; `--store-inflight`). See `objlimit`.
+    pub store_inflight: usize,
+    /// ... on the log client's reads (replay, backfill, followers,
+    /// retention; `--log-store-inflight`); its segment PUTs have their own
+    /// lane (`objlimit::log_write_permits`).
+    pub log_store_inflight: usize,
     /// Shards (slot ranges) in the keyspace; fixed per bucket prefix.
     pub shards: u32,
     pub workers: usize,
@@ -272,6 +279,8 @@ impl Default for Config {
             s3: None,
             prefix: "vlpds".into(),
             inject_latency: None,
+            store_inflight: crate::objlimit::DEFAULT_STATE_INFLIGHT,
+            log_store_inflight: crate::objlimit::DEFAULT_LOG_INFLIGHT,
             shards: 8,
             workers: 2,
             cache_per_worker: 10_000,
@@ -359,17 +368,31 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         full_mb = caps.total_bytes() >> 20,
         "cache caps: {caps}"
     );
-    // Separate clients (connection pools) for the commit log and everything else.
-    let (store, state_store) = match &cfg.s3 {
+    // Separate clients (connection pools) for the commit log, the control
+    // plane, and everything else, each with bounded requests in flight
+    // (objlimit.rs): a takeover's burst queues for permits instead of
+    // opening a connection per request (it once took the host's every
+    // ephemeral port, and the lease renewals failed with the rest).
+    use crate::objlimit::{Limits, Reserve};
+    let log_limits = Limits::new(cfg.log_store_inflight).with_reserved(Reserve::Writes, crate::objlimit::log_write_permits(cfg.log_inflight));
+    let state_limits = Limits::new(cfg.store_inflight);
+    let ctl_limits = Limits::new(crate::objlimit::CTL_PERMITS).with_reserved(Reserve::LeaseWrites, crate::objlimit::LEASE_PERMITS);
+    let (store, state_store, ctl_store) = match &cfg.s3 {
         None => {
             let m = match &cfg.memory_store {
                 Some(raw) => Store { raw: raw.clone(), ..Store::memory(cfg.inject_latency) },
                 None => Store::memory(cfg.inject_latency),
             };
-            (m.clone().counted("log"), Store { latency: None, ..m }.counted("state"))
+            let plain = Store { latency: None, ..m.clone() };
+            (m.counted("log"), plain.clone().counted("state"), plain.counted("ctl"))
         }
-        Some(s3) => (Store::s3(s3, &cfg.prefix, cfg.inject_latency)?.counted("log"), Store::s3(s3, &cfg.prefix, None)?.counted("state")),
+        Some(s3) => (
+            Store::s3(s3, &cfg.prefix, cfg.inject_latency, log_limits.connections())?.counted("log"),
+            Store::s3(s3, &cfg.prefix, None, state_limits.connections())?.counted("state"),
+            Store::s3(s3, &cfg.prefix, None, ctl_limits.connections())?.counted("ctl"),
+        ),
     };
+    let (store, state_store, ctl_store) = (store.limited("log", log_limits), state_store.limited("state", state_limits), ctl_store.limited("ctl", ctl_limits));
     let firehose = Firehose::new(crate::firehose::Options {
         ring_bytes: cfg.firehose_ring_bytes,
         max_lag_bytes: cfg.firehose_max_lag_bytes,
@@ -397,7 +420,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     cc.shards = n;
     crate::version::init_metrics();
     let started = std::time::Instant::now();
-    let cluster = Cluster::join(cc, state_store.clone()).await?;
+    let cluster = Cluster::join(cc, ctl_store).await?;
     // route by this prefix's layout (it may differ from --shards: splits,
     // merges, or a different count at creation)
     table.replace_layout(cluster.layout());
