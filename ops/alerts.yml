@@ -684,6 +684,58 @@ groups:
           summary: "{{ $value }} dead node log(s) have gone unfenced for 30+ minutes"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsdeadlogunfenced"
 
+      # Retired split/merge state (src/reshard_gc.rs). The dir half runs on
+      # the owner of slot 0's shard only, every 60 s.
+      - alert: VlpdsReshardGcFailing
+        expr: >-
+          sum(increase(vlpds_reshard_gc_passes_total{job="vlpds",result="error"}[1h]))
+            > 0.5 * sum(increase(vlpds_reshard_gc_passes_total{job="vlpds"}[1h]))
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Most retired-state GC passes failed in the last hour (retired shard state grows)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsreshardgcfailing"
+
+      # A retired dir that some manifest lists although it holds no
+      # checkpoint: SlateDB's clone invariant is broken. The GC keeps it.
+      - alert: VlpdsRetiredStateReferenced
+        expr: max(vlpds_reshard_gc_retired_dirs{job="vlpds",state="referenced"}) > 0
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} retired shard state dir(s) are listed by a manifest but hold no checkpoint (kept; investigate)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsretiredstatereferenced"
+
+      # Retired dirs normally go within the grace (1 h) plus a forced detach
+      # and the compactor's checkpoint lifetime of the op that retired them.
+      # More retired dirs than live shards for 6 h (guess) means they pile up.
+      - alert: VlpdsRetiredStateGrowing
+        expr: >-
+          max(vlpds_reshard_gc_retired_dirs{job="vlpds",state="total"})
+            > max(vlpds_shard_layout_shards{job="vlpds"})
+        for: 6h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value }} retired shard state dirs (more than live shards) for 6+ hours"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsretiredstategrowing"
+
+      # Forced detach compactions that keep failing validation (conflicts
+      # with the shard's own compactions are normal now and then) while
+      # none completes: the shard keeps pinning its parent.
+      - alert: VlpdsForcedDetachFailing
+        expr: >-
+          sum by (instance) (increase(vlpds_forced_compactions_total{job="vlpds",kind="detach",result="failed"}[2h])) > 5
+          and on (instance) sum by (instance) (increase(vlpds_forced_compactions_total{job="vlpds",kind="detach",result="completed"}[2h])) == 0
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: forced detach compactions keep failing (split/merge parents stay pinned)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsforceddetachfailing"
+
   # ---------------------------------------------------------------------------
   # Memory, caches, runtime
   # ---------------------------------------------------------------------------

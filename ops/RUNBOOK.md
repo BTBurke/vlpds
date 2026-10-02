@@ -861,6 +861,67 @@ log id in `log/` (`<node-id>.<micros>`) names the node.
 **Do:** restart that node id (startup fences its previous incarnation's log) or
 fix the failing takeover. Never write a fence object by hand.
 
+### VlpdsReshardGcFailing
+
+**Means:** most retired-state GC passes (`reshard GC pass failed`, on the owner
+of slot 0's shard) failed in the last hour. Split/merge parents' state dirs
+(`state/{id}/`) and their `assign/` records stop going away: storage, and the
+`assign/` LIST every step makes, grow with each op. Nothing is lost.
+
+**Causes:** store permissions (DELETE) or throttling; the node's lease not
+valid (`node lease not valid: no deletes`: a node about to fail-stop); a dir
+SlateDB refuses to delete.
+
+**Do:** read the error. A dir half-deleted by a failed pass is finished by the
+next one (SlateDB's `.deleting` marker). Never delete `state/` objects by hand:
+a live shard may read a retired dir's SSTs (DESIGN.md "Retired state GC").
+
+### VlpdsRetiredStateReferenced
+
+**Means:** a retired shard's dir holds no checkpoint, yet some shard's manifest
+lists SSTs in it (`vlpds_reshard_gc_retired_dirs{state="referenced"}`). Every
+clone pins what it reads with a checkpoint, so this is a SlateDB invariant
+broken (a bug, or hand edits). The GC keeps the dir, so nothing is lost now; a
+later fix that deletes the reference would let it go.
+
+**Confirm:** the log line `retired state dir holds no checkpoint but a manifest
+lists its SSTs` names the shard; `slatedb` admin `read_manifest` on each live
+shard shows which lists it in `external_dbs`.
+
+**Do:** keep the dir; file a bug with both manifests.
+
+### VlpdsRetiredStateGrowing
+
+**Means:** more retired state dirs than live shards for 6 hours
+(`vlpds_reshard_gc_retired_dirs{state="total"}`). Dirs normally go within the
+grace (`--reshard-gc-grace`, 1 h) after the shards that read them detached.
+
+**Look at:** `vlpds_reshard_gc_retired_dirs` by state on the GC leader:
+`checkpoint` (a clone still reads it: see `vlpds_shards_with_inherited_ssts` per
+node and [VlpdsForcedDetachFailing](#vlpdsforceddetachfailing); a reader or
+backup holds a named checkpoint), `grace`, `other` (no manifest without a
+delete marker, or an assignment with an owner: log `a shard out of the layout
+has an owner`). A reshard op left pending blocks the dir half entirely
+(`getClusterStatus` layout `op`; abort or finish it).
+
+**Do:** fix the cause; GC catches up by itself (8 dirs per pass).
+
+### VlpdsForcedDetachFailing
+
+**Means:** this node's forced detach compactions (a shard still reading SSTs of
+a split/merge parent gets one, `--forced-detach-after` after it opened) keep
+failing SlateDB's validation and none completed for 2 hours. Occasional
+failures are normal (the shard's own compaction took a source first; it is
+resubmitted next pass). The parents stay pinned, so their dirs stay.
+
+**Look at:** `slatedb::compactor` `compaction validation failed` lines for the
+shard; `vlpds_shards_with_inherited_ssts`; L0 depth (no forced compaction is
+submitted while L0 runs deep).
+
+**Do:** usually nothing: a shard under steady ingest compacts its L0 itself and
+the next submission lands. If one shard never detaches, a graceful restart of
+the node hands it to a peer that starts over.
+
 ### VlpdsMemoryHigh
 
 **Means:** RSS over 85% of `vlpds_memory_limit_bytes` (physical RAM, or the

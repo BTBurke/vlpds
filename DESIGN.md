@@ -276,8 +276,10 @@ swappable.
   after `--slatedb-checkpoint-lifetime` (vlpds: 1 h; SlateDB's default 15 min),
   and GC never deletes an SST a live checkpoint references. That lifetime is
   the read guarantee: a scan (a 10M-record getRepo to a slow client) must
-  finish within it. vlpds creates no checkpoints of its own (its
-  "checkpoints" are applied markers + memtable flushes). Separately, GC
+  finish within it. vlpds keeps no checkpoints of its own (its
+  "checkpoints" are applied markers + memtable flushes); the only others
+  are a split/merge clone's pins in its parents and the short-lived
+  checkpoint it reads a parent at ("Retired state GC"). Separately, GC
   skips SSTs younger than `--slatedb-gc-min-age` (10 min), counted from the
   SST's *creation*: that only guards SSTs not yet in a manifest. It was
   24 h, which protected nothing extra (an SST created long ago and replaced
@@ -879,12 +881,35 @@ span start inside a pruned head (e.g. between a span's start and the
 shard's insert floor, which hold nothing of it) is skipped, not an error. A
 hole above the lowest object is still an error inside a closed span.
 
-*Fences stay.* A dead log is pruned down to its fence: the segments below it,
-the K − 1 garbage segments past it, and its report go. The fence stays,
-because it is what makes a zombie of that incarnation fail-stop whatever
-its clock says (a suspended VM waking days later). `first_free` on a
-fence-only log returns the fence, and `last_seq_before` treats a pruned
-predecessor as "long ago".
+*Fences go after `--fence-retention` (7 days).* A dead log is pruned down
+to its fence: the segments below it, the K − 1 garbage segments past it,
+and its report go. The fence is what makes a zombie of that incarnation
+fail-stop whatever its clock says (its PUT at the fence ordinal collides),
+so it stays for `--fence-retention` after it was written. Then it is
+deleted, and the log is gone from `log/` (without this, +1 key and ~80 B
+of `log/` LIST per incarnation, forever: an extra LIST page per ~1,000
+restarts), if the fence is the only object left, `needed_by` is still None
+on freshly read assignments, and no assignment names the log as its
+owner's: a successor that has yet to take such an orphan fences the log
+at `first_free`, which must find this fence, not an empty log (it would
+fence at 0 and close the orphan's span there, cutting its entries).
+`first_free` on a fence-only log returns the fence, `last_seq_before`
+treats a pruned predecessor as "long ago", and replay of a span in a log
+with no objects left reads nothing (by `needed_by`, every such span is
+closed and applied; an open span is never in such a log).
+
+*Why the fence may go after a grace.* After it, a zombie of that
+incarnation could PUT segments there and ack them, and no one would read
+them. So the fence must outlive every zombie of its incarnation ("Liveness"
+below). A node stops acking once its monotonic validity ends (TTL − skew
+after its last renewal's send), and its watchdog fail-stops it 2 × skew
+after that; SIGSTOP and cgroup freezes count on `CLOCK_MONOTONIC`, so a
+stopped process wakes with its validity expired and acks nothing. The one
+zombie only the fence stops is a node whose monotonic clock itself stopped
+(a VM or host suspend): it wakes believing its lease valid. The fence
+retention is therefore a bound on such a suspend, listed with the other
+clock assumptions ("Why safety needs no clocks"); 7 days is far beyond any
+live migration or maintenance pause, and `off` keeps fences forever.
 
 *Readers.* Before deleting, the pruner raises its report's `pruned_seq` to
 the last seq it deletes: the *retained floor* (max over reports) bounds every
@@ -1062,15 +1087,128 @@ whichever node notices, after a fresh GET of the layout.
   or forwards from there, so an enumeration that spans a split or merge
   lists every repo that exists throughout exactly once.
   listReposByCollection and searchAccounts use the same order.
-- *Retired parents:* their assignments stay (frozen) and their state
-  directories stay: children read their SSTs until compaction rewrites
-  them. Deleting a retired directory needs a check that no live manifest
-  references it (`external_dbs`); not implemented yet (bounded leak: the
-  parent's size at the split).
+- *Retired parents:* their assignments (frozen) and state directories stay
+  while a child reads their SSTs; then they are deleted ("Retired state
+  GC" below).
 
 **Policy hook** (off by default): `--reshard-split-mb` /
 `--reshard-split-writes` let the driver-elect (owner of slot 0) plan a split
 of a shard whose SST bytes or entry rate exceed them, one op at a time.
+
+#### Retired state GC (`src/reshard_gc.rs`)
+
+Without it every op left its parents behind for good. The benchbox soak of
+3cdbfac (bench/results/soak-2026-10-02-benchbox, 100 ops in 7 h) measured
++64 MB and 1.5 state dirs per op, unbounded (6.44 GB retired vs 4.30 GB
+live at the end), 32–35 of 64 live shards still reading a parent's SSTs,
+state GET+HEAD per client read 3.8 → 6.4–9.6, graceful exit 0.9 → 1.75 s
+and post-restart requests per commit up ~2x across the reshard hours, and
++1.5 `assign/` records per op. Three parts:
+
+1. **Forced detach** (every node, for the shards it holds). A clone reads
+   its parents' SSTs in place until its compaction rewrites them, and
+   size-tiered compaction may never rewrite a quiet child's bottom run, so
+   a parent could stay pinned forever. A shard still listing inherited
+   SSTs (`external_dbs` entries with SST ids) `--forced-detach-after`
+   (5 min) after it opened on this node gets one compaction submitted
+   (`Admin::submit_compaction`): the suffix of its tree from the newest
+   source holding an inherited SST (L0 view or sorted run) down to the
+   oldest sorted run, merged into that run. A suffix is always a valid
+   compaction (it holds every older L0 and every run, so recency order is
+   kept), and its output is the bottom run. The spec comes from the stored
+   manifest (what the coordinator validates against; the writer's view
+   lags its results). At most one is in flight per node, none while L0 is
+   deep; one that fails validation (a concurrent compaction took a source)
+   is resubmitted next pass, as is one whose node died (the new owner
+   starts over). A child that never received writes is all inherited and
+   is rewritten whole. Once a shard reads no inherited SST in its manifest
+   *and* in every manifest a live checkpoint of it names (the compactor's
+   read guards of the pre-compaction manifests expire after
+   `--slatedb-checkpoint-lifetime`), SlateDB's detach task in that shard's
+   DB (every `--slatedb-detach-interval`, 10 min) deletes the *final
+   checkpoint* the clone pinned in each parent, then drops the parent from
+   its manifest.
+2. **Dir GC** (the owner of slot 0's shard, as for dead-log pruning; every
+   delete re-checks this node's lease). Every 60 s it GETs the layout and
+   does nothing while an op is pending. A state dir whose id is below
+   `next_id` and not in the layout is *retired*: a flipped op's parent, or
+   an aborted op's half-made clone. Up to 32 are checked per pass (round
+   robin, so held dirs don't starve the rest) and up to 8 deleted, each
+   only if (i) its assignment names no owner, (ii) its newest manifest
+   holds no live checkpoint (no expiry, or expiring in the future), (iii)
+   that manifest is older than `--reshard-gc-grace` (1 h; never less than
+   3 manifest polls), and (iv) no manifest under `state/` lists SSTs of it.
+   The delete is SlateDB's `Admin::delete_db`: it strips the checkpoints
+   the dir itself pinned in its own ancestors (so a grandparent is
+   released with it), writes a `.deleting` marker, deletes everything, the
+   marker last; a pass that dies half-way finishes on the next (a dir with
+   a marker and no manifest is deleted). Then its `assign/` record goes.
+   Records out of the layout whose dir is gone (a pass that stopped between
+   the two deletes, an op aborted before its clone) go on the next pass.
+3. **Clone source checkpoints.** `clone_db` reads each source at a
+   checkpoint named `vlpds-clone-{child}` (1 h lifetime), reused by a
+   resumed clone, and deletes it once the clone is initialized; a clone
+   found initialized returns at once. SlateDB's default is an unnamed 5 min
+   checkpoint, which nothing could drop for a source the clone's manifest
+   doesn't name: a source with no SSTs of its own (a split child that took
+   no writes) has no entry there. SlateDB's own retry check wants every
+   source named, so a retried merge of such a child also failed.
+
+*Why the GC never deletes state something needs.*
+- *Clones and readers.* Every DB that may read a dir's SSTs holds a
+  checkpoint in that dir's manifest. A clone holds its final checkpoint
+  (no expiry) from its creation until SlateDB's detach, which waits until
+  neither its current manifest nor any manifest a live checkpoint of it
+  names lists those SSTs, so a scan or snapshot of the clone that started
+  on an older manifest keeps the compactor's checkpoint-lifetime guarantee
+  (§4), as for its own replaced SSTs. Ancestry is transitive: a clone of a
+  clone carries every ancestor it still reads with its own final
+  checkpoint there (`Manifest::cloned`, `cloned_from_union`), so a
+  grandparent is held by its grandchildren directly, not through the
+  retired middle generation. A `DbReader`, or a backup's named checkpoint
+  ("Backups and restore"), holds its own. So (ii) is the complete test;
+  (iv) checks SlateDB's invariant independently (a dir a manifest lists
+  without a checkpoint is kept, counted as `referenced` and alerted on).
+- *Stale in-memory views.* A shard's owner reads through its in-memory
+  manifest, refreshed every manifest poll (10 s), so after a detach it may
+  still list the parent for one poll: the grace is at least 3 polls. (The
+  GC history test found this with a 1 s checkpoint lifetime and the 10 s
+  poll: reads of a deleted parent's SST, answered 500.)
+- *Pending and resuming ops.* Nothing is deleted while the layout carries
+  an op: its children's ids are below `next_id` (the plan allocated them)
+  and out of the layout until the flip, and the driver, or its successor
+  after a crash, may still clone from the parents and write the children's
+  assignments. After an abort, the half-made clones are out of the layout
+  for good (ids are never reused); a driver presumed dead that wakes late
+  finds its clone initialized (no-op) or, once it was deleted, makes a new
+  half-clone that the next passes delete again (its pin in the live parent
+  goes with it).
+- *Replay.* A frozen parent never replays (its DB holds every span of its
+  history: "Why no acked write is lost"), and a child's history starts
+  empty, so nothing ever replays into a retired dir. Retention's
+  `needed_by` already skips frozen assignments: deleting a frozen
+  parent's record changes no retention decision.
+- *Stale routing.* A node whose layout still names a retired parent can't
+  open it: its assignment is frozen while it exists, and once it is gone
+  `acquire` creates a missing assignment only for a shard in a freshly
+  read layout (a step stalled on an old layout must never recreate a
+  deleted shard over an empty directory).
+- *Leadership.* Two nodes that both believe they lead run the same
+  idempotent deletes on the same evidence; a node whose lease isn't valid
+  deletes nothing.
+
+*Opt-in full compactions* (`--full-compaction-every`, off): every held
+shard gets one compaction of every source into its bottom run (which drops
+tombstones) per interval, one per node at a time. The soak found no
+tombstone cost (live bytes per record 207 → 123 B, delete-heavy
+listRecords p99 flat at 2.7–3.8 ms), so it stays off.
+
+Metrics: `vlpds_reshard_gc_retired_dirs{state}`,
+`vlpds_reshard_gc_deleted_total{kind}`, `vlpds_reshard_gc_passes_total`,
+`vlpds_reshard_gc_orphan_assign_records`, `vlpds_shards_with_inherited_ssts`,
+`vlpds_forced_compactions_total{kind,result}`; alerts and runbook in `ops/`.
+Retention metrics were already labelled by kind (own, dead, fence), not by
+log id: the soak's series count was flat across 160 restarts.
 
 ### Liveness: observed lease changes on the observer's monotonic clock
 
@@ -1192,6 +1330,11 @@ linearizable.
   cgroup freezes). A VM or host suspend that stops the monotonic clock makes
   a node believe its lease is still valid on wake. It then serves stale reads
   until its next PUT hits the fence, but acks nothing.
+- **Such a suspend is shorter than `--fence-retention`** (7 days). A dead
+  log's fence is deleted after it ("Log retention"); a node suspended
+  longer, waking with its lease believed valid, would find no fence and
+  could ack writes into a log no one replays. `--fence-retention off`
+  removes the assumption, at one `log/` key per incarnation forever.
 - **Wall-clock offset affects only seq ordering and merge latency.**
   - Seqs are wall-clock based. When a shard moves, the new owner's seqs must
     exceed the old owner's for its repos to keep their firehose order. The
@@ -1947,8 +2090,12 @@ checkpoint (`Admin::create_detached_checkpoint` with
 `CheckpointOptions { name, lifetime }`, or `Db::create_checkpoint` on the
 owner, which flushes first) pins one manifest's SSTs against GC until it
 expires. It is O(manifest) and costs only the replaced SSTs it keeps
-alive (~58 GB/day × lifetime). vlpds today creates none of its own: the
-only checkpoints are the compactor's 1 h read guards (§4). A clone
+alive (~58 GB/day × lifetime). vlpds keeps none of its own: besides the
+compactor's 1 h read guards (§4) there are only split/merge clones' pins
+and their short-lived source checkpoints. Retired-state GC keeps any dir
+holding a live checkpoint, so a named backup checkpoint of a shard that a
+split or merge then retires keeps that dir (and the ancestors it reads)
+until the checkpoint expires ("Retired state GC"). A clone
 (`create_clone_builder_from_source`, as `partition::clone_db` uses for
 splits and merges) accepts `CloneSourceSpec::checkpoint`, so a shard can be
 restored as a new shard id from any live checkpoint in O(manifest). Two

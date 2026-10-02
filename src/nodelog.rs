@@ -1142,8 +1142,14 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
             // Retention may have pruned the log's head. What it pruned holds
             // nothing these spans still need (no entries of their shard and
             // epoch, or entries already durable): DESIGN.md "Log retention".
-            if let Some(first) = crate::backfill::first_ordinal(store, &log_id).await? {
-                lo = lo.max(first);
+            match crate::backfill::first_ordinal(store, &log_id).await? {
+                Some(first) => lo = lo.max(first),
+                // Nothing left at all: retention pruned a dead log to its
+                // fence and later deleted the fence (--fence-retention),
+                // which it does only once no replay needs the log. A span
+                // still open has no fence yet, so it is never this case.
+                None if members.iter().all(|m| m.1.end.is_some()) => continue,
+                None => {}
             }
             let hi = if members.iter().any(|m| m.1.end.is_none()) { u64::MAX } else { members.iter().filter_map(|m| m.1.end).max().unwrap_or(0) };
             let fetch = |ord: u64| {

@@ -1779,6 +1779,7 @@ impl Cluster {
     ) -> anyhow::Result<()> {
         use futures::StreamExt;
         let mut picked = Vec::new();
+        let mut fresh: Option<Arc<Layout>> = None;
         for s in candidates {
             if picked.len() == want {
                 break;
@@ -1786,9 +1787,23 @@ impl Cluster {
             if self.is_owner(s) {
                 continue;
             }
-            let (cur, etag) = match self.assigns.read().get(&s) {
-                None => (Assignment::default(), None),
-                Some((a, e)) => (a.clone(), e.clone()),
+            let cached = self.assigns.read().get(&s).cloned();
+            let (cur, etag) = match cached {
+                None => {
+                    // No record: a shard of a prefix's first layout nobody
+                    // took yet, or a retired one whose state and record
+                    // reshard_gc deleted. Only a fresh layout tells them
+                    // apart: a step that stalled on an old layout must
+                    // never recreate a retired shard over nothing.
+                    if fresh.is_none() {
+                        fresh = Some(self.refresh_layout(host).await?);
+                    }
+                    if !fresh.as_ref().is_some_and(|l| l.contains(s)) {
+                        continue;
+                    }
+                    (Assignment::default(), None)
+                }
+                Some((a, e)) => (a, e),
             };
             if cur.frozen.is_some() {
                 continue;

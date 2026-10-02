@@ -208,6 +208,32 @@ struct Args {
     /// deleted; older cursors get OutdatedCursor.
     #[arg(long, env = "VLPDS_LOG_RETENTION", default_value = "72h")]
     log_retention: String,
+    /// A dead log, once pruned to its fence, keeps the fence this long
+    /// ("off" = forever). The fence is what stops a zombie of that
+    /// incarnation; one paused longer than this (a suspended VM whose
+    /// monotonic clock stopped) could ack writes after it goes (DESIGN.md
+    /// "Log retention", "Fences").
+    #[arg(long, env = "VLPDS_FENCE_RETENTION", default_value = "7d")]
+    fence_retention: String,
+    /// Split/merge parents' state dirs (and aborted ops' clones) are deleted
+    /// once nothing references them and their manifest is this old ("off"
+    /// = keep them forever; DESIGN.md "Retired state GC").
+    #[arg(long, env = "VLPDS_RESHARD_GC_GRACE", default_value = "1h")]
+    reshard_gc_grace: String,
+    /// A shard still reading a split/merge parent's SSTs this long after it
+    /// opened here gets a compaction that rewrites them ("off" = leave it to
+    /// size-tiered compaction, which may never rewrite a quiet shard's
+    /// bottom run, pinning the parent).
+    #[arg(long, env = "VLPDS_FORCED_DETACH_AFTER", default_value = "5m")]
+    forced_detach_after: String,
+    /// Opt-in: every shard held here gets a full compaction once per this
+    /// (drops tombstones in its bottom run; "off" by default).
+    #[arg(long, env = "VLPDS_FULL_COMPACTION_EVERY", default_value = "off")]
+    full_compaction_every: String,
+    /// How often each shard DB checks whether it can detach from a
+    /// split/merge parent it no longer reads (SlateDB's detach GC).
+    #[arg(long, env = "VLPDS_SLATEDB_DETACH_INTERVAL", default_value = "10m")]
+    slatedb_detach_interval: String,
     /// Every owned shard is checkpointed (applied marker + memtable flush)
     /// once per this: bounds how much log a successor replays after a crash.
     #[arg(long, env = "VLPDS_CHECKPOINT_EVERY", default_value = "10s")]
@@ -730,10 +756,23 @@ async fn run(args: Args) -> anyhow::Result<()> {
     vlpds::partition::set_gc_min_age(vlpds::retention::parse_duration(&args.slatedb_gc_min_age)?);
     vlpds::partition::set_checkpoint_lifetime(vlpds::retention::parse_duration(&args.slatedb_checkpoint_lifetime)?);
     vlpds::segment::set_compression_level(args.log_compression);
+    vlpds::partition::set_detach_interval(vlpds::retention::parse_duration(&args.slatedb_detach_interval)?);
+    let opt_duration = |v: &str| -> anyhow::Result<Option<Duration>> {
+        match v {
+            "off" | "none" => Ok(None),
+            v => vlpds::retention::parse_duration(v).map(Some),
+        }
+    };
     let log_retention = match args.log_retention.as_str() {
         "off" | "none" => None,
-        v => Some(vlpds::retention::Config { window: vlpds::retention::parse_duration(v)?, ..Default::default() }),
+        v => Some(vlpds::retention::Config { window: vlpds::retention::parse_duration(v)?, fence_retention: opt_duration(&args.fence_retention)?, ..Default::default() }),
     };
+    let reshard_gc = Some(vlpds::reshard_gc::Config {
+        grace: opt_duration(&args.reshard_gc_grace)?,
+        detach_after: opt_duration(&args.forced_detach_after)?,
+        full_every: opt_duration(&args.full_compaction_every)?,
+        ..Default::default()
+    });
     let cfg = Config {
         public_url: args.public_url.clone(),
         handle_domain: args.handle_domain.clone(),
@@ -828,6 +867,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         memory_store: None,
         metrics_listen: args.metrics_listen.clone(),
         log_retention,
+        reshard_gc,
         cache_budget_bytes: args.cache_budget_mb.map(|m| m << 20),
         cache_entries: vlpds::caches::parse_overrides(&args.cache_entries)?,
         reshard_policy: vlpds::reshard::Policy {

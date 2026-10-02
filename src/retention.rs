@@ -19,8 +19,11 @@
 //! Every node publishes `retain/{log_id}`: the shards its log's owner opened
 //! (with epochs: permanent facts, so a stale copy is merely conservative) and
 //! the highest seq it deleted (the retained floor is the max over reports).
-//! A dead log keeps its fence object: it is what makes a zombie of that
-//! incarnation fail-stop, whatever the zombie's clock says.
+//! A dead log keeps its fence object for `fence_retention` (default 7 days)
+//! after it was written: it is what makes a zombie of that incarnation
+//! fail-stop, whatever the zombie's clock says, so it goes only once no
+//! zombie can plausibly still be running (DESIGN.md "Log retention",
+//! "Fences").
 
 use crate::cluster::Assignment;
 use crate::metrics;
@@ -39,6 +42,7 @@ use std::time::Duration;
 pub const DEFAULT_WINDOW: Duration = Duration::from_secs(72 * 3600);
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 pub const DEFAULT_MAX_DELETES: usize = 10_000;
+pub const DEFAULT_FENCE_RETENTION: Duration = Duration::from_secs(7 * 86400);
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -48,11 +52,14 @@ pub struct Config {
     pub interval: Duration,
     /// Objects deleted per pass at most (all logs together).
     pub max_deletes: usize,
+    /// A dead log pruned to its fence loses the fence (and so disappears
+    /// from `log/`) once the fence is this old. None = fences stay forever.
+    pub fence_retention: Option<Duration>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { window: DEFAULT_WINDOW, interval: DEFAULT_INTERVAL, max_deletes: DEFAULT_MAX_DELETES }
+        Config { window: DEFAULT_WINDOW, interval: DEFAULT_INTERVAL, max_deletes: DEFAULT_MAX_DELETES, fence_retention: Some(DEFAULT_FENCE_RETENTION) }
     }
 }
 
@@ -120,13 +127,15 @@ struct DeadLogs {
     unfenced: i64,
     needed: i64,
     pruning: i64,
+    /// pruned down to their fence (kept for `fence_retention`)
+    fenced: i64,
     /// objects below their logs' ends (fence or durable prefix)
     segments: u64,
 }
 
 impl DeadLogs {
     fn export(&self) {
-        for (state, n) in [("unfenced", self.unfenced), ("needed", self.needed), ("pruning", self.pruning)] {
+        for (state, n) in [("unfenced", self.unfenced), ("needed", self.needed), ("pruning", self.pruning), ("fenced", self.fenced)] {
             metrics::RETENTION_DEAD_LOGS.with_label_values(&[state]).set(n);
         }
         metrics::RETENTION_DEAD_SEGMENTS.set(self.segments as i64);
@@ -155,7 +164,8 @@ struct State {
     written: Option<Report>,
     /// dead logs found fenced: log -> fence ordinal (permanent)
     fenced: HashMap<String, u64>,
-    /// dead logs pruned down to their fence (and report deleted)
+    /// dead logs pruned down to their fence (and report deleted); their
+    /// fence goes after `fence_retention`
     retired: HashSet<String>,
     /// dead logs left after the last full pass over them (leader only)
     dead: Option<DeadLogs>,
@@ -305,10 +315,7 @@ impl Retention {
     async fn prune_dead(&self, cutoff: chrono::DateTime<chrono::Utc>, budget: &mut usize) -> anyhow::Result<Pass> {
         let live = (self.members.live_logs)();
         let logs = crate::backfill::list_logs(&self.store).await?;
-        let dead: Vec<String> = {
-            let st = self.state.lock();
-            logs.into_iter().filter(|l| !live.contains(l) && *l != *self.log.log_id && !st.retired.contains(l)).collect()
-        };
+        let dead: Vec<String> = logs.into_iter().filter(|l| !live.contains(l) && *l != *self.log.log_id).collect();
         let mut pass = Pass::default();
         let mut known: Option<Known> = None;
         let mut stats = DeadLogs::default();
@@ -320,6 +327,14 @@ impl Retention {
             if *budget == 0 {
                 // stopped early: the gauges keep the last full count
                 return Ok(pass);
+            }
+            if self.state.lock().retired.contains(&x) {
+                if self.delete_fence(&x, &mut known, budget).await? {
+                    pass.objects += 1;
+                } else {
+                    stats.fenced += 1;
+                }
+                continue;
             }
             let cached = self.state.lock().fenced.get(&x).copied();
             let fence = match cached {
@@ -357,6 +372,9 @@ impl Retention {
                 let n = self.retire(&x, fence, cutoff, budget).await?;
                 pass.objects += n.objects;
                 pass.bytes += n.bytes;
+                if self.state.lock().retired.contains(&x) {
+                    stats.fenced += 1;
+                }
             } else {
                 stats.pruning += 1;
                 stats.segments += fence.saturating_sub(first.unwrap_or(fence));
@@ -397,6 +415,42 @@ impl Retention {
         tracing::info!(log = x, fence, "dead log retired (pruned to its fence)");
         self.state.lock().retired.insert(x.to_string());
         Ok(pass)
+    }
+
+    /// A retired dead log's fence, once older than `fence_retention`: the
+    /// log is then gone from `log/` entirely. Only if the fence is all that
+    /// is left, no shard's replay can still read the log (`needed_by`,
+    /// re-checked on fresh assignments), and no assignment names the log as
+    /// its owner's (an orphan whose successor has yet to fence it: it must
+    /// find this fence, not an empty log). True if it deleted it.
+    async fn delete_fence(&self, x: &str, known: &mut Option<Known>, budget: &mut usize) -> anyhow::Result<bool> {
+        let Some(keep) = self.cfg.fence_retention else { return Ok(false) };
+        let Some(fence) = self.state.lock().fenced.get(x).copied() else { return Ok(false) };
+        let prefix = Path::from(format!("{}/log/{}", self.store.prefix, x));
+        let objs: Vec<object_store::ObjectMeta> = self.store.raw.list(Some(&prefix)).collect::<Vec<_>>().await.into_iter().collect::<Result<_, _>>()?;
+        let cutoff = chrono::Utc::now() - chrono::Duration::from_std(keep)?;
+        let [only] = objs.as_slice() else { return Ok(false) };
+        if ordinal_of(&only.location) != Some(fence) || only.last_modified >= cutoff {
+            return Ok(false);
+        }
+        if known.is_none() {
+            *known = Some((read_assignments(&self.store).await?, read_reports(&self.store).await?));
+        }
+        let (assigns, reports) = known.as_ref().unwrap();
+        if needed_by(x, assigns, reports).is_some() || assigns.values().any(|a| a.log_id.as_deref() == Some(x)) {
+            return Ok(false);
+        }
+        match self.store.raw.delete(&only.location).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(e) => return Err(e.into()),
+        }
+        *budget = budget.saturating_sub(1);
+        metrics::RETENTION_DELETED_OBJECTS.with_label_values(&["fence"]).inc();
+        tracing::info!(log = x, fence, "dead log's fence deleted (past --fence-retention)");
+        let mut st = self.state.lock();
+        st.retired.remove(x);
+        st.fenced.remove(x);
+        Ok(true)
     }
 }
 
@@ -508,7 +562,7 @@ mod tests {
     }
 
     fn cfg(window: Duration) -> Config {
-        Config { window, interval: Duration::from_secs(3600), max_deletes: 1000 }
+        Config { window, interval: Duration::from_secs(3600), max_deletes: 1000, fence_retention: None }
     }
 
     async fn put_assign(store: &Store, shard: ShardId, history: Vec<Span>) {
@@ -626,7 +680,7 @@ mod tests {
         assert_eq!(follower.pass().await.unwrap(), Pass::default());
         let p = r.pass().await.unwrap();
         assert_eq!(p.objects, 5, "segments 0..4 and the garbage at 5");
-        assert_eq!(dead(&r), DeadLogs::default(), "retired: nothing held");
+        assert_eq!(dead(&r), DeadLogs { fenced: 1, ..Default::default() }, "retired: only the fence held");
         assert_eq!(ordinals(&store, "D").await, vec![4], "the fence stays");
         assert!(!read_reports(&store).await.unwrap().contains_key("D"), "its report is gone");
         assert!(retained_floor(&store).await.unwrap() >= 103, "the deleted seqs are covered");
@@ -637,6 +691,22 @@ mod tests {
         let history = vec![Span { log_id: "D".into(), epoch: 1, start: 0, end: Some(4) }];
         assert_eq!(nodelog::replay_shard(&store, ShardId(0), &db, &history).await.unwrap(), 0);
         assert_eq!(r.pass().await.unwrap(), Pass::default(), "retired");
+        // past --fence-retention the fence goes too, unless an assignment
+        // still names D as its owner's log (a successor must find the fence)
+        let gc = Retention::new(store.clone(), log.clone(), Config { fence_retention: Some(Duration::ZERO), ..cfg(Duration::ZERO) }, members(&["B"], true));
+        put_assign(&store, ShardId(1), vec![Span { log_id: "D".into(), epoch: 1, start: 0, end: None }]).await;
+        let orphan = Assignment { owner: Some("d".into()), log_id: Some("D".into()), epoch: 1, history: vec![Span { log_id: "D".into(), epoch: 1, start: 0, end: None }], ..Default::default() };
+        store.raw.put(&Path::from(format!("{}/assign/{}", store.prefix, ShardId(1).key())), PutPayload::from(serde_json::to_vec(&orphan).unwrap())).await.unwrap();
+        gc.pass().await.unwrap();
+        assert_eq!(ordinals(&store, "D").await, vec![4], "an orphan names D: the fence stays");
+        store.raw.delete(&Path::from(format!("{}/assign/{}", store.prefix, ShardId(1).key()))).await.unwrap();
+        let p = (gc.pass().await.unwrap().objects, gc.pass().await.unwrap().objects);
+        assert_eq!(p, (0, 1), "retired again, then the fence");
+        assert!(ordinals(&store, "D").await.is_empty());
+        assert!(!crate::backfill::list_logs(&store).await.unwrap().contains(&"D".to_string()), "D left log/");
+        assert_eq!(dead(&gc), DeadLogs::default());
+        // a replay of a span in the vanished log reads nothing and doesn't fail
+        assert_eq!(nodelog::replay_shard(&store, ShardId(0), &db, &history).await.unwrap(), 0);
     }
 
     #[test]

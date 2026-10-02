@@ -104,9 +104,14 @@ impl Node {
 }
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> Node {
+    node_with(id, store, |_| {}).await
+}
+
+async fn node_with(id: &str, store: &Arc<object_store::memory::InMemory>, f: impl FnOnce(&mut vlpds::server::Config)) -> Node {
     let k = Arc::new(Killable { inner: store.clone(), dead: AtomicBool::new(false) });
     let (id, raw) = (id.to_string(), k.clone() as Arc<dyn object_store::ObjectStore>);
     let s = TestServer::spawn_with(move |c| {
+        f(c);
         c.memory_store = Some(raw);
         c.shards = SHARDS;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
@@ -907,4 +912,160 @@ async fn shard_ids_past_u16_end_to_end() {
     }
     assert!(assigned.iter().all(|s| *s < l5.next_id), "{assigned:?} vs next_id {}", l5.next_id);
     assert!(keys.iter().filter_map(|k| k.strip_prefix("vlpds/assign/")).all(|k| k == "layout" || ShardId::from_key(k).is_some()), "{keys:?}");
+}
+
+/// Object keys under the prefix: shard ids with a state dir, shard ids with
+/// an assignment, and log ids under log/.
+async fn bucket(store: &Arc<object_store::memory::InMemory>) -> (Vec<u32>, Vec<u32>, Vec<String>) {
+    use futures::TryStreamExt;
+    let keys: Vec<String> = object_store::ObjectStore::list(&**store, Some(&Path::from("vlpds"))).map_ok(|m| m.location.to_string()).try_collect().await.unwrap();
+    let mut dirs: Vec<u32> = keys.iter().filter_map(|k| k.strip_prefix("vlpds/state/")?.split('/').next().and_then(vlpds::slots::ShardId::from_key)).map(|s| s.0).collect();
+    dirs.dedup();
+    let assigns: Vec<u32> = keys.iter().filter_map(|k| k.strip_prefix("vlpds/assign/").and_then(vlpds::slots::ShardId::from_key)).map(|s| s.0).collect();
+    let mut logs: Vec<String> = keys.iter().filter_map(|k| Some(k.strip_prefix("vlpds/log/")?.split('/').next()?.to_string())).collect();
+    logs.dedup();
+    (dirs, assigns, logs)
+}
+
+/// Retired-state GC over a reshard history (DESIGN.md "Retired state GC"):
+/// splits and merges under write load (a split's halves merged back, a
+/// merge across nodes, its split) and graceful restarts in between, with
+/// the grace, the log window and the fence retention all zero. Every acked
+/// write reads back after every step (children detached from parents whose
+/// dirs are then deleted; shards replayed over histories whose dead logs
+/// are gone, fences included), and at the end the bucket holds exactly the
+/// layout's state dirs and assignments and the live nodes' logs.
+/// `RESHARD_GC_CYCLES=4` for a longer run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn retired_state_gc_over_history() {
+    let cycles: usize = std::env::var("RESHARD_GC_CYCLES").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    // a forced detach waits out the compactor's read guards, then SlateDB's
+    // detach task releases the parent (process-wide knobs: harmless to the
+    // other tests, whose SSTs are younger than the SST GC's 10 min min age)
+    vlpds::partition::set_checkpoint_lifetime_unchecked(Duration::from_secs(1));
+    vlpds::partition::set_detach_interval(Duration::from_millis(300));
+    vlpds::partition::set_compaction_poll_interval(Duration::from_millis(500));
+    // (the GC's grace is at least 3 manifest polls: a shard's owner must
+    // have refreshed past a detach before the parent goes)
+    vlpds::partition::set_manifest_poll_interval(Duration::from_millis(500));
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let gc = |c: &mut vlpds::server::Config| {
+        c.reshard_gc = Some(vlpds::reshard_gc::Config {
+            interval: Duration::from_millis(200),
+            grace: Some(Duration::ZERO),
+            max_dirs: 2,
+            detach_after: Some(Duration::ZERO),
+            max_inflight: 2,
+            full_every: None,
+        });
+        c.log_retention = Some(vlpds::retention::Config { window: Duration::ZERO, interval: Duration::from_millis(50), max_deletes: 50, fence_retention: Some(Duration::ZERO) });
+    };
+    let mut nodes = vec![node_with("rsgc-a", &store, gc).await];
+    let accts = accounts(&nodes[0].s, 12).await;
+    nodes.push(node_with("rsgc-b", &store, gc).await);
+    nodes.push(node_with("rsgc-c", &store, gc).await);
+    balanced(&nodes.iter().collect::<Vec<_>>()).await;
+    let load = Load::start(nodes.iter().map(|n| n.s.url.clone()).collect(), &accts);
+    load.progress(30).await;
+    let kids = |r: &J| -> Vec<vlpds::slots::ShardId> { r["op"]["children"].as_array().unwrap().iter().map(|c| vlpds::slots::ShardId(c["id"].as_u64().unwrap() as u32)).collect() };
+    for cyc in 0..cycles {
+        let refs: Vec<&Node> = nodes.iter().collect();
+        // split, merge the halves back
+        let l = layout(refs[0]);
+        let target = *owned(refs[cyc % 3]).first().unwrap();
+        let r = admin(&refs[(cyc + 1) % 3].s, "vlpds.admin.splitShard", json!({"shard": target, "wait": true})).await;
+        assert_eq!(r["done"], json!(true), "{r}");
+        let l2 = settled(&refs, l.version + 1, Duration::from_secs(20)).await;
+        load.progress(20).await;
+        check_acked(&refs[0].s, &load).await;
+        let k = kids(&r);
+        let r = admin(&refs[(cyc + 2) % 3].s, "vlpds.admin.mergeShards", json!({"left": k[0], "right": k[1], "wait": true})).await;
+        assert_eq!(r["done"], json!(true), "{r}");
+        let l3 = settled(&refs, l2.version + 1, Duration::from_secs(20)).await;
+        load.progress(20).await;
+        check_acked(&refs[1].s, &load).await;
+        // a merge across nodes, then a split of it
+        let (x, y) = {
+            let owner = |s: vlpds::slots::ShardId| refs.iter().position(|n| owned(n).contains(&s));
+            let pair = l3.shards.windows(2).find(|w| owner(w[0].id) != owner(w[1].id)).expect("adjacent shards on two nodes");
+            (pair[0].id, pair[1].id)
+        };
+        let r = admin(&refs[cyc % 3].s, "vlpds.admin.mergeShards", json!({"left": x, "right": y, "wait": true})).await;
+        assert_eq!(r["done"], json!(true), "{r}");
+        let l4 = settled(&refs, l3.version + 1, Duration::from_secs(20)).await;
+        let m = kids(&r)[0];
+        load.progress(20).await;
+        let r = admin(&refs[(cyc + 1) % 3].s, "vlpds.admin.splitShard", json!({"shard": m, "wait": true})).await;
+        assert_eq!(r["done"], json!(true), "{r}");
+        settled(&refs, l4.version + 1, Duration::from_secs(20)).await;
+        load.progress(20).await;
+        check_acked(&refs[2].s, &load).await;
+        // a graceful restart of one node: its old log is fenced, pruned,
+        // and its fence deleted; its shards' next owners replay over it
+        let i = cyc % 3;
+        let id = nodes[i].id();
+        vlpds::server::shutdown(&nodes[i].s.app).await;
+        nodes[i] = node_with(&id, &store, gc).await;
+        balanced(&nodes.iter().collect::<Vec<_>>()).await;
+        load.progress(20).await;
+        check_acked(&nodes[i].s, &load).await;
+    }
+    // the bucket converges on the live layout and the live logs
+    let refs: Vec<&Node> = nodes.iter().collect();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let l = settled(&refs, 1, Duration::from_secs(20)).await;
+        let want: Vec<u32> = {
+            let mut v: Vec<u32> = l.ids().iter().map(|s| s.0).collect();
+            v.sort();
+            v
+        };
+        let mut live_logs: Vec<String> = nodes.iter().map(|n| n.s.app.log.log_id.to_string()).collect();
+        live_logs.sort();
+        let (dirs, assigns, logs) = bucket(&store).await;
+        if dirs == want && assigns == want && logs == live_logs {
+            eprintln!("converged: {} shards, logs {logs:?}", want.len());
+            break;
+        }
+        if Instant::now() > deadline {
+            let mut why = Vec::new();
+            for d in dirs.iter().filter(|d| !want.contains(d)) {
+                let path = format!("vlpds/state/{}", vlpds::slots::ShardId(*d).key());
+                let admin = slatedb::admin::AdminBuilder::new(path, store.clone() as Arc<dyn object_store::ObjectStore>).build();
+                let cps = admin.list_checkpoints(None).await.map(|v| v.iter().map(|c| (c.id, c.create_time, c.expire_time, c.manifest_id)).collect::<Vec<_>>()); let ext = admin.read_manifest(None).await.ok().flatten().map(|m| m.external_dbs().iter().map(|e| (e.path.clone(), e.source_checkpoint_id, e.final_checkpoint_id, e.sst_ids.len())).collect::<Vec<_>>());
+                why.push(format!("{d}: now {} checkpoints {cps:?} external {ext:?}", chrono::Utc::now()));
+            }
+            for d in &want {
+                let path = format!("vlpds/state/{}", vlpds::slots::ShardId(*d).key());
+                let admin = slatedb::admin::AdminBuilder::new(path, store.clone() as Arc<dyn object_store::ObjectStore>).build();
+                if let Ok(Some(m)) = admin.read_manifest(None).await {
+                    why.push(format!("live {d}: external {:?}", m.external_dbs().iter().map(|e| (e.path.clone(), e.sst_ids.len(), e.final_checkpoint_id.is_some())).collect::<Vec<_>>()));
+                }
+            }
+            panic!(
+                "retired state never went: dirs {dirs:?} assigns {assigns:?} (layout {want:?}); logs {logs:?} (live {live_logs:?}); inherited per node {:?}; {why:#?}",
+                nodes.iter().map(|n| n.s.app.partitions.owned().iter().filter(|p| vlpds::reshard_gc::has_inherited(&p.db.manifest())).map(|p| p.id.0).collect::<Vec<_>>()).collect::<Vec<_>>()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let (acked, failed, gap) = load.stop().await;
+    eprintln!("{} acked, {failed} failed attempts, longest per-account gap {gap:?}", acked.len());
+    for n in &nodes {
+        verify_readable(&n.s, &acked).await;
+    }
+    // and a node restarted onto the collected bucket serves it all
+    vlpds::server::shutdown(&nodes[0].s.app).await;
+    let id = nodes[0].id();
+    nodes[0] = node_with(&id, &store, gc).await;
+    balanced(&nodes.iter().collect::<Vec<_>>()).await;
+    for n in &nodes {
+        verify_readable(&n.s, &acked).await;
+    }
+}
+
+/// Every write acked so far reads back through `n`.
+async fn check_acked(n: &TestServer, load: &Load) {
+    let snap = load.acked.lock().clone();
+    verify_readable(n, &snap).await;
 }

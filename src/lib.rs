@@ -31,6 +31,7 @@ pub mod partition;
 pub mod partitions;
 pub mod plc;
 pub mod reshard;
+pub mod reshard_gc;
 pub mod profiling;
 pub mod ratelimit;
 pub mod recent_writes;

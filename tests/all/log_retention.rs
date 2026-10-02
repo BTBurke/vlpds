@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn fast() -> Option<vlpds::retention::Config> {
-    Some(vlpds::retention::Config { window: Duration::ZERO, interval: Duration::from_millis(20), max_deletes: 3 })
+    Some(vlpds::retention::Config { window: Duration::ZERO, interval: Duration::from_millis(20), max_deletes: 3, ..Default::default() })
 }
 
 /// Ordinals of `log`'s objects in the store.
@@ -135,11 +135,15 @@ async fn prune_while_subscribers_backfill() {
 }
 
 async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>) -> TestServer {
+    node_with(id, store, fast()).await
+}
+
+async fn node_with(id: &str, store: &Arc<dyn object_store::ObjectStore>, retention: Option<vlpds::retention::Config>) -> TestServer {
     let (id, store) = (id.to_string(), store.clone());
     TestServer::spawn_with(move |c| {
         c.memory_store = Some(store);
         c.shards = 8;
-        c.log_retention = fast();
+        c.log_retention = retention;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
             addr: c.public_url.clone(),
@@ -236,4 +240,47 @@ async fn restart_after_pruning() {
     let (fence, fenced) = vlpds::nodelog::first_free(&vs, &old_log).await.unwrap();
     assert!(fenced);
     wait_for_objects(&vs, &old_log, &[fence]).await;
+}
+
+/// With --fence-retention past, a dead log goes entirely: `a` leaves, `b`
+/// takes its shards and prunes a's log down to its fence and then the
+/// fence, so `log/` no longer lists it. Then `b` leaves too and `c` takes
+/// every shard: their histories still name a's log, and replay over the
+/// vanished log reads nothing (it was all applied and flushed by `b`'s
+/// opens). Every record reads back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn fence_deleted_then_takeover_replays() {
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let no_fences = || fast().map(|c| vlpds::retention::Config { fence_retention: Some(Duration::ZERO), ..c });
+    let a = node_with("retf-a", &store, no_fences()).await;
+    let accounts: Vec<TestAccount> = futures::future::join_all((0..6).map(|_| a.create_account("rf"))).await;
+    let mut posts = Vec::new();
+    for (i, acct) in accounts.iter().enumerate() {
+        posts.push((acct.did.clone(), a.post(acct, &format!("on a {i}")).await));
+    }
+    let b = node_with("retf-b", &store, no_fences()).await;
+    let a_log = a.app.log.log_id.to_string();
+    let vs = b.app.store.clone();
+    vlpds::server::shutdown(&a.app).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while b.app.partitions.owned().len() < 8 {
+        assert!(Instant::now() < deadline, "b never took a's shards");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    wait_for_objects(&vs, &a_log, &[]).await;
+    assert!(!vlpds::backfill::list_logs(&vs).await.unwrap().contains(&a_log), "a's log left log/");
+    for (i, acct) in accounts.iter().enumerate() {
+        posts.push((acct.did.clone(), b.post(acct, &format!("on b {i}")).await));
+    }
+    let c = node_with("retf-c", &store, no_fences()).await;
+    vlpds::server::shutdown(&b.app).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while c.app.partitions.owned().len() < 8 {
+        assert!(Instant::now() < deadline, "c never took b's shards");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for (did, p) in &posts {
+        c.get_record(did, p.collection(), p.rkey()).await.ok();
+    }
+    c.post(&accounts[0], "on c").await;
 }

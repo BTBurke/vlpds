@@ -97,7 +97,7 @@ lazy!(LOG_LIVE_BYTES: IntGauge = register_int_gauge!("vlpds_log_live_ring_bytes"
 lazy!(LOG_STREAM_LAGGED: IntCounter = register_int_counter!("vlpds_log_stream_lagged_total", "Peer log streams dropped for falling behind the live ring (they catch up from S3)"));
 
 // ---- log retention (retention.rs) ----
-lazy!(RETENTION_DELETED_OBJECTS: IntCounterVec = register_int_counter_vec!("vlpds_retention_deleted_objects_total", "Log objects deleted by retention, by log (own, dead)", &["log"]));
+lazy!(RETENTION_DELETED_OBJECTS: IntCounterVec = register_int_counter_vec!("vlpds_retention_deleted_objects_total", "Log objects deleted by retention, by log (own, dead) or fence (a dead log's fence past --fence-retention)", &["log"]));
 lazy!(RETENTION_DELETED_BYTES: IntCounterVec = register_int_counter_vec!("vlpds_retention_deleted_bytes_total", "Log bytes deleted by retention, by log (own, dead)", &["log"]));
 lazy!(RETENTION_PRUNED_SEQ: IntGauge = register_int_gauge!("vlpds_retention_pruned_seq", "Highest seq this node has deleted from any log (older cursors get OutdatedCursor)"));
 lazy!(RETENTION_REPLAY_HOLD: IntGauge = register_int_gauge!("vlpds_retention_replay_hold_segments", "Segments of our log kept only because a crash replay could still need them (durable ordinal - replay floor)"));
@@ -126,6 +126,12 @@ lazy!(COMPACTION_POLL_MODE: IntCounterVec = register_int_counter_vec!("vlpds_com
 lazy!(LAYOUT_VERSION: IntGauge = register_int_gauge!("vlpds_shard_layout_version", "Version of the shard layout this node routes by (grows with each split/merge)"));
 lazy!(RESHARD_EVENTS: IntCounterVec = register_int_counter_vec!("vlpds_reshard_events_total", "Shard split/merge steps this node performed: planned, frozen (parents closed), split / merged (layout flipped), aborted", &["event"]));
 lazy!(RESHARD_SECONDS: Histogram = register_histogram!("vlpds_reshard_drive_seconds", "Driver time from every parent frozen to the children open (clone, assignments, flip, open)", exponential_buckets(0.01, 2.0, 14).unwrap()));
+lazy!(RESHARD_GC_PASSES: IntCounterVec = register_int_counter_vec!("vlpds_reshard_gc_passes_total", "Retired-state GC passes (src/reshard_gc.rs) by result (ok, error); the dir/assign half runs on the owner of slot 0's shard only", &["result"]));
+lazy!(RESHARD_GC_DELETED: IntCounterVec = register_int_counter_vec!("vlpds_reshard_gc_deleted_total", "Retired-state GC deletes: state_dirs (retired split/merge parents, aborted ops' clones), state_objects (their objects), assign_records", &["kind"]));
+lazy!(RESHARD_GC_RETIRED: IntGaugeVec = register_int_gauge_vec!("vlpds_reshard_gc_retired_dirs", "State dirs of shards no longer in the layout, as of the last GC pass (leader only): total, and the ones checked this pass by state: deletable, checkpoint (a clone, reader or backup still holds a checkpoint in it), grace (changed within --reshard-gc-grace), referenced (a manifest lists its SSTs although it holds no checkpoint: never deleted, investigate), other (no manifest, or an owner)", &["state"]));
+lazy!(RESHARD_GC_ORPHAN_ASSIGNS: IntGauge = register_int_gauge!("vlpds_reshard_gc_orphan_assign_records", "assign/ records of shards out of the layout whose state dir is gone, as of the last GC pass (deleted by it, bounded per pass)"));
+lazy!(FORCED_COMPACTIONS: IntCounterVec = register_int_counter_vec!("vlpds_forced_compactions_total", "Compactions this node submitted for its shards, by kind (detach: rewrite SSTs inherited from a split/merge parent; full: --full-compaction-every) and result (submitted, completed, failed: retried next pass)", &["kind", "result"]));
+lazy!(SHARDS_INHERITED: IntGauge = register_int_gauge!("vlpds_shards_with_inherited_ssts", "Shards open here still reading SSTs of a split/merge parent (external SSTs): each pins its parent's state dir until a forced compaction rewrites them"));
 
 // ---- memory ----
 lazy!(JEMALLOC: IntGaugeVec = register_int_gauge_vec!("vlpds_jemalloc_bytes", "jemalloc stats", &["stat"]));
@@ -177,7 +183,7 @@ lazy!(OBJ_DURATION: HistogramVec = register_histogram_vec!("vlpds_object_store_r
 // ---- retention ----
 lazy!(RETENTION_PASS_SECONDS: Histogram = register_histogram!("vlpds_retention_pass_seconds", "One log retention pass, ok or failed", exponential_buckets(0.01, 2.0, 14).unwrap()));
 lazy!(RETENTION_DEAD_SEGMENTS: IntGauge = register_int_gauge!("vlpds_retention_dead_log_segments", "Log objects left below the end of dead (writer gone) logs, as of the last pass that checked them all; only the dead-log pruner (owner of slot 0's shard) reports non-zero"));
-lazy!(RETENTION_DEAD_LOGS: IntGaugeVec = register_int_gauge_vec!("vlpds_retention_dead_logs", "Dead logs by state as of the last pass that checked them all: unfenced (no successor fenced it yet), needed (a shard's replay may still read it), pruning (segments inside the window, or deleting)", &["state"]));
+lazy!(RETENTION_DEAD_LOGS: IntGaugeVec = register_int_gauge_vec!("vlpds_retention_dead_logs", "Dead logs by state as of the last pass that checked them all: unfenced (no successor fenced it yet), needed (a shard's replay may still read it), pruning (segments inside the window, or deleting), fenced (pruned to its fence, which goes after --fence-retention)", &["state"]));
 
 /// Increments a gauge until dropped (in-flight counts that survive cancellation).
 pub struct InflightGuard(&'static IntGauge);

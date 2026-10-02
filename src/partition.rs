@@ -312,10 +312,31 @@ pub fn set_gc_min_age(d: Duration) {
 /// 10M-record getRepo streaming to a slow client, listRepos) must finish
 /// within it. SlateDB's default is 15 min. It also bounds how long a bulk
 /// import's replaced SSTs linger after each compaction.
-static CHECKPOINT_LIFETIME_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3600);
+// (unit tests: 1 s, so forced detaches in reshard_gc tests complete)
+static CHECKPOINT_LIFETIME_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(if cfg!(test) { 1 } else { 3600 });
 
 pub fn set_checkpoint_lifetime(d: Duration) {
     CHECKPOINT_LIFETIME_SECS.store(d.as_secs().max(60), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Tests only: [`set_checkpoint_lifetime`] without its 60 s floor (a
+/// forced detach waits out the compactor's checkpoints before SlateDB
+/// releases the parent; see `reshard_gc`).
+#[doc(hidden)]
+pub fn set_checkpoint_lifetime_unchecked(d: Duration) {
+    CHECKPOINT_LIFETIME_SECS.store(d.as_secs().max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How often each shard DB's garbage collector runs SlateDB's clone detach:
+/// once a shard reads no SST of a split/merge parent any more (in its
+/// manifest and every manifest a live checkpoint names), it deletes the
+/// checkpoint the clone pinned in the parent and drops the parent from its
+/// manifest (`reshard_gc` then deletes the parent's dir). SlateDB's default
+/// is 10 min; each run reads the shard's manifest.
+static DETACH_INTERVAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(600_000);
+
+pub fn set_detach_interval(d: Duration) {
+    DETACH_INTERVAL_MS.store((d.as_millis() as u64).max(100), std::sync::atomic::Ordering::Relaxed);
 }
 
 fn checkpoint_lifetime() -> Duration {
@@ -338,7 +359,7 @@ pub fn set_manifest_poll_interval(d: Duration) {
     MANIFEST_POLL_MS.store((d.as_millis() as u64).max(100), std::sync::atomic::Ordering::Relaxed);
 }
 
-fn manifest_poll_interval() -> Duration {
+pub(crate) fn manifest_poll_interval() -> Duration {
     if cfg!(test) {
         return Duration::from_secs(1); // unit tests wait for compaction results
     }
@@ -364,8 +385,10 @@ fn slow_poll() -> Duration {
 fn gc_options() -> slatedb::config::GarbageCollectorOptions {
     use slatedb::config::{GarbageCollectorDirectoryOptions, GarbageCollectorOptions};
     let min_age = Duration::from_secs(GC_MIN_AGE_SECS.load(std::sync::atomic::Ordering::Relaxed));
+    let detach = Duration::from_millis(if cfg!(test) { 500 } else { DETACH_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed) });
     GarbageCollectorOptions {
         compacted_options: Some(GarbageCollectorDirectoryOptions { min_age, ..Default::default() }),
+        detach_options: Some(slatedb::config::GarbageCollectorScheduleOptions { interval: Some(detach) }),
         ..Default::default()
     }
 }
@@ -519,17 +542,67 @@ pub fn db_path(store: &Store, id: ShardId) -> String {
 pub async fn clone_db(store: &Store, child: ShardId, sources: &[(ShardId, u32, u32)]) -> anyhow::Result<()> {
     use std::ops::Bound;
     anyhow::ensure!(!sources.is_empty(), "clone of shard {child} without sources");
-    let spec = |&(id, lo, hi): &(ShardId, u32, u32)| {
-        let (a, b) = crate::state::slot_range_keys(lo, hi);
-        slatedb::CloneSourceSpec::new(db_path(store, id)).with_projection_range((Bound::Included(a), Bound::Excluded(b)))
-    };
     let admin = slatedb::admin::AdminBuilder::new(db_path(store, child), store.raw.clone()).build();
-    let mut b = admin.create_clone_builder_from_source(spec(&sources[0]));
-    for s in &sources[1..] {
-        b = b.with_source(spec(s));
+    let name = clone_checkpoint_name(child);
+    // Done already (a retried or resumed op). SlateDB's own retry check
+    // wants every source named in the clone's manifest, which a source
+    // with no SSTs of its own (a split child that took no writes) isn't.
+    if admin.read_manifest(None).await?.is_some_and(|m| m.initialized()) {
+        drop_clone_checkpoints(store, &name, sources).await;
+        return Ok(());
+    }
+    // Read each source at a checkpoint of our own, named for the child, and
+    // drop it once the clone is initialized (the clone pins what it reads
+    // with its final checkpoints, which have no expiry). SlateDB would take
+    // an unnamed 5 min one, which nothing could drop for a source the
+    // clone's manifest doesn't name, and which would hold a retired parent
+    // (reshard_gc keeps a dir while any checkpoint is live). A resumed
+    // clone reuses the named one.
+    let mut specs = Vec::with_capacity(sources.len());
+    for &(id, lo, hi) in sources {
+        let src = slatedb::admin::AdminBuilder::new(db_path(store, id), store.raw.clone()).build();
+        let now = chrono::Utc::now();
+        let existing = src.list_checkpoints(Some(&name)).await?.into_iter().find(|c| c.expire_time.is_none_or(|t| t > now + chrono::Duration::minutes(5)));
+        let cp = match existing {
+            Some(c) => c.id,
+            None => src.create_detached_checkpoint(&slatedb::config::CheckpointOptions { lifetime: Some(CLONE_CHECKPOINT_LIFETIME), name: Some(name.clone()), ..Default::default() }).await?.id,
+        };
+        let (a, b) = crate::state::slot_range_keys(lo, hi);
+        specs.push(slatedb::CloneSourceSpec::with_checkpoint(db_path(store, id), cp).with_projection_range((Bound::Included(a), Bound::Excluded(b))));
+    }
+    let mut specs = specs.into_iter();
+    let mut b = admin.create_clone_builder_from_source(specs.next().expect("a source"));
+    for s in specs {
+        b = b.with_source(s);
     }
     b.build().await?;
+    drop_clone_checkpoints(store, &name, sources).await;
     Ok(())
+}
+
+/// How long a clone's source checkpoints live if the clone never gets to
+/// drop them (a driver that died mid-clone and no one resumed it).
+const CLONE_CHECKPOINT_LIFETIME: Duration = Duration::from_secs(3600);
+
+fn clone_checkpoint_name(child: ShardId) -> String {
+    format!("vlpds-clone-{}", child.key())
+}
+
+/// Deletes the source checkpoints `clone_db` took for a clone (best effort:
+/// they expire on their own).
+async fn drop_clone_checkpoints(store: &Store, name: &str, sources: &[(ShardId, u32, u32)]) {
+    for &(id, ..) in sources {
+        let src = slatedb::admin::AdminBuilder::new(db_path(store, id), store.raw.clone()).build();
+        let r = async {
+            for c in src.list_checkpoints(Some(name)).await? {
+                src.delete_checkpoint(c.id).await?;
+            }
+            anyhow::Ok(())
+        };
+        if let Err(e) = r.await {
+            tracing::debug!(shard = id.0, name, "clone source checkpoint left to expire: {e:#}");
+        }
+    }
 }
 
 const SST_BLOCK_SIZE: slatedb::SstBlockSize = slatedb::SstBlockSize::Block16Kib;
@@ -976,6 +1049,38 @@ mod clone_tests {
         let m = open_db(&store, ShardId(3), None).await.unwrap();
         assert!(m.get(k(65535, "h/zz")).await.unwrap().is_some());
         assert!(m.get(k(100, "h/new9001")).await.unwrap().is_some());
+        m.close().await.unwrap();
+    }
+
+    /// A merge whose sources have no SSTs of their own (split halves that
+    /// took no writes) names neither in the clone's manifest, only their
+    /// common ancestor: a retried clone still finds itself done (SlateDB's
+    /// own retry check wanted every source named), and no source
+    /// checkpoint is left behind, only the clones' final pins (which have
+    /// no expiry and go when a clone detaches or is deleted).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clone_retry_with_quiet_sources_leaves_only_pins() {
+        let store = Store { prefix: "cq".into(), ..Store::memory(None) };
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
+        for s in [10u16, 30000, 40000, 65000] {
+            db.put(k(s, "h/x"), format!("v{s}")).await.unwrap();
+        }
+        db.close().await.unwrap();
+        clone_db(&store, ShardId(1), &[(ShardId(0), 0, 32768)]).await.unwrap();
+        clone_db(&store, ShardId(2), &[(ShardId(0), 32768, 65536)]).await.unwrap();
+        let merge = [(ShardId(1), 0, 32768), (ShardId(2), 32768, 65536)];
+        clone_db(&store, ShardId(3), &merge).await.unwrap();
+        clone_db(&store, ShardId(3), &merge).await.expect("a retried merge of quiet sources is a no-op");
+        clone_db(&store, ShardId(1), &[(ShardId(0), 0, 32768)]).await.expect("a retried split too");
+        for id in [0u32, 1, 2] {
+            let admin = slatedb::admin::AdminBuilder::new(db_path(&store, ShardId(id)), store.raw.clone()).build();
+            let cps = admin.list_checkpoints(None).await.unwrap();
+            assert!(cps.iter().all(|c| c.expire_time.is_none() && c.name.is_none()), "shard {id}: {cps:?}");
+        }
+        let m = open_db(&store, ShardId(3), None).await.unwrap();
+        for s in [10u16, 30000, 40000, 65000] {
+            assert_eq!(m.get(k(s, "h/x")).await.unwrap().as_deref(), Some(format!("v{s}").as_bytes()));
+        }
         m.close().await.unwrap();
     }
 

@@ -159,6 +159,9 @@ pub struct Config {
     pub cache_entries: Vec<(crate::caches::Cache, usize)>,
     /// Automatic shard splits (src/reshard.rs; off by default).
     pub reshard_policy: crate::reshard::Policy,
+    /// Retired split/merge state GC and forced detach (src/reshard_gc.rs).
+    /// None = keep retired parents' state forever.
+    pub reshard_gc: Option<crate::reshard_gc::Config>,
     /// Every shard is checkpointed once per this (bounds a successor's
     /// replay; `--checkpoint-every`).
     pub checkpoint_every: Duration,
@@ -282,6 +285,7 @@ impl Default for Config {
             cache_budget_bytes: None,
             cache_entries: Vec::new(),
             reshard_policy: Default::default(),
+            reshard_gc: Some(Default::default()),
             checkpoint_every: Duration::from_secs(10),
             checkpoint_stagger: true,
             preload_recent: crate::partition::DEFAULT_RECENT_REPOS,
@@ -407,6 +411,17 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
             leader: Box::new(move || l.owner_of(l.layout().shard_of_slot(0)).is_some_and(|(o, _)| o == l.cfg.node_id)),
         };
         crate::retention::Retention::new(store.clone(), log.clone(), rc, members).spawn();
+    }
+    if let Some(gc) = cfg.reshard_gc.clone() {
+        let (l, v, t) = (cluster.clone(), cluster.clone(), table.clone());
+        let hooks = crate::reshard_gc::Hooks {
+            // like dead-log retention: the owner of the shard holding slot 0
+            leader: Box::new(move || l.owner_of(l.layout().shard_of_slot(0)).is_some_and(|(o, _)| o == l.cfg.node_id)),
+            lease_ok: Box::new(move || v.lease_valid()),
+            owned: Box::new(move || t.owned().into_iter().map(|p| (p.id, p.db.clone())).collect()),
+            crash_at: None,
+        };
+        crate::reshard_gc::ReshardGc::new(state_store.clone(), gc, hooks).spawn();
     }
     tracing::info!(
         node = %cluster.cfg.node_id, log = %cluster.log_id, writer = cluster.writer, shards = cluster.layout().shards.len(),
