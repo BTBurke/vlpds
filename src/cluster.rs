@@ -228,7 +228,8 @@ pub trait ShardHost: Send + Sync + 'static {
     /// Graceful shutdown is about to delete our lease: a node joining from
     /// now on won't count us (or greet us), and our steps (which would
     /// follow its log) have stopped, so our merged firehose must emit
-    /// nothing more (see `Cluster::try_join`).
+    /// nothing more (see `Cluster::try_join`). Our log is fenced by now:
+    /// its streams to peers end (they drain it from S3 to the fence).
     fn leaving(&self) {}
     /// Whether a TCP connect to `addr` (a peer's advertised URL) is refused:
     /// nothing listens there, so the process that holds that lease is gone.
@@ -386,6 +387,27 @@ fn is_conflict(e: &object_store::Error) -> bool {
     matches!(e, object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. })
 }
 
+/// A CAS on our node lease failed because the object isn't the one we
+/// read: changed, or deleted (S3 answers an If-Match PUT of a missing key
+/// 404, the in-memory store a precondition failure).
+fn lease_moved(e: &object_store::Error) -> bool {
+    is_conflict(e) || matches!(e, object_store::Error::NotFound { .. })
+}
+
+/// How often `join` re-reads its node lease after it changed under the
+/// join's CAS (each time a peer deleted a dead incarnation's lease, or
+/// another incarnation wrote it) before giving up.
+const JOIN_LEASE_RETRIES: u32 = 5;
+
+/// What `Cluster::recreate_vanished_lease` did.
+enum Recreate {
+    Done,
+    /// Our lease is someone else's now, or our log is fenced: fail-stop.
+    Lost,
+    /// A store call failed: the next renewal tries again.
+    Retry,
+}
+
 impl Cluster {
     /// Registers this node: checks the cluster's feature level, claims a
     /// writer id and creates its node lease. A node whose levels can't run
@@ -469,30 +491,27 @@ impl Cluster {
         if let Some(f) = before_lease {
             f.await;
         }
-        // create (or take over our own stale) node lease
-        let path = c.path(&format!("nodes/{}", c.cfg.node_id));
-        let existing = c.get_json::<NodeLease>(&path).await?;
-        let mut mode = match existing {
-            None => PutMode::Create,
-            Some((l, etag)) => {
-                // Our previous incarnation (same node id). Fence its log now:
-                // if it is somehow still running, its next PUT collides and it
-                // fail-stops; everything it acked is before the fence and gets
-                // replayed by whoever takes its shards (us).
-                if l.log_id != c.log_id {
-                    c.fence_dead(&l.log_id, "restart").await?;
-                }
-                // its merged firehose (if it still runs) settles no further
-                c.join_floor.store(l.wm_cap, Ordering::Release);
-                c.lease.write().renewals = l.renewals;
-                PutMode::Update(UpdateVersion { e_tag: etag, version: None })
-            }
-        };
+        // Create (or take over our own stale) node lease. The lease we read
+        // can vanish before our CAS lands: a peer that presumed our previous
+        // incarnation dead (its address refused connects) fenced its log and
+        // deletes the lease once its shards moved. Then we read it again
+        // (gone: create it; or another incarnation's: fence that one too).
+        let mut vanished = 0;
+        let mut mode = c.read_own_lease().await?;
         loop {
             let (writer, claim_etag) = c.claim_writer().await?;
             c.writer = writer;
             c.lease.write().writer = writer;
-            c.write_lease(mode).await?;
+            if let Err(e) = c.write_lease(mode).await {
+                if !e.downcast_ref::<object_store::Error>().is_some_and(lease_moved) || vanished == JOIN_LEASE_RETRIES {
+                    return Err(e);
+                }
+                vanished += 1;
+                tracing::warn!(attempt = vanished, "our node lease changed under the join (a peer deleted our previous incarnation's): reading it again: {e:#}");
+                crate::metrics::LEASE_EVENTS.with_label_values(&["join_lease_moved"]).inc();
+                mode = c.read_own_lease().await?;
+                continue;
+            }
             mode = PutMode::Update(UpdateVersion { e_tag: c.lease_etag.read().clone(), version: None });
             // Confirm the claim now that our lease exists (a claim is taken
             // over only while its holder has no lease). Rewriting it changes
@@ -536,6 +555,27 @@ impl Cluster {
             }
         });
         Ok(c)
+    }
+
+    /// Join: reads `nodes/{our id}` and returns how to write our lease over
+    /// it. None: create it. Another incarnation's (our previous one, same
+    /// node id): fence its log first (if it is somehow still running, its
+    /// next PUT collides and it fail-stops; everything it acked is before
+    /// the fence and gets replayed by whoever takes its shards, us), then
+    /// CAS over it.
+    async fn read_own_lease(&self) -> anyhow::Result<PutMode> {
+        let path = self.path(&format!("nodes/{}", self.cfg.node_id));
+        let Some((l, etag)) = self.get_json::<NodeLease>(&path).await? else {
+            return Ok(PutMode::Create);
+        };
+        if l.log_id != self.log_id {
+            self.fence_dead(&l.log_id, "restart").await?;
+            // its merged firehose (if it still runs) settles no further
+            self.join_floor.fetch_max(l.wm_cap, Ordering::AcqRel);
+        }
+        let mut ours = self.lease.write();
+        ours.renewals = ours.renewals.max(l.renewals);
+        Ok(PutMode::Update(UpdateVersion { e_tag: etag, version: None }))
     }
 
     /// Seconds until our lease validity ends (negative: lapsed that long ago).
@@ -1445,17 +1485,61 @@ impl Cluster {
         }
         let etag = self.lease_etag.read().clone();
         if let Err(e) = self.write_lease(PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
-            match e.downcast_ref::<object_store::Error>() {
-                Some(oe) if is_conflict(oe) => {
+            let moved = e.downcast_ref::<object_store::Error>().is_some_and(lease_moved);
+            let recreated = if moved { self.recreate_vanished_lease().await } else { Recreate::Retry };
+            match (moved, recreated) {
+                (true, Recreate::Done) => {}
+                (true, Recreate::Lost) => {
                     crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&["conflict"]).inc();
-                    tracing::error!("node lease lost (CAS conflict)");
+                    tracing::error!("node lease lost (CAS conflict): {e:#}");
                     host.lost();
                 }
-                oe => {
-                    let kind = if oe.is_some_and(crate::objstats::is_timeout) { "timeout" } else { "error" };
+                _ => {
+                    let kind = if e.downcast_ref::<object_store::Error>().is_some_and(crate::objstats::is_timeout) { "timeout" } else { "error" };
                     crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&[kind]).inc();
                     tracing::warn!("node lease renew error (will retry): {e:#}");
                 }
+            }
+        }
+    }
+
+    /// A renewal CAS failed: if our lease is simply gone and our log isn't
+    /// fenced, recreate it. A peer deletes a lease only once it has fenced
+    /// that incarnation's log (step 7), so a lease missing over our unfenced
+    /// log was our dead previous incarnation's as the peer saw it a moment
+    /// before: it read the old lease, and our join's CAS over it landed
+    /// before its delete. Rewritten, or our log fenced (we were presumed
+    /// dead): lost. A store error: retried at the next renewal (validity
+    /// runs out meanwhile, as with any failing renewal).
+    async fn recreate_vanished_lease(&self) -> Recreate {
+        let path = self.path(&format!("nodes/{}", self.cfg.node_id));
+        match self.get_json::<serde_json::Value>(&path).await {
+            Ok(None) => {}
+            Ok(Some(_)) => return Recreate::Lost,
+            Err(e) => {
+                tracing::warn!("reading our node lease after a failed renewal: {e:#}");
+                return Recreate::Retry;
+            }
+        }
+        self.count("list");
+        match self.bounded_any("fence-scan", crate::nodelog::first_free(&self.store, &self.log_id)).await {
+            Ok((_, false)) => {}
+            Ok((_, true)) => return Recreate::Lost,
+            Err(e) => {
+                tracing::warn!("checking our log for a fence: {e:#}");
+                return Recreate::Retry;
+            }
+        }
+        match self.write_lease(PutMode::Create).await {
+            Ok(()) => {
+                crate::metrics::LEASE_EVENTS.with_label_values(&["lease_recreated"]).inc();
+                tracing::warn!("our node lease vanished (a peer deleted our previous incarnation's after we took it over): recreated");
+                Recreate::Done
+            }
+            Err(e) if e.downcast_ref::<object_store::Error>().is_some_and(is_conflict) => Recreate::Lost,
+            Err(e) => {
+                tracing::warn!("recreating our vanished node lease: {e:#}");
+                Recreate::Retry
             }
         }
     }
@@ -1785,8 +1869,23 @@ impl Cluster {
         // 7. dead nodes whose shards have all moved can be forgotten
         for d in &dead {
             if !assigns.values().any(|(a, _)| a.owner.as_deref() == Some(&d.node_id)) && self.fenced.read().contains_key(&d.log_id) {
-                self.delete(&format!("nodes/{}", d.node_id)).await;
+                self.forget_dead(d).await?;
             }
+        }
+        Ok(())
+    }
+
+    /// Deletes a dead incarnation's lease, unless the node restarted since
+    /// we read it (same node id, a new log): the lease is the new
+    /// incarnation's then. Re-read just before the delete, since the read
+    /// that judged it dead may be a whole step old. (The store has no
+    /// conditional delete; a restart landing between this GET and the
+    /// DELETE recreates its lease at its next renewal, see `renew`.)
+    async fn forget_dead(&self, d: &NodeLease) -> anyhow::Result<()> {
+        let rel = format!("nodes/{}", d.node_id);
+        match self.get_json::<serde_json::Value>(&self.path(&rel)).await? {
+            Some((l, _)) if l["log_id"].as_str() == Some(d.log_id.as_str()) => self.delete(&rel).await,
+            _ => {}
         }
         Ok(())
     }
@@ -2585,7 +2684,9 @@ mod tests {
 
     /// An in-memory store that stalls chosen calls (as MinIO did in bench/ha
     /// ret3): the next call of `op` ("get", "put", "list") on a path
-    /// containing a substring waits 30 s first.
+    /// containing a substring waits 30 s first. "vanish": the next GET is
+    /// answered, then the object deleted. "conflict": the next PUT fails
+    /// its precondition.
     #[derive(Debug, Default)]
     struct Stalls {
         inner: object_store::memory::InMemory,
@@ -2620,6 +2721,9 @@ mod tests {
             if self.take("put", location.as_ref()) {
                 tokio::time::sleep(STALL).await;
             }
+            if self.take("conflict", location.as_ref()) {
+                return Err(object_store::Error::Precondition { path: location.to_string(), source: "armed conflict".into() });
+            }
             self.inner.put_opts(location, payload, opts).await
         }
         async fn put_multipart_opts(&self, location: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
@@ -2628,6 +2732,12 @@ mod tests {
         async fn get_opts(&self, location: &Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
             if self.take("get", location.as_ref()) {
                 tokio::time::sleep(STALL).await;
+            }
+            if self.take("vanish", location.as_ref()) {
+                // answered, then deleted (a peer's delete right after our read)
+                let r = self.inner.get_opts(location, options).await;
+                self.inner.delete(location).await?;
+                return r;
             }
             self.inner.get_opts(location, options).await
         }
@@ -2688,6 +2798,92 @@ mod tests {
         assert!(stalls.stalled.load(Ordering::SeqCst) >= 3, "the stalls were hit");
         assert!(b.fenced_logs().contains_key(&a.log_id));
         assert_eq!(hb.lost.load(Ordering::SeqCst), 0);
+    }
+
+    /// A same-id restart whose previous incarnation's lease vanishes between
+    /// the join's read and its CAS (a peer that presumed the old process
+    /// dead fenced its log and deleted the lease): the join creates the
+    /// lease fresh instead of failing with "precondition failure: not found".
+    #[tokio::test]
+    async fn restart_survives_its_old_lease_vanishing_mid_join() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let old = join(cfg("r"), store.clone()).await.unwrap();
+        let (_ho, ho) = host();
+        old.step(&ho).await.unwrap();
+        assert_eq!(old.owned().len(), 8);
+        let moved0 = crate::metrics::LEASE_EVENTS.with_label_values(&["join_lease_moved"]).get();
+        // the old process is gone; the restart's read of its lease is the
+        // last anyone sees of it
+        stalls.arm("vanish", "nodes/r");
+        let new = join(cfg("r"), store.clone()).await.expect("join creates the vanished lease");
+        assert_eq!(stalls.stalled.load(Ordering::SeqCst), 1, "the lease vanished after the join read it");
+        assert!(crate::metrics::LEASE_EVENTS.with_label_values(&["join_lease_moved"]).get() > moved0);
+        // same safety as a plain restart: the old log is fenced first
+        assert!(new.fenced_logs().contains_key(&old.log_id));
+        let (lease, _) = new.get_json::<NodeLease>(&new.path("nodes/r")).await.unwrap().expect("our lease");
+        assert_eq!((lease.log_id.as_str(), lease.writer), (new.log_id.as_str(), new.writer));
+        let (claim, _) = new.get_json::<serde_json::Value>(&new.path(&format!("writers/{:03}", new.writer))).await.unwrap().unwrap();
+        assert_eq!((claim["log_id"].as_str(), claim["confirmed"].as_bool()), (Some(new.log_id.as_str()), Some(true)));
+        // it renews, and takes its previous incarnation's shards back (once
+        // its seqs pass the old one's published watermark cap)
+        let (hn, hn_dyn) = host();
+        let t = Instant::now();
+        while new.owned().len() < 8 {
+            assert!(t.elapsed() < Duration::from_secs(3), "never took its shards back");
+            new.step(&hn_dyn).await.unwrap();
+        }
+        assert_eq!(hn.lost.load(Ordering::SeqCst), 0);
+        // a lease that keeps changing under the join: bounded retries
+        for _ in 0..=JOIN_LEASE_RETRIES {
+            stalls.arm("conflict", "nodes/r");
+        }
+        let err = join(cfg("r"), store.clone()).await.err().expect("bounded retries");
+        assert!(format!("{err:#}").contains("precondition"), "{err:#}");
+        assert_eq!(stalls.armed.lock().len(), 0, "every retry re-read and CASed again");
+    }
+
+    /// The lease deleted *after* the restart's CAS over the old one landed
+    /// (the peer's delete was in flight): the next renewal finds it gone
+    /// over an unfenced log and recreates it. Gone over a fenced log (we
+    /// were presumed dead), or rewritten by someone else, it is lost.
+    #[tokio::test]
+    async fn renewal_recreates_a_lease_deleted_over_an_unfenced_log() {
+        let store = Store::memory(None);
+        let (h, hd) = host();
+        let a = join(cfg("rv"), store.clone()).await.unwrap();
+        let path = a.path("nodes/rv");
+        store.raw.delete(&path).await.unwrap();
+        a.renew(&hd).await;
+        assert_eq!(h.lost.load(Ordering::SeqCst), 0);
+        let (l, _) = a.get_json::<NodeLease>(&path).await.unwrap().expect("recreated");
+        assert_eq!(l.log_id, a.log_id);
+        a.renew(&hd).await; // and renews from there
+        assert_eq!(h.lost.load(Ordering::SeqCst), 0);
+        // presumed dead: a peer fenced our log, then deleted the lease
+        let p = join(cfg("rv-peer"), store.clone()).await.unwrap();
+        p.fence(&a.log_id).await.unwrap();
+        store.raw.delete(&path).await.unwrap();
+        a.renew(&hd).await;
+        assert_eq!(h.lost.load(Ordering::SeqCst), 1);
+        assert!(a.get_json::<NodeLease>(&path).await.unwrap().is_none(), "not resurrected");
+    }
+
+    /// A peer forgets a dead incarnation's lease only if it is still that
+    /// incarnation's: the node may have restarted under the same id since
+    /// the peer judged it dead.
+    #[tokio::test]
+    async fn dead_lease_is_not_deleted_once_its_node_restarted() {
+        let store = Store::memory(None);
+        let old = join(cfg("fd"), store.clone()).await.unwrap();
+        let dead = old.own_lease();
+        let new = join(cfg("fd"), store.clone()).await.unwrap();
+        let p = join(cfg("fd-peer"), store.clone()).await.unwrap();
+        p.forget_dead(&dead).await.unwrap();
+        let (l, _) = p.get_json::<NodeLease>(&p.path("nodes/fd")).await.unwrap().expect("the restarted node's lease stays");
+        assert_eq!(l.log_id, new.log_id);
+        p.forget_dead(&new.own_lease()).await.unwrap();
+        assert!(p.get_json::<NodeLease>(&p.path("nodes/fd")).await.unwrap().is_none());
     }
 
     /// Steady state reads only what changed: one LIST of leases, one of

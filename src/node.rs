@@ -113,7 +113,7 @@ impl Node {
     /// without closing anything, as a crash would (see `Cluster::halt`).
     pub fn halt(&self) {
         self.cluster.halt();
-        self.log.halted.store(true, Ordering::Release);
+        self.log.closed.store(true, Ordering::Release);
         for p in self.table.owned() {
             self.table.set(p.id, None);
             for w in self.workers.senders.iter() {
@@ -406,6 +406,10 @@ impl ShardHost for Node {
 
     fn leaving(&self) {
         self.firehose.freeze();
+        // our log is fenced: end its streams, so peers drain it from S3 to
+        // the fence instead of trusting our (frozen) watermark for as long
+        // as this process keeps serving
+        self.log.closed.store(true, Ordering::Release);
     }
 
     fn follow_floors(&self) -> std::collections::BTreeMap<String, i64> {

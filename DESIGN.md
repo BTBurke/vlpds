@@ -332,6 +332,19 @@ swappable.
   leaving gracefully stops its merger for good before it deletes its lease
   (`Firehose::freeze`): its steps have stopped, so it would never follow a
   node joining after that, and it keeps serving for 500 ms more.
+- Streams end with their log. A log stream heartbeats its owner's
+  watermark, and a peer's merger trusts it for as long as the stream
+  lives. A node that left gracefully (log fenced, lease deleted) but kept
+  serving (in-process test nodes; a process hung past its shutdown) used
+  to keep its streams open with a frozen watermark, and every peer's
+  merged firehose stalled there. Now the owner closes its streams once its
+  shutdown has fenced the log (and refuses new ones, 410 `LogClosed`), and
+  a follower leaves a live stream within 50 ms of the log's lease no
+  longer being live in its view (deleted, presumed dead, or fenced),
+  whatever the owner still sends: it drains the log from S3 up to the
+  fence and retires it. Either side alone unblocks the merger
+  (`tests/all/firehose_startup.rs`
+  `stopped_node_still_serving_does_not_stall_its_peers`).
 
   This replaced a time-based grace (2 renew intervals, ended early by
   hellos), which lost events: `tests/all/join_follow.rs` holds one peer's
@@ -1295,6 +1308,26 @@ No node ever compares its wall clock with another node's.
   at all. After creating its lease, the claimant rewrites the claim (CAS),
   which changes its ETag, so a joiner that read it before the lease existed
   fails its CAS instead of sharing the id.
+- **Same-id restart vs a peer forgetting the dead incarnation.** A restart
+  reads `nodes/{id}` (its previous incarnation's lease), fences that log
+  and CASes its own lease over it. A peer that presumed the old process
+  dead (the refused probe makes that ~1.5 renew intervals) fences the same
+  log, takes its shards and, a step later, deletes the lease. The store
+  has no conditional delete, so the two race. The peer re-reads the lease
+  just before deleting it and leaves it if its log id changed (the node
+  restarted). If its delete still lands between the restart's read and
+  CAS (412/404), the join reads the lease again and creates it (bounded
+  retries, same fence and writer-claim rules, the level check after the
+  lease exists as before). If it lands after the CAS, the restart's next
+  renewal finds its lease missing: a lease is deleted only once its log is
+  fenced, so a lease gone over our *unfenced* log was the old one as the
+  peer saw it, and the renewal recreates it (`Create`); gone over a fenced
+  log (we were presumed dead) or rewritten, it is lost and the node
+  fail-stops as before. Before this, the first case failed the start
+  ("precondition failure for path nodes/{id}: not found") and the second
+  fail-stopped the new process at its first renewal; a supervisor restart
+  masked both (`tests/all/fast_failover.rs` orders the peer's delete
+  against each step of the join exactly).
 
 Takeover after a crash is TTL + skew after the last observed renewal, plus at
 most one step of observation delay, plus replay.

@@ -237,3 +237,63 @@ async fn start_floor_waits_for_peers_in_flight_segments() {
     let got = from_zero.await.unwrap();
     assert!(got == union, "{}", mismatch("cursor-0 subscriber attached at b's start", &got, &union));
 }
+
+/// A node shut down gracefully whose server keeps answering afterwards (an
+/// in-process test node, or a process hung past its shutdown): its log is
+/// fenced and its lease gone, but its log stream used to stay open,
+/// heartbeating a frozen watermark, so every peer's merger stalled there
+/// for as long as the process lived (tests had to `halt` the node too).
+/// Now the stream ends with the log (and a follower leaves a stream whose
+/// lease is gone): peers drain it from S3 to the fence, retire it, and
+/// their firehoses keep advancing under the writes that go on, every acked
+/// event once and in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn stopped_node_still_serving_does_not_stall_its_peers() {
+    use vlpds::cluster::ShardHost;
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let a = node("sd-a", &store).await;
+    let b = node("sd-b", &store).await;
+    let c = node("sd-c", &store).await;
+    let owned = |s: &TestServer| s.app.partitions.owned().len();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !(owned(&a) > 0 && owned(&b) > 0 && owned(&c) > 0 && owned(&a) + owned(&b) + owned(&c) == SHARDS as usize) {
+        assert!(tokio::time::Instant::now() < deadline, "the shards never spread over 3 nodes");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let accounts: Vec<TestAccount> = futures::future::join_all((0..8).map(|_| a.create_account("sd"))).await;
+    let target = Arc::new(AtomicI64::new(0));
+    let subs = vec![
+        ("a live", collect(a.subscribe(None).await, target.clone())),
+        ("b live", collect(b.subscribe(None).await, target.clone())),
+        ("a cursor 0", collect(a.subscribe(Some(0)).await, target.clone())),
+        ("b cursor 0", collect(b.subscribe(Some(0)).await, target.clone())),
+    ];
+    let writers = Writers::start(&a, &accounts);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let c_log = c.app.log.log_id.to_string();
+    vlpds::server::shutdown(&c.app).await; // and no halt: c keeps serving
+    for (name, n) in [("a", &a), ("b", &b)] {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while n.app.node.follow_floors().contains_key(&c_log) {
+            assert!(tokio::time::Instant::now() < deadline, "{name} never drained c's log to its fence");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    // the peers' firehoses settle past now, twice over, while writes go on
+    for _ in 0..2 {
+        a.settled_now().await;
+        b.settled_now().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let acked = writers.stop().await;
+    assert!(acked.len() > 100, "write load too light: {} acked", acked.len());
+    assert!(!c.app.cluster.as_ref().unwrap().halted(), "c was never halted");
+    let union = s3_union(&a, &acked).await;
+    let seqs: Vec<i64> = union.iter().map(|x| x.0).collect();
+    target.store(*seqs.last().unwrap(), Ordering::Release);
+    for (name, sub) in subs {
+        let got = sub.await.unwrap();
+        let start = if name.ends_with("live") { seqs.iter().position(|s| *s == got[0].0).expect("live subscriber's first event is in the union") } else { 0 };
+        assert!(got == union[start..], "{}", mismatch(name, &got, &union[start..]));
+    }
+}

@@ -17,7 +17,12 @@
 //! has subscribed us, it catches up from S3 after the last ordinal it
 //! delivered, then dedupes against the stream. When the peer dies, the
 //! follower drains the log from S3 up to its fence object and then retires
-//! (the host removes its firehose source). S3 reads are sequential and stop
+//! (the host removes its firehose source). A stream ends when its log does:
+//! the owner closes it (and refuses new ones) once its graceful shutdown
+//! fenced the log, and the follower leaves it as soon as the log's lease is
+//! no longer live (gone, presumed dead, fenced), whatever the owner still
+//! sends: a process outliving its lease must not hold every merger at its
+//! frozen watermark. S3 reads are sequential and stop
 //! at the first missing ordinal or the fence, so they only ever deliver the
 //! log's gap-free durable prefix, never segments a crash left past a hole.
 
@@ -31,12 +36,14 @@ use futures::{SinkExt, StreamExt};
 use object_store::ObjectStoreExt;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 const HEARTBEAT: Duration = Duration::from_millis(5);
 /// A live log stream (or its connect) silent this long is presumed dead.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often a live stream checks that its log's lease is still live.
+const LEASE_CHECK: Duration = Duration::from_millis(50);
 
 pub fn encode_batch(b: &LogBatch) -> Bytes {
     let size: usize = b.events.iter().map(|(_, f)| f.len() + 12).sum();
@@ -102,8 +109,11 @@ pub async fn serve_stream(mut ws: WebSocket, log: Arc<NodeLog>) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        if log.halted.load(Ordering::Acquire) {
-            return; // a halted test node: its connections die with it
+        if log.closed.load(Ordering::Acquire) {
+            // fenced by our shutdown (or a halted test node): the follower
+            // drains the rest from S3 up to the fence
+            let _ = ws.close().await;
+            return;
         }
         // Read the watermark *before* draining: batches covered by it were
         // broadcast before it advanced, so they are already in our queue.
@@ -169,7 +179,7 @@ pub fn follow_log(
         while !stop.load(Ordering::Acquire) {
             match addr() {
                 Some(base) => {
-                    if let Err(e) = stream_live(&log_id, &store, floor, &base, &token, &merger_tx, &wm, &mut next, &stop).await {
+                    if let Err(e) = stream_live(&log_id, &store, floor, &base, &token, &merger_tx, &wm, &mut next, &stop, &*addr).await {
                         tracing::debug!(%log_id, "log stream from {base} ended: {e:#}");
                     }
                 }
@@ -245,6 +255,7 @@ async fn stream_live(
     wm: &AtomicI64,
     next: &mut Option<u64>,
     stop: &AtomicBool,
+    addr: &(dyn Fn() -> Option<String> + Send + Sync),
 ) -> anyhow::Result<()> {
     // name the log: the address may already serve a later incarnation's log
     let url = format!("{}/internal/v1/log/stream?log={log_id}", base.replacen("http", "ws", 1));
@@ -270,6 +281,7 @@ async fn stream_live(
     // us in ws.next() forever. We never noticed the peer's lease was gone, so
     // we never drained its log to the fence, and every survivor's merged
     // firehose stalled for good (bench/ha ctr-partition).
+    let mut checked = Instant::now();
     loop {
         let msg = match first.take() {
             Some(m) => m,
@@ -280,6 +292,20 @@ async fn stream_live(
         };
         if stop.load(Ordering::Acquire) {
             return Ok(());
+        }
+        // The stream is trusted only while the log's lease is live: once
+        // it is gone or dead (fenced, presumed dead), its watermark is no
+        // promise of anything. A process whose lease is gone but whose
+        // server still answers (stuck past its shutdown, or a zombie)
+        // would otherwise heartbeat a frozen watermark forever and stall
+        // our merger. Drain the log from S3 to its fence instead.
+        if checked.elapsed() >= LEASE_CHECK {
+            checked = Instant::now();
+            if addr().is_none() {
+                tracing::info!(%log_id, "log's lease is gone: leaving its stream to drain it from S3");
+                let _ = ws.close(None).await;
+                return Ok(());
+            }
         }
         let Some(data) = msg else { continue };
         match decode(log_id, data)? {

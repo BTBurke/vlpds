@@ -392,9 +392,12 @@ pub struct NodeLog {
     /// Last durable+applied ordinal (u64::MAX = none yet).
     pub durable_ordinal: Arc<AtomicU64>,
     pub sinks: Arc<ShardSinks>,
-    /// Tests: this in-process node "crashed" (`Node::halt`): stop streaming
-    /// the log to peers, as a dead process's connections would drop.
-    pub halted: std::sync::atomic::AtomicBool,
+    /// Nothing more is streamed to peers (`remote::serve_stream` ends, new
+    /// streams are refused): a graceful shutdown fenced this log
+    /// (`Node::leaving`), or an in-process test node "crashed"
+    /// (`Node::halt`), as a dead process's connections would drop. Peers
+    /// then drain the log from S3 to its fence.
+    pub closed: std::sync::atomic::AtomicBool,
 }
 
 pub fn segment_path(store: &Store, log_id: &str, ordinal: u64) -> Path {
@@ -532,7 +535,7 @@ impl NodeLog {
             cfg.lease_ok,
             durable_ordinal.clone(),
         ));
-        Arc::new(NodeLog { log_id, tx, wm, live, durable_ordinal, sinks, halted: Default::default() })
+        Arc::new(NodeLog { log_id, tx, wm, live, durable_ordinal, sinks, closed: Default::default() })
     }
 
     /// The ordinal the next segment will get (an owner records it as the start

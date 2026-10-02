@@ -200,6 +200,10 @@ async fn stream(State(app): AppState, headers: HeaderMap, Query(q): Query<Stream
             return Err(XrpcError::bad("WrongLog", format!("this node serves log {}, not {want}", app.log.log_id)));
         }
     }
+    if app.log.closed.load(std::sync::atomic::Ordering::Acquire) {
+        // fenced on shutdown: the follower drains it from S3
+        return Err(XrpcError { status: StatusCode::GONE, error: "LogClosed".into(), message: format!("log {} is fenced", app.log.log_id) });
+    }
     let log = app.log.clone();
     Ok(ws.on_upgrade(move |socket| crate::remote::serve_stream(socket, log)))
 }
