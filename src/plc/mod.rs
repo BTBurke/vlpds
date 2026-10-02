@@ -1,26 +1,6 @@
-//! PLC identity (DESIGN.md "PLC identity"): did:plc operations, the PLC
-//! directory client, and the server's PLC rotation key.
-//!
-//! Operations follow did-method-plc (`@did-plc/lib` operations.ts / data.ts,
-//! which the reference PDS uses) byte for byte:
-//! - an operation is DAG-CBOR encoded (canonical map key order) and signed
-//!   with a rotation key: ES256K (or ES256 for a P-256 key) over the
-//!   encoding of the op without `sig`, compact 64-byte low-S, base64url
-//!   without padding in `sig`;
-//! - a DID is `did:plc:` + the first 24 chars of base32(sha256(DAG-CBOR of
-//!   the signed genesis op));
-//! - an update's `prev` is the CID (dag-cbor, sha2-256, base32 CIDv1) of the
-//!   op it follows, and it must be signed by one of that op's rotation keys
-//!   (a fork within 72 h needs a higher-priority key: [`PlcLog::apply`]).
-//!
-//! The server holds one rotation key ([`Plc`]; the reference's
-//! `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`), signs every genesis op with
-//! it, and submits ops to `--plc-url` before acknowledging the change. The
-//! key comes from a flag/env (hex) or a file holding it wrapped under the
-//! secrets-at-rest KEK (src/secrets.rs; Cloud KMS in production); it is never
-//! written to the bucket.
-//!
-//! [`mock`] is an in-process PLC directory for tests and local runs.
+//! PLC identity (DESIGN.md "PLC identity"): did:plc operations, byte for
+//! byte with did-method-plc (`@did-plc/lib`, which the reference PDS uses),
+//! the PLC directory client, and the server's PLC rotation key.
 
 use crate::cid::Cid;
 use crate::crypto::Keypair;
@@ -35,14 +15,13 @@ use std::time::{Duration, Instant};
 pub mod mock;
 
 pub const DEFAULT_PLC_URL: &str = "https://plc.directory";
-/// One PLC directory request (connect + response) gives up after this.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// Authenticated-data subject of the wrapped rotation key
-/// (`secrets::Purpose::PlcRotationKey`).
+/// Connect + response.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Of the wrapped rotation key.
 pub const ROTATION_KEY_SUBJECT: &str = "pds";
 /// The PLC directory's limits on an incoming operation (did-method-plc
 /// server constraints.ts).
-pub const MAX_OP_BYTES: usize = 4000;
+const MAX_OP_BYTES: usize = 4000;
 const MAX_AKA_ENTRIES: usize = 10;
 const MAX_AKA_LENGTH: usize = 258;
 const MAX_ROTATION_ENTRIES: usize = 10;
@@ -54,8 +33,7 @@ const MAX_ID_LENGTH: usize = 32;
 const MAX_DID_KEY_LENGTH: usize = 256;
 /// A rotation key may rewrite history signed by a lower-priority key for
 /// this long (PLC spec "recovery").
-pub const RECOVERY_WINDOW_MS: i64 = 72 * 3600 * 1000;
-/// Largest PLC directory response read.
+const RECOVERY_WINDOW_MS: i64 = 72 * 3600 * 1000;
 const MAX_RESPONSE_BYTES: usize = 256 << 10;
 
 static PLC_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -76,11 +54,10 @@ static PLC_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Ops that write to the directory (their failure alerts).
-pub const WRITE_OPS: [&str; 6] = ["create", "update_handle", "update_signing_key", "submit", "tombstone", "rotate_key"];
+/// Ops that write to the directory: their failures alert.
+const WRITE_OPS: [&str; 6] = ["create", "update_handle", "update_signing_key", "submit", "tombstone", "rotate_key"];
 
-/// Exports the write ops' counters at 0, so `increase()` sees the first
-/// failure (called at startup when PLC registration is on).
+/// Exports the write ops' counters at 0 so `increase()` sees the first failure.
 pub fn touch_metrics() {
     for op in WRITE_OPS {
         for r in ["ok", "rejected", "unavailable"] {
@@ -91,13 +68,12 @@ pub fn touch_metrics() {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum PlcError {
-    /// A malformed or invalid operation (ours or a client's).
     #[error("{0}")]
     Invalid(String),
-    /// The directory refused the operation (HTTP 4xx).
+    /// HTTP 4xx.
     #[error("PLC directory rejected the operation (HTTP {status}): {message}")]
     Rejected { status: u16, message: String },
-    /// The directory could not be reached or failed (5xx, timeout).
+    /// 5xx, timeout, connection.
     #[error("PLC directory unavailable: {0}")]
     Unavailable(String),
     #[error("DID not registered with the PLC directory: {0}")]
@@ -113,9 +89,8 @@ fn invalid(m: impl Into<String>) -> PlcError {
 }
 
 impl From<PlcError> for crate::xrpc::XrpcError {
-    /// Client mistakes are 400 InvalidRequest. A directory that refuses or
-    /// fails is a 500 InternalServerError, as in the reference (its
-    /// `PlcClientError` is not an XRPC error), with the directory's reason.
+    /// A directory that refuses or fails is a 500, as in the reference (its
+    /// `PlcClientError` is not an XRPC error).
     fn from(e: PlcError) -> crate::xrpc::XrpcError {
         match e {
             PlcError::Invalid(m) => crate::xrpc::XrpcError::bad("InvalidRequest", m),
@@ -126,12 +101,7 @@ impl From<PlcError> for crate::xrpc::XrpcError {
     }
 }
 
-// ---------------------------------------------------------------------------
-// encoding
-// ---------------------------------------------------------------------------
-
-/// DAG-CBOR of a JSON operation (maps in canonical key order; strings,
-/// arrays, null, bools and integers only, as PLC operations hold).
+/// Only what PLC operations hold: no floats, bytes or links.
 pub fn dag_cbor(v: &J) -> Result<Vec<u8>, PlcError> {
     let mut out = Vec::with_capacity(512);
     encode(v, &mut out, 0)?;
@@ -171,35 +141,28 @@ fn encode(v: &J, out: &mut Vec<u8>, depth: usize) -> Result<(), PlcError> {
     Ok(())
 }
 
-/// The CID of an operation (signed, as stored in the log): `prev` of the
-/// next one.
+/// Of the signed op: the next op's `prev`.
 pub fn op_cid(op: &J) -> Result<Cid, PlcError> {
     Ok(Cid::dag_cbor(&dag_cbor(op)?))
 }
 
-/// `did:plc:` + base32(sha256(signed genesis op))[..24] (`didForCreateOp`).
+/// `didForCreateOp`.
 pub fn did_for_genesis(op: &J) -> Result<String, PlcError> {
     let h = Sha256::digest(dag_cbor(op)?);
     Ok(format!("did:plc:{}", &crate::cid::base32_encode(&h)[..24]))
 }
 
-/// The shape of a did:plc identifier (path-safe).
+/// Also guarantees the DID is path-safe.
 pub fn valid_plc_did(did: &str) -> bool {
     did.strip_prefix("did:plc:")
         .is_some_and(|id| id.len() == 24 && id.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)))
 }
 
-// ---------------------------------------------------------------------------
-// shapes (the zod schemas of @did-plc/lib types.ts, strict)
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpType {
-    /// `plc_operation`
     Operation,
-    /// `plc_tombstone`
     Tombstone,
-    /// The legacy v1 genesis `create` (genesis only).
+    /// The legacy v1 genesis `create`.
     LegacyCreate,
 }
 
@@ -215,8 +178,8 @@ fn only_keys(m: &Map<String, J>, allowed: &[&str]) -> bool {
     m.keys().all(|k| allowed.contains(&k.as_str())) && m.len() == allowed.len()
 }
 
-/// The operation's type if `op` has exactly the fields of one (with `sig`
-/// iff `signed`).
+/// The zod schemas of @did-plc/lib types.ts, strict: exactly the fields of
+/// one type, with `sig` iff `signed`.
 pub fn op_type(op: &J, signed: bool) -> Result<OpType, PlcError> {
     let bad = || invalid("Invalid operation");
     let m = op.as_object().ok_or_else(bad)?;
@@ -248,8 +211,7 @@ pub fn op_type(op: &J, signed: bool) -> Result<OpType, PlcError> {
     }
 }
 
-/// A legacy `create` as the equivalent `plc_operation` (`normalizeOp`);
-/// other ops unchanged.
+/// `normalizeOp`: a legacy `create` as the equivalent `plc_operation`.
 pub fn normalize(op: &J) -> J {
     if op["type"] != "create" {
         return op.clone();
@@ -268,7 +230,6 @@ pub fn normalize(op: &J) -> J {
     n
 }
 
-/// The strings of an op's `rotationKeys` (normalized).
 pub fn rotation_keys(op: &J) -> Vec<String> {
     normalize(op)["rotationKeys"].as_array().map(|a| a.iter().filter_map(|k| k.as_str().map(str::to_string)).collect()).unwrap_or_default()
 }
@@ -281,8 +242,8 @@ pub fn ensure_http_prefix(s: &str) -> String {
     }
 }
 
-/// `at://` + the handle (JS `replace` drops the first `http://` and the
-/// first `https://`).
+/// Like the reference's JS `replace`, drops only the first `http://` and
+/// the first `https://`.
 pub fn ensure_atproto_prefix(s: &str) -> String {
     if s.starts_with("at://") {
         return s.to_string();
@@ -290,7 +251,7 @@ pub fn ensure_atproto_prefix(s: &str) -> String {
     format!("at://{}", s.replacen("http://", "", 1).replacen("https://", "", 1))
 }
 
-/// The unsigned atproto operation (`formatAtprotoOp`).
+/// `formatAtprotoOp`.
 pub fn format_atproto_op(signing_key: &str, handle: &str, pds: &str, rotation_keys: &[String], prev: Option<&str>) -> J {
     json!({
         "type": "plc_operation",
@@ -302,8 +263,7 @@ pub fn format_atproto_op(signing_key: &str, handle: &str, pds: &str, rotation_ke
     })
 }
 
-/// Whether `k` is a did:key this PDS can verify (secp256k1 or P-256,
-/// compressed).
+/// Compressed secp256k1 or P-256.
 pub fn valid_did_key(k: &str) -> bool {
     let Some(mb) = k.strip_prefix("did:key:z") else { return false };
     match bs58::decode(mb).into_vec() {
@@ -312,12 +272,6 @@ pub fn valid_did_key(k: &str) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// signatures
-// ---------------------------------------------------------------------------
-
-/// Signs an unsigned operation (no `sig`) with `key`: hedged, low-S, and
-/// verified before it is returned (`Keypair::sign_verified`).
 pub fn sign(unsigned: J, key: &Keypair) -> Result<J, PlcError> {
     let J::Object(mut m) = unsigned else { return Err(invalid("operation must be an object")) };
     if m.contains_key("sig") {
@@ -329,9 +283,9 @@ pub fn sign(unsigned: J, key: &Keypair) -> Result<J, PlcError> {
     Ok(J::Object(m))
 }
 
-/// The did:key in `allowed` whose signature `op` carries (`assureValidSig`):
-/// base64url without padding (strict: no `=`, no stray bits, no
-/// whitespace), compact 64-byte low-S ECDSA over the op without `sig`.
+/// `assureValidSig`: returns the did:key in `allowed` that signed. The
+/// base64url is strict (no `=`, stray bits or whitespace), as the interop
+/// vectors require.
 pub fn verify_sig(allowed: &[String], op: &J) -> Result<String, PlcError> {
     let bad = || invalid("Invalid signature on op");
     let m = op.as_object().ok_or_else(bad)?;
@@ -353,8 +307,7 @@ pub fn verify_sig(allowed: &[String], op: &J) -> Result<String, PlcError> {
     Err(bad())
 }
 
-/// A genesis op: signed by one of its own rotation keys, `prev` null, and
-/// hashing to `did` (`assureValidCreationOp`). Returns the normalized op.
+/// `assureValidCreationOp`. Returns the normalized op.
 pub fn assure_valid_creation_op(did: &str, op: &J) -> Result<J, PlcError> {
     match op_type(op, true)? {
         OpType::Tombstone => return Err(invalid("Operations not correctly ordered")),
@@ -372,8 +325,7 @@ pub fn assure_valid_creation_op(did: &str, op: &J) -> Result<J, PlcError> {
     Ok(n)
 }
 
-/// The PLC directory's checks on an incoming op (`assertValidIncomingOp`):
-/// size, shape (`plc_operation` or `plc_tombstone`) and field limits.
+/// The directory's `assertValidIncomingOp`.
 pub fn assert_valid_incoming(op: &J) -> Result<OpType, PlcError> {
     if dag_cbor(op)?.len() > MAX_OP_BYTES {
         return Err(invalid(format!("Operation too large ({MAX_OP_BYTES} bytes maximum in cbor encoding)")));
@@ -438,10 +390,6 @@ pub fn assert_valid_incoming(op: &J) -> Result<OpType, PlcError> {
     Ok(t)
 }
 
-// ---------------------------------------------------------------------------
-// the log state machine (assureValidNextOp)
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug)]
 pub struct LogEntry {
     pub op: J,
@@ -450,8 +398,8 @@ pub struct LogEntry {
     pub created_at_ms: i64,
 }
 
-/// One DID's operation log as the PLC directory keeps it: every accepted op,
-/// with the ones a recovery fork rewrote marked nullified.
+/// One DID's log as the directory keeps it: ops a recovery fork rewrote stay,
+/// marked nullified.
 #[derive(Clone, Debug)]
 pub struct PlcLog {
     pub did: String,
@@ -463,14 +411,11 @@ impl PlcLog {
         PlcLog { did: did.to_string(), entries: Vec::new() }
     }
 
-    /// The latest op still in the canonical history.
     pub fn last(&self) -> Option<&LogEntry> {
         self.entries.iter().rev().find(|e| !e.nullified)
     }
 
-    /// Validates `op` as the next operation at `at_ms` (did-method-plc
-    /// `assureValidNextOp`) and appends it, nullifying the ops a recovery
-    /// fork replaces.
+    /// did-method-plc `assureValidNextOp`, then appends.
     pub fn apply(&mut self, op: J, at_ms: i64) -> Result<(), PlcError> {
         let misordered = || invalid("Operations not correctly ordered");
         let active: Vec<usize> = (0..self.entries.len()).filter(|&i| !self.entries[i].nullified).collect();
@@ -517,14 +462,14 @@ impl PlcLog {
         Ok(())
     }
 
-    /// `/data` of the DID (None once tombstoned or empty).
+    /// None once tombstoned or empty.
     pub fn data(&self) -> Option<J> {
         op_to_data(&self.did, &self.last()?.op)
     }
 }
 
-/// The document data an op describes (`opToData`); None for a tombstone.
-pub fn op_to_data(did: &str, op: &J) -> Option<J> {
+/// `opToData`.
+fn op_to_data(did: &str, op: &J) -> Option<J> {
     if op["type"] == "plc_tombstone" {
         return None;
     }
@@ -538,7 +483,7 @@ pub fn op_to_data(did: &str, op: &J) -> Option<J> {
     }))
 }
 
-/// The DID document of document data (`formatDidDoc`).
+/// `formatDidDoc`.
 pub fn format_did_doc(data: &J) -> J {
     let did = data["did"].as_str().unwrap_or("");
     let mut context = vec!["https://www.w3.org/ns/did/v1".to_string(), "https://w3id.org/security/multikey/v1".to_string()];
@@ -578,12 +523,6 @@ pub fn format_did_doc(data: &J) -> J {
     })
 }
 
-// ---------------------------------------------------------------------------
-// directory client
-// ---------------------------------------------------------------------------
-
-/// HTTP client of a PLC directory (`--plc-url`; https://plc.directory, or a
-/// local did-method-plc server / [`mock::MockPlc`]).
 #[derive(Clone)]
 pub struct PlcClient {
     url: String,
@@ -595,10 +534,6 @@ impl PlcClient {
         PlcClient { url: url.trim_end_matches('/').to_string(), http: crate::http::public().clone() }
     }
 
-    pub fn url(&self) -> &str {
-        &self.url
-    }
-
     fn did_url(&self, did: &str, suffix: &str) -> Result<String, PlcError> {
         if !valid_plc_did(did) {
             return Err(invalid(format!("not a did:plc identifier: {did}")));
@@ -606,11 +541,9 @@ impl PlcClient {
         Ok(format!("{}/{did}{suffix}", self.url))
     }
 
-    /// Runs one request with the timeout and records it. `json`: a 2xx body
-    /// is parsed as JSON (the GETs); otherwise it is ignored: the directory
-    /// answers an accepted `POST /{did}` with `res.sendStatus(200)`, a
-    /// text/plain "OK" (did-method-plc server routes.ts), and any 2xx means
-    /// the op was applied.
+    /// `json`: parse a 2xx body (the GETs). An accepted `POST /{did}` gets a
+    /// text/plain "OK" (did-method-plc `res.sendStatus(200)`), so POST bodies
+    /// are ignored: any 2xx means the op was applied.
     async fn call(&self, op: &'static str, rb: reqwest::RequestBuilder, did: &str, json: bool) -> Result<Option<J>, PlcError> {
         let t = Instant::now();
         let r = tokio::time::timeout(REQUEST_TIMEOUT, async {
@@ -651,19 +584,16 @@ impl PlcClient {
         r
     }
 
-    /// The latest op in the DID's log (`GET /{did}/log/last`).
     pub async fn last_op(&self, did: &str) -> Result<J, PlcError> {
         let url = self.did_url(did, "/log/last")?;
         self.call("get_last_op", self.http.get(url), did, true).await?.ok_or_else(|| PlcError::Unavailable("empty response".into()))
     }
 
-    /// The DID's document data (`GET /{did}/data`).
     pub async fn document_data(&self, did: &str) -> Result<J, PlcError> {
         let url = self.did_url(did, "/data")?;
         self.call("get_data", self.http.get(url), did, true).await?.ok_or_else(|| PlcError::Unavailable("empty response".into()))
     }
 
-    /// Submits an op (`POST /{did}`); `op_label` names it in metrics.
     pub async fn send(&self, did: &str, op: &J, op_label: &'static str) -> Result<(), PlcError> {
         let url = self.did_url(did, "")?;
         self.call(op_label, self.http.post(url).json(op), did, false).await.map(|_| ())
@@ -683,23 +613,13 @@ async fn read_capped(r: reqwest::Response) -> Result<Vec<u8>, PlcError> {
     Ok(buf)
 }
 
-// ---------------------------------------------------------------------------
-// configuration and the server's rotation key
-// ---------------------------------------------------------------------------
-
-/// Whether account DIDs are registered with a PLC directory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PlcMode {
-    /// `directory` when a rotation key is configured; otherwise
-    /// `unregistered` in dev mode and a startup error outside it.
+    /// `Directory` with a rotation key, else `Unregistered` (dev mode only).
     #[default]
     Auto,
-    /// Genesis ops are submitted to `--plc-url`; handle and signing-key
-    /// changes are PLC updates; the PLC operation endpoints work.
     Directory,
-    /// Dev/test/bench only: DIDs are minted locally and never registered
-    /// (they resolve only on this server); the PLC operation endpoints answer
-    /// 501. Refused outside dev mode.
+    /// Dev/test/bench only: local DIDs, never registered.
     Unregistered,
 }
 
@@ -715,16 +635,13 @@ impl std::str::FromStr for PlcMode {
     }
 }
 
-/// Where the server's rotation key comes from. Never printed.
+/// Never printed.
 #[derive(Clone)]
 pub enum RotationKey {
-    /// 64 hex chars (`--plc-rotation-key`, the reference's
-    /// `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`).
     Hex(zeroize::Zeroizing<String>),
-    /// `vw1.…` wrapped under the KEK (`--plc-rotation-key-file`), unwrapped
-    /// at startup.
+    /// Under the KEK; unwrapped at startup.
     Wrapped(String),
-    /// An in-process key (tests).
+    /// Tests.
     Key(Arc<Keypair>),
 }
 
@@ -739,9 +656,7 @@ impl std::fmt::Debug for RotationKey {
 }
 
 impl RotationKey {
-    /// A rotation-key file: a `vw1.` wrapped blob (`vlpds
-    /// --wrap-plc-rotation-key`), or the key as 64 hex chars (a mounted
-    /// secret, never the bucket).
+    /// A `vw1.` wrapped blob, or 64 hex chars (a mounted secret).
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<RotationKey> {
         let s = zeroize::Zeroizing::new(
             std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading PLC rotation key file {}: {e}", path.display()))?,
@@ -758,7 +673,6 @@ impl RotationKey {
         Ok(RotationKey::Hex(zeroize::Zeroizing::new(t.to_string())))
     }
 
-    /// The key itself (a wrapped one is unwrapped with `secrets`).
     pub async fn load(&self, secrets: &crate::secrets::Secrets) -> anyhow::Result<Arc<Keypair>> {
         let key = match self {
             RotationKey::Key(k) => return Ok(k.clone()),
@@ -780,31 +694,24 @@ impl RotationKey {
     }
 }
 
-/// Wraps a rotation key under the keyring's current KEK (the
-/// `--plc-rotation-key-file` form).
+/// The `--plc-rotation-key-file` form.
 pub async fn wrap_rotation_key(secrets: &crate::secrets::Secrets, key: &Keypair) -> Result<String, crate::secrets::SecretError> {
     secrets.wrap(crate::secrets::Purpose::PlcRotationKey, ROTATION_KEY_SUBJECT, &key.to_bytes()).await
 }
 
-/// PLC settings (`--plc-mode`, `--plc-rotation-key[-file]`,
-/// `--plc-recovery-did-key`; the directory is `Config::plc_url`).
 #[derive(Clone, Debug, Default)]
 pub struct PlcConfig {
     pub mode: PlcMode,
     pub rotation_key: Option<RotationKey>,
-    /// A server-wide recovery did:key put ahead of the server's rotation key
-    /// in every genesis op and recommendation (reference
-    /// `PDS_RECOVERY_DID_KEY`).
+    /// Put ahead of the server's rotation key in every genesis op and
+    /// recommendation (reference `PDS_RECOVERY_DID_KEY`).
     pub recovery_did_key: Option<String>,
-    /// Previous server rotation keys (`--plc-rotation-key-old-file`): kept
-    /// to sign updates of DIDs that still list them, each such update
-    /// replacing them with the current key (server key rotation; RUNBOOK
-    /// "PLC rotation key rotation").
+    /// Sign updates of DIDs that still list them, each such update replacing
+    /// them with the current key.
     pub old_rotation_keys: Vec<RotationKey>,
 }
 
 impl PlcConfig {
-    /// The mode in force: `Auto` resolved.
     pub fn effective_mode(&self) -> PlcMode {
         match (self.mode, &self.rotation_key) {
             (PlcMode::Auto, Some(_)) => PlcMode::Directory,
@@ -813,8 +720,6 @@ impl PlcConfig {
         }
     }
 
-    /// Startup check (the binary's `Config::check_secrets`): outside dev
-    /// mode DIDs must be registered, so a rotation key is required.
     pub fn check(&self, dev_mode: bool, plc_url: &str) -> anyhow::Result<()> {
         match (self.mode, &self.rotation_key) {
             (PlcMode::Unregistered, _) if !dev_mode => {
@@ -842,7 +747,6 @@ impl PlcConfig {
     }
 }
 
-/// The server's PLC identity service: its rotation key and the directory.
 pub struct Plc {
     pub client: PlcClient,
     key: Arc<Keypair>,
@@ -850,24 +754,21 @@ pub struct Plc {
     recovery_did_key: Option<String>,
     /// Retired server rotation keys and their did:keys.
     old: Vec<(Arc<Keypair>, String)>,
-    /// Per-DID update locks ([`Plc::update`]): this node's updates of one
-    /// DID (handle, signing key, tombstone, key rotation) build on each
-    /// other instead of forking `prev`.
+    /// This node's updates of one DID build on each other instead of forking
+    /// `prev`.
     locks: parking_lot::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
-/// Attempts of one update when another op lands between reading the log
-/// and submitting (a `prev` race, from another node or a user's key).
+/// Another op may land between reading the log and submitting (another
+/// node, or a user's own key).
 const UPDATE_ATTEMPTS: usize = 4;
 
-/// What [`Plc::rotate_server_key`] found (or did) for one DID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyRotation {
-    /// The DID already lists the current server key.
     Current,
-    /// It listed a retired server key, now replaced (or, dry run, to replace).
+    /// A retired server key was (or, in a dry run, would be) replaced.
     Rotated,
-    /// It lists none of this server's keys (migrated away, or never ours).
+    /// Lists none of this server's keys: migrated away, or never ours.
     Foreign,
 }
 
@@ -883,7 +784,6 @@ impl Plc {
         Plc { client: PlcClient::new(plc_url), key, did_key, recovery_did_key, old: Vec::new(), locks: Default::default() }
     }
 
-    /// This node's update lock of `did`.
     async fn lock(&self, did: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let m = {
             let mut g = self.locks.lock();
@@ -902,14 +802,11 @@ impl Plc {
         m.lock_owned().await
     }
 
-    /// Read-modify-write of the DID's log: `build` makes the op following
-    /// the last one (None: nothing to submit), which is submitted as
-    /// `label`. Updates of one DID are serialized on this node; when the
-    /// directory refuses the op because another one landed after the log
-    /// was read (any node, or a user's own rotation key: a same-key fork is
-    /// refused), the update is rebuilt on the new last op and retried, so
-    /// concurrent updates of different fields (handle, signing key) both
-    /// land instead of one failing. Ok(false): nothing submitted.
+    /// `build` makes the op following the last one (None: nothing to
+    /// submit). When the directory refuses it because another op landed
+    /// meanwhile (a same-key fork is refused), it is rebuilt on the new last
+    /// op, so concurrent updates of different fields both land. Ok(false):
+    /// nothing submitted.
     async fn update(&self, did: &str, label: &'static str, build: impl Fn(&J) -> Result<Option<J>, PlcError>) -> Result<bool, PlcError> {
         let _g = self.lock(did).await;
         let mut attempt = 0;
@@ -932,29 +829,18 @@ impl Plc {
         }
     }
 
-    /// Adds retired rotation keys (signing updates of DIDs that still list
-    /// them).
-    pub fn with_old_keys(mut self, keys: Vec<Arc<Keypair>>) -> Plc {
-        self.old = keys.into_iter().map(|k| (k.clone(), k.did_key())).filter(|(_, d)| *d != self.did_key).collect();
-        self
-    }
-
-    /// Whether `did_key` is one of this server's rotation keys (current or
-    /// retired).
+    /// Current or retired.
     pub fn is_server_key(&self, did_key: &str) -> bool {
         did_key == self.did_key || self.old.iter().any(|(_, d)| d == did_key)
     }
 
-    /// Whether `did_key` is this deployment's (a server rotation key or
-    /// the operator's `--plc-recovery-did-key`): ops it signs go through
-    /// this PDS or its operator.
+    /// Ops this key signs go through this PDS or its operator.
     pub fn is_operator_key(&self, did_key: &str) -> bool {
         self.is_server_key(did_key) || self.recovery_did_key.as_deref() == Some(did_key)
     }
 
-    /// The server key to sign the op following `last` with: the current key
-    /// if `last` lists it, else a retired one it lists, else the current key
-    /// (the directory will refuse it).
+    /// The current key if `last` lists it, else a retired one it lists, else
+    /// the current key (which the directory will refuse). The bool: retired.
     fn signer_for(&self, last: &J) -> (&Arc<Keypair>, bool) {
         let keys = rotation_keys(last);
         if keys.contains(&self.did_key) {
@@ -966,7 +852,7 @@ impl Plc {
         }
     }
 
-    /// The service for `cfg` (None when DIDs are not registered).
+    /// None when DIDs are not registered.
     pub async fn from_config(
         cfg: &PlcConfig,
         plc_url: &str,
@@ -982,32 +868,31 @@ impl Plc {
             }
             _ => {
                 let src = cfg.rotation_key.as_ref().ok_or_else(|| anyhow::anyhow!("--plc-mode directory needs a PLC rotation key"))?;
-                let key = src.load(secrets).await?;
-                let mut old = Vec::new();
+                let mut plc = Plc::new(plc_url, src.load(secrets).await?, cfg.recovery_did_key.clone());
                 for k in &cfg.old_rotation_keys {
-                    old.push(k.load(secrets).await?);
+                    let k = k.load(secrets).await?;
+                    let d = k.did_key();
+                    if d != plc.did_key {
+                        plc.old.push((k, d));
+                    }
                 }
                 touch_metrics();
-                let plc = Plc::new(plc_url, key, cfg.recovery_did_key.clone()).with_old_keys(old);
                 tracing::info!(plc_url, rotation_key = plc.did_key, retired_keys = plc.old.len(), "PLC registration on");
                 Ok(Some(Arc::new(plc)))
             }
         }
     }
 
-    /// The server rotation key's did:key.
     pub fn rotation_did_key(&self) -> &str {
         &self.did_key
     }
 
-    /// getRecommendedDidCredentials `rotationKeys`: [recovery?, server].
+    /// getRecommendedDidCredentials `rotationKeys`.
     pub fn recommended_rotation_keys(&self) -> Vec<String> {
         self.recovery_did_key.iter().cloned().chain([self.did_key.clone()]).collect()
     }
 
-    /// The signed genesis op of a new account and its DID (reference
-    /// `formatDidAndPlcOp`): rotation keys [user recovery key?, server
-    /// recovery key?, server rotation key].
+    /// Reference `formatDidAndPlcOp`, including its rotation key order.
     pub fn genesis(&self, signing_did_key: &str, handle: &str, pds: &str, user_recovery_key: Option<&str>) -> Result<(String, J), PlcError> {
         let rotation_keys: Vec<String> =
             user_recovery_key.map(str::to_string).into_iter().chain(self.recovery_did_key.clone()).chain([self.did_key.clone()]).collect();
@@ -1015,15 +900,9 @@ impl Plc {
         Ok((did_for_genesis(&op)?, op))
     }
 
-    /// Signs an unsigned op with the server rotation key.
-    pub fn sign(&self, unsigned: J) -> Result<J, PlcError> {
-        sign(unsigned, &self.key)
-    }
-
-    /// `createUpdateOp`: the op following `last` (prev = its CID), built by
-    /// `f` from `last` normalized without `sig`/`prev`, signed with the
-    /// server rotation key. If `last` lists only a retired server key, that
-    /// key signs, and the op lists the current key in its place.
+    /// `createUpdateOp`: `f` edits `last` normalized without `sig`/`prev`.
+    /// If `last` lists only a retired server key, that key signs, and the op
+    /// lists the current key in its place.
     pub fn update_op(&self, last: &J, f: impl FnOnce(&mut Map<String, J>) -> Result<(), PlcError>) -> Result<J, PlcError> {
         match op_type(last, true)? {
             OpType::Tombstone => return Err(PlcError::Tombstoned),
@@ -1055,9 +934,6 @@ impl Plc {
         sign(unsigned, signer)
     }
 
-    /// Replaces a retired server rotation key in the DID's rotation keys
-    /// with the current one (an update signed by the retired key). `dry`:
-    /// only report.
     pub async fn rotate_server_key(&self, did: &str, dry: bool) -> Result<KeyRotation, PlcError> {
         let last = self.last_op(did).await?;
         let keys = rotation_keys(&last);
@@ -1080,23 +956,19 @@ impl Plc {
         Ok(KeyRotation::Rotated)
     }
 
-    /// The DID's last op, refusing a tombstoned DID (`ensureLastOp`).
+    /// `ensureLastOp`.
     pub async fn last_op(&self, did: &str) -> Result<J, PlcError> {
         let last = self.client.last_op(did).await?;
-        if last["type"] == "plc_tombstone" {
-            return Err(PlcError::Tombstoned);
-        }
+        not_tombstone(&last)?;
         Ok(last)
     }
 
-    /// Registers a genesis op (`sendOperation`).
     pub async fn create(&self, did: &str, op: &J) -> Result<(), PlcError> {
         self.client.send(did, op, "create").await
     }
 
-    /// Points the DID's `at://` alias at `handle` (`updateHandleOp`: the
-    /// first `at://` entry replaced, else prepended). Ok(false): the log
-    /// already says so and nothing was submitted.
+    /// `updateHandleOp`: the first `at://` entry replaced, else prepended.
+    /// Ok(false): already so, nothing submitted.
     pub async fn update_handle(&self, did: &str, handle: &str) -> Result<bool, PlcError> {
         let formatted = ensure_atproto_prefix(handle);
         self.update(did, "update_handle", |last| {
@@ -1119,8 +991,7 @@ impl Plc {
         .await
     }
 
-    /// Sets the DID's `atproto` verification method (`updateAtprotoKeyOp`).
-    /// Ok(false): already that key.
+    /// `updateAtprotoKeyOp`. Ok(false): already that key.
     pub async fn update_signing_key(&self, did: &str, signing_did_key: &str) -> Result<bool, PlcError> {
         self.update(did, "update_signing_key", |last| {
             if normalize(not_tombstone(last)?)["verificationMethods"]["atproto"] == signing_did_key {
@@ -1136,8 +1007,7 @@ impl Plc {
         .await
     }
 
-    /// Tombstones the DID (`tombstone`): undoing a genesis op whose account
-    /// creation failed afterwards.
+    /// Undoes a genesis op whose account creation failed afterwards.
     pub async fn tombstone(&self, did: &str) -> Result<(), PlcError> {
         self.update(did, "tombstone", |last| {
             let last = not_tombstone(last)?;
@@ -1148,7 +1018,6 @@ impl Plc {
     }
 }
 
-/// `ensureLastOp`'s refusal of a tombstoned DID.
 fn not_tombstone(last: &J) -> Result<&J, PlcError> {
     if last["type"] == "plc_tombstone" {
         return Err(PlcError::Tombstoned);
@@ -1306,7 +1175,7 @@ mod tests {
         let stranger = Plc::new("http://127.0.0.1:1", Arc::new(Keypair::generate()), None);
         assert!(log.clone().apply(stranger.update_op(&upd, |_| Ok(())).unwrap(), 3).is_err());
         // tombstone, then nothing more
-        let tomb = plc.sign(json!({"type": "plc_tombstone", "prev": op_cid(&upd).unwrap().to_string()})).unwrap();
+        let tomb = sign(json!({"type": "plc_tombstone", "prev": op_cid(&upd).unwrap().to_string()}), &rot).unwrap();
         log.apply(tomb.clone(), 4).unwrap();
         assert!(log.data().is_none());
         assert!(matches!(plc.update_op(&tomb, |_| Ok(())), Err(PlcError::Tombstoned)));

@@ -1,9 +1,6 @@
-//! An in-process PLC directory for tests and local runs: accepts operations
-//! with the directory's own checks (`assert_valid_incoming`, then
-//! [`PlcLog::apply`]: genesis hash, signature chain, recovery forks,
-//! tombstones) and serves `GET /{did}`, `/{did}/data`, `/{did}/log`,
-//! `/{did}/log/audit`, `/{did}/log/last`. Not the real thing: no rate
-//! limits, no export, state in memory. Failures can be injected.
+//! An in-process PLC directory for tests, with the directory's own checks
+//! on incoming ops. Serves only what the PDS reads: `GET /{did}`,
+//! `/{did}/data` and `/{did}/log/last`. Failures can be injected.
 
 use super::{assert_valid_incoming, format_did_doc, PlcLog};
 use axum::extract::{Path, State};
@@ -22,16 +19,14 @@ struct Inner {
     logs: Mutex<HashMap<String, PlcLog>>,
     /// POSTs answered with this status (count, status) before validation.
     fail_posts: Mutex<(u32, u16)>,
-    /// Every request answered 503.
     down: AtomicBool,
     /// Ops applied just before the next POST of their DID is handled, as if
     /// another writer had landed between that client's read and its submit.
     race: Mutex<HashMap<String, Vec<J>>>,
     posts: AtomicU64,
-    accepted: AtomicU64,
 }
 
-/// A running mock directory (served until the process exits).
+/// Served until the process exits.
 #[derive(Clone)]
 pub struct MockPlc {
     pub url: String,
@@ -43,14 +38,11 @@ fn err(status: StatusCode, message: impl Into<String>) -> Response {
 }
 
 impl MockPlc {
-    /// Binds 127.0.0.1:0 and serves in a background task.
     pub async fn start() -> MockPlc {
         let inner = Arc::new(Inner::default());
         let app = axum::Router::new()
             .route("/{did}", get(doc).post(post_op))
             .route("/{did}/data", get(data))
-            .route("/{did}/log", get(log))
-            .route("/{did}/log/audit", get(audit))
             .route("/{did}/log/last", get(last))
             .with_state(inner.clone());
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind mock PLC");
@@ -61,13 +53,11 @@ impl MockPlc {
         MockPlc { url, inner }
     }
 
-    /// The next `n` POSTs fail with `status` (and change nothing).
     pub fn fail_posts(&self, n: u32, status: u16) {
         *self.inner.fail_posts.lock() = (n, status);
     }
 
-    /// Before the next POST for `did` is handled, `op` is applied (a
-    /// concurrent writer winning the race for `prev`).
+    /// A concurrent writer winning the race for `prev`.
     pub fn race_next_post(&self, did: &str, op: J) {
         self.inner.race.lock().entry(did.to_string()).or_default().push(op);
     }
@@ -77,16 +67,11 @@ impl MockPlc {
         self.inner.down.store(down, Ordering::SeqCst);
     }
 
-    /// POSTs received / accepted.
     pub fn posts(&self) -> u64 {
         self.inner.posts.load(Ordering::SeqCst)
     }
 
-    pub fn accepted(&self) -> u64 {
-        self.inner.accepted.load(Ordering::SeqCst)
-    }
-
-    /// The DID's accepted ops, oldest first (nullified ones included).
+    /// Oldest first, nullified ones included.
     pub fn ops(&self, did: &str) -> Vec<J> {
         self.inner.logs.lock().get(did).map(|l| l.entries.iter().map(|e| e.op.clone()).collect()).unwrap_or_default()
     }
@@ -95,7 +80,6 @@ impl MockPlc {
         self.inner.logs.lock().get(did).and_then(|l| l.last().map(|e| e.op.clone()))
     }
 
-    /// `/data` of the DID (None: unknown or tombstoned).
     pub fn data(&self, did: &str) -> Option<J> {
         self.inner.logs.lock().get(did).and_then(PlcLog::data)
     }
@@ -140,30 +124,6 @@ async fn data(State(s): State<Arc<Inner>>, Path(did): Path<String>) -> Response 
     }
 }
 
-async fn log(State(s): State<Arc<Inner>>, Path(did): Path<String>) -> Response {
-    match known(&s, &did) {
-        Ok(l) => Json(l.entries.iter().filter(|e| !e.nullified).map(|e| e.op.clone()).collect::<Vec<_>>()).into_response(),
-        Err(r) => r,
-    }
-}
-
-async fn audit(State(s): State<Arc<Inner>>, Path(did): Path<String>) -> Response {
-    match known(&s, &did) {
-        Ok(l) => Json(
-            l.entries
-                .iter()
-                .map(|e| {
-                    let at = chrono::DateTime::from_timestamp_millis(e.created_at_ms).unwrap_or_default();
-                    json!({"did": did, "operation": e.op, "cid": e.cid, "nullified": e.nullified,
-                        "createdAt": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)})
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(r) => r,
-    }
-}
-
 async fn last(State(s): State<Arc<Inner>>, Path(did): Path<String>) -> Response {
     match known(&s, &did) {
         Ok(l) => Json(l.last().map(|e| e.op.clone()).unwrap_or(J::Null)).into_response(),
@@ -198,7 +158,6 @@ async fn post_op(State(s): State<Arc<Inner>>, Path(did): Path<String>, body: axu
     for raced in s.race.lock().remove(&did).unwrap_or_default() {
         let at = now_ms().max(l.entries.last().map_or(0, |e| e.created_at_ms + 1));
         if l.apply(raced, at).is_ok() {
-            s.accepted.fetch_add(1, Ordering::SeqCst);
             logs.insert(did.clone(), l.clone());
         }
     }
@@ -207,7 +166,6 @@ async fn post_op(State(s): State<Arc<Inner>>, Path(did): Path<String>, body: axu
     match l.apply(op, at) {
         Ok(()) => {
             logs.insert(did, l);
-            s.accepted.fetch_add(1, Ordering::SeqCst);
             // the directory answers `res.sendStatus(200)`: text/plain "OK"
             ([(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")], "OK").into_response()
         }
