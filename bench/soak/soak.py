@@ -86,7 +86,6 @@ S3_URL = os.environ.get("BENCH_S3", "http://127.0.0.1:9200")
 BUCKET = "vlpds"
 SCRATCH = os.environ.get("BENCH_SCRATCH") or os.path.join(PKG, "target", "soak-scratch")
 ADMIN_TOKEN = "dev-admin-token"
-INTERNAL_TOKEN = "dev-internal-token"
 JWT_SECRET = b"dev-secret-change-me"
 SERVICE_DID = "did:web:localhost"
 GRAFANA = os.environ.get("GRAFANA_URL", "")
@@ -1102,12 +1101,11 @@ class Sampler:
         self.s3 = S3()
         self.prev = {}  # (node, series key) -> value (counter reset aware)
         self.prev_minio = None
-        self.fence_only = set()  # dead logs seen pruned to their fence (they never change: no fence GC at HEAD)
+        self.fence_only = set()  # dead logs pruned to their fence never change again
         self.state_snap = {}
         self.last_state_t = 0
         self.last_purge = 0
         self.load_wins = collections.defaultdict(list)  # window t -> [proc msgs]
-        self.events_since = []
         self.seen_series = {}  # node -> set of "name{labels}" (new series show up per sample)
 
     def delta(self, node, key, v):
@@ -1316,7 +1314,6 @@ class Sampler:
         cfg, st = self.cfg, self.st
         row = {"t": round(now, 1), "soak_s": round(st["soak_s_now"], 1), "phase": phase}
         h = st["h"]
-        # load
         self.drain_load(q)
         lat, err, ops, stats, first, span = self.take_load(now - 2)
         for kind, xs in sorted(lat.items()):
@@ -1340,7 +1337,6 @@ class Sampler:
         h["commits"] += sum(ops.values())
         row["load.span_s"] = span
         row["load.write_ok_s"] = round(len(w_all) / span, 1) if span else None
-        # nodes
         per = self.scrape()
         commits = 0.0
         req_by = collections.Counter()
@@ -1419,13 +1415,11 @@ class Sampler:
                 row["minio.req_s"] = round(sum(max(0, v) for v in dd.values()) / cfg.sample_s, 1)
                 row["minio.list_s"] = round((dd.get("listobjectsv2", 0) + dd.get("listobjectsv1", 0)) / cfg.sample_s, 2)
             self.prev_minio = mm
-        # firehose
         fw = self.fh.take()
         row.update({"fh.events_s": round(fw["events"] / cfg.sample_s, 1), "fh.lag_p50": pct(fw["lag"], 0.5),
                     "fh.lag_p99": pct(fw["lag"], 0.99), "fh.reconnects": fw["reconnects"], "fh.outdated": fw["outdated"],
                     "fh.errors": fw["errors"], "fh.out_of_order": fw["out_of_order"]})
         row["fh.events_per_commit"] = round(fw["events"] / commits, 3) if commits else None
-        # object store layout
         row.update(self.s3_sample(lay))
         if lay:
             row["layout.version"] = lay["version"]
@@ -1628,7 +1622,6 @@ def run(cfg):
         jsonl(ev_path, {"t": time.time(), "soak_s": st["soak_s"], "type": "start", "up_s": round(time.time() - t, 1), "converge_s": conv})
         setup(cfg, st, nodes)
         save_state(cfg, st)
-        # load
         lcfg = {"procs": cfg.procs, "urls": [n.url for n in nodes], "population": cfg.population, "zipf_s": cfg.zipf_s,
                 "zipf_cap": cfg.zipf_cap, "dh_every": cfg.dh_every, "dh_delete_pct": cfg.dh_delete_pct,
                 "delete_pct": cfg.delete_pct, "update_pct": cfg.update_pct, "like_frac": cfg.like_frac,

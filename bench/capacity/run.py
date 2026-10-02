@@ -206,7 +206,7 @@ def annotate(t0, text, tags=()):
 # ---------------------------------------------------------------- nodes
 
 class Node:
-    """One vlpds node: a native process or a docker container."""
+    """A native process or a docker container."""
 
     def __init__(self, cfg, i):
         self.cfg, self.i = cfg, i
@@ -335,7 +335,6 @@ def wait_converged(nodes, shards=SHARDS, timeout=180):
         try:
             ms = [node_metrics(n.url) or {} for n in nodes]
             owned = [int(m.get("vlpds_owned_partitions", 0)) for m in ms]
-            # owner per shard, in slot order (None = unowned)
             tables = [json.loads(http("GET", n.url + "/xrpc/vlpds.admin.getClusterStatus", headers=ADMIN_AUTH)[1])["table"] for n in nodes]
             if sum(owned) >= shards and min(owned) > 0 and all(all(x for x in tb) for tb in tables):
                 log(f"cluster converged {owned} in {time.time()-t:.1f}s")
@@ -470,9 +469,8 @@ def phase_populate(cfg, st, nodes, scr):
                                   stdout=subprocess.PIPE, stderr=open(os.path.join(cfg.state_dir, f"bulk-{n.name}.stderr"), "a"), text=True)
                  for n, pf in zip(nodes, pfiles)]
         def resume_point():
-            # the lowest watermark any node's loadgen reached (every account
-            # below it exists; bulkCreate skips existing accounts, so a
-            # resume from it is idempotent)
+            # the lowest watermark any node's loadgen reached: bulkCreate skips
+            # existing accounts, so resuming from it is idempotent
             wms = []
             for pf in pfiles:
                 try:
@@ -661,7 +659,6 @@ def read_metrics(cfg, t0, t1):
 
 def summarize_metrics(cfg, t0, t1):
     per, mn, du = read_metrics(cfg, t0, t1)
-    secs = max(t1 - t0, 1e-9)
     out = {"nodes": {}}
     tot = {k: 0.0 for k in COUNTERS}
     slate = {}
@@ -732,17 +729,15 @@ def phase_kill(cfg, st, nodes):
 
     def event(nodes, t0):
         ev = {"victim": victim.name}
-        # kill once the measured window is kill_at s in
         time.sleep(max(0, t0 + cfg.warmup + cfg.kill_at - time.time()))
         ev["kill_t"] = time.time()
         victim.kill9()
         log(f"kill: {victim.name} killed (-9)")
-        # watch the survivors take over the dead node's shards
         t = time.time()
         survivors = [n for n in nodes if n is not victim]
         while time.time() - t < cfg.kill_down:
             owned = sum(int((node_metrics(n.url) or {}).get("vlpds_owned_partitions", 0)) for n in survivors)
-            if owned >= 256 and "takeover_s" not in ev:
+            if owned >= SHARDS and "takeover_s" not in ev:
                 ev["takeover_s"] = round(time.time() - ev["kill_t"], 1)
             time.sleep(0.5)
         ev["restart_t"] = time.time()
@@ -784,7 +779,6 @@ def kill_timeline(rec):
         row = [w[i] for w in ws if i < len(w)]
         out.append({"t": row[0]["t"], "ok_s": sum(r["ok_s"] for r in row), "err": sum(r["err"] for r in row),
                     "p99": max(r["p99"] for r in row)})
-    # per-second error deltas
     prev = 0
     for r in out:
         r["err_s"], prev = r["err"] - prev, r["err"]
