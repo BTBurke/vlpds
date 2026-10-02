@@ -4163,6 +4163,15 @@
            },
            "VlpdsRuntimeSaturated": {
             "text": "A server is out of CPU"
+           },
+           "VlpdsPeerTlsCertExpiring": {
+            "text": "Server certificates expire soon (renew them)"
+           },
+           "VlpdsPeerTlsReloadFailing": {
+            "text": "A server couldn't load its new certificate"
+           },
+           "VlpdsPeerTlsHandshakeFailures": {
+            "text": "Servers are refusing each other's certificates"
            }
           }
          }

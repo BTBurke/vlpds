@@ -674,6 +674,21 @@ ts("Integrity: format errors, signature faults", [rate("vlpds_format_errors_tota
    desc=f"Should be empty. Format errors: a newer-level node writing early, or corruption ({rb('VlpdsFormatErrors')}, page). "
         f"Signature faults: suspect hardware ({rb('VlpdsSignatureFault')}, page).")
 
+ts("Peer TLS: days until certificate expiry", [t(by_node(f"(vlpds_peer_tls_cert_expiry_seconds{{{I}}} - time()) / 86400"), "{{node_id}} {{cert}}")],
+   "d", w=8, h=7, decimals=1, empty="TLS not enabled", lines=[(3, "red"), (14, "orange")],
+   desc="Per node, its own server certificate (cert=node) and the CA it trusts (cert=ca), as days until notAfter. Only nodes running "
+        "peer TLS export it. An expired node cert is refused by every peer and the node won't start or reload with one. Dashed: "
+        f"14 days = {rb('VlpdsPeerTlsCertExpiring')} (ticket); 3 days = out of time, renew now (renewal procedure in the same section).")
+ts("Peer TLS: handshake failures/s by side", [rate("vlpds_peer_tls_handshake_failures_total", by="side", legend="{{side}}")], "ops",
+   w=8, h=7, empty="TLS not enabled",
+   desc="Peer connections refused at the TLS handshake: server = a peer was refused by this node, client = this node was refused by (or "
+        "refused) a peer. Cause: a cert from another CA, an expired cert, or an address whose lease names another node. Over 0.1/s for "
+        f"10 min: {rb('VlpdsPeerTlsHandshakeFailures')}.")
+ts("Peer TLS: certificate reloads by result", [rate("vlpds_peer_tls_reloads_total", by="result", legend="{{result}}")], "ops",
+   w=8, h=7, empty="TLS not enabled",
+   desc="Reloads of the CA/cert/key set (file change or SIGHUP). error = the new set failed to load and the node keeps the previous "
+        f"one, which the rotation meant to replace: {rb('VlpdsPeerTlsReloadFailing')}.")
+
 # ============================================================== cluster: forwarding and control plane
 row("Cluster: forwarding, control plane, resharding")
 ts("Forwards/s by owner status", [rate("vlpds_forwards_total", by="result", legend="{{result}}")], "reqps",

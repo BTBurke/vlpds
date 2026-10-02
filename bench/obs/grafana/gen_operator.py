@@ -110,6 +110,9 @@ ALERT_NAMES = {
     "VlpdsFirehoseMergeQueueNearBudget": "Relay feed is near its memory limit",
     "VlpdsRuntimeStalls": "A server is stalling",
     "VlpdsRuntimeSaturated": "A server is out of CPU",
+    "VlpdsPeerTlsCertExpiring": "Server certificates expire soon (renew them)",
+    "VlpdsPeerTlsReloadFailing": "A server couldn't load its new certificate",
+    "VlpdsPeerTlsHandshakeFailures": "Servers are refusing each other's certificates",
 }
 
 # Object-store ops by S3/R2 price class (bench/results/tiny-pds-idle-2026-10-02/analyze.py)
