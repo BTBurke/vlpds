@@ -1,6 +1,5 @@
-//! The node host: opens/closes the shards the cluster assigns to this node and
-//! follows every peer's log for the merged firehose (see cluster.rs, nodelog.rs,
-//! remote.rs).
+//! The [`ShardHost`]: opens and closes the shards the cluster assigns to
+//! this node, and follows every peer's log for the merged firehose.
 
 use crate::cluster::{Cluster, ShardHost};
 use crate::firehose::Firehose;
@@ -18,7 +17,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// Longest commit-wait for a previous owner's clock (see `wait_seq_floor`).
 const SEQ_FLOOR_MAX_WAIT: Duration = Duration::from_secs(30);
 
 pub struct Node {
@@ -30,12 +28,10 @@ pub struct Node {
     pub firehose: Arc<Firehose>,
     pub merger_tx: mpsc::UnboundedSender<LogBatch>,
     pub workers: Workers,
-    /// The local SST disk cache (`--cache-dir`, `--disk-cache-mb`).
     pub disk_cache: Option<partition::DiskCacheConfig>,
     pub internal_token: String,
-    /// Node-to-node client (nudges).
     pub http: crate::http::PeerClient,
-    /// Bound of each shard's recently-written set (`--preload-recent`; 0 = off).
+    /// 0 = off.
     pub recent_cap: usize,
     followers: Mutex<HashMap<String, Follower>>,
 }
@@ -73,8 +69,7 @@ impl Node {
         })
     }
 
-    /// Follows every live peer's log; retires followers of dead logs once
-    /// they've been drained to their fence.
+    /// Retires followers of dead logs once drained to their fence.
     pub fn sync_followers(&self) {
         let peers = self.cluster.peers();
         let mut f = self.followers.lock();
@@ -97,12 +92,10 @@ impl Node {
             tracing::info!(%log_id, "dead peer log drained to its fence");
         }
     }
-}
 
-impl Node {
-    /// The disk cache a shard opened now gets: the node budget split over
-    /// every shard of the layout (plus a split/merge's children), so the
-    /// caps fit the budget even if this node comes to hold them all.
+    /// The node budget split over every shard of the layout plus a
+    /// split/merge's children, so the caps fit the budget even if this node
+    /// comes to hold them all.
     pub fn shard_disk_cache(&self) -> Option<partition::DiskCache> {
         let c = self.disk_cache.as_ref()?;
         let layout = self.cluster.layout();
@@ -124,13 +117,10 @@ impl Node {
         }
     }
 
-    /// Closes one shard (see [`ShardHost::close_many`]).
     pub async fn close(&self, shard: ShardId) -> anyhow::Result<()> {
         self.close_many(vec![shard]).await.pop().map_or(Ok(()), |(_, r)| r)
     }
 
-    /// Drops every worker's cached repos for `shards` and waits until each
-    /// worker has done so.
     async fn purge_worker_caches(&self, shards: &[ShardId]) {
         let mut acks = Vec::new();
         for w in self.workers.senders.iter() {
@@ -165,7 +155,6 @@ impl ShardHost for Node {
         let n = shards.len();
         let cache = self.shard_disk_cache();
         let cache = cache.as_ref();
-        // 1. open every shard's SlateDB concurrently
         let opened: Vec<(ShardId, u64, Vec<Span>, anyhow::Result<Arc<slatedb::Db>>)> = futures::stream::iter(shards)
             .map(|(s, e, h)| async move {
                 let db = partition::open_db(&self.state_store, s, cache).await.map(Arc::new);
@@ -183,7 +172,6 @@ impl ShardHost for Node {
             }
         }
         let opened_ms = started.elapsed().as_millis() as u64;
-        // 2. one batched replay of previous owners' log tails
         let plan: Vec<(ShardId, &slatedb::Db, &[Span])> = ready.iter().map(|(s, _, h, db)| (*s, db.as_ref(), h.as_slice())).collect();
         let replay_started = Instant::now();
         let replayed = match nodelog::replay_many(&self.store, &plan).await {
@@ -202,8 +190,7 @@ impl ShardHost for Node {
             crate::metrics::REPLAY_SECONDS.observe(replay_started.elapsed().as_secs_f64());
         }
         let replayed_ms = started.elapsed().as_millis() as u64;
-        // 3. make replayed state durable, then serve (nothing to flush after
-        //    a handback: the releaser checkpointed, so nothing was replayed)
+        // make replayed state durable before serving
         let flushed: Vec<(ShardId, u64, Arc<slatedb::Db>, anyhow::Result<()>)> = futures::stream::iter(ready)
             .map(|(s, e, _, db)| async move {
                 let r = if replayed == 0 {
@@ -248,8 +235,6 @@ impl ShardHost for Node {
         crate::metrics::SHARDS_OPENED.with_label_values(&["error"]).inc_by(results.len() as u64 - ok);
         crate::metrics::SHARD_OPEN_SECONDS.with_label_values(&[if replayed > 0 { "replay" } else { "clean" }]).observe(started.elapsed().as_secs_f64());
         tracing::info!(shards = n, segments_replayed = replayed, opened_ms, replayed_ms, elapsed_ms = started.elapsed().as_millis() as u64, "shards opened");
-        // 4. warm the shards' recently written repos (served
-        //    already; loads in the background)
         crate::worker::spawn_preload(&self.workers, preload);
         results
     }
@@ -259,19 +244,13 @@ impl ShardHost for Node {
     }
 
     async fn wait_seq_floor(&self, seq: i64) {
-        // Commit-wait: the previous owner's clock ran ahead of ours, so our
-        // seqs for its shards would sort before its last ones (a repo's
-        // commits out of order on the firehose). Wait until our clock passes
-        // its last seq; bounded, so a wildly wrong clock costs order, not
+        // Commit-wait: otherwise a repo's commits could sort out of order on
+        // the firehose. Bounded, so a wildly wrong clock costs order, not
         // availability.
         let started = Instant::now();
-        while nodelog::seq_floor(crate::tid::now_micros()) <= seq {
-            if started.elapsed() > SEQ_FLOOR_MAX_WAIT {
-                tracing::error!(seq, "previous owner's clock is more than {SEQ_FLOOR_MAX_WAIT:?} ahead of ours: serving anyway");
-                return;
-            }
-            let ahead_us = ((seq >> 8) as u64).saturating_sub(crate::tid::now_micros());
-            tokio::time::sleep(Duration::from_micros(ahead_us.clamp(1_000, 50_000))).await;
+        if !crate::cluster::wait_clock_past(seq, SEQ_FLOOR_MAX_WAIT).await {
+            tracing::error!(seq, "previous owner's clock is more than {SEQ_FLOOR_MAX_WAIT:?} ahead of ours: serving anyway");
+            return;
         }
         if started.elapsed() > Duration::from_millis(1) {
             tracing::warn!(waited_ms = started.elapsed().as_millis() as u64, "waited for our clock to pass the previous owner's last seq");
@@ -282,9 +261,8 @@ impl ShardHost for Node {
         use futures::StreamExt;
         let started = Instant::now();
         let mut results = Vec::with_capacity(shards.len());
-        // Keyed off the sink (what our log still applies into), not the
-        // routing table: a shard whose earlier close failed half-way (already
-        // unrouted) is still drained, never reported closed early.
+        // Keyed off the sink, not the routing table: a shard whose earlier
+        // close failed half-way (already unrouted) is still drained.
         let mut sinks = Vec::new();
         for s in shards {
             match self.log.sinks.get(s) {
@@ -296,19 +274,16 @@ impl ShardHost for Node {
             return results;
         }
         let ids: Vec<ShardId> = sinks.iter().map(|k| k.id).collect();
-        // 1. stop routing new work here
         for &s in &ids {
             self.table.set(s, None);
         }
-        // 2. no worker may keep (or start) building commits for them. Loads
-        //    still in flight are dropped when they land: the worker caches a
-        //    load only while its Partition is still the routed one (bench/ha N6)
+        // no worker may keep building commits for them (a load in flight is
+        // cached only while its Partition is still the routed one)
         self.purge_worker_caches(&ids).await;
-        // 3. barriers: once a shard's barrier is durable, every earlier entry
-        //    for it is durable and applied (the log is FIFO), and the log
-        //    refuses any later one (a `put_private` racing the close: it
-        //    would land past the span end we publish). Queued back to back,
-        //    they share one segment (bench/ha O6).
+        // Once a shard's barrier is durable, every earlier entry for it is
+        // durable and applied (the log is FIFO), and the log refuses any
+        // later one (it would land past the span end we publish). Queued back
+        // to back, they share one segment.
         let mut acks = Vec::with_capacity(sinks.len());
         for k in &sinks {
             let (tx, rx) = tokio::sync::oneshot::channel();
@@ -335,7 +310,7 @@ impl ShardHost for Node {
             }
         }
         let drained_ms = started.elapsed().as_millis() as u64;
-        // 4. checkpoint + close so the successor replays nothing
+        // checkpoint so the successor replays nothing
         let ord = self.log.durable_ordinal.load(Ordering::Acquire);
         let closed: Vec<(ShardId, anyhow::Result<()>)> = futures::stream::iter(drained)
             .map(|k| async move {
@@ -349,8 +324,7 @@ impl ShardHost for Node {
                         }
                         k.db.write(wb).await?;
                     }
-                    // closing flushes the memtable (and fails if it can't);
-                    // the shard's replay floor holds until it has
+                    // the shard's replay floor holds until the close flushed
                     self.log.sinks.remove(k.id);
                     k.db.close().await?;
                     self.log.sinks.retire(k.id);
@@ -382,7 +356,7 @@ impl ShardHost for Node {
 
     fn lost(&self) {
         if self.cluster.halted() {
-            return; // a "crashed" in-process test node: already inert
+            return; // an in-process test node "crashed": already inert
         }
         crate::metrics::LEASE_EVENTS.with_label_values(&["lost"]).inc();
         tracing::error!("node lease lost unexpectedly: fail-stop");
@@ -404,9 +378,8 @@ impl ShardHost for Node {
 
     fn leaving(&self) {
         self.firehose.freeze();
-        // our log is fenced: end its streams, so peers drain it from S3 to
-        // the fence instead of trusting our (frozen) watermark for as long
-        // as this process keeps serving
+        // peers drain our fenced log from S3 instead of trusting our frozen
+        // watermark for as long as this process keeps serving
         self.log.closed.store(true, Ordering::Release);
     }
 
@@ -436,7 +409,7 @@ impl ShardHost for Node {
             .iter()
             .map(|p| layout.range_of(*p).ok_or_else(|| anyhow::anyhow!("parent {p} not in layout v{}", layout.version)))
             .collect::<anyhow::Result<_>>()?;
-        // each child takes, from every parent it overlaps, the slots they share
+        // each child takes the slots it shares with every parent it overlaps
         let plans: Vec<(ShardId, Vec<(ShardId, u32, u32)>)> = op
             .children
             .iter()

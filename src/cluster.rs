@@ -1,35 +1,12 @@
-//! Cluster control plane: node leases, writer ids, shard assignments and log
-//! fencing (see DESIGN.md "HA" and "Planet scale"). A single node is a
-//! one-node cluster.
+//! Cluster control plane: node leases (`nodes/`), writer ids (`writers/`),
+//! shard assignments and the layout (`assign/`), log fencing, and the
+//! feature level (`cluster/version`). Every object moves by CAS. A single
+//! node is a one-node cluster.
 //!
-//! Objects (all CAS via ETag or If-None-Match):
-//!   nodes/{node_id}     NodeLease {log_id, addr, writer, renewals, ..}  renewed by the node
-//!   writers/{w:03}      WriterClaim {node_id, log_id, confirmed}  unique seq low byte among live nodes
-//!   assign/{id:010}     Assignment {owner, log_id, addr, epoch, seq_floor, history[Span], frozen, applied_epoch}
-//!                       changes only when a shard moves: taken by CAS, or
-//!                       handed by its owner straight to a joiner (see `Handoff`)
-//!   assign/layout       Layout {version, shards[{id, lo, hi}], next_id, op}: the
-//!                       shard map (slot ranges -> shard ids), CAS-advanced by
-//!                       splits and merges (reshard.rs)
-//!   log/{log}/{ord}.seg a fence object at a dead log's first hole closes it
-//!   cluster/version     ClusterVersion {active, target?, history}: the feature
-//!                       level writers emit (version.rs); checked before a node
-//!                       touches any data and again once its lease exists
-//!
-//! Liveness never compares wall clocks across nodes. A peer is presumed dead
-//! once its lease object has not changed for TTL + skew of *our* monotonic
-//! time since we last saw it change (a lease first seen gets a full TTL). A
-//! node's own validity runs on its own monotonic clock from the send time of
-//! its last successful renewal (TTL - skew).
-//!
-//! Safety does not rest on clocks (DESIGN.md "Why safety needs no clocks"):
-//! - A node acks only after its segment PUT (If-None-Match at the next
-//!   ordinal) succeeded, and only while its lease is valid.
-//! - A dead node's log is fenced before its shards are reassigned, so the
-//!   span end used for replay is final and a zombie can never extend it.
-//! - Assignments move by CAS; a new owner replays previous spans first.
-//! - A node fail-stops when its lease lapses or a shard it holds is
-//!   reassigned under it.
+//! Liveness never compares wall clocks across nodes: a peer is presumed dead
+//! once its lease has not changed for TTL + skew of *our* monotonic time.
+//! Safety rests on fencing and CAS, not clocks: DESIGN.md "HA", "Liveness"
+//! and "Why safety needs no clocks".
 
 use crate::nodelog::Span;
 use crate::slots::{Layout, Reshard, ShardId};
@@ -50,39 +27,31 @@ pub struct NodeLease {
     pub log_id: String,
     pub addr: String,
     pub writer: u8,
-    /// The writer's wall clock + TTL. Informational (status pages); peers
-    /// never compare it with their own clocks.
+    /// Informational (status pages): peers never compare it with their clocks.
     pub expires_ms: u64,
-    /// Bumped on every write, so every renewal changes the object (and its
-    /// ETag): peers judge liveness by seeing it change.
+    /// Bumped on every write: peers judge liveness by seeing the lease change.
     pub renewals: u64,
-    /// Our log's next ordinal as of this renewal. Ordinals only grow, so a
-    /// peer handing us a shard starts our span here: a lower bound on our
-    /// first entry for it.
+    /// Ordinals only grow, so a peer handing us a shard starts our span
+    /// here: a lower bound on our first entry for it.
     pub next_ordinal: u64,
     /// Set by a graceful shutdown before it hands its shards out: peers stop
-    /// counting it toward fair shares and never hand it shards.
+    /// counting it toward fair shares.
     pub draining: bool,
-    /// Set once this incarnation has joined: every live peer follows its
-    /// log from below its first seq (see `Cluster::try_join`). Peers hand
-    /// shards only to joined nodes; a node takes none before.
+    /// Every live peer follows this incarnation's log from below its first
+    /// seq (`Cluster::try_join`); only then may it hold shards.
     pub joined: bool,
-    /// Every peer log this node's merged firehose follows -> the follower's
-    /// floor (it delivers each of the log's events above it). A joiner
-    /// reads its own log here as this node's confirmation.
+    /// Peer log -> our follower's floor (it delivers every event above it).
+    /// A joiner reads its own log here as this node's confirmation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub follows: BTreeMap<String, i64>,
-    /// This node's own watermark is capped here as of this renewal (seq of
-    /// its send time + TTL on its own clock), so its merged firehose never
-    /// settles past it unless a later renewal lands. A joiner that ignores
-    /// this node as dead makes its own seqs pass it.
+    /// This node's merged firehose never settles past this seq (send time +
+    /// TTL) unless a later renewal lands. A joiner that ignores this node as
+    /// dead makes its own seqs pass it.
     pub wm_cap: i64,
-    /// This build's git revision (as in `vlpds_build_info`).
     pub rev: String,
-    /// Feature levels this build can run (version.rs).
     pub min_level: u32,
     pub max_level: u32,
-    /// The cluster's active level as this node last read it (0 = not yet).
+    /// 0 = not read yet.
     pub seen_level: u32,
 }
 
@@ -95,25 +64,21 @@ pub struct Assignment {
     pub epoch: u64,
     /// Every seq a previous owner assigned for this shard is <= this. A new
     /// owner's seqs start above it, so a repo's commits keep their firehose
-    /// order across a handoff whatever the two nodes' wall clocks say.
+    /// order across a handoff whatever the wall clocks say.
     pub seq_floor: i64,
-    /// Chronological ownership spans (last may be open).
+    /// Chronological; the last may be open.
     pub history: Vec<Span>,
-    /// Set (to the reshard op id) when the shard's last owner closed it for
-    /// a split or merge: never acquired again, and its DB holds every entry
-    /// of every span in `history` (DESIGN.md "Online shard split/merge").
+    /// The reshard op id this shard was closed for: never acquired again,
+    /// and its DB holds every entry of every span in `history`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frozen: Option<u64>,
     /// Every span of an epoch below this is in the shard's durable state,
-    /// and its applied marker names a span of this epoch or later: an owner
-    /// at this epoch closed the shard cleanly (`release`), or checkpointed
-    /// it inside its own span (`trim_owned`). Only spans below it ever leave
-    /// `history` (and only once it is longer than `TRIM_SPANS`): replay
-    /// never reads them again. 0 = no such owner yet: nothing is dropped.
+    /// and its applied marker names a span of this epoch or later (a clean
+    /// `release`, or a checkpoint inside the owner's span: `trim_owned`).
+    /// Only spans below it ever leave `history`. 0 = nothing is dropped.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub applied_epoch: u64,
-    /// Fields of a newer feature level, kept when this node CASes the
-    /// object (DESIGN.md "Rolling upgrades": tolerant control objects).
+    /// Fields of a newer feature level, kept across our CAS writes.
     #[serde(default, flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -122,35 +87,28 @@ fn is_zero(v: &u64) -> bool {
     *v == 0
 }
 
-/// A history longer than this drops its spans below `applied_epoch` (at a
-/// release, or by its owner once it checkpointed inside its own span).
+/// A history longer than this drops its spans below `applied_epoch`.
 const TRIM_SPANS: usize = 8;
 
-/// A history is never longer than this. Spans no successful open has
-/// replayed are never dropped (that lost acked writes: DESIGN.md "HA"), so
-/// an acquire that would exceed it takes nothing, loudly: only a crash loop
-/// that never once opens the shard cleanly gets here.
+/// Spans no successful open has replayed are never dropped (they hold acked
+/// writes), so an acquire that would exceed this takes nothing, loudly:
+/// only a crash loop that never once opens the shard cleanly gets here.
 const MAX_SPANS: usize = 1024;
 
-/// Drops the spans below `applied` from a history longer than TRIM_SPANS.
 fn trim_history(history: &mut Vec<Span>, applied: u64) {
     if history.len() > TRIM_SPANS {
         history.retain(|sp| sp.epoch >= applied);
     }
 }
 
-/// A shard handed straight to a joiner: the releaser closed it and CASed its
-/// assignment to name the joiner (epoch + 1, the releaser's span closed at
-/// its barrier, a new open span for the joiner), then POSTs this to the
-/// joiner's /internal/v1/cluster/nudge. The joiner adopts it without a
-/// control-plane read: replays `history` minus its own span and serves once
-/// its seqs pass `seq_floor`. If the nudge is lost, the joiner's next step
-/// finds the same assignment and adopts it then.
+/// A shard handed straight to a peer: the releaser closed it, CASed its
+/// assignment to name the peer, and POSTs this to the peer's
+/// /internal/v1/cluster/nudge, so the peer adopts it without a control-plane
+/// read. If the nudge is lost, the peer's next step finds the assignment.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Handoff {
     pub shard: ShardId,
     pub assignment: Assignment,
-    /// ETag of the handed assignment (our release CAS later starts from it).
     pub etag: Option<String>,
 }
 
@@ -158,17 +116,14 @@ pub struct Handoff {
 pub struct ClusterConfig {
     pub node_id: String,
     pub addr: String,
-    /// Shards of the initial (uniform) layout, used only if this prefix has
-    /// no layout yet; splits and merges change the count later.
+    /// Used only if this prefix has no layout yet.
     pub shards: u32,
     pub ttl: Duration,
     pub renew_every: Duration,
     pub skew: Duration,
-    /// Tests only: offsets this node's wall clock as the control plane sees
-    /// it (the `expires_ms` it publishes), to simulate clock skew in-process.
+    /// Tests only: simulates clock skew in the `expires_ms` we publish.
     pub clock_offset_ms: i64,
-    /// Feature levels this node runs: the build's (`version::Window::BUILD`);
-    /// tests pose as other builds.
+    /// The build's window; tests pose as other builds.
     pub levels: version::Window,
 }
 
@@ -190,77 +145,66 @@ impl Default for ClusterConfig {
 /// What the cluster asks the node to do with shards.
 #[async_trait::async_trait]
 pub trait ShardHost: Send + Sync + 'static {
-    /// Next ordinal of our log (start of our span when we take a shard).
+    /// Start of our span when we take a shard.
     fn next_ordinal(&self) -> u64;
-    /// Last durable ordinal of our log (end of our span when we release).
+    /// End (exclusive) of our span when we release.
     fn durable_end(&self) -> u64;
-    /// Every seq this node has assigned so far is <= this (after a close,
-    /// the closed shards' seqs are covered).
+    /// Every seq this node has assigned so far is <= this.
     fn seq_high(&self) -> i64 {
         0
     }
-    /// Returns once every seq this node assigns from now on exceeds `seq`
-    /// (a shard taken from a node whose clock runs ahead of ours).
+    /// Returns once every seq this node assigns from now on exceeds `seq`.
     async fn wait_seq_floor(&self, _seq: i64) {}
-    /// Replay each shard's `history` (previous owners' spans) and start
-    /// serving them. Batched so a takeover reads a dead log once for all shards.
+    /// Replays each shard's `history` and starts serving it. Batched so a
+    /// takeover reads a dead log once for all shards.
     async fn open_many(&self, shards: Vec<(ShardId, u64, Vec<Span>)>) -> Vec<(ShardId, anyhow::Result<()>)>;
-    /// Stop accepting writes for `shards`, drain (one barrier segment for all
-    /// of them), checkpoint, close. A shard may be released only if its close
-    /// succeeded: otherwise entries of it may still be in flight.
+    /// Stops writes, drains (one barrier segment for all), checkpoints,
+    /// closes. A shard may be released only if its close succeeded:
+    /// otherwise entries of it may still be in flight.
     async fn close_many(&self, shards: Vec<ShardId>) -> Vec<(ShardId, anyhow::Result<()>)>;
-    /// Waits until nothing is queued or in flight on our log (before fencing
-    /// it on shutdown). False if it did not quiesce in time.
+    /// Waits until nothing is queued or in flight on our log. False if it
+    /// did not quiesce in time.
     async fn quiesce(&self) -> bool {
         true
     }
-    /// Whether a checkpoint of `shard`, at an ordinal inside its current
-    /// span on our log, is durable: its applied marker names that span, and
-    /// its state holds every earlier span (the open replayed them).
+    /// Whether a checkpoint of `shard` inside its current span on our log
+    /// is durable (its state then holds every earlier span).
     fn checkpointed(&self, _shard: ShardId) -> bool {
         false
     }
-    /// Our node lease was lost (CAS failed): must stop acking immediately.
+    /// Must stop acking immediately.
     fn lost(&self);
-    /// Called after every membership refresh (e.g. to follow peers' logs).
     fn on_membership(&self) {}
-    /// POSTs /internal/v1/cluster/nudge to each `(addr, handoffs)`: the node
-    /// adopts the shards handed to it, and steps at once instead of on its
-    /// next tick. Best effort: a missed nudge costs a step interval.
+    /// POSTs /internal/v1/cluster/nudge to each `(addr, handoffs)`. Best
+    /// effort: a missed nudge costs a step interval.
     async fn nudge(&self, _nudges: Vec<(String, Vec<Handoff>)>) {}
-    /// A layout was read (or written by us): route by it from now on.
     fn on_layout(&self, _layout: Arc<Layout>) {}
-    /// Creates the state of `op`'s children from its frozen parents
-    /// (`layout` is the one holding the parents). Idempotent.
+    /// Creates `op`'s children from its frozen parents (in `layout`).
+    /// Idempotent.
     async fn clone_shards(&self, _layout: &Layout, _op: &Reshard) -> anyhow::Result<()> {
         Ok(())
     }
-    /// (shard, approximate state bytes, log entries applied so far) of the
-    /// shards open here, for the reshard policy.
+    /// (shard, approximate state bytes, log entries applied so far).
     fn shard_stats(&self) -> Vec<(ShardId, u64, u64)> {
         Vec::new()
     }
-    /// Joiner: asks each of `peers` to learn our lease now and follow our
-    /// log (instead of at its next step). Per peer, the floor its follower
-    /// of our log delivers every event above, or None if it didn't confirm
-    /// (see `Cluster::try_join`). A host without a firehose (unit tests)
-    /// has nothing to lose: every peer confirms.
+    /// Joiner: asks each of `peers` to follow our log now. Per peer, its
+    /// follower's floor, or None if it didn't confirm (`Cluster::try_join`).
+    /// A host without a firehose has nothing to lose: every peer confirms.
     async fn greet(&self, peers: Vec<NodeLease>) -> Vec<Option<i64>> {
         peers.iter().map(|_| Some(i64::MIN)).collect()
     }
-    /// The peer logs our merged firehose follows -> each follower's floor
-    /// (published in our lease: a joiner's confirmation).
+    /// Published in our lease (`NodeLease::follows`).
     fn follow_floors(&self) -> BTreeMap<String, i64> {
         BTreeMap::new()
     }
-    /// Graceful shutdown is about to delete our lease: a node joining from
-    /// now on won't count us (or greet us), and our steps (which would
-    /// follow its log) have stopped, so our merged firehose must emit
-    /// nothing more (see `Cluster::try_join`). Our log is fenced by now:
-    /// its streams to peers end (they drain it from S3 to the fence).
+    /// Graceful shutdown is about to delete our (fenced) lease: a joiner
+    /// from now on won't greet us and our steps have stopped, so our merged
+    /// firehose must emit nothing more, and our log streams end (peers
+    /// drain it from S3 to the fence).
     fn leaving(&self) {}
-    /// Whether a TCP connect to `addr` (a peer's advertised URL) is refused:
-    /// nothing listens there, so the process that holds that lease is gone.
+    /// Whether a TCP connect to a peer's `addr` is refused: the process
+    /// holding that lease is gone.
     async fn refused(&self, _addr: &str) -> bool {
         false
     }
@@ -271,28 +215,27 @@ struct Seen {
     etag: Option<String>,
     lease: NodeLease,
     changed_at: Instant,
-    /// When we first saw this incarnation (log_id) of the peer.
+    /// Of this incarnation (log_id).
     first_seen: Instant,
 }
 
-/// Re-read every assignment (not only those whose ETag changed in the
-/// LIST) every this many steps: a safety net, ~5 min at the default TTL.
+/// Re-read every assignment, not only those whose ETag changed, every this
+/// many steps: a safety net.
 const FULL_RESYNC_STEPS: u64 = 150;
 
-/// A lone, settled node (see `Cluster::step_body`) LISTs `assign/` only every
-/// this many steps (~5 TTLs): nothing but its own writes, which update its
-/// cache, can change `assign/` while no other lease exists. A divisor of
-/// FULL_RESYNC_STEPS, so full resyncs still happen on schedule.
+/// A lone, settled node LISTs `assign/` only every this many steps: nothing
+/// but its own writes can change it while no other lease exists. A divisor
+/// of FULL_RESYNC_STEPS, so full resyncs still happen on schedule.
 const LONE_ASSIGN_EVERY: u64 = 25;
 
-/// The shard map, under `assign/` so the per-step LIST covers it.
+/// Under `assign/` so the per-step LIST covers it.
 pub(crate) const LAYOUT: &str = "assign/layout";
 
 /// An object with the ETag it was read at.
 pub(crate) type Versioned<T> = (T, Option<String>);
 
-/// When the split policy last planned, and per shard the mutation count last
-/// seen (and when).
+/// When the split policy last planned, and per shard the applied-entry
+/// count last seen (and when).
 pub(crate) type PolicyState = (Option<Instant>, HashMap<ShardId, (u64, Instant)>);
 
 pub struct Cluster {
@@ -305,114 +248,90 @@ pub struct Cluster {
     /// Our lease expiry on our own (unoffset) wall clock: the watermark cap.
     expires_local_ms: AtomicU64,
     valid_until: RwLock<Instant>,
-    /// Routing table: shard -> (owner node, addr)
+    /// shard -> (owner node, addr)
     table: RwLock<BTreeMap<ShardId, (String, String)>>,
     owned: RwLock<HashSet<ShardId>>,
-    /// Live peers (node_id -> lease), refreshed every step.
     peers: RwLock<HashMap<String, NodeLease>>,
-    /// Peer leases as last observed (node_id -> etag, lease, when it changed).
     seen: RwLock<HashMap<String, Seen>>,
-    /// Assignment cache (with ETags), refreshed from a LIST every step:
-    /// every shard id with an assignment object, retired ones included.
+    /// Every shard id with an assignment object, retired ones included.
     pub(crate) assigns: RwLock<BTreeMap<ShardId, Versioned<Assignment>>>,
-    /// The shard map and its ETag (`assign/layout`), refreshed in the same LIST.
     pub(crate) layout: RwLock<(Arc<Layout>, Option<String>)>,
-    /// When we last opened each shard (handbacks prefer older ones).
+    /// Handbacks prefer shards opened longer ago.
     opened_at: RwLock<HashMap<ShardId, Instant>>,
-    /// Split policy (reshard.rs; off by default).
     pub(crate) policy: RwLock<crate::reshard::Policy>,
-    /// Policy state: when it last planned, and per shard the entry count
-    /// last seen (and when), for write rates.
     pub(crate) policy_state: parking_lot::Mutex<PolicyState>,
     steps: AtomicU64,
-    /// Control-plane object-store requests this node made (also exported
-    /// as vlpds_cluster_store_requests_total).
     requests: AtomicU64,
-    /// Of which LISTs.
     lists: AtomicU64,
-    /// Dead logs we know are fenced: log_id -> (fence ordinal, last seq in it).
+    /// log_id -> (fence ordinal, last seq in it).
     fenced: RwLock<HashMap<String, (u64, i64)>>,
     joined_at: Instant,
-    /// Set by shutdown(); held across each step so a step can't re-acquire
-    /// shards while (or after) shutdown releases them.
+    /// Set by shutdown; with `step_lock`, a step can't re-acquire shards
+    /// while (or after) shutdown releases them.
     stopping: AtomicBool,
     step_lock: tokio::sync::Mutex<()>,
-    /// Set once shutdown is about to delete our lease: the renew loop and the
-    /// watchdog stop (they keep running during the shutdown drain itself).
+    /// Shutdown is about to delete our lease: the renew loop and watchdog
+    /// stop (they keep running through the shutdown drain itself).
     gone: AtomicBool,
     /// Held across each renewal so shutdown can't delete the lease under one.
     renew_lock: tokio::sync::Mutex<()>,
-    /// Tests: this in-process node "crashed" (`halt`). Its loops stop and its
-    /// store calls hang; it must never fail-stop the shared test process.
+    /// Tests: this in-process node "crashed" (`halt`). Its store calls hang;
+    /// it must never fail-stop the shared test process.
     halted: AtomicBool,
-    /// Control-plane calls run under `call_deadline` (set once `join` is
-    /// done: startup keeps the store's own timeouts and retries).
+    /// Set once `join` is done: startup keeps the store's own timeouts and
+    /// retries instead of `call_deadline`.
     bounded: AtomicBool,
-    /// Wakes the step loop early (a peer released shards for us).
     nudged: tokio::sync::Notify,
-    /// Shards peers handed us that we haven't adopted yet.
+    /// Not adopted yet.
     handed: parking_lot::Mutex<Vec<Handoff>>,
-    /// No live peer as of the last step (or greeting): nothing routes
-    /// elsewhere (see `forward::Router::alone`).
+    /// No live peer as of the last step (or greeting).
     alone: AtomicBool,
-    /// Every peer follows our log and our seqs passed every floor (see
-    /// `try_join`): we may take shards.
     joined: AtomicBool,
-    /// Peers' confirmations (hello answers) that they follow our log: peer
-    /// log id -> its follower's floor.
+    /// Hello answers: peer log id -> its follower's floor of our log.
     confirmed: parking_lot::Mutex<HashMap<String, i64>>,
-    /// Our previous incarnation's published `wm_cap` (its lease, which ours
-    /// overwrote): our seqs pass it before we join.
+    /// Our previous incarnation's published `wm_cap`: our seqs pass it
+    /// before we join.
     join_floor: std::sync::atomic::AtomicI64,
-    /// The step loop runs (`spawn`). Greeting waits for it when we have
-    /// peers: the inline first step at startup must not open shards before
-    /// the node serves.
+    /// The step loop runs. Joining waits for it when we have peers: the
+    /// inline first step at startup must not open shards before the node
+    /// serves.
     spawned: AtomicBool,
     /// Highest epoch of each shard this incarnation has opened. An
-    /// assignment naming us at a newer epoch was handed to us; at an epoch we
-    /// already opened it is ours from before (e.g. a release CAS that failed)
-    /// and must not be adopted again: its history minus our span would
+    /// assignment naming us at an epoch we already opened (a failed release
+    /// CAS) must not be adopted again: its history minus our span would
     /// replay older owners' writes over ours.
     opened: RwLock<HashMap<ShardId, u64>>,
-    /// Epoch each shard last opened *successfully* here at. A release of a
-    /// shard we never served at its epoch logged nothing for it: its span
-    /// is dropped. One we served and closed raises `applied_epoch`.
+    /// Epoch each shard last opened *successfully* at. Releasing a shard we
+    /// never served at its epoch drops our span (nothing of it was logged).
     served: RwLock<HashMap<ShardId, u64>>,
-    /// Tests: skip every step (renewals go on), as a node whose step loop
-    /// is stuck would (`test_hold_steps`).
+    /// Tests: skip every step (renewals go on).
     hold_steps: AtomicBool,
-    /// Tests: answer every greeting "not following" (`test_ignore_hellos`).
+    /// Tests: answer every greeting "not following".
     ignore_hellos: AtomicBool,
-    /// `cluster/version` as last read, and when (re-read once per TTL by steps).
+    /// As last read, and when (re-read once per TTL).
     version: RwLock<Option<(ClusterVersion, Instant)>>,
-    /// Our membership view as of the last step is just us: `nodes/` listed
-    /// only our lease (or the step reused such a view, see `step_body`).
+    /// `nodes/` held only our lease as of the last step.
     lone: AtomicBool,
-    /// The last step finished with nothing in motion: alone, holding every
-    /// shard of a layout with no split/merge in flight, nothing handed or
-    /// left unreleased. Cleared at the start of every step.
+    /// The last step finished alone with nothing in motion: every shard
+    /// ours, no split/merge, nothing handed or unreleased.
     settled: AtomicBool,
-    /// A peer contacted us (hello, nudge) since the last step began: the
-    /// next step lists `nodes/` and `assign/` whatever `lone` says.
+    /// A peer contacted us since the last step began: the next step lists
+    /// whatever `lone` says.
     contact: AtomicBool,
-    /// When the last `LIST nodes/` started, and steps that reused a lone
-    /// view since (a lone node lists `nodes/` at least once per TTL).
+    /// When the last `LIST nodes/` started, and lone steps that reused its
+    /// view since.
     nodes_listed: parking_lot::Mutex<(Option<Instant>, u32)>,
-    /// Tests: list `nodes/` and `assign/` every step even when alone (a
-    /// unit-test host's greetings never reach its peers' `learn_peer`).
+    /// Tests: list every step even when alone (a unit-test host's greetings
+    /// never reach its peers' `learn_peer`).
     pub(crate) list_every_step: AtomicBool,
 }
 
-/// Why `Cluster::finalize_level` didn't raise the level.
 #[derive(Debug)]
 pub enum FinalizeError {
-    /// The request can't be done (level not above the active one, not in
-    /// this node's window, no version object).
     Invalid(String),
-    /// Live nodes whose builds can't run the level: (node id, rev, min
-    /// level, max level).
+    /// (node id, rev, min level, max level) of live nodes that can't run it.
     Incompatible { level: u32, nodes: Vec<(String, String, u32, u32)> },
-    /// The object store failed or the object changed under us: retry.
+    /// Retry.
     Store(anyhow::Error),
 }
 
@@ -439,8 +358,30 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
-fn is_conflict(e: &object_store::Error) -> bool {
+/// Waits (up to `max`) until every seq this node assigns exceeds `floor`.
+/// False if our clock is still behind it.
+pub(crate) async fn wait_clock_past(floor: i64, max: Duration) -> bool {
+    let deadline = Instant::now() + max;
+    loop {
+        let now = crate::tid::now_micros();
+        if crate::nodelog::seq_floor(now) > floor {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        let ahead_us = ((floor >> 8) as u64).saturating_sub(now);
+        tokio::time::sleep(Duration::from_micros(ahead_us.clamp(1_000, 50_000))).await;
+    }
+}
+
+pub(crate) fn is_conflict(e: &object_store::Error) -> bool {
     matches!(e, object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. })
+}
+
+/// A CAS on the version read with `e_tag`.
+pub(crate) fn if_match(e_tag: Option<String>) -> PutMode {
+    PutMode::Update(UpdateVersion { e_tag, version: None })
 }
 
 /// A CAS on our node lease failed because the object isn't the one we
@@ -451,30 +392,28 @@ fn lease_moved(e: &object_store::Error) -> bool {
 }
 
 /// How often `join` re-reads its node lease after it changed under the
-/// join's CAS (each time a peer deleted a dead incarnation's lease, or
-/// another incarnation wrote it) before giving up.
+/// join's CAS before giving up.
 const JOIN_LEASE_RETRIES: u32 = 5;
 
-/// What `Cluster::recreate_vanished_lease` did.
 enum Recreate {
     Done,
     /// Our lease is someone else's now, or our log is fenced: fail-stop.
     Lost,
-    /// A store call failed: the next renewal tries again.
+    /// The next renewal tries again.
     Retry,
 }
 
 impl Cluster {
-    /// Registers this node: checks the cluster's feature level, claims a
-    /// writer id and creates its node lease. A node whose levels can't run
-    /// the cluster's refuses (exit 7, `version::refuse`) before it touches
-    /// anything else, or right after its lease write (then deleting it).
+    /// Checks the cluster's feature level, claims a writer id and creates
+    /// our node lease. A node whose levels can't run the cluster's refuses
+    /// (`version::refuse`) before it touches anything else, or right after
+    /// its lease write (then deleting it).
     pub async fn join(cfg: ClusterConfig, store: Store) -> anyhow::Result<Arc<Cluster>> {
         Self::join_inner(cfg, store, None).await
     }
 
-    /// [`join`](Self::join), running `before_lease` (tests: a race) after
-    /// the first level check and before the lease write.
+    /// Tests run `before_lease` (a race) between the first level check and
+    /// the lease write.
     pub(crate) async fn join_inner(
         cfg: ClusterConfig,
         store: Store,
@@ -544,8 +483,6 @@ impl Cluster {
             list_every_step: AtomicBool::new(false),
             cfg,
         };
-        // the startup gate: before anything else is read or written (our
-        // previous incarnation's log is fenced below)
         let v = c.ensure_version().await?;
         if let Err(why) = c.cfg.levels.check(&v) {
             return Err(version::refuse(&c.cfg.node_id, &why));
@@ -554,11 +491,9 @@ impl Cluster {
         if let Some(f) = before_lease {
             f.await;
         }
-        // Create (or take over our own stale) node lease. The lease we read
-        // can vanish before our CAS lands: a peer that presumed our previous
-        // incarnation dead (its address refused connects) fenced its log and
-        // deletes the lease once its shards moved. Then we read it again
-        // (gone: create it; or another incarnation's: fence that one too).
+        // The lease we read can vanish before our CAS lands: a peer that
+        // presumed our previous incarnation dead fenced its log and deletes
+        // the lease once its shards moved. Then read it again.
         let mut vanished = 0;
         let mut mode = c.read_own_lease().await?;
         loop {
@@ -575,14 +510,13 @@ impl Cluster {
                 mode = c.read_own_lease().await?;
                 continue;
             }
-            mode = PutMode::Update(UpdateVersion { e_tag: c.lease_etag.read().clone(), version: None });
-            // Confirm the claim now that our lease exists (a claim is taken
-            // over only while its holder has no lease). Rewriting it changes
-            // its ETag, so a joiner that read it before our lease existed
-            // fails its CAS instead of sharing our writer id.
+            mode = if_match(c.lease_etag.read().clone());
+            // A claim is taken over only while its holder has no lease:
+            // rewriting it now changes its ETag, so a joiner that read it
+            // before our lease existed fails its CAS instead of sharing our id.
             let wpath = c.path(&format!("writers/{writer:03}"));
             let confirmed = serde_json::json!({"node_id": c.cfg.node_id, "log_id": c.log_id, "confirmed": true});
-            match c.put_json(&wpath, &confirmed, PutMode::Update(UpdateVersion { e_tag: claim_etag, version: None })).await {
+            match c.put_json(&wpath, &confirmed, if_match(claim_etag)).await {
                 Ok(_) => break,
                 Err(e) if is_conflict(&e) => {
                     tracing::warn!(writer, "writer id taken over before our lease existed; claiming another");
@@ -590,9 +524,8 @@ impl Cluster {
                 Err(e) => return Err(e.into()),
             }
         }
-        // Again now that our lease exists: a raise (`finalize_level`) that
-        // listed the leases before ours landed wrote its target first, so we
-        // see it here (store writes are linearizable) and leave.
+        // A raise that listed the leases before ours landed wrote its target
+        // first, so we see it here (store writes are linearizable).
         let v = match c.read_version().await? {
             Some((v, _)) => v,
             None => anyhow::bail!("{} vanished", version::OBJECT),
@@ -605,7 +538,6 @@ impl Cluster {
         c.ensure_layout().await?;
         c.bounded.store(true, Ordering::Release);
         let c = Arc::new(c);
-        // lease validity left, computed at each scrape
         let (weak, node_id) = (Arc::downgrade(&c), c.cfg.node_id.clone());
         crate::metrics::on_render(move || match weak.upgrade() {
             Some(c) => {
@@ -620,28 +552,25 @@ impl Cluster {
         Ok(c)
     }
 
-    /// Join: reads `nodes/{our id}` and returns how to write our lease over
-    /// it. None: create it. Another incarnation's (our previous one, same
-    /// node id): fence its log first (if it is somehow still running, its
-    /// next PUT collides and it fail-stops; everything it acked is before
-    /// the fence and gets replayed by whoever takes its shards, us), then
-    /// CAS over it.
+    /// How to write our lease over `nodes/{our id}`. Another incarnation's
+    /// is fenced first: if it still runs, its next PUT collides and it
+    /// fail-stops; everything it acked is before the fence and replayed.
     async fn read_own_lease(&self) -> anyhow::Result<PutMode> {
         let path = self.path(&format!("nodes/{}", self.cfg.node_id));
         let Some((l, etag)) = self.get_json::<NodeLease>(&path).await? else {
             return Ok(PutMode::Create);
         };
         if l.log_id != self.log_id {
-            self.fence_dead(&l.log_id, "restart").await?;
+            self.fence_as(&l.log_id, Some("restart")).await?;
             // its merged firehose (if it still runs) settles no further
             self.join_floor.fetch_max(l.wm_cap, Ordering::AcqRel);
         }
         let mut ours = self.lease.write();
         ours.renewals = ours.renewals.max(l.renewals);
-        Ok(PutMode::Update(UpdateVersion { e_tag: etag, version: None }))
+        Ok(if_match(etag))
     }
 
-    /// Seconds until our lease validity ends (negative: lapsed that long ago).
+    /// Negative: lapsed that long ago.
     pub fn lease_validity_secs(&self) -> f64 {
         let (until, now) = (*self.valid_until.read(), Instant::now());
         if until >= now {
@@ -651,38 +580,36 @@ impl Cluster {
         }
     }
 
-    /// Reads the layout, creating the uniform one of `cfg.shards` if this
-    /// prefix has none (the first node; a racing creator's wins).
+    /// Creates the uniform layout if this prefix has none (a racing
+    /// creator's wins).
     async fn ensure_layout(&self) -> anyhow::Result<()> {
         let path = self.path(LAYOUT);
-        loop {
+        let (l, etag) = loop {
             if let Some((l, etag)) = self.get_json::<Layout>(&path).await? {
                 l.validate()?;
                 if l.shards.len() != self.cfg.shards as usize && l.version == 1 {
                     tracing::warn!(configured = self.cfg.shards, layout = l.shards.len(), "--shards differs from this prefix's layout: the layout wins");
                 }
-                crate::metrics::LAYOUT_SHARDS.set(l.shards.len() as i64);
-                crate::metrics::LAYOUT_VERSION.set(l.version as i64);
-                *self.layout.write() = (Arc::new(l), etag);
-                return Ok(());
+                break (l, etag);
             }
             let l = Layout::uniform(self.cfg.shards);
             match self.put_json(&path, &l, PutMode::Create).await {
                 Ok(etag) => {
                     tracing::info!(shards = self.cfg.shards, "created the shard layout (v1, uniform)");
-                    crate::metrics::LAYOUT_SHARDS.set(l.shards.len() as i64);
-                    crate::metrics::LAYOUT_VERSION.set(l.version as i64);
-                    *self.layout.write() = (Arc::new(l), etag);
-                    return Ok(());
+                    break (l, etag);
                 }
                 Err(e) if is_conflict(&e) => continue,
                 Err(e) => return Err(e.into()),
             }
-        }
+        };
+        crate::metrics::LAYOUT_SHARDS.set(l.shards.len() as i64);
+        crate::metrics::LAYOUT_VERSION.set(l.version as i64);
+        *self.layout.write() = (Arc::new(l), etag);
+        Ok(())
     }
 
-    /// `cluster/version` (None if absent). An unreadable object is an error
-    /// (counted as a format error), never "absent".
+    /// An unreadable object is an error (counted as a format error), never
+    /// "absent".
     pub async fn read_version(&self) -> anyhow::Result<Option<Versioned<ClusterVersion>>> {
         self.get_json::<ClusterVersion>(&self.path(version::OBJECT)).await.map_err(|e| {
             if e.downcast_ref::<serde_json::Error>().is_some() {
@@ -692,8 +619,8 @@ impl Cluster {
         })
     }
 
-    /// Reads `cluster/version`, creating it at this build's max level if
-    /// this prefix has none (a fresh cluster). A racing creator's wins.
+    /// Creates `cluster/version` at this build's max level if this prefix
+    /// has none. A racing creator's wins.
     async fn ensure_version(&self) -> anyhow::Result<ClusterVersion> {
         loop {
             if let Some((v, _)) = self.read_version().await? {
@@ -712,27 +639,24 @@ impl Cluster {
         }
     }
 
-    /// Records a read of `cluster/version`: the level writers emit, and the
-    /// `seen_level` our next lease write publishes.
     fn observed_version(&self, v: ClusterVersion) {
         self.lease.write().seen_level = v.active;
         version::set_active(v.active);
         *self.version.write() = Some((v, Instant::now()));
     }
 
-    /// `cluster/version` as this node last read it.
     pub fn cluster_version(&self) -> Option<ClusterVersion> {
         self.version.read().as_ref().map(|(v, _)| v.clone())
     }
 
-    /// Our own node lease as of its last write (plus flags set since).
+    /// As of its last write, plus flags set since.
     pub fn own_lease(&self) -> NodeLease {
         self.lease.read().clone()
     }
 
-    /// Steps re-read `cluster/version` once per TTL. An active level outside
-    /// our window (an operator forced it) is a fail-stop 7; a `target` past
-    /// it is not (a raise lists our lease and aborts).
+    /// Once per TTL. An active level outside our window (an operator forced
+    /// it) is a fail-stop; a `target` past it is not (a raise lists our lease
+    /// and aborts).
     async fn observe_version(&self) -> anyhow::Result<()> {
         let due = self.version.read().as_ref().is_none_or(|(_, at)| at.elapsed() >= self.cfg.ttl);
         if !due || self.halted() {
@@ -750,21 +674,19 @@ impl Cluster {
         Ok(())
     }
 
-    /// Raises the cluster's feature level to `level` (DESIGN.md "Raise
-    /// protocol"): (1) CAS `target = level`; (2) list every lease *after*
-    /// that write and require each live one to run `level` (else clear the
-    /// target and fail with the offenders); (3) CAS `active = level`. A
-    /// node whose lease landed after (2)'s listing re-reads the object once
-    /// its lease exists and refuses. Raising a persistent level can't be undone.
+    /// (1) CAS `target = level`; (2) list every lease *after* that write and
+    /// require each live one to run `level`; (3) CAS `active = level`. A node
+    /// whose lease landed after (2)'s listing sees the target in `join` and
+    /// refuses. Raising a persistent level can't be undone.
     pub async fn finalize_level(&self, level: u32, by: &str) -> Result<ClusterVersion, FinalizeError> {
         let path = self.path(version::OBJECT);
         let Some((cur, etag)) = self.read_version().await? else {
             return Err(FinalizeError::Invalid(format!("{} is missing", version::OBJECT)));
         };
         if level == cur.active {
-            // Already there. A leftover target (a finalize that died between
-            // its steps) keeps nodes that can't run it from starting: clear
-            // it. A raise still in flight then fails its last CAS (retry).
+            // A leftover target (a finalize that died between its steps)
+            // keeps nodes that can't run it from starting. A raise still in
+            // flight then fails its last CAS (retry).
             if let Some(t) = cur.target {
                 self.clear_target(t).await?;
                 tracing::warn!(target = t, active = level, by, "cleared a pending feature level raise");
@@ -778,16 +700,14 @@ impl Cluster {
         if !self.cfg.levels.contains(level) {
             return Err(FinalizeError::Invalid(format!("this node runs levels {}..={}, not {level}", self.cfg.levels.min, self.cfg.levels.max)));
         }
-        // 1. the target: from now on a starting node that can't run it refuses
         let mut next = cur.clone();
         next.target = Some(level);
-        let etag = match self.put_json(&path, &next, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
+        let etag = match self.put_json(&path, &next, if_match(etag)).await {
             Ok(e) => e,
             Err(e) if is_conflict(&e) => return Err(FinalizeError::Store(anyhow::anyhow!("{} changed concurrently: retry", version::OBJECT))),
             Err(e) => return Err(FinalizeError::Store(e.into())),
         };
         tracing::info!(level, by, "feature level raise: target written");
-        // 2. every live lease, listed after the target landed
         let offenders = match self.leases_unable(level).await {
             Ok(o) => o,
             Err(e) => {
@@ -802,11 +722,10 @@ impl Cluster {
             tracing::warn!(level, ?offenders, "feature level raise aborted: nodes can't run it");
             return Err(FinalizeError::Incompatible { level, nodes: offenders });
         }
-        // 3. the point of no return
         next.active = level;
         next.target = None;
         next.history.push(version::Change::new(level, by));
-        match self.put_json(&path, &next, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
+        match self.put_json(&path, &next, if_match(etag)).await {
             Ok(_) => {}
             Err(e) if is_conflict(&e) => {
                 // someone else finished (or cleared) it meanwhile
@@ -825,7 +744,6 @@ impl Cluster {
         Ok(next)
     }
 
-    /// Clears `target` if it is still `level` (an aborted raise).
     async fn clear_target(&self, level: u32) -> anyhow::Result<()> {
         let path = self.path(version::OBJECT);
         for _ in 0..5 {
@@ -834,7 +752,7 @@ impl Cluster {
                 return Ok(());
             }
             v.target = None;
-            match self.put_json(&path, &v, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
+            match self.put_json(&path, &v, if_match(etag)).await {
                 Ok(_) => return Ok(()),
                 Err(e) if is_conflict(&e) => continue,
                 Err(e) => return Err(e.into()),
@@ -843,10 +761,9 @@ impl Cluster {
         anyhow::bail!("{} kept changing", version::OBJECT)
     }
 
-    /// Leases (one LIST, a GET each) whose build can't run `level` (it is
-    /// outside their window): (node id, rev, min level, max level). Only a
-    /// lease whose log we fenced (its node is dead and taken over) is
-    /// ignored; an unreadable one counts as unable.
+    /// (node id, rev, min level, max level) of leases that can't run
+    /// `level`. Only a lease whose log we fenced is ignored; an unreadable
+    /// one counts as unable.
     async fn leases_unable(&self, level: u32) -> anyhow::Result<Vec<(String, String, u32, u32)>> {
         let mut out = Vec::new();
         for (id, _) in self.list("nodes").await? {
@@ -862,18 +779,14 @@ impl Cluster {
         Ok(out)
     }
 
-    /// Lowers the cluster's feature level to `level` (`vlpds admin cluster
-    /// lower`): only past levels that put no new bytes in the bucket
-    /// (`version::check_lower`), never while a raise is in progress, and
-    /// only if every live node's build can run `level` (a node whose
-    /// `MIN_LEVEL` is above it would fail-stop at its next observation).
-    /// Running nodes switch at their next segment.
+    /// Only past levels that put no new bytes in the bucket, never while a
+    /// raise is in progress, and only if every live node can run `level`
+    /// (one whose `MIN_LEVEL` is above it would fail-stop).
     pub async fn lower_level(&self, level: u32, by: &str) -> Result<ClusterVersion, FinalizeError> {
         self.lower_level_with(version::LEVELS, level, by).await
     }
 
-    /// [`lower_level`](Self::lower_level) against a level table (tests pose
-    /// as builds with wire-only levels).
+    /// Tests pose as builds with wire-only levels.
     pub(crate) async fn lower_level_with(&self, table: &[version::Level], level: u32, by: &str) -> Result<ClusterVersion, FinalizeError> {
         let path = self.path(version::OBJECT);
         let Some((cur, etag)) = self.read_version().await? else {
@@ -893,7 +806,7 @@ impl Cluster {
         let mut next = cur.clone();
         next.active = level;
         next.history.push(version::Change::new(level, by));
-        match self.put_json(&path, &next, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
+        match self.put_json(&path, &next, if_match(etag)).await {
             Ok(_) => {}
             Err(e) if is_conflict(&e) => return Err(FinalizeError::Store(anyhow::anyhow!("{} changed concurrently: retry", version::OBJECT))),
             Err(e) => return Err(FinalizeError::Store(e.into())),
@@ -903,12 +816,10 @@ impl Cluster {
         Ok(next)
     }
 
-    /// Enables the split policy hook (reshard.rs).
     pub fn set_reshard_policy(&self, p: crate::reshard::Policy) {
         *self.policy.write() = p;
     }
 
-    /// The shard map this node routes by.
     pub fn layout(&self) -> Arc<Layout> {
         self.layout.read().0.clone()
     }
@@ -917,7 +828,6 @@ impl Cluster {
         Path::from(format!("{}/{}", self.store.prefix, rel))
     }
 
-    /// Counts a control-plane object-store request.
     fn count(&self, op: &str) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         if op == "list" {
@@ -926,54 +836,43 @@ impl Cluster {
         crate::metrics::CLUSTER_STORE_REQUESTS.with_label_values(&[op]).inc();
     }
 
-    /// Control-plane object-store requests made so far.
     pub fn store_requests(&self) -> u64 {
         self.requests.load(Ordering::Relaxed)
     }
 
-    /// Control-plane LISTs made so far.
     pub fn store_lists(&self) -> u64 {
         self.lists.load(Ordering::Relaxed)
     }
 
-    /// Our wall clock as published to peers (offset in tests only).
     fn wall_ms(&self) -> u64 {
         (now_ms() as i64 + self.cfg.clock_offset_ms).max(0) as u64
     }
 
-    /// Deadline of one control-plane object-store call made by a step:
-    /// min(TTL, 5 s). A request the store stalls on (bench/ha ret3: MinIO
-    /// held a couple for its 30 s client timeout plus a retry, and failover
-    /// took 36 s instead of ~4) fails the step, which retries on its next
-    /// tick, instead of stalling every takeover behind it. Renewals have
-    /// their own loop and never time out (a cancelled CAS that lands
-    /// anyway would leave us an ETag we never learned).
+    /// min(TTL, 5 s) per control-plane call: a request the store stalls on
+    /// fails the step (retried next tick) instead of stalling every takeover
+    /// behind it. Renewals never time out: a cancelled CAS that lands anyway
+    /// would leave us an ETag we never learned.
     fn call_deadline(&self) -> Option<Duration> {
         self.bounded.load(Ordering::Acquire).then(|| self.cfg.ttl.min(Duration::from_secs(5)))
     }
 
-    /// `bounded` for calls returning anyhow errors.
-    async fn bounded_any<T>(&self, op: &str, f: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    async fn with_deadline<T, E>(&self, op: &str, f: impl std::future::Future<Output = Result<T, E>>, timed_out: impl FnOnce(String) -> E) -> Result<T, E> {
         let Some(d) = self.call_deadline() else { return f.await };
         match tokio::time::timeout(d, f).await {
             Ok(r) => r,
             Err(_) => {
                 crate::metrics::CLUSTER_STORE_TIMEOUTS.with_label_values(&[op]).inc();
-                anyhow::bail!("control-plane {op} timed out after {d:?}")
+                Err(timed_out(format!("control-plane {op} timed out after {d:?}")))
             }
         }
     }
 
-    /// Runs one control-plane store call within `call_deadline`.
+    async fn bounded_any<T>(&self, op: &str, f: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+        self.with_deadline(op, f, |m| anyhow::anyhow!(m)).await
+    }
+
     pub(crate) async fn bounded<T>(&self, op: &str, f: impl std::future::Future<Output = Result<T, object_store::Error>>) -> Result<T, object_store::Error> {
-        let Some(d) = self.call_deadline() else { return f.await };
-        match tokio::time::timeout(d, f).await {
-            Ok(r) => r,
-            Err(_) => {
-                crate::metrics::CLUSTER_STORE_TIMEOUTS.with_label_values(&[op]).inc();
-                Err(object_store::Error::Generic { store: "cluster", source: format!("control-plane {op} timed out after {d:?}").into() })
-            }
-        }
+        self.with_deadline(op, f, |m| object_store::Error::Generic { store: "cluster", source: m.into() }).await
     }
 
     pub(crate) async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &Path) -> anyhow::Result<Option<(T, Option<String>)>> {
@@ -996,14 +895,14 @@ impl Cluster {
         self.bounded("put", self.put_json_unbounded(path, v, mode)).await
     }
 
-    /// A PUT that is never cancelled (renewals).
+    /// Renewals: never cancelled.
     async fn put_json_unbounded<T: Serialize>(&self, path: &Path, v: &T, mode: PutMode) -> Result<Option<String>, object_store::Error> {
         self.count("put");
         let body = PutPayload::from(serde_json::to_vec(v).unwrap());
         self.store.raw.put_opts(path, body, PutOptions { mode, ..Default::default() }).await.map(|r| r.e_tag)
     }
 
-    /// (file name, ETag) of every object under `rel`: one LIST per 1000.
+    /// (file name, ETag) of every object under `rel`.
     async fn list(&self, rel: &str) -> anyhow::Result<Vec<(String, Option<String>)>> {
         use futures::StreamExt;
         self.count("list");
@@ -1028,11 +927,10 @@ impl Cluster {
         let _ = self.bounded("delete", self.store.raw.delete(&self.path(rel))).await;
     }
 
-    /// Claims a writer id (CAS); returns it and the claim's ETag. A claim is
-    /// free when unclaimed, ours (a previous incarnation), or its holder has
-    /// no node lease at all (gone, or not yet created: `join` confirms). A
-    /// holder with a lease is never judged dead here: that takes observation
-    /// over time, and there are 256 ids to choose from.
+    /// Returns the id and the claim's ETag. A claim is free when unclaimed,
+    /// ours, or its holder has no node lease at all (`join` confirms ours).
+    /// A holder with a lease is never judged dead here: that takes
+    /// observation over time, and there are 256 ids to choose from.
     async fn claim_writer(&self) -> anyhow::Result<(u8, Option<String>)> {
         let start = (crate::state::did_hash(&self.cfg.node_id) % 256) as u16;
         let claim = serde_json::json!({"node_id": self.cfg.node_id, "log_id": self.log_id, "confirmed": false});
@@ -1046,7 +944,7 @@ impl Cluster {
                     if holder != self.cfg.node_id && self.get_json::<NodeLease>(&self.path(&format!("nodes/{holder}"))).await?.is_some() {
                         continue;
                     }
-                    PutMode::Update(UpdateVersion { e_tag: etag, version: None })
+                    if_match(etag)
                 }
             };
             match self.put_json(&path, &claim, mode).await {
@@ -1084,26 +982,23 @@ impl Cluster {
         Ok(())
     }
 
-    /// True while we may acknowledge writes / PUT segments.
+    /// True while we may acknowledge writes and PUT segments.
     pub fn lease_valid(&self) -> bool {
         // a halted test node's segment PUTs hang instead of fail-stopping
         // the shared test process
         self.halted.load(Ordering::Acquire) || Instant::now() < *self.valid_until.read()
     }
 
-    /// Tests only: stops this node's control plane as if its process died
-    /// (no renewals, steps or watchdog; peers presume it dead after TTL +
-    /// skew). The caller makes its object-store calls hang, so nothing it
-    /// still has in flight lands; see tests/all/reshard.rs.
+    /// Tests only: stops this node's control plane as if its process died.
+    /// The caller makes its object-store calls hang, so nothing it still has
+    /// in flight lands.
     pub fn halt(&self) {
         self.halted.store(true, Ordering::Release);
         self.gone.store(true, Ordering::Release);
         self.stopping.store(true, Ordering::Release);
     }
 
-    /// Tests only: while set, steps do nothing (no membership, routing or
-    /// shard moves; the lease is still renewed): a peer whose step loop is
-    /// stuck or slow.
+    /// Tests only: while set, steps do nothing (the lease is still renewed).
     pub fn test_hold_steps(&self, on: bool) {
         self.hold_steps.store(on, Ordering::Release);
         if !on {
@@ -1111,8 +1006,7 @@ impl Cluster {
         }
     }
 
-    /// Tests only: while set, greetings are answered "not following" (a
-    /// peer whose hello handling is slow or unreachable).
+    /// Tests only: while set, greetings are answered "not following".
     pub fn test_ignore_hellos(&self, on: bool) {
         self.ignore_hellos.store(on, Ordering::Release);
     }
@@ -1121,12 +1015,11 @@ impl Cluster {
         self.halted.load(Ordering::Acquire)
     }
 
-    /// Our lease expiry on our own wall clock (caps our announced watermark).
+    /// On our own wall clock (caps our announced watermark).
     pub fn lease_expiry_us(&self) -> u64 {
         self.expires_local_ms.load(Ordering::Acquire) * 1000
     }
 
-    /// No live peer (see the field).
     pub fn alone(&self) -> bool {
         self.alone.load(Ordering::Acquire)
     }
@@ -1141,12 +1034,11 @@ impl Cluster {
         v
     }
 
-    /// (node_id, addr) owning `shard`, from the routing table.
+    /// (node_id, addr)
     pub fn owner_of(&self, shard: ShardId) -> Option<(String, String)> {
         self.table.read().get(&shard).cloned()
     }
 
-    /// The assignment of `shard` as last read (or written) by this node.
     pub fn assignment(&self, shard: ShardId) -> Option<Assignment> {
         self.assigns.read().get(&shard).map(|(a, _)| a.clone())
     }
@@ -1159,33 +1051,25 @@ impl Cluster {
         self.fenced.read().iter().map(|(k, (o, _))| (k.clone(), *o)).collect()
     }
 
-    /// Closes a dead node's log: writes a fence object at the end of its
-    /// durable prefix, its first ordinal that isn't a segment (with K PUTs in
-    /// flight a crash can leave segments past a hole: those were never acked
-    /// and the fence cuts them off). Returns that ordinal (the log's final
-    /// end) and the last seq in the log before it.
+    /// Closes a log: writes a fence object at its first ordinal that isn't
+    /// a segment (a crash with K PUTs in flight can leave never-acked
+    /// segments past a hole: the fence cuts them off). Returns that ordinal
+    /// (the log's final end) and the last seq before it.
     pub async fn fence(&self, log_id: &str) -> anyhow::Result<(u64, i64)> {
-        self.fence_inner(log_id, None).await
+        self.fence_as(log_id, None).await
     }
 
-    /// [`Cluster::fence`] of an incarnation that ended without fencing its
-    /// own log (a dead peer's, or our own previous one's: `reason`); counts
-    /// `vlpds_peer_takeovers_total{reason}` when this call writes the fence
-    /// (one count per dead incarnation cluster-wide: a fence is a create-only PUT).
-    async fn fence_dead(&self, log_id: &str, reason: &str) -> anyhow::Result<(u64, i64)> {
-        self.fence_inner(log_id, Some(reason)).await
-    }
-
-    async fn fence_inner(&self, log_id: &str, takeover: Option<&str>) -> anyhow::Result<(u64, i64)> {
+    /// `takeover`: the log of an incarnation that ended without fencing it
+    /// (a dead peer's, or our previous one's); counts
+    /// `vlpds_peer_takeovers_total{reason}` once cluster-wide (a fence is a
+    /// create-only PUT).
+    async fn fence_as(&self, log_id: &str, takeover: Option<&str>) -> anyhow::Result<(u64, i64)> {
         if let Some(f) = self.fenced.read().get(log_id) {
             return Ok(*f);
         }
         loop {
-            // HA fix: if a fence is already there (another survivor fenced
-            // first), it is the log's end. Without this check every survivor
-            // stacked another fence after it, so spans for the same dead log
-            // ended at different ordinals. Fencers agree because the end is
-            // the first non-segment ordinal, which never changes once fenced.
+            // An existing fence is the log's end: every fencer must agree on
+            // it, so never stack another one after it.
             self.count("list");
             let (next, fenced) = self.bounded_any("fence-scan", crate::nodelog::first_free(&self.store, log_id)).await?;
             if !fenced {
@@ -1218,8 +1102,8 @@ impl Cluster {
         }
     }
 
-    /// The last seq in `log_id` below ordinal `end` (0 for an empty log).
-    /// Everything below a fence is a segment, so this reads one header.
+    /// 0 for an empty log. Everything below a fence is a segment, so this
+    /// reads one header.
     async fn last_seq_before(&self, log_id: &str, end: u64) -> anyhow::Result<i64> {
         let mut ord = end;
         while ord > 0 {
@@ -1238,11 +1122,8 @@ impl Cluster {
 
     pub fn spawn(self: &Arc<Self>, host: Arc<dyn ShardHost>) {
         self.spawned.store(true, Ordering::Release);
-        // HA fix: renew the node lease on its own loop. A step reads every
-        // node lease and every shard assignment (O(shards) S3 GETs); renewing
-        // only at the top of a step meant one slow step (S3 at ~400 ms per
-        // call: 64 GETs = ~25 s) let the lease lapse and the node fail-stop
-        // within ~2 s of a mild S3 brownout (bench/ha s3-slow).
+        // Renewals get their own loop: a step makes O(shards) store calls,
+        // and one slow step must not let the lease lapse.
         let me = self.clone();
         let h = host.clone();
         tokio::spawn(async move {
@@ -1250,22 +1131,17 @@ impl Cluster {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                // keeps renewing through a graceful shutdown's drain (closing
-                // 100+ shards takes longer than a TTL); stops when the lease goes
+                // keeps renewing through a graceful shutdown's drain
                 if me.gone.load(Ordering::Acquire) {
                     return;
                 }
                 me.renew(&h).await;
             }
         });
-        // HA fix: lease watchdog. Lease validity was only checked before a
-        // segment PUT or an ack, so a node whose S3 calls hang (the PUT in
-        // flight never returns) stayed up as a zombie. It held forwarded and
-        // client requests open until the network healed (12 s in bench/ha
-        // s3-partition and full-partition), long after peers had fenced its
-        // log. Peers presume us dead TTL + skew after they last saw our lease
-        // change, i.e. no earlier than 2 x skew after our validity ends: by
-        // then we can never ack again, so fail-stop.
+        // Watchdog: a node whose store calls hang never reaches the
+        // validity checks before a PUT or ack, and would hold requests open
+        // as a zombie. Peers presume us dead no earlier than 2 x skew after
+        // our validity ends: by then we can never ack again, so fail-stop.
         let me = self.clone();
         let h = host.clone();
         tokio::spawn(async move {
@@ -1289,8 +1165,6 @@ impl Cluster {
             let mut tick = tokio::time::interval(me.cfg.renew_every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                // Step every tick, and when a peer nudges us (it released
-                // shards for us: take them now, not up to a tick later).
                 tokio::select! {
                     _ = tick.tick() => {}
                     _ = me.nudged.notified() => {
@@ -1307,25 +1181,19 @@ impl Cluster {
         });
     }
 
-    /// A peer handed us shards or released some: adopt / step now
-    /// (coalesced; one queued while a step runs starts right after it).
+    /// A peer handed us shards or released some: adopt and step now
+    /// (coalesced).
     pub fn nudge(&self, handoffs: Vec<Handoff>) {
         self.contact.store(true, Ordering::Release);
         self.handed.lock().extend(handoffs);
         self.nudged.notify_one();
     }
 
-    /// Whether `a` names this incarnation at an epoch it hasn't opened yet:
-    /// a peer handed the shard to us.
+    /// `a` names this incarnation at an epoch it hasn't opened yet.
     fn handed_to_us(&self, shard: ShardId, a: &Assignment) -> bool {
-        a.owner.as_deref() == Some(&self.cfg.node_id)
-            && a.log_id.as_deref() == Some(&self.log_id)
-            && !self.is_owner(shard)
-            && self.opened.read().get(&shard).is_none_or(|&e| e < a.epoch)
+        self.names_us(a) && !self.is_owner(shard) && self.opened.read().get(&shard).is_none_or(|&e| e < a.epoch)
     }
 
-    /// Adopts the shards peers handed us in nudges: no control-plane read,
-    /// the nudge carries the assignment the releaser wrote.
     async fn adopt_handed(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
         if self.handed.lock().is_empty() {
             return Ok(());
@@ -1348,8 +1216,8 @@ impl Cluster {
         self.adopt(host, adopt).await
     }
 
-    /// Starts serving shards whose assignment already names us (handed by
-    /// their previous owner): replay the history before our own span.
+    /// Starts serving shards whose assignment already names us: replays the
+    /// history before our own span.
     async fn adopt(&self, host: &Arc<dyn ShardHost>, shards: Vec<(ShardId, Assignment)>) -> anyhow::Result<()> {
         if shards.is_empty() {
             return Ok(());
@@ -1368,8 +1236,7 @@ impl Cluster {
         self.open_acquired(host, open).await
     }
 
-    /// Opens shards we now own and routes them to us; one that fails to open
-    /// is released (nothing was logged for it).
+    /// One that fails to open is released (nothing was logged for it).
     pub(crate) async fn open_acquired(&self, host: &Arc<dyn ShardHost>, shards: Vec<(ShardId, u64, Vec<Span>)>) -> anyhow::Result<()> {
         {
             let mut opened = self.opened.write();
@@ -1388,7 +1255,6 @@ impl Cluster {
                     self.table.write().insert(s, (self.cfg.node_id.clone(), self.cfg.addr.clone()));
                 }
                 Err(e) => {
-                    // nothing was logged for it: release dropping our span
                     tracing::error!(shard = s.0, "open failed: {e:#}; releasing");
                     self.owned.write().remove(&s);
                     self.release(s, host.next_ordinal(), host.seq_high(), None, None).await?;
@@ -1398,33 +1264,18 @@ impl Cluster {
         Ok(())
     }
 
-    /// Joining: before it takes any shard (acks anything), a new incarnation
-    /// needs every peer's merged firehose to follow its log from below its
-    /// first seq. A peer that starts following a log late starts at its
-    /// merger's position at that moment (`Firehose::add_remote`): it never
-    /// delivers the log's events at or below that floor, and its merged
-    /// stream (already emitted past them) can't take them in order. So:
-    ///
-    /// - every live peer must confirm it follows our log, with its
-    ///   follower's floor: a hello answer (`ShardHost::greet`, retried each
-    ///   step), or our log in its lease's `follows` (its step discovered us);
-    /// - our seqs must pass every floor (and, for a peer we ignore as dead
-    ///   without its confirmation, its published `wm_cap`, past which its
-    ///   merger can't settle) before we join: a peer's floor is its merger's
-    ///   position, which a joiner's clock running behind could still be at.
+    /// Before it takes any shard, a new incarnation needs every peer's
+    /// merged firehose to follow its log from below its first seq: a peer
+    /// that starts following late starts at its merger's position and can
+    /// never deliver the log's events below it in order. So every live peer
+    /// must confirm it follows our log (a hello answer, or our log in its
+    /// lease's `follows`), and our seqs must pass every confirmed floor (and
+    /// the `wm_cap` of each peer we ignore as dead) before we join.
     ///
     /// No timer ends this: a live peer that never confirms keeps us out
-    /// (we forward writes meanwhile) until it confirms or we presume it
-    /// dead (TTL + skew without a renewal). Any peer that appears later lists
-    /// our lease at its own startup and follows our log from its start
-    /// floor (its cursor backfill serves everything below). Once joined we
-    /// publish `joined` at once: peers hand us shards at their next step,
-    /// as they used to once we greeted them. (Nudging them all made every
-    /// peer release at the same instant, and our adopts of the batches
-    /// queue behind each other.)
-    ///
-    /// The inline first step at startup doesn't greet (the node must serve
-    /// first); a node with no live peer joins there.
+    /// until it confirms or we presume it dead. Peers learn `joined` from our
+    /// lease at their next step; nudging them all instead made every peer
+    /// release at the same instant.
     async fn try_join(&self, host: &Arc<dyn ShardHost>, live: &[NodeLease], dead: &[NodeLease]) -> bool {
         let peers: Vec<&NodeLease> = live.iter().filter(|l| l.node_id != self.cfg.node_id).collect();
         if !peers.is_empty() && !self.spawned.load(Ordering::Acquire) {
@@ -1466,7 +1317,7 @@ impl Cluster {
                 floor = floor.max(confirmed(d, &c).unwrap_or(d.wm_cap));
             }
         }
-        if !self.wait_seq_past(floor).await {
+        if !wait_clock_past(floor, self.cfg.renew_every).await {
             tracing::warn!(floor, "not joining yet: our clock is behind a peer's merged firehose");
             return false;
         }
@@ -1477,38 +1328,18 @@ impl Cluster {
         true
     }
 
-    /// Waits (up to a renew interval) until every seq we assign exceeds
-    /// `floor`. False if our clock is still behind it.
-    async fn wait_seq_past(&self, floor: i64) -> bool {
-        let deadline = Instant::now() + self.cfg.renew_every;
-        loop {
-            let now = crate::tid::now_micros();
-            if crate::nodelog::seq_floor(now) > floor {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            let ahead_us = ((floor >> 8) as u64).saturating_sub(now);
-            tokio::time::sleep(Duration::from_micros(ahead_us.clamp(1_000, 50_000))).await;
-        }
-    }
-
-    /// Whether this incarnation has joined (see `try_join`).
     pub fn joined(&self) -> bool {
         self.joined.load(Ordering::Acquire)
     }
 
-    /// A joiner greeted us: learn its lease now (one GET) and follow its
-    /// log, as our next step would. Returns our follower's floor for its
-    /// log (we deliver every event of it above), or None if it has no
-    /// lease, we presume it dead, or we don't follow it yet (a step racing
-    /// us replaced our peer list: it asks again).
+    /// A joiner greeted us: learn its lease now and follow its log. Returns
+    /// our follower's floor for its log, or None if it has no lease, we
+    /// presume it dead, or we don't follow it yet (a step racing us replaced
+    /// our peer list: it asks again).
     pub async fn learn_peer(&self, host: &Arc<dyn ShardHost>, node_id: &str) -> anyhow::Result<Option<i64>> {
         if node_id == self.cfg.node_id || self.ignore_hellos.load(Ordering::Acquire) {
             return Ok(None);
         }
-        // a joiner exists: our next step lists everything again (`step_body`)
         self.contact.store(true, Ordering::Release);
         let Some((lease, etag)) = self.get_json::<NodeLease>(&self.path(&format!("nodes/{node_id}"))).await? else {
             return Ok(None);
@@ -1530,18 +1361,15 @@ impl Cluster {
         Ok(host.follow_floors().get(&log_id).copied())
     }
 
-    /// Renews our node lease (CAS on its ETag); a conflict means someone
-    /// else rewrote it: fail-stop via `host.lost()`.
+    /// A conflict means someone else rewrote our lease: fail-stop.
     async fn renew(&self, host: &Arc<dyn ShardHost>) {
         let _g = self.renew_lock.lock().await;
         if self.gone.load(Ordering::Acquire) {
             return;
         }
-        // HA fix: never resurrect a lapsed lease. Peers may already have
-        // declared us dead and fenced our log; a renewal that lands afterwards
-        // makes them count us live again, so they shrink their fair share and
-        // release shards they just took (unowned until our lease expires once
-        // more). Seen with a SIGSTOP zombie waking (bench/ha zombie-short).
+        // Never resurrect a lapsed lease: peers may have fenced our log, and
+        // a renewal landing now would make them count us live again and
+        // release shards they just took.
         if !self.lease_valid() {
             crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&["lapsed"]).inc();
             tracing::error!("node lease lapsed before renewal: fail-stop");
@@ -1554,7 +1382,7 @@ impl Cluster {
             l.follows = host.follow_floors();
         }
         let etag = self.lease_etag.read().clone();
-        if let Err(e) = self.write_lease(PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
+        if let Err(e) = self.write_lease(if_match(etag)).await {
             let moved = e.downcast_ref::<object_store::Error>().is_some_and(lease_moved);
             let recreated = if moved { self.recreate_vanished_lease().await } else { Recreate::Retry };
             match (moved, recreated) {
@@ -1574,13 +1402,10 @@ impl Cluster {
     }
 
     /// A renewal CAS failed: if our lease is simply gone and our log isn't
-    /// fenced, recreate it. A peer deletes a lease only once it has fenced
-    /// that incarnation's log (step 7), so a lease missing over our unfenced
-    /// log was our dead previous incarnation's as the peer saw it a moment
-    /// before: it read the old lease, and our join's CAS over it landed
-    /// before its delete. Rewritten, or our log fenced (we were presumed
-    /// dead): lost. A store error: retried at the next renewal (validity
-    /// runs out meanwhile, as with any failing renewal).
+    /// fenced, recreate it. A peer deletes a lease only once it fenced that
+    /// incarnation's log, so a lease missing over our unfenced log was our
+    /// previous incarnation's as the peer saw it: our join's CAS landed
+    /// before its delete.
     async fn recreate_vanished_lease(&self) -> Recreate {
         let path = self.path(&format!("nodes/{}", self.cfg.node_id));
         match self.get_json::<serde_json::Value>(&path).await {
@@ -1614,19 +1439,15 @@ impl Cluster {
         }
     }
 
-    /// Membership: (live, dead) node leases. One LIST; a lease is fetched
-    /// only when its ETag changed (or the store reports none). A peer is live
-    /// until its lease has gone unchanged for TTL + skew of our monotonic
-    /// time, or until we fence its log (it can never ack again, even if a
-    /// renewal it sent before lapsing lands late).
+    /// (live, dead) node leases. A lease is fetched only when its ETag
+    /// changed. A peer is dead once its lease has gone unchanged for TTL +
+    /// skew of our monotonic time, or once we fenced its log (a renewal it
+    /// sent before lapsing may still land).
     ///
-    /// A peer that has missed a renewal (quiet for 1.5 renew intervals) is
-    /// probed with a TCP connect to its address: refused means nothing
-    /// listens there, so that incarnation is gone (kill -9, crash, OOM) and
-    /// we presume it dead now instead of after TTL + skew. Presuming early is
-    /// safe (DESIGN.md "Why safety needs no clocks": the takeover fences its
-    /// log first); a probe that connects, times out or fails otherwise
-    /// leaves the TTL rule in charge (a frozen process or a dead machine).
+    /// A peer that missed a renewal is probed with a TCP connect: refused
+    /// means that incarnation is gone, so we presume it dead now. Presuming
+    /// early is safe (the takeover fences its log first); any other probe
+    /// result leaves the TTL rule in charge.
     async fn read_nodes(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<(Vec<NodeLease>, Vec<NodeLease>)> {
         use futures::StreamExt;
         // judge staleness as of before the LIST: a slow LIST can't make a
@@ -1700,9 +1521,8 @@ impl Cluster {
         Ok((live, dead))
     }
 
-    /// Refreshes the assignment cache and the layout: one LIST of `assign/`,
-    /// then a GET for each object whose ETag changed (every one every
-    /// FULL_RESYNC_STEPS steps).
+    /// One LIST of `assign/`, then a GET for each object whose ETag changed
+    /// (every one if `full`).
     async fn read_assignments(&self, host: &Arc<dyn ShardHost>, full: bool) -> anyhow::Result<()> {
         use futures::StreamExt;
         let mut listed: BTreeMap<ShardId, Option<String>> = BTreeMap::new();
@@ -1750,8 +1570,6 @@ impl Cluster {
         Ok(())
     }
 
-    /// GETs the layout and installs it if it is newer than ours (or its op
-    /// changed).
     pub(crate) async fn refresh_layout(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<Arc<Layout>> {
         let Some((l, etag)) = self.get_json::<Layout>(&self.path(LAYOUT)).await? else {
             anyhow::bail!("shard layout missing");
@@ -1760,7 +1578,7 @@ impl Cluster {
         Ok(self.install_layout(host, l, etag))
     }
 
-    /// Adopts `l` (read or written with `etag`) unless ours is newer.
+    /// Unless ours is newer.
     pub(crate) fn install_layout(&self, host: &Arc<dyn ShardHost>, l: Layout, etag: Option<String>) -> Arc<Layout> {
         let mut cur = self.layout.write();
         if l.version < cur.0.version {
@@ -1785,15 +1603,11 @@ impl Cluster {
         l
     }
 
-    /// Runs `fut` (shard opens/closes, which can take many seconds for 100+
-    /// shards) while renewing our lease every renew interval, when no
-    /// independent renew loop is running (the inline first step at startup,
-    /// tests). Renewals are never cancelled mid-flight: a dropped CAS PUT could
-    /// land with an ETag we never learn, and our next renew would "lose" the lease.
-    async fn with_keepalive<T>(&self, host: &Arc<dyn ShardHost>, renew: bool, fut: impl std::future::Future<Output = T>) -> T {
-        if !renew {
-            return fut.await;
-        }
+    /// Runs `fut` while renewing our lease every renew interval (when no
+    /// renew loop runs yet: the inline first step at startup, tests).
+    /// Renewals are never cancelled mid-flight: a dropped CAS PUT could land
+    /// with an ETag we never learn, and our next renew would lose the lease.
+    async fn with_keepalive<T>(&self, host: &Arc<dyn ShardHost>, fut: impl std::future::Future<Output = T>) -> T {
         let done = tokio::sync::Notify::new();
         let work = async {
             let r = fut.await;
@@ -1813,7 +1627,7 @@ impl Cluster {
         r
     }
 
-    /// One control-plane round: renew, membership, routing, acquire/release.
+    /// One control-plane round, renewing first.
     pub async fn step(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
         self.step_inner(host, true).await
     }
@@ -1823,63 +1637,31 @@ impl Cluster {
         if self.stopping.load(Ordering::Acquire) || self.hold_steps.load(Ordering::Acquire) {
             return Ok(());
         }
-        // 1. renew our node lease (the spawned loop renews on its own task)
         if !renew {
             return self.step_body(host).await;
         }
         self.renew(host).await;
-        // HA fix: the first step runs inline at startup, before the renew loop
-        // exists. On a fresh prefix a lone node acquires its whole share there
-        // (one CAS PUT per shard, then opening them all: 181 shards took 19 s
-        // for the UI agent), which outlived the lease, so the node fail-stopped
-        // on first start. Keep renewing for as long as the inline step runs.
-        self.with_keepalive(host, true, self.step_body(host)).await
+        // a lone node's first step opens its whole share, which can outlive
+        // the lease
+        self.with_keepalive(host, self.step_body(host)).await
     }
 
     async fn step_body(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
-        // 1b. the cluster's feature level (once per TTL)
         self.observe_version().await?;
         // A lone node lists less (DESIGN.md "Lone-node control plane"): while
         // `nodes/` holds only our lease, `assign/` changes only by our own
-        // writes (which update our cache), and a joiner greets us (hello ->
-        // `learn_peer`) before it may write anything there.
+        // writes, and a joiner greets us before it may write anything there.
         let step = self.steps.fetch_add(1, Ordering::Relaxed);
         let contact = self.contact.swap(false, Ordering::AcqRel);
         let was_lone = self.lone.load(Ordering::Acquire) && !contact && !self.list_every_step.load(Ordering::Acquire);
         let was_settled = self.settled.swap(false, Ordering::AcqRel);
-        // 2. membership: a lone node still lists `nodes/` at least once per
-        //    TTL, so a joiner whose greeting never arrives is seen anyway
-        let skip_nodes = was_lone && self.joined() && {
-            let (at, reused) = *self.nodes_listed.lock();
-            let per_ttl = (self.cfg.ttl.as_nanos() / self.cfg.renew_every.as_nanos().max(1)).max(1) as u32;
-            at.is_some_and(|t| reused + 1 < per_ttl && t.elapsed() + self.cfg.renew_every / 2 < self.cfg.ttl)
-        };
-        let (live, dead) = if skip_nodes {
-            self.nodes_listed.lock().1 += 1;
-            crate::metrics::CLUSTER_LONE_SKIPS.with_label_values(&["nodes"]).inc();
-            // `peers` is left alone: a greeting racing this step may have
-            // added a joiner, which the next step (contact) lists
-            (vec![self.lease.read().clone()], Vec::new())
-        } else {
-            // a failed LIST leaves us not lone: the next step lists again
-            self.lone.store(false, Ordering::Release);
-            let started = Instant::now();
-            let (live, dead) = self.read_nodes(host).await?;
-            *self.nodes_listed.lock() = (Some(started), 0);
-            let mut peers = self.peers.write();
-            *peers = live.iter().filter(|l| l.node_id != self.cfg.node_id).map(|l| (l.node_id.clone(), l.clone())).collect();
-            self.alone.store(peers.is_empty(), Ordering::Release);
-            (live, dead)
-        };
+        let (live, dead) = self.membership(host, was_lone).await?;
         let lone = live.len() == 1 && dead.is_empty();
         self.lone.store(lone, Ordering::Release);
         let live_ids: HashSet<String> = live.iter().map(|l| l.node_id.clone()).collect();
         let dead_logs: HashMap<String, String> = dead.iter().map(|l| (l.node_id.clone(), l.log_id.clone())).collect();
-        // 3. layout + assignments -> routing table. Skipped while we were
-        //    and still are alone and the last step left nothing in motion
-        //    (every shard ours, no split/merge): only our own writes changed
-        //    `assign/` since. Listed every LONE_ASSIGN_EVERY steps anyway
-        //    (an out-of-band edit of the bucket).
+        // Listed every LONE_ASSIGN_EVERY steps anyway (an out-of-band edit of
+        // the bucket).
         if lone && was_lone && was_settled && !step.is_multiple_of(LONE_ASSIGN_EVERY) {
             crate::metrics::CLUSTER_LONE_SKIPS.with_label_values(&["assign"]).inc();
         } else {
@@ -1889,50 +1671,94 @@ impl Cluster {
         self.route(&live_ids);
         host.on_membership();
         // A shard we hold was reassigned under us: a peer presumed us dead
-        // and fenced our log, so we can never ack again. Fail-stop now rather
-        // than serve stale reads until our next segment PUT collides.
+        // and fenced our log. Fail-stop now rather than serve stale reads
+        // until our next segment PUT collides.
         let assigns = self.assigns.read().clone();
-        if let Some(s) = self.owned().into_iter().find(|s| {
-            assigns.get(s).is_none_or(|(a, _)| a.owner.as_deref() != Some(&self.cfg.node_id) || a.log_id.as_deref() != Some(&self.log_id))
-        }) {
+        if let Some(s) = self.owned().into_iter().find(|s| assigns.get(s).is_none_or(|(a, _)| !self.names_us(a))) {
             tracing::error!(shard = s.0, "a shard we hold was reassigned: fail-stop");
             host.lost();
             return Ok(());
         }
         let fair = layout.shards.len().div_ceil(live.iter().filter(|l| !l.draining).count().max(1));
-        // Join first: no shard before every peer follows our log (`try_join`).
         if !self.joined.load(Ordering::Acquire) && !self.try_join(host, &live, &dead).await {
             return Ok(());
         }
-        // HA fix: never take (or juggle) shards without a valid lease, e.g. a
-        // zombie that woke after its peers fenced it, or while renewals fail.
+        // e.g. a zombie that woke after its peers fenced it
         if !self.lease_valid() {
             return Ok(());
         }
-        // 4a. shards a peer handed us whose nudge we missed
+        // handoffs whose nudge we missed
         let handed: Vec<(ShardId, Assignment)> = layout
             .ids()
             .into_iter()
             .filter_map(|s| assigns.get(&s).filter(|(a, _)| self.handed_to_us(s, a)).map(|(a, _)| (s, a.clone())))
             .collect();
         self.adopt(host, handed).await?;
-        // 4a'. our releases that may not have landed (a CAS that failed or
-        //      timed out after the shard was closed): an assignment still
-        //      naming this incarnation at an epoch we opened, for a shard we
-        //      no longer hold. Left alone it would never be served (we look
-        //      alive, so nobody takes it over). Nothing of it was logged
-        //      since its close, so our span may end now.
+        self.retry_unreleased(host, &layout, &assigns).await;
+        let owned = self.owned();
+        if owned.len() < fair {
+            self.acquire(host, layout.ids(), fair - owned.len(), &live_ids, &dead_logs, fair, live.len()).await?;
+        } else if !self.hand_back_extras(host, &layout, &owned, fair, live.len()).await {
+            return Ok(());
+        }
+        self.trim_owned(host).await;
+        if let Err(e) = self.reshard_step(host, &live_ids).await {
+            tracing::warn!("reshard step failed (retried next step): {e:#}");
+        }
+        // dead nodes whose shards have all moved can be forgotten
+        for d in &dead {
+            if !assigns.values().any(|(a, _)| a.owner.as_deref() == Some(&d.node_id)) && self.fenced.read().contains_key(&d.log_id) {
+                self.forget_dead(d).await?;
+            }
+        }
+        // an early return above leaves this false
+        let layout = self.layout();
+        let settled = lone && layout.op.is_none() && self.handed.lock().is_empty() && layout.ids().iter().all(|s| self.is_owner(*s));
+        self.settled.store(settled, Ordering::Release);
+        Ok(())
+    }
+
+    /// (live, dead) leases. A lone node reuses its view, but still lists
+    /// `nodes/` at least once per TTL, so a joiner whose greeting never
+    /// arrives is seen anyway.
+    async fn membership(&self, host: &Arc<dyn ShardHost>, was_lone: bool) -> anyhow::Result<(Vec<NodeLease>, Vec<NodeLease>)> {
+        let skip = was_lone && self.joined() && {
+            let (at, reused) = *self.nodes_listed.lock();
+            let per_ttl = (self.cfg.ttl.as_nanos() / self.cfg.renew_every.as_nanos().max(1)).max(1) as u32;
+            at.is_some_and(|t| reused + 1 < per_ttl && t.elapsed() + self.cfg.renew_every / 2 < self.cfg.ttl)
+        };
+        if skip {
+            self.nodes_listed.lock().1 += 1;
+            crate::metrics::CLUSTER_LONE_SKIPS.with_label_values(&["nodes"]).inc();
+            // `peers` is left alone: a greeting racing this step may have
+            // added a joiner, which the next step (contact) lists
+            return Ok((vec![self.lease.read().clone()], Vec::new()));
+        }
+        // a failed LIST leaves us not lone: the next step lists again
+        self.lone.store(false, Ordering::Release);
+        let started = Instant::now();
+        let (live, dead) = self.read_nodes(host).await?;
+        *self.nodes_listed.lock() = (Some(started), 0);
+        let mut peers = self.peers.write();
+        *peers = live.iter().filter(|l| l.node_id != self.cfg.node_id).map(|l| (l.node_id.clone(), l.clone())).collect();
+        self.alone.store(peers.is_empty(), Ordering::Release);
+        Ok((live, dead))
+    }
+
+    fn names_us(&self, a: &Assignment) -> bool {
+        a.owner.as_deref() == Some(&self.cfg.node_id) && a.log_id.as_deref() == Some(&self.log_id)
+    }
+
+    /// Our releases that may not have landed (a CAS that failed or timed out
+    /// after the close): an assignment still naming us at an epoch we
+    /// opened, for a shard we no longer hold. Nobody else would ever take it
+    /// (we look alive), and nothing of it was logged since its close, so our
+    /// span may end now.
+    async fn retry_unreleased(&self, host: &Arc<dyn ShardHost>, layout: &Layout, assigns: &BTreeMap<ShardId, Versioned<Assignment>>) {
         let unreleased: Vec<ShardId> = layout
             .ids()
             .into_iter()
-            .filter(|s| {
-                !self.is_owner(*s)
-                    && assigns.get(s).is_some_and(|(a, _)| {
-                        a.owner.as_deref() == Some(&self.cfg.node_id)
-                            && a.log_id.as_deref() == Some(&self.log_id)
-                            && self.opened.read().get(s).is_some_and(|&e| e >= a.epoch)
-                    })
-            })
+            .filter(|s| !self.is_owner(*s) && assigns.get(s).is_some_and(|(a, _)| self.names_us(a) && self.opened.read().get(s).is_some_and(|&e| e >= a.epoch)))
             .collect();
         for s in unreleased {
             let frozen = layout.op.as_ref().filter(|o| o.parents.contains(&s)).map(|o| o.id);
@@ -1941,57 +1767,32 @@ impl Cluster {
                 tracing::warn!(shard = s.0, "release retry failed: {e:#}");
             }
         }
-        let owned = self.owned();
-        // 4b. acquire free / orphaned shards up to our fair share
-        if owned.len() < fair {
-            self.acquire(host, layout.ids(), fair - owned.len(), &live_ids, &dead_logs, fair, live.len()).await?;
-        } else {
-            // 5. hand extras straight to the peers short of their share. A
-            //    peer counts only once it has joined (its lease says so): it
-            //    can't adopt anything before that. Parents of a
-            //    reshard stay (they are about to freeze), and shards we
-            //    opened most recently go last (a split's children).
-            let settled = self.settled_peers();
-            let keep = layout.shards.len().div_ceil(settled.len() + 1);
-            if owned.len() > keep {
-                tracing::info!(owned = owned.len(), keep, live = live.len(), "handing back extra shards");
-                let busy: HashSet<ShardId> = layout.op.iter().flat_map(|o| o.parents.clone()).collect();
-                let mut cands: Vec<ShardId> = owned.iter().copied().filter(|s| !busy.contains(s)).collect();
-                let at = self.opened_at.read().clone();
-                cands.sort_by_key(|s| (at.get(s).copied(), std::cmp::Reverse(*s)));
-                let extras: Vec<ShardId> = cands.into_iter().take(owned.len() - keep).collect();
-                let to = self.short_of(&settled, fair);
-                if !self.close_and_release(host, extras, to, None).await {
-                    return Ok(());
-                }
-            }
-        }
-        // 5b. long histories our own checkpoints made redundant
-        self.trim_owned(host).await;
-        // 6. split/merge work: freeze parents we own, drive the op if ours
-        if let Err(e) = self.reshard_step(host, &live_ids).await {
-            tracing::warn!("reshard step failed (retried next step): {e:#}");
-        }
-        // 7. dead nodes whose shards have all moved can be forgotten
-        for d in &dead {
-            if !assigns.values().any(|(a, _)| a.owner.as_deref() == Some(&d.node_id)) && self.fenced.read().contains_key(&d.log_id) {
-                self.forget_dead(d).await?;
-            }
-        }
-        // nothing in motion: the next step may skip `LIST assign/` if we
-        // are still alone (an early return above leaves this false)
-        let layout = self.layout();
-        let settled = lone && layout.op.is_none() && self.handed.lock().is_empty() && layout.ids().iter().all(|s| self.is_owner(*s));
-        self.settled.store(settled, Ordering::Release);
-        Ok(())
     }
 
-    /// Deletes a dead incarnation's lease, unless the node restarted since
-    /// we read it (same node id, a new log): the lease is the new
-    /// incarnation's then. Re-read just before the delete, since the read
-    /// that judged it dead may be a whole step old. (The store has no
-    /// conditional delete; a restart landing between this GET and the
-    /// DELETE recreates its lease at its next renewal, see `renew`.)
+    /// Hands our shards past an even split straight to the joined peers
+    /// short of their share. Parents of a reshard stay (they are about to
+    /// freeze), and shards we opened most recently go last (a split's
+    /// children). False if we fail-stopped.
+    async fn hand_back_extras(&self, host: &Arc<dyn ShardHost>, layout: &Layout, owned: &[ShardId], fair: usize, live: usize) -> bool {
+        let settled = self.settled_peers();
+        let keep = layout.shards.len().div_ceil(settled.len() + 1);
+        if owned.len() <= keep {
+            return true;
+        }
+        tracing::info!(owned = owned.len(), keep, live, "handing back extra shards");
+        let busy: HashSet<ShardId> = layout.op.iter().flat_map(|o| o.parents.clone()).collect();
+        let mut cands: Vec<ShardId> = owned.iter().copied().filter(|s| !busy.contains(s)).collect();
+        let at = self.opened_at.read().clone();
+        cands.sort_by_key(|s| (at.get(s).copied(), std::cmp::Reverse(*s)));
+        let extras: Vec<ShardId> = cands.into_iter().take(owned.len() - keep).collect();
+        let to = self.short_of(&settled, fair);
+        self.close_and_release(host, extras, to, None).await
+    }
+
+    /// Deletes a dead incarnation's lease unless the node restarted since
+    /// (re-read first: the read that judged it dead may be a step old). The
+    /// store has no conditional delete; a restart landing between this GET
+    /// and the DELETE recreates its lease at its next renewal.
     async fn forget_dead(&self, d: &NodeLease) -> anyhow::Result<()> {
         let rel = format!("nodes/{}", d.node_id);
         match self.get_json::<serde_json::Value>(&self.path(&rel)).await? {
@@ -2001,7 +1802,6 @@ impl Cluster {
         Ok(())
     }
 
-    /// Rebuilds the routing table from the layout and assignment cache.
     fn route(&self, live_ids: &HashSet<String>) {
         let layout = self.layout();
         let assigns = self.assigns.read();
@@ -2017,8 +1817,7 @@ impl Cluster {
     }
 
     /// Takes up to `want` of `candidates` that are free or orphaned (fencing
-    /// an orphan's log first so its span end is final), CASing their
-    /// assignments concurrently, and opens them. Frozen shards are skipped.
+    /// an orphan's log first so its span end is final) and opens them.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn acquire(
         &self,
@@ -2033,7 +1832,6 @@ impl Cluster {
         use futures::StreamExt;
         let mut picked = Vec::new();
         let mut fresh: Option<Arc<Layout>> = None;
-        // owner -> its lease as re-read in this call (`superseded`)
         let mut leases: HashMap<String, Option<String>> = HashMap::new();
         for s in candidates {
             if picked.len() == want {
@@ -2045,11 +1843,10 @@ impl Cluster {
             let cached = self.assigns.read().get(&s).cloned();
             let (cur, etag) = match cached {
                 None => {
-                    // No record: a shard of a prefix's first layout nobody
-                    // took yet, or a retired one whose state and record
-                    // reshard_gc deleted. Only a fresh layout tells them
-                    // apart: a step that stalled on an old layout must
-                    // never recreate a retired shard over nothing.
+                    // No record: never taken yet, or retired and deleted by
+                    // reshard_gc. Only a fresh layout tells them apart: a
+                    // step that stalled on an old layout must never recreate
+                    // a retired shard over nothing.
                     if fresh.is_none() {
                         fresh = Some(self.refresh_layout(host).await?);
                     }
@@ -2068,20 +1865,17 @@ impl Cluster {
             let stale_self = cur.owner.as_deref() == Some(&self.cfg.node_id) && cur.log_id.as_deref() != Some(&self.log_id);
             let mut restarted = stale_self;
             if let Some(o) = cur.owner.as_deref().filter(|o| live_ids.contains(*o) && !stale_self) {
-                // a live owner, unless the assignment names an earlier
-                // incarnation of it (a fast same-id restart: the new one
-                // reclaims only up to its fair share, and nobody else
-                // would ever take the rest)
+                // unless the assignment names an earlier incarnation of it
+                // (a fast same-id restart reclaims only its fair share, and
+                // nobody else would ever take the rest)
                 if !self.superseded(o, cur.log_id.as_deref(), &mut leases).await? {
                     continue; // healthy owner
                 }
                 restarted = true;
             }
             if let Some(o) = &cur.owner {
-                // orphaned (dead owner, or an earlier incarnation of a live
-                // one): fence its log first so the span end is final
                 let Some(log) = cur.log_id.clone().or_else(|| dead_logs.get(o).cloned()) else { continue };
-                let (end, last_seq) = self.fence_dead(&log, if restarted { "restart" } else { "peer" }).await?;
+                let (end, last_seq) = self.fence_as(&log, Some(if restarted { "restart" } else { "peer" })).await?;
                 seq_floor = seq_floor.max(last_seq);
                 if let Some(last) = history.last_mut() {
                     if last.end.is_none() {
@@ -2092,9 +1886,7 @@ impl Cluster {
             let epoch = cur.epoch + 1;
             let mut next = history.clone();
             next.push(Span { log_id: self.log_id.clone(), epoch, start: host.next_ordinal(), end: None });
-            // Never drop a span to make room: one no successful open has
-            // replayed holds acked writes (the old 16-span cap dropped them
-            // after enough failed opens, and retention then deleted the log)
+            // never drop a span to make room: an unreplayed one holds acked writes
             trim_history(&mut next, cur.applied_epoch);
             if next.len() > MAX_SPANS {
                 tracing::error!(shard = s.0, spans = next.len(), applied_epoch = cur.applied_epoch, "shard history at its cap with no clean open to trim it: not taking it (spans are never dropped unreplayed)");
@@ -2114,12 +1906,10 @@ impl Cluster {
             };
             let mode = match etag {
                 None => PutMode::Create,
-                Some(e) => PutMode::Update(UpdateVersion { e_tag: Some(e), version: None }),
+                e => if_match(e),
             };
             picked.push((s, newa, mode, history));
         }
-        // CAS them concurrently: a handback of ~85 shards is one round
-        // trip, not one per shard (~2 s at 25 ms PUTs, bench 2026-10-02 §2)
         let cas: Vec<_> = futures::stream::iter(picked)
             .map(|(s, newa, mode, history)| async move {
                 let r = self.put_json(&self.path(&format!("assign/{}", s.key())), &newa, mode).await;
@@ -2138,7 +1928,7 @@ impl Cluster {
                     self.owned.write().insert(s);
                 }
                 Err(e) if is_conflict(&e) => {
-                    // someone else moved it: re-read it next step
+                    // re-read it next step
                     if let Some((_, etag)) = self.assigns.write().get_mut(&s) {
                         *etag = None;
                     }
@@ -2158,14 +1948,12 @@ impl Cluster {
         Ok(())
     }
 
-    /// Live peers that have joined (see `try_join`) and aren't draining:
-    /// the ones that may take shards.
+    /// The peers that may take shards.
     fn settled_peers(&self) -> Vec<NodeLease> {
         self.peers.read().values().filter(|l| !l.draining && l.joined).cloned().collect()
     }
 
-    /// `peers` owning fewer than `share` shards (per our assignment cache),
-    /// each with how many it is short.
+    /// `peers` owning fewer than `share` shards, each with how many it is short.
     fn short_of(&self, peers: &[NodeLease], share: usize) -> Vec<(NodeLease, usize)> {
         let mut count: HashMap<&str, usize> = HashMap::new();
         let assigns = self.assigns.read();
@@ -2183,16 +1971,13 @@ impl Cluster {
             .collect()
     }
 
-    /// Closes `shards` together (one barrier segment for all of them) and
-    /// releases each one whose close succeeded: handed straight to a peer in
-    /// `to` while it is short (up to its count), else unowned. Then nudges
-    /// every peer: those in `to` with their handoffs, so they serve the
-    /// shards at once; the rest so their routing follows.
-    /// A failed close means entries of that shard may still be in flight
-    /// past the span end we would publish, so it is never released: we
-    /// fail-stop instead, and a successor fences our log and replays it to
-    /// the fence. False if we fail-stopped. `frozen`: release them frozen
-    /// for that reshard op (never handed out; `to` must be empty).
+    /// Closes `shards` together and releases each one whose close
+    /// succeeded: handed to a peer in `to` while it is short, else unowned.
+    /// Then nudges every peer (recipients adopt; the rest fix their routing).
+    /// A failed close may leave entries in flight past the span end we would
+    /// publish, so it is never released: we fail-stop instead, and a
+    /// successor fences our log and replays it. False if we fail-stopped.
+    /// `frozen`: release them frozen for that reshard op (`to` empty).
     pub(crate) async fn close_and_release(&self, host: &Arc<dyn ShardHost>, shards: Vec<ShardId>, mut to: Vec<(NodeLease, usize)>, frozen: Option<u64>) -> bool {
         use futures::StreamExt;
         if shards.is_empty() {
@@ -2243,8 +2028,7 @@ impl Cluster {
             .buffer_unordered(32)
             .collect()
             .await;
-        // every peer: recipients adopt, the rest refresh their routing now
-        // (a stale route forwards to us, and we no longer own the shard)
+        // a stale route forwards to us, and we no longer own the shard
         let mut nudges: HashMap<String, Vec<Handoff>> = self.peers.read().values().map(|l| (l.addr.clone(), Vec::new())).collect();
         for (dest, r) in released {
             match r {
@@ -2257,8 +2041,6 @@ impl Cluster {
         }
         let handed: usize = nudges.values().map(|v| v.len()).sum();
         tracing::info!(shards = n, handed, elapsed_ms = started.elapsed().as_millis() as u64, "closed and released shards");
-        // wake them instead of leaving the shards idle (and misrouted) until
-        // their next step
         let nudges: Vec<(String, Vec<Handoff>)> = nudges.into_iter().filter(|(a, _)| !a.is_empty()).collect();
         crate::metrics::CLUSTER_NUDGES.with_label_values(&["sent"]).inc_by(nudges.len() as u64);
         host.nudge(nudges).await;
@@ -2269,11 +2051,9 @@ impl Cluster {
         ok
     }
 
-    /// Releases `shard`, closing our span at `end` (exclusive) and raising its
-    /// seq floor to `seq_floor`: unowned, or handed to `to` (the next epoch,
-    /// with an open span for it starting at the log ordinal its lease last
-    /// published). CAS against the cached assignment; re-read once on a
-    /// conflict. Returns the handoff for `to`.
+    /// Closes our span at `end` (exclusive): unowned, or handed to `to` (the
+    /// next epoch, with an open span for it). CAS against the cached
+    /// assignment; re-read once on a conflict. Returns the handoff for `to`.
     async fn release(&self, shard: ShardId, end: u64, seq_floor: i64, to: Option<&NodeLease>, frozen: Option<u64>) -> anyhow::Result<Option<Handoff>> {
         let path = self.path(&format!("assign/{}", shard.key()));
         let mut cur = self.assigns.read().get(&shard).cloned().filter(|(_, e)| e.is_some());
@@ -2288,12 +2068,9 @@ impl Cluster {
             if a.owner.as_deref() != Some(&self.cfg.node_id) {
                 return Ok(None);
             }
-            // Served at this epoch (and closed: we release only closed
-            // shards): its state holds every span up to ours, and the close
-            // put its marker in ours. Never served (a failed open, a handoff
-            // passed on unopened): nothing of it is in our log, and no
-            // marker names our span, so the span goes (failed opens no
-            // longer grow the history).
+            // Served at this epoch (and closed): its state holds every span
+            // up to ours. Never served (a failed open, a handoff passed on
+            // unopened): nothing of it is in our log, so our span goes.
             let served = a.log_id.as_deref() == Some(&self.log_id) && self.served.read().get(&shard) == Some(&a.epoch);
             if a.history.last().is_some_and(|l| l.log_id == self.log_id && l.end.is_none()) {
                 if served || frozen.is_some() {
@@ -2317,9 +2094,8 @@ impl Cluster {
                 }
                 Some(l) => {
                     // Its span starts at the ordinal its lease published (a
-                    // lower bound: ordinals only grow), and never inside an
-                    // earlier span of the same log: replay markers must map
-                    // to one span.
+                    // lower bound), and never inside an earlier span of the
+                    // same log: replay markers must map to one span.
                     let start = a.history.iter().filter(|sp| sp.log_id == l.log_id).filter_map(|sp| sp.end).fold(l.next_ordinal, u64::max);
                     a.epoch += 1;
                     a.owner = Some(l.node_id.clone());
@@ -2331,7 +2107,7 @@ impl Cluster {
             if frozen.is_none() {
                 trim_history(&mut a.history, a.applied_epoch);
             }
-            match self.put_json(&path, &a, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
+            match self.put_json(&path, &a, if_match(etag)).await {
                 Ok(e) => {
                     self.assigns.write().insert(shard, (a.clone(), e.clone()));
                     match to {
@@ -2348,13 +2124,10 @@ impl Cluster {
     }
 
     /// Whether an assignment naming live owner `o` with `log` names an
-    /// earlier incarnation of it: `o`'s lease (as listed this step) has
-    /// another log. The listing may predate the assignment (`o` restarted
-    /// and took the shard between our LIST of `nodes/` and of `assign/`), so
-    /// the lease is re-read first: an incarnation writes its lease before
-    /// any assignment, and a later one overwrites it, so a lease read after
-    /// the assignment that still names another log names a later one.
-    /// `leases` caches the re-reads (owner -> its log) for one acquire.
+    /// earlier incarnation of it. Our listing of `o`'s lease may predate the
+    /// assignment, so the lease is re-read: an incarnation writes its lease
+    /// before any assignment, so a lease read after the assignment that
+    /// still names another log names a later one. `leases` caches re-reads.
     async fn superseded(&self, o: &str, log: Option<&str>, leases: &mut HashMap<String, Option<String>>) -> anyhow::Result<bool> {
         let Some(log) = log else { return Ok(false) };
         let listed = self.peers.read().get(o).map(|l| l.log_id.clone());
@@ -2373,10 +2146,9 @@ impl Cluster {
         Ok(false)
     }
 
-    /// Drops the spans of our long shard histories that a durable checkpoint
-    /// inside our own span made redundant (`applied_epoch` = ours): a history
-    /// a crash loop or many takeovers grew past TRIM_SPANS, with no clean
-    /// release since to trim it. One CAS per such shard; best effort.
+    /// Trims our histories past TRIM_SPANS (a crash loop, many takeovers)
+    /// that a durable checkpoint inside our own span made redundant. Best
+    /// effort.
     async fn trim_owned(&self, host: &Arc<dyn ShardHost>) {
         let cands: Vec<(ShardId, Assignment, Option<String>)> = {
             let assigns = self.assigns.read();
@@ -2385,7 +2157,7 @@ impl Cluster {
                 .into_iter()
                 .filter_map(|s| {
                     let (a, e) = assigns.get(&s)?;
-                    let ours = a.owner.as_deref() == Some(&self.cfg.node_id) && a.log_id.as_deref() == Some(&self.log_id) && served.get(&s) == Some(&a.epoch);
+                    let ours = self.names_us(a) && served.get(&s) == Some(&a.epoch);
                     (ours && e.is_some() && a.frozen.is_none() && a.history.len() > TRIM_SPANS && a.history.iter().any(|sp| sp.epoch < a.epoch)).then(|| (s, a.clone(), e.clone()))
                 })
                 .filter(|(s, ..)| host.checkpointed(*s))
@@ -2395,7 +2167,7 @@ impl Cluster {
             a.applied_epoch = a.applied_epoch.max(a.epoch);
             trim_history(&mut a.history, a.applied_epoch);
             let path = self.path(&format!("assign/{}", s.key()));
-            match self.put_json(&path, &a, PutMode::Update(UpdateVersion { e_tag: etag, version: None })).await {
+            match self.put_json(&path, &a, if_match(etag)).await {
                 Ok(e) => {
                     tracing::info!(shard = s.0, spans = a.history.len(), "trimmed a shard's history to our span (checkpointed in it)");
                     self.assigns.write().insert(s, (a, e));
@@ -2411,28 +2183,23 @@ impl Cluster {
         }
     }
 
-    /// Graceful shutdown: close and release every shard, fence our log, drop
-    /// our lease. Err if our log could not be fenced within
-    /// `shutdown_fence_budget`: our lease is then left in place (renewals
-    /// stopped) and the caller must exit nonzero, so that peers presume this
-    /// incarnation dead and fence its log, and so does our restart
-    /// (`read_own_lease`). Deleting the lease over an unfenced log would
+    /// Closes and releases every shard, fences our log, drops our lease.
+    /// Err if our log could not be fenced: our lease is then left in place
+    /// (renewals stopped) and the caller must exit nonzero, so peers presume
+    /// us dead and fence it. Deleting the lease over an unfenced log would
     /// leave nobody to fence it, and peers following it would wait forever.
     pub async fn shutdown(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
-        // HA fix: stop the step loop first (it would re-acquire the shards we
-        // are releasing), and wait out a step already in flight.
+        // a step would re-acquire the shards we are releasing
         self.stopping.store(true, Ordering::Release);
         let _step = self.step_lock.lock().await;
-        // Announce the drain first: otherwise a peer stepping meanwhile still
-        // counts us toward the fair share and hands shards back to us, which
-        // we'd never adopt (they'd wait out our lease and a fence).
+        // Announce the drain first, or a peer stepping meanwhile hands shards
+        // back to us, which we'd never adopt.
         self.lease.write().draining = true;
         self.renew(host).await;
-        // hand our shards straight to the settled peers, evenly
         let settled = self.settled_peers();
         let to = self.short_of(&settled, self.layout().shards.len().div_ceil(settled.len().max(1)));
         // plus any a peer handed us before it saw the drain (never opened:
-        // closing them is a no-op, so they are just handed on)
+        // they are just handed on)
         let mut shards = self.owned();
         let pending = std::mem::take(&mut *self.handed.lock());
         let layout = self.layout();
@@ -2446,19 +2213,14 @@ impl Cluster {
         if !self.close_and_release(host, shards, to, None).await {
             return Ok(()); // fail-stopped (host.lost)
         }
-        // Nothing may still be in flight on our log when we fence it: a
-        // fence below an in-flight segment would cut entries out of a span.
+        // a fence below an in-flight segment would cut entries out of a span
         if !host.quiesce().await {
             tracing::error!("our log did not quiesce: fail-stop without fencing it (peers will)");
             host.lost();
             return Ok(());
         }
-        // HA fix: fence our own (now idle) log before dropping the lease.
-        // Peers following it drain it from S3 up to a fence and only then drop
-        // its firehose source; without a fence they wait forever and every
-        // peer's merged firehose stalls at our watermark (bench/ha sigterm).
-        // Retried (renewals go on meanwhile); if it still fails, keep the
-        // lease so the log gets fenced by whoever presumes us dead.
+        // Peers following our log drop its firehose source only at a fence;
+        // without one every peer's merged firehose stalls at our watermark.
         if let Err(e) = self.fence_own_log().await {
             {
                 let _r = self.renew_lock.lock().await;
@@ -2474,23 +2236,28 @@ impl Cluster {
         }
         host.leaving();
         self.delete(&format!("nodes/{}", self.cfg.node_id)).await;
-        // Our lease is gone, so peers' next step counts us out and takes
-        // whatever we didn't hand them: run it now, not a step interval later.
-        let nudges: Vec<(String, Vec<Handoff>)> = self.peers().into_iter().map(|l| (l.addr, Vec::new())).collect();
-        crate::metrics::CLUSTER_NUDGES.with_label_values(&["sent"]).inc_by(nudges.len() as u64);
-        host.nudge(nudges).await;
+        // peers' next step takes whatever we didn't hand them: run it now
+        self.nudge_all(host, false).await;
         Ok(())
     }
 
-    /// How long a graceful shutdown keeps retrying the fence of our own log:
-    /// a TTL, at most 30 s (inside a supervisor's stop timeout).
+    /// Nudges every peer (and, with `me`, ourselves) to step now.
+    pub(crate) async fn nudge_all(&self, host: &Arc<dyn ShardHost>, me: bool) {
+        let nudges: Vec<(String, Vec<Handoff>)> = self.peers().into_iter().map(|l| (l.addr, Vec::new())).collect();
+        crate::metrics::CLUSTER_NUDGES.with_label_values(&["sent"]).inc_by(nudges.len() as u64);
+        if me {
+            self.nudge(Vec::new());
+        }
+        host.nudge(nudges).await;
+    }
+
+    /// A TTL, at most 30 s (inside a supervisor's stop timeout).
     fn shutdown_fence_budget(&self) -> Duration {
         self.cfg.ttl.min(Duration::from_secs(30))
     }
 
-    /// Fences our own log, retrying with backoff (200 ms doubling to 5 s)
-    /// for `shutdown_fence_budget`. A fence PUT that timed out but landed is
-    /// found by the next attempt's scan.
+    /// Retries with backoff for `shutdown_fence_budget`. A fence PUT that
+    /// timed out but landed is found by the next attempt's scan.
     async fn fence_own_log(&self) -> anyhow::Result<()> {
         let deadline = Instant::now() + self.shutdown_fence_budget();
         let mut backoff = Duration::from_millis(200);
@@ -2835,7 +2602,6 @@ mod tests {
         let (hb, hb_dyn) = host();
         hb.unheard.store(true, Ordering::SeqCst);
         for _ in 0..5 {
-            // 5 x 100 ms: well past the old 2-renew-interval grace
             b.step(&hb_dyn).await.unwrap();
             a.step(&ha_dyn).await.unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2930,10 +2696,8 @@ mod tests {
     }
 
     /// Opens that keep failing (a replay error, say) must never push a dead
-    /// owner's span out of a shard's history: each failed cycle used to add
-    /// a span and the history kept only the last 16, so the dead log's acked
-    /// tail was neither replayed by the next good open nor protected from
-    /// retention (`needed_by`).
+    /// owner's span out of a shard's history: its acked tail would be
+    /// neither replayed nor protected from retention (`needed_by`).
     #[tokio::test]
     async fn failing_opens_never_drop_a_dead_span() {
         let store = Store::memory(None);
@@ -3363,7 +3127,7 @@ mod tests {
         }
         let lists = a.store_lists() - before;
         // nodes/: every 6th step (TTL 600 ms / renew 100 ms) = 8-9; assign/:
-        // the 25th and 50th step = 2 (was 100)
+        // the 25th and 50th step = 2
         assert!((9..=12).contains(&lists), "{lists} LISTs in 50 lone steps");
         assert_eq!(a.owned().len(), 8);
         assert_eq!(ha.lost.load(Ordering::SeqCst), 0);
