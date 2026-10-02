@@ -222,7 +222,13 @@ swappable.
   disk cache holds 2.5× more).
 - One block cache (foyer, `--block-cache-mb`) and one SST metadata cache
   (bloom filters, indexes, stats; a quarter of the block cache) serve every
-  shard DB. The metadata cache is our own (`partition::MetaCache`): 64
+  shard DB. Flushes put their data blocks in it, so RSS climbs with commits
+  until the cache is full (about 2 KB per commit with partial MSTs, whose
+  `M/` writes double state bytes per commit; 0.36 KB at a 64 MB cache) and
+  then stays flat: the benchbox 4.8 → 11 GB "regression" at 50k/s was one
+  node's cache full and the other's not yet. Kept on purpose: caching only
+  index/filter blocks on flush, or a smaller default, would send reads of
+  recent records to the disk cache to save memory that is bounded anyway. The metadata cache is our own (`partition::MetaCache`): 64
   RwLock shards with CLOCK eviction, so a hit takes a shared lock and sets
   one bit. Foyer takes its shard's mutex on every hit (eviction state), and
   every point read of one repo checks the same few SSTs' filters (up to 32
