@@ -16,28 +16,21 @@
 //! }
 //! ```
 //!
-//! Everything is optional: `{}` is the defaults. `version`, `updatedAt`,
-//! `updatedBy`, `note` and `history` are written by the server on save
-//! (whatever a client sends for them is replaced). Unknown fields are
-//! rejected on save ([`parse`], the admin endpoint), so a typo never
-//! silently does nothing. The stored object is read with [`parse_stored`],
-//! which drops fields this build doesn't know (a newer feature level's,
-//! DESIGN.md "Rolling upgrades": the save endpoint of that build accepts
-//! them only once its level is active) instead of rejecting the whole
-//! object; a node that finds an object it cannot accept otherwise keeps its
-//! last good policy (see `runtime`).
+//! Everything is optional: `{}` is the defaults. The server writes the
+//! metadata fields on save. Unknown fields are rejected on save ([`parse`])
+//! so a typo never silently does nothing, but dropped when reading the
+//! stored object ([`parse_stored`]): a newer feature level may have written
+//! them (DESIGN.md "Rolling upgrades").
 
 use super::{Action, Cidr, KeyKind, Ov, Policy, Spec, BUILTIN};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Longest window a bucket may have.
 pub const MAX_WINDOW_SECS: u64 = 7 * 24 * 3600;
-/// Most extra route buckets (each is a metric label value and a top list).
+/// Each route is a metric label value and a top list.
 pub const MAX_ROUTES: usize = 64;
-/// Most overrides (IP overrides are matched linearly once per request).
+/// IP overrides are matched linearly once per request.
 pub const MAX_OVERRIDES: usize = 1000;
-/// Audit entries kept in the object.
 pub const HISTORY: usize = 50;
 const MAX_NOTE: usize = 280;
 
@@ -54,13 +47,12 @@ fn is_true(b: &bool) -> bool {
 pub struct Doc {
     #[serde(default)]
     pub version: u64,
-    /// Global switch: false limits nothing (the layer still runs).
+    /// False limits nothing (the layer still runs).
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub enabled: bool,
-    /// Built-in bucket name -> changes from its default.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub limiters: BTreeMap<String, LimiterCfg>,
-    /// Extra IP-keyed buckets for XRPC methods (named `route:{nsid}`).
+    /// Extra IP-keyed buckets, named `route:{nsid}`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<RouteCfg>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -115,25 +107,23 @@ pub struct RouteCfg {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OverrideCfg {
-    /// An IP or CIDR block, matched against the request's client IP.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
-    /// A DID, matched against DID-keyed buckets' keys.
+    /// Matched against DID-keyed buckets' keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub did: Option<String>,
-    /// Bucket names covered (empty: all).
+    /// Empty: all buckets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limiters: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub exempt: bool,
-    /// Custom limit (instead of `exempt`), in the bucket's window.
+    /// Instead of `exempt`, in the bucket's window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub points: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
-/// One change, as recorded in the object's `history` and the audit log.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Audit {
@@ -149,7 +139,7 @@ pub struct Audit {
 }
 
 impl Doc {
-    /// The parts an operator edits (no version or audit metadata).
+    /// Without version or audit metadata.
     pub fn editable(&self) -> Doc {
         Doc {
             version: 0,
@@ -199,7 +189,6 @@ fn check_note(errs: &mut Vec<String>, at: &str, n: &Option<String>) {
     }
 }
 
-/// Validates `doc` and builds the policy it describes (None: defaults).
 /// Returns every problem found, each prefixed with its JSON path.
 pub fn compile(doc: Option<&Doc>) -> Result<Policy, Vec<String>> {
     let mut p = Policy::default();
@@ -298,22 +287,18 @@ pub fn compile(doc: Option<&Doc>) -> Result<Policy, Vec<String>> {
     }
 }
 
-/// Parses an object's bytes (any JSON or schema error as one message).
 /// Strict: unknown fields are errors (operator input).
 pub fn parse(bytes: &[u8]) -> Result<Doc, String> {
     serde_json::from_slice(bytes).map_err(|e| format!("invalid config JSON: {e}"))
 }
 
-/// Fields each level of the document knows (this build's).
 const DOC_FIELDS: &[&str] = &["version", "enabled", "limiters", "routes", "overrides", "updatedAt", "updatedBy", "note", "history"];
 const LIMITER_FIELDS: &[&str] = &["enabled", "points", "windowSecs"];
 const ROUTE_FIELDS: &[&str] = &["nsid", "points", "windowSecs", "enabled"];
 const OVERRIDE_FIELDS: &[&str] = &["ip", "did", "limiters", "exempt", "points", "note"];
 
-/// Parses the stored object, dropping fields this build doesn't know
-/// (returned as paths, e.g. `routes[0].burst`) instead of rejecting it:
-/// they were written by a build of a newer feature level. Everything else
-/// is as strict as [`parse`].
+/// Returns the dropped fields' paths (e.g. `routes[0].burst`). Everything
+/// else is as strict as [`parse`].
 pub fn parse_stored(bytes: &[u8]) -> Result<(Doc, Vec<String>), String> {
     let mut v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| format!("invalid config JSON: {e}"))?;
     let mut dropped = Vec::new();
@@ -352,8 +337,6 @@ fn ov_label(o: &OverrideCfg) -> String {
     format!("{who} {what} on {on}")
 }
 
-/// Human-readable changes from `old` to `new` (for the audit log line and
-/// the object's history).
 pub fn changes(old: Option<&Doc>, new: &Doc) -> Vec<String> {
     let def = Doc::default();
     let old = old.unwrap_or(&def);

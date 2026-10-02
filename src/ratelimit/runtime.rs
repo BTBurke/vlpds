@@ -1,21 +1,10 @@
-//! Keeping every node's [`Policy`] in step with the config object
-//! (`{prefix}/config/ratelimits.json`).
-//!
-//! - **Load.** Each node re-reads the object every [`REFRESH_EVERY`] with a
-//!   conditional GET (`If-None-Match` its last ETag: a 304 when unchanged),
-//!   at startup, and at once when a peer nudges it after a change
-//!   (`/internal/v1/ratelimits/reload`).
-//! - **Save.** `vlpds.admin.updateRateLimits` reads the object, checks the
-//!   caller edited the version it read (`ifVersion`), validates, and writes
-//!   version + 1 with CAS on the ETag (or create-if-absent), so concurrent
-//!   admins on different nodes can't overwrite each other. The writer
-//!   installs the new policy before answering and then nudges its peers.
-//! - **Unknown fields** (a newer vlpds's, `config::parse_stored`) are
-//!   dropped with a warning; the rest of the object applies.
-//! - **Invalid objects** (bad JSON, failed validation, e.g. written by
-//!   hand) never take a node down: it keeps
-//!   its last good policy and reports the error (`configError` in the admin
-//!   endpoint, `vlpds_rate_limit_config_errors_total`).
+//! Keeps every node's [`Policy`] in step with the config object
+//! (`{prefix}/config/ratelimits.json`): a conditional GET every
+//! [`REFRESH_EVERY`], at startup, and when a peer nudges after a change.
+//! Saves check the caller edited the version it read and write version + 1
+//! with CAS on the ETag, so concurrent admins on different nodes can't
+//! overwrite each other. An invalid object never takes a node down: it keeps
+//! its last good policy and reports the error.
 //!
 //! Loads and saves on a node are serialized, so a slow load can never
 //! install an older version over a newer one.
@@ -30,21 +19,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// How often a node re-checks the object (a 304 when unchanged). Peers are
-/// nudged on every change, so this only bounds staleness after a lost nudge.
+/// Peers are nudged on every change, so this only bounds staleness after a
+/// lost nudge.
 pub const REFRESH_EVERY: Duration = Duration::from_secs(10);
-/// Deadline of one config GET or PUT.
 const CALL_DEADLINE: Duration = Duration::from_secs(5);
 
 pub fn config_path(store: &Store) -> object_store::path::Path {
     object_store::path::Path::from(format!("{}/config/ratelimits.json", store.prefix))
 }
 
-/// The last config object a node rejected.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigError {
-    /// Its `version`, if that much could be read.
+    /// If that much could be read.
     pub version: Option<u64>,
     pub message: String,
     pub at_ms: u64,
@@ -52,20 +39,19 @@ pub struct ConfigError {
 
 #[derive(Clone, Debug, Default)]
 pub struct RtStatus {
-    /// The stored object in force (None: no object, flag defaults).
+    /// None: no object, flag defaults.
     pub doc: Option<Doc>,
-    /// ETag of the last object fetched (good or not), for If-None-Match.
+    /// Of the last object fetched, good or not.
     seen_etag: Option<String>,
     pub loaded_at_ms: Option<u64>,
     pub checked_at_ms: Option<u64>,
-    /// Set while the newest object is rejected (cleared by a good one).
+    /// Set while the newest object is rejected.
     pub error: Option<ConfigError>,
 }
 
 #[derive(Default)]
 pub struct Runtime {
     status: Mutex<RtStatus>,
-    /// Serializes loads and saves on this node.
     io: tokio::sync::Mutex<()>,
     wake: tokio::sync::Notify,
     started: AtomicBool,
@@ -77,12 +63,9 @@ impl Runtime {
     }
 }
 
-/// Why a save failed.
 #[derive(Debug)]
 pub enum SaveError {
-    /// The config doesn't validate (each problem with its JSON path).
     Invalid(Vec<String>),
-    /// Someone saved since the caller read `expected` (now `current`).
     Conflict { expected: u64, current: Option<u64> },
     Store(String),
 }
@@ -103,9 +86,9 @@ impl std::fmt::Display for SaveError {
 }
 
 pub struct SaveReq {
-    /// The edited config (metadata fields are ignored).
+    /// Metadata fields are ignored.
     pub doc: Doc,
-    /// The version the edit was made against (0: none stored).
+    /// 0: none stored.
     pub if_version: u64,
     pub actor: String,
     pub ip: Option<String>,
@@ -120,7 +103,7 @@ async fn bounded<T>(f: impl std::future::Future<Output = object_store::Result<T>
     }
 }
 
-/// Fetches the object: None when absent, else (bytes, ETag).
+/// None when absent.
 async fn fetch(store: &Store, etag: Option<String>) -> object_store::Result<Option<(bytes::Bytes, Option<String>)>> {
     let path = config_path(store);
     let got = bounded(async {

@@ -1,86 +1,28 @@
 //! Rate limits with the reference PDS's buckets and values
-//! (packages/pds/src/rate-limits.ts and the `rateLimit` arrays of the
-//! api/com/atproto/** handlers), in-memory fixed windows like the
-//! reference's `MemoryRateLimiter` (rate-limiter-flexible).
+//! (packages/pds/src/rate-limits.ts and the handlers' `rateLimit` arrays),
+//! in-memory fixed windows like its `MemoryRateLimiter`; DESIGN.md "Rate
+//! limits: observability and runtime config".
 //!
-//! | bucket | window | points | key |
-//! |---|---|---|---|
-//! | global-ip (every XRPC call except sync.getRepo) | 5 min | 3000 | client IP |
-//! | sync.getRepo | 5 min | 6000 | IP |
-//! | server.createSession | 1 day / 5 min | 300 / 30 | identifier + IP |
-//! | ↳ sign-in-account (vlpds; any IP, shared with the OAuth sign-in) | 1 h | 100 | DID |
-//! | server.createAccount | 5 min | 100 | IP |
-//! | server.deleteAccount | 5 min | 50 | IP |
-//! | server.requestPasswordReset | 1 day / 1 h | 50 / 15 | IP |
-//! | server.resetPassword | 5 min | 50 | IP |
-//! | repo.uploadBlob | 1 day | 1000 | IP |
-//! | identity.updateHandle | 5 min / 1 day | 10 / 50 | DID |
-//! | server.requestAccountDelete, requestEmailConfirmation, requestEmailUpdate (each) | 1 day / 1 h | 15 / 5 | DID |
-//! | repo-write-hour / repo-write-day (shared by every repo write) | 1 h / 1 day | 5000 / 35000 | DID; create=3, update=2, delete=1 points |
-//! | OAuth sign-in posts (`/oauth/authorize/sign-in`, `/oauth/account/sign-in`) | | | |
-//! | ↳ global-ip + oauth-sign-in-ip | 5 min | 3000 / 100 | client IP |
-//! | ↳ the createSession buckets (shared with it) | 1 day / 5 min | 300 / 30 | identifier (or pending DID) + IP |
-//! | ↳ sign-in-account (vlpds; any IP) | 1 h | 100 | DID |
-//! | oauth-ip (vlpds): `/oauth/par`, `/oauth/token`, `/oauth/revoke` | 5 min | 3000 | client IP |
-//! | server.reserveSigningKey (vlpds) | 1 h | 100 | IP |
-//! | ↳ reserve-signing-key-node (vlpds; calls that reserve a new key) | 1 day | 5000 | the node |
+//! vlpds adds a per-IP and a cross-IP per-account cap to both createSession
+//! and the OAuth sign-in (password guessing is Argon2 CPU; the reference's
+//! oauth-provider has no sign-in limits of its own). The per-account cap
+//! lets anyone hold an account's password sign-ins off for up to an hour;
+//! app passwords and live sessions keep working. reserveSigningKey is
+//! unauthenticated and costs a KMS wrap and a stored row per new key, hence
+//! its per-IP and per-node caps. IPv6 clients are keyed by their /64.
 //!
-//! The reference's oauth-provider has no sign-in limits of its own; the PDS
-//! applies createSession's to its account-manager login. vlpds adds a per-IP
-//! cap and a per-account cap across IPs to both createSession and the OAuth
-//! sign-in (password guessing is Argon2 CPU); TOTP guessing is bounded
-//! separately by the persisted per-account lockout in `crate::totp`. The
-//! per-account cap lets anyone hold an account's password sign-ins off for
-//! up to an hour (100 guesses); app passwords and live sessions keep
-//! working. reserveSigningKey (unauthenticated in the reference too) costs a
-//! key-service wrap and a stored row per new key, hence its per-IP and
-//! per-node caps (the node cap bounds outstanding reservations: 24 h TTL).
-//! The OAuth endpoints' bucket bounds DPoP and client-auth work per address.
+//! IP-keyed buckets are checked by [`layer`] before the handler; DID- and
+//! body-keyed ones by handlers through [`check`] after auth and input
+//! validation, as the reference does. Both report into a request-scoped
+//! task-local so the response gets the RateLimit-* headers of the tightest
+//! bucket consumed.
 //!
-//! IPv6 clients are keyed by their /64 ([`ip_key`]).
-//!
-//! Responses carry `RateLimit-Limit` / `-Remaining` / `-Reset` / `-Policy`
-//! for the tightest bucket the request consumed (plus `Retry-After` on a
-//! 429 `RateLimitExceeded`), as xrpc-server's `HttpRateLimiter` does.
-//!
-//! Counters live in 64 mutex-sharded maps keyed by a hash of (bucket,
-//! window, key), so there is no global lock; each shard drops expired
-//! windows as it is touched (amortized), so memory is bounded by the keys
-//! active within the longest window.
-//!
-//! IP-keyed buckets are checked by [`layer`] before the handler runs;
-//! DID- and body-keyed buckets are checked by the handlers through [`check`]
-//! once the request is authenticated and parsed (the reference consumes
-//! route limits after auth and input validation). Both report into a
-//! request-scoped task-local so the response gets the headers.
-//!
-//! Bypass: admin (`Basic admin:<token>`) and node-to-node
-//! (`x-vlpds-internal: <token>`) requests, plus the reference's
-//! `x-ratelimit-bypass: <key>` when a bypass key is configured.
-//!
-//! **Cluster mode.** Counters are per node. Per-DID buckets (repo writes,
-//! updateHandle, email flows, sign-in-account) are effectively exact
-//! because requests for a DID are forwarded to and served by the node
-//! owning its partition (createSession routes by its body's identifier,
-//! never by query parameters or an unverified token). Per-IP buckets count
-//! what one node serves: requests a node forwards are counted on the owner,
-//! keyed by the client address the entry node resolved ([`ClientIp`], sent
-//! as [`CLIENT_IP_HEADER`] and trusted only next to the forwarding marker's
-//! valid internal token), never by the forwarding node's address. A client
-//! spreading requests across N nodes can get up to N× the per-IP budget.
-//!
-//! **Runtime configuration and observability** (DESIGN.md "Rate limits:
-//! observability and runtime config"). The values above are defaults: a
-//! versioned config object in the bucket ([`config`], written with CAS by
-//! `vlpds.admin.updateRateLimits`, picked up by every node through
-//! [`runtime`]) can change any bucket's points and window, disable it, add
-//! IP-keyed buckets for further XRPC methods, and exempt or re-limit
-//! IPs/CIDRs and DIDs. The effective [`Policy`] is swapped atomically;
-//! counters are keyed by (bucket, window, key), so a new limit keeps every
-//! live window and a new window length starts fresh ones. Each counter shard
-//! also keeps a few heavy hitters per bucket ([`Counters::top`]) and 429s are
-//! tallied by bucket and route ([`Rejections`]), both bounded, for the
-//! operator console.
+//! Counters are per node. Per-DID buckets are effectively exact because
+//! requests for a DID are served by its owner (createSession routes by its
+//! body, never by query or an unverified token). Per-IP buckets count what
+//! one node serves, keyed by the client address the entry node resolved
+//! ([`ClientIp`]), so a client spreading requests across N nodes can get up
+//! to N times the per-IP budget.
 
 pub mod config;
 pub mod runtime;
@@ -103,31 +45,26 @@ const MINUTE: u64 = 60_000;
 const HOUR: u64 = 60 * MINUTE;
 const DAY: u64 = 24 * HOUR;
 
-/// What a bucket is keyed by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KeyKind {
-    /// The client IP.
     Ip,
-    /// `{identifier}-{client ip}` (createSession and the OAuth sign-in).
+    /// `{identifier}-{client ip}`
     IdentifierIp,
-    /// The authenticated account's DID.
     Did,
     /// One counter for the whole node ([`NODE_KEY`]).
     Node,
 }
 
-/// The key of [`KeyKind::Node`] buckets.
 pub const NODE_KEY: &str = "node";
 
-/// One built-in bucket: its default `points` per fixed `window_ms` window.
-/// `idx` is its position in [`BUILTIN`].
+/// A built-in bucket's defaults. `idx` is its position in [`BUILTIN`].
 #[derive(Debug)]
 pub struct Limit {
     pub idx: usize,
     pub name: &'static str,
     pub key: KeyKind,
-    /// Which requests consume it (for the console).
+    /// For the console.
     pub scope: &'static str,
     pub window_ms: u64,
     pub points: u32,
@@ -172,7 +109,6 @@ limit!(OAUTH_IP, 22, "oauth-ip", Ip, "OAuth /oauth/par, /oauth/token, /oauth/rev
 limit!(RESERVE_SIGNING_KEY_IP, 23, "com.atproto.server.reserveSigningKey-0", Ip, "server.reserveSigningKey", HOUR, 100);
 limit!(RESERVE_SIGNING_KEY_NODE, 24, "reserve-signing-key-node", Node, "server.reserveSigningKey calls that reserve a new key (one KMS wrap each)", DAY, 5000);
 
-/// Every built-in bucket, indexed by [`Limit::idx`].
 pub const BUILTIN: [&Limit; 25] = [
     &GLOBAL_IP,
     &GET_REPO,
@@ -201,21 +137,17 @@ pub const BUILTIN: [&Limit; 25] = [
     &RESERVE_SIGNING_KEY_NODE,
 ];
 
-/// OAuth endpoints the layer limits per IP ([`OAUTH_IP`]; not global-ip,
-/// which is XRPC's). A confidential client's backend calls these for all of
-/// its users from one address: raise or exempt it with an IP override.
+/// A confidential client's backend calls these for all of its users from
+/// one address: raise or exempt it with an IP override.
 const OAUTH_IP_PATHS: [&str; 3] = ["/oauth/par", "/oauth/token", "/oauth/revoke"];
 
-/// Browser form posts that run the rate-limit context (checked by the
-/// handler, which renders its own page on a 429).
+/// Checked by the handler, which renders its own page on a 429.
 const OAUTH_SIGN_IN_PATHS: [&str; 2] = ["/oauth/authorize/sign-in", "/oauth/account/sign-in"];
 
-/// Repo write points (reference: create=3, update=2, delete=1).
 pub const CREATE_POINTS: u32 = 3;
 pub const UPDATE_POINTS: u32 = 2;
 pub const DELETE_POINTS: u32 = 1;
 
-/// IP-keyed route buckets, checked before the handler.
 fn ip_route_limits(path: &str) -> &'static [&'static Limit] {
     match path {
         "/xrpc/com.atproto.sync.getRepo" => &[&GET_REPO],
@@ -231,16 +163,10 @@ fn ip_route_limits(path: &str) -> &'static [&'static Limit] {
     }
 }
 
-/// XRPC paths the layer never limits (route buckets on them would be inert).
 pub fn unlimited_path(path: &str) -> bool {
     path == "/xrpc/_health" || path == "/xrpc/com.atproto.sync.subscribeRepos"
 }
 
-// ---------------------------------------------------------------------------
-// effective policy (defaults + the runtime config object)
-// ---------------------------------------------------------------------------
-
-/// A bucket as currently in force.
 #[derive(Clone, Debug)]
 pub struct Spec {
     pub name: Arc<str>,
@@ -277,12 +203,10 @@ fn name_tag(name: &str) -> u64 {
     h.finish()
 }
 
-/// What an override does to the buckets it covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Not counted at all.
     Exempt,
-    /// Held to this many points instead (same window, same counter).
+    /// Same window, same counter.
     Points(u32),
 }
 
@@ -299,14 +223,11 @@ impl Ov {
     }
 }
 
-/// The limits in force: built-in buckets (values possibly changed), extra
-/// IP-keyed route buckets, and IP/CIDR and DID overrides. Immutable; a
-/// config change installs a new one ([`Limiter::install`]).
+/// Immutable; a config change installs a new one ([`Limiter::install`]).
 #[derive(Debug)]
 pub struct Policy {
-    /// Version of the config object it came from (0: no object, defaults).
+    /// 0: no config object, defaults.
     pub version: u64,
-    /// false: nothing is limited (the config's global switch).
     pub enabled: bool,
     pub(crate) builtin: Vec<Spec>,
     /// `/xrpc/{nsid}` -> extra IP-keyed bucket (`route:{nsid}`).
@@ -333,7 +254,6 @@ impl Policy {
         &self.builtin[l.idx]
     }
 
-    /// Every bucket: built-ins in table order, then route buckets by path.
     pub fn specs(&self) -> impl Iterator<Item = &Spec> {
         self.builtin.iter().chain(self.routes.values())
     }
@@ -342,7 +262,6 @@ impl Policy {
         self.specs().find(|s| &*s.name == name)
     }
 
-    /// Indices of the IP overrides matching `ip` (computed once per request).
     fn ip_matches(&self, ip: Option<IpAddr>) -> Vec<usize> {
         match ip {
             Some(ip) if !self.ip_ov.is_empty() => self
@@ -356,10 +275,8 @@ impl Policy {
         }
     }
 
-    /// The override for consuming bucket `name` with `key` in a request
-    /// whose client IP matched the IP overrides `ip_ov`: DID overrides match
-    /// a DID key, IP overrides the request's client IP. Exempt wins;
-    /// otherwise the largest custom limit.
+    /// `ip_ov`: the IP overrides the request's client IP matched. Exempt
+    /// wins; otherwise the largest custom limit.
     pub fn override_for(&self, name: &str, key: &str, ip_ov: &[usize]) -> Option<Action> {
         if self.did_ov.is_empty() && ip_ov.is_empty() {
             return None;
@@ -377,8 +294,7 @@ impl Policy {
         out
     }
 
-    /// The limit `key` is held to in `spec` (None: exempt), for display:
-    /// the client IP is recovered from the key (an IP, or `{id}-{ip}`).
+    /// For display: the client IP is recovered from the key. None: exempt.
     pub fn limit_for_key(&self, spec: &Spec, key: &str) -> Option<u32> {
         // an IPv6 key is its /64 ([`ip_key`]): its network address stands in
         let parse = |k: &str| k.trim_end_matches("/64").parse::<IpAddr>().ok();
@@ -395,17 +311,12 @@ impl Policy {
     }
 }
 
-// ---------------------------------------------------------------------------
-// counters
-// ---------------------------------------------------------------------------
-
-/// Outcome of consuming from one bucket.
 #[derive(Clone, Copy, Debug)]
 pub struct Status {
     pub limit: u32,
     pub window_ms: u64,
     pub remaining: u32,
-    /// Unix ms at which the window resets.
+    /// Unix ms.
     pub reset_ms: u64,
     pub exceeded: bool,
 }
@@ -416,7 +327,6 @@ struct Window {
     used: u32,
 }
 
-/// A heavy-hitter candidate: a key with high use in its current window.
 #[derive(Clone, Debug)]
 struct Cand {
     id: u64,
@@ -428,22 +338,20 @@ struct Cand {
 
 struct Shard {
     map: HashMap<u64, Window>,
-    /// Bucket tag -> at most [`TOP_PER_SHARD`] candidates.
+    /// Heavy-hitter candidates by bucket tag.
     top: HashMap<u64, Vec<Cand>>,
     next_sweep_ms: u64,
 }
 
 const SHARDS: usize = 64;
-/// A shard sweeps expired windows at most this often (and only when touched).
+/// Only when touched.
 const SWEEP_EVERY_MS: u64 = 10_000;
-/// Heavy hitters kept per bucket per shard: 64 x 8 = 512 candidates per
-/// bucket, so a top-N list is exact unless more than 8 of its keys hash to
-/// one shard.
+/// A top-N list is exact unless more than this many of its keys hash to one
+/// shard.
 const TOP_PER_SHARD: usize = 8;
-/// Longest key kept for a candidate (identifiers are client-chosen).
+/// Identifiers are client-chosen.
 const TOP_KEY_MAX: usize = 96;
 
-/// Sharded fixed-window counters.
 pub struct Counters {
     shards: Box<[Mutex<Shard>]>,
     hasher: std::collections::hash_map::RandomState,
@@ -466,24 +374,17 @@ impl Default for Counters {
     }
 }
 
-/// One key's use of a bucket, for the console.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Consumer {
     pub key: String,
     pub used: u32,
-    /// The limit this key is held to (None: exempt by an override).
+    /// None: exempt by an override.
     pub limit: Option<u32>,
     pub reset_ms: u64,
 }
 
 impl Counters {
-    /// Consumes `points` from `limit`'s default window for `key` at `now_ms`.
-    pub fn consume(&self, limit: &Limit, key: &str, points: u32, now_ms: u64) -> Status {
-        self.consume_spec(&Spec::of(limit), limit.points, key, points, now_ms)
-    }
-
-    /// Consumes `points` from `spec`'s window for `key`, held to `limit`.
     /// Windows are keyed by (bucket, window length, key): a new limit keeps
     /// a key's live window, a new window length starts a fresh one.
     pub fn consume_spec(&self, spec: &Spec, limit: u32, key: &str, points: u32, now_ms: u64) -> Status {
@@ -525,17 +426,11 @@ impl Counters {
         }
     }
 
-    /// Live windows (tests / metrics).
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.shards.iter().map(|s| s.lock().map.len()).sum()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// The `n` keys with the most points used in their current window, for
-    /// each bucket of `policy` (approximate: see [`TOP_PER_SHARD`]).
+    /// Approximate: see [`TOP_PER_SHARD`].
     pub fn top(&self, policy: &Policy, n: usize, now_ms: u64) -> BTreeMap<String, Vec<Consumer>> {
         let mut by_tag: HashMap<u64, Vec<Cand>> = HashMap::new();
         for s in self.shards.iter() {
@@ -568,10 +463,7 @@ impl Counters {
     }
 }
 
-/// Keeps `list` holding the heaviest current-window keys of one bucket in
-/// one shard: updates the key's entry, or replaces the lightest (expired
-/// entries weigh nothing) once the list is full. Allocates only when a key
-/// enters the list.
+/// Allocates only when a key enters the list; expired entries weigh nothing.
 fn track(list: &mut Vec<Cand>, id: u64, window_ms: u64, key: &str, used: u32, reset_ms: u64, now_ms: u64) {
     if let Some(c) = list.iter_mut().find(|c| c.id == id) {
         c.used = used;
@@ -615,10 +507,6 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-// ---------------------------------------------------------------------------
-// 429 tallies (bounded: bucket x route, both bounded sets)
-// ---------------------------------------------------------------------------
-
 static REJECTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     prometheus::register_int_counter_vec!(
         "vlpds_rate_limit_rejections_total",
@@ -650,9 +538,8 @@ pub(crate) static CONFIG_LOADS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// Minutes of 429 history kept per series.
 const REJECT_MINUTES: usize = 15;
-/// Series cap (bucket x route); past it, new series share one row.
+/// Past it, new series share one row.
 const MAX_REJECT_SERIES: usize = 1024;
 
 #[derive(Clone, Copy, Default)]
@@ -662,7 +549,6 @@ struct Ring {
     total: u64,
 }
 
-/// 429 counts by bucket and route over the last minutes.
 #[derive(Default)]
 pub struct Rejections {
     map: Mutex<HashMap<(Arc<str>, String), Ring>>,
@@ -677,7 +563,6 @@ pub struct RejectionCount {
     pub last1m: u64,
     pub last5m: u64,
     pub last15m: u64,
-    /// Since this node started.
     pub total: u64,
 }
 
@@ -727,11 +612,6 @@ impl Rejections {
     }
 }
 
-// ---------------------------------------------------------------------------
-// client IP
-// ---------------------------------------------------------------------------
-
-/// An IP or CIDR block (`10.0.0.0/8`, `::1`, `fd00::/8`).
 #[derive(Clone, Debug)]
 pub struct Cidr {
     net: IpAddr,
@@ -763,12 +643,10 @@ impl Cidr {
     }
 }
 
-/// The client address: the TCP peer, or, when the peer is a trusted proxy,
-/// the right-most `X-Forwarded-For` entry that isn't itself trusted
-/// (Express `trust proxy` semantics). Entries may carry a port
-/// (`1.2.3.4:5678`, `[2001:db8::1]:443`); walking stops at an entry that
-/// doesn't parse, keeping the last trusted hop, so a garbled entry never
-/// lets the walk reach further-left (client-written) ones.
+/// The TCP peer, or, when it is a trusted proxy, the right-most
+/// `X-Forwarded-For` entry that isn't itself trusted (Express `trust proxy`
+/// semantics). The walk stops at an entry that doesn't parse, so a garbled
+/// entry never lets it reach further-left (client-written) ones.
 pub fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trusted: &[Cidr]) -> Option<IpAddr> {
     let peer = peer?.to_canonical();
     let is_trusted = |ip: &IpAddr| trusted.iter().any(|c| c.contains(ip));
@@ -792,7 +670,7 @@ pub fn client_ip(headers: &HeaderMap, peer: Option<IpAddr>, trusted: &[Cidr]) ->
     Some(ip)
 }
 
-/// One `X-Forwarded-For` entry: an IP, `v4:port`, `[v6]` or `[v6]:port`.
+/// An IP, `v4:port`, `[v6]` or `[v6]:port`.
 fn parse_hop(s: &str) -> Option<IpAddr> {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix('[') {
@@ -810,9 +688,8 @@ fn parse_hop(s: &str) -> Option<IpAddr> {
     v4.parse::<std::net::Ipv4Addr>().ok().map(IpAddr::V4)
 }
 
-/// The rate-limit key of a client address: an IPv4 address as is, an IPv6
-/// one as its /64 (`2001:db8:1:2::/64`; one subscriber's allocation, which
-/// it can fill with fresh addresses at will).
+/// IPv6 as its /64: one subscriber's allocation, which it can fill with
+/// fresh addresses at will.
 pub fn ip_key(ip: IpAddr) -> String {
     match ip.to_canonical() {
         IpAddr::V4(v4) => v4.to_string(),
@@ -824,21 +701,15 @@ pub fn ip_key(ip: IpAddr) -> String {
     }
 }
 
-/// Request extension: the client address as the node the client called
-/// resolved it. Set by `crate::forward::route` on a request it forwards
-/// (sent along as [`CLIENT_IP_HEADER`]) and on a request a peer forwarded
-/// (from that header, trusted only with the peer's valid internal token);
-/// it then wins over the TCP peer, which is the forwarding node.
+/// Request extension: the client address as the entry node resolved it.
+/// On a forwarded request it wins over the TCP peer, which is the
+/// forwarding node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ClientIp(pub IpAddr);
 
-/// Node-to-node header carrying [`ClientIp`] on a forwarded request.
-/// Only honored next to a valid `x-vlpds-forwarded` token; a client's copy
-/// is dropped.
+/// Only honored next to a valid `x-vlpds-forwarded` token.
 pub const CLIENT_IP_HEADER: &str = "x-vlpds-client-ip";
 
-/// The client address of a request: [`ClientIp`] if set, else [`client_ip`]
-/// of its TCP peer and headers.
 pub fn request_client_ip(headers: &HeaderMap, ext: &axum::http::Extensions, trusted: &[Cidr]) -> Option<IpAddr> {
     if let Some(ClientIp(ip)) = ext.get::<ClientIp>() {
         return Some(*ip);
@@ -847,25 +718,19 @@ pub fn request_client_ip(headers: &HeaderMap, ext: &axum::http::Extensions, trus
     client_ip(headers, peer, trusted)
 }
 
-// ---------------------------------------------------------------------------
-// the limiter (one per node) and the request-scoped context
-// ---------------------------------------------------------------------------
-
 pub struct Limiter {
-    pub counters: Counters,
+    counters: Counters,
     pub trusted: Vec<Cidr>,
     pub bypass_key: Option<String>,
-    /// `--no-rate-limits` not given, so the layer is installed. When false
-    /// the config can still be edited, but this node counts nothing.
+    /// False: the config can still be edited, but this node counts nothing.
     pub enabled_by_flag: bool,
-    /// Admin / internal tokens for the bypass check.
+    /// For the bypass check's tokens.
     cfg: crate::server::Config,
     policy: RwLock<Arc<Policy>>,
     pub rejections: Rejections,
     pub runtime: runtime::Runtime,
 }
 
-/// What the console shows for one node.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeSnapshot {
@@ -875,7 +740,6 @@ pub struct NodeSnapshot {
     pub config_error: Option<runtime::ConfigError>,
     pub loaded_at_ms: Option<u64>,
     pub checked_at_ms: Option<u64>,
-    /// Bucket name -> heaviest keys in their current window.
     pub top: BTreeMap<String, Vec<Consumer>>,
     pub rejections: Vec<RejectionCount>,
     pub live_windows: usize,
@@ -883,7 +747,6 @@ pub struct NodeSnapshot {
 
 impl Limiter {
     pub fn new(cfg: &crate::server::Config) -> Limiter {
-        // registered up front so /metrics lists them before the first event
         LazyLock::force(&REJECTIONS);
         LazyLock::force(&CONFIG_VERSION);
         LazyLock::force(&CONFIG_ERRORS);
@@ -910,13 +773,12 @@ impl Limiter {
         }
     }
 
-    /// The policy in force.
     pub fn policy(&self) -> Arc<Policy> {
         self.policy.read().clone()
     }
 
-    /// Swaps in `p` atomically: requests already running finish on the old
-    /// one; counters are untouched.
+    /// Requests already running finish on the old policy; counters are
+    /// untouched.
     pub fn install(&self, p: Policy) {
         CONFIG_VERSION.set(p.version as i64);
         *self.policy.write() = Arc::new(p);
@@ -962,15 +824,12 @@ impl Limiter {
 
 struct Ctx {
     limiter: Arc<Limiter>,
-    /// The policy this request runs under (one snapshot per request).
     policy: Arc<Policy>,
     ip: String,
-    /// IP overrides matching the client IP.
     ip_ov: Vec<usize>,
-    /// For 429 tallies.
     route: Option<MatchedPath>,
     bypass: bool,
-    /// Tightest status consumed so far (least remaining; exceeded wins).
+    /// Least remaining; exceeded wins.
     tightest: Option<Status>,
 }
 
@@ -985,8 +844,7 @@ impl Ctx {
         }
     }
 
-    /// Route label: the matched XRPC method (or matched path), so bounded
-    /// by the router's routes.
+    /// Bounded by the router's routes.
     fn route_label(&self) -> &str {
         match &self.route {
             Some(m) => m.as_str().strip_prefix("/xrpc/").unwrap_or(m.as_str()),
@@ -1033,7 +891,7 @@ tokio::task_local! {
     static CTX: RefCell<Ctx>;
 }
 
-pub fn exceeded_error() -> XrpcError {
+fn exceeded_error() -> XrpcError {
     XrpcError {
         status: StatusCode::TOO_MANY_REQUESTS,
         error: "RateLimitExceeded".into(),
@@ -1041,15 +899,13 @@ pub fn exceeded_error() -> XrpcError {
     }
 }
 
-/// Consumes `points` from each of `limits` for `key` (a DID, or a
-/// handler-computed key). No-op when rate limiting is off or bypassed.
+/// No-op when rate limiting is off or bypassed.
 pub fn check(limits: &[&'static Limit], key: &str, points: u32) -> Result<(), XrpcError> {
     CTX.try_with(|c| c.borrow_mut().consume(limits, key, points))
         .unwrap_or(Ok(()))
 }
 
-/// Like [`check`], keyed by `{prefix}-{client ip}` (createSession's
-/// `${identifier}-${ip}`).
+/// Keyed by `{prefix}-{client ip}`.
 pub fn check_with_ip(limits: &[&'static Limit], prefix: &str, points: u32) -> Result<(), XrpcError> {
     CTX.try_with(|c| {
         let mut c = c.borrow_mut();
@@ -1059,7 +915,6 @@ pub fn check_with_ip(limits: &[&'static Limit], prefix: &str, points: u32) -> Re
     .unwrap_or(Ok(()))
 }
 
-/// Like [`check`], keyed by the client IP alone.
 pub fn check_ip(limits: &[&'static Limit], points: u32) -> Result<(), XrpcError> {
     CTX.try_with(|c| {
         let mut c = c.borrow_mut();
@@ -1069,7 +924,6 @@ pub fn check_ip(limits: &[&'static Limit], points: u32) -> Result<(), XrpcError>
     .unwrap_or(Ok(()))
 }
 
-/// The repo-write buckets for `did` (hour and day).
 pub fn check_repo_write(did: Option<&str>, points: u32) -> Result<(), XrpcError> {
     match did {
         Some(d) => check(&[&REPO_WRITE_HOUR, &REPO_WRITE_DAY], d, points),
@@ -1091,15 +945,12 @@ fn set_headers(h: &mut HeaderMap, s: &Status) {
     }
 }
 
-/// Middleware: per-IP buckets (built-in and configured route buckets), the
-/// request context for handler-level buckets, and the RateLimit-* headers.
 pub async fn layer(
     axum::extract::State(limiter): axum::extract::State<Arc<Limiter>>,
     req: Request,
     next: axum::middleware::Next,
 ) -> Response {
     let path = req.uri().path();
-    // OAuth sign-in forms: context only; the handler consumes its buckets
     let post = req.method() == axum::http::Method::POST;
     let sign_in_form = post && OAUTH_SIGN_IN_PATHS.contains(&path);
     let oauth_endpoint = post && OAUTH_IP_PATHS.contains(&path);
@@ -1140,7 +991,6 @@ pub async fn layer(
         });
         let mut resp = match pre {
             Ok(()) => next.run(req).await,
-            // OAuth endpoints answer in OAuth's error shape
             Err(_) if oauth_endpoint => (
                 StatusCode::TOO_MANY_REQUESTS,
                 axum::Json(serde_json::json!({"error": "rate_limit_exceeded", "error_description": "Rate Limit Exceeded"})),
@@ -1171,22 +1021,22 @@ mod tests {
             window_ms: 1000,
             points: 5,
         };
+        let spec = Spec::of(&L);
+        let consume = |key: &str, points, now| c.consume_spec(&spec, L.points, key, points, now);
         for i in 0..5 {
-            let s = c.consume(&L, "k", 1, 10);
+            let s = consume("k", 1, 10);
             assert!(!s.exceeded);
             assert_eq!(s.remaining, 4 - i);
         }
-        assert!(c.consume(&L, "k", 1, 500).exceeded);
-        // other keys are independent
-        assert!(!c.consume(&L, "k2", 5, 500).exceeded);
-        // window resets
-        let s = c.consume(&L, "k", 1, 1010);
+        assert!(consume("k", 1, 500).exceeded);
+        assert!(!consume("k2", 5, 500).exceeded);
+        let s = consume("k", 1, 1010);
         assert!(!s.exceeded);
         assert_eq!(s.reset_ms, 2010);
         // expired windows are swept from each shard as it is touched
         assert_eq!(c.len(), 2);
         for i in 0..1000 {
-            c.consume(&L, &format!("x{i}"), 1, 100_000);
+            consume(&format!("x{i}"), 1, 100_000);
         }
         assert_eq!(c.len(), 1000, "old windows of every touched shard dropped");
     }
