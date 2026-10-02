@@ -293,7 +293,10 @@ pub fn verify_record_proof(
     let Some(Value::Link(data)) = commit.get("data") else {
         return Err("commit has no data".into());
     };
-    let tree = crate::mst::Tree::load_from_blocks(&map, *data).map_err(|e| format!("{e:?}"))?;
+    // only the nodes on rpath's path: the proof needs nothing else, and
+    // the rest of an attacker's block set is never decoded
+    let tree = crate::mst::Tree::load_path_from_blocks(&map, *data, rpath.as_bytes())
+        .map_err(|e| format!("{e:?}"))?;
     let rcid = tree
         .get(rpath.as_bytes())
         .map_err(|e| format!("{e:?}"))?

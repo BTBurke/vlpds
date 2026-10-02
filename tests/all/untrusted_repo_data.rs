@@ -50,6 +50,13 @@ fn deep_car(did: &str, kp: &Keypair, rpath: &str, depth: usize) -> Vec<u8> {
         c = Cid::dag_cbor(&b);
         blocks.push((c, b));
     }
+    signed_car(did, kp, c, &blocks)
+}
+
+/// A CAR of a commit for `did` with MST root `data`, signed by `kp`, then
+/// `blocks` (in reverse).
+fn signed_car(did: &str, kp: &Keypair, data: Cid, blocks: &[(Cid, Vec<u8>)]) -> Vec<u8> {
+    let c = data;
     let mut fields = vec![
         ("did".to_string(), Value::Text(did.to_string())),
         ("rev".to_string(), Value::Text("3l3qo2vuowo2b".to_string())),
@@ -70,6 +77,89 @@ fn deep_car(did: &str, kp: &Keypair, rpath: &str, depth: usize) -> Vec<u8> {
         vlpds::car::write_block(&mut car, c, b);
     }
     car
+}
+
+/// A signed commit whose MST "tree" is a DAG: `levels` nodes above a leaf,
+/// each holding `fan` keys of its height and linking the one node below
+/// `fan + 1` times (l and every t). The leaf holds `rpath`. Expanded as a
+/// tree it has (fan + 1)^levels leaves: fan 40, 4 levels is ~116M entries
+/// from ~18 KB, and a few more levels exhaust memory.
+fn dag_car(did: &str, kp: &Keypair, rpath: &str, fan: usize, levels: i32) -> Vec<u8> {
+    use vlpds::mst::{encode_node, height_for_key, Entry, Node};
+    use std::sync::Arc;
+    let rec =
+        Value::from_json(&json!({"$type": "com.atproto.lexicon.schema", "id": "com.example.dag"}))
+            .unwrap()
+            .to_cbor();
+    let rec_cid = Cid::dag_cbor(&rec);
+    let mut blocks = vec![(rec_cid, rec)];
+    assert_eq!(height_for_key(rpath.as_bytes()), 0, "{rpath} must be a leaf key");
+    let keys_at = |h: i32| -> Vec<Vec<u8>> {
+        let mut ks: Vec<Vec<u8>> = (0..)
+            .map(|i| format!("com.example.dag/{h}-{i}").into_bytes())
+            .filter(|k| height_for_key(k) == h && (h > 0 || k.as_slice() > rpath.as_bytes()))
+            .take(if h == 0 { fan - 1 } else { fan })
+            .collect();
+        if h == 0 {
+            ks.push(rpath.as_bytes().to_vec());
+        }
+        ks.sort();
+        ks
+    };
+    let mut child: Option<Cid> = None;
+    for h in 0..=levels {
+        let mut n = Node { height: h, entries: Vec::new(), cid: None, dirty: true, stub: false, bytes: None };
+        let link = |c: Option<Cid>| c.map(|c| Entry::Child { node: None, cid: Some(c) });
+        n.entries.extend(link(child));
+        for k in keys_at(h) {
+            n.entries.push(Entry::Value { key: Arc::from(k), val: rec_cid });
+            n.entries.extend(link(child));
+        }
+        let mut b = Vec::new();
+        encode_node(&n, &mut b).unwrap();
+        let c = Cid::dag_cbor(&b);
+        blocks.push((c, b));
+        child = Some(c);
+    }
+    signed_car(did, kp, child.unwrap(), &blocks)
+}
+
+/// Both untrusted-CAR paths reject (or, for a proof, walk only the path
+/// of) a DAG-shaped MST in bounded time instead of expanding it.
+#[test]
+fn record_proof_with_dag_mst_is_bounded() {
+    let kp = Keypair::generate();
+    let did = "did:plc:dagdagdagdagdagdagdagdag";
+    // "com.atproto..." sorts before every "com.example.dag/..." key: the
+    // rpath lookup goes down the left edge, a consistent path
+    let rpath = "com.atproto.lexicon.schema/com.example.dag";
+    let key = kp.public_multibase();
+    let car = dag_car(did, &kp, rpath, 40, 4);
+    assert!(car.len() < 20_000, "{}", car.len());
+    let t = std::time::Instant::now();
+    let r = vlpds::oauth::lexicon::verify_record_proof(&car, did, &key, rpath);
+    assert!(t.elapsed() < std::time::Duration::from_secs(1), "{:?}", t.elapsed());
+    assert_eq!(r.unwrap()["id"], "com.example.dag");
+    // a key routed through any other link reaches a leaf outside its range
+    let elsewhere = "com.example.dag/1-zzzz";
+    let r = vlpds::oauth::lexicon::verify_record_proof(&car, did, &key, elsewhere);
+    assert!(r.unwrap_err().contains("outside its parent's range"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn import_repo_with_dag_mst_is_rejected_fast() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("dag").await;
+    // past the old loader's memory: (41)^6 leaves
+    let car = dag_car(&a.did, &Keypair::generate(), "com.example.dag/0", 40, 6);
+    let t = std::time::Instant::now();
+    let r = s
+        .xrpc
+        .post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &a.auth())
+        .await;
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+    r.err(400, "InvalidRequest");
+    assert!(r.text().contains("more than once"), "{}", r.text());
 }
 
 #[test]

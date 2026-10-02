@@ -1112,32 +1112,78 @@ pub fn decode_node_reference(data: &[u8], c: Cid) -> std::result::Result<Node, M
     })
 }
 
-/// Loads the subtree at `c` (`depth` nodes below the root). Children missing
-/// from `blocks` stay unloaded (partial tree). A node without keys takes its
-/// height from its child; every loaded child must be exactly one level below
-/// its parent.
-fn load_from_blocks(
-    blocks: &HashMap<Cid, Vec<u8>>,
-    c: Cid,
-    depth: usize,
-) -> Result<Option<Arc<Node>>> {
-    if depth >= MAX_DEPTH {
-        return Err(MstError::Invalid("tree too deep"));
-    }
-    let Some(data) = blocks.get(&c) else {
-        return Ok(None);
-    };
-    let mut n = decode_node(data, c)?;
-    if depth > 0 && n.entries.is_empty() {
-        return Err(MstError::Invalid("empty child node"));
-    }
-    for e in n.entries.iter_mut() {
-        if let Entry::Child {
-            node,
-            cid: Some(cc),
-        } = e
+/// One load of a (possibly partial) tree from an untrusted block set.
+///
+/// A block set is a DAG, not a tree: nodes may link the same child many
+/// times, and expanding every link materializes an exponential tree from a
+/// few KB (fan 40, 4 levels: ~116M entries from 17.7 KB). A valid MST never
+/// repeats a node (a repeat would repeat its keys, and no child is empty),
+/// so a node reached twice is rejected, and every node's keys must fall
+/// strictly between the separators its parent puts around it (else lookups
+/// by key order would miss them). Each block is decoded at most once, so
+/// load work and memory are linear in the input.
+struct Loader<'a> {
+    blocks: &'a HashMap<Cid, Vec<u8>>,
+    seen: std::collections::HashSet<Cid>,
+    /// Load only the nodes on the key-order path to this key (proofs).
+    path: Option<&'a [u8]>,
+}
+
+impl Loader<'_> {
+    /// Loads the subtree at `c` (`depth` nodes below the root), whose keys
+    /// must lie strictly between `lo` and `hi`. Children missing from
+    /// `blocks` stay unloaded (partial tree), as do children off `path`. A
+    /// node without keys takes its height from its child; every loaded
+    /// child must be exactly one level below its parent.
+    fn load(
+        &mut self,
+        c: Cid,
+        depth: usize,
+        lo: Option<&Arc<[u8]>>,
+        hi: Option<&Arc<[u8]>>,
+    ) -> Result<Option<Arc<Node>>> {
+        if depth >= MAX_DEPTH {
+            return Err(MstError::Invalid("tree too deep"));
+        }
+        let Some(data) = self.blocks.get(&c) else {
+            return Ok(None);
+        };
+        if !self.seen.insert(c) {
+            return Err(MstError::Invalid("node appears more than once"));
+        }
+        let mut n = decode_node(data, c)?;
+        if depth > 0 && n.entries.is_empty() {
+            return Err(MstError::Invalid("empty child node"));
+        }
+        // keys ascend within a node (decode_node): its first and last bound it
+        let first = n.entries.iter().find_map(Entry::key);
+        let last = n.entries.iter().rev().find_map(Entry::key);
+        if first.zip(lo).is_some_and(|(k, lo)| k <= &lo[..])
+            || last.zip(hi).is_some_and(|(k, hi)| k >= &hi[..])
         {
-            if let Some(child) = load_from_blocks(blocks, *cc, depth + 1)? {
+            return Err(MstError::Invalid("node key outside its parent's range"));
+        }
+        let value_key = |e: Option<&Entry>| match e {
+            Some(Entry::Value { key, .. }) => Some(key.clone()),
+            _ => None,
+        };
+        for i in 0..n.entries.len() {
+            let Entry::Child { cid: Some(cc), .. } = n.entries[i] else {
+                continue;
+            };
+            // a child sits between its neighbouring values (decode_node never
+            // puts two children side by side); at an end, the parent's bound
+            let clo = i
+                .checked_sub(1)
+                .and_then(|j| value_key(n.entries.get(j)))
+                .or_else(|| lo.cloned());
+            let chi = value_key(n.entries.get(i + 1)).or_else(|| hi.cloned());
+            if let Some(k) = self.path {
+                if clo.as_ref().is_some_and(|l| k <= &l[..]) || chi.as_ref().is_some_and(|h| k >= &h[..]) {
+                    continue;
+                }
+            }
+            if let Some(child) = self.load(cc, depth + 1, clo.as_ref(), chi.as_ref())? {
                 if child.height >= 0 {
                     if n.height < 0 {
                         n.height = child.height + 1;
@@ -1145,11 +1191,13 @@ fn load_from_blocks(
                         return Err(MstError::Invalid("child height is not parent height - 1"));
                     }
                 }
-                *node = Some(child);
+                if let Entry::Child { node, .. } = &mut n.entries[i] {
+                    *node = Some(child);
+                }
             }
         }
+        Ok(Some(Arc::new(n)))
     }
-    Ok(Some(Arc::new(n)))
 }
 
 /// Pushes known heights down into loaded nodes without keys (whose subtrees
@@ -1356,8 +1404,24 @@ impl Tree {
     }
 
     /// Loads a (possibly partial) tree from a block set.
+    /// Rejects a block set that isn't a tree (a node linked twice) or whose
+    /// nodes hold keys outside their parent's separators (see [`Loader`]),
+    /// so loading is linear in the input.
     pub fn load_from_blocks(blocks: &HashMap<Cid, Vec<u8>>, root: Cid) -> Result<Tree> {
-        let mut r = load_from_blocks(blocks, root, 0)?.ok_or(MstError::Partial)?;
+        Self::load_with(blocks, root, None)
+    }
+
+    /// Loads only the nodes on the key-order path from the root to `key`
+    /// (the rest stay unloaded, like missing blocks): enough for
+    /// [`Tree::get`] of `key`, e.g. to check an inclusion proof, without
+    /// decoding the rest of an untrusted block set.
+    pub fn load_path_from_blocks(blocks: &HashMap<Cid, Vec<u8>>, root: Cid, key: &[u8]) -> Result<Tree> {
+        Self::load_with(blocks, root, Some(key))
+    }
+
+    fn load_with(blocks: &HashMap<Cid, Vec<u8>>, root: Cid, path: Option<&[u8]>) -> Result<Tree> {
+        let mut l = Loader { blocks, seen: Default::default(), path };
+        let mut r = l.load(root, 0, None, None)?.ok_or(MstError::Partial)?;
         ensure_heights(&mut r, 0)?;
         Ok(Tree { root: r, built: false })
     }
@@ -2103,7 +2167,8 @@ mod tests {
         let same = add(&mut blocks, raw_node(None, &[(b"blue", 0, Some(h1))]));
         // a key-less node over height 0 is height 1; over that, height 2 is fine
         let mid = add(&mut blocks, raw_node(Some(h0), &[]));
-        let ok2 = add(&mut blocks, raw_node(Some(mid), &[(b"88bfafc7", 0, None)]));
+        // ("asdf" sorts after "88bfafc7": the subtree hangs to its right)
+        let ok2 = add(&mut blocks, raw_node(None, &[(b"88bfafc7", 0, Some(mid))]));
         let bad2 = add(&mut blocks, raw_node(Some(mid), &[(b"blue", 0, None)]));
         for c in [skip, same, bad2] {
             assert!(load(&blocks, c).is_err());
@@ -2123,6 +2188,105 @@ mod tests {
         let over_empty = add(&mut blocks, raw_node(Some(empty), &[(b"blue", 0, None)]));
         assert!(load(&blocks, over_empty).is_err());
         assert!(load(&blocks, empty).unwrap().is_empty());
+    }
+
+    /// A block set where every level links one child block `fan + 1` times
+    /// used to expand to (fan + 1)^levels nodes (fan 40, 4 levels: ~116M
+    /// entries from 17.7 KB). A repeated node is rejected now, fast.
+    #[test]
+    fn dag_with_shared_children_rejected() {
+        let mut blocks = HashMap::new();
+        let keys_at = |h: i32, n: usize| -> Vec<Vec<u8>> {
+            let mut ks: Vec<Vec<u8>> = (0..)
+                .map(|i| format!("com.example.dag/{h}-{i}").into_bytes())
+                .filter(|k| height_for_key(k) == h)
+                .take(n)
+                .collect();
+            ks.sort();
+            ks
+        };
+        let node = |child: Option<Cid>, keys: &[Vec<u8>]| {
+            let mut n = Node::empty(0);
+            if let Some(c) = child {
+                n.entries.push(Entry::Child { node: None, cid: Some(c) });
+            }
+            for k in keys {
+                n.entries.push(Entry::Value { key: k.clone().into(), val: leaf() });
+                if let Some(c) = child {
+                    n.entries.push(Entry::Child { node: None, cid: Some(c) });
+                }
+            }
+            let mut b = Vec::new();
+            encode_node(&n, &mut b).unwrap();
+            b
+        };
+        let mut c = add(&mut blocks, node(None, &keys_at(0, 40)));
+        for h in 1..=4 {
+            c = add(&mut blocks, node(Some(c), &keys_at(h, 40)));
+        }
+        let leftmost = keys_at(0, 1).remove(0);
+        let mut mid = keys_at(1, 1).remove(0);
+        mid.push(b'x');
+        let t = std::time::Instant::now();
+        let full = load(&blocks, c).err();
+        let left = Tree::load_path_from_blocks(&blocks, c, &leftmost).map(|t| t.get(&leftmost));
+        let right = Tree::load_path_from_blocks(&blocks, c, &mid).err();
+        assert!(t.elapsed() < std::time::Duration::from_secs(1), "{:?}", t.elapsed());
+        assert_eq!(full, Some(MstError::Invalid("node appears more than once")));
+        // a path walk reaches one copy per level: down the left edge it is a
+        // consistent path; anywhere else the leaf's keys fall outside the
+        // separators that route to it
+        assert_eq!(left, Ok(Ok(Some(leaf()))));
+        assert_eq!(right, Some(MstError::Invalid("node key outside its parent's range")));
+    }
+
+    /// Keys a parent's separators don't route to (a lookup by key order
+    /// would never find them) make the tree invalid.
+    #[test]
+    fn child_keys_outside_separators_rejected() {
+        // "blue" has height 1, "asdf"/"2653ae71" height 0; "asdf" > "2653ae71"
+        let mut blocks = HashMap::new();
+        let low = add(&mut blocks, raw_node(None, &[(b"2653ae71", 0, None)]));
+        let high = add(&mut blocks, raw_node(None, &[(b"asdf", 0, None)]));
+        let zkey = (0..)
+            .map(|i| format!("z{i}").into_bytes())
+            .find(|k| height_for_key(k) == 0)
+            .unwrap();
+        let late = add(&mut blocks, raw_node(None, &[(&zkey, 0, None)]));
+        let both = add(&mut blocks, raw_node(Some(low), &[(b"blue", 0, Some(late))]));
+        assert!(load(&blocks, both).is_ok());
+        for bad in [
+            raw_node(Some(late), &[(b"blue", 0, None)]),
+            raw_node(None, &[(b"blue", 0, Some(low))]),
+            raw_node(Some(high), &[(b"blue", 0, Some(high))]),
+        ] {
+            let c = add(&mut blocks, bad);
+            assert!(load(&blocks, c).is_err());
+        }
+    }
+
+    /// A path load answers `get` exactly as a full load, for present and
+    /// absent keys, and leaves the rest of the tree unloaded.
+    #[test]
+    fn path_load_matches_full_load() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let mut t = Tree::new();
+        let keys: Vec<String> = (0..500).map(|_| rand_key(&mut rng)).collect();
+        for k in &keys {
+            t.insert_no_proof(k.as_bytes(), leaf()).unwrap();
+        }
+        let mut blocks = Vec::new();
+        let root = t.write_diff_blocks(&mut blocks).unwrap();
+        let blocks: HashMap<Cid, Vec<u8>> = blocks.into_iter().collect();
+        let full = load(&blocks, root).unwrap();
+        let absent: Vec<String> = (0..100).map(|_| rand_key(&mut rng)).collect();
+        for k in keys.iter().chain(&absent).chain([&"a".to_string(), &"zzzz".to_string()]) {
+            let p = Tree::load_path_from_blocks(&blocks, root, k.as_bytes()).unwrap();
+            assert_eq!(p.get(k.as_bytes()).unwrap(), full.get(k.as_bytes()).unwrap(), "{k}");
+            let mut n = 0;
+            p.walk(&mut |_, _| n += 1);
+            assert!(n < keys.len(), "path load loaded the whole tree");
+        }
     }
 
     #[test]

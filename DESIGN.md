@@ -2024,6 +2024,17 @@ derived, and every loaded node is verified against its parent's link.
     export walk, then advanced per commit as today), or persist
     `l/{did}\0{cid8}` → first key (~12 B/record more). Leaf-node getBlocks
     is rare, so the walk is the default.
+- **Untrusted block sets** (`mst::Tree::load_from_blocks`: importRepo,
+  record proofs behind OAuth `include:` scopes and dynamic lexicons). A
+  CAR is a DAG, not a tree: a node may link one child many times, and
+  expanding every link blew a 17.7 KB CAR (fan 40, 4 levels) up to ~116M
+  entries, and ~50 KB to OOM. The loader now decodes each block at most
+  once (a node reached twice is rejected: a valid MST never repeats one),
+  checks that every node's keys lie strictly between the separators its
+  parent puts around it, and so does work linear in the input. A record
+  proof (`Tree::load_path_from_blocks`) decodes only the nodes on the
+  key-order path to its key. `tests/all/untrusted_repo_data.rs` holds the
+  crafted DAG (and the deep chain) for both entry points.
 - **Storage format.** `M/` is a new family. vlpds is unshipped, so there is
   no migration: bulk import and `importRepo` write `M/` (backfill =
   `mst_lazy::build_tree` + `persisted_nodes`).
