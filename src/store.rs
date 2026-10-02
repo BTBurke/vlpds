@@ -14,13 +14,26 @@ pub struct Store {
     pub latency: Option<(f64, f64)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct S3Config {
     pub endpoint: String,
     pub bucket: String,
     pub access_key: String,
     pub secret_key: String,
     pub region: String,
+}
+
+/// Credentials redacted.
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .field("region", &self.region)
+            .finish()
+    }
 }
 
 impl Store {

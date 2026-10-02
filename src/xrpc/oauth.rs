@@ -1013,7 +1013,8 @@ async fn load_flow(
     let fail =
         |m: &str| FlowError::Redirect(Box::new(req.params.clone()), "access_denied", m.to_string());
     let now = now_secs();
-    let err = if req.did.is_some() || req.code_hash.is_some() || req.consumed.is_some() {
+    let authorized = req.did.is_some() || req.code_hash.is_some() || req.consumed.is_some();
+    let err = if authorized {
         Some(fail("This request was already authorized"))
     } else if req.expires_at < now {
         Some(fail("This request has expired"))
@@ -1025,7 +1026,12 @@ async fn load_flow(
         None
     };
     if let Some(e) = err {
-        if req.consumed.is_none() {
+        // Only an expired, unauthorized request is deleted. The reference
+        // deletes on every failure, but these checks are reachable by anyone
+        // holding the request_uri (it is in the browser's URL): deleting an
+        // authorized request would break the client's code exchange, and a
+        // wrong client_id or device would kill the user's flow in progress.
+        if !authorized && req.expires_at < now {
             store::put_request(app, &id, None).await?;
         }
         return Err(e);
@@ -2222,9 +2228,14 @@ pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Crede
     }
     // Stateful check: the session must still exist and this must be its
     // current token (rotation and revocation take effect immediately).
-    let s = store::get_session(app, did, sid)
-        .await
-        .map_err(|e| XrpcError::internal(e.description))?;
+    // ... and the account must not be taken down (its sessions are revoked
+    // by the takedown too; this holds even if that revocation was missed).
+    // Both reads are point gets in the owner's partition, run together.
+    let (s, acct) = tokio::join!(store::get_session(app, did, sid), account_any(app, did));
+    let s = s.map_err(|e| XrpcError::internal(e.description))?;
+    if acct.is_ok_and(|a| super::server::is_takendown_account(&a)) {
+        return Err(super::server::takedown_error());
+    }
     match s {
         Some(s) if s.token_id == jti && s.client_id == client_id => {}
         _ => return Err(dpop_fail("invalid_token", "Token has been revoked")),

@@ -2880,6 +2880,33 @@ async fn bench_dpop_resource_requests() {
     println!("DPoP resource request: {seq:.0} us sequential, {par:.0} us/request at 16 in flight");
 }
 
+/// Re-opening an authorized request's page (anyone holding its request_uri,
+/// from any device) is refused but doesn't delete the request: the client's
+/// code exchange still works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reopened_authorized_request_keeps_code() {
+    let s = spawn().await;
+    let acct = create_account(&s, "reopen").await;
+    let key = DpopKey::new();
+    let redirect = "http://127.0.0.1/callback";
+    let cid = loopback_client_id("atproto transition:generic", redirect);
+    let f = Flow::new(&cid, redirect, "atproto transition:generic", &key);
+    let mut b = Browser::default();
+    let p = pkce();
+    let par = f.par(&s, &p, "st").await;
+    assert_eq!(par.status, 201, "PAR: {}", par.body);
+    let request_uri = par.body["request_uri"].as_str().unwrap().to_string();
+    let (st, h, body) = browser_consent(&s, &mut b, &f, &acct, &request_uri, &[]).await;
+    assert_eq!(st, 303, "{body}");
+    let code = location_params(&h).1.get("code").expect("code").clone();
+    // another device, and the same browser, open it again
+    let (st, _, body) = Browser::default().get(&s, &f.authorize_url(&s, &request_uri)).await;
+    assert_ne!(st, 200, "{body}");
+    let (st, _, body) = b.get(&s, &f.authorize_url(&s, &request_uri)).await;
+    assert_ne!(st, 200, "{body}");
+    tokens(&exchange(&s, &f, &code, &p, &[]).await);
+}
+
 // Reference-suite ports that reuse this file's client simulation.
 #[path = "ref_oauth.rs"]
 mod ref_oauth;

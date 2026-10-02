@@ -358,8 +358,10 @@ pub fn describe_scopes(scope: &str, sets: &[(IncludeScope, J)]) -> Vec<String> {
                         let inner: Vec<String> = inc.to_permissions(set).iter().map(describe_permission).collect();
                         if !inner.is_empty() {
                             line.push_str("<ul class=\"perms\">");
+                            // escaped like the rest of the line: never rely on
+                            // the scope validators keeping markup out
                             for i in inner {
-                                line.push_str(&format!("<li>{i}</li>"));
+                                line.push_str(&format!("<li>{}</li>", e(&i)));
                             }
                             line.push_str("</ul>");
                         }

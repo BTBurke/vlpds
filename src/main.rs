@@ -23,8 +23,10 @@ struct Args {
     /// Tokio's default is 1024.
     #[arg(long, env = "VLPDS_LISTEN_BACKLOG", default_value_t = 16384)]
     listen_backlog: u32,
-    /// Serve /metrics and /debug/pprof on this address only (e.g.
-    /// 127.0.0.1:9583), not on --listen. Unset = on the app port.
+    /// Serve /metrics and /debug/pprof on this address only, not on
+    /// --listen. Unset: 127.0.0.1:9583 (on the app port with --dev-mode,
+    /// so local multi-node runs don't collide). `app` = on the app port
+    /// (public: only behind a proxy that blocks /metrics).
     #[arg(long, env = "VLPDS_METRICS_LISTEN")]
     metrics_listen: Option<String>,
     #[arg(
@@ -58,9 +60,11 @@ struct Args {
     s3_endpoint: String,
     #[arg(long, env = "VLPDS_S3_BUCKET", default_value = "vlpds")]
     s3_bucket: String,
-    #[arg(long, env = "VLPDS_S3_ACCESS_KEY", default_value = "minioadmin")]
+    /// S3 access key (the MinIO default is refused without --dev-mode).
+    #[arg(long, env = "VLPDS_S3_ACCESS_KEY", default_value = server::DEV_S3_CREDENTIAL, hide_env_values = true, hide_default_value = true)]
     s3_access_key: String,
-    #[arg(long, env = "VLPDS_S3_SECRET_KEY", default_value = "minioadmin")]
+    /// S3 secret key (the MinIO default is refused without --dev-mode).
+    #[arg(long, env = "VLPDS_S3_SECRET_KEY", default_value = server::DEV_S3_CREDENTIAL, hide_env_values = true, hide_default_value = true)]
     s3_secret_key: String,
     #[arg(long, env = "VLPDS_S3_REGION", default_value = "us-east-1")]
     s3_region: String,
@@ -295,6 +299,10 @@ struct Args {
     /// well-known dev secrets are accepted.
     #[arg(long, env = "VLPDS_DEV_MODE")]
     dev_mode: bool,
+    /// Serve vlpds.admin.bulkCreate (synthetic benchmark accounts, admin
+    /// token) without --dev-mode.
+    #[arg(long, env = "VLPDS_ALLOW_BULK_CREATE")]
+    allow_bulk_create: bool,
     /// Key-encryption key for secrets at rest (signing keys, TOTP secrets;
     /// DESIGN.md "Secrets at rest"): a file of 32 random bytes (raw, hex or
     /// base64), the same on every node. Required outside --dev-mode unless
@@ -723,6 +731,17 @@ fn init_logging(format: LogFormat) -> anyhow::Result<()> {
 
 /// A secret flag's value; the well-known dev default only in dev mode (an
 /// unset secret outside dev mode is refused by `Config::check_secrets`).
+/// Where /metrics and /debug/pprof are served (None = the app port): see
+/// `--metrics-listen`.
+fn metrics_listen(args: &Args) -> Option<String> {
+    match args.metrics_listen.as_deref() {
+        Some("app") => None,
+        Some(a) => Some(a.to_string()),
+        None if args.dev_mode => None,
+        None => Some("127.0.0.1:9583".into()),
+    }
+}
+
 fn secret(v: &Option<String>, dev_mode: bool, dev_default: &str) -> String {
     match v {
         Some(v) => v.clone(),
@@ -886,6 +905,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         appview_cdn_url_pattern: args.bsky_app_view_cdn_url_pattern.clone().filter(|p| !p.is_empty()),
         crawlers: args.crawlers.clone(),
         dev_mode: args.dev_mode,
+        allow_bulk_create: args.allow_bulk_create,
         kek: kek_config(&args)?,
         mailer: vlpds::mail::from_flags(args.email_smtp_url.clone(), args.email_from_address.clone())?,
         moderation_mailer: vlpds::mail::moderation_from_flags(
@@ -937,7 +957,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             levels: vlpds::version::Window::BUILD,
         }),
         memory_store: None,
-        metrics_listen: args.metrics_listen.clone(),
+        metrics_listen: metrics_listen(&args),
         log_retention,
         reshard_gc,
         cache_budget_bytes: args.cache_budget_mb.map(|m| m << 20),
@@ -964,8 +984,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         );
     }
     let listener = bind(&args.listen, args.listen_backlog).await?;
-    let metrics_listener = match &args.metrics_listen {
-        Some(a) => Some(bind(a, args.listen_backlog).await?),
+    let metrics_listener = match metrics_listen(&args) {
+        Some(a) => Some(bind(&a, args.listen_backlog).await?),
         None => None,
     };
     let app = server::build(cfg).await?;
@@ -973,7 +993,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         tracing::info!(dir = %c.dir.display(), shard_mb = c.shard_bytes >> 20, "SST disk cache (per shard)");
     }
     server::spawn_reporters(&app);
-    tracing::info!(listen = %args.listen, metrics_listen = args.metrics_listen.as_deref().unwrap_or("(app port)"), "vlpds serving");
+    tracing::info!(listen = %args.listen, metrics_listen = metrics_listen(&args).as_deref().unwrap_or("(app port)"), "vlpds serving");
     if let Some(l) = metrics_listener {
         let r = server::metrics_router(&app);
         tokio::spawn(async move {

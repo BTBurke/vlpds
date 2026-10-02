@@ -21,7 +21,7 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 pub const STEP_SECS: u64 = 30;
 pub const DIGITS: u32 = 6;
@@ -44,7 +44,7 @@ pub struct TotpState {
     /// Base32 secret from setupTotp awaiting confirmTotp.
     #[serde(default)]
     pub pending: Option<String>,
-    /// sha256 hex of each unused recovery code (normalized).
+    /// [`hash_recovery_code`] of each unused recovery code.
     #[serde(default)]
     pub recovery: Vec<String>,
     /// Highest time step accepted so far; codes for steps <= this are replays.
@@ -207,15 +207,19 @@ pub fn generate_recovery_codes() -> Vec<String> {
         .collect()
 }
 
-pub fn hash_recovery_code(code: &str) -> String {
+/// A recovery code's stored form: HMAC-SHA256 keyed by the factor's TOTP
+/// secret (KEK-wrapped at rest), so a leaked state row can't be brute-forced
+/// offline for its ~50-bit codes without the KEK.
+pub fn hash_recovery_code(secret: &[u8], code: &str) -> String {
     let norm: String = code
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
         .to_ascii_lowercase();
-    hex::encode(Sha256::digest(
-        format!("vlpds-totp-recovery:{norm}").as_bytes(),
-    ))
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac accepts any key length");
+    mac.update(b"vlpds-totp-recovery:");
+    mac.update(norm.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 pub async fn load(app: &App, did: &str) -> Result<TotpState, XrpcError> {
@@ -342,7 +346,7 @@ fn consume_at(st: &mut TotpState, code: &str, now: u64) -> Result<(), XrpcError>
         st.last_step = step;
         return Ok(());
     }
-    let h = hash_recovery_code(trimmed);
+    let h = hash_recovery_code(&secret, trimmed);
     let pos = st
         .recovery
         .iter()
@@ -486,9 +490,10 @@ mod tests {
         assert_eq!(base32_decode(&enc).unwrap(), sec);
         let codes = generate_recovery_codes();
         assert_eq!(codes.len(), 10);
+        assert_ne!(hash_recovery_code(&sec, &codes[0]), hash_recovery_code(b"another secret", &codes[0]), "keyed");
         let mut st = TotpState {
             secret: Some(enc),
-            recovery: codes.iter().map(|c| hash_recovery_code(c)).collect(),
+            recovery: codes.iter().map(|c| hash_recovery_code(&sec, c)).collect(),
             ..Default::default()
         };
         assert!(consume(&mut st, &codes[3].to_uppercase()).is_ok());

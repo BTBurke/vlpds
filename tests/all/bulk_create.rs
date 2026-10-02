@@ -105,3 +105,28 @@ async fn indices_and_ownership() {
     let bad = a.xrpc.post("vlpds.admin.bulkCreate", &json!({"indices": [1, 2], "records": [1]}), &Auth::Bearer(ADMIN_TOKEN.into())).await;
     assert_eq!(bad.status, 400, "{}", bad.text());
 }
+
+/// bulkCreate is dev-mode (or `--allow-bulk-create`) only, and its accounts
+/// get the request's password, else a random one nobody can log in with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gated_and_password() {
+    let prod = TestServer::spawn_with(|c| c.dev_mode = false).await;
+    let r = prod.xrpc.post("vlpds.admin.bulkCreate", &json!({"start": 0, "count": 1, "records": 0}), &Auth::Bearer(ADMIN_TOKEN.into())).await;
+    r.err(404, "MethodNotImplemented");
+    let allowed = TestServer::spawn_with(|c| {
+        c.dev_mode = false;
+        c.allow_bulk_create = true;
+    })
+    .await;
+    bulk(&allowed, json!({"start": 0, "count": 1, "records": 0})).await;
+
+    let s = TestServer::spawn().await;
+    let v = bulk(&s, json!({"start": 10, "count": 1, "records": 0, "password": "bulk-pw-1"})).await;
+    assert_eq!(v["created"].as_u64(), Some(1), "{v}");
+    assert!(s.create_session(&bulk_did(10), "bulk-pw-1").await.is_ok());
+    let v = bulk(&s, json!({"start": 11, "count": 1, "records": 0})).await;
+    assert_eq!(v["created"].as_u64(), Some(1), "{v}");
+    for pw in ["hunter2", "bulk-pw-1"] {
+        assert!(!s.create_session(&bulk_did(11), pw).await.is_ok(), "no known password: {pw}");
+    }
+}

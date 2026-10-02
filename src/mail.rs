@@ -79,7 +79,7 @@ impl std::ops::Deref for SharedMailer {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SmtpConfig {
     /// `smtp://[user:pass@]host[:port]` (STARTTLS when offered, port 587;
     /// `?tls=required` insists on it; `?tls=none` is plaintext, port 25) or
@@ -93,6 +93,29 @@ pub struct SmtpConfig {
     pub backoff: Vec<Duration>,
     pub connect_timeout: Duration,
     pub send_timeout: Duration,
+}
+
+/// The URL's password redacted.
+impl std::fmt::Debug for SmtpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let url = match reqwest::Url::parse(&self.url) {
+            Ok(mut u) if u.password().is_some() => {
+                let _ = u.set_password(Some("redacted"));
+                u.to_string()
+            }
+            Ok(u) => u.to_string(),
+            Err(_) => "<unparsable>".into(),
+        };
+        f.debug_struct("SmtpConfig")
+            .field("url", &url)
+            .field("from", &self.from)
+            .field("queue", &self.queue)
+            .field("concurrency", &self.concurrency)
+            .field("backoff", &self.backoff)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("send_timeout", &self.send_timeout)
+            .finish()
+    }
 }
 
 impl SmtpConfig {

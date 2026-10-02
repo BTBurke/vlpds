@@ -474,13 +474,13 @@ async fn set_invites_disabled(app: &App, codes: &[String], disabled: bool) -> XR
 /// Is record `{collection}/{rkey}` of `did` taken down? Takedowns live in
 /// the account's own partition (`sec/td/`), so the owner checks them from
 /// its cached per-DID view (`server::ctl`).
-pub async fn is_record_takendown(app: &App, did: &str, path: &str) -> bool {
-    ctl(app, did).await.has_takedown(&format!("rec/{path}"))
+pub async fn is_record_takendown(app: &App, did: &str, path: &str) -> XResult<bool> {
+    Ok(ctl(app, did).await?.has_takedown(&format!("rec/{path}")))
 }
 
 /// Is blob `cid` of repo `did` taken down?
-pub async fn is_blob_takendown(app: &App, did: &str, cid: &str) -> bool {
-    ctl(app, did).await.has_takedown(&format!("blob/{cid}"))
+pub async fn is_blob_takendown(app: &App, did: &str, cid: &str) -> XResult<bool> {
+    Ok(ctl(app, did).await?.has_takedown(&format!("blob/{cid}")))
 }
 
 /// Applies (`val` = Some) or lifts a record/blob takedown of `did`; `name` is
@@ -919,10 +919,13 @@ fn parse_subject(s: &J) -> XResult<Subject> {
 
 /// Deletes every OAuth session of `did`, so its DPoP access tokens stop
 /// verifying (verify_dpop requires the live session) and can't be refreshed.
-async fn revoke_oauth_sessions(app: &App, did: &str) {
-    if let Err(e) = crate::oauth::store::revoke_all_sessions(app, did).await {
+/// A failure fails the takedown request (the status is already applied, so a
+/// retry is idempotent); verify_dpop also rejects taken-down accounts.
+async fn revoke_oauth_sessions(app: &App, did: &str) -> XResult<()> {
+    crate::oauth::store::revoke_all_sessions(app, did).await.map(|_| ()).map_err(|e| {
         tracing::warn!(%did, "takedown: revoking OAuth sessions failed: {}", e.description);
-    }
+        XrpcError::internal(format!("takedown applied but revoking OAuth sessions failed (retry): {}", e.description))
+    })
 }
 
 async fn update_subject_status(
@@ -959,7 +962,7 @@ async fn update_subject_status(
                     // takedownAccount (revokeRefreshTokensByDid, token.removeByDid);
                     // legacy access tokens stay valid until they expire
                     super::server::revoke_refresh_tokens(&app, did).await?;
-                    revoke_oauth_sessions(&app, did).await;
+                    revoke_oauth_sessions(&app, did).await?;
                 }
             }
             Subject::Record { uri, did, cid } => {
@@ -1344,6 +1347,10 @@ struct BulkCreateIn {
     #[serde(default)]
     indices: Option<Vec<u64>>,
     records: BulkRecords,
+    /// Password of the created accounts (a load generator logging into
+    /// them). Unset: a random one nobody knows (no login).
+    #[serde(default)]
+    password: Option<String>,
 }
 
 /// Genesis records: one count for every account, or one per account
@@ -1385,6 +1392,14 @@ async fn bulk_create(
     if !tok.is_some_and(|t| crate::auth::token_eq(&app.admin_token, t)) {
         return Err(XrpcError::auth("admin token required"));
     }
+    if !(app.config.dev_mode || app.config.allow_bulk_create) {
+        return Err(XrpcError {
+            status: StatusCode::NOT_FOUND,
+            error: "MethodNotImplemented".into(),
+            message: "bulkCreate needs --dev-mode or --allow-bulk-create".into(),
+        });
+    }
+    let password_hash = bulk_password_hash(inp.password).await?;
     let idx: Vec<u64> = match inp.indices {
         Some(v) => v,
         None => {
@@ -1440,8 +1455,8 @@ async fn bulk_create(
             handle: handle.clone(),
             wrapped_signing_key,
             signing_pubkey,
-            // simulation accounts share one precomputed hash (Argon2id is ~20 ms each)
-            password_hash: BULK_PASSWORD_HASH.clone(),
+            // a request's accounts share one hash (Argon2id is ~20 ms each)
+            password_hash: password_hash.clone(),
             created_at: crate::events::now_rfc3339(),
             ..Default::default()
         };
@@ -1490,8 +1505,31 @@ async fn bulk_create(
     })))
 }
 
-static BULK_PASSWORD_HASH: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| state::hash_password_blocking("hunter2"));
+/// The password hash of a bulkCreate request's accounts: of `password`
+/// (the last one's hash is reused: a load generator sends the same one on
+/// every request), else of a random per-process password (no login).
+async fn bulk_password_hash(password: Option<String>) -> XResult<String> {
+    static LAST: parking_lot::Mutex<Option<(String, String)>> = parking_lot::Mutex::new(None);
+    let pw = match password {
+        Some(p) if p.is_empty() => return Err(invalid_request("password must not be empty")),
+        Some(p) => p,
+        None => return Ok(BULK_RANDOM_PASSWORD_HASH.clone()),
+    };
+    if let Some((p, h)) = LAST.lock().as_ref() {
+        if crate::auth::token_eq(p, &pw) {
+            return Ok(h.clone());
+        }
+    }
+    let p = pw.clone();
+    let h = tokio::task::spawn_blocking(move || state::hash_password_blocking(&p))
+        .await
+        .map_err(XrpcError::from_err)?;
+    *LAST.lock() = Some((pw, h.clone()));
+    Ok(h)
+}
+
+static BULK_RANDOM_PASSWORD_HASH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| state::hash_password_blocking(&hex::encode(rand::random::<[u8; 32]>())));
 
 // ---------------------------------------------------------------------------
 // PLC rotation key rotation (DESIGN.md "PLC identity")

@@ -285,13 +285,19 @@ async fn verify_mod_service(app: &App, tok: &str, nsid: &str) -> XResult<Credent
 /// (including a `did#service` issuer) is the reference's actor-store miss,
 /// 400 NotFound "Repo not found". Account status is the handler's business.
 async fn verify_user_service_auth(app: &App, tok: &str, nsid: &str) -> XResult<Credentials> {
-    let sa = verify_service_jwt(app, tok, Some(nsid)).await?;
+    let sa = verify_service_jwt_impl(app, tok, Some(nsid), None, true).await?;
+    Ok(Credentials::UserServiceAuth { did: sa.iss })
+}
+
+/// `iss` must be an account hosted here: 400 NotFound "Repo not found" for
+/// anything else (the reference's actor-store miss).
+async fn local_account_iss(app: &App, iss: &str) -> XResult<()> {
     let repo_not_found = || XrpcError::bad("NotFound", "Repo not found");
-    if sa.iss.contains('#') {
+    if iss.contains('#') {
         return Err(repo_not_found());
     }
-    match app.account(&sa.iss).await {
-        Ok(_) => Ok(Credentials::UserServiceAuth { did: sa.iss }),
+    match app.account(iss).await {
+        Ok(_) => Ok(()),
         Err(e) if e.error == "AccountNotFound" => Err(repo_not_found()),
         Err(e) => Err(e),
     }
@@ -438,8 +444,10 @@ async fn issuer_key(app: &App, iss: &str, fresh: bool) -> XResult<String> {
             }
         }
     }
-    if fresh {
-        app.did_resolver.invalidate(did);
+    if fresh && !app.did_resolver.refresh(did) {
+        // refreshed recently: the cached key is the current one as far as
+        // we may know (no re-fetch per forged token)
+        return Err(service_auth_err("BadJwtSignature", "jwt signature does not match jwt issuer"));
     }
     let doc = app
         .did_resolver
@@ -478,6 +486,20 @@ pub async fn verify_service_jwt_from(
     token: &str,
     lxm: Option<&str>,
     trusted: Option<&[String]>,
+) -> XResult<ServiceAuth> {
+    verify_service_jwt_impl(app, token, lxm, trusted, false).await
+}
+
+/// [`verify_service_jwt_from`]; `local_iss`: the issuer must be an account
+/// hosted here (no `#fragment`), else 400 NotFound "Repo not found",
+/// checked before any key resolution, so a forged token naming a foreign
+/// DID costs no outbound DID fetch.
+async fn verify_service_jwt_impl(
+    app: &App,
+    token: &str,
+    lxm: Option<&str>,
+    trusted: Option<&[String]>,
+    local_iss: bool,
 ) -> XResult<ServiceAuth> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
     use base64::Engine;
@@ -528,6 +550,9 @@ pub async fn verify_service_jwt_from(
     }
     if trusted.is_some_and(|t| !t.iter().any(|x| x == iss)) {
         return Err(service_auth_err("UntrustedIss", "Untrusted issuer"));
+    }
+    if local_iss {
+        local_account_iss(app, iss).await?;
     }
     let msg = format!("{h}.{p}");
     let sig = B64.decode(s).map_err(|_| service_auth_err("BadJwtSignature", "could not verify jwt signature"))?;

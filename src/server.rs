@@ -11,7 +11,8 @@ use axum::response::IntoResponse;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[derive(Clone, Debug)]
+/// No Debug: it holds secrets (tokens, S3/SMTP credentials, KEK config).
+#[derive(Clone)]
 pub struct Config {
     pub public_url: String,
     pub handle_domain: String,
@@ -84,6 +85,9 @@ pub struct Config {
     pub crawlers: Vec<String>,
     /// Dev mode: email/password-reset tokens are returned/logged instead of mailed.
     pub dev_mode: bool,
+    /// vlpds.admin.bulkCreate (synthetic benchmark accounts) outside dev
+    /// mode (`--allow-bulk-create`).
+    pub allow_bulk_create: bool,
     /// Key-encryption keys for secrets at rest (src/secrets.rs; `--kek-file`,
     /// `--gcp-kms-key`). Empty: the dev KEK, dev mode only.
     pub kek: crate::secrets::KekConfig,
@@ -189,6 +193,9 @@ pub struct Config {
 
 
 /// Well-known secrets: only accepted with `dev_mode` (see [`Config::check_secrets`]).
+/// The MinIO default S3 access/secret key (the CLI default): refused
+/// outside dev mode.
+pub const DEV_S3_CREDENTIAL: &str = "minioadmin";
 pub const DEV_JWT_SECRET: &str = "dev-secret-change-me";
 pub const DEV_ADMIN_TOKEN: &str = "dev-admin-token";
 pub const DEV_INTERNAL_TOKEN: &str = "dev-internal-token";
@@ -216,6 +223,12 @@ impl Config {
         }
         self.kek.check(self.dev_mode)?;
         self.plc.check(self.dev_mode, &self.plc_url)?;
+        if let (Some(s3), false) = (&self.s3, self.dev_mode) {
+            anyhow::ensure!(
+                s3.access_key != DEV_S3_CREDENTIAL && s3.secret_key != DEV_S3_CREDENTIAL,
+                "VLPDS_S3_ACCESS_KEY / VLPDS_S3_SECRET_KEY are the MinIO defaults ({DEV_S3_CREDENTIAL}); set real credentials (or run with --dev-mode)"
+            );
+        }
         if !self.dev_mode {
             for (i, (a, va, _)) in secrets.iter().enumerate() {
                 for (b, vb, _) in &secrets[i + 1..] {
@@ -265,6 +278,7 @@ impl Default for Config {
             appview_cdn_url_pattern: None,
             crawlers: Vec::new(),
             dev_mode: true,
+            allow_bulk_create: false,
             kek: Default::default(),
             mailer: None,
             moderation_mailer: None,
@@ -750,6 +764,21 @@ mod tests {
         assert!(prod(&a, &"b".repeat(31), &c).check_secrets().is_err());
         let e = prod(&a, &b, &b).check_secrets().unwrap_err();
         assert!(e.to_string().contains("must differ"), "{e}");
+        // the MinIO default S3 credentials, and their Debug is redacted
+        let s3 = |k: &str| crate::store::S3Config {
+            endpoint: "http://s3".into(),
+            bucket: "b".into(),
+            access_key: k.into(),
+            secret_key: format!("{k}-secret"),
+            region: "r".into(),
+        };
+        prod(&a, &b, &c).check_secrets().expect("no S3 (memory store)");
+        Config { s3: Some(s3("AKIAREAL")), ..prod(&a, &b, &c) }.check_secrets().expect("real S3 credentials");
+        let e = Config { s3: Some(s3(DEV_S3_CREDENTIAL)), ..prod(&a, &b, &c) }.check_secrets().unwrap_err();
+        assert!(e.to_string().contains("MinIO defaults"), "{e}");
+        Config { s3: Some(s3(DEV_S3_CREDENTIAL)), ..Config::default() }.check_secrets().expect("dev mode allows them");
+        let dbg = format!("{:?}", s3("AKIAREAL"));
+        assert!(!dbg.contains("AKIAREAL"), "{dbg}");
     }
 
     /// `metrics_listen` moves /metrics and /debug/pprof off the app port.

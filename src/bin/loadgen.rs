@@ -1148,8 +1148,8 @@ async fn bulk(
                 let (lo, hi) = (q.lo, q.hi);
                 if !q.records.is_empty() {
                     let body = match &q.indices {
-                        Some(idx) => json!({"indices": idx, "records": q.records}),
-                        None => json!({"start": lo, "count": hi - lo, "records": q.records}),
+                        Some(idx) => json!({"indices": idx, "records": q.records, "password": "hunter2"}),
+                        None => json!({"start": lo, "count": hi - lo, "records": q.records, "password": "hunter2"}),
                     };
                     let resp = c.post(format!("{host}/xrpc/vlpds.admin.bulkCreate")).bearer_auth(admin_token).json(&body).send().await?;
                     let status = resp.status();

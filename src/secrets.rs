@@ -298,7 +298,7 @@ impl KeyWrapper for LocalKek {
 // ---------------------------------------------------------------------------
 
 /// Where [`GcpKms`] gets OAuth access tokens.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum GcpToken {
     /// The GCE/GKE metadata server (the node's service account). The URL is
     /// the token endpoint; `GCE_METADATA_HOST` overrides its host.
@@ -309,6 +309,17 @@ pub enum GcpToken {
     /// A fixed bearer token (tests, or a short-lived token for an operator
     /// running an admin task off-cluster).
     Static(String),
+}
+
+/// A static token redacted.
+impl std::fmt::Debug for GcpToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GcpToken::Metadata(u) => f.debug_tuple("Metadata").field(u).finish(),
+            GcpToken::ServiceAccount(sa) => f.debug_tuple("ServiceAccount").field(sa).finish(),
+            GcpToken::Static(_) => f.debug_tuple("Static").field(&"<redacted>").finish(),
+        }
+    }
 }
 
 impl GcpToken {
@@ -967,7 +978,9 @@ impl Secrets {
             }
         };
         let key = Arc::new(Keypair::from_bytes(&u.plaintext).map_err(|e| SecretError::Rejected(format!("signing key of {did}: {e}")))?);
-        if !pubkey.is_empty() && key.public_multibase() != pubkey {
+        // an empty expected key is refused too: an unchecked unwrap would let
+        // a swapped wrapped key sign for the account
+        if pubkey.is_empty() || key.public_multibase() != pubkey {
             KEY_CACHE.with_label_values(&["rejected"]).inc();
             return Err(SecretError::Rejected(format!("signing key of {did} does not match its public key")));
         }
@@ -1083,6 +1096,7 @@ mod tests {
         s.clear_cache();
         let other = Keypair::generate().public_multibase();
         assert!(matches!(s.signing_key("did:plc:c", &w, &other).await, Err(SecretError::Rejected(_))));
+        assert!(matches!(s.signing_key("did:plc:c", &w, "").await, Err(SecretError::Rejected(_))), "no expected key: refused");
         // a cached key isn't served for another public key (rotated)
         let _ = s.signing_key("did:plc:c", &w, &pk).await.unwrap();
         assert!(s.cached_signing_key("did:plc:c", &other).is_none());

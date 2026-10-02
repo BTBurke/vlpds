@@ -192,10 +192,13 @@ async fn foreign_issuers_are_refused() {
         let t = vlpds::auth::service_auth_jwt(&key, &iss, &pds, Some(UPLOAD), 60).unwrap();
         assert_err(&upload(&s, &t, mp4(10, 3)).await, 400, "NotFound", "Repo not found");
     }
-    // ...and a wrong key for that issuer is a signature error first
+    // ...and so is a wrong key for that issuer: the issuer is checked before
+    // its key is resolved (stricter ordering than the reference, which
+    // resolves first), so forged tokens cause no outbound DID fetches
     let other = Keypair::generate();
     let t = vlpds::auth::service_auth_jwt(&other, &did, &pds, Some(UPLOAD), 60).unwrap();
-    assert_err(&upload(&s, &t, mp4(10, 3)).await, 401, "BadJwtSignature", "jwt signature does not match jwt issuer");
+    assert_err(&upload(&s, &t, mp4(10, 3)).await, 400, "NotFound", "Repo not found");
+    assert!(s.app.did_resolver.cached(&did).is_none(), "the foreign issuer was never resolved");
 }
 
 /// Account status: deactivated accounts upload (as with a session, and as

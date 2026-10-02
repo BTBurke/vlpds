@@ -163,6 +163,12 @@ const RELOAD_SECS: u64 = 10;
 /// ... and when read from a partition this node owns (changes made here or
 /// forwarded here invalidate it at once; this only bounds a missed one).
 const LOCAL_RELOAD_SECS: u64 = 60;
+/// When the owner can't be reached, a cached view at most this old is still
+/// used (so a revocation/takedown made during an owner outage is enforced
+/// here at most this late); older or none fails the request closed (503).
+const STALE_MAX_SECS: u64 = 300;
+/// How long [`ctl`] retries an unreadable owner before falling back.
+const CTL_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(3);
 const EMAIL_TOKEN_TTL_MS: u64 = 15 * 60 * 1000;
 pub(super) const NEW_PASSWORD_MAX_LENGTH: usize = 256;
 pub(super) const OLD_PASSWORD_MAX_LENGTH: usize = 512;
@@ -559,8 +565,10 @@ async fn load_sets(app: &App, did: &str, local: Option<(crate::slots::ShardId, u
 /// on the owning node until a change ([`ctl_changed`], also called for
 /// changes forwarded here) or an ownership move; elsewhere re-read from the
 /// owner every [`RELOAD_SECS`]. If the owner can't be reached the last view
-/// (or none) is used, as before for the cluster-wide sets.
-pub(super) async fn ctl(app: &App, did: &str) -> Arc<Ctl> {
+/// (after retrying for [`CTL_RETRY_FOR`]) is used while at most
+/// [`STALE_MAX_SECS`] old; otherwise this fails closed
+/// (503) rather than letting revoked sessions or taken-down records through.
+pub(super) async fn ctl(app: &App, did: &str) -> XResult<Arc<Ctl>> {
     let e = ext(app);
     let now = now_secs();
     let local = app.partitions.for_key(did).map(|p| (p.id, p.epoch));
@@ -572,11 +580,26 @@ pub(super) async fn ctl(app: &App, did: &str) -> Arc<Ctl> {
             _ => false,
         };
         if fresh {
-            return c.clone();
+            return Ok(c.clone());
         }
     }
     let gen0 = e.gen.load(Ordering::SeqCst);
-    match load_sets(app, did, local).await {
+    // a shard in flight (moving, frozen for a split, owner restarting) is
+    // retried briefly before failing closed
+    let start = std::time::Instant::now();
+    let mut local = local;
+    let mut wait = std::time::Duration::from_millis(50);
+    let loaded = loop {
+        match load_sets(app, did, local).await {
+            Err(_) if start.elapsed() + wait < CTL_RETRY_FOR => {
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(std::time::Duration::from_millis(500));
+                local = app.partitions.for_key(did).map(|p| (p.id, p.epoch));
+            }
+            r => break r,
+        }
+    };
+    match loaded {
         Ok(c) => {
             let c = Arc::new(c);
             let mut m = e.ctl.write();
@@ -593,12 +616,21 @@ pub(super) async fn ctl(app: &App, did: &str) -> Arc<Ctl> {
                 }
                 m.insert(did.to_string(), c.clone());
             }
-            c
+            Ok(c)
         }
         Err(err) => {
             tracing::warn!(%did, "loading session revocations/takedowns failed: {}", err.message);
-            cached.unwrap_or_default()
+            stale_or_unavailable(cached, now)
         }
+    }
+}
+
+/// The fallback of [`ctl`] when its sets can't be read: a cached view no
+/// older than [`STALE_MAX_SECS`], else 503 (fail closed).
+fn stale_or_unavailable(cached: Option<Arc<Ctl>>, now: u64) -> XResult<Arc<Ctl>> {
+    match cached {
+        Some(c) if now.saturating_sub(c.at) <= STALE_MAX_SECS => Ok(c),
+        _ => Err(err(StatusCode::SERVICE_UNAVAILABLE, "Unavailable", "account security state is unavailable; try again")),
     }
 }
 
@@ -646,10 +678,10 @@ pub struct LogMailer;
 
 impl Mailer for LogMailer {
     fn send(&self, m: &Mail) {
-        // Never the token or body at info: they are credentials. Dev mode
-        // keeps them in the dev mailbox (vlpds.admin.getDevMail).
-        tracing::info!(to = %m.to, subject = %m.subject, purpose = %m.purpose, "mail (log mailer: email disabled, not sent)");
-        tracing::debug!(to = %m.to, purpose = %m.purpose, token = ?m.token, body = %m.body, "mail (log mailer) contents");
+        // Never the token or body, at any level: they are credentials (a
+        // debug log is still shipped to log storage). Dev mode keeps them
+        // in the dev mailbox (vlpds.admin.getDevMail).
+        tracing::info!(to = %m.to, subject = %m.subject, purpose = %m.purpose, has_token = m.token.is_some(), body_bytes = m.body.len(), "mail (log mailer: email disabled, not sent)");
     }
 }
 
@@ -1192,7 +1224,7 @@ pub async fn verify_bearer(app: &App, token: &str) -> XResult<Credentials> {
         SCOPE_TAKENDOWN => Credentials::Takendown { did: c.sub.clone() },
         _ => return Err(bad_scope()),
     };
-    if ctl(app, &c.sub).await.is_revoked(c.jti.as_deref(), c.iat) {
+    if ctl(app, &c.sub).await?.is_revoked(c.jti.as_deref(), c.iat) {
         return Err(expired_token("Token has been revoked"));
     }
     Ok(creds)
@@ -1732,7 +1764,7 @@ async fn refresh_session(State(app): AppState, headers: HeaderMap) -> XResult<Js
     // revoked (deleteSession, password change, ...) or past its grace period
     let now = now_secs();
     let st = st.filter(|s| s.exp >= now).ok_or_else(|| expired_token("Token has been revoked"))?;
-    if ctl(&app, &did).await.is_revoked(Some(&st.family), 0) {
+    if ctl(&app, &did).await?.is_revoked(Some(&st.family), 0) {
         return Err(expired_token("Token has been revoked"));
     }
     // Rotation as in the reference: the old token stays usable for a grace
@@ -3058,7 +3090,7 @@ async fn confirm_totp(
         st.last_step = step;
         st.recovery = codes
             .iter()
-            .map(|c| crate::totp::hash_recovery_code(c))
+            .map(|c| crate::totp::hash_recovery_code(&secret, c))
             .collect();
         st.enabled_at = Some(crate::events::now_rfc3339());
         // flag first: a crash between the two writes must not leave TOTP
@@ -3277,5 +3309,22 @@ mod invite_interval_tests {
         assert_eq!(codes_to_create(NOW, NOW - 100 * DAY, &four, 0, DAY).0, 1);
         four.iter_mut().for_each(|c| c.disabled = true);
         assert_eq!(codes_to_create(NOW, NOW - 100 * DAY, &four, 0, DAY).0, 5);
+    }
+}
+
+#[cfg(test)]
+mod ctl_tests {
+    use super::*;
+
+    /// An unreadable owner: a recent cached view is still used, an old one
+    /// or none fails closed (503).
+    #[test]
+    fn ctl_fails_closed_without_a_recent_view() {
+        let now = 1_000_000;
+        let view = |age: u64| Some(Arc::new(Ctl { at: now - age, ..Default::default() }));
+        assert!(stale_or_unavailable(view(STALE_MAX_SECS), now).is_ok());
+        let status = |r: XResult<Arc<Ctl>>| r.err().map(|e| e.status);
+        assert_eq!(status(stale_or_unavailable(view(STALE_MAX_SECS + 1), now)), Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert_eq!(status(stale_or_unavailable(None, now)), Some(StatusCode::SERVICE_UNAVAILABLE));
     }
 }

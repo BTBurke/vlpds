@@ -16,8 +16,16 @@ use std::time::{Duration, Instant};
 const CACHE_TTL: Duration = Duration::from_secs(600);
 const MAX_DOC_BYTES: usize = 256 << 10;
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A failed resolution (not found, unreachable, bad document) is remembered
+/// this long, so a stream of requests naming a bogus DID (forged service
+/// JWTs, ...) doesn't turn into a stream of outbound fetches.
+const NEGATIVE_TTL: Duration = Duration::from_secs(30);
+/// [`DidResolver::refresh`] re-fetches a DID's document at most this often.
+const REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+/// Bound on the negative-result and refresh-time maps (cleared when full).
+const SIDE_MAP_CAP: usize = 10_000;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ResolveError {
     #[error("unsupported or malformed DID: {0}")]
     BadDid(String),
@@ -37,6 +45,22 @@ pub struct DidResolver {
     plc_http: reqwest::Client,
     /// Capped by the `did_docs` cap ([`crate::caches`]).
     cache: Arc<Mutex<HashMap<String, (Instant, Arc<J>)>>>,
+    /// Recent failed resolutions ([`NEGATIVE_TTL`]).
+    negative: Mutex<HashMap<String, (Instant, ResolveError)>>,
+    /// Last forced refresh per DID ([`REFRESH_MIN_INTERVAL`]).
+    refreshed: Mutex<HashMap<String, (Instant, ())>>,
+}
+
+/// Inserts into a side map bounded by [`SIDE_MAP_CAP`]: when full, entries
+/// older than `ttl` go, else all of them.
+fn bounded_insert<V>(m: &mut HashMap<String, (Instant, V)>, k: &str, v: V, ttl: Duration) {
+    if m.len() >= SIDE_MAP_CAP && !m.contains_key(k) {
+        m.retain(|_, (at, _)| at.elapsed() < ttl);
+        if m.len() >= SIDE_MAP_CAP {
+            m.clear();
+        }
+    }
+    m.insert(k.to_string(), (Instant::now(), v));
 }
 
 impl DidResolver {
@@ -47,6 +71,8 @@ impl DidResolver {
             http: crate::http::guarded(allow_insecure).clone(),
             plc_http: crate::http::public().clone(),
             cache: crate::caches::track(crate::caches::Cache::DidDocs, Default::default()),
+            negative: Default::default(),
+            refreshed: Default::default(),
         }
     }
 
@@ -64,12 +90,43 @@ impl DidResolver {
 
     pub fn invalidate(&self, did: &str) {
         self.cache.lock().remove(did);
+        self.negative.lock().remove(did);
+    }
+
+    /// Like [`Self::invalidate`] (the next resolve re-fetches), but at most
+    /// once per [`REFRESH_MIN_INTERVAL`] per DID: for refreshes an outside
+    /// party can trigger (a service JWT whose signature doesn't match the
+    /// cached key), so they can't evict a busy DID's document on every
+    /// request. Returns whether the cache was dropped.
+    pub fn refresh(&self, did: &str) -> bool {
+        {
+            let mut r = self.refreshed.lock();
+            if r.get(did).is_some_and(|(at, _)| at.elapsed() < REFRESH_MIN_INTERVAL) {
+                return false;
+            }
+            bounded_insert(&mut r, did, (), REFRESH_MIN_INTERVAL);
+        }
+        self.invalidate(did);
+        true
     }
 
     pub async fn resolve(&self, did: &str) -> Result<Arc<J>, ResolveError> {
         if let Some(d) = self.cached(did) {
             return Ok(d);
         }
+        if let Some((_, e)) = self.negative.lock().get(did).filter(|(at, _)| at.elapsed() < NEGATIVE_TTL) {
+            return Err(e.clone());
+        }
+        let r = self.fetch(did).await;
+        if let Err(e) = &r {
+            if !matches!(e, ResolveError::BadDid(_)) {
+                bounded_insert(&mut self.negative.lock(), did, e.clone(), NEGATIVE_TTL);
+            }
+        }
+        r
+    }
+
+    async fn fetch(&self, did: &str) -> Result<Arc<J>, ResolveError> {
         let (url, client) = if let Some(id) = did.strip_prefix("did:plc:") {
             if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
                 return Err(ResolveError::BadDid(did.into()));
@@ -228,6 +285,7 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
                 || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64/10 CGNAT
                 || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0/24
                 || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18/15 benchmarking
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99) // 192.88.99/24 6to4 relay anycast
                 || o[0] >= 240) // reserved
         }
         IpAddr::V6(v6) => {
@@ -240,10 +298,16 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
                 || v6.is_multicast()
                 || (s[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
                 || (s[0] & 0xffc0) == 0xfe80 // link-local
+                || (s[0] & 0xffc0) == 0xfec0 // site-local fec0::/10 (deprecated)
                 || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
-                || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64
+                || (s[0] == 0x0064 && s[1] == 0xff9b) // NAT64 64:ff9b::/96 and 64:ff9b:1::/48
+                || s[0] == 0x2002 // 6to4: embeds any IPv4 (relays reach private ones)
+                || (s[0] == 0x2001 && s[1] == 0) // Teredo 2001::/32: embeds an IPv4
+                || (s[0] == 0x2001 && (s[1] & 0xffe0) == 0x0020) // ORCHIDv2 2001:20::/28
+                || (s[0] == 0x2001 && (s[1] & 0xfff0) == 0x0010) // ORCHID 2001:10::/28
+                || (s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0) // discard 100::/64
+                // IPv4-compatible ::a.b.c.d (deprecated) and the rest of ::/96
                 || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0))
-            // IPv4-compatible
         }
     }
 }
@@ -292,13 +356,52 @@ mod tests {
             "fd00::1",
             "fe80::1",
             "::ffff:10.0.0.1",
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "::127.0.0.1",
+            "::10.0.0.1",
+            "::8.8.8.8",
             "224.0.0.1",
+            "192.88.99.1",
+            // 6to4 of 127.0.0.1 / 10.0.0.1 / a public address (all refused)
+            "2002:7f00:1::1",
+            "2002:a00:1::",
+            "2002:808:808::1",
+            // Teredo (server 65.54.227.120, client embedded)
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001::1",
+            "fec0::1",
+            "feff::1",
+            "64:ff9b::a00:1",
+            "64:ff9b:1::1",
+            "100::1",
+            "2001:10::1",
+            "2001:20::1",
         ] {
             assert!(!is_public_ip(s.parse().unwrap()), "{s}");
         }
-        for s in ["8.8.8.8", "1.1.1.1", "2606:4700::1111", "::ffff:8.8.8.8"] {
+        for s in ["8.8.8.8", "1.1.1.1", "2606:4700::1111", "::ffff:8.8.8.8", "2001:4860:4860::8888", "2001:200::1", "2003::1"] {
             assert!(is_public_ip(s.parse().unwrap()), "{s}");
         }
+    }
+
+    /// Failed resolutions are remembered briefly; forced refreshes are
+    /// rate-limited per DID; invalidate clears both caches.
+    #[tokio::test]
+    async fn negative_cache_and_refresh_limit() {
+        // nothing listens on port 1: connection refused, no outbound traffic
+        let r = DidResolver::new("http://127.0.0.1:1", true);
+        let did = "did:plc:abcdefghijklmnopqrstuvwx";
+        assert!(matches!(r.resolve(did).await, Err(ResolveError::Failed(..))));
+        assert!(r.negative.lock().contains_key(did), "failure remembered");
+        assert!(matches!(r.resolve(did).await, Err(ResolveError::Failed(..))));
+        // malformed DIDs are refused without a fetch and not remembered
+        assert!(matches!(r.resolve("did:plc:").await, Err(ResolveError::BadDid(_))));
+        assert!(!r.negative.lock().contains_key("did:plc:"));
+        assert!(r.refresh(did), "first forced refresh goes through");
+        assert!(!r.negative.lock().contains_key(did), "a refresh drops the negative entry");
+        assert!(!r.refresh(did), "a second one within the interval is refused");
+        assert!(r.refresh("did:plc:other"), "per DID");
     }
 
     #[test]

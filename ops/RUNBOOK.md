@@ -77,14 +77,21 @@ it is marked **(unverified)**.
 
 ## Tools: endpoints, CLI, logs, exit codes
 
-**Endpoints** (any node; `/metrics` moves to `--metrics-listen` if set):
+**Endpoints** (any node). `/metrics` and `/debug/pprof` are served only on
+`--metrics-listen` (default `127.0.0.1:9583`; on the app port with
+`--dev-mode` or `--metrics-listen app`, which is public unless a proxy blocks
+it). `/internal/*` is on the app port and peers use cleartext h2c with the
+internal token: keep node-to-node traffic on a private network and block
+`/internal/` at the edge (the Ansible Caddy does; DESIGN.md "HTTP").
+Production refuses the MinIO default S3 credentials, and
+`vlpds.admin.bulkCreate` needs `--dev-mode` or `--allow-bulk-create`.
 
 | What | How |
 |---|---|
 | Liveness | `GET /xrpc/_health` -> `{"version":"vlpds"}` |
 | Caddy on-demand TLS | `on_demand_tls { ask http://127.0.0.1:2583/tls-check }`: `GET /tls-check?domain=D` is 200 for the `--public-url` host and handles of active accounts here, 400 outside `--handle-domain`, 404 for unknown/deactivated handles (any node answers) |
 | Service DID document | `GET /.well-known/did.json`: the `did:web` `--service-did`'s document (`#atproto_pds` at `--public-url`); 404 for any other DID method |
-| Metrics | `GET /metrics` (Prometheus text) |
+| Metrics | `GET http://127.0.0.1:9583/metrics` (Prometheus text; `--metrics-listen`) |
 | Cluster view (admin) | `GET /xrpc/vlpds.admin.getClusterStatus` with `Authorization: Basic base64(admin:$VLPDS_ADMIN_TOKEN)`. Returns `node`, `log`, `logDurableOrdinal`, `owned` (shard ids), `shards`, `table` (owner per shard in slot order, `null` = unowned), `layout` (`version`, `shards`, `op` = split/merge in progress), `leaseValid`, `leaseExpiresMs`, `fencedLogs`, `firehose.{lastEmitted,minWatermark,sources[{log,watermark,local}]}`, `version` (feature levels: `active`, `target` while a raise runs, `history`, this build's `binary.{min,max,rev}`, `mixedBuilds`, `revs`, `finalizable`, `finalizedAt`; see [Rolling upgrade](#rolling-upgrade-finalize-rollback)), and `nodes[]` with each peer's `reachable`, `leaseValid`, `logDurableOrdinal`, `owned` count, `writer`, `expiresMs`, `rev`, `minLevel`, `maxLevel`, `seenLevel` (peers fetched with a 1.5 s timeout). |
 | Feature level raise (admin) | `POST /xrpc/vlpds.admin.setFeatureLevel {"level": N}` (CLI `vlpds admin cluster finalize`): 200 with the new `cluster/version`; 409 `IncompatibleNodes` names live nodes whose build can't run N (nothing changed); 400 below the active level or past the asked node's build. With `"lower": true` (CLI `vlpds admin cluster lower`) it lowers instead: 400 past a persistent level or during a raise, 409 while a live node can't run N. |
 | Cluster view (node-to-node) | `GET /internal/v1/cluster` with header `x-vlpds-internal: $VLPDS_INTERNAL_TOKEN`: this node's `owned`, `table`, `layout`, `peers`, `lease_valid`, `log_durable_ordinal`, `firehose_last_emitted`, `firehose_min_watermark`. |

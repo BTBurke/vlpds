@@ -158,7 +158,7 @@ fn take<'a>(v: &mut JsonValue<'a>, k: &str) -> XResult<JsonValue<'a>> {
 async fn check_blobs(app: &App, did: &str, decls: &[BlobDecl]) -> XResult<()> {
     for (cid, mime, size) in decls {
         let missing = || XrpcError::bad("BlobNotFound", format!("Could not find blob: {cid}"));
-        if super::admin::is_blob_takendown(app, did, &cid.to_string()).await {
+        if super::admin::is_blob_takendown(app, did, &cid.to_string()).await? {
             return Err(missing());
         }
         let opts = object_store::GetOptions { head: true, ..Default::default() };
@@ -670,7 +670,7 @@ async fn get_record(
         )
     })?;
     let (cid, bytes) = state::decode_record_value(&v).map_err(XrpcError::from_err)?;
-    if super::admin::is_record_takendown(&app, &did, &path).await {
+    if super::admin::is_record_takendown(&app, &did, &path).await? {
         return Err(XrpcError::bad(
             "RecordNotFound",
             format!("Could not locate record: at://{did}/{path}"),
@@ -771,7 +771,7 @@ async fn list_records(
     };
     let opts = slatedb::config::ScanOptions::default().with_order(order);
     // the repo's takedowns, read once for the page
-    let takedowns = super::server::ctl(&app, &did).await;
+    let takedowns = super::server::ctl(&app, &did).await?;
     let mut iter =
         p.db.scan_with_options(lo..hi, &opts)
             .await

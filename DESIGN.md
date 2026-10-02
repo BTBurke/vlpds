@@ -473,6 +473,19 @@ concurrency in connections as tasks hopped threads (laptop A/B, 6 IO
 threads: 369-398 connections at 256 in flight, 185-202 at 64; now exactly
 256 and 64-65), at the same ~39-40 µs CPU per proxied request.
 
+**Exposure.** One listener serves the public XRPC/OAuth surface and the
+node-to-node `/internal/*` routes (and forwarded requests); peers call each
+other over cleartext h2c with the shared internal token in
+`x-vlpds-internal`. So cluster traffic must stay on a private network (a
+VLAN, WireGuard/Tailscale, a VPC), and an edge proxy must not pass
+`/internal/` (nor `/metrics`, `/debug/`) from the internet: the Ansible
+role's Caddy answers 404 for them and publishes the app port on loopback
+only. There is no separate internal listener yet: the peer address
+(`--advertise-url`) is used for both forwarding and internal calls, so
+splitting them needs a second advertised address. `/metrics` and
+`/debug/pprof` are on `--metrics-listen` (default `127.0.0.1:9583`; on the
+app port only with `--dev-mode` or `--metrics-listen app`).
+
 Server (`server::serve`, HTTP/1.1 + h2c auto): h1 header read timeout 30 s
 (slowloris; also the idle keep-alive bound), h2 windows as above, 1,024
 concurrent streams per connection, 32 KiB header list, PING every 20 s with a
@@ -2853,7 +2866,7 @@ are stored as hashes.
 | TOTP secret (enabled and pending) | `p/{did}\0totp` | wrapped, AAD = purpose + DID |
 | Account password | `a/{did}` `password_hash` | argon2id (unchanged: a verifier) |
 | App passwords | `p/{did}\0apphash/{h}` | SHA-256 of DID + server-generated ~80-bit password (unchanged) |
-| TOTP recovery codes | in `p/{did}\0totp` | SHA-256 (unchanged; ~50 bits, second factor only, needs the password too) |
+| TOTP recovery codes | in `p/{did}\0totp` | HMAC-SHA256 keyed by the account's TOTP secret (itself KEK-wrapped), so a leaked row can't be brute-forced offline for the ~50-bit codes |
 | Email tokens (confirm, update, reset, delete, PLC) | `p/{did}\0etok/{purpose}`, `p/_reset:{digest}\0t` | HMAC-SHA256 under a key derived from `jwt_secret` (were plaintext, the reset token even in the key) |
 | OAuth codes, refresh tokens | `oauth/*` rows | hashes / MACs under keys derived from `jwt_secret` (unchanged) |
 | Sessions | `p/{did}\0sess/{id}` | ids only: tokens are JWTs under `jwt_secret` (unchanged) |

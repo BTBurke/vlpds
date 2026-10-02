@@ -7,8 +7,9 @@
 #     -e VLPDS_ADMIN_TOKEN=... -e VLPDS_INTERNAL_TOKEN=... vlpds:local
 #
 # Configuration is all VLPDS_* env vars (see `vlpds --help`). Prometheus
-# metrics are served at /metrics on the app port, or only on
-# VLPDS_METRICS_LISTEN (e.g. 0.0.0.0:9583) when set. Thread pools default to
+# metrics are served at /metrics on VLPDS_METRICS_LISTEN only (default
+# 127.0.0.1:9583, i.e. inside the container: set 0.0.0.0:9583 and publish it
+# on a private address to scrape it). Thread pools default to
 # the container's CPUs (cgroup quota aware): --io-threads = cores, --workers =
 # cores/2. vlpds raises its soft open-files limit to the hard limit at startup
 # (docker run --ulimit nofile=1048576:1048576 sets the hard limit).
@@ -66,7 +67,8 @@ USER vlpds:vlpds
 WORKDIR /var/lib/vlpds
 ENV VLPDS_LISTEN=0.0.0.0:2583 \
     RUST_LOG=info
-# 2583: XRPC, web UI, /internal (cluster) and /metrics (Prometheus)
+# 2583: XRPC, web UI, /internal (cluster: private network only)
+# 9583: /metrics (Prometheus) when VLPDS_METRICS_LISTEN=0.0.0.0:9583
 EXPOSE 2583
 HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=3 \
     CMD curl -sf http://127.0.0.1:2583/xrpc/_health || exit 1
