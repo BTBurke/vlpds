@@ -114,18 +114,19 @@ name = "level_gating"
 path = "tests/level_gating.rs"
 required-features = ["test-level"]
 
-# slatedb 0.17.0 (upstream c1e36fc) plus one fix, on the fork branch
-# vlpds-0.17-union-l0-view-ids (pending an upstream report): a union clone (a
-# shard merge) of two sources that inherited the same L0 SST from a common
-# ancestor (a split's halves merged back) repeated its L0 view id, and the
-# merged shard's first compaction of it dropped one half's keys
-# (Manifest::cloned_from_union now gives repeats fresh ids). DESIGN.md
-# "Online shard split/merge", "Patched SlateDB".
+# slatedb 0.17.0 (upstream c1e36fc) plus two patches on the fork branch
+# vlpds-0.17-batch-next (both pending an upstream report):
+# 1. a union clone (a shard merge) of two sources that inherited the same L0
+#    SST from a common ancestor (a split's halves merged back) repeated its L0
+#    view id, and the merged shard's first compaction of it dropped one half's
+#    keys (Manifest::cloned_from_union now gives repeats fresh ids). DESIGN.md
+#    "Online shard split/merge", "Patched SlateDB".
+# 2. a synchronous `next` fast path for resident rows plus DbIterator::next_batch
+#    (scan ~12.5k -> ~3.4k instructions/row; getRepo export -57%).
 [patch.crates-io]
-# LOCAL (iterfast): repoint to the fork rev of branch vlpds-0.17-batch-next once pushed
-slatedb = { path = "/tmp/scratch/slatedb-iterfast/slatedb" }
+slatedb = { git = "https://github.com/jazware/slatedb", rev = "fc2aae0a912554d50b602dfe269dfe8c285b784e" }
 # the same rev, so the metrics recorder (src/metrics.rs) and slatedb share one slatedb-common
-slatedb-common = { path = "/tmp/scratch/slatedb-iterfast/slatedb-common" }
+slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "fc2aae0a912554d50b602dfe269dfe8c285b784e" }
 
 [profile.release]
 opt-level = 3
