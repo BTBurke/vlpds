@@ -259,9 +259,7 @@ pub(super) fn valid_email(e: &str) -> bool {
             .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
-/// createAccount / updateEmail: well formed and not a disposable domain
-/// (reference `isEmailValid(email) && !isDisposableEmail(email)`; both
-/// refusals are "This email address is not supported, ...").
+/// The reference's `isEmailValid(email) && !isDisposableEmail(email)`.
 pub(super) fn email_supported(e: &str) -> bool {
     valid_email(e) && !crate::email_policy::is_disposable_email(e)
 }
@@ -686,14 +684,11 @@ async fn read_claim(app: &App, path: &object_store::path::Path) -> XResult<Optio
 }
 
 /// Global uniqueness of a handle or email: a conditional create of the claim
-/// object holding `did`. Ok(true): claimed (or already ours). A claim held by
-/// another DID is taken over only when it is stale: older than the grace
-/// period and its holder definitely has no account standing on it (`holds`;
-/// no account at all, or one that moved to another value; a failed lookup
-/// is not "no account"), by a compare-and-swap on the version read, so two
-/// takers can't both win and a holder that just claimed (mid-createAccount:
-/// no account yet) keeps it. Claims a failed release or a deletion left
-/// behind are reclaimed this way.
+/// object holding `did`. Ok(true): claimed or already ours. Another DID's
+/// claim is taken over only when stale (past the grace period, and its
+/// holder definitely has no account standing on it per `holds`; a failed
+/// lookup is not "no account"), by a compare-and-swap on the version read,
+/// so two takers can't both win and a holder mid-createAccount keeps it.
 async fn claim(app: &App, path: &object_store::path::Path, did: &str, holds: impl Fn(&Account) -> bool) -> XResult<bool> {
     let payload = || PutPayload::from(did.as_bytes().to_vec());
     let grace = std::time::Duration::from_millis(ext(app).claim_grace_ms.load(Ordering::Relaxed));
