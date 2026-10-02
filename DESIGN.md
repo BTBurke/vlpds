@@ -169,6 +169,20 @@ swappable.
   0.35 µs per row); cold scans and gets showed no difference above noise (the
   block cache holds decoded blocks, so only misses decompress, and the local
   disk cache holds 2.5× more).
+- One block cache (foyer, `--block-cache-mb`) and one SST metadata cache
+  (bloom filters, indexes, stats; a quarter of the block cache) serve every
+  shard DB. The metadata cache is our own (`partition::MetaCache`): 64
+  RwLock shards with CLOCK eviction, so a hit takes a shared lock and sets
+  one bit. Foyer takes its shard's mutex on every hit (eviction state), and
+  every point read of one repo checks the same few SSTs' filters (up to 32
+  L0s plus the sorted runs of its shard): reads of one hot repo serialized
+  on those keys, the more IO threads the worse. Profile of getRecord on one
+  10M-record repo (laptop, 14 IO threads): 32 % of CPU spinning in foyer's
+  lock at 0b2a322 (66 % at 2e64422) -> under 3 %, getRecord 24.5k -> 30.4k/s
+  (2e64422: 16.9k/s); the rest is now the client's single h2 connection.
+  Likely the benchbox regression (63k -> 35k/s at 10M, -13-28 % on small
+  repos) from 2e64422's 6 IO threads to fa0975c's 32. Decompression was
+  not it: blocks are cached decoded, and the sweep reads 2,000 records.
 - Each shard's compactor (coordinator + one worker writing the same SST
   format) starts after the DB opens rather than inside the open, so a
   takeover or handback serves ~11 store round trips sooner. Its outputs
@@ -317,6 +331,17 @@ resets, 1,024 local error resets; CVE-2023-44487). Metrics:
 `vlpds_http_server_connections_total`, `_connections_open`,
 `vlpds_http_server_active_requests{version}` (h2 = streams awaiting a
 response head).
+
+Listen backlog: `--listen-backlog` (default 16384) instead of tokio's 1024.
+The kernel clamps it to `net.core.somaxconn` (Linux; 4096 on benchbox, older
+kernels 128) or `kern.ipc.somaxconn` (macOS, 128), so raise that as well
+(`sysctl -w net.core.somaxconn=16384`, and `net.ipv4.tcp_max_syn_backlog`
+for SYN floods of new clients). A full accept queue drops the SYN or the
+final ACK and the client waits out a retransmit (1 s, then 2 s, ...):
+benchbox's `TcpExtListenOverflows` grew 16 -> 1683 over one bench session
+(1000 firehose subscribers connecting at once, proxy runs at 1024 in
+flight). `ss -ltn` shows the effective queue (Send-Q) per listener;
+`netstat -Lan` on macOS.
 
 ## Sync 1.1 checklist
 - Commit object v3, `prev: null`, `rev` = per-repo monotonic TID, signed.
@@ -496,7 +521,17 @@ to K PUTs in flight:
   behavior: whatever queued during the PUT is the next segment) or it holds
   at least `max_segment_bytes / K`. Extra PUTs start only under load, so the
   PUT rate at low load is unchanged; the ceiling becomes K full segments per
-  round trip.
+  round trip. One more trigger: the newest PUT in flight has *stalled* (been
+  out for over 2x the moving average PUT latency, clamped to 5 ms ..
+  `hedge_after`): what queued behind it goes out now and is acked when the
+  stall ends instead of after the stall plus its own PUT
+  (`vlpds_segment_stall_seals_total`). One stall seals one segment (timed
+  from the newest PUT). Laptop, inj 7 ms lognormal, 20k/s: K=4 p99 41.5 ->
+  39.2 ms (K=1 45.7). At low load K=4 and K=1 measure the same on the laptop
+  (inj0 and inj7, 5k-20k/s: p50 within 0.4 ms) and on benchbox's 1M/50k grid
+  (25k/s: 40/74 vs 42/72); benchbox's one 10k/5k K=4 sample (p50 17.7 vs 8.2)
+  had slower PUTs (p50 7.2 vs 5.6 ms) and 2.2x larger segments, i.e. the
+  disk, not the seal rule.
 - **In-order finalization.** Completions are taken in ordinal order
   (`FuturesOrdered`): a segment that lands early waits for every earlier
   one. Only then does the finalizer apply it, write its applied marker, push
@@ -821,6 +856,47 @@ No node ever compares its wall clock with another node's.
 
 Takeover after a crash is TTL + skew after the last observed renewal, plus at
 most one step of observation delay, plus replay.
+
+**Fast paths (benchbox 2026-10-03 found 15 s of 503s per kill -9):**
+- *Refused probe.* A peer that has missed a renewal (unchanged for 1.5 renew
+  intervals) gets a TCP connect to its advertised address each step. Refused
+  means nothing listens there: the process is gone (kill -9, crash, OOM), so
+  it is presumed dead at once. Presuming early is safe (the takeover fences
+  its log first, see below); anything else (connects, times out, unreachable
+  host) leaves the TTL rule in charge: a frozen process still has its socket,
+  a dead machine doesn't answer at all. Takeover after a process death is
+  ~1.5–2.5 renew intervals (3–5 s at TTL 10 s) plus replay.
+- *Greeting.* A joiner's first loop step (not the inline startup step: the
+  node must serve before it opens shards) POSTs `/internal/v1/cluster/hello`
+  to every live peer, which reads its lease and starts following its log
+  (`learn_peer`). Once every peer confirmed, the join grace (which waits for
+  exactly that) is over: a node restarted with the same id reclaims the
+  shards still assigned to its previous incarnation, which `join` already
+  fenced, right away; and peers count a greeted joiner as settled, so
+  handbacks start at their next step instead of a grace later.
+- *Writes wait out the gap.* A forward refused at connect sent nothing, so
+  the entry node resends a write (marker `forward::NotSent`; reason
+  `unreachable`) until routing follows the takeover. A shard this node
+  doesn't hold (`App::partition`) answers `ShardMoved`, also resent. Resends
+  back off (doubling, ≤ 1 s): fixed 50 ms resends of every held write
+  starved a restarted node (3 IO threads) and stretched its 0.5 s replay to
+  60 s.
+- *Replay* writes a shard's batch only for segments holding its entries, and
+  its applied marker once at the end (85 shards x 342 segments were 29k
+  SlateDB writes, most of them marker-only).
+- *Graceful stop keeps serving* until its shards are handed out, its lease is
+  gone and 500 ms more: a forward it would drop mid-request is ambiguous to
+  the peer (a client 503), one it answers "not owned" is resent.
+
+Laptop (3 nodes x 3+3 threads, 100k accounts / 10k active, inj25, 6k/s
+across 3 loadgens, unrouted; per-second errors on the survivors' two
+loadgens): kill -9 then restart after 15 s: HEAD 0b2a322 ~650 errors/s per
+loadgen for 15 s (9.8k each), now ~40 each, all in the second of the kill
+(writes in flight on the dead node). Restart after 2 s (within the TTL):
+HEAD ~1.4k errors in 2 s, then 0.4–1.4k/s from +22 s to past the window's
+end (the restarted node's replay under resends took 61 s), now ~40 each.
+SIGTERM: 0 at HEAD and now (3–8 when a forward is in flight as the node
+exits). The killed node's own loadgen fails until its restart either way.
 
 ### Why safety needs no clocks
 

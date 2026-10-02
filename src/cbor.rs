@@ -92,13 +92,27 @@ pub fn write_bool(out: &mut Vec<u8>, b: bool) {
     out.push(if b { 0xf5 } else { 0xf4 });
 }
 
+/// A CID link's encoding before the CID bytes: tag 42, a 37-byte byte
+/// string head, the 0x00 multibase-identity prefix.
+pub const LINK_PREFIX: [u8; 5] = [0xd8, 0x2a, 0x58, 0x25, 0x00];
+
+/// Encoded length of a CID link.
+pub const LINK_LEN: usize = LINK_PREFIX.len() + CID_BYTES_LEN;
+
+/// A CID link as one fixed-size block (one copy into `out` instead of five
+/// pushes).
+#[inline]
+pub fn link_bytes(c: &Cid) -> [u8; LINK_LEN] {
+    let mut b = [0u8; LINK_LEN];
+    b[..5].copy_from_slice(&LINK_PREFIX);
+    b[5..].copy_from_slice(&c.to_bytes());
+    b
+}
+
 #[inline]
 pub fn write_cid(out: &mut Vec<u8>, c: &Cid) {
     // tag 42, byte string with a leading 0x00 multibase-identity prefix
-    out.extend_from_slice(&[0xd8, 0x2a]);
-    write_head(out, 2, (CID_BYTES_LEN + 1) as u64);
-    out.push(0);
-    out.extend_from_slice(&c.to_bytes());
+    out.extend_from_slice(&link_bytes(c));
 }
 
 #[inline]
@@ -283,7 +297,34 @@ impl Value {
         }
     }
 
+    /// Decodes one strict DAG-CBOR value (the whole input). Accepts exactly
+    /// what [`Value::decode_reference`] accepts, with the same value and,
+    /// on rejection, the same error.
     pub fn decode(data: &[u8]) -> Result<Value, CborError> {
+        let mut d = Decoder { data, pos: 0 };
+        match d.owned(0) {
+            Ok(v) if d.pos == data.len() => Ok(v),
+            // rare: let the reference decoder name the error (it walks the
+            // input in the same order, so the first problem it meets is the
+            // one the old decoder reported)
+            _ => Value::decode_reference(data),
+        }
+    }
+
+    /// Decodes one value from the front of `data`, returning bytes consumed.
+    pub fn decode_prefix(data: &[u8]) -> Result<(Value, usize), CborError> {
+        let mut d = Decoder { data, pos: 0 };
+        match d.owned(0) {
+            Ok(v) => Ok((v, d.pos)),
+            Err(_) => Value::decode_prefix_reference(data),
+        }
+    }
+
+    /// The original recursive decoder: the oracle the fast paths are tested
+    /// against (`tests/all/shrike_adopt.rs`) and the source of their error
+    /// values.
+    #[doc(hidden)]
+    pub fn decode_reference(data: &[u8]) -> Result<Value, CborError> {
         let mut d = Decoder { data, pos: 0 };
         let v = d.value(0)?;
         if d.pos != data.len() {
@@ -292,12 +333,94 @@ impl Value {
         Ok(v)
     }
 
-    /// Decodes one value from the front of `data`, returning bytes consumed.
-    pub fn decode_prefix(data: &[u8]) -> Result<(Value, usize), CborError> {
+    #[doc(hidden)]
+    pub fn decode_prefix_reference(data: &[u8]) -> Result<(Value, usize), CborError> {
         let mut d = Decoder { data, pos: 0 };
         let v = d.value(0)?;
         Ok((v, d.pos))
     }
+}
+
+// ---------- borrowed value tree ----------
+
+/// A decoded DAG-CBOR value whose strings and byte strings borrow from the
+/// input: decoding allocates only the `Vec`s of arrays and maps. For
+/// read-only consumers (firehose frames, commit blocks, CAR headers) that
+/// would otherwise copy every key and string into a [`Value`].
+///
+/// Approach from shrike (MIT/Apache-2.0): its `cbor::Value<'a>` borrows
+/// `Text`/`Bytes`/map keys from the input buffer, which is most of why its
+/// decoder ran 2.1-2.8x faster than vlpds's owned one
+/// (bench/results/shrike-perf/RESULTS.md). Same strictness as [`Value`]:
+/// canonical heads, no floats/simple values, canonical key order, tag 42
+/// only, depth limit.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ValueRef<'a> {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Bytes(&'a [u8]),
+    Text(&'a str),
+    Array(Vec<ValueRef<'a>>),
+    /// In canonical key order (the decoder checks it).
+    Map(Vec<(&'a str, ValueRef<'a>)>),
+    Link(Cid),
+}
+
+impl<'a> ValueRef<'a> {
+    /// Decodes the whole input; accepts exactly what [`Value::decode`]
+    /// accepts (same error on rejection).
+    pub fn decode(data: &'a [u8]) -> Result<ValueRef<'a>, CborError> {
+        let mut d = Decoder { data, pos: 0 };
+        match d.borrowed(0) {
+            Ok(v) if d.pos == data.len() => Ok(v),
+            _ => Err(reference_error(Value::decode_reference(data).err())),
+        }
+    }
+
+    /// Decodes one value from the front of `data`, returning bytes consumed.
+    pub fn decode_prefix(data: &'a [u8]) -> Result<(ValueRef<'a>, usize), CborError> {
+        let mut d = Decoder { data, pos: 0 };
+        match d.borrowed(0) {
+            Ok(v) => Ok((v, d.pos)),
+            Err(_) => Err(reference_error(Value::decode_prefix_reference(data).err())),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&ValueRef<'a>> {
+        match self {
+            ValueRef::Map(m) => m.iter().find(|(k, _)| *k == key).map(|(_, v)| v),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&'a str> {
+        match self {
+            ValueRef::Text(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn to_value(&self) -> Value {
+        match self {
+            ValueRef::Null => Value::Null,
+            ValueRef::Bool(b) => Value::Bool(*b),
+            ValueRef::Int(n) => Value::Int(*n),
+            ValueRef::Bytes(b) => Value::Bytes(b.to_vec()),
+            ValueRef::Text(s) => Value::Text(s.to_string()),
+            ValueRef::Array(a) => Value::Array(a.iter().map(ValueRef::to_value).collect()),
+            ValueRef::Map(m) => Value::Map(m.iter().map(|(k, v)| (k.to_string(), v.to_value())).collect()),
+            ValueRef::Link(c) => Value::Link(*c),
+        }
+    }
+}
+
+/// The reference decoder's error for an input a fast decoder rejected. Both
+/// accept the same inputs (tests/all/shrike_adopt.rs), so `None` (the
+/// reference accepted it) is a fast-path bug.
+fn reference_error(e: Option<CborError>) -> CborError {
+    debug_assert!(e.is_some(), "fast DAG-CBOR decoder rejected what the reference accepts");
+    e.unwrap_or(CborError::Invalid("decoder mismatch"))
 }
 
 // ---------- JSON -> DAG-CBOR without a Value tree ----------
@@ -647,7 +770,17 @@ pub fn write_json(bytes: &[u8], out: &mut Vec<u8>) -> Result<(), CborError> {
     r
 }
 
+#[inline]
 fn json_str(out: &mut Vec<u8>, s: &str) {
+    // Most keys and texts need no escaping: copy them as they are (the bytes
+    // serde_json writes for them). Otherwise serde_json escapes.
+    if s.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\') {
+        out.reserve(s.len() + 2);
+        out.push(b'"');
+        out.extend_from_slice(s.as_bytes());
+        out.push(b'"');
+        return;
+    }
     // writing into a Vec cannot fail
     let _ = serde_json::to_writer(&mut *out, s);
 }
@@ -658,6 +791,7 @@ struct Decoder<'a> {
 }
 
 impl<'a> Decoder<'a> {
+    #[inline(always)]
     fn byte(&mut self) -> Result<u8, CborError> {
         let b = *self.data.get(self.pos).ok_or(CborError::Eof)?;
         self.pos += 1;
@@ -666,6 +800,7 @@ impl<'a> Decoder<'a> {
 
     /// Takes `n` bytes; `n` is an untrusted length (up to u64::MAX), so it is
     /// compared against what remains rather than added to `pos`.
+    #[inline(always)]
     fn take(&mut self, n: u64) -> Result<&'a [u8], CborError> {
         let rest = self.data.len() - self.pos;
         if n > rest as u64 {
@@ -678,6 +813,7 @@ impl<'a> Decoder<'a> {
 
     /// Reads a head; DAG-CBOR requires the shortest encoding of every
     /// argument (ints, lengths, tags).
+    #[inline(always)]
     fn head(&mut self) -> Result<(u8, u64), CborError> {
         let b = self.byte()?;
         let major = b >> 5;
@@ -779,6 +915,182 @@ impl<'a> Decoder<'a> {
     }
 }
 
+// Fast decoders. They accept exactly what `value` accepts (same checks:
+// depth limit, minimal heads, text keys in canonical order without
+// duplicates, tag 42 links of 0x00 + a 36-byte CID, major 7 only
+// false/true/null), but read map keys and links in place instead of through
+// a recursive `value` call and a `match` on its result, and size vectors by
+// what the input can hold. On any error the callers re-run `value` for the
+// error to report, so the fast paths only need to get accept/reject right.
+impl<'a> Decoder<'a> {
+    /// A map key (`depth` is the key's own depth, as `value` counts it),
+    /// checked against the previous key: canonical order, no duplicates.
+    #[inline(always)]
+    fn map_key(&mut self, depth: usize, prev: Option<&str>) -> Result<&'a str, CborError> {
+        let k = self.json_key(depth)?;
+        if let Some(prev) = prev {
+            if key_cmp(prev, k) != std::cmp::Ordering::Less {
+                return Err(CborError::Invalid("map keys not in canonical order"));
+            }
+        }
+        Ok(k)
+    }
+
+    /// Room for `n` items of at least `min` bytes each in what remains.
+    #[inline(always)]
+    fn cap(&self, n: u64, min: usize) -> usize {
+        (n.min(((self.data.len() - self.pos) / min) as u64)) as usize
+    }
+
+    fn owned(&mut self, depth: usize) -> Result<Value, CborError> {
+        if depth > 128 {
+            return Err(CborError::Invalid("nesting too deep"));
+        }
+        let (major, n) = self.head()?;
+        Ok(match major {
+            0 => Value::Int(i64::try_from(n).map_err(|_| CborError::Invalid("int range"))?),
+            1 => Value::Int(-1 - i64::try_from(n).map_err(|_| CborError::Invalid("int range"))?),
+            2 => Value::Bytes(self.take(n)?.to_vec()),
+            3 => Value::Text(std::str::from_utf8(self.take(n)?).map_err(|_| CborError::Invalid("utf8"))?.to_owned()),
+            4 => {
+                let mut a = Vec::with_capacity(self.cap(n, 1));
+                for _ in 0..n {
+                    a.push(self.owned(depth + 1)?);
+                }
+                Value::Array(a)
+            }
+            5 => {
+                let mut m: Vec<(String, Value)> = Vec::with_capacity(self.cap(n, 2));
+                let mut prev: Option<&str> = None;
+                for _ in 0..n {
+                    let k = self.map_key(depth + 1, prev)?;
+                    let v = self.owned(depth + 1)?;
+                    m.push((k.to_owned(), v));
+                    prev = Some(k);
+                }
+                Value::Map(m)
+            }
+            6 => {
+                if n != 42 {
+                    return Err(CborError::Invalid("unsupported tag"));
+                }
+                Value::Link(self.json_link(depth + 1)?)
+            }
+            7 => match n {
+                20 => Value::Bool(false),
+                21 => Value::Bool(true),
+                _ => Value::Null,
+            },
+            _ => unreachable!(),
+        })
+    }
+
+    fn borrowed(&mut self, depth: usize) -> Result<ValueRef<'a>, CborError> {
+        if depth > 128 {
+            return Err(CborError::Invalid("nesting too deep"));
+        }
+        let (major, n) = self.head()?;
+        Ok(match major {
+            0 => ValueRef::Int(i64::try_from(n).map_err(|_| CborError::Invalid("int range"))?),
+            1 => ValueRef::Int(-1 - i64::try_from(n).map_err(|_| CborError::Invalid("int range"))?),
+            2 => ValueRef::Bytes(self.take(n)?),
+            3 => ValueRef::Text(std::str::from_utf8(self.take(n)?).map_err(|_| CborError::Invalid("utf8"))?),
+            4 => {
+                let mut a = Vec::with_capacity(self.cap(n, 1));
+                for _ in 0..n {
+                    a.push(self.borrowed(depth + 1)?);
+                }
+                ValueRef::Array(a)
+            }
+            5 => {
+                let mut m: Vec<(&'a str, ValueRef<'a>)> = Vec::with_capacity(self.cap(n, 2));
+                let mut prev: Option<&str> = None;
+                for _ in 0..n {
+                    let k = self.map_key(depth + 1, prev)?;
+                    m.push((k, self.borrowed(depth + 1)?));
+                    prev = Some(k);
+                }
+                ValueRef::Map(m)
+            }
+            6 => {
+                if n != 42 {
+                    return Err(CborError::Invalid("unsupported tag"));
+                }
+                ValueRef::Link(self.json_link(depth + 1)?)
+            }
+            7 => match n {
+                20 => ValueRef::Bool(false),
+                21 => ValueRef::Bool(true),
+                _ => ValueRef::Null,
+            },
+            _ => unreachable!(),
+        })
+    }
+}
+
+/// A cursor for decoders specialized to one fixed shape (MST nodes). Each
+/// read applies `Value::decode`'s rules for that item (minimal heads,
+/// in-bounds lengths); `None` means "not that item here", and the caller
+/// falls back to the generic decoder for the verdict.
+pub(crate) struct Cursor<'a> {
+    d: Decoder<'a>,
+}
+
+impl<'a> Cursor<'a> {
+    pub(crate) fn new(data: &'a [u8]) -> Self {
+        Cursor { d: Decoder { data, pos: 0 } }
+    }
+
+    pub(crate) fn at_end(&self) -> bool {
+        self.d.pos == self.d.data.len()
+    }
+
+    /// Consumes `lit` if the input continues with it.
+    #[inline(always)]
+    pub(crate) fn lit(&mut self, lit: &[u8]) -> bool {
+        let ok = self.d.data[self.d.pos..].starts_with(lit);
+        if ok {
+            self.d.pos += lit.len();
+        }
+        ok
+    }
+
+    /// A head of major type `major` (minimal encoding); its argument.
+    #[inline(always)]
+    pub(crate) fn head(&mut self, major: u8) -> Option<u64> {
+        match self.d.head() {
+            Ok((m, n)) if m == major => Some(n),
+            _ => None,
+        }
+    }
+
+    /// A byte string.
+    #[inline(always)]
+    pub(crate) fn bytes(&mut self) -> Option<&'a [u8]> {
+        let n = self.head(2)?;
+        self.d.take(n).ok()
+    }
+
+    /// A CID link (tag 42 over 0x00 + a supported 36-byte CID).
+    #[inline(always)]
+    pub(crate) fn link(&mut self) -> Option<Cid> {
+        if !self.lit(&LINK_PREFIX) {
+            return None;
+        }
+        let c = Cid::from_bytes(self.d.take(CID_BYTES_LEN as u64).ok()?).ok()?;
+        Some(c)
+    }
+
+    /// A link or null.
+    #[inline(always)]
+    pub(crate) fn opt_link(&mut self) -> Option<Option<Cid>> {
+        if self.lit(&[0xf6]) {
+            return Some(None);
+        }
+        self.link().map(Some)
+    }
+}
+
 // The transcoder mirrors `value` check for check (depth limit, minimal
 // heads, string keys in canonical order, tag 42 links, major 7) so both
 // accept the same inputs.
@@ -867,6 +1179,7 @@ impl<'a> Decoder<'a> {
         Ok(())
     }
 
+    #[inline(always)]
     fn json_key(&mut self, depth: usize) -> Result<&'a str, CborError> {
         if depth > 128 {
             return Err(CborError::Invalid("nesting too deep"));
@@ -877,6 +1190,7 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    #[inline(always)]
     fn json_link(&mut self, depth: usize) -> Result<Cid, CborError> {
         if depth > 128 {
             return Err(CborError::Invalid("nesting too deep"));

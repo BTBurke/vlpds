@@ -375,6 +375,21 @@ impl ShardHost for Node {
         crate::xrpc::internal::nudge_peers(&self.http, &self.internal_token, nudges).await;
     }
 
+    async fn greet(&self, peers: Vec<crate::cluster::NodeLease>) -> bool {
+        let addrs = peers.into_iter().map(|l| l.addr).collect();
+        crate::xrpc::internal::hello_peers(&self.http, &self.internal_token, &self.cluster.cfg.node_id, addrs).await
+    }
+
+    async fn refused(&self, addr: &str) -> bool {
+        let Some(authority) = reqwest::Url::parse(addr).ok().and_then(|u| Some(format!("{}:{}", u.host_str()?, u.port_or_known_default()?))) else {
+            return false;
+        };
+        match tokio::time::timeout(Duration::from_millis(500), tokio::net::TcpStream::connect(&authority)).await {
+            Ok(Err(e)) => e.kind() == std::io::ErrorKind::ConnectionRefused,
+            _ => false,
+        }
+    }
+
     fn on_layout(&self, layout: Arc<crate::slots::Layout>) {
         self.table.set_layout(layout);
     }

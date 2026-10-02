@@ -19,6 +19,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/internal/v1/oauth/replay", post(claim_replay))
         .route("/internal/v1/cluster", get(cluster_status))
         .route("/internal/v1/cluster/nudge", post(cluster_nudge))
+        .route("/internal/v1/cluster/hello", post(cluster_hello))
         .route("/internal/v1/admin/searchAccounts", get(admin_search_accounts))
         .route("/internal/v1/admin/inviteCodes", get(admin_invite_codes))
         .route("/internal/v1/sync/listRepos", get(sync_list_repos))
@@ -73,6 +74,45 @@ async fn cluster_nudge(State(app): AppState, headers: HeaderMap, axum::Json(inp)
         c.nudge(inp.handoffs);
     }
     Ok(Json(json!({})))
+}
+
+#[derive(serde::Serialize, Deserialize)]
+struct HelloIn {
+    node_id: String,
+}
+
+/// A joiner greets us: learn its lease and follow its log now (see
+/// `Cluster::learn_peer`). 200 `{"ok": true}` once we do.
+async fn cluster_hello(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<HelloIn>) -> XResult<Json<J>> {
+    check(&app, &headers)?;
+    let Some(c) = &app.cluster else {
+        return Ok(Json(json!({"ok": false})));
+    };
+    let host: Arc<dyn crate::cluster::ShardHost> = app.node.clone();
+    let ok = c.learn_peer(&host, &inp.node_id).await.map_err(XrpcError::from_err)?;
+    Ok(Json(json!({"ok": ok})))
+}
+
+/// Greets each live peer (see [`cluster_hello`]); true if all confirmed.
+pub async fn hello_peers(http: &reqwest::Client, token: &str, node_id: &str, addrs: Vec<String>) -> bool {
+    let sends = addrs.into_iter().map(|addr| async move {
+        let r = http
+            .post(format!("{}/internal/v1/cluster/hello", addr.trim_end_matches('/')))
+            .header(HDR, token)
+            .json(&HelloIn { node_id: node_id.to_string() })
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status());
+        match r {
+            Ok(r) => r.json::<J>().await.is_ok_and(|v| v["ok"] == json!(true)),
+            Err(e) => {
+                tracing::debug!(%addr, "hello failed: {e}");
+                false
+            }
+        }
+    });
+    futures::future::join_all(sends).await.into_iter().all(|ok| ok)
 }
 
 /// Sends each `(addr, handoffs)` nudge (see [`cluster_nudge`]). Best effort

@@ -2091,18 +2091,12 @@ fn dpop_fail(error: &str, desc: &str) -> XrpcError {
 /// Response layer for requests authenticated with `Authorization: DPoP`:
 /// adds a fresh `DPoP-Nonce` (RFC 9449 §8.2/§9) and, when verification
 /// failed, the `WWW-Authenticate: DPoP error=...` challenge.
-pub async fn dpop_layer(
-    State(app): State<Arc<App>>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    let is_dpop = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .is_some_and(|v| v.as_bytes().starts_with(b"DPoP "));
-    if !is_dpop {
+/// Installed with [`with_dpop_layer`], which clones the app only for DPoP
+/// requests (not one `Arc<App>` refcount round trip per request).
+async fn dpop_layer(app: Option<Arc<App>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let Some(app) = app else {
         return next.run(req).await;
-    }
+    };
     DPOP_CHALLENGE
         .scope(RefCell::new(None), async move {
             let mut r = next.run(req).await;
@@ -2125,6 +2119,15 @@ pub async fn dpop_layer(
             r
         })
         .await
+}
+
+/// Adds [`dpop_layer`] to `r`.
+pub fn with_dpop_layer(r: axum::Router<Arc<App>>, app: &Arc<App>) -> axum::Router<Arc<App>> {
+    let app = app.clone();
+    r.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+        let is_dpop = req.headers().get(header::AUTHORIZATION).is_some_and(|v| v.as_bytes().starts_with(b"DPoP "));
+        dpop_layer(is_dpop.then(|| app.clone()), req, next)
+    }))
 }
 
 /// Verifies `Authorization: DPoP <token>` on a resource request.

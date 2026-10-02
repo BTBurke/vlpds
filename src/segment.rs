@@ -410,7 +410,9 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<u16>) -> anyhow::Result
 /// the head (`h/`). Exactly what the repo worker writes for a commit, in
 /// the same order; the worker checks the two agree (debug builds).
 pub fn derive_commit_muts(frame: &[u8]) -> anyhow::Result<Vec<Mutation>> {
-    use crate::cbor::Value;
+    // borrowed decoding: the frame's strings and the CAR stay in `frame`
+    // (replay runs this for every #commit it applies)
+    use crate::cbor::ValueRef as Value;
     use crate::cid::Cid;
     use crate::state;
     let (header, n) = Value::decode_prefix(frame)?;

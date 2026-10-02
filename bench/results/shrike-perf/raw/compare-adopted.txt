@@ -1,0 +1,54 @@
+18:25  up 27 days,  1:37, 6 users, load averages: 7.74 15.22 16.20
+# shrike-perf: mode=compare sha2-asm-feature=false rounds=11 batch=60ms
+# repo CAR: 16571401 bytes, 55245 blocks, 43649 records: [("app.bsky.feed.like", 36934), ("app.bsky.feed.post", 4492), ("app.bsky.feed.repost", 1895), ("app.bsky.graph.follow", 258), ("app.bsky.feed.generator", 32), ("app.bsky.graph.listitem", 17), ("app.bsky.graph.block", 17), ("app.bsky.graph.list", 2)]
+cbor.decode    post x4492                                               338.7 ns vs     625.9 ns  ratio   0.54x (rounds 0.53..0.55)  [shrike cbor::decode vs independent]  per record
+cbor.decode    like x5000                                               104.9 ns vs     216.5 ns  ratio   0.49x (rounds 0.47..0.50)  [shrike cbor::decode vs independent]  per record
+cbor.decode    follow x258                                               65.2 ns vs     136.9 ns  ratio   0.48x (rounds 0.42..0.49)  [shrike cbor::decode vs independent]  per record
+cbor.decode    repost x1895                                             103.7 ns vs     213.0 ns  ratio   0.48x (rounds 0.47..0.50)  [shrike cbor::decode vs independent]  per record
+cbor.decode    profile x1                                               228.0 ns vs     479.9 ns  ratio   0.47x (rounds 0.46..0.49)  [shrike cbor::decode vs independent]  per record
+cbor.decode    interop data-model x3                                    188.7 ns vs     323.5 ns  ratio   0.59x (rounds 0.56..0.60)  [shrike cbor::decode vs independent]  per record
+cbor.decode    post x4492 (decode vs decode_bump)                       346.1 ns vs     231.7 ns  ratio   1.48x (rounds 1.45..1.54)  [shrike decode vs shrike decode_bump]  per record
+cbor.encode    post x4492                                               168.0 ns vs     134.7 ns  ratio   1.25x (rounds 1.20..1.28)  [shrike encode_value_into vs independent]  per record
+cbor.encode    like x5000                                                49.9 ns vs      43.7 ns  ratio   1.16x (rounds 1.07..1.24)  [shrike encode_value_into vs independent]  per record
+cbor.encode    follow x258                                               30.8 ns vs      29.2 ns  ratio   1.07x (rounds 1.03..1.12)  [shrike encode_value_into vs independent]  per record
+cbor.encode    repost x1895                                              49.6 ns vs      42.7 ns  ratio   1.16x (rounds 1.09..1.20)  [shrike encode_value_into vs independent]  per record
+cbor.encode    profile x1                                               133.1 ns vs     103.2 ns  ratio   1.26x (rounds 1.19..1.40)  [shrike encode_value_into vs independent]  per record
+cbor.encode    interop data-model x3                                    100.3 ns vs      73.3 ns  ratio   1.35x (rounds 1.33..1.44)  [shrike encode_value_into vs independent]  per record
+cbor->json     post x4492 (bytes -> JSON text)                           1.58 µs vs     773.5 ns  ratio   2.06x (rounds 2.02..2.21)  [shrike drisl_to_json + serde_json::to_vec vs independent]  per record
+cbor->json     post x4492 (bytes -> serde_json::Value only)              1.07 µs vs     762.5 ns  ratio   1.41x (rounds 1.38..1.47)  [shrike drisl_to_json vs independent]  per record
+cbor->json     like x5000 (bytes -> JSON text)                          500.1 ns vs     287.1 ns  ratio   1.76x (rounds 1.65..1.87)  [shrike drisl_to_json + serde_json::to_vec vs independent]  per record
+cbor->json     like x5000 (bytes -> serde_json::Value only)             361.6 ns vs     297.4 ns  ratio   1.22x (rounds 1.15..1.27)  [shrike drisl_to_json vs independent]  per record
+cbor->json     follow x258 (bytes -> JSON text)                         303.5 ns vs     201.4 ns  ratio   1.51x (rounds 1.46..1.53)  [shrike drisl_to_json + serde_json::to_vec vs independent]  per record
+cbor->json     follow x258 (bytes -> serde_json::Value only)            224.5 ns vs     202.3 ns  ratio   1.11x (rounds 1.05..1.16)  [shrike drisl_to_json vs independent]  per record
+cbor->json     repost x1895 (bytes -> JSON text)                        510.6 ns vs     301.9 ns  ratio   1.66x (rounds 1.62..1.75)  [shrike drisl_to_json + serde_json::to_vec vs independent]  per record
+cbor->json     repost x1895 (bytes -> serde_json::Value only)           351.9 ns vs     289.7 ns  ratio   1.23x (rounds 1.15..1.28)  [shrike drisl_to_json vs independent]  per record
+cbor->json     profile x1 (bytes -> JSON text)                           1.47 µs vs     574.1 ns  ratio   2.57x (rounds 2.53..2.65)  [shrike drisl_to_json + serde_json::to_vec vs independent]  per record
+cbor->json     profile x1 (bytes -> serde_json::Value only)              1.02 µs vs     571.1 ns  ratio   1.79x (rounds 1.72..1.85)  [shrike drisl_to_json vs independent]  per record
+cid            compute (sha-256) post x4492 avg 597 B                   227.6 ns vs     227.2 ns  ratio   1.00x (rounds 1.00..1.01)  [shrike Cid::compute vs independent]  per cid
+cid            to_string x5000                                           61.0 ns vs      31.6 ns  ratio   1.93x (rounds 1.90..1.96)  [shrike Display vs independent]  per cid
+cid            parse x5000                                               26.2 ns vs      17.1 ns  ratio   1.52x (rounds 1.50..1.54)  [shrike Cid::from_str vs independent]  per cid
+cid            parse $link x5000                                        114.2 ns vs      17.1 ns  ratio   6.75x (rounds 6.45..6.82)  [shrike json::parse_cid vs independent]  per cid
+# lexicon catalog: 133 docs (0 rejected by shrike)
+# lexicon app.bsky.feed.post: 4492 records, rejected by shrike 0, by independent 0; timing the 4492 both accept
+lexicon        post x4492                                                2.74 µs vs     620.6 ns  ratio   4.44x (rounds 4.37..4.58)  [shrike validate_record vs independent]  per record
+# lexicon app.bsky.feed.like: 5000 records, rejected by shrike 0, by independent 0; timing the 5000 both accept
+lexicon        like x5000                                               534.6 ns vs     266.2 ns  ratio   2.02x (rounds 1.94..2.09)  [shrike validate_record vs independent]  per record
+# lexicon app.bsky.graph.follow: 258 records, rejected by shrike 0, by independent 0; timing the 258 both accept
+lexicon        follow x258                                              169.9 ns vs     110.7 ns  ratio   1.54x (rounds 1.42..1.58)  [shrike validate_record vs independent]  per record
+# lexicon app.bsky.feed.repost: 1895 records, rejected by shrike 0, by independent 0; timing the 1895 both accept
+lexicon        repost x1895                                             538.7 ns vs     263.4 ns  ratio   2.03x (rounds 1.98..2.16)  [shrike validate_record vs independent]  per record
+# lexicon app.bsky.actor.profile: 1 records, rejected by shrike 0, by independent 0; timing the 1 both accept
+lexicon        profile x1                                                2.15 µs vs     220.5 ns  ratio   9.76x (rounds 9.52..10.13)  [shrike validate_record vs independent]  per record
+car            read_all 16.6 MB, 55245 blocks                          143.19 µs vs     15.49 µs  ratio   9.20x (rounds 8.91..9.76)  [shrike car::read_all vs independent]  per MB
+mst.node       decode x11595 real nodes                                 460.3 ns vs     229.1 ns  ratio   2.02x (rounds 1.99..2.03)  [shrike decode_node_data vs independent]  per node
+mst.node       encode x11595 real nodes                                  66.6 ns vs      59.5 ns  ratio   1.12x (rounds 0.99..1.96)  [shrike encode_node_data vs independent]  per node
+proof          generate record proof CAR x1000 (real repo, 43649 keys)     10.50 µs vs      1.45 µs  ratio   7.24x (rounds 6.82..7.50)  [shrike record_proof_car (from blocks) vs independent]  per proof
+proof          verify record proof CAR x200 (k256 commit)               46.88 µs vs     23.98 µs  ratio   1.95x (rounds 1.91..2.00)  [shrike verify_record_proof vs independent]  per proof
+mst.build/43k  real keys, shuffled, x43649: inserts                     876.9 ns vs     408.9 ns  ratio   2.11x (rounds 1.93..2.33)  [shrike DetachedTree::insert vs independent]  per key
+mst.build/43k  real keys, shuffled, x43649: root + all blocks           118.0 ns vs      66.9 ns  ratio   1.74x (rounds 1.41..1.87)  [shrike flush vs independent]  per key
+mst.build/43k  real keys, shuffled, x43649: total                       989.2 ns vs     475.7 ns  ratio   2.07x (rounds 1.85..2.26)  [shrike vs independent]  per key
+mst.commit/43k real x43649: insert 1 key + root/new blocks             794.18 µs vs      3.13 µs  ratio 260.11x (rounds 233.91..267.86)  [shrike insert+flush (materialized tree) vs independent]  per commit
+mst.commit/43k real x43649: delete 1 key + root/new blocks             784.45 µs vs      3.08 µs  ratio 261.62x (rounds 244.45..278.34)  [shrike remove+flush (materialized tree) vs independent]  per commit
+mst.commit/43k real x43649: insert + covering proof                    791.46 µs vs      3.18 µs  ratio 253.35x (rounds 233.62..263.15)  [shrike insert+flush+covering_proof vs independent]  per commit
+mst.commit/43k real x43649: insert, tree reopened per commit            16.26 µs vs      3.13 µs  ratio   5.32x (rounds 5.01..5.48)  [shrike load+insert+flush vs independent]  per commit
+18:26  up 27 days,  1:38, 6 users, load averages: 5.49 12.60 15.10

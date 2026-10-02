@@ -298,25 +298,81 @@ pub async fn hash_password(password: &str) -> String {
 pub fn hash_password_blocking(password: &str) -> String {
     use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
     let salt = SaltString::generate(&mut OsRng);
-    argon2_params().hash_password(password.as_bytes(), &salt).expect("argon2 hash").to_string()
+    PooledArgon2
+        .hash_password_customized(password.as_bytes(), Some(argon2::Algorithm::Argon2id.ident()), Some(0x13), argon2_params(), &salt)
+        .expect("argon2 hash")
+        .to_string()
 }
 
 pub async fn verify_password_hash(phc: &str, password: &str) -> bool {
     let (phc, pw) = (phc.to_string(), password.to_string());
     tokio::task::spawn_blocking(move || {
         use argon2::password_hash::{PasswordHash, PasswordVerifier};
-        PasswordHash::new(&phc).is_ok_and(|h| argon2_params().verify_password(pw.as_bytes(), &h).is_ok())
+        PasswordHash::new(&phc).is_ok_and(|h| PooledArgon2.verify_password(pw.as_bytes(), &h).is_ok())
     })
     .await
     .unwrap_or(false)
 }
 
-fn argon2_params() -> argon2::Argon2<'static> {
-    argon2::Argon2::new(
-        argon2::Algorithm::Argon2id,
-        argon2::Version::V0x13,
-        argon2::Params::new(19 * 1024, 2, 1, None).expect("argon2 params"),
-    )
+fn argon2_params() -> argon2::Params {
+    argon2::Params::new(19 * 1024, 2, 1, None).expect("argon2 params")
+}
+
+/// Argon2 with its 19 MiB of block memory reused across hashes. Each hash
+/// used to allocate and free it: with jemalloc that's a fresh mapping
+/// (page faults, zeroing) and an unmap per hash, ~1/3 of createAccount's
+/// CPU at 64 in flight (laptop profile: `RawVec<Block>::drop` 31 %), and on
+/// Linux every unmap takes the process's mmap lock. Same PHC strings as
+/// `argon2::Argon2` (`PasswordVerifier` is the blanket impl over this).
+struct PooledArgon2;
+
+/// Idle argon2 block buffers (19 MiB each): one per core, at most 16, so
+/// they hold at most ~300 MiB. Hashing is CPU-bound, so more concurrent
+/// hashes than cores (they allocate their own) gain nothing anyway.
+static ARGON2_MEMORY: parking_lot::Mutex<Vec<Vec<argon2::Block>>> = parking_lot::Mutex::new(Vec::new());
+static ARGON2_POOL_MAX: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| std::thread::available_parallelism().map_or(8, |n| n.get()).min(16));
+
+impl argon2::password_hash::PasswordHasher for PooledArgon2 {
+    type Params = argon2::Params;
+
+    fn hash_password_customized<'a>(
+        &self,
+        password: &[u8],
+        alg_id: Option<argon2::password_hash::Ident<'a>>,
+        version: Option<argon2::password_hash::Decimal>,
+        params: argon2::Params,
+        salt: impl Into<argon2::password_hash::Salt<'a>>,
+    ) -> argon2::password_hash::Result<argon2::password_hash::PasswordHash<'a>> {
+        let algorithm = alg_id.map(argon2::Algorithm::try_from).transpose()?.unwrap_or_default();
+        let version = version.map(argon2::Version::try_from).transpose()?.unwrap_or_default();
+        let salt = salt.into();
+        let mut salt_arr = [0u8; 64];
+        let salt_bytes = salt.decode_b64(&mut salt_arr)?;
+        let ctx = argon2::Argon2::new(algorithm, version, params.clone());
+        let blocks = params.block_count();
+        let output = argon2::password_hash::Output::init_with(params.output_len().unwrap_or(argon2::Params::DEFAULT_OUTPUT_LEN), |out| {
+            let mut mem = ARGON2_MEMORY.lock().pop().unwrap_or_default();
+            if mem.len() < blocks {
+                // every block is written before it is read: no zeroing needed
+                // beyond what a fresh allocation does
+                mem.resize(blocks, argon2::Block::default());
+            }
+            let r = ctx.hash_password_into_with_memory(password, salt_bytes, out, &mut mem[..blocks]);
+            let mut pool = ARGON2_MEMORY.lock();
+            if pool.len() < *ARGON2_POOL_MAX {
+                pool.push(mem);
+            }
+            Ok(r?)
+        })?;
+        Ok(argon2::password_hash::PasswordHash {
+            algorithm: algorithm.ident(),
+            version: Some(version.into()),
+            params: argon2::password_hash::ParamsString::try_from(&params)?,
+            salt: Some(salt),
+            hash: Some(output),
+        })
+    }
 }
 
 /// Stable across processes and nodes (partition assignment must agree everywhere).
@@ -340,4 +396,35 @@ pub fn bulk_did(i: u64) -> String {
 
 pub fn bulk_handle(i: u64) -> String {
     format!("b{i}.bulk.vlpds.test")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+
+    /// Pooled hashing is argon2's hashing: same PHC string for the same
+    /// salt, and each verifies the other's (buffers reused across calls).
+    #[test]
+    fn pooled_argon2_matches_argon2() {
+        let stock = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, argon2_params());
+        for (i, pw) in ["hunter2", "", "correct horse battery staple"].iter().enumerate() {
+            let salt = SaltString::encode_b64(&[i as u8 + 1; 16]).unwrap();
+            let a = stock.hash_password(pw.as_bytes(), &salt).unwrap().to_string();
+            let b = PooledArgon2
+                .hash_password_customized(pw.as_bytes(), Some(argon2::Algorithm::Argon2id.ident()), Some(0x13), argon2_params(), &salt)
+                .unwrap()
+                .to_string();
+            assert_eq!(a, b);
+            let mine = hash_password_blocking(pw);
+            assert!(stock.verify_password(pw.as_bytes(), &PasswordHash::new(&mine).unwrap()).is_ok());
+            assert!(PooledArgon2.verify_password(pw.as_bytes(), &PasswordHash::new(&a).unwrap()).is_ok());
+            assert!(PooledArgon2.verify_password(b"wrong", &PasswordHash::new(&a).unwrap()).is_err());
+        }
+        // a hash with other parameters (e.g. made before a cost change) still verifies
+        let small = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, argon2::Params::new(4096, 3, 1, None).unwrap());
+        let salt = SaltString::encode_b64(&[9; 16]).unwrap();
+        let h = small.hash_password(b"pw", &salt).unwrap().to_string();
+        assert!(PooledArgon2.verify_password(b"pw", &PasswordHash::new(&h).unwrap()).is_ok());
+    }
 }

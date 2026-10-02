@@ -394,3 +394,115 @@ both are small next to the items above and are mentioned only in passing.
   shrike-only A/Bs wherever possible: (1) materialized vs reopened tree and
   scaling with size, (2) `shipped` vs `sha2asm` builds, (4) `read_all` vs
   `next_block_into`, (6) `k256` vs the `secp256k1` crate, (9) frame vs floor.
+
+## Adopted in vlpds
+
+The user asked whether vlpds took the techniques behind the rows where
+shrike was faster. It has now, without dropping any check: strict DAG-CBOR
+(minimal heads, no floats or simple values, canonical key order, tag 42
+only, depth limit), canonical CIDs, and full MST node validation, including
+key heights. Code: `src/cbor.rs`, `src/cid.rs`, `src/mst.rs`,
+`src/lexicon.rs`, plus `src/segment.rs` and `src/car.rs` as callers. Comments
+credit shrike (MIT/Apache-2.0) where a technique came from it.
+
+| technique (from shrike) | where in vlpds |
+|---|---|
+| borrowed decode tree (`Value<'a>`: text, bytes and keys borrow the input) | new `cbor::ValueRef<'a>`, used by replay's `segment::derive_commit_muts` and the CAR header. The owned `Value::decode` now reads keys and links in place and sizes its vectors from the remaining input |
+| CID string through stack buffers, no `Vec` | `Cid::parse` decodes 8 characters into 5 bytes through a 256-entry table. `Display`/`write_string` encode 5 bytes into 8 characters into a `[u8; 59]`. `base32_encode`/`decode` use the same table for whole groups |
+| MST node decode without the generic `Value` path | `mst::decode_node` is now a reader for the one canonical node layout: fixed key/link byte literals, a single reused key buffer, one `Arc` per key. Anything it doesn't recognise goes to the old decoder (`decode_node_reference`), so errors are the same |
+| owned nodes mutated in place (`DetachedTree`) | a tree grown from `Tree::new()` gives the mutation its only `Arc` to the root. Before, insert/remove kept a second reference so they could restore the root on error, and that made `Arc::make_mut` copy every node on the path on every insert. Loaded (possibly partial) trees keep the restore path. If a built tree's mutation fails anyway (a broken invariant, i.e. a bug), the tree is poisoned (stub root: every later op errors) instead of restored, as shrike refuses further use |
+| `height_from_hash` via `u64::leading_zeros` | `mst::height_for_key` |
+| fixed-byte encoding of links | `cbor::write_cid` writes one 41-byte block. `encode_node` writes literal keys and compares key prefixes 8 bytes at a time |
+| table-driven character classes (shrike's base32 via data-encoding) | `lexicon::valid_tid` for TID record keys and the `tid` format: `syntax::valid_tid` called `memchr` once per character, ~95 ns per rkey |
+
+Correctness: `tests/all/shrike_adopt.rs` compares each fast path with the
+code it replaced, kept as an oracle (`Value::decode_reference`,
+`mst::decode_node_reference`, the old base32 codec copied into the test,
+`syntax::valid_tid`). Inputs are real repo blocks, random values and nodes,
+80k/60k byte-level mutations, nesting-limit and key/tag edge cases, every
+byte at every TID position, and 200k mutated CID strings (also checked
+against shrike's parser). The checks are the same verdict, the same value
+and the same error text. Built (in-place) and loaded (restore-on-error)
+trees give identical roots and diff blocks over random insert/remove
+histories with proofs, and snapshots stay intact. The existing differential,
+transcode, record-encode, interop and MST tests pass unchanged.
+
+### After: the existing harness (`--features compare`, vlpds = this tree)
+
+[raw/compare-adopted.txt](raw/compare-adopted.txt), 2026-10-01, 11 rounds,
+load average 5-12. Ratio = shrike / vlpds, so > 1 means vlpds is faster.
+
+| case | before (shrike / vlpds) | after (shrike / vlpds) |
+|---|---|---|
+| DAG-CBOR decode, owned `Value` (post / like, follow, repost / interop) | 0.48 / 0.40-0.41 / 0.45 | 0.54 / 0.48-0.49 / 0.59 |
+| DAG-CBOR decode, borrowed `ValueRef` (adopt-ab, same run as shrike), post / like / follow / repost / interop | n/a | **1.09 / 1.12 / 1.12 / 1.15 / 1.14** |
+| CID parse | 0.25 | **1.52** (26.2 vs 17.1 ns) |
+| CID to_string | 0.64 | **1.93** (61.0 vs 31.6 ns) |
+| MST node decode, 11,595 real nodes | 0.37 | **2.02** (460 vs 229 ns; vlpds still hashes every key to check heights) |
+| MST node encode | 0.85 | **1.12** |
+| MST bulk build, 43k real keys: inserts | 0.69 | **2.11** (877 vs 409 ns/key) |
+| MST bulk build, 43k: root + all blocks | | 1.74 |
+| lexicon follow | 0.91 | **1.54** (170 vs 111 ns) |
+| lexicon like / repost / post | 1.44 / 1.44 / 3.75 | 2.02 / 2.03 / 4.44 |
+| record proof verify | 1.27 | 1.95 |
+| record proof generation | 6.8-7.0 | 7.24 |
+
+The owned `Value::decode` is still about 2x slower than shrike. It has to
+allocate a `String` per key and text and a `Vec` per byte string, which is
+what the owned type means. The read-only paths that matter now use
+`ValueRef`, which is 9-15% faster than shrike's `decode`.
+
+### Before/after on vlpds itself: [adopt-ab/](adopt-ab/)
+
+[raw/adopt-ab.txt](raw/adopt-ab.txt). One process links shrike, vlpds
+before this change (`vlpds_base`: a copy of the tree at f6a9e33 with the
+package renamed) and vlpds after. Each round runs one batch per side,
+rotating the order, 11 rounds, `nice -n 5`, medians.
+
+| path | before | after | |
+|---|---|---|---|
+| `Value::decode` post / like | 711 / 246 ns | 627 / 215 ns | 1.13-1.29x |
+| `ValueRef::decode` post / like | (owned only) | 317 / 94 ns | 2.2-2.7x vs before |
+| `Cid::parse` / `to_string` / `write_string` | 105 / 97 / 40 ns | 17.6 / 32.6 / 16.9 ns | 5.95x / 3.0x / 2.3x |
+| `mst::decode_node` | 1.27 µs | 228 ns | 5.6x |
+| `mst::encode_node` | 81 ns | 58 ns | 1.40x |
+| MST inserts, 43k shuffled | 1.23 µs/key | 396 ns/key | 3.1x |
+| **repo cold load: sorted inserts + `root_cid`, 43k records** | **690 ns/record (0.69 ms per 1k)** | **234 ns/record (0.23 ms per 1k)** | **2.9x** |
+| cold load, 1k-record repo | 501 ns/record | 197 ns/record | 2.5x |
+| live commit (insert with proof + diff + remove + diff, 43k tree) | 8.43 µs | 6.63 µs | 1.27x |
+| `Tree::load_from_blocks`, 43k (importRepo, proof verify) | 365 ns/record | 100 ns/record | 3.6x |
+| replay: `derive_commit_muts`, 4 real #commit frames | 5.25 µs/frame | 3.10 µs/frame | 1.69x |
+| lexicon validate follow / like / post | 198 / 370 / 753 ns | 112 / 273 / 638 ns | 1.77x / 1.36x / 1.19x |
+| `proof_blocks` (sync.getRecord) / `find_node` (getBlocks) | 715 / 265 ns | 657 / 238 ns | 1.09x / 1.10x |
+| `walk_blocks` (getRepo export) | 17.1 ns/record | 12.3 ns/record | 1.39x |
+| `write_json` (getRecord's transcoder) post / like | 515 / 163 ns | 535 / 160 ns | 0.97-1.07x across runs: within noise |
+| `car::read_car` | 15.9 µs/MB | 15.9 µs/MB | (already 9x shrike) |
+
+End to end:
+
+- Repo cold load. The MST part of the ~2.6 µs/record total drops from
+  ~0.69 to ~0.23 µs/record, so ~0.46 ms less per 1k records. The rest of
+  the total is the slatedb scan and `decode_record_value` (other lanes'
+  code).
+- getRecord. Its transcoder (`write_json`) was already a single pass that
+  never built the decode tree, so the decode work doesn't touch it. The
+  link-writing speedup is lost in noise. The getRecord regression is not
+  CBOR.
+- Replay. Every derived #commit now decodes borrowed: 1.69x per frame.
+- getBlocks/proofs: 1.09-1.10x from the faster leaf re-encode. getRepo's
+  block walk: 1.39x.
+
+What didn't transfer:
+
+- Owned decode allocations. `Value` keeps its owned `String`/`Vec`s
+  because it's the type the API, lexicon and record paths hold. The gain
+  comes from `ValueRef` where data is only read. `xrpc/repo.rs`'s import
+  path (`Value::decode` of commit and records) could switch to `ValueRef`
+  too, but that file belongs to another lane.
+- shrike's `simdutf8`. It would mean a new dependency for short
+  keys/strings, where std's ASCII fast path is already close.
+- `syntax::valid_tid` itself (in `src/xrpc/syntax.rs`, outside this lane)
+  still scans with `memchr`. The table version lives in `lexicon.rs`.
+  `valid_rkey`/`valid_nsid` would gain from the same change.
+- Node decode still hashes every key (height check), which shrike's
+  `decode_node_data` skips. vlpds is 2x faster than shrike anyway.

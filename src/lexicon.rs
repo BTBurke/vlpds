@@ -82,7 +82,7 @@ pub fn validate_record<N: Node>(
     };
     let key = &*main.key;
     let key_ok = match key {
-        "tid" => syntax::valid_tid(rkey),
+        "tid" => valid_tid(rkey),
         "nsid" => syntax::valid_nsid(rkey),
         "any" | "record-key" => syntax::valid_rkey(rkey),
         k => match k.strip_prefix("literal:") {
@@ -99,6 +99,27 @@ pub fn validate_record<N: Node>(
     v.check(set, &main.schema, record)
         .map_err(|e| format!("Invalid {collection} record: {e}"))?;
     Ok(Some("valid"))
+}
+
+/// [`syntax::valid_tid`] through a lookup table: one load per character
+/// instead of a `memchr` over the alphabet for each (~90 ns -> a few ns on
+/// every TID record key; the table-driven approach of shrike's base32 codec
+/// (MIT/Apache-2.0), via data-encoding). Same accepted strings
+/// (tests/all/shrike_adopt.rs).
+pub fn valid_tid(s: &str) -> bool {
+    // bit 0: base32-sortable character; bit 1: allowed first character
+    const T: [u8; 256] = {
+        let mut t = [0u8; 256];
+        let all = b"234567abcdefghijklmnopqrstuvwxyz";
+        let mut i = 0;
+        while i < all.len() {
+            t[all[i] as usize] = if i < 16 { 3 } else { 1 };
+            i += 1;
+        }
+        t
+    };
+    let b = s.as_bytes();
+    b.len() == 13 && T[b[0] as usize] & 2 != 0 && b.iter().all(|&c| T[c as usize] & 1 != 0)
 }
 
 fn is_record(d: &J) -> bool {
@@ -1018,7 +1039,7 @@ impl<'a> Validator<'a> {
                     "must be a cid string",
                 ),
                 Format::Language => (valid_language(s), "must be a well-formed BCP 47 language tag"),
-                Format::Tid => (syntax::valid_tid(s), "must be a valid TID"),
+                Format::Tid => (valid_tid(s), "must be a valid TID"),
                 Format::RecordKey => (syntax::valid_rkey(s), "must be a valid Record Key"),
             };
             if !ok {

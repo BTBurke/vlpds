@@ -88,27 +88,18 @@ impl Entry {
     }
 }
 
+/// Leading zero 2-bit pairs of the key's SHA-256: counted a 64-bit word at
+/// a time with `leading_zeros` (approach from shrike (MIT/Apache-2.0),
+/// `mst::height::height_from_hash`) rather than byte by byte.
 pub fn height_for_key(key: &[u8]) -> i32 {
-    let hv = Sha256::digest(key);
-    let mut height = 0;
-    for &b in hv.iter() {
-        if b & 0xC0 != 0 {
-            break;
+    let hv: [u8; 32] = Sha256::digest(key).into();
+    for (i, w) in hv.as_chunks::<8>().0.iter().enumerate() {
+        let w = u64::from_be_bytes(*w);
+        if w != 0 {
+            return (i * 32) as i32 + (w.leading_zeros() / 2) as i32;
         }
-        if b == 0 {
-            height += 4;
-            continue;
-        }
-        if b & 0xFC == 0 {
-            height += 3;
-        } else if b & 0xF0 == 0 {
-            height += 2;
-        } else {
-            height += 1;
-        }
-        break;
     }
-    height
+    128
 }
 
 fn valid_key(key: &[u8]) -> bool {
@@ -644,8 +635,21 @@ fn remove_child(
 
 // ---------- encoding ----------
 
+/// Length of the common prefix, 8 bytes at a time (MST keys in one node
+/// share most of their bytes: `collection/` and the TID's leading
+/// characters).
 fn count_prefix_len(a: &[u8], b: &[u8]) -> usize {
-    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let x = u64::from_le_bytes(a[i..i + 8].try_into().unwrap())
+            ^ u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        if x != 0 {
+            return i + (x.trailing_zeros() / 8) as usize;
+        }
+        i += 8;
+    }
+    i + a[i..n].iter().zip(&b[i..n]).take_while(|(x, y)| x == y).count()
 }
 
 fn child_cid(e: &Entry) -> Option<Cid> {
@@ -656,7 +660,9 @@ fn child_cid(e: &Entry) -> Option<Cid> {
     }
 }
 
-/// Encodes a node whose children all have CIDs computed.
+/// Encodes a node whose children all have CIDs computed. The map keys and
+/// link heads are fixed byte strings in a node's one canonical encoding, so
+/// they go out as literals and each link as one 41-byte copy.
 pub fn encode_node(n: &Node, out: &mut Vec<u8>) -> Result<()> {
     let nvals = n.entries.iter().filter(|e| !e.is_child()).count();
     let mut left = None;
@@ -665,8 +671,9 @@ pub fn encode_node(n: &Node, out: &mut Vec<u8>) -> Result<()> {
         left = Some(child_cid(e).ok_or(MstError::Invalid("child without cid"))?);
         start = 1;
     }
-    cbor::write_map_head(out, 2);
-    cbor::write_text(out, "e");
+    // ~55 bytes of framing and links per entry, plus key suffixes
+    out.reserve(48 + nvals * 64);
+    out.extend_from_slice(&[0xa2, 0x61, b'e']);
     cbor::write_array_head(out, nvals);
     let mut prev_key: &[u8] = &[];
     let mut i = start;
@@ -682,21 +689,28 @@ pub fn encode_node(n: &Node, out: &mut Vec<u8>) -> Result<()> {
             _ => None,
         };
         let p = count_prefix_len(prev_key, key);
-        cbor::write_map_head(out, 4);
-        cbor::write_text(out, "k");
+        out.extend_from_slice(&[0xa4, 0x61, b'k']);
         cbor::write_bytes(out, &key[p..]);
-        cbor::write_text(out, "p");
+        out.extend_from_slice(&[0x61, b'p']);
         cbor::write_uint(out, p as u64);
-        cbor::write_text(out, "t");
-        cbor::write_opt_cid(out, right.as_ref());
-        cbor::write_text(out, "v");
-        cbor::write_cid(out, val);
+        out.extend_from_slice(&[0x61, b't']);
+        write_opt_link(out, right.as_ref());
+        out.extend_from_slice(&[0x61, b'v']);
+        out.extend_from_slice(&cbor::link_bytes(val));
         prev_key = key;
         i += 1;
     }
-    cbor::write_text(out, "l");
-    cbor::write_opt_cid(out, left.as_ref());
+    out.extend_from_slice(&[0x61, b'l']);
+    write_opt_link(out, left.as_ref());
     Ok(())
+}
+
+#[inline]
+fn write_opt_link(out: &mut Vec<u8>, c: Option<&Cid>) {
+    match c {
+        Some(c) => out.extend_from_slice(&cbor::link_bytes(c)),
+        None => out.push(0xf6),
+    }
 }
 
 /// Recomputes CIDs of dirty nodes, emitting their blocks into `out`. A node
@@ -773,6 +787,123 @@ fn write_blocks(
 /// maximal prefix lengths (the first entry's is 0), and no child pointers
 /// in a height-0 node. Heights across nodes are checked by `load_from_blocks`.
 pub fn decode_node(data: &[u8], c: Cid) -> std::result::Result<Node, MstError> {
+    match decode_node_fast(data, c) {
+        Some(n) => Ok(n),
+        // anything the fast path doesn't take (every invalid node, and
+        // valid ones it doesn't recognize, if there were any): the generic
+        // decoder decides, with its error
+        None => decode_node_reference(data, c),
+    }
+}
+
+/// [`decode_node`] specialized to the one encoding a valid node can have,
+/// read straight off the bytes: `{"e": [{"k", "p", "t", "v"}...], "l"}`
+/// with canonical heads, so every map key and the 37-byte link heads are
+/// fixed byte strings. No intermediate `Value` tree, no `String` per map
+/// key, one buffer for key reconstruction and one allocation per key.
+/// Approach from shrike (MIT/Apache-2.0), whose MST node decoder ran 2.7x
+/// faster than the generic-`Value` path by borrowing keys and byte strings
+/// from the block; this goes one step further and skips the tree.
+///
+/// Returns a node only when [`decode_node_reference`] would return the
+/// same node (tests/all/shrike_adopt.rs checks this on real, random and
+/// mutated blocks); every check that one makes is made here: exact fields,
+/// links or null, keys ascending, valid and of one height, canonical
+/// prefix lengths, no children under height 0, no trailing bytes.
+fn decode_node_fast(data: &[u8], c: Cid) -> Option<Node> {
+    let mut r = cbor::Cursor::new(data);
+    // {"e": [...
+    if !r.lit(&[0xa2, 0x61, b'e']) {
+        return None;
+    }
+    let n = r.head(4)?;
+    // an entry takes at least 53 bytes (two links); a child pointer adds a
+    // slot, so internal nodes may grow this once
+    let mut entries = Vec::with_capacity(n.min(data.len() as u64 / 53) as usize + 1);
+    let mut key: Vec<u8> = Vec::with_capacity(64);
+    let mut height = -1;
+    let mut has_child = false;
+    for i in 0..n {
+        // {"k": suffix, "p": prefix len, "t": link/null, "v": link}
+        if !r.lit(&[0xa4, 0x61, b'k']) {
+            return None;
+        }
+        let k = r.bytes()?;
+        if !r.lit(&[0x61, b'p']) {
+            return None;
+        }
+        let p = r.head(0)?;
+        if p > key.len() as u64 {
+            return None;
+        }
+        let p = p as usize;
+        // the new key is key[..p] + k: canonical prefix compression wants
+        // it to differ from the previous key right at p (or extend it), and
+        // ascending order wants it greater there
+        if i > 0 {
+            let ok = match key.get(p) {
+                Some(&prev_byte) => k.first().is_some_and(|&b| b > prev_byte),
+                None => !k.is_empty(),
+            };
+            if !ok {
+                return None;
+            }
+        }
+        if !r.lit(&[0x61, b't']) {
+            return None;
+        }
+        let t = r.opt_link()?;
+        if !r.lit(&[0x61, b'v']) {
+            return None;
+        }
+        let val = r.link()?;
+        key.truncate(p);
+        key.extend_from_slice(k);
+        if !valid_key(&key) {
+            return None;
+        }
+        let h = height_for_key(&key);
+        if height < 0 {
+            height = h;
+        } else if h != height {
+            return None;
+        }
+        entries.push(Entry::Value { key: Arc::from(&key[..]), val });
+        if let Some(t) = t {
+            has_child = true;
+            entries.push(Entry::Child { node: None, cid: Some(t) });
+        }
+    }
+    // ..., "l": link/null}
+    if !r.lit(&[0x61, b'l']) {
+        return None;
+    }
+    let l = r.opt_link()?;
+    if !r.at_end() {
+        return None;
+    }
+    if let Some(l) = l {
+        has_child = true;
+        entries.insert(0, Entry::Child { node: None, cid: Some(l) });
+    }
+    if height == 0 && has_child {
+        return None;
+    }
+    Some(Node {
+        height,
+        entries,
+        cid: Some(c),
+        dirty: false,
+        stub: false,
+        bytes: None,
+    })
+}
+
+/// The generic node decoder (DAG-CBOR `Value` tree, then structure
+/// checks): the oracle for [`decode_node_fast`] and the source of
+/// [`decode_node`]'s errors.
+#[doc(hidden)]
+pub fn decode_node_reference(data: &[u8], c: Cid) -> std::result::Result<Node, MstError> {
     use cbor::Value;
     let v = Value::decode(data).map_err(|_| MstError::Invalid("bad node cbor"))?;
     let link = |v: Option<&Value>| match v {
@@ -929,6 +1060,18 @@ fn ensure_heights(n: &mut Arc<Node>, depth: usize) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct Tree {
     pub root: Arc<Node>,
+    /// Grown from [`Tree::new`] by inserts and removes alone: every node is
+    /// loaded and was built by this code, so a mutation can only fail on a
+    /// broken invariant (a bug). Such trees mutate in place; other trees
+    /// (loaded from blocks, possibly partial, where `Partial` and
+    /// structure errors are expected) keep the old root to restore on error.
+    built: bool,
+}
+
+/// What `self.root` holds while a mutation owns the real root.
+fn placeholder() -> Arc<Node> {
+    static P: std::sync::OnceLock<Arc<Node>> = std::sync::OnceLock::new();
+    P.get_or_init(|| Arc::new(Node::empty(0))).clone()
 }
 
 impl Default for Tree {
@@ -941,6 +1084,50 @@ impl Tree {
     pub fn new() -> Tree {
         Tree {
             root: Arc::new(Node::empty(0)),
+            built: true,
+        }
+    }
+
+    /// Runs a mutation that consumes the root. A built tree hands over its
+    /// only reference, so copy-on-write copies nothing; the old code kept a
+    /// second reference to restore on error, which made `Arc::make_mut`
+    /// copy every node on the path, every insert (approach from shrike
+    /// (MIT/Apache-2.0), whose `DetachedTree` mutates its owned nodes in
+    /// place and refuses further use after a failure only a bug can cause).
+    /// If a built tree's mutation fails anyway, the tree is poisoned: its
+    /// root becomes a stub, so every later read or write fails (`Partial`
+    /// / `Invalid`) rather than report a half-applied tree's root.
+    fn mutate<T>(
+        &mut self,
+        root: Arc<Node>,
+        f: impl FnOnce(Arc<Node>) -> Result<(Arc<Node>, T)>,
+    ) -> Result<T> {
+        if self.built {
+            return match f(root) {
+                Ok((r, x)) => {
+                    self.root = r;
+                    Ok(x)
+                }
+                Err(e) => {
+                    self.root = Arc::new(Node {
+                        stub: true,
+                        dirty: false,
+                        ..Node::empty(0)
+                    });
+                    self.built = false;
+                    Err(e)
+                }
+            };
+        }
+        match f(root.clone()) {
+            Ok((r, x)) => {
+                self.root = r;
+                Ok(x)
+            }
+            Err(e) => {
+                self.root = root;
+                Err(e)
+            }
         }
     }
 
@@ -959,7 +1146,7 @@ impl Tree {
             return Err(MstError::InvalidKey);
         }
         let height = height_for_key(key);
-        let root = std::mem::replace(&mut self.root, Arc::new(Node::empty(0)));
+        let root = std::mem::replace(&mut self.root, placeholder());
         // An emptied tree can be left with a non-zero height; an empty node has no
         // fixed height, so restart it at the key's height to keep the shape canonical.
         let root = if root.is_empty() && !root.stub && root.height != height {
@@ -967,16 +1154,7 @@ impl Tree {
         } else {
             root
         };
-        match insert(root.clone(), key, val, height, prove) {
-            Ok((r, prev)) => {
-                self.root = r;
-                Ok(prev)
-            }
-            Err(e) => {
-                self.root = root;
-                Err(e)
-            }
-        }
+        self.mutate(root, |r| insert(r, key, val, height, prove))
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Result<Option<Cid>> {
@@ -990,10 +1168,8 @@ impl Tree {
         if self.root.get(key, height_for_key(key))?.is_none() {
             return Ok(None);
         }
-        let root = self.root.clone();
-        let (r, prev) = remove(root, key, None, prove)?;
-        self.root = r;
-        Ok(prev)
+        let root = std::mem::replace(&mut self.root, placeholder());
+        self.mutate(root, |r| remove(r, key, None, prove))
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Cid>> {
@@ -1057,7 +1233,7 @@ impl Tree {
     pub fn load_from_blocks(blocks: &HashMap<Cid, Vec<u8>>, root: Cid) -> Result<Tree> {
         let mut r = load_from_blocks(blocks, root, 0)?.ok_or(MstError::Partial)?;
         ensure_heights(&mut r, 0)?;
-        Ok(Tree { root: r })
+        Ok(Tree { root: r, built: false })
     }
 
     /// Visits every (key, value) in key order.

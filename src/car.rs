@@ -52,15 +52,15 @@ pub fn read_car(b: &[u8]) -> anyhow::Result<(Vec<Cid>, Vec<(Cid, &[u8])>)> {
     let mut pos = n + hlen as usize;
     // CARv1 header: {version: 1, roots: [CID...]} (as go-car and the
     // reference require; a v2 or rootless header is not a CARv1)
-    let header = cbor::Value::decode(&b[n..pos])?;
-    if header.get("version") != Some(&cbor::Value::Int(1)) {
+    let header = cbor::ValueRef::decode(&b[n..pos])?;
+    if header.get("version") != Some(&cbor::ValueRef::Int(1)) {
         anyhow::bail!("car header version must be 1");
     }
     let roots = match header.get("roots") {
-        Some(cbor::Value::Array(a)) => a
+        Some(cbor::ValueRef::Array(a)) => a
             .iter()
             .map(|v| match v {
-                cbor::Value::Link(c) => Ok(*c),
+                cbor::ValueRef::Link(c) => Ok(*c),
                 _ => Err(anyhow::anyhow!("car root is not a CID")),
             })
             .collect::<anyhow::Result<Vec<Cid>>>()?,

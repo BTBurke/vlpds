@@ -171,6 +171,17 @@ pub trait ShardHost: Send + Sync + 'static {
     fn shard_stats(&self) -> Vec<(u16, u64, u64)> {
         Vec::new()
     }
+    /// Joiner: asks each of `peers` to learn our lease now (and follow our
+    /// log) instead of at its next step. True only if every one confirmed;
+    /// then our join grace is over at once (see `Cluster::join_grace`).
+    async fn greet(&self, _peers: Vec<NodeLease>) -> bool {
+        false
+    }
+    /// Whether a TCP connect to `addr` (a peer's advertised URL) is refused:
+    /// nothing listens there, so the process that holds that lease is gone.
+    async fn refused(&self, _addr: &str) -> bool {
+        false
+    }
 }
 
 /// What we last saw of a peer's lease, timed on our monotonic clock.
@@ -180,6 +191,8 @@ struct Seen {
     changed_at: Instant,
     /// When we first saw this incarnation (log_id) of the peer.
     first_seen: Instant,
+    /// It greeted us (`learn_peer`): past its join grace already.
+    greeted: bool,
 }
 
 /// Re-read every assignment (not only those whose ETag changed in the
@@ -251,6 +264,15 @@ pub struct Cluster {
     nudged: tokio::sync::Notify,
     /// Shards peers handed us that we haven't adopted yet.
     handed: parking_lot::Mutex<Vec<Handoff>>,
+    /// No live peer as of the last step (or greeting): nothing routes
+    /// elsewhere (see `forward::Router::alone`).
+    alone: AtomicBool,
+    /// Every live peer confirmed it follows our log (`ShardHost::greet`):
+    /// our join grace ended early.
+    greeted: AtomicBool,
+    /// The step loop runs (`spawn`). Greeting waits for it: the inline first
+    /// step at startup must not open shards before the node serves.
+    spawned: AtomicBool,
     /// Highest epoch of each shard this incarnation has opened. An
     /// assignment naming us at a newer epoch was handed to us; at an epoch we
     /// already opened it is ours from before (e.g. a release CAS that failed)
@@ -301,6 +323,9 @@ impl Cluster {
             nudged: tokio::sync::Notify::new(),
             handed: parking_lot::Mutex::new(Vec::new()),
             opened: RwLock::new(HashMap::new()),
+            greeted: AtomicBool::new(false),
+            spawned: AtomicBool::new(false),
+            alone: AtomicBool::new(false),
             cfg,
         };
         // create (or take over our own stale) node lease
@@ -557,6 +582,11 @@ impl Cluster {
         self.expires_local_ms.load(Ordering::Acquire) * 1000
     }
 
+    /// No live peer (see the field).
+    pub fn alone(&self) -> bool {
+        self.alone.load(Ordering::Acquire)
+    }
+
     pub fn is_owner(&self, shard: u16) -> bool {
         self.owned.read().contains(&shard)
     }
@@ -647,6 +677,7 @@ impl Cluster {
     }
 
     pub fn spawn(self: &Arc<Self>, host: Arc<dyn ShardHost>) {
+        self.spawned.store(true, Ordering::Release);
         // HA fix: renew the node lease on its own loop. A step reads every
         // node lease and every shard assignment (O(shards) S3 GETs); renewing
         // only at the top of a step meant one slow step (S3 at ~400 ms per
@@ -744,7 +775,7 @@ impl Cluster {
         let _step = self.step_lock.lock().await;
         let handed = std::mem::take(&mut *self.handed.lock());
         // in our join grace (or without a lease) the step adopts them later
-        if self.stopping.load(Ordering::Acquire) || !self.lease_valid() || self.joined_at.elapsed() < self.join_grace() {
+        if self.stopping.load(Ordering::Acquire) || !self.lease_valid() || self.in_join_grace() {
             return Ok(());
         }
         let mut adopt = Vec::new();
@@ -809,8 +840,44 @@ impl Cluster {
     /// After joining, give every peer a membership refresh to discover us
     /// (and start following our log) before we produce events, so no peer's
     /// merged firehose has already moved past our first seqs.
+    ///
+    /// A greeting ends it early: every live peer confirmed it has learned
+    /// our lease and follows our log (`learn_peer`). That is what the grace
+    /// waits for, so a restarted node (same id, its old shards still
+    /// assigned to its previous incarnation) reclaims them as soon as it
+    /// runs its first loop step instead of 2 renew intervals later.
     fn join_grace(&self) -> Duration {
         self.cfg.renew_every * 2
+    }
+
+    fn in_join_grace(&self) -> bool {
+        !self.greeted.load(Ordering::Acquire) && self.joined_at.elapsed() < self.join_grace()
+    }
+
+    /// A joiner greeted us: learn its lease now (one GET) and follow its
+    /// log, as our next step would. False if it has no lease or we already
+    /// presume it dead.
+    pub async fn learn_peer(&self, host: &Arc<dyn ShardHost>, node_id: &str) -> anyhow::Result<bool> {
+        if node_id == self.cfg.node_id {
+            return Ok(false);
+        }
+        let Some((lease, etag)) = self.get_json::<NodeLease>(&self.path(&format!("nodes/{node_id}"))).await? else {
+            return Ok(false);
+        };
+        if lease.draining || self.fenced.read().contains_key(&lease.log_id) {
+            return Ok(false);
+        }
+        {
+            let now = Instant::now();
+            let mut seen = self.seen.write();
+            let same = seen.get(node_id).filter(|s| s.lease.log_id == lease.log_id);
+            let first_seen = same.map_or(now, |s| s.first_seen);
+            seen.insert(node_id.to_string(), Seen { etag, lease: lease.clone(), changed_at: now, first_seen, greeted: true });
+        }
+        self.peers.write().insert(node_id.to_string(), lease);
+        self.alone.store(false, Ordering::Release);
+        host.on_membership();
+        Ok(true)
     }
 
     /// Renews our node lease (CAS on its ETag); a conflict means someone
@@ -848,7 +915,15 @@ impl Cluster {
     /// until its lease has gone unchanged for TTL + skew of our monotonic
     /// time, or until we fence its log (it can never ack again, even if a
     /// renewal it sent before lapsing lands late).
-    async fn read_nodes(&self) -> anyhow::Result<(Vec<NodeLease>, Vec<NodeLease>)> {
+    ///
+    /// A peer that has missed a renewal (quiet for 1.5 renew intervals) is
+    /// probed with a TCP connect to its address: refused means nothing
+    /// listens there, so that incarnation is gone (kill -9, crash, OOM) and
+    /// we presume it dead now instead of after TTL + skew. Presuming early is
+    /// safe (DESIGN.md "Why safety needs no clocks": the takeover fences its
+    /// log first); a probe that connects, times out or fails otherwise
+    /// leaves the TTL rule in charge (a frozen process or a dead machine).
+    async fn read_nodes(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<(Vec<NodeLease>, Vec<NodeLease>)> {
         use futures::StreamExt;
         // judge staleness as of before the LIST: a slow LIST can't make a
         // lease look older than it is
@@ -873,30 +948,50 @@ impl Cluster {
             .into_iter()
             .collect::<anyhow::Result<_>>()?;
         let now = Instant::now();
-        let mut seen = self.seen.write();
-        for (id, got) in fetched {
-            match got {
-                None => {
-                    seen.remove(&id);
+        let late = self.cfg.renew_every + self.cfg.renew_every / 2;
+        let (mut live, mut dead, mut suspects) = (vec![self.lease.read().clone()], Vec::new(), Vec::new());
+        {
+            let mut seen = self.seen.write();
+            for (id, got) in fetched {
+                match got {
+                    None => {
+                        seen.remove(&id);
+                    }
+                    Some((lease, etag)) => {
+                        let same = seen.get(&id).filter(|s| s.lease.log_id == lease.log_id);
+                        let first_seen = same.map_or(now, |s| s.first_seen);
+                        let changed_at = same.filter(|s| s.lease.renewals == lease.renewals).map_or(now, |s| s.changed_at);
+                        let greeted = same.is_some_and(|s| s.greeted);
+                        seen.insert(id, Seen { etag, lease, changed_at, first_seen, greeted });
+                    }
                 }
-                Some((lease, etag)) => {
-                    let same = seen.get(&id).filter(|s| s.lease.log_id == lease.log_id);
-                    let first_seen = same.map_or(now, |s| s.first_seen);
-                    let changed_at = same.filter(|s| s.lease.renewals == lease.renewals).map_or(now, |s| s.changed_at);
-                    seen.insert(id, Seen { etag, lease, changed_at, first_seen });
+            }
+            let names: HashSet<&String> = listed.iter().map(|(id, _)| id).collect();
+            seen.retain(|id, _| names.contains(id));
+            let fenced = self.fenced.read();
+            for s in seen.values() {
+                let quiet = t0.saturating_duration_since(s.changed_at);
+                if fenced.contains_key(&s.lease.log_id) || quiet > self.cfg.ttl + self.cfg.skew {
+                    dead.push(s.lease.clone());
+                } else if quiet > late && !s.lease.draining {
+                    suspects.push(s.lease.clone());
+                } else {
+                    live.push(s.lease.clone());
                 }
             }
         }
-        let names: HashSet<&String> = listed.iter().map(|(id, _)| id).collect();
-        seen.retain(|id, _| names.contains(id));
-        let fenced = self.fenced.read();
-        let (mut live, mut dead) = (vec![self.lease.read().clone()], Vec::new());
-        for s in seen.values() {
-            let quiet = t0.saturating_duration_since(s.changed_at);
-            if fenced.contains_key(&s.lease.log_id) || quiet > self.cfg.ttl + self.cfg.skew {
-                dead.push(s.lease.clone());
+        let probed: Vec<(NodeLease, bool)> = futures::future::join_all(suspects.into_iter().map(|l| async move {
+            let gone = host.refused(&l.addr).await;
+            (l, gone)
+        }))
+        .await;
+        for (l, gone) in probed {
+            if gone {
+                tracing::warn!(node = %l.node_id, log_id = %l.log_id, addr = %l.addr, "peer missed a renewal and refuses connections: presumed dead");
+                crate::metrics::LEASE_EVENTS.with_label_values(&["peer_refused"]).inc();
+                dead.push(l);
             } else {
-                live.push(s.lease.clone());
+                live.push(l);
             }
         }
         Ok((live, dead))
@@ -1034,8 +1129,12 @@ impl Cluster {
 
     async fn step_body(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
         // 2. membership
-        let (live, dead) = self.read_nodes().await?;
-        *self.peers.write() = live.iter().filter(|l| l.node_id != self.cfg.node_id).map(|l| (l.node_id.clone(), l.clone())).collect();
+        let (live, dead) = self.read_nodes(host).await?;
+        {
+            let mut peers = self.peers.write();
+            *peers = live.iter().filter(|l| l.node_id != self.cfg.node_id).map(|l| (l.node_id.clone(), l.clone())).collect();
+            self.alone.store(peers.is_empty(), Ordering::Release);
+        }
         let live_ids: HashSet<String> = live.iter().map(|l| l.node_id.clone()).collect();
         let dead_logs: HashMap<String, String> = dead.iter().map(|l| (l.node_id.clone(), l.log_id.clone())).collect();
         // 3. layout + assignments -> routing table
@@ -1057,8 +1156,13 @@ impl Cluster {
         let fair = layout.shards.len().div_ceil(live.iter().filter(|l| !l.draining).count().max(1));
         // Join grace (see `join_grace`).
         let has_peers = live.iter().any(|l| l.node_id != self.cfg.node_id);
-        if has_peers && self.joined_at.elapsed() < self.join_grace() {
-            return Ok(());
+        if has_peers && self.in_join_grace() {
+            let others: Vec<NodeLease> = live.iter().filter(|l| l.node_id != self.cfg.node_id).cloned().collect();
+            if !self.spawned.load(Ordering::Acquire) || !host.greet(others).await {
+                return Ok(());
+            }
+            tracing::info!(after_ms = self.joined_at.elapsed().as_millis() as u64, "every peer follows our log: join grace over");
+            self.greeted.store(true, Ordering::Release);
         }
         // HA fix: never take (or juggle) shards without a valid lease, e.g. a
         // zombie that woke after its peers fenced it, or while renewals fail.
@@ -1266,7 +1370,7 @@ impl Cluster {
         self.peers
             .read()
             .values()
-            .filter(|l| !l.draining && seen.get(&l.node_id).is_some_and(|s| s.first_seen.elapsed() >= self.join_grace()))
+            .filter(|l| !l.draining && seen.get(&l.node_id).is_some_and(|s| s.greeted || s.first_seen.elapsed() >= self.join_grace()))
             .cloned()
             .collect()
     }

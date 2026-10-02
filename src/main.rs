@@ -15,6 +15,14 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 struct Args {
     #[arg(long, env = "VLPDS_LISTEN", default_value = "0.0.0.0:2583")]
     listen: String,
+    /// Accept queue length for --listen (and --metrics-listen). The kernel
+    /// clamps it to net.core.somaxconn on Linux (kern.ipc.somaxconn on
+    /// macOS): raise that too, or connect bursts (1000 firehose
+    /// subscribers, proxy clients at 1024 in flight) overflow the queue
+    /// (TcpExtListenOverflows) and clients wait out a SYN retransmit (1 s+).
+    /// Tokio's default is 1024.
+    #[arg(long, env = "VLPDS_LISTEN_BACKLOG", default_value_t = 16384)]
+    listen_backlog: u32,
     /// Serve /metrics and /debug/pprof on this address only (e.g.
     /// 127.0.0.1:9583), not on --listen. Unset = on the app port.
     #[arg(long, env = "VLPDS_METRICS_LISTEN")]
@@ -551,9 +559,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
             "lease TTL below 10 s: a renewal slower than 0.4 x TTL fail-stops the node (see --lease-ttl-ms)"
         );
     }
-    let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    let listener = bind(&args.listen, args.listen_backlog).await?;
     let metrics_listener = match &args.metrics_listen {
-        Some(a) => Some(tokio::net::TcpListener::bind(a).await?),
+        Some(a) => Some(bind(a, args.listen_backlog).await?),
         None => None,
     };
     let app = server::build(cfg).await?;
@@ -573,15 +581,41 @@ async fn run(args: Args) -> anyhow::Result<()> {
     vlpds::oauth::gc::spawn_gc(app.clone());
     tokio::spawn(vlpds::xrpc::request_crawl(app.clone()));
     let router = server::router(&app);
+    // Keep serving through a graceful shutdown: peers forward to us until
+    // our handoff nudges reach them, and a forward we drop mid-request is
+    // ambiguous to them (a client 503), while one we answer "not owned"
+    // (ShardMoved) they resend to the new owner.
+    let mut serving = tokio::spawn(server::serve(listener, router));
     tokio::select! {
-        r = server::serve(listener, router) => r,
+        r = &mut serving => r?,
         _ = shutdown_signal() => {
             server::shutdown(&app).await;
+            // let in-flight requests finish and peers' routing settle
+            tokio::time::sleep(SHUTDOWN_DRAIN).await;
             tracing::info!("shutdown complete");
             Ok(())
         }
     }
 }
+
+/// Binds `addr` with an explicit accept backlog (see `--listen-backlog`).
+async fn bind(addr: &str, backlog: u32) -> anyhow::Result<tokio::net::TcpListener> {
+    let mut last = None;
+    for a in tokio::net::lookup_host(addr).await? {
+        let sock = if a.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+        // as std's TcpListener::bind: rebind while old connections sit in TIME_WAIT
+        sock.set_reuseaddr(true)?;
+        match sock.bind(a).and_then(|()| sock.listen(backlog)) {
+            Ok(l) => return Ok(l),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.map_or_else(|| anyhow::anyhow!("{addr}: no address"), |e| anyhow::Error::from(e).context(format!("binding {addr}"))))
+}
+
+/// How long a gracefully stopping node keeps answering after it handed
+/// its shards out and dropped its lease.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
 
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};

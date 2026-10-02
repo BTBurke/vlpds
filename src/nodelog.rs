@@ -684,10 +684,13 @@ struct SeqConfig {
 /// ones), so the finalizer sees a gap-free ordinal sequence.
 ///
 /// A segment is sealed when a slot is free and either nothing is in flight
-/// (the K = 1 behavior: whatever queued during a PUT is the next segment) or
-/// it holds at least max_segment_bytes / K. Extra concurrent PUTs therefore
-/// only start under load, so the PUT rate at low load stays one per PUT
-/// latency while the ceiling is K full segments per PUT latency.
+/// (the K = 1 behavior: whatever queued during a PUT is the next segment),
+/// it holds at least max_segment_bytes / K, or the newest PUT in flight has
+/// stalled (taken over twice the recent PUT latency): then what queued
+/// behind it goes out now and is acked when the stall ends, instead of
+/// waiting for the stall *and* its own PUT. Extra concurrent PUTs therefore
+/// only start under load or a stall, so the PUT rate at low load stays one
+/// per PUT latency while the ceiling is K full segments per PUT latency.
 async fn run_sequencer(
     store: Store,
     cfg: SeqConfig,
@@ -706,13 +709,25 @@ async fn run_sequencer(
     let mut prefix_end = 0u64;
     let mut open = Open::new(&log_id);
     let mut inflight: FuturesOrdered<tokio::task::JoinHandle<Sealed>> = FuturesOrdered::new();
+    // seal times of the PUTs in `inflight` (same order), and a moving
+    // average of PUT latency: a PUT older than 2x that has stalled
+    let mut started: std::collections::VecDeque<Instant> = Default::default();
+    let mut put_avg = Duration::from_millis(10);
+    let mut stalled = false;
     let mut closed = false;
     loop {
         let can_recv = !closed && open.seg.len() < max_segment_bytes;
+        // timed from the newest PUT: one stall seals one segment, not one
+        // per entry that queues while it lasts
+        let stall_at = started.back().map(|t| *t + (put_avg * 2).clamp(Duration::from_millis(5), hedge_after));
+        let watch_stall = k > 1 && !stalled && inflight.len() < k && !open.seg.is_empty() && stall_at.is_some();
         tokio::select! {
             biased;
             res = inflight.next(), if !inflight.is_empty() => match res {
                 Some(Ok(sealed)) => {
+                    started.pop_front();
+                    stalled = false;
+                    put_avg = (put_avg * 7 + Duration::from_secs_f64(sealed.put_secs)) / 8;
                     prefix_end = sealed.ordinal + 1;
                     if fin_tx.send(sealed).await.is_err() {
                         return;
@@ -736,9 +751,12 @@ async fn run_sequencer(
                 }
                 None => closed = true,
             },
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(stall_at.unwrap_or_else(Instant::now))), if watch_stall => {
+                stalled = true;
+            }
         }
         metrics::SEQ_QUEUE.with_label_values(&["node"]).set((rx.max_capacity() - rx.capacity()) as i64);
-        let want = if inflight.is_empty() { 1 } else { concurrent_fill };
+        let want = if inflight.is_empty() || stalled { 1 } else { concurrent_fill };
         if inflight.len() < k && !open.seg.is_empty() && open.seg.len() >= want {
             if let Some(ok) = &lease_ok {
                 if !ok() {
@@ -767,6 +785,11 @@ async fn run_sequencer(
                 stored_bytes: 0,
             };
             ordinal += 1;
+            if stalled {
+                metrics::SEGMENT_STALL_SEALS.inc();
+            }
+            stalled = false;
+            started.push_back(Instant::now());
             let (store, log_id) = (store.clone(), log_id.clone());
             inflight.push_back(tokio::spawn(async move {
                 let mut sealed = sealed;
@@ -1110,6 +1133,11 @@ pub async fn replay_many(store: &Store, shards: &[(u16, &Db, &[Span])]) -> anyho
             };
             let mut objs = futures::stream::iter(lo..hi).map(fetch).buffered(16);
             let mut ord = lo;
+            // per member: the last ordinal read for it whose marker isn't
+            // written yet (segments with none of its entries only move the
+            // marker; one write at the end instead of one per segment per
+            // shard: 85 shards x 342 segments were 29k writes)
+            let mut marker_due: Vec<Option<u64>> = vec![None; members.len()];
             while let Some(obj) = objs.next().await {
                 // The end of the log (missing object or its fence) is only
                 // legitimate past every closed span: a closed span's end is the
@@ -1134,13 +1162,18 @@ pub async fn replay_many(store: &Store, shards: &[(u16, &Db, &[Span])]) -> anyho
                     h.ordinal
                 );
                 read += 1;
-                for (i, span, from) in &members {
+                for (j, (i, span, from)) in members.iter().enumerate() {
                     if ord < *from || span.end.is_some_and(|e| ord >= e) {
                         continue;
                     }
                     let (shard, db, _) = &shards[*i];
                     let mut wb = WriteBatch::new();
-                    for e in entries.iter().filter(|e| e.shard == *shard && e.epoch == span.epoch) {
+                    let mut any = false;
+                    for e in entries.iter() {
+                        if e.shard != *shard || e.epoch != span.epoch {
+                            continue;
+                        }
+                        any = true;
                         for m in &e.muts {
                             match &m.val {
                                 Some(v) => wb.put(&m.key, v),
@@ -1148,10 +1181,23 @@ pub async fn replay_many(store: &Store, shards: &[(u16, &Db, &[Span])]) -> anyho
                             }
                         }
                     }
+                    if !any {
+                        marker_due[j] = Some(ord);
+                        continue;
+                    }
                     wb.put(META_APPLIED, encode_marker(&span.log_id, ord));
                     db.write(wb).await?;
+                    marker_due[j] = None;
                 }
                 ord += 1;
+            }
+            for (j, due) in marker_due.into_iter().enumerate() {
+                if let Some(o) = due {
+                    let (i, span, _) = &members[j];
+                    let mut wb = WriteBatch::new();
+                    wb.put(META_APPLIED, encode_marker(&span.log_id, o));
+                    shards[*i].1.write(wb).await?;
+                }
             }
         }
     }

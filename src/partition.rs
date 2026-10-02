@@ -125,9 +125,118 @@ fn shared_db_cache() -> Arc<dyn slatedb::db_cache::DbCache> {
                 Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions { max_capacity: cap, ..Default::default() }))
             };
             let block = BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-            Arc::new(SplitCache::new().with_block_cache(Some(mk(block))).with_meta_cache(Some(mk(block / 4))))
+            let meta: Arc<dyn slatedb::db_cache::DbCache> = Arc::new(MetaCache::new(block / 4));
+            Arc::new(SplitCache::new().with_block_cache(Some(mk(block))).with_meta_cache(Some(meta)))
         })
         .clone()
+}
+
+/// The shared SST metadata cache (bloom filters, indexes, stats): read-mostly
+/// shards under RwLocks with CLOCK eviction, so a hit takes a shared lock
+/// and sets one bit. Foyer (the block cache) takes its shard's mutex on every
+/// hit to update eviction state, and every point read of a repo checks the
+/// same few SSTs' filters (one DB per repo's shard, up to 32 L0s plus the
+/// sorted runs): the threads serialized on those hot keys. Point reads of one
+/// 10M-record repo spent 32-66% of CPU spinning on that lock (getRecord
+/// 24k/s on the laptop, 35k/s on benchbox with 32 IO threads vs 63k with 6).
+pub struct MetaCache {
+    shards: Vec<parking_lot::RwLock<MetaShard>>,
+    shard_bytes: usize,
+    hasher: std::hash::RandomState,
+}
+
+#[derive(Default)]
+struct MetaShard {
+    map: std::collections::HashMap<slatedb::db_cache::CachedKey, MetaSlot>,
+    bytes: usize,
+}
+
+struct MetaSlot {
+    entry: slatedb::db_cache::CachedEntry,
+    size: usize,
+    /// CLOCK bit: set on a hit, cleared by an eviction sweep that spares it
+    used: std::sync::atomic::AtomicBool,
+}
+
+const META_SHARDS: usize = 64;
+
+impl MetaCache {
+    pub fn new(bytes: u64) -> MetaCache {
+        MetaCache {
+            shards: (0..META_SHARDS).map(|_| Default::default()).collect(),
+            shard_bytes: (bytes as usize / META_SHARDS).max(1 << 20),
+            hasher: Default::default(),
+        }
+    }
+
+    fn shard(&self, key: &slatedb::db_cache::CachedKey) -> &parking_lot::RwLock<MetaShard> {
+        use std::hash::BuildHasher;
+        &self.shards[(self.hasher.hash_one(key) >> 32) as usize % META_SHARDS]
+    }
+
+    fn get(&self, key: &slatedb::db_cache::CachedKey) -> Option<slatedb::db_cache::CachedEntry> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let s = self.shard(key).read();
+        let slot = s.map.get(key)?;
+        // load first: a hot entry's bit is already set, and a store would
+        // bounce its cache line between threads
+        if !slot.used.load(Relaxed) {
+            slot.used.store(true, Relaxed);
+        }
+        Some(slot.entry.clone())
+    }
+}
+
+#[async_trait::async_trait]
+impl slatedb::db_cache::DbCache for MetaCache {
+    async fn get_block(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> {
+        Ok(self.get(key))
+    }
+    async fn get_index(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> {
+        Ok(self.get(key))
+    }
+    async fn get_filter(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> {
+        Ok(self.get(key))
+    }
+    async fn get_stats(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> {
+        Ok(self.get(key))
+    }
+    async fn insert(&self, key: slatedb::db_cache::CachedKey, value: slatedb::db_cache::CachedEntry) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let size = value.size();
+        let mut s = self.shard(&key).write();
+        let slot = MetaSlot { entry: value, size, used: std::sync::atomic::AtomicBool::new(false) };
+        if let Some(old) = s.map.insert(key, slot) {
+            s.bytes -= old.size;
+        }
+        s.bytes += size;
+        // CLOCK over the shard: drop entries not hit since the last sweep,
+        // clear the bit of the rest; a second pass evicts if all were hot
+        for _ in 0..2 {
+            if s.bytes <= self.shard_bytes {
+                break;
+            }
+            let mut freed = 0;
+            s.map.retain(|_, v| {
+                if v.used.swap(false, Relaxed) {
+                    true
+                } else {
+                    freed += v.size;
+                    false
+                }
+            });
+            s.bytes -= freed;
+        }
+    }
+    async fn remove(&self, key: &slatedb::db_cache::CachedKey) {
+        let mut s = self.shard(key).write();
+        if let Some(old) = s.map.remove(key) {
+            s.bytes -= old.size;
+        }
+    }
+    fn entry_count(&self) -> u64 {
+        self.shards.iter().map(|s| s.read().map.len() as u64).sum()
+    }
 }
 
 /// SST block compression for shard DBs (`--sst-compression`). Each SST

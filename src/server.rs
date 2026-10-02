@@ -557,8 +557,11 @@ impl crate::forward::Router for ClusterRouter {
     async fn resolve_handle(&self, handle: &str) -> Option<String> {
         self.app.resolve_handle(handle).await.ok().flatten()
     }
-    fn app(&self) -> Option<Arc<xrpc::App>> {
-        Some(self.app.clone())
+    fn app(&self) -> Option<&xrpc::App> {
+        Some(&self.app)
+    }
+    fn alone(&self) -> bool {
+        self.app.cluster.as_ref().is_some_and(|c| c.alone())
     }
 }
 
@@ -567,11 +570,11 @@ pub fn with_forwarding(app: &Arc<xrpc::App>, router: axum::Router) -> axum::Rout
     if app.cluster.is_none() {
         return router;
     }
-    let r: Arc<dyn crate::forward::Router> = Arc::new(ClusterRouter { app: app.clone() });
-    let client = app.http.clone();
+    // one Arc clone per request (router and client together)
+    let ctx = Arc::new((ClusterRouter { app: app.clone() }, app.http.clone()));
     router.layer(axum::middleware::from_fn(move |req, next| {
-        let (r, client) = (r.clone(), client.clone());
-        async move { crate::forward::route(r, client, req, next).await }
+        let ctx = ctx.clone();
+        async move { crate::forward::route(&ctx.0, &ctx.1, req, next).await }
     }))
 }
 

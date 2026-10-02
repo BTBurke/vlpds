@@ -84,9 +84,11 @@ type AppState = State<Arc<App>>;
 impl App {
     pub fn partition(&self, did: &str) -> Result<Arc<Partition>, XrpcError> {
         let p = self.partitions.shard_of(did);
+        // not here (moving, or not reopened yet after a restart or takeover):
+        // nothing was done, so the entry node resends writes (crate::forward)
         self.partitions.get(p).ok_or_else(|| XrpcError {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            error: "PartitionUnavailable".into(),
+            error: crate::forward::SHARD_MOVED.into(),
             message: format!("partition {p} is not owned by this node"),
         })
     }
@@ -223,9 +225,9 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(oauth::routes())
         .merge(internal::routes())
         .merge(crate::profiling::routes())
-        .merge(webui::routes())
-        // DPoP-Nonce / WWW-Authenticate on DPoP-authenticated requests
-        .layer(axum::middleware::from_fn_with_state(app.clone(), oauth::dpop_layer));
+        .merge(webui::routes());
+    // DPoP-Nonce / WWW-Authenticate on DPoP-authenticated requests
+    let r = oauth::with_dpop_layer(r, &app);
     let r = if app.config.rate_limits_enabled {
         let limiter = Arc::new(crate::ratelimit::Limiter::new(&app.config));
         r.layer(axum::middleware::from_fn_with_state(limiter, crate::ratelimit::layer))

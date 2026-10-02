@@ -69,25 +69,58 @@ impl Cid {
         Ok((Cid::from_bytes(&b[..CID_BYTES_LEN])?, CID_BYTES_LEN))
     }
 
+    /// Parses the string form: `b` + 58 base32-lower characters, canonical
+    /// (the 2 padding bits of the last character zero). Decodes into a
+    /// stack buffer, 8 characters to 5 bytes at a time through a lookup
+    /// table: no allocation (approach from shrike (MIT/Apache-2.0), whose
+    /// `Cid::from_str` decodes into a stack buffer; the old path built a
+    /// `Vec` bit by bit). Accepts exactly what
+    /// `Cid::from_bytes(&base32_decode(rest)?)` accepts: no other length
+    /// decodes canonically to 36 bytes.
     pub fn parse(s: &str) -> Result<Cid, CidError> {
-        let rest = s.strip_prefix('b').ok_or(CidError::Unsupported)?;
-        let bytes = base32_decode(rest).ok_or(CidError::Unsupported)?;
-        Cid::from_bytes(&bytes)
+        let s = s.as_bytes();
+        if s.len() != 1 + CID_STR_LEN || s[0] != b'b' {
+            return Err(CidError::Unsupported);
+        }
+        let mut b = [0u8; CID_BYTES_LEN];
+        if !decode_cid_body(&s[1..], &mut b) {
+            return Err(CidError::Unsupported);
+        }
+        Cid::from_bytes(&b)
+    }
+
+    /// The string form (as `Display`) in a stack buffer.
+    #[inline]
+    fn encode_str(&self) -> [u8; 1 + CID_STR_LEN] {
+        let raw = self.to_bytes();
+        let mut out = [0u8; 1 + CID_STR_LEN];
+        out[0] = b'b';
+        // 36 bytes = 7 groups of 5 (8 characters each) + 1 byte (2 characters)
+        for g in 0..7 {
+            enc5(&raw[g * 5..g * 5 + 5], &mut out[1 + g * 8..1 + g * 8 + 8]);
+        }
+        let last = raw[35];
+        out[57] = B32[(last >> 3) as usize];
+        out[58] = B32[((last & 7) << 2) as usize];
+        out
     }
 }
+
+/// Base32 characters in a CID string (36 bytes, unpadded).
+const CID_STR_LEN: usize = 58;
 
 impl Cid {
     /// Appends the string form (as `Display`) without an intermediate String.
     pub fn write_string(&self, out: &mut Vec<u8>) {
-        out.push(b'b');
-        base32_encode_into(&self.to_bytes(), out);
+        out.extend_from_slice(&self.encode_str());
     }
 }
 
 impl fmt::Display for Cid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("b")?;
-        f.write_str(&base32_encode(&self.to_bytes()))
+        // one stack buffer and one write (shrike's Display does the same)
+        let s = self.encode_str();
+        f.write_str(std::str::from_utf8(&s).map_err(|_| fmt::Error)?)
     }
 }
 
@@ -105,6 +138,57 @@ pub enum CidError {
 
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
+/// Character -> 5-bit value, 0xff for anything outside base32-lower.
+const B32_DEC: [u8; 256] = {
+    let mut t = [0xffu8; 256];
+    let mut i = 0;
+    while i < 32 {
+        t[B32[i] as usize] = i as u8;
+        i += 1;
+    }
+    t
+};
+
+/// 5 bytes -> 8 characters.
+#[inline(always)]
+fn enc5(src: &[u8], dst: &mut [u8]) {
+    let v = (src[0] as u64) << 32 | (src[1] as u64) << 24 | (src[2] as u64) << 16 | (src[3] as u64) << 8 | src[4] as u64;
+    for (i, d) in dst[..8].iter_mut().enumerate() {
+        *d = B32[((v >> (35 - 5 * i)) & 31) as usize];
+    }
+}
+
+/// 8 characters -> 5 bytes; false on a character outside the alphabet.
+#[inline(always)]
+fn dec8(src: &[u8], dst: &mut [u8]) -> bool {
+    let mut v = 0u64;
+    let mut bad = 0u8;
+    for &c in &src[..8] {
+        let d = B32_DEC[c as usize];
+        bad |= d;
+        v = v << 5 | (d & 31) as u64;
+    }
+    dst[..5].copy_from_slice(&v.to_be_bytes()[3..]);
+    bad & 0x80 == 0
+}
+
+/// The 58 characters after a CID's `b` -> its 36 bytes, canonical only.
+#[inline]
+fn decode_cid_body(s: &[u8], out: &mut [u8; CID_BYTES_LEN]) -> bool {
+    debug_assert_eq!(s.len(), CID_STR_LEN);
+    let mut ok = true;
+    for g in 0..7 {
+        ok &= dec8(&s[g * 8..g * 8 + 8], &mut out[g * 5..g * 5 + 5]);
+    }
+    let (a, b) = (B32_DEC[s[56] as usize], B32_DEC[s[57] as usize]);
+    // 10 bits: one byte, then 2 padding bits that must be zero
+    if !ok || (a | b) & 0x80 != 0 || b & 3 != 0 {
+        return false;
+    }
+    out[35] = a << 3 | b >> 2;
+    true
+}
+
 pub fn base32_encode(data: &[u8]) -> String {
     let mut out = Vec::with_capacity((data.len() * 8).div_ceil(5));
     base32_encode_into(data, &mut out);
@@ -113,9 +197,17 @@ pub fn base32_encode(data: &[u8]) -> String {
 }
 
 pub fn base32_encode_into(data: &[u8], out: &mut Vec<u8>) {
+    // whole 5-byte groups through the table, then the tail bit by bit
+    let whole = data.len() / 5 * 5;
+    out.reserve((data.len() * 8).div_ceil(5));
+    let mut chunk = [0u8; 8];
+    for g in data[..whole].as_chunks::<5>().0 {
+        enc5(g, &mut chunk);
+        out.extend_from_slice(&chunk);
+    }
     let mut buf: u32 = 0;
     let mut bits = 0;
-    for &b in data {
+    for &b in &data[whole..] {
         buf = (buf << 8) | b as u32;
         bits += 8;
         while bits >= 5 {
@@ -129,16 +221,26 @@ pub fn base32_encode_into(data: &[u8], out: &mut Vec<u8>) {
 }
 
 pub fn base32_decode(s: &str) -> Option<Vec<u8>> {
+    let s = s.as_bytes();
     let mut out = Vec::with_capacity(s.len() * 5 / 8);
+    // whole 8-character groups through the table (they end on a byte
+    // boundary), then the tail bit by bit
+    let whole = s.len() / 8 * 8;
+    let mut chunk = [0u8; 5];
+    for g in s[..whole].as_chunks::<8>().0 {
+        if !dec8(g, &mut chunk) {
+            return None;
+        }
+        out.extend_from_slice(&chunk);
+    }
     let mut buf: u32 = 0;
     let mut bits = 0;
-    for c in s.bytes() {
-        let v = match c {
-            b'a'..=b'z' => c - b'a',
-            b'2'..=b'7' => c - b'2' + 26,
-            _ => return None,
-        } as u32;
-        buf = (buf << 5) | v;
+    for &c in &s[whole..] {
+        let v = B32_DEC[c as usize];
+        if v == 0xff {
+            return None;
+        }
+        buf = (buf << 5) | v as u32;
         bits += 5;
         if bits >= 8 {
             bits -= 8;

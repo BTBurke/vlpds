@@ -82,6 +82,12 @@ pub const REPO_LOADING: &str = "RepoLoading";
 /// before it started (moving between owners): not applied either.
 pub const SHARD_MOVED: &str = "ShardMoved";
 
+/// Response extension on a forward's 503 when the owner refused the
+/// connection: nothing was sent, so a write can be resent (its owner died;
+/// routing follows once a peer presumes it dead, see `Cluster::read_nodes`).
+#[derive(Clone, Copy, Debug)]
+pub struct NotSent;
+
 tokio::task_local! {
     /// Set while a request a peer forwarded here is being served.
     static FORWARDED: ();
@@ -114,8 +120,13 @@ pub trait Router: Send + Sync + 'static {
     /// The node itself: its internal token (forwarded markers are trusted
     /// and sent only with it), OAuth routing and email lookups. None (tests)
     /// = XRPC routing only, and no forwarded marker is trusted.
-    fn app(&self) -> Option<Arc<crate::xrpc::App>> {
+    fn app(&self) -> Option<&crate::xrpc::App> {
         None
+    }
+    /// No live peer: every shard is ours or unowned, so nothing routes
+    /// elsewhere and requests skip the routing work (token and body parse).
+    fn alone(&self) -> bool {
+        false
     }
 }
 
@@ -486,34 +497,32 @@ async fn oauth_target(
     Ok((req, key))
 }
 
-pub async fn route(
-    router: Arc<dyn Router>,
-    client: crate::http::PeerClient,
-    mut req: Request,
-    next: axum::middleware::Next,
-) -> Response {
+pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut req: Request, next: axum::middleware::Next) -> Response {
     let path = req.uri().path();
     let (xrpc, oauth) = (path.starts_with("/xrpc/"), path.starts_with("/oauth/"));
     if !xrpc && !oauth {
         return next.run(req).await;
     }
     let app = router.app();
-    if take_forwarded(&mut req, app.as_deref()) {
+    if take_forwarded(&mut req, app) {
         return FORWARDED.scope((), next.run(req)).await;
     }
+    if router.alone() {
+        return next.run(req).await;
+    }
     let target = if xrpc {
-        xrpc_target(&*router, app.as_deref(), req).await
+        xrpc_target(router, app, req).await
     } else {
-        oauth_target(app.as_deref(), req).await
+        oauth_target(app, req).await
     };
     let (req, key) = match target {
         Ok(t) => t,
         Err(r) => return r,
     };
-    let token = app.as_ref().map(|a| a.config.internal_token.clone());
-    let retry = app.as_ref().is_some_and(|a| a.config.retry_unapplied_writes);
+    let token = app.map(|a| a.config.internal_token.as_str());
+    let retry = app.is_some_and(|a| a.config.retry_unapplied_writes);
     if let Some(k) = key.as_deref().filter(|_| retry && retryable_write(&req)) {
-        return write_with_retries(&*router, &client, k, req, token.as_deref(), next).await;
+        return write_with_retries(router, client, k, req, token, next).await;
     }
     let Some(owner) = key.as_deref().and_then(|k| router.remote_owner(k)) else {
         return next.run(req).await;
@@ -521,7 +530,7 @@ pub async fn route(
     crate::metrics::FORWARDED.inc();
     let ttfb = ttfb_for(&req);
     let t = Instant::now();
-    let resp = forward(client.pick(), &owner, req, token.as_deref(), ttfb).await;
+    let resp = forward(client.pick(), &owner, req, token, ttfb).await;
     crate::metrics::observe_forward(resp.status().as_u16(), t);
     resp
 }
@@ -547,6 +556,11 @@ async fn write_with_retries(
     let ttfb = ttfb_for(&req);
     let (parts, _) = req.into_parts();
     let started = Instant::now();
+    // Resends back off (doubling, at most 1 s): an owner that is reopening
+    // shards must not be swamped by every entry node's resends (seen at
+    // 50 ms fixed: ~20 resends/s per held write starved a restarted node's
+    // replay, 0.5 s -> 60 s).
+    let mut attempt = 0u32;
     loop {
         let mut req = Request::new(Body::from(body.clone()));
         *req.method_mut() = parts.method.clone();
@@ -567,10 +581,13 @@ async fn write_with_retries(
         if resp.status() != StatusCode::SERVICE_UNAVAILABLE {
             return resp;
         }
+        let not_sent = resp.extensions().get::<NotSent>().is_some();
         let (rp, rbody) = resp.into_parts();
         let bytes = axum::body::to_bytes(rbody, 64 << 10).await.unwrap_or_default();
         let err = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v["error"].as_str().map(str::to_string));
         let (reason, pause) = match err.as_deref() {
+            // the owner died: wait for a peer to take its shards over
+            _ if not_sent => ("unreachable", Duration::from_millis(100)),
             Some(REPO_LOADING) => ("loading", Duration::from_millis(10)),
             // routing follows the move within a control-plane nudge
             Some(SHARD_MOVED) => ("moved", Duration::from_millis(50)),
@@ -580,7 +597,8 @@ async fn write_with_retries(
             return Response::from_parts(rp, Body::from(bytes));
         }
         crate::metrics::WRITE_RETRIES.with_label_values(&[reason]).inc();
-        tokio::time::sleep(pause).await;
+        tokio::time::sleep((pause * 2u32.pow(attempt.min(6))).min(Duration::from_secs(1))).await;
+        attempt += 1;
     }
 }
 
@@ -725,7 +743,14 @@ async fn forward(
     let resp = tokio::select! {
         r = send => match r {
             Ok(r) => r,
-            Err(e) => return unavailable(format!("owner unreachable: {e}")),
+            Err(e) => {
+                let mut r = unavailable(format!("owner unreachable: {e}"));
+                // a refused connect sent nothing; anything later may have
+                if e.is_connect() {
+                    r.extensions_mut().insert(NotSent);
+                }
+                return r;
+            }
         },
         _ = progress.deadline(ttfb) => {
             tracing::warn!(owner, path = parts.uri.path(), "forward: owner did not answer in time");
@@ -851,7 +876,7 @@ mod tests {
             )
             .layer(axum::middleware::from_fn(move |req, next| {
                 let (r, client) = (r.clone(), client.clone());
-                async move { route(r, client, req, next).await }
+                async move { route(&*r, &client, req, next).await }
             }));
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());

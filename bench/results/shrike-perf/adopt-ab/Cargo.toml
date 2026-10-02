@@ -1,0 +1,21 @@
+[package]
+name = "ab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "cbor", "crypto", "mst", "repo", "car", "lexicon", "streaming"] }
+serde_json = "1"
+rand = "0.8"
+base64 = "0.22"
+vlpds = { path = "../../../..", default-features = false }
+# the tree before this change (f6a9e33 + working tree) copied elsewhere with
+# its package renamed to vlpds_base (RESULTS.md "Adopted in vlpds")
+vlpds_base = { path = "../vlpds_base", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = 1

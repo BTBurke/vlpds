@@ -1360,23 +1360,26 @@ pub(super) async fn create_account_inner(
             super::admin::release_invite_use(app, c).await;
         }
     };
-    // Global handle uniqueness across nodes: conditional create of handle/{handle}.
-    let claimed = match claim_handle(app, &handle, &did).await {
-        Ok(c) => c,
-        Err(e) => {
-            release(claim).await;
-            return Err(e);
+    // Global handle and email uniqueness across nodes: conditional creates
+    // of handle/{handle} and the email claim. Both store round trips and the
+    // password hash (~20 ms of CPU on the blocking pool) run concurrently:
+    // one after the other they were most of createAccount's latency, and at
+    // a fixed concurrency its rate.
+    let (h, e, password_hash) =
+        tokio::join!(claim_handle(app, &handle, &did), claim_email(app, &email, &did), state::hash_password(&password));
+    let (h_ok, e_ok) = (matches!(h, Ok(true)), matches!(e, Ok(true)));
+    if !(h_ok && e_ok) {
+        if h_ok {
+            release_handle(app, &handle, &did).await;
         }
-    };
-    if !claimed {
+        if e_ok {
+            release_email(app, &email, &did).await;
+        }
         release(claim).await;
-        return Err(XrpcError::bad("HandleNotAvailable", format!("Handle already taken: {handle}")));
-    }
-    let r = claim_email(app, &email, &did).await;
-    if !matches!(r, Ok(true)) {
-        release_handle(app, &handle, &did).await;
-        release(claim).await;
-        r?;
+        if !h? {
+            return Err(XrpcError::bad("HandleNotAvailable", format!("Handle already taken: {handle}")));
+        }
+        e?;
         return Err(invalid_request(format!("Email already taken: {email}")));
     }
     let key = Arc::new(Keypair::generate());
@@ -1388,7 +1391,7 @@ pub(super) async fn create_account_inner(
         email: Some(email.clone()),
         ..Default::default()
     };
-    acct.password_hash = state::hash_password(&password).await;
+    acct.password_hash = password_hash;
     set_extra(&mut acct, "totpEnabled", json!(false));
     if let Some(code) = &invite {
         set_extra(&mut acct, "invitedBy", json!(code));
