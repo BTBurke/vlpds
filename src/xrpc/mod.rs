@@ -176,18 +176,26 @@ impl From<WriteError> for XrpcError {
             WriteError::InvalidSwap(m) => XrpcError::bad("InvalidSwap", m),
             WriteError::Invalid(m) => XrpcError::bad("InvalidRequest", m),
             WriteError::Internal(m) => XrpcError::internal(m),
-            WriteError::Unavailable(m) => XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: "PartitionUnavailable".into(), message: m },
+            // not applied (the shard left before the write started): the
+            // entry node resends repo writes (crate::forward)
+            WriteError::Unavailable(m) => XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: crate::forward::SHARD_MOVED.into(), message: m },
         }
     }
 }
 
 impl IntoResponse for XrpcError {
     fn into_response(self) -> Response {
-        (
+        let unavailable = self.status == StatusCode::SERVICE_UNAVAILABLE;
+        let mut r = (
             self.status,
             Json(json!({"error": self.error, "message": self.message})),
         )
-            .into_response()
+            .into_response();
+        // every 503 here is transient (shard moving, shedding, repo loading)
+        if unavailable {
+            r.headers_mut().insert(header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));
+        }
+        r
     }
 }
 

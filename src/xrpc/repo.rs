@@ -199,7 +199,12 @@ async fn submit(
     };
     let start = Instant::now();
     STATS.write_requests.fetch_add(1, Ordering::Relaxed);
-    let (tx, rx) = oneshot::channel();
+    let (tx, mut rx) = oneshot::channel();
+    // A peer forwarded this and fails it at its time-to-first-byte deadline:
+    // if the write can't start soon (cold repo load), give it up unapplied
+    // and say so; the peer resends it (crate::forward, "RepoLoading").
+    let start_wait = app.config.forwarded_write_start.filter(|_| crate::forward::is_forwarded());
+    let claim = start_wait.map(|_| Arc::new(crate::worker::Claim::default()));
     app.workers
         .route(&did)
         .send(WorkerMsg::Write(WriteReq {
@@ -207,11 +212,25 @@ async fn submit(
             writes,
             swap_commit,
             reply: tx,
+            claim: claim.clone(),
         }))
         .map_err(XrpcError::from_err)?;
-    let r = rx
-        .await
-        .map_err(|_| XrpcError::internal("worker dropped request"))?;
+    let r = match (start_wait, &claim) {
+        (Some(wait), Some(c)) => match tokio::time::timeout(wait, &mut rx).await {
+            Ok(r) => r,
+            Err(_) if c.abandon() => {
+                metrics::WRITE_ERRORS.with_label_values(&["not_started"]).inc();
+                return Err(XrpcError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    error: crate::forward::REPO_LOADING.into(),
+                    message: format!("write not started within {} ms (repo loading); not applied, retry", wait.as_millis()),
+                });
+            }
+            Err(_) => rx.await,
+        },
+        _ => rx.await,
+    }
+    .map_err(|_| XrpcError::internal("worker dropped request"))?;
     STATS.record_request(start.elapsed());
     r.map_err(|e| {
         STATS.write_errors.fetch_add(1, Ordering::Relaxed);

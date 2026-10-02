@@ -176,6 +176,30 @@ struct Args {
     /// deleted; older cursors get OutdatedCursor.
     #[arg(long, env = "VLPDS_LOG_RETENTION", default_value = "72h")]
     log_retention: String,
+    /// Every owned shard is checkpointed (applied marker + memtable flush)
+    /// once per this: bounds how much log a successor replays after a crash.
+    #[arg(long, env = "VLPDS_CHECKPOINT_EVERY", default_value = "10s")]
+    checkpoint_every: String,
+    /// Spread checkpoints over --checkpoint-every, one shard at a time
+    /// (false: every shard back to back once per interval).
+    #[arg(long, env = "VLPDS_CHECKPOINT_STAGGER", default_value_t = true, action = clap::ArgAction::Set)]
+    checkpoint_stagger: bool,
+    /// Recently written repos remembered per shard (persisted with its
+    /// checkpoints) and preloaded by the shard's next owner (restart,
+    /// takeover, handback). 0 = off.
+    #[arg(long, env = "VLPDS_PRELOAD_RECENT", default_value_t = vlpds::partition::DEFAULT_RECENT_REPOS)]
+    preload_recent: usize,
+    /// A write forwarded here that hasn't started within this many ms (its
+    /// repo still loading) is answered 503 RepoLoading, unapplied, and the
+    /// forwarding node resends it (DESIGN.md "Forwarding deadlines"). 0 =
+    /// wait for it (the forwarder's 3 s deadline then fails it).
+    #[arg(long, env = "VLPDS_FORWARDED_WRITE_START_MS", default_value_t = vlpds::forward::FORWARDED_WRITE_START.as_millis() as u64)]
+    forwarded_write_start_ms: u64,
+    /// Resend repo writes answered "not applied" (503 RepoLoading /
+    /// ShardMoved: a cold repo load, a shard moving) from the node the
+    /// client called, for up to 20 s, instead of failing them.
+    #[arg(long, env = "VLPDS_RETRY_UNAPPLIED_WRITES", default_value_t = true, action = clap::ArgAction::Set)]
+    retry_unapplied_writes: bool,
     /// Default AppView for proxied requests: "<url>,<service did>".
     #[arg(long, env = "VLPDS_APPVIEW")]
     appview: Option<String>,
@@ -514,6 +538,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
             split_bytes: (args.reshard_split_mb > 0).then_some(args.reshard_split_mb << 20),
             split_writes_per_sec: (args.reshard_split_writes > 0.0).then_some(args.reshard_split_writes),
         },
+        checkpoint_every: vlpds::retention::parse_duration(&args.checkpoint_every)?,
+        checkpoint_stagger: args.checkpoint_stagger,
+        preload_recent: args.preload_recent,
+        forwarded_write_start: (args.forwarded_write_start_ms > 0).then(|| Duration::from_millis(args.forwarded_write_start_ms)),
+        retry_unapplied_writes: args.retry_unapplied_writes,
     };
     cfg.check_secrets()?;
     if args.lease_ttl_ms < 10_000 && !args.dev_mode {

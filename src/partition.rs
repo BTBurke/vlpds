@@ -23,6 +23,85 @@ pub struct Partition {
     /// The node log's watermark.
     pub wm: Arc<Watermark>,
     pub log: Arc<NodeLog>,
+    /// Repos recently written here (preloaded by the shard's next owner).
+    pub recent: Arc<RecentRepos>,
+}
+
+/// Default bound of [`RecentRepos`] per shard (`--preload-recent`).
+pub const DEFAULT_RECENT_REPOS: usize = 2048;
+
+/// The repos a shard committed to most recently, newest first, bounded.
+/// Persisted with each checkpoint and at close (`nodelog::META_RECENT`,
+/// only when the set's members changed), and preloaded by the shard's next
+/// owner ([`crate::worker::spawn_preload`]), so the first writes after a
+/// restart, takeover or handback find their repos warm (DESIGN.md §2). A
+/// hint: a stale entry costs one load.
+pub struct RecentRepos {
+    cap: usize,
+    inner: parking_lot::Mutex<(lru::LruCache<Arc<str>, ()>, bool)>,
+}
+
+impl Default for RecentRepos {
+    fn default() -> Self {
+        RecentRepos::new(DEFAULT_RECENT_REPOS)
+    }
+}
+
+impl RecentRepos {
+    /// `cap` 0 = track nothing.
+    pub fn new(cap: usize) -> RecentRepos {
+        RecentRepos { cap, inner: parking_lot::Mutex::new((lru::LruCache::unbounded(), false)) }
+    }
+
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// `did` committed (a worker, once per commit batch).
+    pub fn touch(&self, did: &Arc<str>) {
+        if self.cap == 0 {
+            return;
+        }
+        let mut g = self.inner.lock();
+        if g.0.put(did.clone(), ()).is_none() {
+            g.1 = true;
+            if g.0.len() > self.cap {
+                g.0.pop_lru();
+            }
+        }
+    }
+
+    /// Adds a previous owner's list (newest first) behind what's here.
+    pub fn seed(&self, dids: &[Arc<str>]) {
+        let mut g = self.inner.lock();
+        for d in dids {
+            if g.0.len() >= self.cap {
+                break;
+            }
+            if !g.0.contains(d) {
+                g.0.push(d.clone(), ());
+                g.0.demote(d);
+            }
+        }
+    }
+
+    /// The set, newest first, if its members changed since the last call.
+    pub fn take_dirty(&self) -> Option<bytes::Bytes> {
+        let mut g = self.inner.lock();
+        if !std::mem::take(&mut g.1) {
+            return None;
+        }
+        let mut b = Vec::with_capacity(g.0.len() * 33);
+        for (d, _) in g.0.iter() {
+            b.extend_from_slice(d.as_bytes());
+            b.push(b'\n');
+        }
+        Some(b.into())
+    }
+
+    pub fn decode(b: &[u8]) -> Vec<Arc<str>> {
+        b.split(|&c| c == b'\n').filter(|d| !d.is_empty()).filter_map(|d| std::str::from_utf8(d).ok()).map(Arc::from).collect()
+    }
 }
 
 /// One SST block/meta cache shared by every shard DB in the process. SlateDB's

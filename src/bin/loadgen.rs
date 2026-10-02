@@ -177,8 +177,11 @@ enum Cmd {
         acked: String,
     },
     /// Bulk-create simulation accounts (deterministic DIDs) via the admin API.
-    /// In a cluster send the same range to every node: each creates the DIDs
-    /// it owns and skips the rest.
+    /// Run one per node with the same range: each asks its node which shards
+    /// it serves (getClusterStatus) and sends it only those DIDs, with one
+    /// record count per account. Idempotent: a resumed range skips accounts
+    /// that exist. Fails if the node stops owning a DID it was sent (the
+    /// layout moved): re-run.
     Bulk {
         #[arg(long, default_value_t = 0)]
         start: u64,
@@ -187,8 +190,8 @@ enum Cmd {
         /// Max accounts per bulkCreate request.
         #[arg(long, default_value_t = 1000)]
         batch: u64,
-        /// Max genesis records per bulkCreate request (a run of big repos is
-        /// split; one account always fits in a request).
+        /// Max genesis records per bulkCreate request (one account always
+        /// fits in a request).
         #[arg(long, default_value_t = 50_000)]
         max_request_records: u64,
         #[arg(long, default_value_t = 16)]
@@ -230,8 +233,8 @@ enum Cmd {
 /// --dist-scale with stochastic rounding (keeps the mean exactly /scale and
 /// the tail's shape; the body collapses toward 0/1 records), optionally
 /// capped. Deterministic in (seed, index / group): consecutive groups of
-/// --dist-group accounts share one draw, so a bulkCreate batch splits into
-/// few equal-count runs (the API takes one record count per range). DIDs
+/// --dist-group accounts share one draw (1 = every account its own; the
+/// API takes a count per account, so groups no longer save requests). DIDs
 /// are hashed, so a group's repos land on unrelated shards; the marginal
 /// distribution per repo is unchanged.
 #[derive(clap::Args, Clone)]
@@ -244,7 +247,7 @@ struct DistArgs {
     records: u32,
     #[arg(long, default_value_t = 1.0)]
     dist_scale: f64,
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 1)]
     dist_group: u64,
     #[arg(long, default_value_t = 1)]
     dist_seed: u64,
@@ -983,40 +986,77 @@ impl Dist {
     }
 }
 
-/// bulkCreate requests for accounts start..start+count, in index order: runs
-/// of equal record counts, at most `batch` accounts and (one account aside)
-/// `max_records` genesis records each. Yields (start, count, records).
+/// The slot ranges of the shards a node serves (its getClusterStatus), or
+/// None outside a cluster (it serves every account).
+async fn owned_slots(c: &reqwest::Client, host: &str, admin_token: &str) -> anyhow::Result<Option<Vec<(u32, u32)>>> {
+    let v: serde_json::Value = c
+        .get(format!("{host}/xrpc/vlpds.admin.getClusterStatus"))
+        .basic_auth("admin", Some(admin_token))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let Some(shards) = v["layout"]["shards"].as_array() else { return Ok(None) };
+    let owned: std::collections::HashSet<u64> = v["owned"].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).collect();
+    let mut r: Vec<(u32, u32)> = shards
+        .iter()
+        .filter(|s| s["id"].as_u64().is_some_and(|id| owned.contains(&id)))
+        .map(|s| (s["lo"].as_u64().unwrap_or(0) as u32, s["hi"].as_u64().unwrap_or(0) as u32))
+        .collect();
+    r.sort_unstable();
+    Ok(Some(r))
+}
+
+fn owns(slots: &[(u32, u32)], i: u64) -> bool {
+    let s = vlpds::slots::slot_of(&vlpds::state::bulk_did(i)) as u32;
+    let k = slots.partition_point(|r| r.1 <= s);
+    k < slots.len() && slots[k].0 <= s
+}
+
+/// One bulkCreate request: the accounts of [lo, hi) this node creates
+/// (`indices`; None = all of them) and their record counts.
+struct BulkReq {
+    lo: u64,
+    hi: u64,
+    indices: Option<Vec<u64>>,
+    records: Vec<u32>,
+}
+
+/// bulkCreate requests for accounts start..start+count, in index order: at
+/// most `batch` accounts and (one account aside) `max_records` genesis
+/// records each, skipping accounts outside `owned` (slot ranges).
 struct BulkPlan<'a> {
     d: &'a Dist,
     next: u64,
     end: u64,
     batch: u64,
     max_records: u64,
+    owned: Option<&'a [(u32, u32)]>,
 }
 
 impl Iterator for BulkPlan<'_> {
-    type Item = (u64, u64, u32);
-    fn next(&mut self) -> Option<(u64, u64, u32)> {
+    type Item = BulkReq;
+    fn next(&mut self) -> Option<BulkReq> {
         if self.next >= self.end {
             return None;
         }
-        let s = self.next;
-        let r = self.d.records(s);
-        let per = (self.max_records / (r as u64).max(1)).max(1).min(self.batch);
-        // batches stay aligned to `batch` so the plan is the same from any resume point
-        let batch_end = ((s / self.batch) + 1) * self.batch;
-        let lim = self.end.min(batch_end).min(s + per);
-        let mut e = s + 1;
-        // runs only change at group boundaries
-        while e < lim {
-            let ge = (((e / self.d.group) + 1) * self.d.group).min(lim);
-            if self.d.records(e) != r {
-                break;
+        let lo = self.next;
+        let (mut idx, mut recs, mut total) = (Vec::new(), Vec::new(), 0u64);
+        while self.next < self.end && (idx.len() as u64) < self.batch {
+            let i = self.next;
+            if self.owned.is_none_or(|o| owns(o, i)) {
+                let r = self.d.records(i);
+                if !idx.is_empty() && total + r as u64 > self.max_records {
+                    break;
+                }
+                idx.push(i);
+                recs.push(r);
+                total += r as u64;
             }
-            e = ge;
+            self.next += 1;
         }
-        self.next = e;
-        Some((s, e - s, r))
+        Some(BulkReq { lo, hi: self.next, indices: self.owned.is_some().then_some(idx), records: recs })
     }
 }
 
@@ -1033,22 +1073,28 @@ async fn bulk(
     progress_file: &str,
 ) -> anyhow::Result<()> {
     let c = client();
+    let owned = owned_slots(&c, &args.host, admin_token).await?;
+    if let Some(o) = &owned {
+        let slots: u32 = o.iter().map(|r| r.1 - r.0).sum();
+        eprintln!("bulk: {} serves {} shards ({:.1}% of slots): sending only its DIDs", args.host, o.len(), slots as f64 / 655.36);
+        anyhow::ensure!(!o.is_empty(), "{} serves no shards (cluster not converged?)", args.host);
+    }
     let t = Instant::now();
     let done = Arc::new(AtomicU64::new(0));
     let recs = Arc::new(AtomicU64::new(0));
     let created = Arc::new(AtomicU64::new(0));
-    let skipped = Arc::new(AtomicU64::new(0));
+    let existing = Arc::new(AtomicU64::new(0));
     let reqs = Arc::new(AtomicU64::new(0));
     // completed ranges past the watermark (requests finish out of order)
     let wm = Arc::new(Mutex::new((start, std::collections::BTreeMap::<u64, u64>::new())));
     let write_progress = {
-        let (done, recs, created, skipped, wm) = (done.clone(), recs.clone(), created.clone(), skipped.clone(), wm.clone());
+        let (done, recs, created, existing, reqs, wm) = (done.clone(), recs.clone(), created.clone(), existing.clone(), reqs.clone(), wm.clone());
         let path = progress_file.to_string();
         move |fin: bool| {
             let secs = t.elapsed().as_secs_f64();
-            let (a, r) = (done.load(Ordering::Relaxed), recs.load(Ordering::Relaxed));
+            let (a, r, n) = (done.load(Ordering::Relaxed), recs.load(Ordering::Relaxed), reqs.load(Ordering::Relaxed));
             let v = json!({"start": start, "count": count, "watermark": wm.lock().0, "accounts": a, "records": r,
-                "created": created.load(Ordering::Relaxed), "skipped": skipped.load(Ordering::Relaxed),
+                "created": created.load(Ordering::Relaxed), "existing": existing.load(Ordering::Relaxed), "requests": n,
                 "secs": secs, "accounts_s": a as f64 / secs, "records_s": r as f64 / secs, "done": fin});
             if !path.is_empty() {
                 let tmp = format!("{path}.tmp");
@@ -1076,32 +1122,33 @@ async fn bulk(
             }
         })
     };
-    let plan = BulkPlan { d, next: start, end: start + count, batch: batch.max(1), max_records: max_records.max(1) };
+    let plan = BulkPlan { d, next: start, end: start + count, batch: batch.max(1), max_records: max_records.max(1), owned: owned.as_deref() };
     let mut results = futures::stream::iter(plan)
-        .map(|(b, n, r)| {
+        .map(|q| {
             let c = c.clone();
             let host = args.host.clone();
-            let (done, recs, created, skipped, reqs, wm) = (done.clone(), recs.clone(), created.clone(), skipped.clone(), reqs.clone(), wm.clone());
+            let (done, recs, created, existing, reqs, wm) = (done.clone(), recs.clone(), created.clone(), existing.clone(), reqs.clone(), wm.clone());
             async move {
-                let resp = c
-                    .post(format!("{host}/xrpc/vlpds.admin.bulkCreate"))
-                    .bearer_auth(admin_token)
-                    .json(&json!({"start": b, "count": n, "records": r}))
-                    .send()
-                    .await?;
-                let status = resp.status();
-                let body = resp.text().await?;
-                let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({"raw": body}));
-                anyhow::ensure!(status.is_success() && v["failed"].as_u64() == Some(0), "bulk {b}+{n} (x{r}) failed: {status} {v}");
-                reqs.fetch_add(1, Ordering::Relaxed);
-                done.fetch_add(n, Ordering::Relaxed);
-                // records this node created (skipped = another node's DIDs)
-                let made = v["created"].as_u64().unwrap_or(0);
-                created.fetch_add(made, Ordering::Relaxed);
-                skipped.fetch_add(v["skipped"].as_u64().unwrap_or(0), Ordering::Relaxed);
-                recs.fetch_add(made * r as u64, Ordering::Relaxed);
+                let (lo, hi) = (q.lo, q.hi);
+                if !q.records.is_empty() {
+                    let body = match &q.indices {
+                        Some(idx) => json!({"indices": idx, "records": q.records}),
+                        None => json!({"start": lo, "count": hi - lo, "records": q.records}),
+                    };
+                    let resp = c.post(format!("{host}/xrpc/vlpds.admin.bulkCreate")).bearer_auth(admin_token).json(&body).send().await?;
+                    let status = resp.status();
+                    let text = resp.text().await?;
+                    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"raw": text}));
+                    anyhow::ensure!(status.is_success() && v["failed"].as_u64() == Some(0), "bulk {lo}..{hi} failed: {status} {v}");
+                    anyhow::ensure!(v["notOwned"].as_u64() == Some(0), "bulk {lo}..{hi}: {host} no longer serves {} of its DIDs (layout moved): re-run", v["notOwned"]);
+                    reqs.fetch_add(1, Ordering::Relaxed);
+                    created.fetch_add(v["created"].as_u64().unwrap_or(0), Ordering::Relaxed);
+                    existing.fetch_add(v["existing"].as_u64().unwrap_or(0), Ordering::Relaxed);
+                    recs.fetch_add(v["records"].as_u64().unwrap_or(0), Ordering::Relaxed);
+                }
+                done.fetch_add(hi - lo, Ordering::Relaxed);
                 let mut g = wm.lock();
-                g.1.insert(b, b + n);
+                g.1.insert(lo, hi);
                 loop {
                     let k = g.0;
                     let Some(e) = g.1.remove(&k) else { break };
@@ -1125,9 +1172,9 @@ async fn bulk(
         return Err(e);
     }
     eprintln!(
-        "bulk done: {count} accounts ({} created here, {} skipped) x {} dist, {} records here, {} requests in {:.1}s ({:.0} accounts/s, {:.0} records/s)",
-        v["created"], v["skipped"], d.fixed.map(|n| n.to_string()).unwrap_or_else(|| format!("real/{}", d.scale)),
-        v["records"], reqs.load(Ordering::Relaxed), t.elapsed().as_secs_f64(),
+        "bulk done: {count} accounts ({} created here, {} existed) x {} dist, {} records here, {} requests in {:.1}s ({:.0} accounts/s, {:.0} records/s)",
+        v["created"], v["existing"], d.fixed.map(|n| n.to_string()).unwrap_or_else(|| format!("real/{}", d.scale)),
+        v["records"], v["requests"], t.elapsed().as_secs_f64(),
         v["accounts_s"].as_f64().unwrap_or(0.0), v["records_s"].as_f64().unwrap_or(0.0)
     );
     println!("{v}");
@@ -1157,7 +1204,8 @@ fn dist_report(start: u64, count: u64, d: &Dist, batch: u64, max_records: u64, p
         h.record_n(r as u64 + 1, w)?;
         i = ge;
     }
-    let requests = BulkPlan { d, next: start, end, batch: batch.max(1), max_records: max_records.max(1) }.count();
+    // requests over all nodes (each sends only its own DIDs), as if one node
+    let requests = BulkPlan { d, next: start, end, batch: batch.max(1), max_records: max_records.max(1), owned: None }.count();
     let q = |p: f64| h.value_at_quantile(p).saturating_sub(1);
     let bytes = per_repo * count as f64 + per_record * total as f64;
     println!(

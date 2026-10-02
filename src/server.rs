@@ -110,6 +110,23 @@ pub struct Config {
     pub cache_entries: Vec<(crate::caches::Cache, usize)>,
     /// Automatic shard splits (src/reshard.rs; off by default).
     pub reshard_policy: crate::reshard::Policy,
+    /// Every shard is checkpointed once per this (bounds a successor's
+    /// replay; `--checkpoint-every`).
+    pub checkpoint_every: Duration,
+    /// Spread the checkpoints over the interval, one shard at a time, instead
+    /// of all shards back to back (`--checkpoint-stagger`).
+    pub checkpoint_stagger: bool,
+    /// Recently written repos tracked per shard and preloaded by its next
+    /// owner (`--preload-recent`; 0 = off).
+    pub preload_recent: usize,
+    /// A forwarded write not started within this (its repo still loading)
+    /// is answered 503 `RepoLoading` and retried by the forwarding node
+    /// (`--forwarded-write-start-ms`; None = wait for it).
+    pub forwarded_write_start: Option<Duration>,
+    /// The node a client called resends its repo writes answered "not
+    /// applied" (RepoLoading, ShardMoved) for up to 20 s
+    /// (`--retry-unapplied-writes`; crate::forward).
+    pub retry_unapplied_writes: bool,
 }
 
 /// Well-known secrets: only accepted with `dev_mode` (see [`Config::check_secrets`]).
@@ -198,6 +215,11 @@ impl Default for Config {
             cache_budget_bytes: None,
             cache_entries: Vec::new(),
             reshard_policy: Default::default(),
+            checkpoint_every: Duration::from_secs(10),
+            checkpoint_stagger: true,
+            preload_recent: crate::partition::DEFAULT_RECENT_REPOS,
+            forwarded_write_start: Some(crate::forward::FORWARDED_WRITE_START),
+            retry_unapplied_writes: true,
         }
     }
 }
@@ -274,13 +296,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
             }
         });
         // bound how much of our log a successor replays after a crash (~10 s)
-        let l = log.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                l.checkpoint_all().await;
-            }
-        });
+        log.spawn_checkpoints(cfg.checkpoint_every, cfg.checkpoint_stagger);
     }
     let http = crate::http::PeerClient::new(cfg.peer_connections)?;
     let node = crate::node::Node::new(
@@ -295,6 +311,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         cfg.cache_dir.clone(),
         cfg.internal_token.clone(),
         http.clone(),
+        cfg.preload_recent,
     );
     let host: Arc<dyn ShardHost> = node.clone();
     let node_handle = node.clone();

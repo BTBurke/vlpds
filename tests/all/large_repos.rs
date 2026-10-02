@@ -17,6 +17,8 @@ async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, pin: u64) ->
         c.memory_store = Some(store);
         c.shards = SHARDS;
         c.pin_repo_records = pin;
+        // only the large-repo preload (recent repos: tests/all/cold_start.rs)
+        c.preload_recent = 0;
         c.cluster = Some(vlpds::cluster::ClusterConfig {
             node_id: id,
             addr: c.public_url.clone(),

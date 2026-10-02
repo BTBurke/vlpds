@@ -1270,19 +1270,47 @@ async fn get_dev_mail(
 
 #[derive(Deserialize)]
 struct BulkCreateIn {
+    #[serde(default)]
     start: u64,
+    #[serde(default)]
     count: u64,
-    records: u32,
+    /// Explicit account indexes, instead of `start..start+count` (a load
+    /// generator sends each node only the DIDs it owns).
+    #[serde(default)]
+    indices: Option<Vec<u64>>,
+    records: BulkRecords,
 }
 
-/// Simulation-only: creates accounts `start..start+count` with deterministic
-/// DIDs (`state::bulk_did`) and `records` genesis posts each. Emits the normal
-/// #identity/#account/#sync events but skips the global handle claim object.
+/// Genesis records: one count for every account, or one per account
+/// (aligned with the account list).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BulkRecords {
+    All(u32),
+    Each(Vec<u32>),
+}
+
+/// Accounts and genesis records one bulkCreate request may carry.
+const BULK_MAX_ACCOUNTS: usize = 100_000;
+const BULK_MAX_RECORDS: u64 = 1_000_000;
+/// Head lookups in flight per request (the existence check).
+const BULK_EXISTS_CONCURRENCY: usize = 64;
+
+/// Simulation-only: creates accounts `start..start+count` (or `indices`)
+/// with deterministic DIDs (`state::bulk_did`) and genesis posts (`records`:
+/// one count, or one per account). Emits the normal #identity/#account/#sync
+/// events but skips the global handle claim object.
+///
+/// Idempotent, so a resumed range is safe: an account whose head is stored
+/// (or that its worker holds) is left alone and counted as `existing`.
+/// Accounts in shards this node doesn't serve are counted as `notOwned`
+/// (send each node its own DIDs, or the same range to every node).
 async fn bulk_create(
     State(app): AppState,
     headers: HeaderMap,
     Json(inp): Json<BulkCreateIn>,
 ) -> XResult<Json<J>> {
+    use futures::StreamExt;
     let tok = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -1290,14 +1318,51 @@ async fn bulk_create(
     if !tok.is_some_and(|t| crate::auth::token_eq(&app.admin_token, t)) {
         return Err(XrpcError::auth("admin token required"));
     }
-    let mut waits = Vec::with_capacity(inp.count as usize);
-    let mut skipped = 0u64;
-    for i in inp.start..inp.start + inp.count {
+    let idx: Vec<u64> = match inp.indices {
+        Some(v) => v,
+        None => {
+            if inp.count as usize > BULK_MAX_ACCOUNTS {
+                return Err(invalid_request(format!("at most {BULK_MAX_ACCOUNTS} accounts per request")));
+            }
+            (inp.start..inp.start.saturating_add(inp.count)).collect()
+        }
+    };
+    if idx.len() > BULK_MAX_ACCOUNTS {
+        return Err(invalid_request(format!("at most {BULK_MAX_ACCOUNTS} accounts per request")));
+    }
+    let records: Vec<u32> = match inp.records {
+        BulkRecords::All(n) => vec![n; idx.len()],
+        BulkRecords::Each(v) if v.len() == idx.len() => v,
+        BulkRecords::Each(v) => {
+            return Err(invalid_request(format!("records has {} entries for {} accounts", v.len(), idx.len())));
+        }
+    };
+    if records.iter().map(|&n| n as u64).sum::<u64>() > BULK_MAX_RECORDS {
+        return Err(invalid_request(format!("at most {BULK_MAX_RECORDS} genesis records per request")));
+    }
+    // owned accounts whose head isn't stored yet
+    let mut not_owned = 0u64;
+    let mut owned = Vec::with_capacity(idx.len());
+    for (&i, &n) in idx.iter().zip(&records) {
         let did = state::bulk_did(i);
-        // cluster mode: each node creates the accounts in partitions it owns
-        // (send the same bulk request to every node)
-        if app.cluster.is_some() && app.remote_owner(&did).is_some() {
-            skipped += 1;
+        match app.partitions.for_key(&did) {
+            Some(p) => owned.push((i, n, did, p)),
+            None => not_owned += 1,
+        }
+    }
+    let checked: Vec<_> = futures::stream::iter(owned)
+        .map(|(i, n, did, p)| async move {
+            let exists = p.db.get(state::head_key(&did)).await.map(|h| h.is_some());
+            (i, n, did, exists)
+        })
+        .buffered(BULK_EXISTS_CONCURRENCY)
+        .collect()
+        .await;
+    let mut waits = Vec::with_capacity(checked.len());
+    let mut existing = 0u64;
+    for (i, n, did, exists) in checked {
+        if exists.map_err(XrpcError::from_err)? {
+            existing += 1;
             continue;
         }
         let handle = state::bulk_handle(i);
@@ -1311,8 +1376,8 @@ async fn bulk_create(
             created_at: crate::events::now_rfc3339(),
             ..Default::default()
         };
-        let mut records = Vec::with_capacity(inp.records as usize);
-        for r in 0..inp.records {
+        let mut recs = Vec::with_capacity(n as usize);
+        for r in 0..n {
             let v = Value::from_json(&json!({
                 "$type": "app.bsky.feed.post",
                 "text": format!("genesis post {r} of account {i}"),
@@ -1321,7 +1386,7 @@ async fn bulk_create(
             .map_err(XrpcError::from_err)?;
             let bytes = v.to_cbor();
             let path = format!("app.bsky.feed.post/{}", app.tids.next());
-            records.push((path, Cid::dag_cbor(&bytes), Bytes::from(bytes)));
+            recs.push((path, Cid::dag_cbor(&bytes), Bytes::from(bytes)));
         }
         let (tx, rx) = oneshot::channel();
         app.workers
@@ -1331,21 +1396,29 @@ async fn bulk_create(
                 handle,
                 key,
                 account_json: Bytes::from(serde_json::to_vec(&acct).unwrap()),
-                records,
+                records: recs,
                 reply: tx,
             }))
             .map_err(XrpcError::from_err)?;
-        waits.push(rx);
+        waits.push((n, rx));
     }
-    let mut ok = 0u64;
-    let mut failed = 0u64;
-    for w in waits {
+    let (mut created, mut created_records, mut failed) = (0u64, 0u64, 0u64);
+    for (n, w) in waits {
         match w.await {
-            Ok(Ok(_)) => ok += 1,
+            Ok(Ok(_)) => {
+                created += 1;
+                created_records += n as u64;
+            }
+            // created by a concurrent request since the head check (the
+            // worker still holds it)
+            Ok(Err(WriteError::Invalid(m))) if m == crate::worker::REPO_EXISTS => existing += 1,
             _ => failed += 1,
         }
     }
-    Ok(Json(json!({"created": ok, "failed": failed, "skipped": skipped})))
+    Ok(Json(json!({
+        "created": created, "records": created_records, "existing": existing,
+        "notOwned": not_owned, "failed": failed,
+    })))
 }
 
 static BULK_PASSWORD_HASH: std::sync::LazyLock<String> =

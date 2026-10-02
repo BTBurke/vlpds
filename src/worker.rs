@@ -25,6 +25,8 @@ use tokio::sync::oneshot;
 /// Spec limits for a single commit.
 pub const MAX_COMMIT_OPS: usize = 200;
 pub const MAX_COMMIT_RECORD_BYTES: usize = 1_000_000;
+/// [`WriteError::Invalid`] message of a CreateRepo for a repo the worker holds.
+pub const REPO_EXISTS: &str = "repo already exists";
 
 #[derive(Debug, Clone)]
 pub enum WriteError {
@@ -35,7 +37,8 @@ pub enum WriteError {
     Invalid(String),
     Internal(String),
     /// The repo's shard isn't served by this node right now (moving between
-    /// owners); clients should retry.
+    /// owners). Only raised before the request started, so it was never
+    /// applied: 503 `ShardMoved`, which the entry node resends.
     Unavailable(String),
 }
 
@@ -104,6 +107,33 @@ pub struct WriteReq {
     pub writes: Vec<Write>,
     pub swap_commit: Option<Cid>,
     pub reply: WriteReply,
+    /// Set for a forwarded write the owner may give up on before it starts
+    /// (see [`Claim`]); None = always applied once queued.
+    pub claim: Option<Arc<Claim>>,
+}
+
+/// Who decides a queued write's fate: its worker taking it into a commit,
+/// or its handler abandoning it (a forwarded write whose repo is still
+/// loading: the owner answers 503 `RepoLoading` and the forwarding node
+/// retries). Exactly one wins, so an abandoned write is never applied and a
+/// taken one is always answered.
+#[derive(Default)]
+pub struct Claim(std::sync::atomic::AtomicU8);
+
+impl Claim {
+    const PENDING: u8 = 0;
+    const TAKEN: u8 = 1;
+    const ABANDONED: u8 = 2;
+
+    /// The worker starts the write: false if it was abandoned.
+    pub fn take(&self) -> bool {
+        self.0.compare_exchange(Self::PENDING, Self::TAKEN, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    /// The handler gives up: false if the worker took it already.
+    pub fn abandon(&self) -> bool {
+        self.0.compare_exchange(Self::PENDING, Self::ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
 }
 
 pub struct CreateRepoReq {
@@ -198,9 +228,10 @@ pub enum WorkerMsg {
     /// worker holds a sender to its own channel for `Loaded`, so the channel
     /// alone never disconnects).
     Shutdown,
-    /// Load a large repo ahead of its first request (after a shard open);
-    /// `done` gets whether a load was started and cached it.
-    Preload { did: Arc<str>, done: oneshot::Sender<bool> },
+    /// Load a repo ahead of its first request (after a shard open): a large
+    /// one (`large`: from the `L/` index, pinned once loaded) or a recently
+    /// written one; `done` gets whether a load was started and cached it.
+    Preload { did: Arc<str>, large: bool, done: oneshot::Sender<bool> },
     /// What the worker holds for a repo (None = not cached).
     CacheInfo { did: Arc<str>, reply: oneshot::Sender<Option<CachedRepo>> },
 }
@@ -376,8 +407,9 @@ struct Worker {
     pinned: usize,
     pinned_bytes: usize,
     loading: HashMap<Arc<str>, Vec<Queued>>,
-    /// Preloads in flight (their `loading` entry starts empty).
-    preloads: HashMap<Arc<str>, oneshot::Sender<bool>>,
+    /// Preloads in flight (their `loading` entry starts empty), and whether
+    /// each is a large repo's.
+    preloads: HashMap<Arc<str>, (oneshot::Sender<bool>, bool)>,
     /// Repos whose commit failed while earlier commits were still in flight:
     /// held out of the cache (their requests buffer in `loading`) until those
     /// commits are durable, then reloaded. Reloading any sooner would build
@@ -498,12 +530,16 @@ impl Worker {
                     }
                     continue;
                 };
+                let wrote = reqs.iter().any(|q| matches!(q, Queued::Write(_)));
                 if let Err(e) = process(st, reqs, self.clock_id) {
                     // MST errors mean in-memory state can't be trusted: drop it and
                     // reload from durable state, once nothing is in flight.
                     tracing::error!(%did, "commit failed, evicting repo: {e:#}");
                     self.discard(did);
                     continue;
+                }
+                if wrote {
+                    st.partition.recent.touch(&did);
                 }
                 self.settle(&did);
             }
@@ -533,10 +569,10 @@ impl Worker {
                     WorkerMsg::Loaded { did, res } => {
                         let buffered = self.loading.remove(&did).unwrap_or_default();
                         let preload = self.preloads.remove(&did);
-                        let preloaded = preload.is_some();
+                        let preloaded_large = preload.as_ref().is_some_and(|p| p.1);
                         let cached = matches!(&res, Ok(Some(st)) if (self.partitions)(&did).is_some_and(|p| Arc::ptr_eq(&p, &st.partition)));
-                        if let Some(done) = preload {
-                            metrics::REPO_PRELOADS.with_label_values(&[match &res {
+                        if let Some((done, large)) = preload {
+                            metrics::REPO_PRELOADS.with_label_values(&[if large { "large" } else { "recent" }, match &res {
                                 _ if cached => "loaded",
                                 Ok(Some(_)) => "stale",
                                 Ok(None) => "not_found",
@@ -565,9 +601,9 @@ impl Worker {
                             Ok(Some(mut st)) => {
                                 STATS.repo_loads.fetch_add(1, Ordering::Relaxed);
                                 metrics::REPO_LOADS.with_label_values(&["ok"]).inc();
-                                // preloaded: found in the L/ index, so the key
-                                // exists (settle deletes it if it's stale)
-                                st.large |= preloaded;
+                                // preloaded from the L/ index: the key exists
+                                // (settle deletes it if it's stale)
+                                st.large |= preloaded_large;
                                 self.cache_put(did.clone(), st);
                                 self.settle(&did);
                                 order.push(did.clone());
@@ -594,13 +630,13 @@ impl Worker {
                     WorkerMsg::CacheInfo { did, reply } => {
                         let _ = reply.send(self.cache.peek(&did).map(|st| CachedRepo { records: st.records(), large: st.large, charge: st.charge }));
                     }
-                    WorkerMsg::Preload { did, done } => {
+                    WorkerMsg::Preload { did, large, done } => {
                         if self.cache.contains(&did) || self.loading.contains_key(&did) || self.draining.contains_key(&did) {
-                            metrics::REPO_PRELOADS.with_label_values(&["cached"]).inc();
+                            metrics::REPO_PRELOADS.with_label_values(&[if large { "large" } else { "recent" }, "cached"]).inc();
                             let _ = done.send(false);
                         } else {
                             self.loading.insert(did.clone(), Vec::new());
-                            self.preloads.insert(did.clone(), done);
+                            self.preloads.insert(did.clone(), (done, large));
                             self.spawn_load(did);
                         }
                     }
@@ -797,7 +833,7 @@ impl Worker {
         if self.cache.contains(&req.did) || self.loading.contains_key(&req.did) {
             let _ = req
                 .reply
-                .send(Err(WriteError::Invalid("repo already exists".into())));
+                .send(Err(WriteError::Invalid(REPO_EXISTS.into())));
             return;
         }
         let Some(partition) = (self.partitions)(&req.did) else {
@@ -934,53 +970,90 @@ impl Worker {
 /// record repo is ~1.5 s of CPU and ~240 MB), so a takeover of many shards
 /// doesn't starve request-driven loads.
 const PRELOAD_CONCURRENCY: usize = 4;
+/// Recently-written-repo preloads in flight per node: typical repos (a few
+/// point reads and a short scan each).
+const RECENT_PRELOAD_CONCURRENCY: usize = 32;
 
-/// Preloads the large repos (`L/` index) of freshly opened shards in the
-/// background, [`PRELOAD_CONCURRENCY`] at a time, so their first write
-/// doesn't pay the cold load. Stops early if the workers shut down; a shard
-/// closed meanwhile just fails its loads (the worker drops stale ones).
-pub fn spawn_preload(workers: &Workers, shards: Vec<(u16, Arc<slatedb::Db>)>) {
+/// Warms freshly opened shards in the background, so first writes don't pay
+/// the cold load: their large repos (`L/` index, pinned once loaded),
+/// [`PRELOAD_CONCURRENCY`] at a time, and their recently written repos (the
+/// set the previous owner persisted with its last checkpoint,
+/// [`crate::partition::RecentRepos`]), newest first and interleaved across
+/// shards, [`RECENT_PRELOAD_CONCURRENCY`] at a time. Each shard's set is
+/// seeded with what it read, so it carries over to the next owner. Stops
+/// early if the workers shut down; a shard closed meanwhile just fails its
+/// loads (the worker drops stale ones).
+pub fn spawn_preload(workers: &Workers, shards: Vec<(u16, Arc<slatedb::Db>, Arc<crate::partition::RecentRepos>)>) {
     use futures::StreamExt;
     let senders = Arc::downgrade(&workers.senders);
     tokio::spawn(async move {
         let t = Instant::now();
-        let mut dids: Vec<Arc<str>> = Vec::new();
-        for (shard, db) in shards {
-            let r: anyhow::Result<()> = async {
-                let mut it = state::FamilyScan::new(db.as_ref(), state::LARGE_REPO_FAMILY, None, &Default::default()).await?;
-                while let Some(kv) = it.next().await? {
-                    dids.push(String::from_utf8_lossy(state::slot_did(&kv.key, state::LARGE_REPO_FAMILY.len()).1).into());
+        // every shard's indexes at once: one at a time, a takeover's reads
+        // queue behind the request-driven cold loads it is meant to spare
+        // per shard: (large repos, recently written repos)
+        type Dids = Vec<Arc<str>>;
+        let read: Vec<(Dids, Dids)> = futures::stream::iter(shards)
+            .map(|(shard, db, set)| async move {
+                let mut large = Vec::new();
+                let mut recent = Vec::new();
+                let r: anyhow::Result<()> = async {
+                    if set.cap() > 0 {
+                        if let Some(b) = db.get(crate::nodelog::META_RECENT).await? {
+                            recent = crate::partition::RecentRepos::decode(&b);
+                            set.seed(&recent);
+                        }
+                    }
+                    let mut it = state::FamilyScan::new(db.as_ref(), state::LARGE_REPO_FAMILY, None, &Default::default()).await?;
+                    while let Some(kv) = it.next().await? {
+                        large.push(String::from_utf8_lossy(state::slot_did(&kv.key, state::LARGE_REPO_FAMILY.len()).1).into());
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-            .await;
-            if let Err(e) = r {
-                tracing::warn!(shard, "large-repo index scan failed: {e:#}");
-            }
-        }
-        if dids.is_empty() {
-            return;
-        }
-        let n = dids.len();
-        let loaded = futures::stream::iter(dids)
-            .map(|did| {
-                let senders = senders.clone();
-                async move {
-                    let tx = {
-                        let senders = senders.upgrade()?;
-                        let (tx, rx) = oneshot::channel();
-                        let w = Workers { senders };
-                        w.route(&did).send(WorkerMsg::Preload { did, done: tx }).ok()?;
-                        rx
-                    };
-                    tx.await.ok()
+                .await;
+                if let Err(e) = r {
+                    tracing::warn!(shard, "preload index read failed: {e:#}");
                 }
+                (large, recent)
             })
-            .buffer_unordered(PRELOAD_CONCURRENCY)
-            .filter(|r| std::future::ready(*r == Some(true)))
-            .count()
+            .buffer_unordered(64)
+            .collect()
             .await;
-        tracing::info!(repos = n, loaded, elapsed_ms = t.elapsed().as_millis() as u64, "large repos preloaded");
+        let large: Vec<Arc<str>> = read.iter().flat_map(|r| r.0.iter().cloned()).collect();
+        let recent: Vec<Vec<Arc<str>>> = read.into_iter().map(|r| r.1).filter(|v| !v.is_empty()).collect();
+        // newest first, round-robin over the shards
+        let mut order = Vec::with_capacity(recent.iter().map(Vec::len).sum());
+        for k in 0..recent.iter().map(Vec::len).max().unwrap_or(0) {
+            order.extend(recent.iter().filter_map(|v| v.get(k).cloned()));
+        }
+        let run = |dids: Vec<Arc<str>>, is_large: bool, concurrency: usize| {
+            let senders = senders.clone();
+            async move {
+                let n = dids.len();
+                let loaded = futures::stream::iter(dids)
+                    .map(|did| {
+                        let senders = senders.clone();
+                        async move {
+                            let rx = {
+                                let senders = senders.upgrade()?;
+                                let (tx, rx) = oneshot::channel();
+                                let w = Workers { senders };
+                                w.route(&did).send(WorkerMsg::Preload { did, large: is_large, done: tx }).ok()?;
+                                rx
+                            };
+                            rx.await.ok()
+                        }
+                    })
+                    .buffer_unordered(concurrency)
+                    .filter(|r| std::future::ready(*r == Some(true)))
+                    .count()
+                    .await;
+                (n, loaded)
+            }
+        };
+        let ((nl, ll), (nr, lr)) = tokio::join!(run(large, true, PRELOAD_CONCURRENCY), run(order, false, RECENT_PRELOAD_CONCURRENCY));
+        if nl + nr > 0 {
+            tracing::info!(large = nl, large_loaded = ll, recent = nr, recent_loaded = lr, elapsed_ms = t.elapsed().as_millis() as u64, "repos preloaded");
+        }
     });
 }
 
@@ -1153,6 +1226,11 @@ fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64) -> anyhow::Resu
     let mut batch = Batch::new();
     for q in reqs {
         let req = match q {
+            // abandoned by its handler (answered "not started"): drop it
+            Queued::Write(r) if r.claim.as_ref().is_some_and(|c| !c.take()) => {
+                metrics::WRITES_ABANDONED.inc();
+                continue;
+            }
             Queued::Write(r) => r,
             Queued::Snapshot(r) => {
                 let _ = r.reply.send(Ok(st.view.clone()));
@@ -1810,7 +1888,7 @@ mod tests {
         let bytes = Bytes::from(format!("record {rkey}"));
         let (reply, rx) = oneshot::channel();
         let w = Write::Create { collection: "app.test.thing".into(), rkey: rkey.into(), cid: Cid::dag_cbor(&bytes), bytes, blobs: Vec::new() };
-        (WorkerMsg::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply }), rx)
+        (WorkerMsg::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None }), rx)
     }
 
     /// A commit that fails while an earlier one is still in flight must not
@@ -1828,7 +1906,7 @@ mod tests {
         );
         // the "sequencer" is this test: it decides when entries become durable
         let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(16);
-        let part = Arc::new(Partition { id: 0, epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone() });
+        let part = Arc::new(Partition { id: 0, epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() });
         let p2 = part.clone();
         let workers = spawn(1, 100, Arc::new(move |_: &str| Some(p2.clone())), tokio::runtime::Handle::current());
         drop(part);
@@ -1872,6 +1950,58 @@ mod tests {
         assert!(r.is_err());
     }
 
+    /// A write its handler abandoned before the worker took it (a forwarded
+    /// write answered RepoLoading) is never applied; one with a live claim is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_writes_are_not_applied() {
+        let store = crate::store::Store::memory(None);
+        let db = Arc::new(crate::partition::open_db(&store, 0, None).await.unwrap());
+        let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
+        let log = NodeLog::start(
+            store.clone(),
+            NodeLogConfig { log_id: "t".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(1), lease_ok: None },
+            merger_tx,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(16);
+        let part = Arc::new(Partition { id: 0, epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() });
+        let p2 = part.clone();
+        let workers = spawn(1, 100, Arc::new(move |_: &str| Some(p2.clone())), tokio::runtime::Handle::current());
+        let w = workers.senders[0].clone();
+        let did: Arc<str> = "did:plc:claims".into();
+        let key = Arc::new(Keypair::generate());
+        let account = serde_json::json!({
+            "did": &*did, "handle": "t.test", "signing_key": hex::encode(key.to_bytes()),
+            "password_hash": "", "created_at": "2026-01-01T00:00:00Z",
+        });
+        let (reply, created) = oneshot::channel();
+        w.send(WorkerMsg::CreateRepo(CreateRepoReq { did: did.clone(), handle: "t.test".into(), key, account_json: Bytes::from(serde_json::to_vec(&account).unwrap()), records: Vec::new(), reply })).unwrap();
+        settle(rx.recv().await.unwrap());
+        created.await.unwrap().unwrap();
+        let with_claim = |rkey: &str, abandoned: bool| {
+            let (m, r) = write(&did, rkey);
+            let WorkerMsg::Write(mut req) = m else { unreachable!() };
+            let c = Arc::new(Claim::default());
+            if abandoned {
+                assert!(c.abandon());
+            }
+            req.claim = Some(c.clone());
+            (WorkerMsg::Write(req), r, c)
+        };
+        let (m1, r1, _) = with_claim("a", true);
+        let (m2, r2, c2) = with_claim("b", false);
+        w.send(m1).unwrap();
+        w.send(m2).unwrap();
+        settle(rx.recv().await.unwrap());
+        assert!(r1.await.is_err(), "abandoned write answered");
+        let ack = r2.await.unwrap().unwrap();
+        assert!(matches!(&ack.results[..], [WriteOutcome::Create { path, .. }] if path == "app.test.thing/b"), "{:?}", ack.results);
+        assert!(!c2.abandon(), "taken by the worker");
+        let (reply, info) = oneshot::channel();
+        w.send(WorkerMsg::CacheInfo { did: did.clone(), reply }).unwrap();
+        assert_eq!(info.await.unwrap().unwrap().records, 1);
+        assert!(part.recent.take_dirty().is_some_and(|b| b.as_ref() == b"did:plc:claims\n"), "written repo tracked as recent");
+    }
+
     /// The cache evicts by approximate bytes as well as count; a repo past
     /// the pin threshold is never evicted and gets an `L/` index entry, and
     /// below half the threshold it is unpinned (entry deleted) and evictable.
@@ -1886,7 +2016,7 @@ mod tests {
             merger_tx,
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel::<LogEntry>(16);
-        let part = Arc::new(Partition { id: 0, epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone() });
+        let part = Arc::new(Partition { id: 0, epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() });
         let repo = |name: &str, records: u32| {
             let did: Arc<str> = format!("did:plc:{name}").into();
             let key = Keypair::generate();

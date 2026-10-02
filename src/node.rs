@@ -33,6 +33,8 @@ pub struct Node {
     pub internal_token: String,
     /// Node-to-node client (nudges).
     pub http: crate::http::PeerClient,
+    /// Bound of each shard's recently-written set (`--preload-recent`; 0 = off).
+    pub recent_cap: usize,
     followers: Mutex<HashMap<String, Follower>>,
 }
 
@@ -50,6 +52,7 @@ impl Node {
         cache_dir: Option<std::path::PathBuf>,
         internal_token: String,
         http: crate::http::PeerClient,
+        recent_cap: usize,
     ) -> Arc<Node> {
         Arc::new(Node {
             cluster,
@@ -63,6 +66,7 @@ impl Node {
             cache_dir,
             internal_token,
             http,
+            recent_cap,
             followers: Mutex::new(HashMap::new()),
         })
     }
@@ -197,9 +201,10 @@ impl ShardHost for Node {
                 results.push((shard, Err(e)));
                 continue;
             }
-            preload.push((shard, db.clone()));
+            let recent = Arc::new(partition::RecentRepos::new(self.recent_cap));
+            preload.push((shard, db.clone(), recent.clone()));
             let apply_lock = Arc::new(tokio::sync::RwLock::new(()));
-            self.log.sinks.insert(Arc::new(ShardSink { id: shard, epoch, db: db.clone(), apply_lock: apply_lock.clone(), applied: Default::default() }));
+            self.log.sinks.insert(Arc::new(ShardSink { id: shard, epoch, db: db.clone(), apply_lock: apply_lock.clone(), applied: Default::default(), recent: recent.clone() }));
             self.table.set(
                 shard,
                 Some(Arc::new(Partition {
@@ -210,6 +215,7 @@ impl ShardHost for Node {
                     tx: self.log.tx.clone(),
                     wm: self.log.wm.clone(),
                     log: self.log.clone(),
+                    recent,
                 })),
             );
             crate::metrics::LEASE_EVENTS.with_label_values(&["opened"]).inc();
@@ -217,7 +223,8 @@ impl ShardHost for Node {
         }
         crate::metrics::OWNED_PARTITIONS.set(self.table.owned().len() as i64);
         tracing::info!(shards = n, segments_replayed = replayed, opened_ms, replayed_ms, elapsed_ms = started.elapsed().as_millis() as u64, "shards opened");
-        // 4. warm the shards' large repos (served already; loads in the background)
+        // 4. warm the shards' large and recently written repos (served
+        //    already; loads in the background)
         crate::worker::spawn_preload(&self.workers, preload);
         results
     }
@@ -317,6 +324,9 @@ impl ShardHost for Node {
                         let _g = k.apply_lock.write().await;
                         let mut wb = slatedb::WriteBatch::new();
                         wb.put(nodelog::META_APPLIED, nodelog::encode_marker(&self.log.log_id, ord));
+                        if let Some(r) = k.recent.take_dirty() {
+                            wb.put(nodelog::META_RECENT, r);
+                        }
                         k.db.write(wb).await?;
                     }
                     // closing flushes the memtable (and fails if it can't)

@@ -447,7 +447,7 @@ def phase_populate(cfg, st, nodes, scr):
         return
     p = plan(cfg)
     log(f"populate: {cfg.total} accounts, plan {p['records']} records (mean {p['mean']:.2f}, p99 {p['p99']}, max {p['max']}), "
-        f"{p['requests']} requests per node; resuming at {pop['watermark']}")
+        f"{p['requests']} requests over all nodes (each gets only its DIDs); resuming at {pop['watermark']}")
     while pop["watermark"] < cfg.total:
         check_disk()
         s = pop["watermark"]
@@ -463,8 +463,8 @@ def phase_populate(cfg, st, nodes, scr):
                  for n, pf in zip(nodes, pfiles)]
         def resume_point():
             # the lowest watermark any node's loadgen reached (every account
-            # below it exists; above it a resume re-creates at most
-            # concurrency x batch accounts per node: see RESULTS.md caveats)
+            # below it exists; bulkCreate skips existing accounts, so a
+            # resume from it is idempotent)
             wms = []
             for pf in pfiles:
                 try:
@@ -491,6 +491,8 @@ def phase_populate(cfg, st, nodes, scr):
         res = [json.loads(o.strip().splitlines()[-1]) for o in outs]
         recs = sum(r["records"] for r in res)
         created = sum(r["created"] for r in res)
+        existing = sum(r.get("existing", 0) for r in res)
+        nreq = sum(r.get("requests", 0) for r in res)
         pop["watermark"] = s + c
         pop["secs"] += secs
         pop["records"] += recs
@@ -498,15 +500,17 @@ def phase_populate(cfg, st, nodes, scr):
         st.pop("populate_inflight", None)
         save_state(cfg, st)
         rss = scr.gauge("vlpds_process_resident_bytes", max) / 1e9
-        rec = {"t": t0, "start": s, "count": c, "created": created, "records": recs, "secs": round(secs, 1),
+        rec = {"t": t0, "start": s, "count": c, "created": created, "existing": existing, "requests": nreq,
+               "requests_per_1k": round(nreq * 1000 / max(c, 1), 2), "records": recs, "secs": round(secs, 1),
                "accounts_s": round(c / secs), "records_s": round(recs / secs), "rss_gb_max_node": round(rss, 2),
                "du_before": du0, "du": scr.du, "free_gb": round(disk_free_gb(), 1)}
         write_jsonl(out, rec)
-        log(f"populate: {s+c}/{cfg.total} (+{c} in {secs:.0f}s: {c/secs:.0f} accounts/s, {recs/secs:.0f} records/s; created {created}) "
+        log(f"populate: {s+c}/{cfg.total} (+{c} in {secs:.0f}s: {c/secs:.0f} accounts/s, {recs/secs:.0f} records/s; created {created}, "
+            f"existing {existing}, {nreq * 1000 / max(c, 1):.2f} requests/1k accounts) "
             f"rss<= {rss:.1f} GB, s3 {fmt_gb((scr.du or {}).get('total'))}")
         annotate(t0, f"populate {s}+{c}: {c/secs:.0f} accounts/s", ("populate",))
-        if created != c:
-            log(f"populate: WARNING created {created} != {c} (accounts re-created on resume or skipped by every node?)")
+        if created + existing != c:
+            log(f"populate: WARNING created {created} + existing {existing} != {c} (an account no node owned?)")
     # settle: wait for compaction / GC to stop shrinking the prefix
     t0 = time.time()
     last, stable = None, 0
@@ -911,7 +915,7 @@ def config(argv):
     ap.add_argument("--records", type=int, default=5, help="--dist fixed: records per repo")
     ap.add_argument("--dist-scale", type=float, default=128)
     ap.add_argument("--dist-knee", type=int, default=2)
-    ap.add_argument("--dist-group", type=int, default=32)
+    ap.add_argument("--dist-group", type=int, default=1, help="accounts sharing one records draw (1 = independent)")
     ap.add_argument("--chunk", type=int, default=0, help="accounts per checkpointed bulk chunk (default total/20, 100k..5M)")
     ap.add_argument("--bulk-batch", type=int, default=1000)
     ap.add_argument("--bulk-concurrency", type=int, default=16)

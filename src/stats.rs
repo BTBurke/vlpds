@@ -114,6 +114,11 @@ pub fn spawn_stall_detector() {
         loop {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let late = last.elapsed().saturating_sub(Duration::from_millis(10));
+            // timer granularity is ~1 ms: count only what's beyond it
+            if late > Duration::from_millis(2) {
+                crate::metrics::RUNTIME_LATE.observe(late.as_secs_f64());
+                crate::metrics::RUNTIME_LATE_TOTAL.inc_by(late.as_secs_f64());
+            }
             if late > Duration::from_millis(100) {
                 tracing::warn!(late_ms = late.as_millis() as u64, "tokio runtime stall");
             }

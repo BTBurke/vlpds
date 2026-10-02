@@ -19,6 +19,10 @@ macro_rules! lazy {
     };
 }
 
+// ---- runtime ----
+lazy!(RUNTIME_LATE: Histogram = register_histogram!("vlpds_runtime_tick_late_seconds", "How late a 10 ms ticker on the tokio runtime wakes (runtime threads blocked or starved)", exponential_buckets(0.001, 2.0, 12).unwrap()));
+lazy!(RUNTIME_LATE_TOTAL: prometheus::Counter = prometheus::register_counter!("vlpds_runtime_late_seconds_total", "Sum of the 10 ms ticker's lateness: time the runtime could not run a ready task promptly"));
+
 // ---- HTTP ----
 lazy!(HTTP_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_http_requests_total", "XRPC requests by method and status", &["method", "status"]));
 lazy!(HTTP_DURATION: HistogramVec = register_histogram_vec!("vlpds_http_request_duration_seconds", "XRPC request latency", &["method"], latency_buckets()));
@@ -49,9 +53,11 @@ lazy!(REPO_EVICTIONS: IntCounter = register_int_counter!("vlpds_repo_evictions_t
 lazy!(REPO_CACHE_BYTES: IntGaugeVec = register_int_gauge_vec!("vlpds_repo_cache_bytes", "Approximate heap of the repos a worker holds (MST ~ records x per-record bytes)", &["worker"]));
 lazy!(PINNED_REPOS: IntGaugeVec = register_int_gauge_vec!("vlpds_repo_cache_pinned", "Large repos pinned in a worker's cache (not evicted by the LRU)", &["worker"]));
 lazy!(REPO_LOAD_BY_SIZE: HistogramVec = register_histogram_vec!("vlpds_repo_load_by_size_seconds", "Cold repo load latency by repo size (records)", &["records"], latency_buckets()));
-lazy!(REPO_PRELOADS: IntCounterVec = register_int_counter_vec!("vlpds_repo_preloads_total", "Large-repo preloads after a shard open, by result", &["result"]));
+lazy!(REPO_PRELOADS: IntCounterVec = register_int_counter_vec!("vlpds_repo_preloads_total", "Repo preloads after a shard open, by kind (large: L/ index; recent: recently written) and result", &["kind", "result"]));
+lazy!(WRITES_ABANDONED: IntCounter = register_int_counter!("vlpds_writes_abandoned_total", "Forwarded writes answered 503 RepoLoading before their worker started them (never applied; the forwarding node retries)"));
 
 // ---- partitions / log ----
+lazy!(CHECKPOINT_SHARD: Histogram = register_histogram!("vlpds_checkpoint_shard_seconds", "One shard's checkpoint (applied marker + memtable flush)", latency_buckets()));
 lazy!(SEQ_QUEUE: IntGaugeVec = register_int_gauge_vec!("vlpds_sequencer_queue_depth", "Log entries waiting for the sequencer", &["partition"]));
 lazy!(SEGMENTS: IntCounterVec = register_int_counter_vec!("vlpds_segments_total", "Segments made durable", &["partition"]));
 lazy!(SEGMENT_BYTES: Histogram = register_histogram!("vlpds_segment_bytes", "Segment object size", exponential_buckets(1024.0, 2.0, 14).unwrap()));
@@ -103,6 +109,7 @@ lazy!(CACHE_CAPACITY: IntGaugeVec = register_int_gauge_vec!("vlpds_cache_capacit
 
 // ---- cluster ----
 lazy!(FORWARDED: IntCounter = register_int_counter!("vlpds_requests_forwarded_total", "Requests proxied to the partition owner"));
+lazy!(WRITE_RETRIES: IntCounterVec = register_int_counter_vec!("vlpds_write_retries_total", "Repo writes the entry node resent after a not-applied 503, by reason (loading: RepoLoading; moved: ShardMoved)", &["reason"]));
 lazy!(OWNED_PARTITIONS: IntGauge = register_int_gauge!("vlpds_owned_partitions", "Partitions this node owns"));
 lazy!(LEASE_EVENTS: IntCounterVec = register_int_counter_vec!("vlpds_lease_events_total", "Partition lease transitions", &["event"]));
 lazy!(OBJ_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_object_store_requests_total", "Object-store requests that reached the store, by billable op (put, put_create, put_cas, get, get_range, head, list pages, delete, delete_batch, copy, mpu_*), key component and client pool (objstats.rs)", &["op", "component", "client"]));

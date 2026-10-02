@@ -95,6 +95,17 @@ The MST is fully determined by the set of `(key, record CID)` pairs. So:
   their first write. The key is a hint: a stale one costs a load.
   Metrics: `vlpds_repo_cache_bytes`, `vlpds_repo_cache_pinned`,
   `vlpds_repo_load_by_size_seconds{records}`, `vlpds_repo_preloads_total`.
+- **Recently written repos are preloaded too.** Each shard keeps the
+  repos it committed to most recently (`--preload-recent`, 2,048 per
+  shard; `partition::RecentRepos`, touched once per commit batch) and
+  writes the list, newest first, as `meta/recent` with its checkpoints and
+  at close, only when its members changed. The shard's next owner (a
+  restart, takeover or handback) reads it right after the open, seeds its
+  own set with it, and loads those repos in the background, 32 at a time
+  per node, interleaved across shards, beside the large-repo preloads; the
+  index reads of all newly opened shards run at once, so they don't queue
+  behind the request-driven loads they are meant to spare. Bulk creation
+  doesn't touch the set. Metric: `vlpds_repo_preloads_total{kind}`.
 - Escape hatch if even preloads are too slow (≥10M records): periodically
   write an MST snapshot object so a cold load doesn't need an O(n) rebuild.
   Not needed for v1.
@@ -404,7 +415,73 @@ the per-node-log design of "Planet scale" items 1–5 (`src/cluster.rs`,
 - **Global uniqueness:** handles are claimed with a conditional PUT of
   `handle/{handle}`; writer ids (the seq low byte) by CAS on `writers/{w}`.
 
+- **Checkpoints.** Every owned shard gets an applied marker plus a
+  memtable flush (an L0 SST PUT and a manifest update) once per
+  `--checkpoint-every` (10 s), bounding a successor's replay. They are
+  staggered (`--checkpoint-stagger`, default on): one shard every
+  interval/shards instead of all of them back to back each interval, so
+  the flushes' CPU (SST encoding + zstd on the runtime) and store PUTs
+  spread evenly. Metrics: `vlpds_checkpoint_shard_seconds`, and the 10 ms
+  ticker's lateness `vlpds_runtime_tick_late_seconds` /
+  `vlpds_runtime_late_seconds_total` (runtime threads blocked or starved).
+  Checkpoints were never a burst: `checkpoint_all` goes one shard at a time
+  (~37 ms each, store-bound). In-process (tests/all/checkpoint_stall.rs,
+  256 shards, 8,000 writes/s, 3 runtime threads, 10 ms store) neither
+  schedule stalls the runtime: worst 10 ms-tick lateness 7.2 ms
+  back-to-back vs 9.3 ms staggered, write p99 27 vs 26 ms. The ~700 ms
+  stalls after checkpoints in the laptop dry run (load average 20–37 on 14
+  cores) were CPU starvation; the lateness metrics are there to check on
+  benchbox.
+
 Single-node mode is the same code with one node owning all shards.
+
+### Forwarding deadlines and not-applied writes (`src/forward.rs`)
+
+A forward fails at a time-to-first-byte deadline (3 s for quick calls, 30 s
+for exports, uploads and proxying): an owner that doesn't answer is
+presumed frozen, the client gets 503 `PartitionUnavailable` + Retry-After,
+and the owner's lease moves the shard. That answer is ambiguous (the write
+may still be applied), so it is never resent. But after a restart,
+takeover or handback, the first write to each repo on its new owner is a
+cold load, and on a loaded box these queued past 3 s: ~20 s of failed
+writes after a node restart (capacity dry run, 2026-10-01).
+
+Options were a longer write deadline (a frozen owner then holds every
+forwarded write for that long), or telling "busy loading" apart from
+"frozen". vlpds does the latter, and makes such failures retryable:
+
+- **The owner answers early, unapplied.** A forwarded write (task-local
+  marker set while serving a peer's request) carries a `worker::Claim`.
+  If its worker hasn't taken it into a commit within
+  `--forwarded-write-start-ms` (1 s), the handler abandons it: exactly one
+  of take/abandon wins (a CAS), so an abandoned write is never applied and
+  a taken one is always answered. The answer is 503 `RepoLoading`, well
+  inside the 3 s deadline. A write that finds its shard gone before it
+  started (the load says "not owned": the shard is moving) is answered 503
+  `ShardMoved`; also never applied.
+- **The entry node resends.** The node the client called buffers repo
+  writes (createRecord, putRecord, deleteRecord, applyWrites; JSON, at most
+  4 MiB) and resends one answered `RepoLoading` (after 10 ms) or
+  `ShardMoved` (after 50 ms) to whoever owns the repo by then, itself
+  included, for up to 20 s (`--retry-unapplied-writes`); then the last
+  503 + Retry-After goes to the client. Own-account writes route by the
+  token's DID without parsing the body, so they get this too. Metrics:
+  `vlpds_write_retries_total{reason}`, `vlpds_writes_abandoned_total`.
+- Directly received writes (the client called the owner) just wait for
+  their load. Every 503 vlpds answers carries `Retry-After: 1`.
+
+So a cold start or a shard move shows up as latency, while a frozen owner
+still fails in 3 s. Measured (tests/all/cold_start.rs `restart_window_*`,
+in-process, M4 Pro): 3 nodes, 48 shards, 50k repos x 100 records, a store
+with 10 ms per call and 64 calls in flight, 1,500 writes/s with Zipf(1.0)
+repo choice entering through two nodes while the third restarts gracefully
+(its shards go to the others at 4 s and come back at 10 s). Before: 400
+failed writes in 3 s (all 503s at the two shard moves), p99 78 ms. After:
+0 failed, p99 243 ms over the window, worst one-second p99 669 ms (at the
+moves; 1,736 resends), 1,991 recently written repos preloaded. Cold loads
+in-process stay well under 1 s (the processes share one block cache), so
+`RepoLoading` didn't fire there; it is what the capacity dry run's 20 s
+restart stall needs.
 
 ### Pipelined segment PUTs (K in flight per log)
 

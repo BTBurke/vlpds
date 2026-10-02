@@ -31,6 +31,17 @@
 //! time-to-first-byte deadline (counted once the request body is sent) the
 //! client gets 503 `PartitionUnavailable` + `Retry-After`, and the owner's
 //! lease expiry moves the shard. Response bodies then stream without limit.
+//!
+//! A slow cold repo load is not a dead owner: a forwarded repo write that its
+//! worker hasn't started within [`FORWARDED_WRITE_START`] (its repo is still
+//! loading, e.g. right after a restart or takeover) is abandoned unapplied
+//! and answered 503 `RepoLoading` (see `worker::Claim`), well inside the
+//! deadline; a write that finds its shard gone (moving between owners) is
+//! answered 503 `ShardMoved`, also before it started. The node the client
+//! called resends such writes (the body is buffered), to whoever owns the
+//! repo by then, until answered or [`WRITE_RETRY_BUDGET`] runs out, so the
+//! client sees a load or a shard move as latency, not as an error; a frozen
+//! owner still fails in TTFB_FAST (ambiguous: never resent).
 
 use axum::body::Body;
 use axum::extract::Request;
@@ -58,6 +69,41 @@ const BODY_STALL: Duration = Duration::from_secs(10);
 /// Ceiling on one forwarded exchange (response streaming included);
 /// overrides the internal client's short default.
 const FORWARD_MAX: Duration = Duration::from_secs(3600);
+/// How long the owner waits for a forwarded write to start before answering
+/// 503 `RepoLoading` (well under TTFB_FAST, so it is never mistaken for a
+/// frozen owner).
+pub const FORWARDED_WRITE_START: Duration = Duration::from_millis(1000);
+/// How long the entry node keeps resending a write answered "not applied"
+/// before passing the 503 (+ Retry-After) to the client.
+pub const WRITE_RETRY_BUDGET: Duration = Duration::from_secs(20);
+/// Error name of a forwarded write abandoned before it started.
+pub const REPO_LOADING: &str = "RepoLoading";
+/// Error name of a write that found its repo's shard gone from this node
+/// before it started (moving between owners): not applied either.
+pub const SHARD_MOVED: &str = "ShardMoved";
+
+tokio::task_local! {
+    /// Set while a request a peer forwarded here is being served.
+    static FORWARDED: ();
+}
+
+/// The request being served was forwarded by a peer (its client waits on the
+/// peer's time-to-first-byte deadline).
+pub fn is_forwarded() -> bool {
+    FORWARDED.try_with(|_| ()).is_ok()
+}
+
+/// Repo writes the entry node resends after a not-applied 503.
+fn retryable_write(req: &Request) -> bool {
+    req.method() == Method::POST
+        && matches!(
+            req.uri().path(),
+            "/xrpc/com.atproto.repo.createRecord"
+                | "/xrpc/com.atproto.repo.putRecord"
+                | "/xrpc/com.atproto.repo.deleteRecord"
+                | "/xrpc/com.atproto.repo.applyWrites"
+        )
+}
 
 #[async_trait::async_trait]
 pub trait Router: Send + Sync + 'static {
@@ -394,8 +440,9 @@ async fn xrpc_target(
     }
     let sub = token_sub(&req);
     if sub.as_deref().is_some_and(|s| router.remote_owner(s).is_none()) {
-        // the caller's own account is ours: no body parse
-        return Ok((req, None));
+        // the caller's own account is ours: no body parse (it still routes
+        // by it, so a write resent after its shard moved finds the new owner)
+        return Ok((req, sub));
     }
     let is_json = req
         .headers()
@@ -452,7 +499,7 @@ pub async fn route(
     }
     let app = router.app();
     if take_forwarded(&mut req, app.as_deref()) {
-        return next.run(req).await;
+        return FORWARDED.scope((), next.run(req)).await;
     }
     let target = if xrpc {
         xrpc_target(&*router, app.as_deref(), req).await
@@ -463,16 +510,78 @@ pub async fn route(
         Ok(t) => t,
         Err(r) => return r,
     };
+    let token = app.as_ref().map(|a| a.config.internal_token.clone());
+    let retry = app.as_ref().is_some_and(|a| a.config.retry_unapplied_writes);
+    if let Some(k) = key.as_deref().filter(|_| retry && retryable_write(&req)) {
+        return write_with_retries(&*router, &client, k, req, token.as_deref(), next).await;
+    }
     let Some(owner) = key.as_deref().and_then(|k| router.remote_owner(k)) else {
         return next.run(req).await;
     };
     crate::metrics::FORWARDED.inc();
-    let token = app.as_ref().map(|a| a.config.internal_token.clone());
     let ttfb = ttfb_for(&req);
     let t = Instant::now();
     let resp = forward(client.pick(), &owner, req, token.as_deref(), ttfb).await;
     crate::metrics::observe_forward(resp.status().as_u16(), t);
     resp
+}
+
+/// Serves a repo write here or at its owner, and sends it again (to whoever
+/// owns `key` by then) while the answer says it was not applied: the owner
+/// gave it up while its repo loaded ([`REPO_LOADING`]), or the shard moved
+/// away before it started ([`SHARD_MOVED`]). Within [`WRITE_RETRY_BUDGET`];
+/// after that the last 503 (+ Retry-After) goes to the client. The body is
+/// buffered for the resends (JSON, at most 4 MiB).
+async fn write_with_retries(
+    router: &dyn Router,
+    client: &crate::http::PeerClient,
+    key: &str,
+    req: Request,
+    token: Option<&str>,
+    next: axum::middleware::Next,
+) -> Response {
+    let (req, body) = match buffer(req).await {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    let ttfb = ttfb_for(&req);
+    let (parts, _) = req.into_parts();
+    let started = Instant::now();
+    loop {
+        let mut req = Request::new(Body::from(body.clone()));
+        *req.method_mut() = parts.method.clone();
+        *req.uri_mut() = parts.uri.clone();
+        *req.version_mut() = parts.version;
+        *req.headers_mut() = parts.headers.clone();
+        *req.extensions_mut() = parts.extensions.clone();
+        let resp = match router.remote_owner(key) {
+            None => next.clone().run(req).await,
+            Some(owner) => {
+                crate::metrics::FORWARDED.inc();
+                let t = Instant::now();
+                let r = forward(client.pick(), &owner, req, token, ttfb).await;
+                crate::metrics::observe_forward(r.status().as_u16(), t);
+                r
+            }
+        };
+        if resp.status() != StatusCode::SERVICE_UNAVAILABLE {
+            return resp;
+        }
+        let (rp, rbody) = resp.into_parts();
+        let bytes = axum::body::to_bytes(rbody, 64 << 10).await.unwrap_or_default();
+        let err = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v["error"].as_str().map(str::to_string));
+        let (reason, pause) = match err.as_deref() {
+            Some(REPO_LOADING) => ("loading", Duration::from_millis(10)),
+            // routing follows the move within a control-plane nudge
+            Some(SHARD_MOVED) => ("moved", Duration::from_millis(50)),
+            _ => return Response::from_parts(rp, Body::from(bytes)),
+        };
+        if started.elapsed() + FORWARDED_WRITE_START > WRITE_RETRY_BUDGET {
+            return Response::from_parts(rp, Body::from(bytes));
+        }
+        crate::metrics::WRITE_RETRIES.with_label_values(&[reason]).inc();
+        tokio::time::sleep(pause).await;
+    }
 }
 
 /// Time-to-first-byte deadline for forwarding `req` (see [`TTFB_FAST`]).

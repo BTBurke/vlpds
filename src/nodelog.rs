@@ -42,6 +42,9 @@ pub type LeaseCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 /// Per-shard applied marker: everything for this shard in `log_id` up to and
 /// including `ordinal` is in the shard's SlateDB.
 pub const META_APPLIED: &[u8] = b"meta/applied2";
+/// The shard's recently written repos (`partition::RecentRepos`), newest
+/// first, one DID per line: what its next owner preloads.
+pub const META_RECENT: &[u8] = b"meta/recent";
 
 pub struct LogEntry {
     pub shard: u16,
@@ -256,6 +259,8 @@ pub struct ShardSink {
     pub apply_lock: Arc<tokio::sync::RwLock<()>>,
     /// State mutations applied since the shard opened here (reshard policy).
     pub applied: AtomicU64,
+    /// Shared with the shard's `Partition`; persisted by its checkpoints.
+    pub recent: Arc<crate::partition::RecentRepos>,
 }
 
 pub struct ShardSinks {
@@ -524,6 +529,8 @@ impl NodeLog {
 
     /// Writes an applied marker for every shard and flushes their memtables,
     /// bounding how much of this log a successor must replay after a crash.
+    /// One shard after another: the background loop
+    /// ([`NodeLog::spawn_checkpoints`]) spreads them over its interval instead.
     pub async fn checkpoint_all(&self) {
         let ord = self.durable_ordinal.load(Ordering::Acquire);
         if ord == u64::MAX {
@@ -532,25 +539,78 @@ impl NodeLog {
         // HA tests (bench/ha kill9-mid-checkpoint) key off this line.
         tracing::info!(ordinal = ord, shards = self.sinks.all().len(), "checkpoint start");
         for s in self.sinks.all() {
-            // Nothing of the shard is in this log before its insert floor; a
-            // marker below it could also name the end of an earlier span of
-            // this log for the shard (A -> B -> A), and replay would start
-            // there (DESIGN.md "Log retention"). Its replay marker stands.
-            if self.sinks.insert_floor(s.id).is_none_or(|f| ord < f) {
-                continue;
-            }
-            let _g = s.apply_lock.write().await;
-            // the finalizer has applied every segment <= ord (it updates
-            // durable_ordinal only after applying)
-            let mut wb = WriteBatch::new();
-            wb.put(META_APPLIED, encode_marker(&self.log_id, ord));
-            let written = s.db.write(wb).await.is_ok();
-            drop(_g);
-            let flushed = s.db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await;
-            if written && flushed.is_ok() {
-                self.sinks.checkpointed(s.id, ord);
-            }
+            self.checkpoint_shard(&s).await;
         }
+    }
+
+    /// Checkpoints one shard at the current durable ordinal: an applied
+    /// marker, then a memtable flush (an L0 SST PUT plus a manifest update).
+    pub async fn checkpoint_shard(&self, s: &ShardSink) {
+        let ord = self.durable_ordinal.load(Ordering::Acquire);
+        if ord == u64::MAX {
+            return;
+        }
+        // Nothing of the shard is in this log before its insert floor; a
+        // marker below it could also name the end of an earlier span of
+        // this log for the shard (A -> B -> A), and replay would start
+        // there (DESIGN.md "Log retention"). Its replay marker stands.
+        if self.sinks.insert_floor(s.id).is_none_or(|f| ord < f) {
+            return;
+        }
+        let t = Instant::now();
+        let _g = s.apply_lock.write().await;
+        // the finalizer has applied every segment <= ord (it updates
+        // durable_ordinal only after applying)
+        let mut wb = WriteBatch::new();
+        wb.put(META_APPLIED, encode_marker(&self.log_id, ord));
+        if let Some(r) = s.recent.take_dirty() {
+            wb.put(META_RECENT, r);
+        }
+        let written = s.db.write(wb).await.is_ok();
+        drop(_g);
+        let flushed = s.db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await;
+        if written && flushed.is_ok() {
+            self.sinks.checkpointed(s.id, ord);
+        }
+        crate::metrics::CHECKPOINT_SHARD.observe(t.elapsed().as_secs_f64());
+    }
+
+    /// Checkpoints every shard once per `every` (bounds a successor's replay
+    /// to about `every` of log). `stagger`: one shard every `every / shards`,
+    /// so the flushes (SST encode + zstd on the runtime, two store PUTs
+    /// each) spread over the interval instead of arriving as one burst of
+    /// `shards` flushes; otherwise all of them back to back every `every`.
+    pub fn spawn_checkpoints(self: &Arc<Self>, every: Duration, stagger: bool) {
+        let log = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                if !stagger {
+                    tokio::time::sleep(every).await;
+                    let Some(l) = log.upgrade() else { return };
+                    l.checkpoint_all().await;
+                    continue;
+                }
+                // one pass takes `every` (plus the checkpoints' own time)
+                let Some(l) = log.upgrade() else { return };
+                let mut shards = l.sinks.all();
+                drop(l);
+                shards.sort_by_key(|s| s.id);
+                // bench/ha kill9-mid-checkpoint keys off "checkpoint start"
+                tracing::info!(shards = shards.len(), every_ms = every.as_millis() as u64, "checkpoint start (staggered pass)");
+                let gap = every / shards.len().max(1) as u32;
+                if shards.is_empty() {
+                    tokio::time::sleep(every).await;
+                }
+                for s in shards {
+                    tokio::time::sleep(gap).await;
+                    let Some(l) = log.upgrade() else { return };
+                    // closed meanwhile (its close checkpointed it), or reopened
+                    if l.sinks.get(s.id).is_some_and(|cur| Arc::ptr_eq(&cur, &s)) {
+                        l.checkpoint_shard(&s).await;
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -1296,7 +1356,7 @@ mod tests {
         let cfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes, hedge_after: Duration::from_secs(10), lease_ok: None };
         let log = NodeLog::start_with_inflight(store.clone(), cfg, k, tx);
         let db = Arc::new(crate::partition::open_db(&Store { prefix: "apply".into(), ..store.clone() }, shard, None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: shard, epoch: 1, db: db.clone(), apply_lock: Default::default(), applied: Default::default() }));
+        log.sinks.insert(Arc::new(ShardSink { id: shard, epoch: 1, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default() }));
         (log, db, rx)
     }
 
