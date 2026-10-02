@@ -88,6 +88,18 @@ lettre = { version = "0.11", default-features = false, features = ["smtp-transpo
 name = "all"
 path = "tests/all/main.rs"
 
+# slatedb 0.17.0 (upstream c1e36fc) plus one fix, on the fork branch
+# vlpds-0.17-union-l0-view-ids (pending an upstream report): a union clone (a
+# shard merge) of two sources that inherited the same L0 SST from a common
+# ancestor (a split's halves merged back) repeated its L0 view id, and the
+# merged shard's first compaction of it dropped one half's keys
+# (Manifest::cloned_from_union now gives repeats fresh ids). DESIGN.md
+# "Online shard split/merge", "Patched SlateDB".
+[patch.crates-io]
+slatedb = { git = "https://github.com/jazware/slatedb", rev = "f2461431ecbafe834f697e5ce06382dbdd9974d2" }
+# the same rev, so the metrics recorder (src/metrics.rs) and slatedb share one slatedb-common
+slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "f2461431ecbafe834f697e5ce06382dbdd9974d2" }
+
 [profile.release]
 opt-level = 3
 lto = "fat"

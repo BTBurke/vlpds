@@ -978,6 +978,160 @@ mod clone_tests {
         m.close().await.unwrap();
     }
 
+    /// Flushes small L0s into `db` until its compactor has drained every L0
+    /// SST it holds now (the inherited ones included).
+    async fn compact_away_l0(db: &Db) {
+        let before: Vec<_> = db.manifest().l0().iter().map(|v| v.sst.id).collect();
+        let t = std::time::Instant::now();
+        for i in 0.. {
+            let m = db.manifest();
+            if !m.l0().iter().any(|v| before.contains(&v.sst.id)) {
+                return;
+            }
+            assert!(t.elapsed() < Duration::from_secs(60), "never compacted: {} L0s", m.l0().len());
+            db.put(k(100, &format!("h/filler{i}")), "f").await.unwrap();
+            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = db.refresh_manifest().await;
+        }
+    }
+
+    /// Regression (split_and_merge_under_write_load's lost acked write): a
+    /// split's halves both inherit the parent's L0 SSTs as views with the
+    /// parent's view ids, so merging them back gave the union one view id
+    /// twice (once per half). SlateDB's compactor keys L0 views by id: it
+    /// compacted one half's view and dropped both, losing every key of the
+    /// other half that was still in those L0s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merging_a_splits_halves_keeps_their_shared_l0s() {
+        let store = Store { prefix: "smc".into(), ..Store::memory(None) };
+        let db = open_db(&store, 0, None).await.unwrap();
+        let slots = [10u16, 20000, 32767, 32768, 40000, 65535];
+        let mut wb = slatedb::WriteBatch::new();
+        for s in slots {
+            wb.put(k(s, "h/x"), format!("v{s}"));
+        }
+        db.write(wb).await.unwrap();
+        db.close().await.unwrap(); // flushes them into one L0, spanning both halves
+        clone_db(&store, 1, &[(0, 0, 32768)]).await.unwrap();
+        clone_db(&store, 2, &[(0, 32768, 65536)]).await.unwrap();
+        clone_db(&store, 3, &[(1, 0, 32768), (2, 32768, 65536)]).await.unwrap();
+        let m = open_db(&store, 3, None).await.unwrap();
+        let ids: Vec<_> = m.manifest().l0().iter().map(|v| v.id).collect();
+        compact_away_l0(&m).await;
+        let mut lost = Vec::new();
+        for s in slots {
+            if m.get(k(s, "h/x")).await.unwrap().is_none() {
+                lost.push(s);
+            }
+        }
+        assert!(lost.is_empty(), "keys of slots {lost:?} lost by the merged shard's compaction (L0 view ids {ids:?})");
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "L0 view ids repeat in the merged shard: {ids:?}");
+        m.close().await.unwrap();
+    }
+
+    /// Model check: random generations of split/merge clones with writes,
+    /// flushes and compactions in between; every key ever written stays
+    /// readable from the shard holding its slot. Timing-dependent (whether a
+    /// shard compacted its inherited L0s before the next clone), so a seed
+    /// sweep, not a CI test (it found the repeated-L0-view-id loss above):
+    /// `for s in $(seq 1 20); do SEED=$s cargo test --lib generations_of_clones -- --ignored; done`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn generations_of_clones_keep_every_key() {
+        use rand::{Rng, SeedableRng};
+        let seed: u64 = std::env::var("SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let store = Store { prefix: format!("gen{seed}"), ..Store::memory(None) };
+        let mut model: std::collections::BTreeMap<Vec<u8>, (u16, String, u16, usize)> = Default::default();
+        // (id, lo, hi, db)
+        let mut shards: Vec<(u16, u32, u32, Db)> = Vec::new();
+        for i in 0..4u16 {
+            let lo = i as u32 * 16384;
+            shards.push((i, lo, lo + 16384, open_db(&store, i, None).await.unwrap()));
+        }
+        let mut next_id = 4u16;
+        let mut n = 0u64;
+        let mut log: Vec<String> = Vec::new();
+        for step in 0..40 {
+            // writes into every shard, some flushes, sometimes enough L0s to compact
+            for (sid, lo, hi, db) in &shards {
+                let flushes = if rng.gen_bool(0.3) { 6 } else { rng.gen_range(0..3) };
+                for _ in 0..=flushes {
+                    for _ in 0..20 {
+                        let slot = rng.gen_range(*lo..*hi) as u16;
+                        let key = k(slot, &format!("h/{n:08}"));
+                        db.put(&key, format!("v{n}")).await.unwrap();
+                        model.insert(key, (slot, format!("v{n}"), *sid, step));
+                        n += 1;
+                    }
+                    db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
+                }
+            }
+            if rng.gen_bool(0.5) {
+                tokio::time::sleep(Duration::from_millis(rng.gen_range(0..600))).await;
+            }
+            check(&shards, &model, &log, seed, step, "after writes").await;
+            // an op
+            let split = shards.len() < 3 || (shards.len() < 8 && rng.gen_bool(0.5));
+            if split {
+                let i = rng.gen_range(0..shards.len());
+                let (id, lo, hi, db) = shards.remove(i);
+                if hi - lo < 2 {
+                    shards.insert(i, (id, lo, hi, db));
+                    continue;
+                }
+                db.close().await.unwrap();
+                let mid = (lo + hi) / 2;
+                let (a, b) = (next_id, next_id + 1);
+                next_id += 2;
+                clone_db(&store, a, &[(id, lo, mid)]).await.unwrap();
+                clone_db(&store, b, &[(id, mid, hi)]).await.unwrap();
+                log.push(format!("step {step}: split {id} [{lo},{hi}) -> {a} [{lo},{mid}), {b} [{mid},{hi})"));
+                shards.insert(i, (b, mid, hi, open_db(&store, b, None).await.unwrap()));
+                shards.insert(i, (a, lo, mid, open_db(&store, a, None).await.unwrap()));
+            } else {
+                let i = rng.gen_range(0..shards.len() - 1);
+                let (x, xlo, xhi, xdb) = shards.remove(i);
+                let (y, ylo, yhi, ydb) = shards.remove(i);
+                xdb.close().await.unwrap();
+                ydb.close().await.unwrap();
+                let m = next_id;
+                next_id += 1;
+                clone_db(&store, m, &[(x, xlo, xhi), (y, ylo, yhi)]).await.unwrap();
+                log.push(format!("step {step}: merge {x} [{xlo},{xhi}) + {y} [{ylo},{yhi}) -> {m}"));
+                shards.insert(i, (m, xlo, yhi, open_db(&store, m, None).await.unwrap()));
+            }
+            check(&shards, &model, &log, seed, step, "after op").await;
+        }
+        for (_, _, _, db) in shards {
+            db.close().await.unwrap();
+        }
+    }
+
+    /// Every key of `model` reads back its value from the shard holding its slot.
+    async fn check(shards:&[(u16, u32, u32, Db)], model: &std::collections::BTreeMap<Vec<u8>, (u16, String, u16, usize)>, log: &[String], seed: u64, step: usize, when: &str) {
+        let mut missing = Vec::new();
+        for (key, (slot, v, wid, wstep)) in model {
+            let (id, _, _, db) = shards.iter().find(|(_, lo, hi, _)| (*slot as u32) >= *lo && (*slot as u32) < *hi).unwrap();
+            match db.get(key).await.unwrap() {
+                Some(got) if got.as_ref() == v.as_bytes() => {}
+                other => missing.push((*id, *slot, v.clone(), other.is_some(), *wid, *wstep)),
+            }
+        }
+        if !missing.is_empty() {
+            for l in log {
+                eprintln!("{l}");
+            }
+            for (id, _, _, db) in shards {
+                let m = db.manifest();
+                eprintln!("shard {id}: l0 {} srs {} ext {:?}", m.l0().len(), m.compacted().len(), m.external_dbs().iter().map(|e| (e.path.clone(), e.sst_ids.len())).collect::<Vec<_>>());
+            }
+            panic!("seed {seed} step {step} {when}: {} of {} keys missing, e.g. (shard, slot, v, present, written to, at step) {:?}", missing.len(), model.len(), &missing[..missing.len().min(8)]);
+        }
+    }
+
     /// FamilyScan walks one family across slots, skipping other families and
     /// empty slots, from any start key.
     #[tokio::test]

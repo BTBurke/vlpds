@@ -827,7 +827,16 @@ impl Worker {
         };
         self.rt.spawn(async move {
             let t = Instant::now();
-            let res = load_repo_with(partition, did.clone(), opts).await;
+            // a shard closed under the load (a handback, takeover or a
+            // reshard's freeze) moved: retryable like "not owned", not a 500
+            let res = load_repo_with(partition, did.clone(), opts).await.map_err(|e| {
+                let closed = e.chain().any(|c| c.downcast_ref::<slatedb::Error>().is_some_and(|s| matches!(s.kind(), slatedb::ErrorKind::Closed(_))));
+                if closed {
+                    e.context("partition not owned by this node (closed while loading)")
+                } else {
+                    e
+                }
+            });
             let _ = STATS
                 .load_us
                 .lock()

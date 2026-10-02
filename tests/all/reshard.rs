@@ -288,18 +288,51 @@ impl Load {
 /// 503 (a node whose routing hasn't caught up with a move yet) is retried,
 /// as clients do.
 async fn verify_readable(n: &TestServer, acked: &[Acked]) {
-    for a in acked {
-        let rkey = a.uri.rsplit('/').next().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let r = n.get_record(&a.did, "app.bsky.feed.post", rkey).await;
-            if r.status == 503 && Instant::now() < deadline {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
+    use futures::StreamExt;
+    futures::stream::iter(acked)
+        .for_each_concurrent(16, |a| async move {
+            let rkey = a.uri.rsplit('/').next().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let r = n.get_record(&a.did, "app.bsky.feed.post", rkey).await;
+                if r.status == 503 && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                if !r.is_ok() {
+                    diagnose(n, a).await;
+                }
+                assert!(r.is_ok(), "acked record {} lost: {r:?}", a.uri);
+                break;
             }
-            assert!(r.is_ok(), "acked record {} lost: {r:?}", a.uri);
-            break;
+        })
+        .await;
+}
+
+/// On a failed read-back: where the record is. This node's routing and open
+/// shards (record, head, L0 view ids that repeat), then every shard DB in the
+/// bucket read directly. A record in the shard that routes it but not in its
+/// open DB was lost by that shard's state, not misrouted.
+async fn diagnose(n: &TestServer, a: &Acked) {
+    let path = a.uri.splitn(4, '/').nth(3).unwrap().to_string();
+    let rk = vlpds::state::record_key(&a.did, &path);
+    let l = n.app.partitions.layout();
+    eprintln!("DIAG {} slot {} rev {} layout v{} routes to shard {} of {:?}", a.uri, vlpds::slots::slot_of(&a.did), a.rev, l.version, l.shard_of(&a.did), l.ids());
+    for p in n.app.partitions.owned() {
+        let rec = p.db.get(&rk).await.map(|v| v.is_some());
+        let head = p.db.get(vlpds::state::head_key(&a.did)).await.map(|v| v.is_some());
+        let m = p.db.manifest();
+        let ids: Vec<_> = m.l0().iter().map(|v| v.id).collect();
+        let repeats = ids.len() - ids.iter().collect::<HashSet<_>>().len();
+        eprintln!("DIAG open shard {}: record {rec:?} head {head:?}; L0 {} ({repeats} repeated view ids), {} sorted runs", p.id, ids.len(), m.compacted().len());
+    }
+    for id in 0..256u16 {
+        let path = vlpds::partition::db_path(&n.app.store, id);
+        let Ok(r) = slatedb::DbReader::builder(path.clone(), n.app.store.raw.clone()).build().await else { continue };
+        if let Ok(Some(_)) = r.get(&rk).await {
+            eprintln!("DIAG {path} holds the record");
         }
+        let _ = r.close().await;
     }
 }
 
@@ -711,4 +744,70 @@ async fn policy_splits_a_hot_shard() {
         post(format!("after {i}")).await;
     }
     assert_eq!(cluster(&s).layout().version, 2);
+}
+
+/// Splits and merges back to back under write load (a split, a merge of its
+/// halves, a merge across nodes, a split of that), every acked write read
+/// back after each op. Merging a split's halves while they still held the
+/// parent's L0 SSTs lost one half's keys at the merged shard's first
+/// compaction (SlateDB repeated the shared L0 view id; DESIGN.md "Patched
+/// SlateDB"): without the fix this failed 9 runs in 10 (the deterministic
+/// check is partition.rs `merging_a_splits_halves_keeps_their_shared_l0s`).
+/// `RESHARD_CYCLES=6` for a longer run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn repeated_splits_and_merges_under_write_load() {
+    let cycles: usize = std::env::var("RESHARD_CYCLES").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let a = node("rss-a", &store).await;
+    let accts = accounts(&a.s, 18).await;
+    let b = node("rss-b", &store).await;
+    let c = node("rss-c", &store).await;
+    balanced(&[&a, &b, &c]).await;
+    let load = Load::start(vec![a.s.url.clone(), b.s.url.clone(), c.s.url.clone()], &accts);
+    load.progress(30).await;
+    let nodes = [&a, &b, &c];
+    // after each op: writes keep landing for a while (the new shards flush
+    // L0s, run deep and compact, inherited L0s included), then every acked
+    // write so far reads back
+    let after_op = || async {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        load.progress(20).await;
+        let snap = load.acked.lock().clone();
+        verify_readable(&a.s, &snap).await;
+    };
+    for cyc in 0..cycles {
+        // split a shard of one node, asked of another
+        let l = layout(&a);
+        let target = *owned(nodes[cyc % 3]).first().unwrap();
+        let r = admin(&nodes[(cyc + 1) % 3].s, "vlpds.admin.splitShard", json!({"shard": target, "wait": true})).await;
+        assert_eq!(r["done"], json!(true), "{r}");
+        let l2 = settled(&nodes, l.version + 1, Duration::from_secs(20)).await;
+        let kids: Vec<u16> = r["op"]["children"].as_array().unwrap().iter().map(|c| c["id"].as_u64().unwrap() as u16).collect();
+        after_op().await;
+        // merge its halves back, asked of a third node
+        let r = admin(&nodes[(cyc + 2) % 3].s, "vlpds.admin.mergeShards", json!({"left": kids[0], "right": kids[1], "wait": true})).await;
+        assert_eq!(r["done"], json!(true), "{r}");
+        let l3 = settled(&nodes, l2.version + 1, Duration::from_secs(20)).await;
+        after_op().await;
+        // a merge across nodes, then split that back
+        let (x, y) = {
+            let owner = |s: u16| nodes.iter().position(|n| owned(n).contains(&s));
+            let pair = l3.shards.windows(2).find(|w| owner(w[0].id) != owner(w[1].id)).expect("adjacent shards on two nodes");
+            (pair[0].id, pair[1].id)
+        };
+        let r = admin(&nodes[cyc % 3].s, "vlpds.admin.mergeShards", json!({"left": x, "right": y, "wait": true})).await;
+        assert_eq!(r["done"], json!(true), "{r}");
+        let l4 = settled(&nodes, l3.version + 1, Duration::from_secs(20)).await;
+        let m = r["op"]["children"][0]["id"].as_u64().unwrap() as u16;
+        after_op().await;
+        let r = admin(&nodes[(cyc + 1) % 3].s, "vlpds.admin.splitShard", json!({"shard": m, "wait": true})).await;
+        assert_eq!(r["done"], json!(true), "{r}");
+        settled(&nodes, l4.version + 1, Duration::from_secs(20)).await;
+        after_op().await;
+    }
+    let (acked, failed, gap) = load.stop().await;
+    eprintln!("{} acked, {failed} failed attempts, longest per-account gap {gap:?}", acked.len());
+    for n in nodes {
+        verify_readable(&n.s, &acked).await;
+    }
 }

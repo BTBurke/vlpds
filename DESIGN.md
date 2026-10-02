@@ -817,6 +817,25 @@ slot by slot: `state::FamilyScan` keeps one iterator over the shard and
 `seek`s past slots without the family, so empty slots cost nothing and a
 populated one costs one seek.
 
+*Patched SlateDB (fork).* A projection keeps each SST view's
+id, so right after a split both children hold the parent's L0 SSTs under
+the parent's view ids (each with its half as the visible range). Merging
+them back before either compacted those L0s gave the union's L0 one view
+id twice, and SlateDB 0.17's compactor keys L0 views by id: the merged
+shard's first compaction of such a view rewrote one half and dropped both
+from the manifest, so the other half's keys (acked writes, account and
+handle keys) were gone from the shard and from every later clone of it.
+This was `split_and_merge_under_write_load`'s rare "acked record lost"
+(the merged shard compacted only when its L0 ran deep under load). vlpds
+builds slatedb (and slatedb-common) from the fork
+`github.com/jazware/slatedb`, branch `vlpds-0.17-union-l0-view-ids`, rev
+`f2461431` (0.17.0 = upstream `c1e36fc` plus one change, via
+`[patch.crates-io]`), whose `Manifest::cloned_from_union` gives repeated
+L0 view ids fresh ids (same timestamp; the union has no L0 watermark that
+could name the old ones). Pending an upstream report; drop the patch once
+a release carries a fix. `partition.rs`
+`merging_a_splits_halves_keeps_their_shared_l0s` pins it.
+
 **Protocol.** One reshard op at a time, cluster-wide, recorded in the
 layout as `op = {id, parents, children, driver}`:
 
