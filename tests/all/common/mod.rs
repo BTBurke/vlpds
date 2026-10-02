@@ -131,7 +131,7 @@ impl TestServer {
             .await;
         let j = r.ok();
         TestAccount {
-            did: j["did"].as_str().expect("did").to_string(),
+            did: j["did"].as_str().unwrap_or_else(|| panic!("createAccount failed: {j}")).to_string(),
             handle: j["handle"].as_str().unwrap_or(handle).to_string(),
             password: password.to_string(),
             email,

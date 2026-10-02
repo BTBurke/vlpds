@@ -289,7 +289,7 @@ async fn admin_send_email_falls_back_to_the_main_mailer() {
     let (addr, mut rx, _) = fake_smtp(&[]).await;
     let mailer = SmtpMailer::start(cfg(addr)).unwrap();
     let s = TestServer::spawn_with(|c| c.mailer = Some(SharedMailer(Arc::new(mailer)))).await;
-    let a = s.create_account("modfallback").await;
+    let a = s.create_account("modfb").await;
     admin_send(&s, &a.did, "Fallback notice").await;
     let m = next_with_subject(&mut rx, "Fallback notice").await;
     assert_eq!(m.from, "noreply@vlpds.test");
