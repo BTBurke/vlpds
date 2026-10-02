@@ -1751,3 +1751,53 @@ Each node mails for the requests it handles; tokens live in the account's
 private state, so any node verifies them. Queued mail is lost if the node
 stops (the user asks again). The reference's separate moderation mailer
 (`PDS_MODERATION_EMAIL_*`) is not split out: admin mail uses the same one.
+
+## Choosing a bucket (`vlpds-bucket-probe`)
+
+vlpds is only correct on a store with strongly consistent conditional writes:
+segment PUTs and log fences are `If-None-Match: *` creates, and node leases,
+shard assignments, the layout and writer ids are `If-Match` CAS on the ETag.
+A store that silently ignores either header loses data on failover. Before
+pointing a deployment at a bucket, run the probe from the datacenter the nodes
+will run in. It uses the node's client (`Store::s3`: same pool, timeouts,
+path-style addressing) and its `VLPDS_S3_*` env vars / `--s3-*` flags:
+
+    cargo build --release --bin vlpds-bucket-probe
+    VLPDS_S3_ENDPOINT=https://s3.us-east-1.amazonaws.com VLPDS_S3_BUCKET=my-bucket \
+    VLPDS_S3_ACCESS_KEY=... VLPDS_S3_SECRET_KEY=... VLPDS_S3_REGION=us-east-1 \
+      target/release/vlpds-bucket-probe [--ops 200] [--concurrency 4] [--json report.json]
+
+Endpoints (path-style, as the node uses them): S3
+`https://s3.<region>.amazonaws.com`; R2
+`https://<account>.r2.cloudflarestorage.com` with region `auto`; OVHcloud
+`https://s3.<region>.io.cloud.ovh.net`; GCS `https://storage.googleapis.com`
+with HMAC keys.
+
+It works under a fresh `vlpds-probe/<random>/` prefix (or `--prefix`, which
+must be empty) and deletes everything it wrote unless `--keep`. Checks:
+
+1. **conditional_create**: a second `If-None-Match: *` create of a key fails
+   with AlreadyExists and leaves the first bytes intact.
+2. **compare_and_swap**: CAS with the GET's ETag succeeds and changes the
+   ETag; a stale ETag and a CAS on a missing key are refused; the ETag a PUT
+   returns works for the next CAS (lease renewals rely on it).
+3. **race_create / race_cas**: `--racers` (16) concurrent creates, or CASes
+   from one ETag, on each of `--race-rounds` (4) keys: exactly one wins, every
+   loser gets a conflict, and the object holds the winner's bytes.
+4. **list_read_delete / multipart**: LIST right after PUT returns every
+   object with its size, in order, and honors start-after offsets (the fence
+   scan); deletes are visible to LIST and GET; a two-part multipart upload
+   completes with the right bytes and an aborted one leaves nothing.
+
+Then latency: `--ops` requests at `--concurrency` in flight for each request
+shape the node issues, `put_1mib`, `put_64kib`, `put_create_64kib` (a segment
+PUT), `put_cas_small` (a lease renewal), `get_1kib`, `get_range_4kib` (a
+segment header read), `head`, `list` (~`--ops` keys) and `delete`, reported
+as p50/p90/p99/max and ops/s. An acked write waits for at least one segment
+PUT, so `put_create_64kib` bounds write latency from below; the lease CAS max
+should stay well under the renewal interval (TTL/5, 2 s by default).
+
+The last line is the verdict: `SAFE for vlpds` (exit 0) or `UNSAFE: <check>:
+<reason>` (exit 1); exit 2 means it could not run (endpoint, credentials, a
+non-empty `--prefix`). `--json PATH` also writes the report as JSON (`--json -`
+prints only the JSON); `--skip-latency` runs only the checks.
