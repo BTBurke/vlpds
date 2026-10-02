@@ -1,0 +1,35 @@
+# shrike-perf: mode=shrike-only sha2-asm-feature=false rounds=11 batch=60ms
+# repo CAR: 16571401 bytes, 55245 blocks, 43649 records: [("app.bsky.feed.like", 36934), ("app.bsky.feed.post", 4492), ("app.bsky.feed.repost", 1895), ("app.bsky.graph.follow", 258), ("app.bsky.feed.generator", 32), ("app.bsky.graph.block", 17), ("app.bsky.graph.listitem", 17), ("app.bsky.graph.list", 2)]
+cid            compute (sha-256) post x4492 avg 597 B                    1.15 µs (min    1.12 µs)  [shrike Cid::compute]  per cid
+cid            to_string x5000                                           64.1 ns (min    62.2 ns)  [shrike Display]  per cid
+cid            parse x5000                                               26.7 ns (min    26.4 ns)  [shrike Cid::from_str]  per cid
+cid            parse $link x5000                                        116.0 ns (min   112.1 ns)  [shrike json::parse_cid]  per cid
+crypto         k256 sign (150 B msg)                                    25.83 µs (min   25.80 µs)  [shrike K256SigningKey::sign]  per sig
+crypto         k256 verify (150 B msg)                                  35.34 µs (min   35.14 µs)  [shrike K256VerifyingKey::verify]  per verify
+crypto         k256 sign: k256 crate vs libsecp256k1                    25.79 µs vs     13.81 µs  ratio   1.87x (rounds 1.85..1.88)  [shrike (RustCrypto k256) vs secp256k1 crate]  per sig
+crypto         k256 verify: k256 crate vs libsecp256k1                  35.53 µs vs     13.17 µs  ratio   2.70x (rounds 2.68..2.71)  [shrike (RustCrypto k256) vs secp256k1 crate (parsed key)]  per verify
+crypto         p256 sign (150 B msg)                                    88.90 µs vs     88.63 µs  ratio   1.00x (rounds 0.99..1.01)  [shrike P256SigningKey::sign vs p256 crate directly]  per sig
+crypto         p256 verify (150 B msg)                                 145.25 µs vs    145.08 µs  ratio   1.00x (rounds 0.94..1.01)  [shrike P256VerifyingKey::verify vs p256 crate directly]  per verify
+car            read_all 16.6 MB, 55245 blocks                          148.59 µs (min  143.97 µs)  [shrike car::read_all]  per MB
+car            shrike read_all vs Reader::next_block_into 16.6 MB      149.33 µs vs     53.36 µs  ratio   2.79x (rounds 2.60..2.90)  [shrike car::read_all vs shrike next_block_into (reused buffer)]  per MB
+car            verify (hash every block) 16.6 MB                         1.85 ms (min    1.84 ms)  [shrike car::verify]  per MB
+car            write 16.6 MB, 55245 blocks                              38.54 µs (min   36.82 µs)  [shrike car::write_all]  per MB
+firehose       #commit frames x4 (6504 B avg)                           15.30 µs vs     10.22 µs  ratio   1.50x (rounds 1.48..1.50)  [shrike parse_firehose_frame vs floor: shrike decode + CAR Reader + Cid::compute]  per frame
+mst.node       decode x11595 real nodes                                 473.7 ns (min   469.1 ns)  [shrike decode_node_data]  per node
+mst.node       encode x11595 real nodes                                  68.4 ns (min    68.0 ns)  [shrike encode_node_data]  per node
+proof          generate record proof CAR x1000 (real repo, 43649 keys)     11.38 µs (min   11.20 µs)  [shrike record_proof_car (from blocks)]  per proof
+proof          verify record proof CAR x200 (k256 commit)               55.15 µs (min   54.89 µs)  [shrike verify_record_proof]  per proof
+mst.build/43k  real keys, shuffled, x43649: inserts                     992.1 ns (min   978.6 ns)  [shrike DetachedTree::insert]  per key
+mst.build/43k  real keys, shuffled, x43649: root + all blocks           249.4 ns (min   245.3 ns)  [shrike flush]  per key
+mst.build/43k  real keys, shuffled, x43649: total                        1.24 µs (min    1.22 µs)  [shrike]  per key
+mst.commit/43k real x43649: insert 1 key + root/new blocks             856.97 µs (min  836.90 µs)  [shrike insert+flush (materialized tree)]  per commit
+mst.commit/43k real x43649: delete 1 key + root/new blocks             879.83 µs (min  836.76 µs)  [shrike remove+flush (materialized tree)]  per commit
+mst.commit/43k real x43649: insert + covering proof                    902.83 µs (min  841.02 µs)  [shrike insert+flush+covering_proof]  per commit
+mst.commit/43k real x43649: insert, tree reopened per commit            24.77 µs (min   23.61 µs)  [shrike load+insert+flush]  per commit
+mst.build/1M   synthetic keys, shuffled, x1000000: inserts               2.70 µs (min    2.67 µs)  [shrike DetachedTree::insert]  per key
+mst.build/1M   synthetic keys, shuffled, x1000000: root + all blocks     335.8 ns (min   332.1 ns)  [shrike flush]  per key
+mst.build/1M   synthetic keys, shuffled, x1000000: total                 3.06 µs (min    3.00 µs)  [shrike]  per key
+mst.commit/1M  synthetic x1000000: insert 1 key + root/new blocks       58.30 ms (min   57.44 ms)  [shrike insert+flush (materialized tree)]  per commit
+mst.commit/1M  synthetic x1000000: delete 1 key + root/new blocks       58.14 ms (min   57.30 ms)  [shrike remove+flush (materialized tree)]  per commit
+mst.commit/1M  synthetic x1000000: insert + covering proof              58.46 ms (min   58.28 ms)  [shrike insert+flush+covering_proof]  per commit
+mst.commit/1M  synthetic x1000000: insert, tree reopened per commit     36.30 µs (min   35.52 µs)  [shrike load+insert+flush]  per commit

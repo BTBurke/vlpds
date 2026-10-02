@@ -1,0 +1,9 @@
+# shrike-perf: mode=shrike-only sha2-asm-feature=false rounds=11 batch=60ms
+# repo CAR: 16571401 bytes, 55245 blocks, 43649 records: [("app.bsky.feed.like", 36934), ("app.bsky.feed.post", 4492), ("app.bsky.feed.repost", 1895), ("app.bsky.graph.follow", 258), ("app.bsky.feed.generator", 32), ("app.bsky.graph.listitem", 17), ("app.bsky.graph.block", 17), ("app.bsky.graph.list", 2)]
+mst.build/200k synthetic keys, shuffled, x200000: inserts                1.45 µs (min    1.42 µs)  [shrike DetachedTree::insert]  per key
+mst.build/200k synthetic keys, shuffled, x200000: root + all blocks     300.7 ns (min   299.4 ns)  [shrike flush]  per key
+mst.build/200k synthetic keys, shuffled, x200000: total                  1.75 µs (min    1.72 µs)  [shrike]  per key
+mst.commit/200k synthetic x200000: insert 1 key + root/new blocks         7.53 ms (min    6.69 ms)  [shrike insert+flush (materialized tree)]  per commit
+mst.commit/200k synthetic x200000: delete 1 key + root/new blocks         7.60 ms (min    6.70 ms)  [shrike remove+flush (materialized tree)]  per commit
+mst.commit/200k synthetic x200000: insert + covering proof                7.86 ms (min    6.74 ms)  [shrike insert+flush+covering_proof]  per commit
+mst.commit/200k synthetic x200000: insert, tree reopened per commit      32.20 µs (min   28.74 µs)  [shrike load+insert+flush]  per commit

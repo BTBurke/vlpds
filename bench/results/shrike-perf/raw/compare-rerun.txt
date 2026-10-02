@@ -1,0 +1,23 @@
+# compare mode, --rounds 21, groups cbor->json car proof crypto (summary of compare-rerun.jsonl)
+cbor->json     post x4492 (bytes -> JSON text)                               1.69 µs vs   785.8 ns  ratio 2.15x (2.06..2.58)  [shrike drisl_to_json + serde_json::to_vec vs independent] per record
+cbor->json     post x4492 (bytes -> serde_json::Value only)                  1.18 µs vs   787.4 ns  ratio 1.50x (1.24..1.56)  [shrike drisl_to_json vs independent] per record
+cbor->json     like x5000 (bytes -> JSON text)                              582.9 ns vs   318.2 ns  ratio 1.82x (1.70..1.94)  [shrike drisl_to_json + serde_json::to_vec vs independent] per record
+cbor->json     like x5000 (bytes -> serde_json::Value only)                 408.2 ns vs   321.2 ns  ratio 1.27x (1.16..1.31)  [shrike drisl_to_json vs independent] per record
+cbor->json     follow x258 (bytes -> JSON text)                             330.9 ns vs   223.2 ns  ratio 1.50x (1.40..1.69)  [shrike drisl_to_json + serde_json::to_vec vs independent] per record
+cbor->json     follow x258 (bytes -> serde_json::Value only)                245.8 ns vs   221.8 ns  ratio 1.12x (1.03..1.16)  [shrike drisl_to_json vs independent] per record
+cbor->json     repost x1895 (bytes -> JSON text)                            580.6 ns vs   325.1 ns  ratio 1.77x (1.72..1.90)  [shrike drisl_to_json + serde_json::to_vec vs independent] per record
+cbor->json     repost x1895 (bytes -> serde_json::Value only)               413.5 ns vs   326.4 ns  ratio 1.27x (1.15..1.33)  [shrike drisl_to_json vs independent] per record
+cbor->json     profile x1 (bytes -> JSON text)                               1.71 µs vs   805.9 ns  ratio 2.12x (1.93..2.69)  [shrike drisl_to_json + serde_json::to_vec vs independent] per record
+cbor->json     profile x1 (bytes -> serde_json::Value only)                  1.18 µs vs   788.1 ns  ratio 1.50x (1.42..1.59)  [shrike drisl_to_json vs independent] per record
+crypto         k256 sign (150 B msg)                                        24.75 µs vs   15.26 µs  ratio 1.60x (1.56..1.68)  [shrike K256SigningKey::sign vs independent] per sig
+crypto         k256 verify (150 B msg)                                      39.21 µs vs   16.76 µs  ratio 2.30x (1.52..2.51)  [shrike K256VerifyingKey::verify vs independent] per verify
+crypto         k256 sign: k256 crate vs libsecp256k1                        22.56 µs vs   13.59 µs  ratio 1.66x (1.49..1.68)  [shrike (RustCrypto k256) vs secp256k1 crate] per sig
+crypto         k256 verify: k256 crate vs libsecp256k1                      35.45 µs vs   12.94 µs  ratio 2.74x (2.59..2.87)  [shrike (RustCrypto k256) vs secp256k1 crate (parsed key)] per verify
+crypto         p256 sign (150 B msg)                                        87.73 µs vs   88.18 µs  ratio 1.00x (0.97..1.03)  [shrike P256SigningKey::sign vs p256 crate directly] per sig
+crypto         p256 verify (150 B msg)                                     148.31 µs vs  147.48 µs  ratio 1.00x (0.97..1.03)  [shrike P256VerifyingKey::verify vs p256 crate directly] per verify
+car            read_all 16.6 MB, 55245 blocks                              166.23 µs vs   17.95 µs  ratio 9.21x (8.21..10.52)  [shrike car::read_all vs independent] per MB
+car            shrike read_all vs Reader::next_block_into 16.6 MB          166.84 µs vs   59.51 µs  ratio 2.80x (2.18..2.97)  [shrike car::read_all vs shrike next_block_into (reused buffer)] per MB
+car            verify (hash every block) 16.6 MB                           477.48 µs vs  376.52 µs  ratio 1.27x (1.23..1.32)  [shrike car::verify vs independent] per MB
+car            write 16.6 MB, 55245 blocks                                  39.42 µs vs   33.35 µs  ratio 1.18x (1.06..1.24)  [shrike car::write_all vs independent] per MB
+proof          generate record proof CAR x1000 (real repo, 43649 keys)      10.55 µs vs    1.51 µs  ratio 6.97x (4.88..8.04)  [shrike record_proof_car (from blocks) vs independent] per proof
+proof          verify record proof CAR x200 (k256 commit)                   46.76 µs vs   36.91 µs  ratio 1.27x (0.55..1.33)  [shrike verify_record_proof vs independent] per proof
