@@ -530,10 +530,6 @@ struct Args {
     /// is written as one log entry).
     #[arg(long, env = "VLPDS_MAX_IMPORT_MB", default_value_t = 1024)]
     max_import_mb: usize,
-    /// Accepted for script compatibility; every node runs the cluster protocol
-    /// (a lone node is a one-node cluster).
-    #[arg(long, env = "VLPDS_CLUSTER")]
-    cluster: bool,
     /// Stable node id (keep it across restarts so a restarted node reclaims
     /// its shards immediately). Default "single".
     #[arg(long, env = "VLPDS_NODE_ID")]
