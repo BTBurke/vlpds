@@ -86,19 +86,16 @@ async fn cluster_nudge(State(app): AppState, headers: HeaderMap, axum::Json(inp)
 struct HelloIn {
     node_id: String,
     /// The joiner's build and feature levels (informational: its lease is
-    /// authoritative). Absent from a build that predates levels.
-    #[serde(default)]
+    /// authoritative).
     rev: String,
-    #[serde(default)]
-    min_level: Option<u32>,
-    #[serde(default)]
-    max_level: Option<u32>,
+    min_level: u32,
+    max_level: u32,
 }
 
 /// Logs a peer whose build or level window differs from ours (a rolling
 /// deploy in progress, or a node that missed one).
-fn note_peer_build(peer: &str, rev: &str, min: Option<u32>, max: Option<u32>, ours: crate::version::Window) {
-    let window = (min.unwrap_or(crate::version::legacy_level()), max.unwrap_or(crate::version::legacy_level()));
+fn note_peer_build(peer: &str, rev: &str, min: u32, max: u32, ours: crate::version::Window) {
+    let window = (min, max);
     if window != (ours.min, ours.max) || rev != crate::version::build_rev() {
         tracing::info!(peer, rev, min_level = window.0, max_level = window.1, our_rev = crate::version::build_rev(), our_min = ours.min, our_max = ours.max, "peer runs a different build");
     }
@@ -125,7 +122,7 @@ async fn cluster_hello(State(app): AppState, headers: HeaderMap, axum::Json(inp)
 /// follower of our log, or None if it didn't confirm.
 pub async fn hello_peers(http: &crate::http::PeerClient, token: &str, node_id: &str, levels: crate::version::Window, addrs: Vec<String>) -> Vec<Option<i64>> {
     let sends = addrs.into_iter().map(|addr| async move {
-        let hello = HelloIn { node_id: node_id.to_string(), rev: crate::version::build_rev().to_string(), min_level: Some(levels.min), max_level: Some(levels.max) };
+        let hello = HelloIn { node_id: node_id.to_string(), rev: crate::version::build_rev().to_string(), min_level: levels.min, max_level: levels.max };
         let r = http
             .post(format!("{}/internal/v1/cluster/hello", addr.trim_end_matches('/')))
             .header(HDR, token)
@@ -137,7 +134,8 @@ pub async fn hello_peers(http: &crate::http::PeerClient, token: &str, node_id: &
         match r {
             Ok(r) => {
                 let v = r.json::<J>().await.ok()?;
-                let level = |k: &str| v[k].as_u64().map(|l| l as u32);
+                // informational (logged); 0 = unparseable
+                let level = |k: &str| v[k].as_u64().unwrap_or(0) as u32;
                 note_peer_build(&addr, v["rev"].as_str().unwrap_or_default(), level("minLevel"), level("maxLevel"), levels);
                 (v["ok"] == json!(true)).then(|| v["floor"].as_i64()).flatten()
             }

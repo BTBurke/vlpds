@@ -117,11 +117,6 @@ pub fn check_lower(table: &[Level], active: u32, to: u32) -> Result<(), String> 
     Ok(())
 }
 
-/// Level assumed for a lease or object written before levels existed.
-pub fn legacy_level() -> u32 {
-    1
-}
-
 /// The control-plane object holding the cluster's levels.
 pub const OBJECT: &str = "cluster/version";
 
@@ -170,7 +165,6 @@ pub struct ClusterVersion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<u32>,
     /// Every change of `active`, oldest first.
-    #[serde(default)]
     pub history: Vec<Change>,
     /// Fields of a newer build, kept by read-modify-CAS.
     #[serde(default, flatten)]
@@ -349,8 +343,5 @@ mod tests {
         let j = serde_json::json!({"active": 1, "history": [{"level": 1, "at": "t", "by": "a", "op": "x"}], "pinned": true});
         let v: ClusterVersion = serde_json::from_value(j.clone()).unwrap();
         assert_eq!(serde_json::to_value(&v).unwrap(), j);
-        // fields written before `target`/`history` existed default
-        let v: ClusterVersion = serde_json::from_str(r#"{"active": 1}"#).unwrap();
-        assert_eq!((v.target, v.history.len()), (None, 0));
     }
 }

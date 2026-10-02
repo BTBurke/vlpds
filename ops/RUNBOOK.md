@@ -1634,7 +1634,7 @@ segment; then the old build can be redeployed.
 Feature levels never change by themselves: a node never raises the level at
 startup, and finalize (or `cluster lower`) is the only writer of
 `cluster/version` after its creation (a fresh prefix starts at its first
-node's max level; a prefix from before levels existed at 1).
+node's max level).
 
 **Before a release** with a new level: `just upgrade-ci` (fixtures and the
 MANIFEST freeze, the level-gating test, and the two-build `upgrade-rolling`

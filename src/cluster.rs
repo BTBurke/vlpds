@@ -80,16 +80,11 @@ pub struct NodeLease {
     #[serde(default)]
     pub wm_cap: i64,
     /// This build's git revision (as in `vlpds_build_info`).
-    #[serde(default)]
     pub rev: String,
-    /// Feature levels this build can run (version.rs). A lease written
-    /// before levels existed is from a level-1-only build.
-    #[serde(default = "crate::version::legacy_level")]
+    /// Feature levels this build can run (version.rs).
     pub min_level: u32,
-    #[serde(default = "crate::version::legacy_level")]
     pub max_level: u32,
     /// The cluster's active level as this node last read it (0 = not yet).
-    #[serde(default)]
     pub seen_level: u32,
 }
 
@@ -699,25 +694,18 @@ impl Cluster {
         })
     }
 
-    /// Reads `cluster/version`, creating it if this prefix has none: at
-    /// level 1 on a prefix that predates levels (it has a layout), else at
-    /// this build's max level (a fresh cluster). A racing creator's wins.
+    /// Reads `cluster/version`, creating it at this build's max level if
+    /// this prefix has none (a fresh cluster). A racing creator's wins.
     async fn ensure_version(&self) -> anyhow::Result<ClusterVersion> {
         loop {
             if let Some((v, _)) = self.read_version().await? {
                 return Ok(v);
             }
-            self.count("head");
-            let legacy = match self.store.raw.head(&self.path(LAYOUT)).await {
-                Ok(_) => true,
-                Err(object_store::Error::NotFound { .. }) => false,
-                Err(e) => return Err(e.into()),
-            };
-            let level = if legacy { version::legacy_level() } else { self.cfg.levels.max };
+            let level = self.cfg.levels.max;
             let v = ClusterVersion::new(level, &self.cfg.node_id);
             match self.put_json(&self.path(version::OBJECT), &v, PutMode::Create).await {
                 Ok(_) => {
-                    tracing::info!(level, legacy, "created {}", version::OBJECT);
+                    tracing::info!(level, "created {}", version::OBJECT);
                     return Ok(v);
                 }
                 Err(e) if is_conflict(&e) => continue,
@@ -3602,9 +3590,8 @@ mod tests {
         store.raw.list(Some(&Path::from(format!("{}/{rel}", store.prefix)))).map(|m| m.unwrap().location.to_string()).collect().await
     }
 
-    /// A fresh prefix starts at the first node's max level; a prefix that
-    /// predates levels (it has a layout) at level 1. Leases advertise the
-    /// node's window and the level it read.
+    /// A fresh prefix starts at the first node's max level. Leases advertise
+    /// the node's window and the level it read.
     #[tokio::test]
     async fn version_object_is_created_at_join() {
         let store = Store::memory(None);
@@ -3612,13 +3599,6 @@ mod tests {
         assert_eq!(a.cluster_version().unwrap().active, 2);
         let l = a.own_lease();
         assert_eq!((l.min_level, l.max_level, l.seen_level, l.rev.is_empty()), (1, 2, 2, false));
-        let legacy = Store::memory(None);
-        legacy.raw.put(&Path::from(format!("vlpds/{LAYOUT}")), PutPayload::from(serde_json::to_vec(&Layout::uniform(8)).unwrap())).await.unwrap();
-        let b = join(levels("vb", 1, 2), legacy.clone()).await.unwrap();
-        assert_eq!(b.cluster_version().unwrap().active, 1);
-        // a lease written before levels existed reads as a level-1 build
-        let old: NodeLease = serde_json::from_str(r#"{"node_id":"x","log_id":"x.1","addr":"","writer":1,"expires_ms":0,"renewals":1,"next_ordinal":0,"draining":false}"#).unwrap();
-        assert_eq!((old.min_level, old.max_level, old.seen_level, old.rev.as_str()), (1, 1, 0, ""));
     }
 
     /// A node whose build can't run the cluster's level refuses (exit 7)

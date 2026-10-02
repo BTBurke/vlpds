@@ -3933,7 +3933,7 @@ effect at the next segment). Not built yet: everything under "Later".
 | Private `p/` rows | sessions, app passwords, tokens, TOTP (`totp.rs`), OAuth (`oauth/store.rs`), `sec/` revocations/takedowns (`xrpc/server.rs`) | none; mostly JSON | per type; mostly serde-default |
 | Shard meta | `meta/applied2` (`nodelog::encode_marker`), `meta/recent` | key-name suffix (`applied2`): the only precedent | **(built)** `decode_marker` of anything but exactly its bytes is an error (the shard doesn't open, `format="applied_marker"`), never "no marker" |
 | SlateDB SSTs + manifest | `state/{id}/` | slatedb's own (pinned fork rev, `Cargo.toml`); SST compression from flags | slatedb error at open |
-| Node lease | `nodes/{id}`, `cluster::NodeLease` | none; serde ignores unknown fields | **(built)** new fields (`rev`, `min_level`, `max_level`, `seen_level`) default (a lease without them is a level-1 build) |
+| Node lease | `nodes/{id}`, `cluster::NodeLease` | none; serde ignores unknown fields | **(built)** level 1 has `rev`, `min_level`, `max_level`, `seen_level`; a later level's new fields default |
 | Assignment | `assign/{id:010}`, `cluster::Assignment` | none; CAS read-modify-write by *every* node | **(built)** `#[serde(default)]` + `flatten extra`: an old node's CAS (acquire, release, handoff) keeps fields it doesn't know. `Span` (history entries) is closed: a new span field needs a new object |
 | Layout | `assign/layout`, `slots::Layout` | `version` = routing generation, not format | **(built)** `flatten extra` on `Layout` and its `op` (`Reshard`); every layout write derives from the one read. `ShardRange` is closed |
 | Writer claim | `writers/{w:03}` | none | n/a |
@@ -4024,8 +4024,8 @@ old node silently rewrites a new node's objects.
   read). Leases are already read by every peer each step, so every node
   knows the whole cluster's window without a new RPC.
 - **Startup gate** (before claiming `writers/`, following logs or taking
-  shards): read `cluster/version` (absent = create at `MAX_LEVEL` for a
-  fresh prefix, else `1` on legacy prefixes); refuse unless
+  shards): read `cluster/version` (absent = a fresh prefix: create it at
+  `MAX_LEVEL`); refuse unless
   `MIN_LEVEL <= active` and `active`/`target` `<= MAX_LEVEL`. **After**
   writing its lease, re-read `cluster/version` and apply the same check.
   Refusal = new fail-stop **exit 7 `incompatible_level`** (lease deleted,
