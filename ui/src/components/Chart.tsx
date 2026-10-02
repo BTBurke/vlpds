@@ -18,12 +18,15 @@ export function Chart({
   series,
   data,
   fmt,
+  height = PLOT_H,
 }: {
   title: string
   sub?: string
   series: Series[]
   data: (number | null)[][]
   fmt: (v: number) => string
+  /** Plot height in px (the legend comes on top of it). */
+  height?: number
 }) {
   const host = useRef<HTMLDivElement>(null)
   const plot = useRef<uPlot | null>(null)
@@ -46,7 +49,7 @@ export function Chart({
     }
     const opts: uPlot.Options = {
       width: el.clientWidth,
-      height: PLOT_H,
+      height,
       padding: [8, 8, 0, 0],
       cursor: { points: { size: 8, width: 2 }, drag: { x: false, y: false } },
       legend: { show: true, live: true },
@@ -70,7 +73,7 @@ export function Chart({
     }
     const u = new uPlot(opts, data as uPlot.AlignedData, el)
     plot.current = u
-    const ro = new ResizeObserver(() => u.setSize({ width: el.clientWidth, height: PLOT_H }))
+    const ro = new ResizeObserver(() => u.setSize({ width: el.clientWidth, height }))
     ro.observe(el)
     return () => {
       ro.disconnect()
@@ -78,7 +81,7 @@ export function Chart({
       plot.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, theme])
+  }, [key, theme, height])
 
   useEffect(() => {
     plot.current?.setData(data as uPlot.AlignedData)
@@ -87,10 +90,10 @@ export function Chart({
   const empty = data.length < 2 || data[0].length < 2
   return (
     <div className="chart">
-      <h3>{title}</h3>
-      <div className="sub">{sub}</div>
+      {title && <h3>{title}</h3>}
+      {(title || sub) && <div className="sub">{sub}</div>}
       <div style={{ position: 'relative' }}>
-        <div className="plot" ref={host} />
+        <div className="plot" ref={host} style={height === PLOT_H ? undefined : { minHeight: height }} />
         {empty && <div className="nodata">Collecting samples…</div>}
       </div>
     </div>
