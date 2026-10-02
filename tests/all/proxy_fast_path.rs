@@ -136,23 +136,87 @@ async fn upstream_connections_are_reused() {
     for _ in 0..50 {
         get("seq").await;
     }
-    // Not one: a connection goes back to the pool of the thread that read
-    // its response to the end, and a request on a thread whose pool is
-    // empty connects (it doesn't look in the other threads' pools), so
-    // even sequential requests spread connections over the IO threads and
-    // the count drifts up when tasks hop threads (2-10 under 14 CPU hogs).
+    // One: a connection goes back to the slot of the thread that read its
+    // response to the end, and a request on a thread whose slot is empty
+    // takes it from there instead of connecting (per-thread pools drifted
+    // to 2-10 here when tasks hopped threads)
     let seq = accepted.load(Ordering::Relaxed);
-    assert!(seq <= 16, "{seq} connections for 50 sequential requests");
+    assert!(seq <= 2, "{seq} connections for 50 sequential requests");
     for _ in 0..20 {
         futures::future::join_all((0..32).map(|_| get("par"))).await;
     }
-    // bounded by the concurrency plus what each thread keeps idle
-    // (vlpds::http::h1::LOCAL_IDLE per IO thread), not one per request
+    // bounded by the concurrency, not one per request or per thread
     let par = accepted.load(Ordering::Relaxed) - seq;
-    assert!(par <= 32 + 4 * vlpds::http::h1::LOCAL_IDLE, "{par} connections for 640 requests, 32 in flight");
+    assert!(par <= 32, "{par} connections for 640 requests, 32 in flight");
     // connections the upstream closes are not reused
     for _ in 0..5 {
         get("close=1").await;
         get("after").await;
     }
+}
+
+/// Compressed AppView responses pass through as they are: same bytes, same
+/// Content-Encoding and Content-Length (no decode/re-encode, no buffering),
+/// and the client's Accept-Encoding reaches the upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compressed_responses_pass_through() {
+    // not valid gzip on purpose: the PDS must not look inside
+    let payload: Vec<u8> = (0..5000u32).map(|i| (i * 7 + 3) as u8).collect();
+    let seen_ae: Arc<Mutex<Vec<String>>> = Default::default();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let (body, seen) = (payload.clone(), seen_ae.clone());
+    let router = axum::Router::new().fallback(move |req: Request| {
+        let (body, seen) = (body.clone(), seen.clone());
+        async move {
+            let ae = req.headers().get("accept-encoding").map(|v| v.to_str().unwrap().to_string());
+            seen.lock().push(ae.unwrap_or_default());
+            ([("content-type", "application/json"), ("content-encoding", "gzip")], body)
+        }
+    });
+    tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+    let s = TestServer::spawn_with(|c| {
+        c.appview = Some((url, APPVIEW_DID.into()));
+        c.dev_mode = true;
+    })
+    .await;
+    let a = s.create_account("gzipper").await;
+    let r = reqwest::Client::new()
+        .get(format!("{}/xrpc/app.bsky.actor.getProfile?actor=x", s.url))
+        .header("authorization", format!("Bearer {}", a.access))
+        .header("accept-encoding", "gzip, br")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers().get("content-encoding").unwrap(), "gzip");
+    assert_eq!(r.headers().get("content-length").unwrap(), "5000");
+    assert_eq!(r.bytes().await.unwrap().as_ref(), payload.as_slice());
+    assert_eq!(seen_ae.lock().last().unwrap(), "gzip, br");
+}
+
+/// CORS preflights for proxied methods are answered by the PDS itself: no
+/// auth, no upstream request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preflights_stay_local() {
+    let (seen, av_url) = spawn_appview().await;
+    let s = TestServer::spawn_with(|c| {
+        c.appview = Some((av_url, APPVIEW_DID.into()));
+        c.dev_mode = true;
+    })
+    .await;
+    let r = reqwest::Client::new()
+        .request(reqwest::Method::OPTIONS, format!("{}/xrpc/app.bsky.actor.getProfile?actor=x", s.url))
+        .header("origin", "https://bsky.app")
+        .header("access-control-request-method", "GET")
+        .header("access-control-request-headers", "authorization,atproto-accept-labelers")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    let h = r.headers();
+    assert_eq!(h.get("access-control-allow-origin").unwrap(), "*");
+    assert_eq!(h.get("access-control-allow-headers").unwrap(), "authorization,atproto-accept-labelers");
+    assert_eq!(h.get("access-control-max-age").unwrap(), "86400");
+    assert!(seen.lock().is_empty(), "a preflight reached the AppView");
 }

@@ -6,7 +6,8 @@
 //! - [`public`]: operator-configured upstreams (AppView, report service, PLC
 //!   directory, relays). h2 via ALPN on https, a pooled HTTP/1.1 on http.
 //!   The AppView proxy has its own: [`proxy`] (https, one client per IO
-//!   thread) and [`h1`] (plain http, per-thread connection pools).
+//!   thread) and [`h1`] (plain http, one capped pool per host with
+//!   per-thread slots).
 //! - [`guarded`]: targets derived from user input (did:web hosts, handle
 //!   `.well-known`, OAuth client metadata, lexicon authorities, service
 //!   endpoints from DID documents). [`public`] plus a DNS resolver that drops
@@ -99,105 +100,255 @@ pub fn proxy() -> &'static reqwest::Client {
 }
 
 /// Plain-HTTP/1.1 client for the proxy fast path (an operator-configured
-/// `http://` AppView): hyper's connection API under a per-thread pool of
-/// idle connections. Compared with reqwest + hyper-util's pool, a request
-/// normally takes no lock (the pool is the calling thread's, and a
-/// connection goes back to whichever thread finishes its response), parses
-/// no URL and runs no retry/redirect layers. Threads keep up to
-/// [`LOCAL_IDLE`] idle connections each; beyond that they go to a shared
-/// pool, which a thread with none left takes from before connecting, so the
-/// connection count follows the total concurrency, not threads x peak.
+/// `http://` AppView): hyper's connection API under a lock-light pool.
+/// Compared with reqwest + hyper-util's pool, a request normally takes only
+/// its own thread's slot lock (uncontended), parses no URL and runs no
+/// retry/redirect layers.
+///
+/// Pool, per upstream host ("host:port"):
+/// - idle connections sit in per-thread slots: a finished response puts its
+///   connection in the slot of the thread that read its body to the end, and
+///   a request takes from its own thread's slot first (most recent first);
+/// - a thread whose slot is empty takes one from another slot before it
+///   connects, so connections never pile up per thread when tasks hop
+///   threads: the count follows the concurrency, not threads x peak;
+/// - at most [`MAX_CONNS`] connections are open per host (idle + busy; a
+///   permit is held by each connection's task until the socket closes).
+///   A request at the cap waits for a connection to come back or close
+///   (`vlpds_http_client_pool_waits_total`), within the caller's deadline.
 ///
 /// A connection is reused once its response body has been read to the end;
-/// one dropped mid-body is closed. A request that fails before it was
-/// written on a reused connection (the server closed it while idle) is
-/// retried once on a new one, like hyper-util's pool. Idle connections are
-/// closed after [`H1_IDLE`] (checked when the thread next uses its pool).
+/// one dropped mid-body (e.g. the client went away) is closed, which also
+/// ends the upstream exchange. A request that fails before it was written
+/// on a reused connection (the server closed it while idle) is retried once
+/// on a new one, like hyper-util's pool. Idle connections are closed after
+/// [`H1_IDLE`] (checked when their slot is next used).
+///
+/// Hosts are never dropped: only operator-configured upstreams use this.
 pub mod h1 {
     use super::*;
     use axum::body::Body;
     use bytes::Bytes;
     use hyper::client::conn::http1::SendRequest;
-    use std::cell::RefCell;
+    use std::cell::Cell;
     use std::time::Instant;
+    use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
     use axum::http;
 
     pub type Response = http::Response<PooledBody>;
 
-    /// Idle connections kept per thread and host.
-    pub const LOCAL_IDLE: usize = 32;
-    /// Idle connections kept in the shared pool, per host.
-    const SHARED_IDLE: usize = 1024;
+    /// Connections open per upstream host (idle and in use). The AppView
+    /// proxy runs ~100-500 requests in flight to one host per node.
+    pub const MAX_CONNS: usize = 1024;
     /// Idle connections older than this are closed (below the 90-120 s idle
     /// close of common load balancers, like [`super::public`]'s pool).
     pub const H1_IDLE: Duration = Duration::from_secs(60);
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    /// A waiter at the cap re-checks the pool this often (a backstop: a
+    /// returned connection or a freed permit wakes it first).
+    const WAIT_RECHECK: Duration = Duration::from_millis(50);
 
     struct Idle {
         conn: SendRequest<Body>,
         since: Instant,
     }
 
-    /// authority ("host:port") -> idle connections, most recent last
-    type Pool = Vec<(Arc<str>, Vec<Idle>)>;
+    /// One thread's idle connections (most recent last). Padded to its own
+    /// cache lines: threads update their own slots on every request.
+    #[repr(align(128))]
+    struct Slot {
+        idle: parking_lot::Mutex<Vec<Idle>>,
+        /// `idle.len()`, readable without the lock (stealers skip empty slots)
+        len: AtomicUsize,
+    }
+
+    /// The pool of one upstream host.
+    pub struct Host {
+        authority: Box<str>,
+        slots: Box<[Slot]>,
+        /// one permit per open connection
+        open: Arc<Semaphore>,
+        max: usize,
+        /// requests waiting at the cap
+        waiting: AtomicUsize,
+        returned: Notify,
+    }
+
+    static HOSTS: parking_lot::RwLock<Vec<&'static Host>> = parking_lot::RwLock::new(Vec::new());
+    static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 
     thread_local! {
-        static LOCAL: RefCell<Pool> = const { RefCell::new(Vec::new()) };
+        /// this thread's slot number (modulo each host's slot count)
+        static SLOT: usize = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+        /// the last host this thread used (nearly always the one AppView)
+        static LAST: Cell<Option<&'static Host>> = const { Cell::new(None) };
     }
-    static SHARED: parking_lot::Mutex<Pool> = parking_lot::Mutex::new(Vec::new());
 
-    /// The most recently used live connection of `pool` to `authority`;
-    /// drops expired ones.
-    fn take(pool: &mut Pool, authority: &str) -> Option<SendRequest<Body>> {
-        let idle = &mut pool.iter_mut().find(|(a, _)| **a == *authority)?.1;
-        // the oldest sit at the front
-        if idle.first().is_some_and(|c| c.since.elapsed() > H1_IDLE) {
-            idle.retain(|c| c.since.elapsed() <= H1_IDLE);
+    /// The pool for `authority`, created with `max` connections if new.
+    fn host_with(authority: &str, max: usize) -> &'static Host {
+        if let Some(h) = LAST.get().filter(|h| *h.authority == *authority) {
+            return h;
         }
-        // (one just handed back may not be ready yet: its connection task
-        // finishes the previous exchange first; `send` waits for it)
-        while let Some(c) = idle.pop() {
-            if !c.conn.is_closed() {
-                return Some(c.conn);
+        let found = HOSTS.read().iter().copied().find(|h| *h.authority == *authority);
+        let h = found.unwrap_or_else(|| {
+            let mut hosts = HOSTS.write();
+            if let Some(h) = hosts.iter().copied().find(|h| *h.authority == *authority) {
+                return h;
+            }
+            let n = std::thread::available_parallelism().map_or(8, |n| n.get()).clamp(1, 64);
+            let h: &'static Host = Box::leak(Box::new(Host {
+                authority: authority.into(),
+                slots: (0..n).map(|_| Slot { idle: Default::default(), len: AtomicUsize::new(0) }).collect(),
+                open: Arc::new(Semaphore::new(max.max(1))),
+                max: max.max(1),
+                waiting: AtomicUsize::new(0),
+                returned: Notify::new(),
+            }));
+            hosts.push(h);
+            h
+        });
+        LAST.set(Some(h));
+        h
+    }
+
+    /// The pool for `authority`.
+    pub fn host(authority: &str) -> &'static Host {
+        host_with(authority, MAX_CONNS)
+    }
+
+    /// Creates `authority`'s pool with a cap of `max` connections (tests).
+    /// No effect if the pool exists.
+    pub fn host_with_max(authority: &str, max: usize) -> &'static Host {
+        host_with(authority, max)
+    }
+
+    impl Host {
+        /// Connections open (idle and in use).
+        pub fn open_connections(&self) -> usize {
+            self.max - self.open.available_permits()
+        }
+
+        /// Idle connections across all slots.
+        pub fn idle_connections(&self) -> usize {
+            self.slots.iter().map(|s| s.len.load(Ordering::Relaxed)).sum()
+        }
+
+        fn my_slot(&self) -> usize {
+            SLOT.with(|s| *s) % self.slots.len()
+        }
+
+        /// The most recent live idle connection of slot `i`; drops expired
+        /// and closed ones on the way.
+        fn take_from(&self, i: usize) -> Option<SendRequest<Body>> {
+            let slot = &self.slots[i];
+            let mut idle = slot.idle.lock();
+            // the oldest sit at the front
+            if idle.first().is_some_and(|c| c.since.elapsed() > H1_IDLE) {
+                idle.retain(|c| c.since.elapsed() <= H1_IDLE);
+            }
+            let mut got = None;
+            // (one just handed back may not be ready yet: its connection task
+            // finishes the previous exchange first; `send` waits for it)
+            while let Some(c) = idle.pop() {
+                if !c.conn.is_closed() {
+                    got = Some(c.conn);
+                    break;
+                }
+            }
+            slot.len.store(idle.len(), Ordering::SeqCst);
+            got
+        }
+
+        /// An idle connection: this thread's slot first, then the others'.
+        fn take(&self) -> Option<SendRequest<Body>> {
+            let mine = self.my_slot();
+            if self.slots[mine].len.load(Ordering::SeqCst) > 0 {
+                if let Some(c) = self.take_from(mine) {
+                    return Some(c);
+                }
+            }
+            let n = self.slots.len();
+            (1..n)
+                .map(|k| (mine + k) % n)
+                .filter(|&i| self.slots[i].len.load(Ordering::SeqCst) > 0)
+                .find_map(|i| self.take_from(i))
+        }
+
+        /// Back to this thread's slot (a closed one is dropped).
+        fn put(&self, conn: SendRequest<Body>) {
+            if conn.is_closed() {
+                return;
+            }
+            let slot = &self.slots[self.my_slot()];
+            {
+                let mut idle = slot.idle.lock();
+                idle.push(Idle { conn, since: Instant::now() });
+                slot.len.store(idle.len(), Ordering::SeqCst);
+            }
+            // (SeqCst on both sides: a waiter either sees this connection
+            // in its re-check or is counted here)
+            if self.waiting.load(Ordering::SeqCst) > 0 {
+                self.returned.notify_one();
             }
         }
-        None
-    }
 
-    /// Adds `conn` unless `pool` already holds `max` for `authority`
-    /// (then hands it back).
-    fn put(pool: &mut Pool, authority: &Arc<str>, conn: SendRequest<Body>, max: usize) -> Option<SendRequest<Body>> {
-        let i = match pool.iter().position(|(a, _)| **a == **authority) {
-            Some(i) => i,
-            None => {
-                pool.push((authority.clone(), Vec::new()));
-                pool.len() - 1
+        /// A connection to send on and whether it was reused: an idle one,
+        /// else a new one if under the cap, else the first to come back or
+        /// the first permit a closed one frees.
+        async fn checkout(&'static self, role: &'static str) -> Result<(SendRequest<Body>, bool), BoxError> {
+            if let Some(c) = self.take() {
+                return Ok((c, true));
             }
-        };
-        let idle = &mut pool[i].1;
-        if idle.len() >= max {
-            return Some(conn);
+            if let Ok(p) = self.open.clone().try_acquire_owned() {
+                return Ok((connect(role, self, p).await?, false));
+            }
+            crate::metrics::HTTP_CLIENT_POOL_WAITS.with_label_values(&[role]).inc();
+            struct Waiting<'a>(&'a AtomicUsize);
+            impl Drop for Waiting<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            self.waiting.fetch_add(1, Ordering::SeqCst);
+            let _waiting = Waiting(&self.waiting);
+            loop {
+                let returned = self.returned.notified();
+                tokio::pin!(returned);
+                returned.as_mut().enable();
+                if let Some(c) = self.take() {
+                    return Ok((c, true));
+                }
+                tokio::select! {
+                    p = self.open.clone().acquire_owned() => {
+                        let p = p.map_err(|_| "pool closed")?;
+                        return Ok((connect(role, self, p).await?, false));
+                    }
+                    _ = &mut returned => {}
+                    _ = tokio::time::sleep(WAIT_RECHECK) => {}
+                }
+            }
         }
-        idle.push(Idle { conn, since: Instant::now() });
-        None
+
+        /// A new connection, within the cap (waits for a permit).
+        async fn fresh(&'static self, role: &'static str) -> Result<SendRequest<Body>, BoxError> {
+            let p = match self.open.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => self.open.clone().acquire_owned().await.map_err(|_| "pool closed")?,
+            };
+            connect(role, self, p).await
+        }
     }
 
-    fn checkout(authority: &str) -> Option<SendRequest<Body>> {
-        LOCAL.with_borrow_mut(|p| take(p, authority)).or_else(|| take(&mut SHARED.lock(), authority))
-    }
-
-    fn checkin(authority: &Arc<str>, conn: SendRequest<Body>) {
-        if conn.is_closed() {
-            return;
-        }
-        if let Some(conn) = LOCAL.with_borrow_mut(|p| put(p, authority, conn, LOCAL_IDLE)) {
-            put(&mut SHARED.lock(), authority, conn, SHARED_IDLE);
-        }
-    }
-
-    async fn connect(role: &'static str, authority: &str) -> Result<SendRequest<Body>, BoxError> {
+    /// Opens a connection to `host`; its task holds `permit` until the
+    /// connection closes.
+    async fn connect(
+        role: &'static str,
+        host: &Host,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<SendRequest<Body>, BoxError> {
         crate::metrics::HTTP_CLIENT_CONNECTS.with_label_values(&[role]).inc();
+        let authority = &*host.authority;
         let connect = async {
             let mut last = None;
             for addr in tokio::net::lookup_host(authority).await? {
@@ -217,6 +368,7 @@ pub mod h1 {
             if let Err(e) = conn.await {
                 tracing::debug!("upstream connection: {e}");
             }
+            drop(permit);
         });
         Ok(send)
     }
@@ -228,34 +380,33 @@ pub mod h1 {
     /// connection back to the pool once read to the end.
     pub async fn send(
         role: &'static str,
-        authority: &Arc<str>,
+        authority: &str,
         mut req: http::Request<Body>,
     ) -> Result<Response, BoxError> {
-        let host = http::HeaderValue::from_str(authority)?;
+        let host = self::host(authority);
         let h = req.headers_mut();
-        h.insert(http::header::HOST, host);
+        h.insert(http::header::HOST, http::HeaderValue::from_str(authority)?);
         h.entry(http::header::USER_AGENT).or_insert(http::HeaderValue::from_static(USER_AGENT));
         h.entry(http::header::ACCEPT).or_insert(http::HeaderValue::from_static("*/*"));
-        let (mut conn, mut reused) = match checkout(authority) {
-            Some(c) => (c, true),
-            None => (connect(role, authority).await?, false),
-        };
+        let (mut conn, mut reused) = host.checkout(role).await?;
         if conn.ready().await.is_err() {
-            (conn, reused) = (connect(role, authority).await?, false);
+            drop(conn);
+            (conn, reused) = (host.fresh(role).await?, false);
         }
         let resp = match conn.try_send_request(req).await {
             Ok(r) => r,
             Err(mut e) => match e.take_message() {
                 // never written: the idle connection was closed under us
                 Some(req) if reused => {
-                    conn = connect(role, authority).await?;
+                    drop(conn);
+                    conn = host.fresh(role).await?;
                     conn.send_request(req).await?
                 }
                 _ => return Err(e.into_error().into()),
             },
         };
         let (parts, body) = resp.into_parts();
-        let body = PooledBody { body, conn: Some(conn), authority: authority.clone() };
+        let body = PooledBody { body, conn: Some(conn), host };
         Ok(http::Response::from_parts(parts, body))
     }
 
@@ -263,7 +414,7 @@ pub mod h1 {
     pub struct PooledBody {
         body: hyper::body::Incoming,
         conn: Option<SendRequest<Body>>,
-        authority: Arc<str>,
+        host: &'static Host,
     }
 
     impl PooledBody {
@@ -271,7 +422,7 @@ pub mod h1 {
         fn release(&mut self) {
             if hyper::body::Body::is_end_stream(&self.body) {
                 if let Some(c) = self.conn.take() {
-                    checkin(&self.authority, c);
+                    self.host.put(c);
                 }
             }
         }
@@ -483,5 +634,155 @@ mod tests {
         // one connection per client (other tests may connect concurrently)
         let opened = count() - before;
         assert!((3..10).contains(&opened), "{opened} connections for 60 requests");
+    }
+
+    /// An upstream answering every request with 3,000 bytes after `delay`;
+    /// returns its `host:port`.
+    async fn h1_upstream(delay: Duration) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority = l.local_addr().unwrap().to_string();
+        let router = axum::Router::new().fallback(move || async move {
+            tokio::time::sleep(delay).await;
+            "x".repeat(3000)
+        });
+        tokio::spawn(crate::server::serve(l, router));
+        authority
+    }
+
+    fn h1_get(path: &str) -> axum::http::Request<axum::body::Body> {
+        let mut r = axum::http::Request::new(axum::body::Body::empty());
+        *r.uri_mut() = path.parse().unwrap();
+        r
+    }
+
+    fn h1_connects(role: &str) -> u64 {
+        crate::metrics::HTTP_CLIENT_CONNECTS.with_label_values(&[role]).get()
+    }
+
+    /// Sends a GET on a new OS thread and reads its body to the end on
+    /// another: the request runs on a thread whose own slot is empty, and
+    /// the connection goes back to a slot the next request doesn't use first.
+    fn h1_hop(rt: &tokio::runtime::Handle, role: &'static str, authority: &str) {
+        let (h, a) = (rt.clone(), authority.to_string());
+        let resp = std::thread::spawn(move || h.block_on(h1::send(role, &a, h1_get("/hop"))).unwrap()).join().unwrap();
+        let h = rt.clone();
+        let len = std::thread::spawn(move || {
+            h.block_on(axum::body::to_bytes(axum::body::Body::new(resp.into_body()), usize::MAX)).unwrap().len()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(len, 3000);
+    }
+
+    /// Requests and bodies on ever-new threads: per-thread pools connected
+    /// once per hop; the shared slots keep it to one connection per request
+    /// in flight (vlpds_http_client_connects_total).
+    #[test]
+    fn h1_pool_survives_thread_hops() {
+        const ROLE: &str = "test-h1-hops";
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+        let authority = rt.block_on(h1_upstream(Duration::ZERO));
+        for _ in 0..64 {
+            h1_hop(rt.handle(), ROLE, &authority);
+        }
+        assert_eq!(h1_connects(ROLE), 1, "sequential requests hopping threads");
+        let host = h1::host(&authority);
+        assert_eq!((host.open_connections(), host.idle_connections()), (1, 1));
+
+        // 8 concurrent chains of hopping requests: at most 8 connections
+        let chains: Vec<_> = (0..8)
+            .map(|_| {
+                let (h, a) = (rt.handle().clone(), authority.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..24 {
+                        h1_hop(&h, ROLE, &a);
+                    }
+                })
+            })
+            .collect();
+        for c in chains {
+            c.join().unwrap();
+        }
+        let n = h1_connects(ROLE);
+        assert!(n <= 8, "{n} connections for 8 chains of thread-hopping requests");
+        assert_eq!(host.open_connections() as u64, n);
+    }
+
+    /// At most `max` connections per host: requests beyond it wait for one
+    /// to come back instead of connecting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn h1_pool_is_capped() {
+        const ROLE: &str = "test-h1-cap";
+        let authority = h1_upstream(Duration::from_millis(20)).await;
+        let host = h1::host_with_max(&authority, 4);
+        let tasks: Vec<_> = (0..32)
+            .map(|_| {
+                let a = authority.clone();
+                tokio::spawn(async move {
+                    for _ in 0..4 {
+                        let r = h1::send(ROLE, &a, h1_get("/cap")).await.unwrap();
+                        let b = axum::body::to_bytes(axum::body::Body::new(r.into_body()), usize::MAX).await.unwrap();
+                        assert_eq!(b.len(), 3000);
+                    }
+                })
+            })
+            .collect();
+        let mut max_open = 0;
+        while !tasks.iter().all(|t| t.is_finished()) {
+            max_open = max_open.max(host.open_connections());
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert!(max_open <= 4, "{max_open} open");
+        assert!(h1_connects(ROLE) <= 4, "{} connects", h1_connects(ROLE));
+        let waits = crate::metrics::HTTP_CLIENT_POOL_WAITS.with_label_values(&[ROLE]).get();
+        assert!(waits > 0, "128 requests over 4 connections waited");
+    }
+
+    /// A body dropped part-way (the client went away) closes its connection,
+    /// which ends the upstream exchange and frees the permit, instead of
+    /// pooling it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn h1_dropped_body_closes_its_connection() {
+        const ROLE: &str = "test-h1-drop";
+        struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                if let Some(t) = self.0.take() {
+                    let _ = t.send(());
+                }
+            }
+        }
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let authority = l.local_addr().unwrap().to_string();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let closed_tx = Arc::new(parking_lot::Mutex::new(Some(closed_tx)));
+        // a body that never ends; its stream is dropped when the connection closes
+        let router = axum::Router::new().fallback(move || {
+            let guard = OnDrop(closed_tx.lock().take());
+            async move {
+                let s = futures::stream::unfold(guard, |g| async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Some((Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"chunk")), g))
+                });
+                axum::body::Body::from_stream(s)
+            }
+        });
+        tokio::spawn(crate::server::serve(l, router));
+        let r = h1::send(ROLE, &authority, h1_get("/stream")).await.unwrap();
+        let mut body = axum::body::Body::new(r.into_body()).into_data_stream();
+        let first = futures::StreamExt::next(&mut body).await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), b"chunk");
+        drop(body);
+        tokio::time::timeout(Duration::from_secs(5), closed_rx).await.expect("upstream saw the close").unwrap();
+        let host = h1::host(&authority);
+        let t = std::time::Instant::now();
+        while host.open_connections() > 0 {
+            assert!(t.elapsed() < Duration::from_secs(5), "permit not freed");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(host.idle_connections(), 0);
     }
 }

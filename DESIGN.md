@@ -363,7 +363,7 @@ load it should stay flat (a rising rate means pool churn).
 |---|---|---|
 | peer | forwarding, internal calls | h2c prior knowledge; 4 MiB stream / 64 MiB conn windows; PING every 10 s (also idle), dead after 5 s; TCP keepalive 30 s; nodelay; connect 1 s; `--peer-connections` (default 4) connections per peer, round-robin |
 | public | PLC, requestCrawl | h2 by ALPN on https, HTTP/1.1 on http with 1,024 idle per host; idle close 60 s; h2 PING 20 s / 10 s; TCP keepalive; connect 5 s, read 30 s |
-| proxy | configured AppView / report service | `http://`: hyper HTTP/1.1 connections in per-IO-thread pools (32 idle per thread, overflow to a shared pool of 1,024), idle close 60 s, retry once if a reused connection was closed before the request went out; `https://`: public's settings as one client per IO thread. No read timeout: the proxy arms a 10 s head deadline and a 30 s body-idle timer only while the upstream makes it wait |
+| proxy | configured AppView / report service | `http://`: hyper HTTP/1.1 connections, one pool per host with a slot per IO thread: a connection goes back to the slot of the thread that finished its body, a request takes from its own slot, else from another slot, else connects; at most 1,024 connections per host (idle + busy; past that a request waits for one, `vlpds_http_client_pool_waits_total`); idle close 60 s, retry once if a reused connection was closed before the request went out; `https://`: public's settings as one client per IO thread. No read timeout: the proxy arms a 10 s head deadline and a 30 s body-idle timer only while the upstream makes it wait. Responses stream through unbuffered; compressed ones as the upstream encoded them (Content-Encoding/-Length kept, never decoded or re-compressed; the client's Accept-Encoding is forwarded); a client that goes away mid-body closes the upstream connection. CORS preflights are answered locally (no auth, no upstream) |
 | guarded | user-derived URLs: did:web, handle `.well-known`, OAuth client metadata, lexicons, DID-doc service endpoints | public's settings, 32 idle per host, plus a resolver that drops non-public addresses (outside dev mode); pair with `check_outbound_url` |
 | S3 (object_store) | log and state stores (separate pools) | HTTP/1.1 only, 256 idle per host, idle close 15 s (S3 closes at ~20 s), connect 2 s, 30 s total |
 
@@ -376,7 +376,13 @@ from being the bottleneck or the single point of failure. The AppView stays
 on pooled HTTP/1.1 over plaintext: one multiplexed h2c connection was slower
 (bench 2026-10-02 §6). The proxy's pools are per IO thread because a shared
 pool's mutex (taken at checkout and return) and the timers reqwest arms per
-read (tokio has one timer-wheel lock) were ~20% of the proxy's CPU.
+read (tokio has one timer-wheel lock) were ~20% of the proxy's CPU. The h1
+pool keeps that (a request normally locks only its own thread's slot) but
+lets a thread with an empty slot take from the others before connecting:
+purely per-thread pools (+ a shared overflow) drifted to 1.45-3x the
+concurrency in connections as tasks hopped threads (laptop A/B, 6 IO
+threads: 369-398 connections at 256 in flight, 185-202 at 64; now exactly
+256 and 64-65), at the same ~39-40 µs CPU per proxied request.
 
 Server (`server::serve`, HTTP/1.1 + h2c auto): h1 header read timeout 30 s
 (slowloris; also the idle keep-alive bound), h2 windows as above, 1,024

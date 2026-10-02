@@ -149,6 +149,11 @@ enum Cmd {
         listen: String,
         #[arg(long, default_value_t = 2048)]
         body_bytes: usize,
+        /// Label the body with this Content-Encoding (e.g. gzip) and send
+        /// `body_bytes` opaque bytes, like an AppView's compressed response
+        /// (the PDS passes it through without looking inside).
+        #[arg(long, default_value = "")]
+        content_encoding: String,
     },
     /// Closed-loop proxied reads (app.bsky.* via the default AppView) from a
     /// window of `active` bulk accounts (self-minted access tokens).
@@ -168,6 +173,9 @@ enum Cmd {
         jwt_secret: String,
         #[arg(long, default_value = "did:web:localhost")]
         service_did: String,
+        /// Accept-Encoding sent with each request (none if empty).
+        #[arg(long, default_value = "")]
+        accept_encoding: String,
         #[arg(long, default_value = "")]
         json_out: String,
     },
@@ -347,9 +355,12 @@ fn main() -> anyhow::Result<()> {
                 json_out,
             } => fanout(&args, *subscribers, *seconds, *cursor, json_out).await,
             Cmd::Verify { acked } => verify(&args, acked).await,
-            Cmd::StubAppview { listen, body_bytes } => stub_appview(listen, *body_bytes).await,
-            Cmd::Proxy { active, concurrency, seconds, path, connections, jwt_secret, service_did, json_out } => {
-                proxy_bench(&args, *active, *concurrency, *seconds, path, *connections, jwt_secret, service_did, json_out).await
+            Cmd::StubAppview { listen, body_bytes, content_encoding } => {
+                stub_appview(listen, *body_bytes, content_encoding).await
+            }
+            Cmd::Proxy { active, concurrency, seconds, path, connections, jwt_secret, service_did, accept_encoding, json_out } => {
+                proxy_bench(&args, *active, *concurrency, *seconds, path, *connections, jwt_secret, service_did, accept_encoding, json_out)
+                    .await
             }
             Cmd::CloneRepo { car, copies, concurrency, blobs_dir } => clone_repo(&args, car, *copies, *concurrency, blobs_dir).await,
             Cmd::Sweep { sizes, concurrency, seconds, fill_concurrency, json_out } => {
@@ -2096,12 +2107,23 @@ async fn clone_repo(args: &Args, car_path: &str, copies: usize, concurrency: usi
 
 // ---------------- proxy fast path ----------------
 
-async fn stub_appview(listen: &str, body_bytes: usize) -> anyhow::Result<()> {
-    let pad = "x".repeat(body_bytes.saturating_sub(32));
-    let body = bytes::Bytes::from(format!("{{\"feed\":[],\"cursor\":\"{pad}\"}}"));
+async fn stub_appview(listen: &str, body_bytes: usize, content_encoding: &str) -> anyhow::Result<()> {
+    let body = if content_encoding.is_empty() {
+        let pad = "x".repeat(body_bytes.saturating_sub(32));
+        bytes::Bytes::from(format!("{{\"feed\":[],\"cursor\":\"{pad}\"}}"))
+    } else {
+        bytes::Bytes::from((0..body_bytes).map(|i| (i * 131 + 7) as u8).collect::<Vec<u8>>())
+    };
+    let ce = (!content_encoding.is_empty()).then(|| axum::http::HeaderValue::from_str(content_encoding)).transpose()?;
     let app = axum::Router::new().fallback(move || {
-        let body = body.clone();
-        async move { ([(axum::http::header::CONTENT_TYPE, "application/json")], body) }
+        let (body, ce) = (body.clone(), ce.clone());
+        async move {
+            let mut r = axum::response::IntoResponse::into_response(([(axum::http::header::CONTENT_TYPE, "application/json")], body));
+            if let Some(ce) = ce {
+                r.headers_mut().insert(axum::http::header::CONTENT_ENCODING, ce);
+            }
+            r
+        }
     });
     let l = tokio::net::TcpListener::bind(listen).await?;
     eprintln!("stub appview on {listen}, {body_bytes}-byte bodies");
@@ -2119,9 +2141,11 @@ async fn proxy_bench(
     connections: usize,
     jwt_secret: &str,
     service_did: &str,
+    accept_encoding: &str,
     json_out: &str,
 ) -> anyhow::Result<()> {
     let t = Instant::now();
+    let accept_encoding: Arc<str> = accept_encoding.into();
     let jwt = vlpds::auth::Jwt::new(jwt_secret, service_did);
     let tokens: Arc<Vec<(String, String)>> = Arc::new(
         (0..active)
@@ -2137,12 +2161,12 @@ async fn proxy_bench(
     let url: Arc<str> = format!("{}/xrpc/{path}", args.host).into();
     // warm: one pass over a sample so connections are up
     let run_for = |secs: u64, record: bool| {
-        let (clients, tokens, url) = (clients.clone(), tokens.clone(), url.clone());
+        let (clients, tokens, url, ae) = (clients.clone(), tokens.clone(), url.clone(), accept_encoding.clone());
         async move {
             let deadline = Instant::now() + Duration::from_secs(secs);
             let tasks: Vec<_> = (0..concurrency)
                 .map(|_| {
-                    let (clients, tokens, url) = (clients.clone(), tokens.clone(), url.clone());
+                    let (clients, tokens, url, ae) = (clients.clone(), tokens.clone(), url.clone(), ae.clone());
                     tokio::spawn(async move {
                         let mut h = hist();
                         let (mut ok, mut err, mut bytes) = (0u64, 0u64, 0u64);
@@ -2150,7 +2174,11 @@ async fn proxy_bench(
                         while Instant::now() < deadline {
                             let (_, tok) = &tokens[rand::thread_rng().gen_range(0..tokens.len())];
                             let t = Instant::now();
-                            match clients.pick().get(&*url).header("authorization", tok).send().await {
+                            let mut rb = clients.pick().get(&*url).header("authorization", tok);
+                            if !ae.is_empty() {
+                                rb = rb.header("accept-encoding", &*ae);
+                            }
+                            match rb.send().await {
                                 Ok(r) if r.status().is_success() => match r.bytes().await {
                                     Ok(b) => {
                                         ok += 1;
