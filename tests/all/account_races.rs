@@ -1,11 +1,11 @@
 //! Account changes race with each other and with shard handoff:
 //! - every account mutation is a read-modify-write the repo's worker applies
 //!   to its current state, so a concurrent refreshIdentity / updateHandle can't
-//!   write back a stale snapshot over a takedown (XRPC review: 11/20 takedowns
-//!   reverted), and changes to different fields all land;
-//! - a repo load that straddles a shard close/reopen is never cached (bench/ha
-//!   N6: commits chained on the stale state, then "rebuilt MST root != head
-//!   data" forever).
+//!   write back a stale snapshot over a takedown, and changes to different
+//!   fields all land;
+//! - a repo load that straddles a shard close/reopen is never cached (else
+//!   commits chain on the stale state, then "rebuilt MST root != head data"
+//!   forever).
 use crate::common::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

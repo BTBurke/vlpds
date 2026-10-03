@@ -196,9 +196,9 @@ async fn staggered_starts_under_load_lose_no_events() {
 /// F is above seqs the peer assigned but hasn't made durable yet. A cursor-0
 /// subscriber attached the moment the node is up backfills (0, F] from S3,
 /// which has to wait until every peer's log is durable past F. The merger
-/// drops events <= F as the backfill's, so an early backfill loses the
-/// peer's in-flight ones for good (they used to be: a follower's watermark
-/// started at F, before the peer had reported anything).
+/// drops events <= F as the backfill's, so an early backfill (say, a
+/// follower's watermark starting at F before the peer reported anything)
+/// loses the peer's in-flight ones for good.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn start_floor_waits_for_peers_in_flight_segments() {
     let store = Arc::new(object_store::memory::InMemory::new());
@@ -222,13 +222,12 @@ async fn start_floor_waits_for_peers_in_flight_segments() {
 
 /// A node shut down gracefully whose server keeps answering afterwards (an
 /// in-process test node, or a process hung past its shutdown): its log is
-/// fenced and its lease gone, but its log stream used to stay open,
-/// heartbeating a frozen watermark, so every peer's merger stalled there
-/// for as long as the process lived (tests had to `halt` the node too).
-/// Now the stream ends with the log (and a follower leaves a stream whose
-/// lease is gone): peers drain it from S3 to the fence, retire it, and
-/// their firehoses keep advancing under the writes that go on, every acked
-/// event once and in order.
+/// fenced and its lease gone. A log stream left open, heartbeating a frozen
+/// watermark, would stall every peer's merger for as long as the process
+/// lived. The stream must end with the log (and a follower leave a stream
+/// whose lease is gone): peers drain it from S3 to the fence, retire it,
+/// and their firehoses keep advancing under the writes that go on, every
+/// acked event once and in order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn stopped_node_still_serving_does_not_stall_its_peers() {
     use vlpds::cluster::ShardHost;

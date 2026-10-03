@@ -51,9 +51,8 @@ async fn list_repos(s: &TestServer, limit: usize) -> Vec<J> {
     panic!("too many pages");
 }
 
-/// listRepos / listReposByCollection used to 500 ("partition not owned") on
-/// any node of a multi-node cluster; they now scatter-gather like the admin
-/// listings and page across every node's shards.
+/// listRepos / listReposByCollection on any node scatter-gather like the
+/// admin listings and page across every node's shards (not just its own).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn list_repos_spans_the_cluster() {
     let (a, b, c) = cluster("e2e-lr").await;
@@ -97,8 +96,8 @@ async fn list_repos_spans_the_cluster() {
     }
 }
 
-/// resetPassword names only its token; it used to run on whichever node got
-/// it and fail with 503 (the account update needs the owner's worker).
+/// resetPassword names only its token, but the account update needs the
+/// owner's worker: any node must route it there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reset_password_through_any_node() {
     let (a, b, c) = cluster("e2e-rp").await;
@@ -145,8 +144,8 @@ async fn resolve_identity_routes_by_identifier() {
     }
 }
 
-/// HTTPS handle verification (`/.well-known/atproto-did` by Host) was not
-/// served at all; every node answers for every account.
+/// HTTPS handle verification (`/.well-known/atproto-did` by Host): every
+/// node answers for every account.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn well_known_atproto_did_by_host() {
     let (a, b, c) = cluster("e2e-wk").await;

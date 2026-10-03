@@ -1,7 +1,6 @@
 //! Compaction polling (`--compaction-polling`, partition.rs): what each mode
 //! costs idle (object-store requests per shard per second) and what an
-//! unpaced single-shard bulk ingest stalls for (TODO "Unpaced single-shard
-//! bulk still backpressures for seconds per compaction cycle"). Ignored by
+//! unpaced single-shard bulk ingest stalls for. Ignored by
 //! default (the ingest moves GBs); run alone, since the mode is process-wide:
 //! `INGEST_RECORDS=3000000 cargo test --test all compaction_polling --
 //! --ignored --nocapture --test-threads=1`.

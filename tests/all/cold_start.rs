@@ -1,7 +1,6 @@
-//! Cold start after a node restart (TODO "Capacity-test findings"): the
-//! first writes to a shard's repos on their new owner are cold loads, which
-//! used to queue past the forwarder's 3 s time-to-first-byte deadline and
-//! fail. Now (DESIGN.md "Forwarding deadlines" and §2):
+//! Cold start after a node restart: the first writes to a shard's repos on
+//! their new owner are cold loads, which can queue past the forwarder's 3 s
+//! time-to-first-byte deadline (DESIGN.md "Forwarding deadlines" and §2):
 //! - a forwarded write that hasn't started within 1 s is abandoned unapplied
 //!   and answered 503 `RepoLoading`; the forwarding node resends it, so the
 //!   client sees latency, not an error;

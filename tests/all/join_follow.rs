@@ -8,11 +8,11 @@
 //! is stuck (it can't discover c from the node list) and b answers c's
 //! greeting "not following" (`Cluster::test_hold_steps`,
 //! `test_ignore_hellos`). b keeps renewing its lease and its merger keeps
-//! emitting a's and its own events. The time-based join grace (2 renew
-//! intervals) used to expire here, c took a handback from a and acked
-//! writes, and once b recovered, b's live subscribers never saw those
-//! commits. Now c joins only once b confirms (hello or its lease), and every
-//! node's stream is the union of all logs.
+//! emitting a's and its own events. A time-based join grace (2 renew
+//! intervals) would expire here, c take a handback from a and ack writes,
+//! and once b recovered, b's live subscribers would never see those
+//! commits. c must join only once b confirms (hello or its lease), and every
+//! node's stream be the union of all logs.
 
 use crate::common::*;
 use crate::firehose_startup::{Writers, collect, mismatch, node_with, s3_union};

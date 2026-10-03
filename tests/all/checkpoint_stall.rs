@@ -1,7 +1,7 @@
 //! Node-log checkpoints (applied marker + memtable flush per shard) are
 //! staggered: one shard every `checkpoint_every / shards` instead of every
-//! shard back to back each interval (TODO "Capacity-test findings": ~700 ms
-//! runtime stalls right after each 10 s checkpoint on a CPU-starved box).
+//! shard back to back each interval (which stalls a CPU-starved runtime
+//! right after each checkpoint).
 //!
 //! `stall_*` measure it (ignored; run one at a time): one node with 128
 //! shards on 3 runtime threads (the laptop's --io-threads), writes at a

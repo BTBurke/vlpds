@@ -156,10 +156,8 @@ impl TestServer {
             public_url: url.clone(),
             // Off by default, as in the reference's dev-env test network: the
             // suite drives thousands of writes from one IP and DID.
-            // tests/rate_limits.rs turns them on.
             rate_limits_enabled: false,
             cluster: peer.is_some().then(|| vlpds::cluster::ClusterConfig { node_id: "single".into(), addr: peer_url.clone(), ..Default::default() }),
-            // small ring is fine; tests are tiny
             ..Default::default()
         };
         f(&mut cfg);
@@ -294,10 +292,8 @@ impl TestServer {
     /// The cursor is a seq, not an event: every event acked before this call
     /// is at or below this node log's durable watermark (or the clock, for
     /// other nodes' logs), and the call returns once the firehose has settled
-    /// past it. (It used to replay from 0 and take the highest seq seen
-    /// within 400 ms of idleness, which a slow backfill start or emission
-    /// lag under load turned into cursor 0: the account creation's events
-    /// were then replayed to tests expecting only later ones.)
+    /// past it. (The highest seq seen on a replay goes wrong under load: a
+    /// slow backfill start reads as idle, and the cursor falls back to 0.)
     pub async fn subscribe_from_now(&self) -> Sub {
         let head = self.settled_now().await;
         self.subscribe(Some(head)).await
@@ -943,7 +939,6 @@ impl CommitEvt {
     pub fn invert(&self) -> anyhow::Result<Cid> {
         let c = self.commit_obj();
         let mut tree = Tree::load_from_blocks(&self.blocks, c.data).map_err(|e| anyhow::anyhow!("load partial tree: {e}"))?;
-        // Check the post-state of each op first.
         for op in &self.ops {
             let got = tree.get(op.path.as_bytes()).map_err(|e| anyhow::anyhow!("get {}: {e}", op.path))?;
             let want = if op.action == "delete" { None } else { op.cid };
@@ -1166,7 +1161,6 @@ pub async fn eventually<T, F: std::future::Future<Output = Option<T>>>(timeout: 
     }
 }
 
-pub const SEC: Duration = Duration::from_secs(1);
 pub const FH_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn fixture_path(rel: &str) -> std::path::PathBuf {
@@ -1208,7 +1202,9 @@ pub const PNG_1X1: &[u8] = &[
     0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ];
 
-// ---- ref group A helpers ----
+// ---------------------------------------------------------------------------
+// mail, moderation, encodings, generators, stubs
+// ---------------------------------------------------------------------------
 
 /// The newest dev-mode mail sent to `email` (vlpds.admin.getDevMail):
 /// `{to, subject, body, html, purpose, token, sentAt}`.

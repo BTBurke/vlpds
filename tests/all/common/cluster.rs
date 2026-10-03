@@ -42,7 +42,7 @@ pub fn owned(n: &TestServer) -> usize {
 }
 
 /// The shards `n` has open, sorted.
-pub fn owned_shards(n: &TestServer) -> Vec<ShardId> {
+fn owned_shards(n: &TestServer) -> Vec<ShardId> {
     let mut v: Vec<ShardId> = n.app.partitions.owned().iter().map(|p| p.id).collect();
     v.sort();
     v

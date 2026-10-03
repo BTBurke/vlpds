@@ -356,14 +356,12 @@ async fn frames_to(s: &TestServer, cursor: i64, did: &str, head: &Cid) -> Vec<Fr
     sub.until(Duration::from_secs(20), |fs| fs.last().and_then(|f| f.commit()).is_some_and(|c| c.repo == did && c.commit == *head)).await
 }
 
-/// Soak 2026-10-02 (benchbox, 1 of 210 probes): a cursor 44.7 s old, inside the
-/// 90 s window, got OutdatedCursor and skipped 31.8 s of stored events. A dead
-/// log lying wholly below the cursor was being pruned while the backfill
-/// seeked it: the seek LISTed the log's lowest ordinal, retention deleted it
-/// before the header read, and the reader returned `Pruned`. The retained
-/// floor was below the cursor (nothing past it had been deleted), so the
-/// firehose took it for a failed backfill: OutdatedCursor and a jump to the
-/// ring floor.
+/// A cursor inside the retention window must not get OutdatedCursor when a
+/// log lying wholly below it is pruned while the backfill seeks it: the seek
+/// LISTs the log's lowest ordinal, retention deletes it before the header
+/// read, and the reader returns `Pruned`. The retained floor is still below
+/// the cursor (nothing past it was deleted), so that is not a failed
+/// backfill.
 ///
 /// Here a dead log (the node's previous incarnation, all of it below the
 /// cursor) and the live log's head below the cursor are each deleted under
@@ -473,7 +471,7 @@ impl Proc {
 /// with cursors a quarter window old. Log GETs take 2 ms (object-store
 /// latency is what opens the LIST-then-GET window the soak hit). None may get
 /// OutdatedCursor, and each sees its events in seq order with every repo's
-/// commits chained. Before the fix every run got OutdatedCursor.
+/// commits chained.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn cursors_inside_the_window_through_restarts_and_reshards() {
     const WINDOW: Duration = Duration::from_secs(3);
