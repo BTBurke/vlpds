@@ -28,6 +28,7 @@ import {
   type Saved,
   type StepId,
 } from './flow'
+import type { RecordCounts } from './count'
 
 type Describe = { did: string; availableUserDomains: string[]; inviteCodeRequired?: boolean }
 
@@ -297,6 +298,27 @@ const hostOf = (u: string) => {
     return u
   }
 }
+
+/** English nouns with the reader's digit grouping; zeros are left out. */
+const NOUNS = {
+  posts: ['post', 'posts'],
+  likes: ['like', 'likes'],
+  follows: ['follow', 'follows'],
+  reposts: ['repost', 'reposts'],
+  media: ['photo or video', 'photos & videos'],
+} as const
+type Tally = Partial<Record<keyof typeof NOUNS, number>>
+
+const noun = (k: keyof typeof NOUNS, n: number) => NOUNS[k][n === 1 ? 0 : 1]
+
+function tally(t: Tally): string[] {
+  return (Object.keys(NOUNS) as (keyof typeof NOUNS)[]).flatMap((k) => {
+    const n = t[k]
+    return n ? [`${fmtNum(n)} ${noun(k, n)}`] : []
+  })
+}
+
+const andList = (xs: string[]) => (xs.length < 2 ? xs.join('') : `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}`)
 
 function Checkline({ state, title, children }: { state: 'ok' | 'warn' | 'bad' | 'wait'; title: string; children?: ReactNode }) {
   return (
@@ -624,6 +646,10 @@ function CheckStep({
   useEffect(() => {
     setChecks({})
     const did = saved.did
+    // the AppView's counts, through the old server: approximate, and optional
+    const profile: Promise<{ postsCount?: number; followsCount?: number } | undefined> = adv
+      ? Promise.resolve(undefined)
+      : Promise.race([oldPds.call('app.bsky.actor.getProfile', { params: { actor: did } }).catch(() => undefined), sleep(5000).then(() => undefined)])
     put('server', { state: 'ok', title: `${here} is ready`, detail: describe.inviteCodeRequired ? 'New accounts here need an invite code.' : 'Open to new accounts.' })
     put('did', adv ? { state: 'ok', title: 'Your identity can move', detail: <>A did:plc: the PLC directory records which server hosts it.</> } : { state: 'ok', title: 'Your account can move' })
     put('here', { state: 'wait', title: 'Looking for an earlier copy here' })
@@ -646,16 +672,22 @@ function CheckStep({
     put('old', { state: 'wait', title: `Checking your account on ${hostOf(saved.oldPds)}` })
     oldPds
       .call<AccountStatus>('com.atproto.server.checkAccountStatus')
-      .then((st) => {
+      .then(async (st) => {
+        const p = await profile
         if (!st.activated) put('old', { state: 'warn', title: `Your account on ${hostOf(saved.oldPds)} is deactivated`, detail: 'It can still be moved, but it is not live there now.' })
         else put('old', { state: 'ok', title: `Your account on ${hostOf(saved.oldPds)} is active` })
         const big = st.indexedRecords > 500_000 || st.expectedBlobs > 20_000
         put('size', {
           state: big ? 'warn' : 'ok',
           title: adv ? `${fmtNum(st.indexedRecords)} records, ${fmtNum(st.expectedBlobs)} images and videos` : 'Your posts, follows and photos are ready to copy',
-          detail: big
-            ? 'A large account: copying can take a long time. Keep this tab open; if it stops, reload and it picks up where it was.'
-            : 'About a minute or two to copy.',
+          detail: (
+            <>
+              {!adv && <PreflightCounts posts={p?.postsCount} follows={p?.followsCount} media={st.expectedBlobs} />}
+              {big
+                ? 'A large account: copying can take a long time. Keep this tab open; if it stops, reload and it picks up where it was.'
+                : 'About a minute or two to copy.'}
+            </>
+          ),
         })
       })
       .catch((e) => put('old', { state: 'bad', title: `Couldn't read your account on ${hostOf(saved.oldPds)}`, detail: say(e) }))
@@ -715,6 +747,21 @@ function CheckStep({
     </Card>
   )
 }
+
+function PreflightCounts({ posts, follows, media }: { posts?: number; follows?: number; media: number }) {
+  const records = tally({ posts, follows })
+  const photos = tally({ media })
+  if (!records.length && !photos.length) return null
+  return (
+    <div className="mig-counts">
+      {records.length
+        ? `About ${andList(records)}${photos.length ? `, plus ${photos[0]}` : ''}.`
+        : `${photos[0]}, plus your posts, likes and follows.`}
+    </div>
+  )
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 function maskEmail(e: string) {
   const [u, d] = e.split('@')
@@ -1044,7 +1091,7 @@ function SignInInline({ pds, onDone }: { pds: Pds; onDone: (handle: string) => v
 // ---------------------------------------------------------------- 6. copy
 
 type CopyView = {
-  repo: { phase?: 'download' | 'upload' | 'verify'; bytes: number; total?: number; records?: [number, number] }
+  repo: { phase?: 'download' | 'upload' | 'verify'; bytes: number; total?: number; records?: [number, number]; found?: RecordCounts }
   blobs: { done: number; total?: number; bytes: number; failed: { cid: string; reason: string }[]; pausedUntil?: number }
   prefs?: number
   error?: unknown
@@ -1068,7 +1115,19 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
         try {
           const s = () => savedRef.current
           if (!s().repoDone) {
-            await copyRepo(oldPds, newPds, (phase, bytes, total) => set((x) => ({ ...x, repo: { ...x.repo, phase, bytes, total } })))
+            // counting is for show: a CAR it can't read just means no numbers
+            let counting: Promise<RecordCounts | undefined> = Promise.resolve(undefined)
+            await copyRepo(
+              oldPds,
+              newPds,
+              (phase, bytes, total) => set((x) => ({ ...x, repo: { ...x.repo, phase, bytes, total } })),
+              (car) => {
+                counting = Promise.all([car.arrayBuffer(), import('./count')])
+                  .then(([b, m]) => m.countRecords(new Uint8Array(b)))
+                  .catch(() => undefined)
+                counting.then((found) => found && set((x) => ({ ...x, repo: { ...x.repo, found } })))
+              },
+            )
             set((x) => ({ ...x, repo: { ...x.repo, phase: 'verify' } }))
             const [a, b] = await Promise.all([
               oldPds.call<AccountStatus>('com.atproto.server.checkAccountStatus'),
@@ -1079,7 +1138,8 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
               set((x) => ({ ...x, mismatch: `${hostOf(saved.oldPds)} reports ${fmtNum(a.indexedRecords)} records; the copy here has ${fmtNum(b.indexedRecords)}.` }))
               return
             }
-            update({ repoDone: true })
+            const found = await counting
+            update({ repoDone: true, counts: found && found.total === b.indexedRecords ? found : undefined })
           }
           if (!s().blobsDone) {
             const skip = new Set(s().unavailableBlobs ?? [])
@@ -1128,6 +1188,9 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
   }, [run])
 
   const r = v.repo
+  const copied = saved.counts ? tally(saved.counts) : []
+  const found = r.found ? tally(r.found) : []
+  const media = (n: number) => (adv ? '' : ` ${noun('media', n)}`)
   return (
     <Card title="Copying your data" sub={<>From {hostOf(saved.oldPds)} to {here}. Your account there keeps working meanwhile. If anything stops, reload: it picks up where it was.</>}>
       <ul className="mig-checks">
@@ -1136,7 +1199,15 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
           title={adv ? 'Posts, follows, likes and profile (your repository)' : 'Your posts, follows, likes and profile'}
         >
           {saved.repoDone ? (
-            r.records && adv ? `${fmtNum(r.records[1])} records copied and checked.` : r.records ? 'Copied and checked.' : 'Copied.'
+            adv ? (
+              `${r.records ? `${fmtNum(r.records[1])} records copied and checked` : 'Copied'}${copied.length ? ` (${copied.join(', ')})` : ''}.`
+            ) : copied.length ? (
+              <span className="mig-counts">All {andList(copied)} copied.</span>
+            ) : r.records ? (
+              'Copied and checked.'
+            ) : (
+              'Copied.'
+            )
           ) : r.phase === 'download' ? (
             <>
               Downloading from {hostOf(saved.oldPds)}: {fmtBytes(r.bytes)}
@@ -1145,11 +1216,12 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
             </>
           ) : r.phase === 'upload' ? (
             <>
+              {found.length > 0 && !adv && <div className="mig-counts">Copying {andList(found)}.</div>}
               Uploading here: {fmtBytes(r.bytes)} of {fmtBytes(r.total ?? 0)}
               <Bar value={r.bytes} total={r.total} label="Repository upload" />
             </>
           ) : r.phase === 'verify' ? (
-            'Checking the copy…'
+            found.length && !adv ? `Checking the copy of ${andList(found)}…` : 'Checking the copy…'
           ) : (
             'Starting…'
           )}
@@ -1161,6 +1233,8 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
           {saved.blobsDone ? (
             saved.unavailableBlobs?.length ? (
               `Copied, except ${saved.unavailableBlobs.length} that ${hostOf(saved.oldPds)} couldn't provide.`
+            ) : v.blobs.total && !adv ? (
+              <span className="mig-counts">All {tally({ media: v.blobs.total })[0]} copied.</span>
             ) : (
               'All copied.'
             )
@@ -1169,7 +1243,7 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
           ) : (
             <>
               {fmtNum(v.blobs.done)}
-              {v.blobs.total !== undefined ? ` of ${fmtNum(v.blobs.total)}` : ''} copied{v.blobs.bytes ? ` (${fmtBytes(v.blobs.bytes)} this session)` : ''}
+              {v.blobs.total !== undefined ? ` of ${fmtNum(v.blobs.total)}${media(v.blobs.total)}` : media(v.blobs.done)} copied{v.blobs.bytes ? ` (${fmtBytes(v.blobs.bytes)} this session)` : ''}
               <Bar value={v.blobs.done} total={v.blobs.total || undefined} label="Images and videos" />
               {v.blobs.pausedUntil && v.blobs.pausedUntil > Date.now() && (
                 <div>
@@ -1573,7 +1647,30 @@ function DoneStep({ saved, newPds, onReset }: { saved: Saved; newPds: Pds; onRes
         </>
       }
     >
-      {st.data && (
+      {st.data && !adv && saved.counts && (
+        <div className="tiles mig-counts">
+          {(['posts', 'likes', 'follows', 'reposts'] as const)
+            .filter((k) => k !== 'reposts' || saved.counts![k] > 0)
+            .map((k) => (
+              <div className="tile" key={k}>
+                <div className="v">{fmtNum(saved.counts![k])}</div>
+                <div className="k">{noun(k, saved.counts![k])}</div>
+              </div>
+            ))}
+          <div className="tile">
+            <div className="v">
+              {fmtNum(st.data.importedBlobs)}
+              {st.data.importedBlobs !== st.data.expectedBlobs && <small>/ {fmtNum(st.data.expectedBlobs)}</small>}
+            </div>
+            <div className="k">{noun('media', st.data.importedBlobs)}</div>
+          </div>
+          <div className="tile">
+            <div className="v">{st.data.activated && st.data.validDid ? <Status kind="ok">Live</Status> : <Status kind="warn">Check</Status>}</div>
+            <div className="k">status</div>
+          </div>
+        </div>
+      )}
+      {st.data && (adv || !saved.counts) && (
         <div className="tiles">
           <div className="tile">
             <div className="v">{fmtNum(st.data.indexedRecords)}</div>

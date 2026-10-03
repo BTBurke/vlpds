@@ -321,6 +321,35 @@ const plcData = (did) => fetch(`${PLC}/${did}/data`).then((r) => r.json())
 
 const heading = (page) => page.locator('.mig-card h1')
 
+/** What simple mode should say about `a`, from the seeded records and blobs. */
+function expectCounts(a) {
+  const by = {}
+  for (const uri of Object.keys(a.records)) {
+    const c = uri.split('/')[3]
+    by[c] = (by[c] ?? 0) + 1
+  }
+  const n = (k, one, many) => `${k.toLocaleString('en-US')} ${k === 1 ? one : many}`
+  const posts = n(by['app.bsky.feed.post'] ?? 0, 'post', 'posts')
+  const likes = n(by['app.bsky.feed.like'] ?? 0, 'like', 'likes')
+  const follows = n(by['app.bsky.graph.follow'] ?? 0, 'follow', 'follows')
+  const media = n(Object.keys(a.blobs).length, 'photo or video', 'photos & videos')
+  return { by, posts, likes, follows, media, nBlobs: Object.keys(a.blobs).length }
+}
+
+const flat = (s) => s.replace(/\s+/g, ' ').trim()
+
+/** Polls the card until its text matches `re` (the page's CSP rules out waitForFunction). */
+async function waitCardText(page, re, timeout = 60_000) {
+  for (const end = Date.now() + timeout; ; ) {
+    const t = flat(await page.locator('.mig-card').innerText().catch(() => ''))
+    if (re.test(t)) return t
+    if (Date.now() > end) throw new Error(`card never matched ${re}: ${t.slice(0, 300)}`)
+    await sleep(100)
+  }
+}
+
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
 async function waitHeading(page, re, timeout = 60_000) {
   await page.locator('.mig-card h1', { hasText: re }).waitFor({ timeout })
 }
@@ -335,6 +364,15 @@ async function driveOne(ctx, a, state, opts) {
   if (opts.keepHandle) {
     await page.route(`${REF}/xrpc/com.atproto.server.describeServer`, (r) =>
       r.fulfill({ json: { did: 'did:web:localhost', availableUserDomains: ['.elsewhere.invalid'], inviteCodeRequired: false } }),
+    )
+  }
+  if (opts.fakeProfile) {
+    // the harness has no AppView; answer getProfile (proxied by the old server) with the seeded numbers
+    const w = expectCounts(a)
+    await page.route(`${REF}/xrpc/app.bsky.actor.getProfile*`, (r) =>
+      r.fulfill({
+        json: { did: a.did, handle: a.handle, postsCount: w.by['app.bsky.feed.post'], followsCount: w.by['app.bsky.graph.follow'], followersCount: 3 },
+      }),
     )
   }
   if (opts.fromLanding) {
@@ -395,8 +433,16 @@ async function driveOne(ctx, a, state, opts) {
   }
   await shot(page, `${a.name}-checks`)
   const checksText = await page.locator('.mig-checks').innerText()
+  const want = expectCounts(a)
   if (opts.advanced) check(checksText.includes(`${a.oldStatus.indexedRecords} records`), 'preflight shows the record count', checksText)
-  else check(!checksText.includes('records'), 'simple preflight shows no record count', checksText)
+  else {
+    check(!checksText.includes('records'), 'simple preflight shows no record count', checksText)
+    const line = flat(await page.locator('.mig-counts').innerText().catch(() => ''))
+    const exp = opts.fakeProfile
+      ? `About ${want.posts} and ${want.follows}, plus ${want.media}.`
+      : `${want.media}, plus your posts, likes and follows.`
+    check(line === exp, `simple preflight counts: "${exp}"${opts.fakeProfile ? ' (AppView profile counts)' : ' (no AppView: photos only)'}`, `got "${line}"`)
+  }
   await page.click('button:has-text("Continue")')
 
   // 4. handle
@@ -445,7 +491,30 @@ async function driveOne(ctx, a, state, opts) {
   }
 
   // 6. copy
+  const repoLine = `All ${want.posts}, ${want.likes} and ${want.follows} copied.`
+  // blobs, then settings, wait until each screen has been read, so the step can't move on first
+  const gate = () => {
+    let open
+    const p = new Promise((r) => (open = r))
+    return { p, open }
+  }
+  const blobGate = gate()
+  const prefsGate = gate()
+  if (opts.holdBlobs) {
+    await page.route(`${REF}/xrpc/com.atproto.sync.getBlob*`, async (r) => (await blobGate.p, r.continue()))
+    await page.route(`${REF}/xrpc/app.bsky.actor.getPreferences*`, async (r) => (await prefsGate.p, r.continue()))
+  }
   await waitHeading(page, /Copying your data/)
+  if (opts.holdBlobs) {
+    await waitCardText(page, new RegExp(`${esc(repoLine)}.*0 of ${want.nBlobs} photos & videos copied`))
+    check(true, `simple copy step: "${repoLine}" and "0 of ${want.media} copied"`)
+    await shot(page, `${a.name}-copy-counts`)
+    blobGate.open()
+    await waitCardText(page, new RegExp(esc(`All ${want.media} copied.`)))
+    check(true, `simple copy step: "All ${want.media} copied."`)
+    await shot(page, `${a.name}-copy-done`)
+    prefsGate.open()
+  }
   if (opts.reloadMidBlobs) {
     // slow the old server's blobs so the reload lands mid-copy
     await page.route(`${REF}/xrpc/com.atproto.sync.getBlob*`, async (r) => {
@@ -453,17 +522,25 @@ async function driveOne(ctx, a, state, opts) {
       await r.continue()
     })
     // (polled from here: the page's CSP forbids the eval waitForFunction needs)
-    for (let i = 0; !/\b([5-9]|\d\d+) of \d+ copied/.test(await page.locator('.mig-card').innerText()); i++) {
+    for (let i = 0; !/\b([5-9]|\d\d+) of \d+ (photos & videos )?copied/.test(await page.locator('.mig-card').innerText()); i++) {
       if (i > 600) throw new Error('blob copy never got going')
       await sleep(200)
     }
     await shot(page, `${a.name}-copy-midway`)
-    const before = await page.locator('.mig-card').innerText()
+    const before = flat(await page.locator('.mig-card').innerText())
+    if (!opts.advanced) {
+      check(before.includes(repoLine), `simple copy step: "${repoLine}"`, before)
+      check(new RegExp(`\\d+ of ${want.nBlobs} photos & videos copied`).test(before), `simple copy step: "N of ${want.media}" while copying`, before)
+    }
     let imports = 0
     page.on('request', (r) => r.url().includes('com.atproto.repo.importRepo') && imports++)
     await page.reload()
     await waitHeading(page, /Copying your data|Move your identity|Confirm the move/)
-    check(true, `reloaded mid-copy (${before.match(/\d+ of \d+ copied/)?.[0]}) and landed back on the copy step`)
+    check(true, `reloaded mid-copy (${before.match(/\d+ of \d+ (photos & videos )?copied/)?.[0]}) and landed back on the copy step`)
+    if (!opts.advanced) {
+      const after = await waitCardText(page, new RegExp(`${esc(repoLine)}|Confirm the move`))
+      check(after.includes(repoLine), 'after the reload, the repo counts are still shown (kept with the progress)', after)
+    }
     await waitHeading(page, /Move your identity|Confirm the move/, 300_000)
     check(imports === 0, 'the resumed copy did not import the repository again', `imports=${imports}`)
   } else {
@@ -520,6 +597,11 @@ async function driveOne(ctx, a, state, opts) {
   // 8. finish
   await waitHeading(page, /Welcome to your new home/, 120_000)
   await page.locator('.tiles').waitFor()
+  if (!opts.advanced) {
+    const tiles = flat(await page.locator('.tiles.mig-counts').innerText().catch(() => ''))
+    const exp = `${want.posts} ${want.likes} ${want.follows} ${want.media}`
+    check(tiles.startsWith(exp), `welcome screen: ${exp}`, `got "${tiles}"`)
+  } else check((await page.locator('.tiles.mig-counts').count()) === 0, 'advanced welcome screen keeps the records tile')
   await shot(page, `${a.name}-done`)
   await page.click('button:has-text("Open your account")')
   await page.waitForURL(/\/account/)
@@ -601,7 +683,7 @@ async function drive(state) {
     // alice and dave in advanced mode with their own recovery keys; bob and carol in simple mode
     const plans = {
       alice: { byHandle: true, inviteInUrl: true, appPasswordFirst: true, advanced: true, ownKey: 'generate' },
-      bob: { loseCreateAnswer: true, wrongPlcToken: true, fromLanding: true, accountKey: true },
+      bob: { loseCreateAnswer: true, wrongPlcToken: true, fromLanding: true, accountKey: true, fakeProfile: true, holdBlobs: true },
       carol: { reloadMidBlobs: true, newTabBeforePlc: true },
       dave: { keepHandle: true, advanced: true, ownKey: 'paste' },
     }

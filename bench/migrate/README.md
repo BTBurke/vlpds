@@ -22,6 +22,7 @@ It then builds the UI and `vlpds`, and runs vlpds on `127.0.0.1:2784` (rate limi
    - **carol** (simple mode): about 420 records and 42 blobs, some of them 1.5 MB. The page reloads in the middle of the blob copy and must resume without importing the repo again. Then a new tab resumes at the identity step, after signing in to both servers again.
    - **dave** (advanced mode): keeps his handle as if it were a custom domain. The old server's `describeServer` is faked so that it doesn't seem to own `.test`. He pastes an invalid did:key (refused before anything is signed), then a valid one as his recovery key.
    - In simple mode every screen is checked for protocol jargon (PLC, DID, repo, blobs, rotation keys, …), and the key table and recovery-key option must be absent.
+   - Simple mode's counts must match the seeded data: the checks screen (bob gets a faked AppView `getProfile`, so "About 30 posts and 3 follows, plus 6 photos & videos"; carol has no AppView, so photos only), the copy step ("All 30 posts, 15 likes and 3 follows copied", "N of 42 photos & videos copied", still there after carol's reload; bob's blobs and settings are held so each line can be read), and the welcome tiles.
    - After the four accounts, the harness checks two refusals: an account that already moved here, and a `did:web`.
 3. **Verify.** For each account, on vlpds:
    - Every record has the same CID, and every blob has identical bytes.

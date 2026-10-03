@@ -5,6 +5,7 @@
 // passwords never leave memory.
 
 import { call, XrpcError, type CallOpts, type Session } from '../../lib/xrpc'
+import type { RecordCounts } from './count'
 
 export type Tokens = { accessJwt: string; refreshJwt: string }
 
@@ -40,6 +41,8 @@ export type Saved = {
   identityDone?: boolean
   activated?: boolean
   oldDeactivated?: boolean
+  /** Counted from the copied repo, kept once they match the import's record total. */
+  counts?: RecordCounts
   /** Blobs the old server couldn't produce; reported, not retried forever. */
   unavailableBlobs?: string[]
   startedAt: number
@@ -355,10 +358,16 @@ export async function fetchOk(url: string): Promise<Response> {
 }
 
 /** getRepo from the old server, importRepo here. Re-running replaces the copy. */
-export async function copyRepo(oldPds: Pds, newPds: Pds, onProgress: (phase: 'download' | 'upload', bytes: number, total?: number) => void) {
+export async function copyRepo(
+  oldPds: Pds,
+  newPds: Pds,
+  onProgress: (phase: 'download' | 'upload', bytes: number, total?: number) => void,
+  onDownloaded?: (car: Blob) => void,
+) {
   const r = await fetchOk(`${oldPds.base}/xrpc/com.atproto.sync.getRepo?did=${encodeURIComponent(oldPds.did)}`)
   const len = Number(r.headers.get('content-length')) || undefined
   const car = await readAll(r, (n) => onProgress('download', n, len))
+  onDownloaded?.(car)
   onProgress('upload', 0, car.size)
   await upload('com.atproto.repo.importRepo', car, 'application/vnd.ipld.car', await newPds.auth(), (n) => onProgress('upload', n, car.size))
   return car.size
