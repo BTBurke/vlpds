@@ -6,17 +6,14 @@
 //! `INGEST_RECORDS=3000000 cargo test --test all compaction_polling --
 //! --ignored --nocapture --test-threads=1`.
 
+use crate::common::{env_or, throttled_store};
 use object_store::path::Path;
-use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use object_store::{GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vlpds::partition::CompactionPolling;
 
-fn env(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
 
 /// Counts requests (GET, PUT, LIST, DELETE) on top of another store.
 #[derive(Debug)]
@@ -75,14 +72,60 @@ impl object_store::ObjectStore for Counting {
     }
 }
 
+pub(crate) struct Ingest {
+    pub secs: f64,
+    pub worst: Duration,
+    /// Writes over 250 ms, and the time spent in them.
+    pub slow: u64,
+    pub stalled: Duration,
+    pub max_l0: usize,
+}
+
+/// Writes `records` record rows (with their CID index rows) to one shard
+/// DB as fast as it takes them, 1,000 per WriteBatch like the finalizer.
+pub(crate) async fn unpaced_ingest(db: &slatedb::Db, records: u64) -> Ingest {
+    let did = "did:plc:ingestingestingestingest";
+    let record = vec![0xa5u8; 260];
+    let started = Instant::now();
+    let mut out = Ingest { secs: 0.0, worst: Duration::ZERO, slow: 0, stalled: Duration::ZERO, max_l0: 0 };
+    let mut written = 0u64;
+    while written < records {
+        let mut wb = slatedb::WriteBatch::new();
+        for i in 0..1000u64 {
+            let n = written + i;
+            let path = format!("app.bsky.feed.post/{n:013}");
+            let cid: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(n.to_le_bytes()).into();
+            let mut val = cid.to_vec();
+            val.extend_from_slice(&record);
+            wb.put(vlpds::state::record_key(did, &path), val);
+            let c = vlpds::cid::Cid::dag_cbor(&cid);
+            wb.put(vlpds::state::record_cid_key(did, &c, &path), b"");
+        }
+        let t = Instant::now();
+        if tokio::time::timeout(Duration::from_secs(60), db.write(wb)).await.is_err() {
+            panic!("a write hung for 60 s at {written} records (L0 {})", db.manifest().l0().len());
+        }
+        let took = t.elapsed();
+        out.worst = out.worst.max(took);
+        if took > Duration::from_millis(250) {
+            out.slow += 1;
+            out.stalled += took;
+        }
+        out.max_l0 = out.max_l0.max(db.manifest().l0().len());
+        written += 1000;
+    }
+    out.secs = started.elapsed().as_secs_f64();
+    out
+}
+
 const MODES: [(&str, CompactionPolling); 3] = [("slow", CompactionPolling::Slow), ("adaptive", CompactionPolling::Adaptive), ("fast", CompactionPolling::Fast)];
 
 /// Idle shards: requests per shard per second by mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn idle_requests_per_mode() {
-    let shards = env("IDLE_SHARDS", 8) as u32;
-    let secs = env("IDLE_SECS", 20);
+    let shards = env_or("IDLE_SHARDS", 8) as u32;
+    let secs: u64 = env_or("IDLE_SECS", 20);
     for (name, mode) in MODES {
         vlpds::partition::set_compaction_polling(mode);
         let counting = Counting::new(Arc::new(object_store::memory::InMemory::new()));
@@ -113,8 +156,8 @@ async fn idle_requests_per_mode() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn unpaced_ingest_per_mode() {
-    let records = env("INGEST_RECORDS", 3_000_000);
-    let latency = Duration::from_millis(env("INGEST_LATENCY_MS", 10));
+    let records: u64 = env_or("INGEST_RECORDS", 3_000_000);
+    let latency_ms = env_or("INGEST_LATENCY_MS", 10);
     crate::common::init_tracing();
     let only = std::env::var("INGEST_MODES").unwrap_or_default();
     for (name, mode) in MODES {
@@ -122,39 +165,10 @@ async fn unpaced_ingest_per_mode() {
             continue;
         }
         vlpds::partition::set_compaction_polling(mode);
-        let cfg = ThrottleConfig { wait_get_per_call: latency, wait_put_per_call: latency, wait_list_per_call: latency, wait_delete_per_call: latency, ..Default::default() };
-        let counting = Counting::new(Arc::new(ThrottledStore::new(object_store::memory::InMemory::new(), cfg)));
+        let counting = Counting::new(Arc::new(throttled_store(latency_ms)));
         let store = vlpds::store::Store { raw: counting.clone(), ..vlpds::store::Store::memory(None) };
         let db = vlpds::partition::open_db(&store, vlpds::slots::ShardId(0), None).await.unwrap();
-        let did = "did:plc:ingestingestingestingest";
-        let record = vec![0xa5u8; 260];
-        let started = Instant::now();
-        let (mut worst, mut slow, mut stalled, mut written) = (Duration::ZERO, 0u64, Duration::ZERO, 0u64);
-        while written < records {
-            let mut wb = slatedb::WriteBatch::new();
-            for i in 0..1000u64 {
-                let n = written + i;
-                let path = format!("app.bsky.feed.post/{n:013}");
-                let cid: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(n.to_le_bytes()).into();
-                let mut val = cid.to_vec();
-                val.extend_from_slice(&record);
-                wb.put(vlpds::state::record_key(did, &path), val);
-                let c = vlpds::cid::Cid::dag_cbor(&cid);
-                wb.put(vlpds::state::record_cid_key(did, &c, &path), b"");
-            }
-            let t = Instant::now();
-            if tokio::time::timeout(Duration::from_secs(60), db.write(wb)).await.is_err() {
-                panic!("{name}: a write hung for 60 s at {written} records (L0 {})", db.manifest().l0().len());
-            }
-            let took = t.elapsed();
-            worst = worst.max(took);
-            if took > Duration::from_millis(250) {
-                slow += 1;
-                stalled += took;
-            }
-            written += 1000;
-        }
-        let secs = started.elapsed().as_secs_f64();
+        let Ingest { secs, worst, slow, stalled, .. } = unpaced_ingest(&db, records).await;
         let [g, p, l, d] = counting.take();
         eprintln!(
             "ingest {name}: {records} records in {secs:.1} s ({:.0}/s), worst write {worst:?}, {slow} writes > 250 ms ({stalled:?} total); requests {g} GET {p} PUT {l} LIST {d} DELETE",

@@ -5,8 +5,6 @@
 //! (src/oauth/lexicon.rs unit tests).
 
 use crate::common::*;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use base64::Engine;
 
 fn gauge(metrics: &str, name: &str, cache: &str) -> Option<i64> {
     let prefix = format!("{name}{{cache=\"{cache}\"}} ");
@@ -18,7 +16,7 @@ async fn cache_metrics_report_entries_bytes_and_caps() {
     let s = TestServer::spawn().await;
     let a = s.create_account("caches").await;
     // a verified access token lands in the session token cache
-    s.xrpc.get("com.atproto.server.getSession", &[], &a.auth()).await.ok();
+    s.get_session(&a.auth()).await.ok();
     let m = reqwest::get(format!("{}/metrics", s.url)).await.unwrap().text().await.unwrap();
     for c in vlpds::caches::Cache::ALL {
         let cap = gauge(&m, "vlpds_cache_capacity_entries", c.name()).unwrap_or_else(|| panic!("no cap for {}", c.name()));
@@ -28,10 +26,7 @@ async fn cache_metrics_report_entries_bytes_and_caps() {
     }
     let n = gauge(&m, "vlpds_cache_entries", "session_tokens").unwrap();
     assert!(n >= 1, "session token cached: {n}");
-    assert_eq!(
-        gauge(&m, "vlpds_cache_bytes", "session_tokens").unwrap(),
-        n * vlpds::caches::Cache::SessionTokens.entry_bytes() as i64
-    );
+    assert_eq!(gauge(&m, "vlpds_cache_bytes", "session_tokens").unwrap(), n * vlpds::caches::Cache::SessionTokens.entry_bytes() as i64);
 }
 
 /// The high-S form of an ES256K signature.
@@ -51,16 +46,16 @@ async fn service_auth_accepts_high_s_like_the_reference() {
     let r = s.xrpc.get("com.atproto.server.getServiceAuth", &[("aud", &aud), ("lxm", LXM)], &a.auth()).await;
     let token = r.ok()["token"].as_str().unwrap().to_string();
     let (input, sig) = token.rsplit_once('.').unwrap();
-    let sig = B64.decode(sig).unwrap();
+    let sig = b64url_decode(sig);
     let verify = |t: String| {
         let app = s.app.clone();
         async move { vlpds::xrpc::authn::verify_service_jwt(&app, &t, Some(LXM)).await.map(|v| v.iss).map_err(|e| e.error) }
     };
     assert_eq!(verify(token.clone()).await, Ok(a.did.clone()));
-    let high = format!("{input}.{}", B64.encode(high_s(&sig)));
+    let high = format!("{input}.{}", b64url(high_s(&sig)));
     assert_eq!(verify(high).await, Ok(a.did.clone()), "high-S service JWT accepted");
     // still a signature check: a corrupted one fails in either form
     let mut bad = sig.clone();
     bad[40] ^= 1;
-    assert_eq!(verify(format!("{input}.{}", B64.encode(&bad))).await, Err("BadJwtSignature".to_string()));
+    assert_eq!(verify(format!("{input}.{}", b64url(&bad))).await, Err("BadJwtSignature".to_string()));
 }

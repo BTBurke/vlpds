@@ -1,8 +1,6 @@
 //! Port of atproto/packages/pds/tests/auth.test.ts: session creation, refresh
 //! (rotation, grace period, revocation), token types, expiry, takedowns and
 //! the email sign-in second factor.
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use base64::Engine;
 use crate::common::*;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -10,24 +8,15 @@ use std::sync::Arc;
 const JWT_SECRET: &str = "dev-secret-change-me";
 const SERVICE_DID: &str = "did:web:localhost";
 
-fn decode_jwt(tok: &str) -> J {
-    let p = tok.split('.').nth(1).expect("jwt payload");
-    serde_json::from_slice(&B64.decode(p).expect("b64")).expect("jwt json")
-}
-
 /// HS256 JWT signed with the test server's session secret.
 fn forge(claims: &J, typ: &str, secret: &str) -> String {
     use hmac::{Hmac, Mac};
-    let header = B64.encode(json!({"alg": "HS256", "typ": typ}).to_string());
-    let payload = B64.encode(claims.to_string());
+    let header = b64url(json!({"alg": "HS256", "typ": typ}).to_string());
+    let payload = b64url(claims.to_string());
     let input = format!("{header}.{payload}");
     let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(input.as_bytes());
-    format!("{input}.{}", B64.encode(mac.finalize().into_bytes()))
-}
-
-fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+    format!("{input}.{}", b64url(mac.finalize().into_bytes()))
 }
 
 async fn get_session(s: &TestServer, tok: &str) -> Resp {
@@ -102,9 +91,9 @@ async fn valid_tokens_on_session_refresh_and_chained_refresh() {
     let next = refresh(&s, sess["refreshJwt"].as_str().unwrap()).await.ok();
     assert_eq!(next["did"], json!(a.did));
     // token types
-    assert_eq!(decode_jwt(&a.access)["scope"], json!("com.atproto.access"));
-    assert_eq!(decode_jwt(&a.refresh)["scope"], json!("com.atproto.refresh"));
-    assert_eq!(decode_jwt(&a.access)["sub"], json!(a.did));
+    assert_eq!(jwt_claims(&a.access)["scope"], json!("com.atproto.access"));
+    assert_eq!(jwt_claims(&a.refresh)["scope"], json!("com.atproto.refresh"));
+    assert_eq!(jwt_claims(&a.access)["sub"], json!(a.did));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -117,7 +106,7 @@ async fn handles_racing_refreshes() {
         let tok = a.refresh.clone();
         tasks.push(tokio::spawn(async move {
             let j = refresh(&s, &tok).await.ok();
-            decode_jwt(j["refreshJwt"].as_str().unwrap())["jti"].as_str().expect("jti on refresh token").to_string()
+            jwt_claims(j["refreshJwt"].as_str().unwrap())["jti"].as_str().expect("jti on refresh token").to_string()
         }));
     }
     let mut ids = HashSet::new();
@@ -133,9 +122,9 @@ async fn refresh_reuse_within_grace_period_yields_same_token_id() {
     let a = s.create_account("eve").await;
     let r1 = refresh(&s, &a.refresh).await.ok();
     let r2 = refresh(&s, &a.refresh).await.ok();
-    let t0 = decode_jwt(&a.refresh);
-    let t1 = decode_jwt(r1["refreshJwt"].as_str().unwrap());
-    let t2 = decode_jwt(r2["refreshJwt"].as_str().unwrap());
+    let t0 = jwt_claims(&a.refresh);
+    let t1 = jwt_claims(r1["refreshJwt"].as_str().unwrap());
+    let t2 = jwt_claims(r2["refreshJwt"].as_str().unwrap());
     assert!(t1["jti"].is_string());
     assert_eq!(t1["jti"], t2["jti"]);
     assert_ne!(t1["jti"], t0["jti"]);
@@ -161,14 +150,8 @@ async fn access_token_cannot_refresh_and_refresh_token_cannot_access() {
     let r = get_session(&s, &a.refresh).await;
     assert!(matches!(r.status, 400 | 401), "refresh token used as access token: {}", r.text());
     // a refresh token cannot write either
-    let r = s
-        .xrpc
-        .post(
-            "com.atproto.repo.createRecord",
-            &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x")}),
-            &a.refresh_auth(),
-        )
-        .await;
+    let body = json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x")});
+    let r = s.xrpc.post("com.atproto.repo.createRecord", &body, &a.refresh_auth()).await;
     assert!(matches!(r.status, 400 | 401), "{}", r.text());
 }
 
@@ -176,7 +159,7 @@ async fn access_token_cannot_refresh_and_refresh_token_cannot_access() {
 async fn expired_refresh_token_cannot_be_used() {
     let s = TestServer::spawn().await;
     let a = s.create_account("holga").await;
-    let t = now();
+    let t = now_secs();
     let tok = forge(
         &json!({"scope": "com.atproto.refresh", "sub": a.did, "aud": SERVICE_DID, "iat": t - 100, "exp": t - 1, "jti": "expired-test-jti"}),
         "refresh+jwt",
@@ -191,7 +174,7 @@ async fn expired_refresh_token_cannot_be_used() {
 async fn invalid_and_expired_access_tokens_are_rejected() {
     let s = TestServer::spawn().await;
     let a = s.create_account("ivan").await;
-    let t = now();
+    let t = now_secs();
     let expired = forge(
         &json!({"scope": "com.atproto.access", "sub": a.did, "aud": SERVICE_DID, "iat": t - 100, "exp": t - 1}),
         "at+jwt",
@@ -211,34 +194,20 @@ async fn invalid_and_expired_access_tokens_are_rejected() {
         assert!(matches!(r.status, 400 | 401), "token {tok:?}: {}", r.text());
     }
     // alg=none must never be accepted
-    let none = format!(
-        "{}.{}.",
-        B64.encode(r#"{"alg":"none","typ":"at+jwt"}"#),
-        B64.encode(json!({"scope": "com.atproto.access", "sub": a.did, "aud": SERVICE_DID, "iat": t, "exp": t + 600}).to_string())
-    );
+    let claims = json!({"scope": "com.atproto.access", "sub": a.did, "aud": SERVICE_DID, "iat": t, "exp": t + 600});
+    let none = format!("{}.{}.", b64url(r#"{"alg":"none","typ":"at+jwt"}"#), b64url(claims.to_string()));
     let r = get_session(&s, &none).await;
     assert!(matches!(r.status, 400 | 401), "alg=none accepted: {}", r.text());
     // wrong scheme
-    let r = s.xrpc.get("com.atproto.server.getSession", &[], &Auth::Raw(format!("Token {}", a.access))).await;
+    let r = s.get_session(&Auth::Raw(format!("Token {}", a.access))).await;
     assert!(matches!(r.status, 400 | 401), "{}", r.text());
-}
-
-async fn takedown(s: &TestServer, did: &str, applied: bool) {
-    s.xrpc
-        .post(
-            "com.atproto.admin.updateSubjectStatus",
-            &json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": did}, "takedown": {"applied": applied, "ref": "test"}}),
-            &Auth::Admin,
-        )
-        .await
-        .ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn actor_takedown_disallows_fresh_session() {
     let s = TestServer::spawn().await;
     let a = s.create_account("iris").await;
-    takedown(&s, &a.did, true).await;
+    set_repo_takedown(&s, &a.did, true).await;
     let r = s.create_session(&a.handle, &a.password).await;
     r.client_err();
     assert_eq!(r.error_name(), Some("AccountTakedown"), "{}", r.text());
@@ -248,7 +217,7 @@ async fn actor_takedown_disallows_fresh_session() {
 async fn actor_takedown_disallows_refresh_session() {
     let s = TestServer::spawn().await;
     let a = s.create_account("jared").await;
-    takedown(&s, &a.did, true).await;
+    set_repo_takedown(&s, &a.did, true).await;
     let r = refresh(&s, &a.refresh).await;
     r.client_err();
     assert_eq!(r.error_name(), Some("AccountTakedown"), "{}", r.text());
@@ -256,51 +225,13 @@ async fn actor_takedown_disallows_refresh_session() {
 
 // ---- email sign-in second factor ----
 
-fn collect_tokens(j: &J, out: &mut HashSet<String>) {
-    match j {
-        J::Object(o) => {
-            for (k, v) in o {
-                if (k == "token" || k == "code") && v.is_string() {
-                    out.insert(v.as_str().unwrap().to_string());
-                } else {
-                    collect_tokens(v, out);
-                }
-            }
-        }
-        J::Array(a) => a.iter().for_each(|v| collect_tokens(v, out)),
-        _ => {}
-    }
-}
-
-async fn all_tokens(s: &TestServer, email: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
-    collect_tokens(&s.dev_mail(email).await.json, &mut out);
-    out
-}
-
-/// Runs `f` (which should send mail) and returns the newly mailed token plus its response.
-async fn mailed<F: std::future::Future<Output = Resp>>(s: &TestServer, email: &str, f: F) -> (String, Resp) {
-    let before = all_tokens(s, email).await;
-    let r = f.await;
-    let after = all_tokens(s, email).await;
-    let fresh: Vec<_> = after.difference(&before).cloned().collect();
-    let tok = match fresh.len() {
-        1 => fresh[0].clone(),
-        0 => s.mail_token(email).await.unwrap_or_else(|| panic!("no mailed token for {email}; response {}", r.text())),
-        _ => panic!("several new tokens: {fresh:?}"),
-    };
-    (tok, r)
-}
-
 async fn enable_email_auth_factor(s: &TestServer, a: &TestAccount) {
-    let (tok, _) = mailed(s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
+    let (tok, _, _) = mailed(s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
     s.xrpc.post("com.atproto.server.confirmEmail", &json!({"email": a.email, "token": tok}), &a.auth()).await.ok();
-    let (tok, r) = mailed(s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailUpdate", &a.auth())).await;
+    let (tok, r, _) = mailed(s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailUpdate", &a.auth())).await;
     assert_eq!(r.ok()["tokenRequired"], json!(true));
-    s.xrpc
-        .post("com.atproto.server.updateEmail", &json!({"email": a.email, "emailAuthFactor": true, "token": tok}), &a.auth())
-        .await
-        .ok();
+    let body = json!({"email": a.email, "emailAuthFactor": true, "token": tok});
+    s.xrpc.post("com.atproto.server.updateEmail", &body, &a.auth()).await.ok();
     let sess = get_session(s, &a.access).await.ok();
     assert_eq!(sess["emailAuthFactor"], json!(true));
 }
@@ -311,14 +242,10 @@ async fn email_2fa_challenges_and_accepts_token() {
     let a = s.create_account("jane").await;
     enable_email_auth_factor(&s, &a).await;
 
-    let (tok, r) = mailed(&s, &a.email, s.create_session(&a.handle, &a.password)).await;
+    let (tok, r, _) = mailed(&s, &a.email, s.create_session(&a.handle, &a.password)).await;
     r.err(401, "AuthFactorTokenRequired");
 
-    let r = s
-        .xrpc
-        .post("com.atproto.server.createSession", &json!({"identifier": a.handle, "password": a.password, "authFactorToken": tok}), &Auth::None)
-        .await;
-    let j = r.ok();
+    let j = s.login(&a.handle, &a.password, Some(&tok)).await.ok();
     assert_eq!(j["did"], json!(a.did));
     assert_eq!(j["email"], json!(a.email));
     assert_eq!(j["emailConfirmed"], json!(true));
@@ -331,21 +258,11 @@ async fn email_2fa_rejects_invalid_token() {
     let s = TestServer::spawn().await;
     let a = s.create_account("jane").await;
     enable_email_auth_factor(&s, &a).await;
-    let (tok, r) = mailed(&s, &a.email, s.create_session(&a.handle, &a.password)).await;
+    let (tok, r, _) = mailed(&s, &a.email, s.create_session(&a.handle, &a.password)).await;
     r.err(401, "AuthFactorTokenRequired");
     assert_ne!(tok, "AAAAA-AAAAA");
-    let r = s
-        .xrpc
-        .post(
-            "com.atproto.server.createSession",
-            &json!({"identifier": a.handle, "password": a.password, "authFactorToken": "AAAAA-AAAAA"}),
-            &Auth::None,
-        )
-        .await;
+    let r = s.login(&a.handle, &a.password, Some("AAAAA-AAAAA")).await;
     r.client_err();
     assert!(r.text().contains("Token is invalid") || r.error_name() == Some("InvalidToken"), "{}", r.text());
-    s.xrpc
-        .post("com.atproto.server.createSession", &json!({"identifier": a.handle, "password": a.password, "authFactorToken": tok}), &Auth::None)
-        .await
-        .ok();
+    s.login(&a.handle, &a.password, Some(&tok)).await.ok();
 }

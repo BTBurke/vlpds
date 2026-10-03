@@ -11,14 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use vlpds::cluster::ShardHost;
 
-async fn takedown(s: &TestServer, did: &str) {
-    let body = json!({
-        "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": did},
-        "takedown": {"applied": true, "ref": "race"},
-    });
-    s.xrpc.post("com.atproto.admin.updateSubjectStatus", &body, &Auth::Admin).await.ok();
-}
-
 /// Hammers `nsid` as the account from 8 tasks while an admin takes it down;
 /// the takedown must stick every time.
 async fn takedown_survives(nsid: &'static str, body: impl Fn(&TestAccount) -> J) {
@@ -36,13 +28,14 @@ async fn takedown_survives(nsid: &'static str, body: impl Fn(&TestAccount) -> J)
             }));
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        takedown(&s, &a.did).await;
+        let body = json!({"subject": repo_ref(&a.did), "takedown": {"applied": true, "ref": "race"}});
+        s.xrpc.post("com.atproto.admin.updateSubjectStatus", &body, &Auth::Admin).await.ok();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         stop.store(true, Ordering::Relaxed);
         for t in tasks {
             t.await.unwrap();
         }
-        let st = s.xrpc.get("com.atproto.sync.getRepoStatus", &[("did", &a.did)], &Auth::None).await.ok();
+        let st = s.repo_status(&a.did).await.ok();
         assert_eq!(st["active"], json!(false), "takedown reverted by a concurrent {nsid}: {st}");
         assert_eq!(st["status"], json!("takendown"));
         let acct = s.app.account(&a.did).await.unwrap_or_else(|e| panic!("{}", e.message));
@@ -110,6 +103,15 @@ async fn rejected_account_mutation_writes_nothing() {
     assert_eq!(s.current_seq().await, seq, "no events");
 }
 
+/// Closes and reopens shard `p`. Its history is our own closed span, which
+/// the close's marker names.
+async fn bounce(s: &TestServer, p: &vlpds::partition::Partition) {
+    s.app.node.close(p.id).await.unwrap();
+    let ours = vlpds::nodelog::Span { log_id: s.app.log.log_id.to_string(), epoch: p.epoch, start: 0, end: Some(s.app.log.next_ordinal()) };
+    let opened = s.app.node.open_many(vec![(p.id, p.epoch, vec![ours])]).await;
+    assert!(opened.iter().all(|(_, r)| r.is_ok()), "reopen failed");
+}
+
 /// A repo load in flight while its shard closes and reopens lands after the
 /// reopen; it must be dropped (and the repo reloaded), not cached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -119,17 +121,10 @@ async fn load_straddling_shard_bounce_is_dropped() {
     s.post(&a, "one").await;
     let old = s.app.partition(&a.did).unwrap_or_else(|e| panic!("{}", e.message));
     // the load starts under the old ownership...
-    let stale = vlpds::worker::load_repo(old.clone(), a.did.as_str().into())
-        .await
-        .unwrap()
-        .expect("repo");
+    let stale = vlpds::worker::load_repo(old.clone(), a.did.as_str().into()).await.unwrap().expect("repo");
     // ...the repo moves on, the shard bounces...
     let two = s.post(&a, "two").await;
-    s.app.node.close(old.id).await.unwrap();
-    // (its history: our own closed span, which the close's marker names)
-    let ours = vlpds::nodelog::Span { log_id: s.app.log.log_id.to_string(), epoch: old.epoch, start: 0, end: Some(s.app.log.next_ordinal()) };
-    let opened = s.app.node.open_many(vec![(old.id, old.epoch, vec![ours])]).await;
-    assert!(opened.iter().all(|(_, r)| r.is_ok()), "reopen failed");
+    bounce(&s, &old).await;
     assert!(!Arc::ptr_eq(&old, &s.app.partition(&a.did).unwrap_or_else(|e| panic!("{}", e.message))));
     // ...and the load completes (ahead of the next write in the worker's queue)
     s.app
@@ -140,16 +135,11 @@ async fn load_straddling_shard_bounce_is_dropped() {
     let three = s.post(&a, "three").await;
     let rev3 = three.rev.clone().unwrap();
     let mut sub = s.subscribe(Some(0)).await;
-    let frames = sub
-        .until(FH_TIMEOUT, |fs| fs.last().and_then(|f| f.commit()).is_some_and(|c| c.rev == rev3))
-        .await;
+    let frames = sub.until(FH_TIMEOUT, |fs| fs.last().and_then(|f| f.commit()).is_some_and(|c| c.rev == rev3)).await;
     let last = frames.last().and_then(|f| f.commit()).unwrap();
     assert_eq!(last.since.as_deref(), two.rev.as_deref(), "chained on the stale load");
     // durable state is consistent: another bounce forces a reload from it
-    s.app.node.close(old.id).await.unwrap();
-    let ours = vlpds::nodelog::Span { log_id: s.app.log.log_id.to_string(), epoch: old.epoch, start: 0, end: Some(s.app.log.next_ordinal()) };
-    let opened = s.app.node.open_many(vec![(old.id, old.epoch, vec![ours])]).await;
-    assert!(opened.iter().all(|(_, r)| r.is_ok()), "reopen failed");
+    bounce(&s, &old).await;
     s.post(&a, "four").await;
     let repo = s.get_repo(&a.did).await;
     assert_eq!(repo.entries().len(), 4);

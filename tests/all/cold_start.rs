@@ -21,22 +21,7 @@ use vlpds::state::bulk_did;
 use vlpds::worker::{CachedRepo, WorkerMsg};
 
 async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, shards: u32, f: impl FnOnce(&mut vlpds::server::Config)) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = shards;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(300),
-            ..Default::default()
-        });
-        f(c);
-    })
-    .await
+    cluster_node(id, store.clone(), shards, f).await
 }
 
 async fn cache_info(s: &TestServer, did: &str) -> Option<CachedRepo> {
@@ -50,9 +35,8 @@ async fn populate(nodes: &[&TestServer], range: std::ops::Range<u64>, records: u
     let auth = Auth::Bearer(ADMIN_TOKEN.into());
     let mut per: Vec<Vec<u64>> = vec![Vec::new(); nodes.len()];
     for i in range {
-        let did = bulk_did(i);
-        let k = nodes.iter().position(|n| n.app.partitions.for_key(&did).is_some()).expect("an owner");
-        per[k].push(i);
+        let owner = owner_of(nodes, &bulk_did(i));
+        per[nodes.iter().position(|n| std::ptr::eq(*n, owner)).unwrap()].push(i);
     }
     let reqs = per.iter().enumerate().flat_map(|(k, idx)| idx.chunks(1000).map(move |c| (k, c.to_vec())));
     use futures::StreamExt;
@@ -72,17 +56,8 @@ async fn populate(nodes: &[&TestServer], range: std::ops::Range<u64>, records: u
 
 async fn create_via(s: &TestServer, did: &str, text: &str) -> Resp {
     let token = s.app.jwt.access(did);
-    s.xrpc
-        .post(
-            "com.atproto.repo.createRecord",
-            &json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record(text)}),
-            &Auth::Bearer(token),
-        )
-        .await
-}
-
-fn owner<'a>(nodes: &[&'a TestServer], did: &str) -> &'a TestServer {
-    nodes.iter().find(|n| n.app.partitions.for_key(did).is_some()).copied().expect("owned")
+    let body = json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record(text)});
+    s.xrpc.post("com.atproto.repo.createRecord", &body, &Auth::Bearer(token)).await
 }
 
 /// Writes keep succeeding, each applied once, while shards move: a second
@@ -129,7 +104,7 @@ async fn writes_survive_a_handback() {
     let nodes = [&a, &b];
     for (i, n) in sent.iter().enumerate() {
         let did = bulk_did(i as u64);
-        let r = owner(&nodes, &did).list_records(&did, "app.bsky.feed.post", &[("limit", "100")]).await.ok();
+        let r = owner_of(&nodes, &did).list_records(&did, "app.bsky.feed.post", &[("limit", "100")]).await.ok();
         assert_eq!(r["records"].as_array().unwrap().len(), 3 + n, "{did}: every write applied once");
     }
 }
@@ -186,9 +161,7 @@ async fn recent_repos_preloaded_after_restart() {
     let b = node("rp", &store, 4, |_| {}).await;
     for i in 0..10 {
         let did = bulk_did(i);
-        let info = eventually(Duration::from_secs(10), || async { cache_info(&b, &did).await })
-            .await
-            .unwrap_or_else(|| panic!("repo {i} not preloaded"));
+        let info = eventually(Duration::from_secs(10), || async { cache_info(&b, &did).await }).await.unwrap_or_else(|| panic!("repo {i} not preloaded"));
         assert!(info.loaded_nodes >= 1, "{info:?}");
     }
     for i in 10..30 {
@@ -200,9 +173,6 @@ async fn recent_repos_preloaded_after_restart() {
 // measurement
 // ---------------------------------------------------------------------------
 
-fn env<T: std::str::FromStr>(k: &str, d: T) -> T {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
-}
 
 /// Zipf(s) over `n` ranks, mapped through a fixed permutation (so the hot
 /// repos spread over the shards).
@@ -243,20 +213,15 @@ struct Second {
 /// One run: populate, then write at `rate`/s (Zipf) through a and b for
 /// `secs`; c shuts down gracefully at `down_at` and starts again at `up_at`.
 async fn restart_window(label: &str, tuned: bool) {
-    let repos: u64 = env("COLD_REPOS", 50_000);
-    let records: u32 = env("COLD_RECORDS", 20);
-    let rate: u64 = env("COLD_RATE", 1500);
-    let secs: u64 = env("COLD_SECS", 30);
-    let (down_at, up_at) = (env("COLD_DOWN_AT", 4u64), env("COLD_UP_AT", 10u64));
-    let lat_ms: u64 = env("COLD_STORE_MS", 10);
-    let limit: usize = env("COLD_STORE_CONCURRENCY", 48);
+    let repos: u64 = env_or("COLD_REPOS", 50_000);
+    let records: u32 = env_or("COLD_RECORDS", 20);
+    let rate: u64 = env_or("COLD_RATE", 1500);
+    let secs: u64 = env_or("COLD_SECS", 30);
+    let (down_at, up_at) = (env_or("COLD_DOWN_AT", 4u64), env_or("COLD_UP_AT", 10u64));
+    let lat_ms: u64 = env_or("COLD_STORE_MS", 10);
+    let limit: usize = env_or("COLD_STORE_CONCURRENCY", 48);
     vlpds::partition::set_block_cache_bytes(64 << 20);
-    let store: Arc<dyn object_store::ObjectStore> = {
-        use object_store::throttle::{ThrottleConfig, ThrottledStore};
-        let d = Duration::from_millis(lat_ms);
-        let cfg = ThrottleConfig { wait_get_per_call: d, wait_put_per_call: d, wait_list_per_call: d, wait_delete_per_call: d, ..Default::default() };
-        Arc::new(object_store::limit::LimitStore::new(ThrottledStore::new(object_store::memory::InMemory::new(), cfg), limit))
-    };
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::limit::LimitStore::new(throttled_store(lat_ms), limit));
     let shards: u32 = 48;
     let set = move |c: &mut vlpds::server::Config| {
         c.workers = 2;
@@ -287,7 +252,7 @@ async fn restart_window(label: &str, tuned: bool) {
     }
 
     let misses0 = vlpds::metrics::REPO_CACHE.with_label_values(&["miss"]).get();
-    let zipf = Arc::new(Zipf::new(repos as usize, env("COLD_ZIPF_S", 1.0)));
+    let zipf = Arc::new(Zipf::new(repos as usize, env_or("COLD_ZIPF_S", 1.0)));
     let tokens: Arc<Vec<String>> = Arc::new((0..repos).map(|i| a.app.jwt.access(&bulk_did(i))).collect());
     let seconds: Arc<Vec<Second>> = Arc::new((0..secs + 40).map(|_| Second::default()).collect());
     let http = reqwest::Client::builder().timeout(Duration::from_secs(60)).pool_max_idle_per_host(512).build().unwrap();

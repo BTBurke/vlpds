@@ -38,7 +38,6 @@
 //! `syntax_reference_oracle` / `json_reference_oracle` compare vlpds with
 //! verdicts from the TypeScript reference (bench/results/differential/*.mjs).
 use crate::common::*;
-use base64::Engine;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use shrike::cbor::json::{drisl_to_json, json_to_drisl, Integers};
@@ -54,12 +53,6 @@ use vlpds::{car, crypto, lexicon, tid, xrpc::syntax};
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
-
-fn b64(s: &str) -> Vec<u8> {
-    base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(s.trim_end_matches('='))
-        .unwrap()
-}
 
 fn shrike_fixture(rel: &str) -> String {
     read_fixture(&format!("shrike/{rel}"))
@@ -174,49 +167,6 @@ fn cbor_compare(b: &[u8]) -> Cbor {
     }
 }
 
-fn rand_text(rng: &mut impl Rng) -> String {
-    const PIECES: &[&str] = &[
-        "a", "b", "z", "$type", "$link", "$bytes", "text", "\"", "\\", "\n", "\u{0}", "\u{7f}",
-        "é", "日本", "😀", "\u{2028}", "/", " ", "aa", "ab", "b",
-    ];
-    let n = rng.gen_range(0..6);
-    (0..n).map(|_| PIECES[rng.gen_range(0..PIECES.len())]).collect()
-}
-
-fn rand_value(rng: &mut impl Rng, depth: usize) -> Value {
-    let leaf = depth >= 5 || rng.gen_bool(0.4);
-    match rng.gen_range(0..if leaf { 6 } else { 8 }) {
-        0 => Value::Null,
-        1 => Value::Bool(rng.gen()),
-        2 => Value::Int(match rng.gen_range(0..4) {
-            0 => rng.gen_range(-30..30),
-            1 => rng.gen_range(-70_000..70_000),
-            2 => rng.gen(),
-            _ => [i64::MIN, i64::MAX, i64::MIN + 1, -1 - u32::MAX as i64, u32::MAX as i64, 23, 24, -24, -25, 255, 256]
-                [rng.gen_range(0..11)],
-        }),
-        3 => Value::Bytes((0..rng.gen_range(0..40)).map(|_| rng.gen()).collect()),
-        4 => Value::Text(rand_text(rng)),
-        5 => Value::Link(if rng.gen() {
-            Cid::dag_cbor(&rng.gen::<[u8; 8]>())
-        } else {
-            Cid::raw(&rng.gen::<[u8; 8]>())
-        }),
-        6 => Value::Array((0..rng.gen_range(0..5)).map(|_| rand_value(rng, depth + 1)).collect()),
-        _ => {
-            let mut m: Vec<(String, Value)> = Vec::new();
-            for _ in 0..rng.gen_range(0..6) {
-                let k = rand_text(rng);
-                if !m.iter().any(|(x, _)| *x == k) {
-                    m.push((k, rand_value(rng, depth + 1)));
-                }
-            }
-            m.sort_by(|a, b| vlpds::cbor::key_cmp(&a.0, &b.0));
-            Value::Map(m)
-        }
-    }
-}
-
 /// Byte-level mutations of a valid encoding.
 fn mutate(rng: &mut impl Rng, b: &[u8]) -> Vec<u8> {
     let mut m = b.to_vec();
@@ -251,21 +201,10 @@ fn mutate(rng: &mut impl Rng, b: &[u8]) -> Vec<u8> {
     m
 }
 
-fn data_model_fixtures() -> Vec<(J, Vec<u8>, String)> {
-    #[derive(serde::Deserialize)]
-    struct F {
-        json: J,
-        cbor_base64: String,
-        cid: String,
-    }
-    let fs: Vec<F> = serde_json::from_str(&read_fixture("interop/data-model/data-model-fixtures.json")).unwrap();
-    fs.into_iter().map(|f| (f.json, b64(&f.cbor_base64), f.cid)).collect()
-}
-
 #[test]
 fn cbor_interop_fixtures_identical() {
     let mut d = Diffs::new("data-model fixtures");
-    for (j, cbor, cid) in data_model_fixtures() {
+    for DataModelFixture { json: j, cbor, cid } in data_model_fixtures() {
         if let o @ (Cbor::Disagree(_) | Cbor::FloatShrikeOnly | Cbor::DepthVlpdsOnly) = cbor_compare(&cbor) {
             d.push(format!("{cid}: {o:?}"));
         }
@@ -335,9 +274,9 @@ fn cbor_rfc8949_vectors() {
 #[test]
 fn cbor_random_values_and_mutations() {
     let mut rng = StdRng::seed_from_u64(0x5ee_d001);
-    let mut corpus: Vec<Vec<u8>> = data_model_fixtures().into_iter().map(|f| f.1).collect();
+    let mut corpus: Vec<Vec<u8>> = data_model_fixtures().into_iter().map(|f| f.cbor).collect();
     for _ in 0..500 {
-        corpus.push(rand_value(&mut rng, 0).to_cbor());
+        corpus.push(rand_cbor(&mut rng, 0).to_cbor());
     }
     // MST nodes and commits too
     let mut t = Tree::new();
@@ -908,7 +847,7 @@ fn car_read_agreement() {
     // proof CARs from the reference implementation
     let ts: J = serde_json::from_str(&shrike_fixture("ts_vectors.json")).unwrap();
     for c in ts["cases"].as_array().unwrap().iter().step_by(5) {
-        cars.push(b64(c["proof"].as_str().unwrap()));
+        cars.push(b64_decode(c["proof"].as_str().unwrap()));
     }
     let mut read = 0;
     let mut rejected = 0;
@@ -1309,7 +1248,7 @@ fn mst_reference_commit_vectors() {
     }
     let mut n = 0;
     for c in &v.commits {
-        let car = b64(&c.car);
+        let car = b64_decode(&c.car);
         let (roots, blocks) = car_compare(&car).unwrap().unwrap();
         let blocks: HashMap<Cid, Vec<u8>> = blocks.into_iter().collect();
         let commit = Value::decode(&blocks[&roots[0]]).unwrap();
@@ -1447,7 +1386,7 @@ fn record_proofs_reference_and_shrike_to_vlpds() {
     let mut n = 0;
     for c in ts["cases"].as_array().unwrap() {
         let name = c["name"].as_str().unwrap();
-        let car = b64(c["proof"].as_str().unwrap());
+        let car = b64_decode(c["proof"].as_str().unwrap());
         let (did, key, rkey) = (c["did"].as_str().unwrap(), c["signingKey"].as_str().unwrap(), c["rkey"].as_str().unwrap());
         // expect: "error" (bad proof), null (proves absence) or the record CID
         let want = match &c["expect"] {
@@ -1760,7 +1699,7 @@ fn signature_fixtures_both_sides() {
     }
     let fs: Vec<F> = serde_json::from_str(&read_fixture("interop/crypto/signature-fixtures.json")).unwrap();
     for f in fs {
-        let (msg, sig) = (b64(&f.message_base64), b64(&f.signature_base64));
+        let (msg, sig) = (b64_decode(&f.message_base64), b64_decode(&f.signature_base64));
         let vk = shrike::crypto::parse_did_key(&f.public_key_did).unwrap();
         let s = <[u8; 64]>::try_from(sig.as_slice()).is_ok_and(|a| vk.verify(&msg, &shrike::crypto::Signature::from_bytes(a)).is_ok());
         assert_eq!(s, f.valid_signature, "shrike: {}", f.comment);

@@ -8,10 +8,7 @@ async fn creates_posts_with_tags() {
     let a = s.create_account("alice").await;
     let rec = json!({"$type": "app.bsky.feed.post", "text": "hello world", "tags": ["javascript", "hehe"], "createdAt": now_iso()});
     let r = s.create_record(&a, "app.bsky.feed.post", rec.clone()).await;
-    let g = s
-        .get_record(&a.did, "app.bsky.feed.post", r.rkey())
-        .await
-        .ok();
+    let g = s.get_record(&a.did, "app.bsky.feed.post", r.rkey()).await.ok();
     assert_eq!(g["value"]["tags"], json!(["javascript", "hehe"]));
     assert_eq!(g["value"], rec);
 }
@@ -30,13 +27,8 @@ async fn creates_posts_with_tag_facets() {
         "createdAt": now_iso(),
     });
     let r = s.create_record(&a, "app.bsky.feed.post", rec.clone()).await;
-    let g = s
-        .get_record(&a.did, "app.bsky.feed.post", r.rkey())
-        .await
-        .ok();
+    let g = s.get_record(&a.did, "app.bsky.feed.post", r.rkey()).await.ok();
     let facets = g["value"]["facets"].as_array().unwrap();
-    assert!(facets
-        .iter()
-        .all(|f| f["features"][0]["$type"] == json!("app.bsky.richtext.facet#tag")));
+    assert!(facets.iter().all(|f| f["features"][0]["$type"] == json!("app.bsky.richtext.facet#tag")));
     assert_eq!(g["value"], rec);
 }

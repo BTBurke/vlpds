@@ -6,11 +6,11 @@ use crate::common::*;
 use std::time::Duration;
 
 async fn upload(s: &TestServer, a: &TestAccount, bytes: &[u8]) -> J {
-    s.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.to_vec(), "image/jpeg", &a.auth()).await.ok()["blob"].clone()
+    s.upload_blob(a, bytes, "image/jpeg").await
 }
 
 fn file(tag: u8) -> Vec<u8> {
-    let mut v: Vec<u8> = (0..4000).map(|_| rand::random::<u8>()).collect();
+    let mut v = random_bytes(4000);
     v[0] = tag;
     v
 }
@@ -20,13 +20,7 @@ fn link(blob: &J) -> String {
 }
 
 async fn post_with_image(s: &TestServer, a: &TestAccount, blob: &J) -> RecordRef {
-    s.create_record(
-        a,
-        "app.bsky.feed.post",
-        json!({"$type": "app.bsky.feed.post", "text": "img", "createdAt": now_iso(),
-               "embed": {"$type": "app.bsky.embed.images", "images": [{"image": blob, "alt": "alt"}]}}),
-    )
-    .await
+    s.create_record(a, "app.bsky.feed.post", image_post("img", blob)).await
 }
 
 async fn update_profile(s: &TestServer, a: &TestAccount, avatar: Option<&J>, banner: Option<&J>) {
@@ -37,21 +31,17 @@ async fn update_profile(s: &TestServer, a: &TestAccount, avatar: Option<&J>, ban
     if let Some(b) = banner {
         rec["banner"] = b.clone();
     }
-    s.xrpc
-        .post("com.atproto.repo.putRecord", &json!({"repo": a.did, "collection": "app.bsky.actor.profile", "rkey": "self", "record": rec}), &a.auth())
-        .await
-        .ok();
+    s.put_record(a, "app.bsky.actor.profile", "self", rec).await.ok();
 }
 
 async fn listed(s: &TestServer, did: &str) -> Vec<String> {
-    let j = s.xrpc.get("com.atproto.sync.listBlobs", &[("did", did)], &Auth::None).await.ok();
-    let mut v: Vec<String> = j["cids"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    let mut v = s.list_blobs(did).await;
     v.sort();
     v
 }
 
 async fn stored(s: &TestServer, did: &str, cid: &str) -> bool {
-    let r = s.xrpc.get("com.atproto.sync.getBlob", &[("did", did), ("cid", cid)], &Auth::None).await;
+    let r = s.get_blob(did, cid).await;
     match r.status {
         200 => true,
         _ => {
@@ -72,10 +62,7 @@ async fn deletes_blob_when_record_is_deleted() {
     let img = upload(&s, &a, &file(1)).await;
     let post = post_with_image(&s, &a, &img).await;
     assert_eq!(listed(&s, &a.did).await, vec![link(&img)]);
-    s.xrpc
-        .post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": post.rkey()}), &a.auth())
-        .await
-        .ok();
+    s.delete_record(&a, "app.bsky.feed.post", post.rkey()).await.ok();
     assert!(listed(&s, &a.did).await.is_empty(), "listBlobs must drop the blob once unreferenced");
     gc(&s).await;
     assert!(!stored(&s, &a.did, &link(&img)).await, "unreferenced blob must be deleted");
@@ -117,19 +104,11 @@ async fn keeps_blob_reused_by_another_record_in_same_commit() {
     let a = s.create_account("alice").await;
     let img = upload(&s, &a, &file(1)).await;
     let post = post_with_image(&s, &a, &img).await;
-    s.xrpc
-        .post(
-            "com.atproto.repo.applyWrites",
-            &json!({"repo": a.did, "writes": [
-                {"$type": "com.atproto.repo.applyWrites#delete", "collection": "app.bsky.feed.post", "rkey": post.rkey()},
-                {"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": {
-                    "$type": "app.bsky.feed.post", "text": "post2", "createdAt": now_iso(),
-                    "embed": {"$type": "app.bsky.embed.images", "images": [{"image": img, "alt": "alt"}]}}},
-            ]}),
-            &a.auth(),
-        )
-        .await
-        .ok();
+    let writes = json!([
+        {"$type": "com.atproto.repo.applyWrites#delete", "collection": "app.bsky.feed.post", "rkey": post.rkey()},
+        {"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": image_post("post2", &img)},
+    ]);
+    s.apply_writes(&a, writes).await.ok();
     assert_eq!(listed(&s, &a.did).await, vec![link(&img)]);
     gc(&s).await;
     assert!(stored(&s, &a.did, &link(&img)).await);
@@ -146,10 +125,7 @@ async fn deletes_from_own_store_even_if_another_user_uses_it() {
     assert_eq!(link(&ia), link(&ib));
     let pa = post_with_image(&s, &a, &ia).await;
     post_with_image(&s, &b, &ib).await;
-    s.xrpc
-        .post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": pa.rkey()}), &a.auth())
-        .await
-        .ok();
+    s.delete_record(&a, "app.bsky.feed.post", pa.rkey()).await.ok();
     gc(&s).await;
     assert!(!stored(&s, &a.did, &link(&ia)).await, "alice's copy is gone");
     assert!(stored(&s, &b.did, &link(&ib)).await, "bob's copy remains");
@@ -203,10 +179,9 @@ async fn blob_refs_load_lazily() {
     for i in 0..3 {
         imgs.push(upload(&s, &a, &file(i)).await);
     }
-    let post = |img: &J| json!({"$type": "app.bsky.feed.post", "text": "img", "createdAt": now_iso(), "embed": {"$type": "app.bsky.embed.images", "images": [{"image": img, "alt": ""}]}});
     for round in 0..24usize {
         let auth = a.auth();
-        let cbody = json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": format!("p{round}"), "record": post(&imgs[round % 3])});
+        let cbody = json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": format!("p{round}"), "record": image_post("img", &imgs[round % 3])});
         let dbody = json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": format!("p{}", round.saturating_sub(1))});
         let mut profile = json!({"$type": "app.bsky.actor.profile"});
         if round % 4 != 3 {

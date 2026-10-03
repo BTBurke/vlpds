@@ -15,34 +15,18 @@ use std::time::{Duration, Instant};
 const SHARDS: u32 = 8;
 
 async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, advertise: Option<String>, ttl: Duration, renew: Duration) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = SHARDS;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: advertise.unwrap_or_else(|| peer_url(c)),
-            shards: SHARDS,
-            ttl,
-            renew_every: renew,
-            skew: ttl / 5,
-            ..Default::default()
-        });
+    cluster_node(id, store.clone(), SHARDS, |c| {
+        let l = lease(c);
+        (l.ttl, l.renew_every, l.skew) = (ttl, renew, ttl / 5);
+        if let Some(a) = advertise {
+            l.addr = a;
+        }
     })
     .await
 }
 
 fn owned(s: &TestServer) -> usize {
     s.app.partitions.owned().len()
-}
-
-async fn wait_for(what: &str, deadline: Duration, f: impl Fn() -> bool) -> Duration {
-    let t = Instant::now();
-    while !f() {
-        assert!(t.elapsed() < deadline, "{what}: not within {deadline:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    t.elapsed()
 }
 
 /// An address nothing listens on (bound once, then closed).
@@ -61,9 +45,9 @@ async fn refused_peer_is_taken_over_before_its_ttl() {
     // b advertises an address that refuses connections: once it stops
     // renewing, a's probe finds nobody there
     let b = node("b", &store, Some(refusing_addr().await), ttl, renew).await;
-    wait_for("b gets its share", Duration::from_secs(10), || owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize).await;
+    wait_until("b gets its share", Duration::from_secs(10), || owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize).await;
     b.app.node.halt();
-    let took = wait_for("a takes b's shards", Duration::from_secs(4), || owned(&a) == SHARDS as usize).await;
+    let took = wait_until("a takes b's shards", Duration::from_secs(4), || owned(&a) == SHARDS as usize).await;
     assert!(took < ttl / 2, "takeover after {took:?} (TTL {ttl:?})");
     eprintln!("refused peer taken over after {took:?} (TTL {ttl:?})");
 }
@@ -74,7 +58,7 @@ async fn accepting_peer_keeps_the_ttl_rule() {
     let (ttl, renew) = (Duration::from_secs(3), Duration::from_millis(200));
     let a = node("a", &store, None, ttl, renew).await;
     let b = node("b", &store, None, ttl, renew).await;
-    wait_for("b gets its share", Duration::from_secs(10), || owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize).await;
+    wait_until("b gets its share", Duration::from_secs(10), || owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize).await;
     // a halted in-process node still accepts connections: frozen, not gone
     b.app.node.halt();
     let t = Instant::now();
@@ -84,7 +68,7 @@ async fn accepting_peer_keeps_the_ttl_rule() {
     // interval after it was sent), plus at most one step to notice and the
     // takeover itself
     let bound = ttl + ttl / 5 + renew * 3 + Duration::from_secs(1);
-    wait_for("a takes b's shards within TTL + skew", bound, || owned(&a) == SHARDS as usize).await;
+    wait_until("a takes b's shards within TTL + skew", bound, || owned(&a) == SHARDS as usize).await;
     assert!(t.elapsed() >= ttl, "taken over after {:?}", t.elapsed());
     eprintln!("frozen peer taken over after {:?} (TTL {ttl:?})", t.elapsed());
 }
@@ -189,7 +173,7 @@ async fn same_id_restarts_race_the_refused_probe_takeover() {
     let mut r = restart(store.clone()).await;
     let mut dead = Vec::new();
     for round in 0..9u32 {
-        wait_for("r gets its share", Duration::from_secs(15), || owned(&r) > 0).await;
+        wait_until("r gets its share", Duration::from_secs(15), || owned(&r) > 0).await;
         r.app.node.halt();
         let next = match round % 3 {
             0 => {
@@ -209,7 +193,7 @@ async fn same_id_restarts_race_the_refused_probe_takeover() {
                     tokio::time::timeout(Duration::from_secs(10), r_read).await.expect("the join reads its lease").unwrap();
                     let moved = events("join_lease_moved");
                     a_go.send(()).unwrap();
-                    wait_for_async("a deletes the old lease", || async { !hooks.lease_exists().await }).await;
+                    retry("a deletes the old lease", || async { (!hooks.lease_exists().await).then_some(()) }).await;
                     r_go.send(()).unwrap();
                     let n = join.await.unwrap();
                     assert!(events("join_lease_moved") > moved, "the join met the vanished lease");
@@ -219,27 +203,19 @@ async fn same_id_restarts_race_the_refused_probe_takeover() {
                     let recreated = events("lease_recreated");
                     let n = restart(store.clone()).await;
                     a_go.send(()).unwrap();
-                    wait_for("the renewal recreates the deleted lease", Duration::from_secs(5), || events("lease_recreated") > recreated).await;
+                    wait_until("the renewal recreates the deleted lease", Duration::from_secs(5), || events("lease_recreated") > recreated).await;
                     n
                 }
             }
         };
         dead.push(std::mem::replace(&mut r, next));
     }
-    wait_for("the last incarnation and a split the shards", Duration::from_secs(15), || owned(&r) > 0 && owned(&a) + owned(&r) == SHARDS as usize).await;
+    wait_until("the last incarnation and a split the shards", Duration::from_secs(15), || owned(&r) > 0 && owned(&a) + owned(&r) == SHARDS as usize).await;
     // still renewing well past a step (a lost lease would have exited)
     tokio::time::sleep(renew * 4).await;
     assert!(r.app.cluster.as_ref().unwrap().lease_valid());
     assert!(hooks.lease_exists().await);
     eprintln!("lease vanished under a join {}x, recreated at a renewal {}x", events("join_lease_moved") - moved0, events("lease_recreated") - recreated0);
-}
-
-async fn wait_for_async<F: std::future::Future<Output = bool>>(what: &str, f: impl Fn() -> F) {
-    let t = Instant::now();
-    while !f().await {
-        assert!(t.elapsed() < Duration::from_secs(10), "{what}: not within 10 s");
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -253,7 +229,7 @@ async fn greeted_joiner_skips_its_join_grace() {
     let b = node("b", &store, None, ttl, renew).await;
     // a hands b its share at a's next step (<= one renew interval), not
     // after b's join grace plus a's step
-    let took = wait_for("b gets its share", Duration::from_secs(6), || owned(&b) == SHARDS as usize / 2).await;
+    let took = wait_until("b gets its share", Duration::from_secs(6), || owned(&b) == SHARDS as usize / 2).await;
     assert!(took < renew * 2, "b served its share {:?} after joining (join grace {:?})", t.elapsed(), renew * 2);
     eprintln!("joiner served its share {took:?} after joining");
 }

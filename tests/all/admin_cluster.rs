@@ -5,7 +5,6 @@
 //! is reported instead of silently dropped.
 
 use crate::common::*;
-use object_store::ObjectStoreExt;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,57 +12,7 @@ use std::time::Duration;
 const SHARDS: u32 = 8;
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = SHARDS;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: SHARDS,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(200),
-            ..Default::default()
-        });
-    })
-    .await
-}
-
-/// Waits until the shards are spread at fair share (sizes within one of each
-/// other, each shard owned once) and the assignment holds still for 500 ms:
-/// "every node owns something" can still be mid-rebalance (e.g. 6/1/1), and
-/// later moves would carry a node's accounts off it.
-async fn balanced(nodes: &[&TestServer]) {
-    let mut stable_since: Option<(Vec<Vec<vlpds::slots::ShardId>>, std::time::Instant)> = None;
-    for _ in 0..400 {
-        let owned: Vec<Vec<vlpds::slots::ShardId>> = nodes
-            .iter()
-            .map(|n| {
-                let mut v: Vec<vlpds::slots::ShardId> = n.app.partitions.owned().iter().map(|p| p.id).collect();
-                v.sort();
-                v
-            })
-            .collect();
-        let all: HashSet<vlpds::slots::ShardId> = owned.iter().flatten().copied().collect();
-        let sizes: Vec<usize> = owned.iter().map(|o| o.len()).collect();
-        let fair = sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1;
-        let complete = all.len() == SHARDS as usize && sizes.iter().sum::<usize>() == SHARDS as usize;
-        if fair && complete {
-            match &stable_since {
-                Some((prev, at)) if *prev == owned => {
-                    if at.elapsed() >= Duration::from_millis(500) {
-                        return;
-                    }
-                }
-                _ => stable_since = Some((owned, std::time::Instant::now())),
-            }
-        } else {
-            stable_since = None;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("cluster never balanced");
+    cluster_node(id, store.clone(), SHARDS, |_| {}).await
 }
 
 /// Every page of `nsid` (key `items`) at `limit`, following cursors.
@@ -108,15 +57,7 @@ async fn admin_listings_scatter_gather_across_nodes() {
             want.push(n.create_account_with(&handle, PASSWORD).await);
         }
     }
-    let n = SHARDS;
-    let shard = |did: &str| vlpds::slots::shard_of(did, n);
-    let owners: HashSet<String> = want
-        .iter()
-        .map(|t| {
-            let p = shard(&t.did);
-            [&a, &b, &c].iter().find(|s| s.app.partitions.get(p).is_some()).map(|s| s.url.clone()).unwrap()
-        })
-        .collect();
+    let owners: HashSet<String> = want.iter().map(|t| owner_of(&[&a, &b, &c], &t.did).url.clone()).collect();
     assert_eq!(owners.len(), 3, "accounts spread over all three nodes");
 
     // email-prefix search from any node, paged 2 at a time, sees all 9 in
@@ -189,56 +130,20 @@ async fn admin_listings_scatter_gather_across_nodes() {
     let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = format!("https://{}", dead.local_addr().unwrap());
     drop(dead);
-    let ghost_store = store.clone();
-    let ghost = tokio::spawn(async move {
-        for renewals in 1u64.. {
-            let lease = vlpds::cluster::NodeLease {
-                node_id: "adm-ghost".into(),
-                log_id: "adm-ghost.0".into(),
-                addr: dead_addr.clone(),
-                writer: 254,
-                expires_ms: (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() + 60_000) as u64,
-                renewals,
-                next_ordinal: 0,
-                draining: false,
-                joined: false,
-                follows: Default::default(),
-                wm_cap: 0,
-                rev: "ghost-rev".into(),
-                min_level: 1,
-                max_level: 1,
-                seen_level: 1,
-            };
-            ghost_store
-                .put(&object_store::path::Path::from("vlpds/nodes/adm-ghost"), serde_json::to_vec(&lease).unwrap().into())
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    });
+    let ghost = spawn_ghost(store.clone(), ghost_lease("adm-ghost", dead_addr));
     let reports_ghost = |r: &J| r["unreachableNodes"].as_array().is_some_and(|v| v.iter().any(|n| n == "adm-ghost"));
     // each node reports it once its membership step has seen the lease
-    let mut seen = None;
-    for _ in 0..100 {
+    let r = retry("unreachable peer reported", || async {
         let r = a.xrpc.get("com.atproto.admin.searchAccounts", &[("email", &prefix)], &Auth::Admin).await.ok();
-        if reports_ghost(&r) {
-            seen = Some(r);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    let r = seen.expect("unreachable peer reported");
+        reports_ghost(&r).then_some(r)
+    })
+    .await;
     assert!(r["accounts"].is_array(), "partial results still returned: {r}");
-    let mut last = J::Null;
-    for _ in 0..100 {
-        last = b.xrpc.get("com.atproto.admin.getInviteCodes", &[], &Auth::Admin).await.ok();
-        if reports_ghost(&last) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    retry("getInviteCodes reports the ghost", || async {
+        reports_ghost(&b.xrpc.get("com.atproto.admin.getInviteCodes", &[], &Auth::Admin).await.ok()).then_some(())
+    })
+    .await;
     ghost.abort();
-    assert!(reports_ghost(&last), "{last}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

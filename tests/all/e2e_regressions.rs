@@ -9,69 +9,11 @@
 use crate::common::*;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 const SHARDS: u32 = 8;
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = SHARDS;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: SHARDS,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(200),
-            ..Default::default()
-        });
-    })
-    .await
-}
-
-/// Waits until the nodes own every shard once between them in a fair split
-/// (none over ceil(shards / nodes)), every routing table names those owners, and it holds
-/// still for 500 ms: "every node owns some" can still be mid-rebalance
-/// (e.g. 6/1/1), and the hand-backs after it move accounts off their node.
-async fn balanced(nodes: &[&TestServer]) {
-    let mut stable_since: Option<(Vec<Vec<vlpds::slots::ShardId>>, std::time::Instant)> = None;
-    for _ in 0..400 {
-        let owned: Vec<Vec<vlpds::slots::ShardId>> = nodes
-            .iter()
-            .map(|n| {
-                let mut v: Vec<vlpds::slots::ShardId> = n.app.partitions.owned().iter().map(|p| p.id).collect();
-                v.sort();
-                v
-            })
-            .collect();
-        let all: HashSet<vlpds::slots::ShardId> = owned.iter().flatten().copied().collect();
-        let routed = nodes.iter().all(|n| {
-            let c = n.app.cluster.as_ref().unwrap();
-            owned.iter().zip(nodes).all(|(shards, o)| {
-                let id = &o.app.cluster.as_ref().unwrap().cfg.node_id;
-                shards.iter().all(|p| c.owner_of(*p).is_some_and(|(owner, _)| &owner == id))
-            })
-        });
-        let sizes: Vec<usize> = owned.iter().map(|o| o.len()).collect();
-        // the cluster's rule: nobody over ceil(shards / nodes), so e.g. 6/6/4
-        let fair = sizes.iter().all(|&k| k > 0 && k <= (SHARDS as usize).div_ceil(nodes.len()));
-        if fair && all.len() == SHARDS as usize && sizes.iter().sum::<usize>() == SHARDS as usize && routed {
-            match &stable_since {
-                Some((prev, at)) if *prev == owned => {
-                    if at.elapsed() >= Duration::from_millis(500) {
-                        return;
-                    }
-                }
-                _ => stable_since = Some((owned, std::time::Instant::now())),
-            }
-        } else {
-            stable_since = None;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("cluster never balanced");
+    cluster_node(id, store.clone(), SHARDS, |_| {}).await
 }
 
 async fn cluster(prefix: &str) -> (TestServer, TestServer, TestServer) {
@@ -139,27 +81,18 @@ async fn list_repos_spans_the_cluster() {
                 assert_eq!(r["active"], json!(true));
             }
         }
-        let r = n
-            .xrpc
-            .get("com.atproto.sync.listReposByCollection", &[("collection", "com.example.e2e")], &Auth::None)
-            .await
-            .ok();
-        let got: HashSet<String> =
-            r["repos"].as_array().unwrap().iter().map(|r| r["did"].as_str().unwrap().to_string()).collect();
+        let by_coll = |extra: Option<(&'static str, String)>| {
+            let x = n.xrpc.clone();
+            let q: Vec<(&str, String)> = std::iter::once(("collection", "com.example.e2e".to_string())).chain(extra).collect();
+            async move { x.get_multi("com.atproto.sync.listReposByCollection", &q, &Auth::None).await.ok() }
+        };
+        let r = by_coll(None).await;
+        let got: HashSet<String> = r["repos"].as_array().unwrap().iter().map(|r| r["did"].as_str().unwrap().to_string()).collect();
         assert_eq!(got, want);
         // paged by DID
-        let r = n
-            .xrpc
-            .get("com.atproto.sync.listReposByCollection", &[("collection", "com.example.e2e"), ("limit", "4")], &Auth::None)
-            .await
-            .ok();
+        let r = by_coll(Some(("limit", "4".into()))).await;
         assert_eq!(r["repos"].as_array().unwrap().len(), 4);
-        let cur = r["cursor"].as_str().expect("cursor").to_string();
-        let r2 = n
-            .xrpc
-            .get("com.atproto.sync.listReposByCollection", &[("collection", "com.example.e2e"), ("cursor", &cur)], &Auth::None)
-            .await
-            .ok();
+        let r2 = by_coll(Some(("cursor", r["cursor"].as_str().expect("cursor").to_string()))).await;
         assert_eq!(r2["repos"].as_array().unwrap().len(), want.len() - 4);
     }
 }
@@ -175,35 +108,24 @@ async fn reset_password_through_any_node() {
         let acct = owner.create_account("rp").await;
         let (req, reset) = (nodes[(i + 1) % 3], nodes[(i + 2) % 3]);
         assert!(!owns(req, &acct.did) && !owns(reset, &acct.did));
-        req.xrpc
-            .post("com.atproto.server.requestPasswordReset", &json!({"email": acct.email}), &Auth::None)
-            .await
-            .ok();
+        req.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": acct.email}), &Auth::None).await.ok();
         // the dev mailbox is per node (the mail is where the request ran):
         // the newest reset token on any of them
         let mut token = None;
         for n in nodes {
-            let m = n.dev_mail(&acct.email).await.ok();
-            for msg in m["messages"].as_array().unwrap() {
+            for msg in mails(n, &acct.email).await {
                 if msg["purpose"] == "reset_password" {
                     token = msg["token"].as_str().map(String::from);
                 }
             }
         }
         let token = token.expect("reset token mailed");
-        reset
-            .xrpc
-            .post("com.atproto.server.resetPassword", &json!({"token": token, "password": "brand-new-pw"}), &Auth::None)
-            .await
-            .ok();
+        let reset_to = |pw: &str| reset.xrpc.post_owned("com.atproto.server.resetPassword", json!({"token": token, "password": pw}), Auth::None);
+        reset_to("brand-new-pw").await.ok();
         owner.create_session(&acct.handle, "brand-new-pw").await.ok();
         req.create_session(&acct.handle, PASSWORD).await.err(401, "AuthenticationRequired");
         // single use
-        reset
-            .xrpc
-            .post("com.atproto.server.resetPassword", &json!({"token": token, "password": "again-pw"}), &Auth::None)
-            .await
-            .client_err();
+        reset_to("again-pw").await.client_err();
     }
 }
 
@@ -269,7 +191,7 @@ async fn tls_check_for_caddy_on_demand_tls() {
         async move {
             let r = rb.send().await.unwrap();
             let status = r.status().as_u16();
-            (status, r.json::<serde_json::Value>().await.unwrap_or_default())
+            (status, r.json::<J>().await.unwrap_or_default())
         }
     };
     let unknown = format!("nobody-{}.{HANDLE_DOMAIN}", unique_name("x"));
@@ -299,31 +221,18 @@ async fn tls_check_for_caddy_on_demand_tls() {
 async fn admin_account_calls_reach_the_owner() {
     let (a, b, c) = cluster("e2e-ad").await;
     let accts = [a.create_account("ad").await, b.create_account("ad").await, c.create_account("ad").await];
-    let inv = a
-        .xrpc
-        .post("com.atproto.server.createInviteCode", &json!({"useCount": 1, "forAccount": accts[1].did}), &Auth::Admin)
-        .await
-        .ok();
+    let inv = a.xrpc.post("com.atproto.server.createInviteCode", &json!({"useCount": 1, "forAccount": accts[1].did}), &Auth::Admin).await.ok();
     for (i, n) in [&a, &b, &c].into_iter().enumerate() {
         let acct = &accts[(i + 1) % 3];
         assert!(!owns(n, &acct.did));
         let email = format!("{}@example.org", unique_name("new"));
-        n.xrpc
-            .post("com.atproto.admin.updateAccountEmail", &json!({"account": acct.did, "email": email}), &Auth::Admin)
-            .await
-            .ok();
-        let info = n.xrpc.get("com.atproto.admin.getAccountInfo", &[("did", &acct.did)], &Auth::Admin).await.ok();
-        assert_eq!(info["email"], json!(email));
+        let update = |account: &str, email: &str| n.xrpc.post_owned("com.atproto.admin.updateAccountEmail", json!({"account": account, "email": email}), Auth::Admin);
+        update(&acct.did, &email).await.ok();
+        assert_eq!(n.account_info(&acct.did).await.ok()["email"], json!(email));
         // by handle too
-        n.xrpc
-            .post("com.atproto.admin.updateAccountEmail", &json!({"account": acct.handle, "email": acct.email}), &Auth::Admin)
-            .await
-            .ok();
-        let r = n
-            .xrpc
-            .post("com.atproto.admin.sendEmail", &json!({"recipientDid": acct.did, "content": "hi", "senderDid": "did:plc:admin"}), &Auth::Admin)
-            .await
-            .ok();
+        update(&acct.handle, &acct.email).await.ok();
+        let body = json!({"recipientDid": acct.did, "content": "hi", "senderDid": "did:plc:admin"});
+        let r = n.xrpc.post("com.atproto.admin.sendEmail", &body, &Auth::Admin).await.ok();
         assert_eq!(r["sent"], json!(true));
         let dids: Vec<(&str, String)> = accts.iter().map(|a| ("dids", a.did.clone())).collect();
         let r = n.xrpc.get_multi("com.atproto.admin.getAccountInfos", &dids, &Auth::Admin).await.ok();
@@ -331,10 +240,7 @@ async fn admin_account_calls_reach_the_owner() {
         let got: HashSet<&str> = infos.iter().map(|i| i["did"].as_str().unwrap()).collect();
         assert_eq!(got, accts.iter().map(|a| a.did.as_str()).collect::<HashSet<_>>());
         let b_info = infos.iter().find(|i| i["did"] == json!(accts[1].did)).unwrap();
-        assert!(
-            b_info["invites"].as_array().unwrap().iter().any(|c| c["code"] == inv["code"]),
-            "invites of an account owned elsewhere: {b_info}"
-        );
+        assert!(b_info["invites"].as_array().unwrap().iter().any(|c| c["code"] == inv["code"]), "invites of an account owned elsewhere: {b_info}");
     }
 }
 
@@ -352,22 +258,19 @@ async fn unowned_shard_is_unavailable_not_missing() {
     let acct = a.create_account("un").await;
     vlpds::server::shutdown(&a.app).await;
     for _ in 0..5 {
-        let r = a.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", &acct.handle)], &Auth::None).await;
+        let r = a.resolve_handle(&acct.handle).await;
         assert_eq!(r.status, 503, "resolveHandle on an unowned shard: {}", r.text());
         let s = a.create_session(&acct.handle, &acct.password).await;
         assert_eq!(s.status, 503, "createSession on an unowned shard: {}", s.text());
     }
     // a new node takes them over and serves the account
     let b = node("e2e-un-b", &store).await;
-    for _ in 0..200 {
-        let r = b.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", &acct.handle)], &Auth::None).await;
-        if r.status == 200 {
-            assert_eq!(r.json["did"], json!(acct.did));
-            b.create_session(&acct.handle, &acct.password).await.ok();
-            return;
-        }
-        assert_eq!(r.status, 503, "{}", r.text());
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("survivor never took the shards over");
+    let r = retry("survivor takes the shards over", || async {
+        let r = b.resolve_handle(&acct.handle).await;
+        assert!(matches!(r.status, 200 | 503), "{}", r.text());
+        (r.status == 200).then_some(r)
+    })
+    .await;
+    assert_eq!(r.json["did"], json!(acct.did));
+    b.create_session(&acct.handle, &acct.password).await.ok();
 }

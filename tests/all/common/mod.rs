@@ -25,6 +25,10 @@ pub use vlpds::cbor::Value;
 pub use vlpds::cid::Cid;
 use vlpds::mst::Tree;
 
+mod cluster;
+#[allow(unused_imports)]
+pub use cluster::*;
+
 pub const ADMIN_TOKEN: &str = "dev-admin-token";
 pub const HANDLE_DOMAIN: &str = "vlpds.test";
 pub const PASSWORD: &str = "hunter2-password";
@@ -402,10 +406,81 @@ impl TestServer {
         let frames = sub.drain(Duration::from_millis(400)).await;
         frames.iter().filter_map(|f| f.seq()).max().unwrap_or(0)
     }
+
+    pub async fn put_record(&self, a: &TestAccount, collection: &str, rkey: &str, record: J) -> Resp {
+        let body = json!({"repo": a.did, "collection": collection, "rkey": rkey, "record": record});
+        self.xrpc.post("com.atproto.repo.putRecord", &body, &a.auth()).await
+    }
+
+    pub async fn delete_record(&self, a: &TestAccount, collection: &str, rkey: &str) -> Resp {
+        let body = json!({"repo": a.did, "collection": collection, "rkey": rkey});
+        self.xrpc.post("com.atproto.repo.deleteRecord", &body, &a.auth()).await
+    }
+
+    pub async fn apply_writes(&self, a: &TestAccount, writes: J) -> Resp {
+        self.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await
+    }
+
+    pub async fn repo_status(&self, did: &str) -> Resp {
+        self.xrpc.get("com.atproto.sync.getRepoStatus", &[("did", did)], &Auth::None).await
+    }
+
+    /// admin.getAccountInfo.
+    pub async fn account_info(&self, did: &str) -> Resp {
+        self.xrpc.get("com.atproto.admin.getAccountInfo", &[("did", did)], &Auth::Admin).await
+    }
+
+    pub async fn resolve_handle(&self, handle: &str) -> Resp {
+        self.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", handle)], &Auth::None).await
+    }
+
+    /// uploadBlob as `a`; returns the blob ref.
+    pub async fn upload_blob(&self, a: &TestAccount, bytes: &[u8], mime: &str) -> J {
+        self.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.to_vec(), mime, &a.auth()).await.ok()["blob"].clone()
+    }
+
+    pub async fn get_blob(&self, did: &str, cid: &str) -> Resp {
+        self.xrpc.get("com.atproto.sync.getBlob", &[("did", did), ("cid", cid)], &Auth::None).await
+    }
+
+    pub async fn list_blobs(&self, did: &str) -> Vec<String> {
+        let j = self.xrpc.get("com.atproto.sync.listBlobs", &[("did", did)], &Auth::None).await.ok();
+        j["cids"].as_array().expect("cids").iter().map(|c| c.as_str().unwrap().to_string()).collect()
+    }
+
+    pub async fn get_blocks(&self, did: &str, cids: &[Cid]) -> Resp {
+        let mut q = vec![("did", did.to_string())];
+        q.extend(cids.iter().map(|c| ("cids", c.to_string())));
+        self.xrpc.get_multi("com.atproto.sync.getBlocks", &q, &Auth::None).await
+    }
+
+    pub async fn get_session(&self, auth: &Auth) -> Resp {
+        self.xrpc.get("com.atproto.server.getSession", &[], auth).await
+    }
+
+    /// createSession with an optional `authFactorToken`.
+    pub async fn login(&self, identifier: &str, password: &str, code: Option<&str>) -> Resp {
+        let mut body = json!({"identifier": identifier, "password": password});
+        if let Some(c) = code {
+            body["authFactorToken"] = json!(c);
+        }
+        self.xrpc.post("com.atproto.server.createSession", &body, &Auth::None).await
+    }
+
+    /// The server's own DID (describeServer).
+    pub async fn pds_did(&self) -> String {
+        self.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok()["did"].as_str().unwrap().to_string()
+    }
 }
 
 pub fn post_record(text: &str) -> J {
     json!({"$type": "app.bsky.feed.post", "text": text, "createdAt": now_iso()})
+}
+
+/// A post embedding `blob` as an image.
+pub fn image_post(text: &str, blob: &J) -> J {
+    json!({"$type": "app.bsky.feed.post", "text": text, "createdAt": now_iso(),
+           "embed": {"$type": "app.bsky.embed.images", "images": [{"image": blob, "alt": ""}]}})
 }
 
 pub fn now_iso() -> String {
@@ -677,6 +752,13 @@ impl Xrpc {
     pub async fn post(&self, nsid: &str, body: &J, auth: &Auth) -> Resp {
         let rb = self.http.post(self.url(nsid)).json(body);
         self.send(Self::apply(rb, auth)).await
+    }
+
+    /// `post` owning its arguments, so a closure can build a request and
+    /// return its future.
+    pub fn post_owned(&self, nsid: &str, body: J, auth: Auth) -> impl std::future::Future<Output = Resp> + 'static {
+        let (x, nsid) = (self.clone(), nsid.to_string());
+        async move { x.post(&nsid, &body, &auth).await }
     }
 
     /// POST with no body (procedures without input).
@@ -1266,6 +1348,22 @@ pub fn is_tid(s: &str) -> bool {
         })
 }
 
+/// Polls `f` every 20 ms until it holds; panics after `deadline`. Returns
+/// how long it took.
+pub async fn wait_until(what: &str, deadline: Duration, f: impl Fn() -> bool) -> Duration {
+    let t = std::time::Instant::now();
+    while !f() {
+        assert!(t.elapsed() < deadline, "{what}: not within {deadline:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    t.elapsed()
+}
+
+/// Retries `f` every 50 ms until it returns Some; panics after 10 s.
+pub async fn retry<T, F: std::future::Future<Output = Option<T>>>(what: &str, f: impl FnMut() -> F) -> T {
+    eventually(Duration::from_secs(10), f).await.unwrap_or_else(|| panic!("never: {what}"))
+}
+
 /// Waits until `f` returns Some or the timeout passes.
 pub async fn eventually<T, F: std::future::Future<Output = Option<T>>>(
     timeout: Duration,
@@ -1296,6 +1394,25 @@ pub fn read_fixture(rel: &str) -> String {
     std::fs::read_to_string(fixture_path(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
+/// An interop data-model fixture: a record's JSON, DAG-CBOR and CID.
+pub struct DataModelFixture {
+    pub json: J,
+    pub cbor: Vec<u8>,
+    pub cid: String,
+}
+
+pub fn data_model_fixtures() -> Vec<DataModelFixture> {
+    #[derive(serde::Deserialize)]
+    struct F {
+        json: J,
+        cbor_base64: String,
+        cid: String,
+    }
+    let fs: Vec<F> = serde_json::from_str(&read_fixture("interop/data-model/data-model-fixtures.json")).unwrap();
+    assert!(!fs.is_empty());
+    fs.into_iter().map(|f| DataModelFixture { json: f.json, cbor: b64_decode(&f.cbor_base64), cid: f.cid }).collect()
+}
+
 /// Non-comment, non-empty lines of an interop syntax fixture.
 pub fn fixture_lines(rel: &str) -> Vec<String> {
     read_fixture(rel)
@@ -1321,6 +1438,30 @@ pub const PNG_1X1: &[u8] = &[
 pub async fn latest_mail(s: &TestServer, email: &str) -> J {
     let j = s.dev_mail(email).await.ok();
     j["messages"].as_array().and_then(|m| m.last().cloned()).unwrap_or_else(|| panic!("no mail to {email}: {j}"))
+}
+
+/// Dev-mode mail sent to `email`, oldest first.
+pub async fn mails(s: &TestServer, email: &str) -> Vec<J> {
+    s.dev_mail(email).await.ok()["messages"].as_array().cloned().unwrap_or_default()
+}
+
+/// Runs `f`, asserting it mailed exactly `n` messages to `email`; returns
+/// its response and the newest message (if any).
+pub async fn mailed_n<F: std::future::Future<Output = Resp>>(s: &TestServer, email: &str, n: usize, f: F) -> (Resp, Option<J>) {
+    let before = mails(s, email).await.len();
+    let r = f.await;
+    let after = mails(s, email).await;
+    assert_eq!(after.len(), before + n, "mails to {email} (response {})", r.text());
+    (r, (n > 0).then(|| after.last().unwrap().clone()))
+}
+
+/// Runs `f`, asserts it sent exactly one mail to `email`, and returns that
+/// mail's token, `f`'s response and the mail.
+pub async fn mailed<F: std::future::Future<Output = Resp>>(s: &TestServer, email: &str, f: F) -> (String, Resp, J) {
+    let (r, m) = mailed_n(s, email, 1, f).await;
+    let m = m.unwrap();
+    let tok = m["token"].as_str().map(String::from).or_else(|| find_token(&m["body"])).unwrap_or_else(|| panic!("mail without token: {m}"));
+    (tok, r, m)
 }
 
 /// Moves the stored email token for `purpose` `ms` milliseconds into the
@@ -1352,4 +1493,140 @@ pub async fn set_repo_takedown(s: &TestServer, did: &str, applied: bool) {
         )
         .await
         .ok();
+}
+
+pub fn repo_ref(did: &str) -> J {
+    json!({"$type": "com.atproto.admin.defs#repoRef", "did": did})
+}
+
+pub fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// base64url without padding (JWT/JWK/DPoP encoding).
+pub fn b64url(b: impl AsRef<[u8]>) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
+/// A JWT's claims (payload), unverified.
+pub fn jwt_claims(tok: &str) -> J {
+    serde_json::from_slice(&b64url_decode(tok.split('.').nth(1).expect("jwt payload"))).expect("jwt json")
+}
+
+pub fn b64url_decode(s: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).unwrap()
+}
+
+/// Standard base64, padded or not.
+pub fn b64_decode(s: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD_NO_PAD.decode(s.trim_end_matches('=')).unwrap()
+}
+
+/// Short random text from pieces that stress escaping, UTF-8 and map key
+/// order ("$"-keys, prefixes of each other).
+pub fn rand_text(rng: &mut impl rand::Rng) -> String {
+    const PIECES: &[&str] = &[
+        "a", "b", "z", "aa", "ab", "$type", "$link", "$bytes", "text", "\"", "\\", "\n", "\t", "\u{0}", "\u{1f}", "\u{7f}", "é", "日本",
+        "😀", "\u{2028}", "/", "<", " ",
+    ];
+    (0..rng.gen_range(0..6)).map(|_| PIECES[rng.gen_range(0..PIECES.len())]).collect()
+}
+
+/// A random DAG-CBOR value tree (canonical key order), at most 5 deep, with
+/// integers around the encoding's width boundaries.
+pub fn rand_cbor(rng: &mut impl rand::Rng, depth: usize) -> Value {
+    let leaf = depth >= 5 || rng.gen_bool(0.4);
+    match rng.gen_range(0..if leaf { 6 } else { 8 }) {
+        0 => Value::Null,
+        1 => Value::Bool(rng.gen()),
+        2 => Value::Int(match rng.gen_range(0..4) {
+            0 => rng.gen_range(-30..30),
+            1 => rng.gen_range(-70_000..70_000),
+            2 => rng.gen(),
+            _ => [i64::MIN, i64::MAX, i64::MIN + 1, -1 - u32::MAX as i64, u32::MAX as i64, 23, 24, -24, -25, 255, 256][rng.gen_range(0..11)],
+        }),
+        3 => Value::Bytes((0..rng.gen_range(0..40)).map(|_| rng.gen()).collect()),
+        4 => Value::Text(rand_text(rng)),
+        5 => Value::Link(if rng.gen() { Cid::dag_cbor(&rng.gen::<[u8; 8]>()) } else { Cid::raw(&rng.gen::<[u8; 8]>()) }),
+        6 => Value::Array((0..rng.gen_range(0..5)).map(|_| rand_cbor(rng, depth + 1)).collect()),
+        _ => {
+            let mut m: Vec<(String, Value)> = Vec::new();
+            for _ in 0..rng.gen_range(0..6) {
+                let k = rand_text(rng);
+                if !m.iter().any(|(x, _)| *x == k) {
+                    m.push((k, rand_cbor(rng, depth + 1)));
+                }
+            }
+            m.sort_by(|a, b| vlpds::cbor::key_cmp(&a.0, &b.0));
+            Value::Map(m)
+        }
+    }
+}
+
+/// Env var `k` parsed, else `d` (measurement knobs).
+pub fn env_or<T: std::str::FromStr>(k: &str, d: T) -> T {
+    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+}
+
+/// An in-memory store adding `ms` to every request (S3-like latency).
+pub fn throttled_store(ms: u64) -> object_store::throttle::ThrottledStore<object_store::memory::InMemory> {
+    let d = Duration::from_millis(ms);
+    let cfg = object_store::throttle::ThrottleConfig { wait_get_per_call: d, wait_put_per_call: d, wait_list_per_call: d, wait_delete_per_call: d, ..Default::default() };
+    object_store::throttle::ThrottledStore::new(object_store::memory::InMemory::new(), cfg)
+}
+
+pub fn random_bytes(n: usize) -> Vec<u8> {
+    (0..n).map(|_| rand::random::<u8>()).collect()
+}
+
+/// A unique ~2 KB blob that sniffs as PNG.
+pub fn random_png(tag: u8) -> Vec<u8> {
+    let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+    v.extend(random_bytes(2000));
+    v.push(tag);
+    v
+}
+
+#[derive(clap::Parser)]
+struct AdminCli {
+    #[arg(long)]
+    json: bool,
+    #[command(subcommand)]
+    cmd: vlpds::cli::admin::Cmd,
+}
+
+/// Runs `vlpds admin --url <url> <args...>` through the CLI's library entry
+/// (argv parsed by clap as the binary does): (result, stdout).
+pub async fn admin_cli(url: &str, args: &[&str]) -> (anyhow::Result<()>, String) {
+    admin_cli_as(url, vlpds::server::DEV_ADMIN_TOKEN, args).await
+}
+
+pub async fn admin_cli_as(url: &str, token: &str, args: &[&str]) -> (anyhow::Result<()>, String) {
+    use clap::Parser;
+    let cli = AdminCli::try_parse_from(std::iter::once("vlpds-admin").chain(args.iter().copied())).expect("argv parses");
+    let opts = vlpds::cli::admin::Opts { url: url.to_string(), token: token.to_string(), json: cli.json };
+    let mut out = Vec::new();
+    let r = vlpds::cli::admin::run(cli.cmd, &opts, &mut out).await;
+    (r, String::from_utf8(out).unwrap())
+}
+
+/// A fake AppView answering `{"feed": []}` to everything; records each
+/// request's Authorization header. Returns (headers, url).
+pub async fn spawn_auth_recorder() -> (Arc<parking_lot::Mutex<Vec<String>>>, String) {
+    use axum::extract::{Request, State};
+    let seen: Arc<parking_lot::Mutex<Vec<String>>> = Default::default();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    let router = axum::Router::new()
+        .fallback(|State(seen): State<Arc<parking_lot::Mutex<Vec<String>>>>, req: Request| async move {
+            let auth = req.headers().get("authorization").map(|v| v.to_str().unwrap().to_string());
+            seen.lock().push(auth.unwrap_or_default());
+            axum::Json(json!({"feed": []}))
+        })
+        .with_state(seen.clone());
+    tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+    (seen, url)
 }

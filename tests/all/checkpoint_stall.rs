@@ -15,14 +15,8 @@ use std::time::{Duration, Instant};
 use vlpds::state::bulk_did;
 
 async fn node(stagger: bool, every: Duration, shards: u32, store_ms: u64) -> TestServer {
-    let store: Arc<dyn object_store::ObjectStore> = {
-        use object_store::throttle::{ThrottleConfig, ThrottledStore};
-        let d = Duration::from_millis(store_ms);
-        let cfg = ThrottleConfig { wait_get_per_call: d, wait_put_per_call: d, wait_list_per_call: d, wait_delete_per_call: d, ..Default::default() };
-        Arc::new(ThrottledStore::new(object_store::memory::InMemory::new(), cfg))
-    };
     TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
+        c.memory_store = Some(Arc::new(throttled_store(store_ms)));
         c.shards = shards;
         c.workers = 2;
         c.checkpoint_every = every;
@@ -48,24 +42,18 @@ async fn staggered_checkpoints_cover_every_shard() {
     s.post(&a, "one").await;
     let ord = s.app.log.durable_ordinal.load(Ordering::Acquire);
     let log = s.app.log.log_id.to_string();
-    let done = eventually(Duration::from_secs(5), || async {
-        markers(&s).await.iter().all(|m| m.as_ref().is_some_and(|(l, o)| *l == log && *o >= ord)).then_some(())
-    })
-    .await;
+    let done = eventually(Duration::from_secs(5), || async { markers(&s).await.iter().all(|m| m.as_ref().is_some_and(|(l, o)| *l == log && *o >= ord)).then_some(()) }).await;
     assert!(done.is_some(), "not every shard checkpointed past {ord}: {:?}", markers(&s).await);
 }
 
-fn env<T: std::str::FromStr>(k: &str, d: T) -> T {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
-}
 
 async fn stall(label: &str, stagger: bool) {
-    let shards: u32 = env("STALL_SHARDS", 128);
-    let repos: u64 = env("STALL_REPOS", 20_000);
-    let rate: u64 = env("STALL_RATE", 3000);
-    let secs: u64 = env("STALL_SECS", 30);
-    let every = Duration::from_secs(env("STALL_EVERY_S", 5));
-    let s = node(stagger, every, shards, env("STALL_STORE_MS", 10)).await;
+    let shards: u32 = env_or("STALL_SHARDS", 128);
+    let repos: u64 = env_or("STALL_REPOS", 20_000);
+    let rate: u64 = env_or("STALL_RATE", 3000);
+    let secs: u64 = env_or("STALL_SECS", 30);
+    let every = Duration::from_secs(env_or("STALL_EVERY_S", 5));
+    let s = node(stagger, every, shards, env_or("STALL_STORE_MS", 10)).await;
     for chunk in (0..repos).collect::<Vec<_>>().chunks(2000) {
         let r = s.xrpc.post("vlpds.admin.bulkCreate", &json!({"indices": chunk, "records": 2}), &Auth::Bearer(ADMIN_TOKEN.into())).await;
         assert_eq!(r.status, 200, "{}", r.text());

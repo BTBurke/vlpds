@@ -39,18 +39,12 @@ fn commit_signatures_match_k256_across_keys_and_lengths() {
     }
 }
 
-async fn get_blocks(s: &TestServer, did: &str, cids: &[Cid]) -> Resp {
-    let mut q = vec![("did", did.to_string())];
-    q.extend(cids.iter().map(|c| ("cids", c.to_string())));
-    s.xrpc.get_multi("com.atproto.sync.getBlocks", &q, &Auth::None).await
-}
-
 async fn assert_nodes_served(s: &TestServer, did: &str) -> Vec<Cid> {
     let repo = s.get_repo(did).await;
     let mut nodes = Vec::new();
     repo.tree().walk_blocks(&mut |c, _| nodes.push(c)).unwrap();
     for chunk in nodes.chunks(100) {
-        let r = get_blocks(s, did, chunk).await;
+        let r = s.get_blocks(did, chunk).await;
         assert_eq!(r.status, 200, "{}", r.text());
         let (_, blocks) = vlpds::car::read_car(&r.body).unwrap();
         assert_eq!(blocks.len(), chunk.len());
@@ -77,16 +71,9 @@ async fn node_index_serves_deep_trees_across_commits() {
         }
     };
     // pseudo-random TID-shaped rkeys, so inserts land all over the tree
-    let rkey = |i: u64| {
-        let t = vlpds::tid::Tid::from_parts(1_700_000_000_000_000 + (i * 2_654_435_761) % 100_000_000_000, i % 1024);
-        t.to_string()
-    };
+    let rkey = |i: u64| vlpds::tid::Tid::from_parts(1_700_000_000_000_000 + (i * 2_654_435_761) % 100_000_000_000, i % 1024).to_string();
     for batch in 0..8u64 {
-        let writes: Vec<J> = (0..150).map(|j| write(rkey(batch * 150 + j), false)).collect();
-        s.xrpc
-            .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth())
-            .await
-            .ok();
+        s.apply_writes(&a, (0..150).map(|j| write(rkey(batch * 150 + j), false)).collect()).await.ok();
     }
     let nodes1 = assert_nodes_served(&s, &a.did).await;
     assert!(nodes1.len() > 100, "{} nodes", nodes1.len());
@@ -94,10 +81,7 @@ async fn node_index_serves_deep_trees_across_commits() {
     for round in 0..6u64 {
         let mut writes: Vec<J> = (0..40).map(|j| write(rkey(10_000 + round * 40 + j), false)).collect();
         writes.extend((0..20).map(|j| write(rkey(round * 150 + j * 7), true)));
-        s.xrpc
-            .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth())
-            .await
-            .ok();
+        s.apply_writes(&a, json!(writes)).await.ok();
         s.post(&a, &format!("single {round}")).await;
     }
     let nodes2 = assert_nodes_served(&s, &a.did).await;
@@ -105,6 +89,6 @@ async fn node_index_serves_deep_trees_across_commits() {
     let gone: Vec<Cid> = nodes1.iter().filter(|c| !now.contains(c)).copied().collect();
     assert!(!gone.is_empty());
     for c in gone.iter().take(50) {
-        get_blocks(&s, &a.did, &[*c]).await.err(400, "BlockNotFound");
+        s.get_blocks(&a.did, &[*c]).await.err(400, "BlockNotFound");
     }
 }

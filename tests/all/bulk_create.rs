@@ -5,25 +5,10 @@
 
 use crate::common::*;
 use std::sync::Arc;
-use std::time::Duration;
 use vlpds::state::bulk_did;
 
 async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = 4;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: 4,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(300),
-            ..Default::default()
-        });
-    })
-    .await
+    cluster_node(id, store.clone(), 4, |_| {}).await
 }
 
 async fn bulk(s: &TestServer, body: J) -> J {
@@ -81,12 +66,7 @@ async fn indices_and_ownership() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let a = node("ix-a", &store).await;
     let b = node("ix-b", &store).await;
-    let split = eventually(Duration::from_secs(10), || async {
-        let (na, nb) = (a.app.partitions.owned().len(), b.app.partitions.owned().len());
-        (na == 2 && nb == 2).then_some(())
-    })
-    .await;
-    assert!(split.is_some(), "shards never split between the nodes");
+    balanced(&[&a, &b]).await;
     let idx: Vec<u64> = (0..40).map(|i| 5000 + i * 3).collect();
     let (mine, theirs): (Vec<u64>, Vec<u64>) = idx.iter().partition(|&&i| a.app.partitions.for_key(&bulk_did(i)).is_some());
     assert!(!mine.is_empty() && !theirs.is_empty());

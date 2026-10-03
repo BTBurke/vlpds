@@ -2,9 +2,8 @@
 //! path `Value::decode(..)?.to_json()`: same output on records, same
 //! accept/reject decision on corrupted input.
 use crate::common::*;
-use base64::Engine;
 use rand::{Rng, SeedableRng};
-use vlpds::cbor::{key_cmp, write_json};
+use vlpds::cbor::write_json;
 
 fn tree_json(b: &[u8]) -> Option<J> {
     Value::decode(b).ok().map(|v| v.to_json())
@@ -16,76 +15,9 @@ fn stream_json(b: &[u8]) -> Option<J> {
     Some(serde_json::from_slice(&out).expect("write_json emitted invalid JSON"))
 }
 
-fn rand_text(rng: &mut impl Rng) -> String {
-    const PIECES: &[&str] = &[
-        "a", "b", "z", "$type", "$link", "$bytes", "text", "\"", "\\", "\n", "\t", "\u{0}",
-        "\u{1f}", "\u{7f}", "é", "日本", "😀", "\u{2028}", "/", "<", " ",
-    ];
-    let n = rng.gen_range(0..6);
-    (0..n)
-        .map(|_| PIECES[rng.gen_range(0..PIECES.len())])
-        .collect()
-}
-
-fn rand_value(rng: &mut impl Rng, depth: usize) -> Value {
-    let leaf = depth >= 5 || rng.gen_bool(0.4);
-    match rng.gen_range(0..if leaf { 6 } else { 8 }) {
-        0 => Value::Null,
-        1 => Value::Bool(rng.gen()),
-        2 => Value::Int(match rng.gen_range(0..4) {
-            0 => rng.gen_range(-30..30),
-            1 => rng.gen_range(-70_000..70_000),
-            2 => rng.gen(),
-            _ => [
-                i64::MIN,
-                i64::MAX,
-                i64::MIN + 1,
-                -1 - u32::MAX as i64,
-                u32::MAX as i64,
-            ][rng.gen_range(0..5)],
-        }),
-        3 => Value::Bytes((0..rng.gen_range(0..40)).map(|_| rng.gen()).collect()),
-        4 => Value::Text(rand_text(rng)),
-        5 => Value::Link(if rng.gen() {
-            Cid::dag_cbor(&rng.gen::<[u8; 8]>())
-        } else {
-            Cid::raw(&rng.gen::<[u8; 8]>())
-        }),
-        6 => Value::Array(
-            (0..rng.gen_range(0..5))
-                .map(|_| rand_value(rng, depth + 1))
-                .collect(),
-        ),
-        _ => {
-            let mut m: Vec<(String, Value)> = Vec::new();
-            for _ in 0..rng.gen_range(0..6) {
-                let k = rand_text(rng);
-                if !m.iter().any(|(x, _)| *x == k) {
-                    m.push((k, rand_value(rng, depth + 1)));
-                }
-            }
-            m.sort_by(|a, b| key_cmp(&a.0, &b.0));
-            Value::Map(m)
-        }
-    }
-}
-
 /// Records: the data-model fixtures plus random value trees.
 fn corpus() -> Vec<Vec<u8>> {
-    #[derive(serde::Deserialize)]
-    struct Fixture {
-        cbor_base64: String,
-    }
-    let fixtures: Vec<Fixture> =
-        serde_json::from_str(&read_fixture("interop/data-model/data-model-fixtures.json")).unwrap();
-    let mut out: Vec<Vec<u8>> = fixtures
-        .iter()
-        .map(|f| {
-            base64::engine::general_purpose::STANDARD_NO_PAD
-                .decode(f.cbor_base64.trim_end_matches('='))
-                .unwrap()
-        })
-        .collect();
+    let mut out: Vec<Vec<u8>> = data_model_fixtures().into_iter().map(|f| f.cbor).collect();
     let post = json!({
         "$type": "app.bsky.feed.post",
         "text": "Check out this thing @alice.bsky.social wrote https://example.com/mst — neat",
@@ -97,7 +29,7 @@ fn corpus() -> Vec<Vec<u8>> {
     out.push(Value::from_json(&post).unwrap().to_cbor());
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
     for _ in 0..3000 {
-        out.push(rand_value(&mut rng, 0).to_cbor());
+        out.push(rand_cbor(&mut rng, 0).to_cbor());
     }
     out
 }
@@ -132,10 +64,7 @@ fn write_json_is_as_strict_as_decode() {
         rejected += want.is_none() as usize;
         assert_eq!(stream_json(&b), want, "mutation {i}: {b:02x?}");
     }
-    assert!(
-        rejected > 1000,
-        "too few corrupted inputs rejected ({rejected})"
-    );
+    assert!(rejected > 1000, "too few corrupted inputs rejected ({rejected})");
     // around the nesting limit (compared as bytes: serde_json's parser stops
     // at depth 128)
     let raw = |b: &[u8]| {
@@ -162,14 +91,7 @@ fn write_json_is_as_strict_as_decode() {
 #[ignore]
 fn bench() {
     use std::time::Instant;
-    let post = corpus().into_iter().nth(
-        serde_json::from_str::<Vec<J>>(&read_fixture(
-            "interop/data-model/data-model-fixtures.json",
-        ))
-        .unwrap()
-        .len(),
-    );
-    let post = post.unwrap();
+    let post = corpus().into_iter().nth(data_model_fixtures().len()).unwrap();
     let n = 300_000;
     let run = |name: &str, f: &dyn Fn() -> usize| {
         let mut sink = 0;
@@ -183,11 +105,7 @@ fn bench() {
         let ns = t.elapsed().as_nanos() as f64 / n as f64;
         println!("{name:36} {ns:8.0} ns/op ({sink})");
     };
-    run("decode -> to_json -> to_vec", &|| {
-        serde_json::to_vec(&Value::decode(&post).unwrap().to_json())
-            .unwrap()
-            .len()
-    });
+    run("decode -> to_json -> to_vec", &|| serde_json::to_vec(&Value::decode(&post).unwrap().to_json()).unwrap().len());
     run("write_json", &|| {
         let mut out = Vec::with_capacity(post.len() * 2);
         write_json(&post, &mut out).unwrap();

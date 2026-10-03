@@ -14,17 +14,10 @@ async fn setup() -> Fixture {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
     let post = s.post(&a, "hello").await;
-    let up = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", PNG_1X1.to_vec(), "image/png", &a.auth()).await.ok();
-    let blob = up["blob"].clone();
+    let blob = s.upload_blob(&a, PNG_1X1, "image/png").await;
     // profile's key is literal:self
-    s.xrpc
-        .post(
-            "com.atproto.repo.putRecord",
-            &json!({"repo": a.did, "collection": "app.bsky.actor.profile", "rkey": "self", "record": {"$type": "app.bsky.actor.profile", "displayName": "alice", "avatar": blob}}),
-            &a.auth(),
-        )
-        .await
-        .ok();
+    let profile = json!({"$type": "app.bsky.actor.profile", "displayName": "alice", "avatar": blob});
+    s.put_record(&a, "app.bsky.actor.profile", "self", profile).await.ok();
     let blob_cid = blob["ref"]["$link"].as_str().unwrap().to_string();
     Fixture { s, a, post, blob_cid }
 }
@@ -33,21 +26,15 @@ async fn deactivate(f: &Fixture) {
     f.s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &f.a.auth()).await.ok();
 }
 
-#[track_caller]
-fn deactivated_err(r: &Resp, what: &str) {
-    assert_eq!(r.status, 400, "{what}: {}", r.text());
-    assert_eq!(r.error_name(), Some("RepoDeactivated"), "{what}: {}", r.text());
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn returns_deactivated_status() {
     let f = setup().await;
     deactivate(&f).await;
-    let j = f.s.xrpc.get("com.atproto.sync.getRepoStatus", &[("did", &f.a.did)], &Auth::None).await.ok();
+    let j = f.s.repo_status(&f.a.did).await.ok();
     assert_eq!(j["did"], json!(f.a.did));
     assert_eq!(j["active"], json!(false));
     assert_eq!(j["status"], json!("deactivated"));
-    let info = f.s.xrpc.get("com.atproto.admin.getAccountInfo", &[("did", &f.a.did)], &Auth::Admin).await.ok();
+    let info = f.s.account_info(&f.a.did).await.ok();
     assert!(info["deactivatedAt"].is_string(), "{info}");
 }
 
@@ -57,20 +44,16 @@ async fn no_longer_serves_repo_data() {
     deactivate(&f).await;
     let s = &f.s;
     let did = f.a.did.as_str();
-    deactivated_err(&s.xrpc.get("com.atproto.sync.getRepo", &[("did", did)], &Auth::None).await, "getRepo");
-    deactivated_err(&s.xrpc.get("com.atproto.sync.getLatestCommit", &[("did", did)], &Auth::None).await, "getLatestCommit");
-    deactivated_err(&s.xrpc.get("com.atproto.sync.listBlobs", &[("did", did)], &Auth::None).await, "listBlobs");
-    deactivated_err(
-        &s.xrpc
-            .get("com.atproto.sync.getRecord", &[("did", did), ("collection", f.post.collection()), ("rkey", f.post.rkey())], &Auth::None)
-            .await,
-        "sync.getRecord",
-    );
+    for nsid in ["getRepo", "getLatestCommit", "listBlobs"] {
+        s.xrpc.get(&format!("com.atproto.sync.{nsid}"), &[("did", did)], &Auth::None).await.err(400, "RepoDeactivated");
+    }
+    let q = [("did", did), ("collection", f.post.collection()), ("rkey", f.post.rkey())];
+    s.xrpc.get("com.atproto.sync.getRecord", &q, &Auth::None).await.err(400, "RepoDeactivated");
     s.get_record(did, f.post.collection(), f.post.rkey()).await.client_err();
     let r = s.xrpc.get("com.atproto.repo.describeRepo", &[("repo", did)], &Auth::None).await;
     r.client_err();
     assert!(r.text().contains("deactivated") || r.error_name() == Some("RepoDeactivated"), "{}", r.text());
-    deactivated_err(&s.xrpc.get("com.atproto.sync.getBlob", &[("did", did), ("cid", &f.blob_cid)], &Auth::None).await, "getBlob");
+    s.get_blob(did, &f.blob_cid).await.err(400, "RepoDeactivated");
 
     let j = s.xrpc.get("com.atproto.sync.listRepos", &[], &Auth::None).await.ok();
     let me = j["repos"].as_array().unwrap().iter().find(|r| r["did"] == json!(did)).cloned().expect("deactivated repo still listed");
@@ -82,7 +65,7 @@ async fn no_longer_serves_repo_data() {
 async fn no_longer_resolves_handle() {
     let f = setup().await;
     deactivate(&f).await;
-    f.s.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", &f.a.handle)], &Auth::None).await.client_err();
+    f.s.resolve_handle(&f.a.handle).await.client_err();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -92,7 +75,7 @@ async fn still_allows_login_and_returns_status() {
     let j = f.s.create_session(&f.a.did, &f.a.password).await.ok();
     assert_eq!(j["status"], json!("deactivated"));
     assert_eq!(j["active"], json!(false));
-    let j = f.s.xrpc.get("com.atproto.server.getSession", &[], &f.a.auth()).await.ok();
+    let j = f.s.get_session(&f.a.auth()).await.ok();
     assert_eq!(j["status"], json!("deactivated"));
     assert_eq!(j["active"], json!(false));
 }
@@ -102,40 +85,13 @@ async fn does_not_allow_writes() {
     // reference findAccount(checkDeactivated): 401 AccountDeactivated
     let f = setup().await;
     deactivate(&f).await;
-    let s = &f.s;
-    let auth = f.a.auth();
-    let r = s
-        .xrpc
-        .post(
-            "com.atproto.repo.createRecord",
-            &json!({"repo": f.a.did, "collection": "app.bsky.feed.post", "record": post_record("blah")}),
-            &auth,
-        )
-        .await;
-    r.err(401, "AccountDeactivated");
-    let r = s
-        .xrpc
-        .post(
-            "com.atproto.repo.putRecord",
-            &json!({"repo": f.a.did, "collection": f.post.collection(), "rkey": f.post.rkey(), "record": post_record("blah")}),
-            &auth,
-        )
-        .await;
-    r.err(401, "AccountDeactivated");
-    let r = s
-        .xrpc
-        .post("com.atproto.repo.deleteRecord", &json!({"repo": f.a.did, "collection": f.post.collection(), "rkey": f.post.rkey()}), &auth)
-        .await;
-    r.err(401, "AccountDeactivated");
-    let r = s
-        .xrpc
-        .post(
-            "com.atproto.repo.applyWrites",
-            &json!({"repo": f.a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": post_record("x")}]}),
-            &auth,
-        )
-        .await;
-    r.err(401, "AccountDeactivated");
+    let (s, a, p) = (&f.s, &f.a, &f.post);
+    let body = json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("blah")});
+    s.xrpc.post("com.atproto.repo.createRecord", &body, &a.auth()).await.err(401, "AccountDeactivated");
+    s.put_record(a, p.collection(), p.rkey(), post_record("blah")).await.err(401, "AccountDeactivated");
+    s.delete_record(a, p.collection(), p.rkey()).await.err(401, "AccountDeactivated");
+    let create = json!([{"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": post_record("x")}]);
+    s.apply_writes(a, create).await.err(401, "AccountDeactivated");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -155,13 +111,13 @@ async fn reactivates() {
     assert!(ev.str("status").is_none());
 
     f.s.get_repo(&f.a.did).await;
-    let j = f.s.xrpc.get("com.atproto.sync.getRepoStatus", &[("did", &f.a.did)], &Auth::None).await.ok();
+    let j = f.s.repo_status(&f.a.did).await.ok();
     assert_eq!(j["active"], json!(true));
     assert!(j.get("status").is_none() || j["status"].is_null(), "{j}");
-    let info = f.s.xrpc.get("com.atproto.admin.getAccountInfo", &[("did", &f.a.did)], &Auth::Admin).await.ok();
+    let info = f.s.account_info(&f.a.did).await.ok();
     assert!(info.get("deactivatedAt").is_none() || info["deactivatedAt"].is_null(), "{info}");
     // writes work again and resolveHandle is back
     f.s.post(&f.a, "back").await;
-    let j = f.s.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", &f.a.handle)], &Auth::None).await.ok();
+    let j = f.s.resolve_handle(&f.a.handle).await.ok();
     assert_eq!(j["did"], json!(f.a.did));
 }

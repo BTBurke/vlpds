@@ -116,11 +116,7 @@ async fn own_writes_visible_with_slow_manifest_poll() {
     // compaction ran and the writer saw it well before a 10 s poll could
     // matter: L0 back under the deep mark, with sorted runs
     let t = Instant::now();
-    let seen = eventually(Duration::from_secs(30), || async {
-        let m = db.manifest();
-        (m.l0().len() < 8 && !m.compacted().is_empty()).then_some(())
-    })
-    .await;
+    let seen = eventually(Duration::from_secs(30), || async { (db.manifest().l0().len() < 8 && !db.manifest().compacted().is_empty()).then_some(()) }).await;
     assert!(seen.is_some(), "writer never saw compaction: L0 {}, {} sorted runs", db.manifest().l0().len(), db.manifest().compacted().len());
     eprintln!("writer saw compaction after {:?}", t.elapsed());
     check(&db, 11, 500).await;
@@ -201,49 +197,16 @@ async fn idle_checkpoint_writes_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn deep_l0_ingest_keeps_up() {
-    use object_store::throttle::{ThrottleConfig, ThrottledStore};
-    let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-    let records = env("INGEST_RECORDS", 2_000_000);
+    let records: u64 = env_or("INGEST_RECORDS", 2_000_000);
     if let Some(ms) = std::env::var("MANIFEST_POLL_MS").ok().and_then(|v| v.parse().ok()) {
         vlpds::partition::set_manifest_poll_interval(Duration::from_millis(ms));
     }
     if let Some(ms) = std::env::var("COMPACTION_POLL_MS").ok().and_then(|v| v.parse().ok()) {
         vlpds::partition::set_compaction_poll_interval(Duration::from_millis(ms));
     }
-    let latency = Duration::from_millis(env("INGEST_LATENCY_MS", 10));
-    let cfg = ThrottleConfig { wait_get_per_call: latency, wait_put_per_call: latency, wait_list_per_call: latency, wait_delete_per_call: latency, ..Default::default() };
-    let store = vlpds::store::Store { raw: Arc::new(ThrottledStore::new(object_store::memory::InMemory::new(), cfg)), ..vlpds::store::Store::memory(None) };
+    let store = vlpds::store::Store { raw: Arc::new(throttled_store(env_or("INGEST_LATENCY_MS", 10))), ..vlpds::store::Store::memory(None) };
     let db = vlpds::partition::open_db(&store, vlpds::slots::ShardId(0), None).await.unwrap();
-    let did = "did:plc:ingestingestingestingest";
-    let record = vec![0xa5u8; 260];
-    let started = Instant::now();
-    let (mut worst, mut slow, mut stalled, mut written, mut max_l0) = (Duration::ZERO, 0u64, Duration::ZERO, 0u64, 0usize);
-    while written < records {
-        let mut wb = slatedb::WriteBatch::new();
-        for i in 0..1000u64 {
-            let n = written + i;
-            let path = format!("app.bsky.feed.post/{n:013}");
-            let cid: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(n.to_le_bytes()).into();
-            let mut val = cid.to_vec();
-            val.extend_from_slice(&record);
-            wb.put(vlpds::state::record_key(did, &path), val);
-            let c = vlpds::cid::Cid::dag_cbor(&cid);
-            wb.put(vlpds::state::record_cid_key(did, &c, &path), b"");
-        }
-        let t = Instant::now();
-        if tokio::time::timeout(Duration::from_secs(60), db.write(wb)).await.is_err() {
-            panic!("a write hung for 60 s at {written} records (L0 {})", db.manifest().l0().len());
-        }
-        let took = t.elapsed();
-        worst = worst.max(took);
-        if took > Duration::from_millis(250) {
-            slow += 1;
-            stalled += took;
-        }
-        max_l0 = max_l0.max(db.manifest().l0().len());
-        written += 1000;
-    }
-    let secs = started.elapsed().as_secs_f64();
+    let crate::compaction_polling::Ingest { secs, worst, slow, stalled, max_l0 } = crate::compaction_polling::unpaced_ingest(&db, records).await;
     eprintln!(
         "ingest: {records} records in {secs:.1} s ({:.0}/s), worst write {worst:?}, {slow} writes > 250 ms ({stalled:?} total), max L0 {max_l0}",
         records as f64 / secs

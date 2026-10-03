@@ -6,28 +6,9 @@
 //! requestCrawl.
 
 use crate::common::*;
-use clap::Parser;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use vlpds::cli::admin::{run, Cmd, Opts};
-
-#[derive(Parser)]
-struct Cli {
-    #[arg(long)]
-    json: bool,
-    #[command(subcommand)]
-    cmd: Cmd,
-}
-
-/// Runs `vlpds admin --url <s> <args...>`: (ok, stdout).
-async fn admin(url: &str, args: &[&str]) -> (anyhow::Result<()>, String) {
-    let cli = Cli::try_parse_from(std::iter::once("vlpds-admin").chain(args.iter().copied())).expect("argv parses");
-    let opts = Opts { url: url.to_string(), token: vlpds::server::DEV_ADMIN_TOKEN.to_string(), json: cli.json };
-    let mut out = Vec::new();
-    let r = run(cli.cmd, &opts, &mut out).await;
-    (r, String::from_utf8(out).unwrap())
-}
 
 #[track_caller]
 fn ok((r, out): (anyhow::Result<()>, String)) -> String {
@@ -40,7 +21,7 @@ fn ok((r, out): (anyhow::Result<()>, String)) -> String {
 async fn admin_json(url: &str, args: &[&str]) -> J {
     let mut a = vec!["--json"];
     a.extend_from_slice(args);
-    let out = ok(admin(url, &a).await);
+    let out = ok(admin_cli(url, &a).await);
     serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"))
 }
 
@@ -52,13 +33,13 @@ async fn account_commands_match_pdsadmin() {
     // create: an invite is minted (the PDS requires one), the password generated
     let handle = format!("{}.{HANDLE_DOMAIN}", unique_name("cli"));
     let email = format!("{}@example.com", unique_name("cli"));
-    let out = ok(admin(u, &["account", "create", &email, &handle]).await);
+    let out = ok(admin_cli(u, &["account", "create", &email, &handle]).await);
     assert!(out.contains("Account created successfully!"), "{out}");
     let did = out.lines().find_map(|l| l.strip_prefix("DID      : ")).unwrap().to_string();
     let password = out.lines().find_map(|l| l.strip_prefix("Password : ")).unwrap().to_string();
     assert_eq!(password.len(), 24);
     s.create_session(&handle, &password).await.ok();
-    let info = s.xrpc.get("com.atproto.admin.getAccountInfo", &[("did", &did)], &Auth::Admin).await.ok();
+    let info = s.account_info(&did).await.ok();
     assert!(info["invitedBy"]["code"].is_string(), "used a fresh invite: {info}");
     // --json, a given password
     let h2 = format!("{}.{HANDLE_DOMAIN}", unique_name("cli"));
@@ -67,11 +48,11 @@ async fn account_commands_match_pdsadmin() {
     assert_eq!(j["handle"], json!(h2));
     s.create_session(&h2, "a-given-password-1").await.ok();
     // a bad handle is the server's error
-    let (r, _) = admin(u, &["account", "create", "x@example.com", "no spaces allowed"]).await;
+    let (r, _) = admin_cli(u, &["account", "create", "x@example.com", "no spaces allowed"]).await;
     assert!(format!("{:#}", r.unwrap_err()).contains("createAccount"));
 
     // list: table and JSON
-    let out = ok(admin(u, &["account", "list"]).await);
+    let out = ok(admin_cli(u, &["account", "list"]).await);
     let header = out.lines().next().unwrap();
     assert!(header.starts_with("Handle") && header.contains("Email") && header.contains("DID"), "{out}");
     assert!(out.lines().any(|l| l.starts_with(&handle) && l.contains(&did) && l.contains(&email)), "{out}");
@@ -80,22 +61,22 @@ async fn account_commands_match_pdsadmin() {
     assert!(dids.contains(did.as_str()) && dids.contains(did2.as_str()), "{j}");
     let j = admin_json(u, &["account", "list", "--email", &email]).await;
     assert_eq!(j.as_array().unwrap().len(), 1, "{j}");
-    let out = ok(admin(u, &["account", "info", &did]).await);
+    let out = ok(admin_cli(u, &["account", "info", &did]).await);
     assert!(out.contains(&handle) && out.contains("takedown:"), "{out}");
 
     // takedown / untakedown
-    let out = ok(admin(u, &["account", "takedown", &did, "--ref", "ticket-42"]).await);
+    let out = ok(admin_cli(u, &["account", "takedown", &did, "--ref", "ticket-42"]).await);
     assert_eq!(out.trim(), format!("{did} taken down (ref ticket-42)"));
     let st = s.xrpc.get("com.atproto.admin.getSubjectStatus", &[("did", &did)], &Auth::Admin).await.ok();
     assert_eq!(st["takedown"], json!({"applied": true, "ref": "ticket-42"}), "{st}");
     s.create_session(&handle, &password).await.err(401, "AccountTakedown");
     let j = admin_json(u, &["account", "info", &did]).await;
     assert_eq!(j["status"]["takedown"]["applied"], json!(true), "{j}");
-    ok(admin(u, &["account", "untakedown", &did]).await);
+    ok(admin_cli(u, &["account", "untakedown", &did]).await);
     s.create_session(&handle, &password).await.ok();
 
     // reset-password: the new one works, the old one doesn't
-    let out = ok(admin(u, &["account", "reset-password", &did]).await);
+    let out = ok(admin_cli(u, &["account", "reset-password", &did]).await);
     let new_pw = out.lines().find_map(|l| l.strip_prefix("New password: ")).unwrap().to_string();
     assert_eq!(new_pw.len(), 24);
     assert_ne!(new_pw, password);
@@ -111,24 +92,22 @@ async fn account_commands_match_pdsadmin() {
         let c = listed["codes"].as_array().unwrap().iter().find(|c| c["code"] == json!(code)).expect("listed");
         assert_eq!(c["available"], json!(3), "{c}");
     }
-    let out = ok(admin(u, &["create-invite-code"]).await);
+    let out = ok(admin_cli(u, &["create-invite-code"]).await);
     assert_eq!(out.lines().count(), 1, "{out}");
 
     // delete: refused without --yes off a terminal, then permanent
-    let (r, _) = admin(u, &["account", "delete", &did2]).await;
+    let (r, _) = admin_cli(u, &["account", "delete", &did2]).await;
     assert!(r.unwrap_err().to_string().contains("--yes"));
-    s.xrpc.get("com.atproto.admin.getAccountInfo", &[("did", &did2)], &Auth::Admin).await.ok();
-    let out = ok(admin(u, &["account", "delete", &did2, "--yes"]).await);
+    s.account_info(&did2).await.ok();
+    let out = ok(admin_cli(u, &["account", "delete", &did2, "--yes"]).await);
     assert_eq!(out.trim(), format!("{did2} deleted"));
-    s.xrpc.get("com.atproto.admin.getAccountInfo", &[("did", &did2)], &Auth::Admin).await.client_err();
+    s.account_info(&did2).await.client_err();
 
     // DIDs are checked before anything is sent
-    let (r, _) = admin(u, &["account", "takedown", "alice.test"]).await;
+    let (r, _) = admin_cli(u, &["account", "takedown", "alice.test"]).await;
     assert!(r.unwrap_err().to_string().contains("did:"));
     // a wrong token is an error, not output
-    let opts = Opts { url: s.url.clone(), token: "wrong".into(), json: false };
-    let cli = Cli::try_parse_from(["x", "account", "list"]).unwrap();
-    assert!(run(cli.cmd, &opts, &mut Vec::new()).await.is_err());
+    assert!(admin_cli_as(u, "wrong", &["account", "list"]).await.0.is_err());
 }
 
 /// A relay stand-in: answers requestCrawl with `status`, recording bodies.
@@ -159,20 +138,20 @@ async fn request_crawl_reports_each_relay() {
     let s = TestServer::spawn().await;
     let host = s.url.strip_prefix("http://").unwrap().to_string();
 
-    let out = ok(admin(&s.url, &["request-crawl", &good]).await);
+    let out = ok(admin_cli(&s.url, &["request-crawl", &good]).await);
     assert!(out.contains(&format!("Requesting crawl of {host} from {good}: ok")), "{out}");
     assert_eq!(seen.lock().last().unwrap(), &json!({"hostname": host}));
 
     // comma-separated; one failing relay fails the command, the other is still asked
     let n = seen.lock().len();
-    let (r, out) = admin(&s.url, &["request-crawl", &format!("{good},{bad}")]).await;
+    let (r, out) = admin_cli(&s.url, &["request-crawl", &format!("{good},{bad}")]).await;
     assert!(r.unwrap_err().to_string().contains("1 of 2 relays failed"), "{out}");
     assert!(out.contains(": ok") && out.contains("FAILED 500"), "{out}");
     assert_eq!(seen.lock().len(), n + 1);
     assert_eq!(bad_seen.lock().len(), 1);
 
     // nothing given, nothing configured
-    let (r, _) = admin(&s.url, &["request-crawl"]).await;
+    let (r, _) = admin_cli(&s.url, &["request-crawl"]).await;
     assert!(r.unwrap_err().to_string().contains("none configured"));
     // default: the node's --crawlers
     let g = good.clone();
@@ -205,7 +184,7 @@ async fn publish_identity_and_key_rotation() {
     let mut sub = s.subscribe_from_now().await;
     let file = std::env::temp_dir().join(format!("vlpds-cli-dids-{}", unique_name("f")));
     std::fs::write(&file, format!("# accounts\n{}\n", b.did)).unwrap();
-    let out = ok(admin(&s.url, &["publish-identity", &a.did, "--file", file.to_str().unwrap()]).await);
+    let out = ok(admin_cli(&s.url, &["publish-identity", &a.did, "--file", file.to_str().unwrap()]).await);
     let _ = std::fs::remove_file(&file);
     assert!(out.contains(&format!("published identity evt for {} ({})", a.did, a.handle)), "{out}");
     let frames = sub
@@ -214,7 +193,7 @@ async fn publish_identity_and_key_rotation() {
     let ids: Vec<(&str, Option<&str>)> = frames.iter().filter(|f| f.kind() == "#identity").map(|f| (f.did().unwrap(), f.str("handle"))).collect();
     assert_eq!(ids, vec![(a.did.as_str(), Some(a.handle.as_str())), (b.did.as_str(), Some(b.handle.as_str()))]);
     // an unknown DID fails the batch, the others still go out
-    let (r, out) = admin(&s.url, &["publish-identity", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", &a.did]).await;
+    let (r, out) = admin_cli(&s.url, &["publish-identity", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", &a.did]).await;
     assert!(r.unwrap_err().to_string().contains("1 of 2 DIDs failed"), "{out}");
     assert!(out.contains("FAILED") && out.contains(&format!("published identity evt for {}", a.did)), "{out}");
 
@@ -222,10 +201,10 @@ async fn publish_identity_and_key_rotation() {
     let other = vlpds::crypto::Keypair::generate().did_key();
     let direct = vlpds::plc::Plc::new(&plc.url, rot.clone(), None);
     assert!(direct.update_signing_key(&a.did, &other).await.unwrap(), "diverged");
-    let out = ok(admin(&s.url, &["rotate-keys", &a.did]).await);
+    let out = ok(admin_cli(&s.url, &["rotate-keys", &a.did]).await);
     assert!(out.contains("PLC signing key updated"), "{out}");
     assert_eq!(plc.last_op(&a.did).unwrap()["verificationMethods"]["atproto"], json!(local_key(a.did.clone()).await));
-    let out = ok(admin(&s.url, &["rotate-keys", &a.did]).await);
+    let out = ok(admin_cli(&s.url, &["rotate-keys", &a.did]).await);
     assert!(out.contains("already current"), "{out}");
     // --generate: a fresh signing key, in PLC too
     let before = local_key(b.did.clone()).await;
@@ -241,7 +220,7 @@ async fn publish_identity_and_key_rotation() {
     assert_eq!(j.as_array().unwrap().len(), 1, "{j}");
     let r = &j[0]["result"];
     assert_eq!((r["accounts"].as_u64(), r["current"].as_u64(), r["rotated"].as_u64()), (Some(2), Some(2), Some(0)), "{j}");
-    let out = ok(admin(&s.url, &["rewrap-secrets", "--dry-run"]).await);
+    let out = ok(admin_cli(&s.url, &["rewrap-secrets", "--dry-run"]).await);
     assert!(out.starts_with("node") && out.contains("(dry run: nothing changed)"), "{out}");
     let j = admin_json(&s.url, &["rewrap-secrets", "--dry-run", "--node-only"]).await;
     assert_eq!((j[0]["result"]["accounts"].as_u64(), j[0]["result"]["stale"].as_u64()), (Some(2), Some(0)), "{j}");
@@ -250,13 +229,13 @@ async fn publish_identity_and_key_rotation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rotate_plc_keys_needs_plc() {
     let s = TestServer::spawn().await;
-    let (r, out) = admin(&s.url, &["rotate-plc-keys", "--dry-run"]).await;
+    let (r, out) = admin_cli(&s.url, &["rotate-plc-keys", "--dry-run"]).await;
     assert!(r.is_err() && out.contains("PLC registration is off"), "{out}");
     // publish-identity of a non-PLC setup still works; rotate-keys refuses
     // to sync PLC without it
     let a = s.create_account("np").await;
-    ok(admin(&s.url, &["publish-identity", &a.did]).await);
-    let (r, out) = admin(&s.url, &["rotate-keys", &a.did]).await;
+    ok(admin_cli(&s.url, &["publish-identity", &a.did]).await);
+    let (r, out) = admin_cli(&s.url, &["rotate-keys", &a.did]).await;
     assert!(r.is_err() && out.contains("PLC registration is off"), "{out}");
 }
 
@@ -265,7 +244,7 @@ async fn many_records(s: &TestServer, a: &TestAccount, n: usize) {
         let writes: Vec<J> = (0..50.min(n - chunk * 50))
             .map(|i| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": post_record(&format!("p{chunk}-{i}"))}))
             .collect();
-        s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok();
+        s.apply_writes(a, json!(writes)).await.ok();
     }
 }
 
@@ -277,7 +256,7 @@ async fn check_and_rebuild_repo() {
     let u = s.url.as_str();
 
     // a healthy repo
-    let out = ok(admin(u, &["check-repo", &a.did]).await);
+    let out = ok(admin_cli(u, &["check-repo", &a.did]).await);
     assert!(out.contains("(ok)") && out.contains("Records      : 120 (0 bad)"), "{out}");
     let j = admin_json(u, &["check-repo", &a.did]).await;
     assert_eq!(j["ok"], json!(true), "{j}");
@@ -296,19 +275,19 @@ async fn check_and_rebuild_repo() {
     p.db.delete(first).await.unwrap();
     let stray = Cid::dag_cbor(b"\xa0");
     p.db.put(vlpds::state::mst_node_key(&a.did, &stray), b"\xa0".to_vec()).await.unwrap();
-    let (r, out) = admin(u, &["check-repo", &a.did]).await;
+    let (r, out) = admin_cli(u, &["check-repo", &a.did]).await;
     assert!(r.unwrap_err().to_string().contains("2 problem(s)"), "{out}");
     assert!(out.contains("1 persisted MST node(s) missing") && out.contains("1 persisted MST node(s) not in the tree"), "{out}");
 
     // rebuild: dry run changes nothing; then a new commit, #sync, clean state
     let (head0, rev0) = s.latest_commit(&a.did).await;
-    let out = ok(admin(u, &["rebuild-repo", &a.did, "--dry-run"]).await);
+    let out = ok(admin_cli(u, &["rebuild-repo", &a.did, "--dry-run"]).await);
     assert!(out.contains("would write 120 records"), "{out}");
     assert_eq!(s.latest_commit(&a.did).await.0, head0);
-    let (r, _) = admin(u, &["rebuild-repo", &a.did]).await;
+    let (r, _) = admin_cli(u, &["rebuild-repo", &a.did]).await;
     assert!(r.unwrap_err().to_string().contains("--yes"), "asks first");
     let mut sub = s.subscribe_from_now().await;
-    let out = ok(admin(u, &["rebuild-repo", &a.did, "--yes"]).await);
+    let out = ok(admin_cli(u, &["rebuild-repo", &a.did, "--yes"]).await);
     assert!(out.contains("Record count : 120") && out.contains("After        : ok"), "{out}");
     let (head1, rev1) = s.latest_commit(&a.did).await;
     assert_ne!(head1, head0);
@@ -339,16 +318,13 @@ async fn check_and_rebuild_repo() {
         it.next().await.unwrap().unwrap().key
     };
     p.db.delete(rec).await.unwrap();
-    let j = {
-        let (_, out) = admin(u, &["--json", "check-repo", &a.did]).await;
-        serde_json::from_str::<J>(&out).unwrap()
-    };
+    let j: J = serde_json::from_str(&admin_cli(u, &["--json", "check-repo", &a.did]).await.1).unwrap();
     assert_eq!(j["mst"]["matchesHead"], json!(false), "{j}");
-    let (r, _) = admin(u, &["rebuild-repo", &a.did, "--yes"]).await;
+    let (r, _) = admin_cli(u, &["rebuild-repo", &a.did, "--yes"]).await;
     assert!(r.unwrap_err().to_string().contains("RepoUnrecoverable"));
 
     // unknown repos
-    let (r, _) = admin(u, &["check-repo", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"]).await;
+    let (r, _) = admin_cli(u, &["check-repo", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"]).await;
     assert!(r.unwrap_err().to_string().contains("RepoNotFound"));
 }
 
@@ -356,35 +332,9 @@ async fn check_and_rebuild_repo() {
 async fn per_node_commands_cover_the_cluster() {
     const SHARDS: u32 = 8;
     let store = Arc::new(object_store::memory::InMemory::new());
-    let node = |id: &str| {
-        let (id, store) = (id.to_string(), store.clone());
-        TestServer::spawn_with(move |c| {
-            c.memory_store = Some(store);
-            c.shards = SHARDS;
-            c.cluster = Some(vlpds::cluster::ClusterConfig {
-                node_id: id,
-                addr: peer_url(c),
-                shards: SHARDS,
-                ttl: Duration::from_millis(1500),
-                renew_every: Duration::from_millis(100),
-                skew: Duration::from_millis(200),
-                ..Default::default()
-            });
-        })
-    };
-    let a = node("cli-a").await;
-    let b = node("cli-b").await;
-    // both own shards, every shard owned once, holding still
-    let mut stable = 0;
-    for _ in 0..400 {
-        let (na, nb) = (a.app.partitions.owned().len(), b.app.partitions.owned().len());
-        stable = if na > 0 && nb > 0 && na + nb == SHARDS as usize { stable + 1 } else { 0 };
-        if stable >= 10 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(stable >= 10, "cluster never settled");
+    let a = cluster_node("cli-a", store.clone(), SHARDS, |_| {}).await;
+    let b = cluster_node("cli-b", store.clone(), SHARDS, |_| {}).await;
+    balanced(&[&a, &b]).await;
 
     let accts = [a.create_account("pn").await, a.create_account("pn").await, b.create_account("pn").await, b.create_account("pn").await];
     let on_b = accts.iter().find(|t| b.app.partition(&t.did).is_ok()).expect("an account on b");
@@ -395,16 +345,16 @@ async fn per_node_commands_cover_the_cluster() {
     assert_eq!(nodes, HashSet::from(["cli-a", "cli-b"]), "{j}");
     let total: u64 = j.as_array().unwrap().iter().map(|r| r["result"]["accounts"].as_u64().unwrap()).sum();
     assert_eq!(total, 4, "{j}");
-    let out = ok(admin(&a.url, &["rewrap-secrets", "--dry-run"]).await);
+    let out = ok(admin_cli(&a.url, &["rewrap-secrets", "--dry-run"]).await);
     assert!(out.lines().any(|l| l.starts_with("total") && l.split_whitespace().nth(1) == Some("4")), "{out}");
 
     // cluster status lists both
-    let out = ok(admin(&b.url, &["cluster", "status"]).await);
+    let out = ok(admin_cli(&b.url, &["cluster", "status"]).await);
     assert!(out.contains("cli-a") && out.contains("cli-b*") && out.contains("0 unowned"), "{out}");
 
     // DID-keyed calls through the other node reach the owner
     let mut sub = b.subscribe_from_now().await;
-    ok(admin(&a.url, &["publish-identity", &on_b.did]).await);
+    ok(admin_cli(&a.url, &["publish-identity", &on_b.did]).await);
     sub.until(Duration::from_secs(10), |f| f.iter().any(|f| f.kind() == "#identity" && f.did() == Some(on_b.did.as_str()))).await;
     let j = admin_json(&a.url, &["check-repo", &on_b.did]).await;
     assert_eq!(j["ok"], json!(true), "{j}");

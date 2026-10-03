@@ -3,20 +3,12 @@
 //! repo writes) and the #account firehose events for each transition.
 use crate::common::*;
 
-fn repo_ref(did: &str) -> J {
-    json!({"$type": "com.atproto.admin.defs#repoRef", "did": did})
-}
-
 async fn update_status(s: &TestServer, did: &str, extra: J) -> Resp {
     let mut body = json!({"subject": repo_ref(did)});
     for (k, v) in extra.as_object().unwrap() {
         body[k] = v.clone();
     }
     s.xrpc.post("com.atproto.admin.updateSubjectStatus", &body, &Auth::Admin).await
-}
-
-async fn repo_status(s: &TestServer, did: &str) -> J {
-    s.xrpc.get("com.atproto.sync.getRepoStatus", &[("did", did)], &Auth::None).await.ok()
 }
 
 async fn next_account_event(sub: &mut Sub, did: &str) -> Frame {
@@ -30,7 +22,7 @@ async fn takedown_plus_activation_is_an_error() {
     let r = update_status(&s, &a.did, json!({"takedown": {"applied": true}, "deactivated": {"applied": false}})).await;
     r.err(400, "InvalidRequest");
     // nothing changed
-    assert_eq!(repo_status(&s, &a.did).await["active"], json!(true));
+    assert_eq!(s.repo_status(&a.did).await.ok()["active"], json!(true));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -46,7 +38,7 @@ async fn deactivate_takedown_untakedown_activate() {
     update_status(&s, &a.did, json!({"takedown": {"applied": true, "ref": "mod-1"}})).await.ok();
     let ev = next_account_event(&mut sub, &a.did).await;
     assert_eq!((ev.bool("active"), ev.str("status")), (Some(false), Some("takendown")));
-    let st = repo_status(&s, &a.did).await;
+    let st = s.repo_status(&a.did).await.ok();
     assert_eq!((st["active"].clone(), st["status"].clone()), (json!(false), json!("takendown")));
 
     update_status(&s, &a.did, json!({"takedown": {"applied": false}})).await.ok();
@@ -60,7 +52,7 @@ async fn deactivate_takedown_untakedown_activate() {
     assert!(ev.str("status").is_none());
 
     s.create_session(&a.handle, &a.password).await.ok();
-    assert_eq!(repo_status(&s, &a.did).await["active"], json!(true));
+    assert_eq!(s.repo_status(&a.did).await.ok()["active"], json!(true));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -85,7 +77,7 @@ async fn takedown_then_deactivate_reports_both() {
     assert!(j["takedown"]["ref"].is_string(), "{j}");
     assert_eq!(j["deactivated"]["applied"], json!(true));
     // takedown wins in the public status
-    let st = repo_status(&s, &a.did).await;
+    let st = s.repo_status(&a.did).await.ok();
     assert_eq!(st["status"], json!("takendown"));
 }
 
@@ -99,7 +91,7 @@ async fn cannot_activate_a_takendown_account() {
     assert_eq!(r.error_name(), Some("AccountNotFound"), "{}", r.text());
     // the user cannot reactivate themselves either
     s.xrpc.post_empty("com.atproto.server.activateAccount", &a.auth()).await.client_err();
-    assert_eq!(repo_status(&s, &a.did).await["status"], json!("takendown"));
+    assert_eq!(s.repo_status(&a.did).await.ok()["status"], json!("takendown"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -109,11 +101,9 @@ async fn update_subject_status_requires_admin() {
     let body = json!({"subject": repo_ref(&a.did), "takedown": {"applied": true}});
     s.xrpc.post("com.atproto.admin.updateSubjectStatus", &body, &Auth::None).await.err_status(401);
     s.xrpc.post("com.atproto.admin.updateSubjectStatus", &body, &a.auth()).await.client_err();
-    s.xrpc
-        .post("com.atproto.admin.updateSubjectStatus", &body, &Auth::Basic("admin".into(), "wrong".into()))
-        .await
-        .err_status(401);
-    assert_eq!(repo_status(&s, &a.did).await["active"], json!(true));
+    let wrong = Auth::Basic("admin".into(), "wrong".into());
+    s.xrpc.post("com.atproto.admin.updateSubjectStatus", &body, &wrong).await.err_status(401);
+    assert_eq!(s.repo_status(&a.did).await.ok()["active"], json!(true));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -136,7 +126,7 @@ async fn takedown_effects_on_reads_and_writes() {
     s.get_record(did, p.collection(), p.rkey()).await.client_err();
     s.list_records(did, "app.bsky.feed.post", &[]).await.client_err();
 
-    let st = repo_status(&s, did).await;
+    let st = s.repo_status(did).await.ok();
     assert_eq!((st["active"].clone(), st["status"].clone()), (json!(false), json!("takendown")));
     let j = s.xrpc.get("com.atproto.sync.listRepos", &[], &Auth::None).await.ok();
     let repos = j["repos"].as_array().unwrap();
@@ -147,11 +137,8 @@ async fn takedown_effects_on_reads_and_writes() {
     assert_eq!(them["active"], json!(true));
 
     // existing access token can no longer write
-    let r = s
-        .xrpc
-        .post("com.atproto.repo.createRecord", &json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("x")}), &a.auth())
-        .await;
-    r.client_err();
+    let body = json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("x")});
+    s.xrpc.post("com.atproto.repo.createRecord", &body, &a.auth()).await.client_err();
 
     // reversal restores everything
     update_status(&s, did, json!({"takedown": {"applied": false}})).await.ok();
@@ -166,10 +153,10 @@ async fn takedown_effects_on_reads_and_writes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unknown_repo_status() {
     let s = TestServer::spawn().await;
-    let r = s.xrpc.get("com.atproto.sync.getRepoStatus", &[("did", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")], &Auth::None).await;
+    let r = s.repo_status("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await;
     r.err(400, "RepoNotFound");
     let a = s.create_account("st").await;
-    let j = repo_status(&s, &a.did).await;
+    let j = s.repo_status(&a.did).await.ok();
     assert_eq!(j["did"], json!(a.did));
     assert_eq!(j["active"], json!(true));
     let (_, rev) = s.latest_commit(&a.did).await;

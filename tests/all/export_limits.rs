@@ -80,11 +80,7 @@ async fn stalled_export_readers_dont_block_commits() {
         bodies.push(r.into_body()); // held, never read
     }
     // all four stall out: two at a time, each queued one after a slot frees
-    let t = Instant::now();
-    while ended("stalled") < stalled_before + 4 {
-        assert!(t.elapsed() < Duration::from_secs(15), "stalled exports didn't end ({} of 4)", ended("stalled") - stalled_before);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_until("all four stalled exports end", Duration::from_secs(15), || ended("stalled") >= stalled_before + 4).await;
     // a reading client gets the whole repo
     let repo = s.get_repo(&a.did).await;
     repo.check_block_hashes().unwrap();
@@ -123,22 +119,14 @@ async fn subscribe_repos_per_ip_cap_and_bad_cursor() {
     let first = Sub::connect(&s.ws_url(None)).await;
     let _second = Sub::connect(&s.ws_url(None)).await;
     let local: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-    let t = Instant::now();
-    while s.app.firehose.connections_from(local) < 2 {
-        assert!(t.elapsed() < Duration::from_secs(5));
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_until("two subscribers counted", Duration::from_secs(5), || s.app.firehose.connections_from(local) >= 2).await;
     match tokio_tungstenite::connect_async(s.ws_url(None)).await {
         Err(tokio_tungstenite::tungstenite::Error::Http(r)) => assert_eq!(r.status(), 429),
         Err(e) => panic!("{e}"),
         Ok(_) => panic!("third connection from one address accepted"),
     }
     drop(first);
-    let t = Instant::now();
-    while s.app.firehose.connections_from(local) > 1 {
-        assert!(t.elapsed() < Duration::from_secs(5), "closed subscriber still counted");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_until("the closed subscriber uncounted", Duration::from_secs(5), || s.app.firehose.connections_from(local) <= 1).await;
     let _third = Sub::connect(&s.ws_url(None)).await;
 
     let r = s.xrpc.get("com.atproto.sync.subscribeRepos", &[("cursor", "abc")], &Auth::None).await;

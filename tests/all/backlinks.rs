@@ -8,10 +8,8 @@
 
 use crate::common::*;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use serde_json::{json, Value as J};
 use std::sync::Arc;
 use std::time::Duration;
-use vlpds::cid::Cid;
 
 const LIKE: &str = "app.bsky.feed.like";
 const REPOST: &str = "app.bsky.feed.repost";
@@ -74,13 +72,7 @@ async fn create(s: &TestServer, a: &TestAccount, coll: &str, record: J, validate
 /// The rkeys of `coll` records whose subject is `subject`.
 async fn subject_records(s: &TestServer, did: &str, coll: &str, subject: &J) -> Vec<String> {
     let l = s.list_records(did, coll, &[("limit", "100")]).await.ok();
-    l["records"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|r| &r["value"]["subject"] == subject)
-        .map(|r| r["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_string())
-        .collect()
+    l["records"].as_array().unwrap().iter().filter(|r| &r["value"]["subject"] == subject).map(|r| r["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_string()).collect()
 }
 
 async fn rkeys(s: &TestServer, did: &str, coll: &str) -> Vec<String> {
@@ -154,11 +146,7 @@ async fn apply_writes_duplicates_and_updates() {
     let s = TestServer::spawn().await;
     let a = s.create_account("blw").await;
     let w = |coll: &str, rkey: usize, n: usize| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": coll, "rkey": rk(rkey), "value": rec(coll, n)});
-    let r = s
-        .xrpc
-        .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": [w(LIKE, 1, 7), w(LIKE, 2, 7), w(FOLLOW, 1, 7), w(FOLLOW, 2, 7), w(LIKE, 3, 8)]}), &a.auth())
-        .await;
-    r.ok();
+    s.apply_writes(&a, json!([w(LIKE, 1, 7), w(LIKE, 2, 7), w(FOLLOW, 1, 7), w(FOLLOW, 2, 7), w(LIKE, 3, 8)])).await.ok();
     assert_eq!(rkeys(&s, &a.did, LIKE).await, vec![rk(1), rk(2), rk(3)]);
     assert_eq!(rkeys(&s, &a.did, FOLLOW).await, vec![rk(1), rk(2)]);
     assert_eq!(check_backlinks(&s, &a.did).await, 3);
@@ -167,10 +155,9 @@ async fn apply_writes_duplicates_and_updates() {
     assert_eq!(raw.iter().find(|(key, _)| *key == k).map(|(_, v)| v.clone()), Some(format!("{}\0{}", rk(1), rk(2)).into_bytes()));
 
     // putRecord moves rk(3) from subject 8 to 7; deleting rk(1) leaves rk(2), rk(3)
-    let put = json!({"repo": a.did, "collection": LIKE, "rkey": rk(3), "record": rec(LIKE, 7)});
-    s.xrpc.post("com.atproto.repo.putRecord", &put, &a.auth()).await.ok();
+    s.put_record(&a, LIKE, &rk(3), rec(LIKE, 7)).await.ok();
     assert_eq!(check_backlinks(&s, &a.did).await, 2);
-    s.xrpc.post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": LIKE, "rkey": rk(1)}), &a.auth()).await.ok();
+    s.delete_record(&a, LIKE, &rk(1)).await.ok();
     assert_eq!(check_backlinks(&s, &a.did).await, 2);
 
     let mut sub = s.subscribe_from_now().await;
@@ -279,10 +266,7 @@ async fn import_with_duplicates_then_delete() {
     create(&s, &a, LIKE, rec(LIKE, 50), None).await;
     create(&s, &a, BLOCK, rec(BLOCK, 51), None).await;
     let w = |coll: &str, rkey: usize, n: usize| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": coll, "rkey": rk(rkey), "value": rec(coll, n)});
-    s.xrpc
-        .post("com.atproto.repo.applyWrites", &json!({"repo": b.did, "writes": [w(LIKE, 1, 9), w(LIKE, 2, 9), w(LIKE, 3, 9), w(REPOST, 1, 9), w(FOLLOW, 1, 3)]}), &b.auth())
-        .await
-        .ok();
+    s.apply_writes(&b, json!([w(LIKE, 1, 9), w(LIKE, 2, 9), w(LIKE, 3, 9), w(REPOST, 1, 9), w(FOLLOW, 1, 3)])).await.ok();
     let car = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &b.did)], &Auth::None).await.body.to_vec();
     s.xrpc.post_bytes("com.atproto.repo.importRepo", car.clone(), "application/vnd.ipld.car", &a.auth()).await.ok();
     assert_eq!(rkeys(&s, &a.did, LIKE).await, vec![rk(1), rk(2), rk(3)]);
@@ -308,14 +292,6 @@ async fn import_with_duplicates_then_delete() {
     assert_eq!(check_backlinks(&s, &b.did).await, 3);
 }
 
-async fn wait_until(what: &str, deadline: Duration, f: impl Fn() -> bool) {
-    let t = std::time::Instant::now();
-    while !f() {
-        assert!(t.elapsed() < deadline, "{what}: not within {deadline:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// Replay rebuilds `bl/` exactly: the owner is killed (nothing
 /// checkpointed) and the survivor replays its log, deriving each record's
 /// put from the #commit frame and the rest from the stored muts. Then a
@@ -325,25 +301,15 @@ async fn replay_after_kill_reproduces_the_index() {
     const SHARDS: u32 = 4;
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let node = |id: &'static str| {
-        let store = store.clone();
-        TestServer::spawn_with(move |c| {
-            c.memory_store = Some(store);
-            c.shards = SHARDS;
+        cluster_node(id, store.clone(), SHARDS, |c| {
             c.checkpoint_every = Duration::from_secs(3600);
-            c.cluster = Some(vlpds::cluster::ClusterConfig {
-                node_id: id.into(),
-                addr: peer_url(c),
-                shards: SHARDS,
-                ttl: Duration::from_secs(2),
-                renew_every: Duration::from_millis(200),
-                skew: Duration::from_millis(400),
-                ..Default::default()
-            });
+            let l = lease(c);
+            (l.ttl, l.renew_every, l.skew) = (Duration::from_secs(2), Duration::from_millis(200), Duration::from_millis(400));
         })
     };
     let a = node("bra").await;
     let b = node("brb").await;
-    wait_until("both own shards", Duration::from_secs(15), || !a.app.partitions.owned().is_empty() && !b.app.partitions.owned().is_empty() && a.app.partitions.owned().len() + b.app.partitions.owned().len() == SHARDS as usize).await;
+    balanced(&[&a, &b]).await;
     let mut accts = Vec::new();
     for i in 0..6 {
         accts.push(a.create_account(&format!("brk{i}")).await);
@@ -395,14 +361,11 @@ async fn reshard_carries_the_index() {
         check_backlinks(&s, &x.did).await;
         before.push(scan_backlinks(&s, &x.did).await);
     }
-    let admin = |nsid: &'static str, body: J| {
-        let x = s.xrpc.clone();
-        async move { x.post(nsid, &body, &Auth::Admin).await.ok() }
-    };
+    let admin = |nsid: &str, body: J| s.xrpc.post_owned(nsid, body, Auth::Admin);
     let cl = s.app.cluster.as_deref().unwrap();
     let slot = vlpds::slots::slot_of(&accts[0].did) as u32;
     let target = cl.layout().shards.iter().find(|r| r.lo <= slot && slot < r.hi).cloned().unwrap();
-    let r = admin("vlpds.admin.splitShard", json!({"shard": target.id, "at": (target.lo + target.hi) / 2, "wait": true})).await;
+    let r = admin("vlpds.admin.splitShard", json!({"shard": target.id, "at": (target.lo + target.hi) / 2, "wait": true})).await.ok();
     assert_eq!(r["done"], json!(true), "{r}");
     for (x, want) in accts.iter().zip(&before) {
         assert_eq!(&scan_backlinks(&s, &x.did).await, want, "{}: after the split", x.did);
@@ -413,7 +376,7 @@ async fn reshard_carries_the_index() {
         create(&s, x, FOLLOW, rec(FOLLOW, 1), None).await;
         assert!(!rkeys(&s, &x.did, FOLLOW).await.is_empty());
     }
-    let r = admin("vlpds.admin.mergeShards", json!({"left": kids[0], "right": kids[1], "wait": true})).await;
+    let r = admin("vlpds.admin.mergeShards", json!({"left": kids[0], "right": kids[1], "wait": true})).await.ok();
     assert_eq!(r["done"], json!(true), "{r}");
     for x in &accts {
         check_backlinks(&s, &x.did).await;
@@ -432,8 +395,7 @@ async fn duplicate_pruning_is_capped_per_commit() {
     let a = s.create_account("blcap").await;
     let w = |rkey: usize| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": LIKE, "rkey": rk(rkey), "value": rec(LIKE, 9)});
     for range in [0..200, 200..250] {
-        let writes: Vec<J> = range.map(w).collect();
-        s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok();
+        s.apply_writes(&a, range.map(w).collect()).await.ok();
     }
     let all = || async {
         let (mut out, mut cursor) = (Vec::new(), None::<String>);
