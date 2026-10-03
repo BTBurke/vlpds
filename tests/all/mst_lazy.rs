@@ -21,6 +21,7 @@
 //! Server benchmarks: `bench_cold_write`, `bench_readers`, `bench_rss`, `bench_cold_open_blobs`
 //! (ignored; DESIGN.md "Partial MSTs").
 
+use crate::common::*;
 use rand::{rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -663,8 +664,6 @@ fn bench() {
 // end to end: a node against an independent reference
 // ---------------------------------------------------------------------------
 
-use crate::common::*;
-
 /// A node holding almost nothing: one repo per worker at most and no loaded
 /// paths once a repo is idle, so writes and reads keep opening repos and
 /// walking from the root through the store.
@@ -1100,14 +1099,6 @@ async fn lazy_node_matches_reference() {
     }
 }
 
-async fn wait_until(what: &str, deadline: Duration, f: impl Fn() -> bool) {
-    let t = Instant::now();
-    while !f() {
-        assert!(t.elapsed() < deadline, "{what}: not within {deadline:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// Replay rebuilds `M/` exactly: the owner of a lazy repo is killed
 /// (`Node::halt`, kill -9: nothing flushed or checkpointed since its last
 /// periodic checkpoint) and the survivor replays its log, deriving each
@@ -1119,27 +1110,17 @@ async fn replay_after_kill_reconstructs_nodes() {
     const SHARDS: u32 = 4;
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let node = |id: &'static str| {
-        let store = store.clone();
-        TestServer::spawn_with(move |c| {
+        cluster_node(id, store.clone(), SHARDS, |c| {
             c.lazy_mst_unload_idle = true;
-            c.memory_store = Some(store);
-            c.shards = SHARDS;
             // nothing checkpointed during the test: the survivor replays it all
             c.checkpoint_every = Duration::from_secs(3600);
-            c.cluster = Some(vlpds::cluster::ClusterConfig {
-                node_id: id.into(),
-                addr: peer_url(c),
-                shards: SHARDS,
-                ttl: Duration::from_secs(2),
-                renew_every: Duration::from_millis(200),
-                skew: Duration::from_millis(400),
-                ..Default::default()
-            });
+            let l = lease(c);
+            (l.ttl, l.renew_every, l.skew) = (Duration::from_secs(2), Duration::from_millis(200), Duration::from_millis(400));
         })
     };
     let a = node("ra").await;
     let b = node("rb").await;
-    wait_until("both own shards", Duration::from_secs(15), || !a.app.partitions.owned().is_empty() && !b.app.partitions.owned().is_empty() && a.app.partitions.owned().len() + b.app.partitions.owned().len() == SHARDS as usize).await;
+    balanced(&[&a, &b]).await;
     let mut accts = Vec::new();
     for i in 0..6 {
         accts.push(a.create_account(&format!("rk{i}")).await);
@@ -1154,7 +1135,7 @@ async fn replay_after_kill_reconstructs_nodes() {
     assert!(!moved.is_empty(), "the victim owns some of the repos");
     let heads: Vec<(Cid, String)> = futures::future::join_all(moved.iter().map(|x| survivor.latest_commit(&x.did))).await;
     victim.app.node.halt();
-    wait_until("survivor takes every shard", Duration::from_secs(20), || survivor.app.partitions.owned().len() == SHARDS as usize).await;
+    wait_until("survivor takes every shard", Duration::from_secs(20), || owned(survivor) == SHARDS as usize).await;
     for (x, head) in moved.iter().zip(&heads) {
         // every acked commit survived the kill
         assert_eq!(&survivor.latest_commit(&x.did).await, head, "{}", x.did);
@@ -1248,8 +1229,7 @@ async fn import_and_delete_leave_no_stale_nodes() {
     // a's repo replaced by b's records (a different, smaller tree), twice:
     // the second import finds the first's tree
     for _ in 0..2 {
-        let car = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &b.did)], &Auth::None).await.body.to_vec();
-        s.xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &a.auth()).await.ok();
+        s.import_repo(&a.auth(), s.get_repo_car(&b.did).await).await.ok();
         check_stored_nodes(&s, &a.did).await;
         s.create_record(a, "com.example.thing", json!({"$type": "com.example.thing", "n": 1})).await;
         check_stored_nodes(&s, &a.did).await;
@@ -1272,7 +1252,7 @@ async fn export_buffer_caps_give_same_bytes() {
         let writes: Vec<J> = (0..200)
             .map(|i| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "com.example.thing", "value": {"$type": "com.example.thing", "n": batch * 1000 + i, "pad": "x".repeat(400)}}))
             .collect();
-        let r = s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok();
+        let r = s.apply_writes(&a, json!(writes)).await.ok();
         if batch == 5 {
             since = r["commit"]["rev"].as_str().unwrap().to_string();
         }
@@ -1301,10 +1281,6 @@ async fn export_buffer_caps_give_same_bytes() {
     }
 }
 
-fn env_or<T: std::str::FromStr>(k: &str, d: T) -> T {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
-}
-
 /// A single node (id `id`, 4 shards) on `store`, with nothing preloaded
 /// (every first write is a cold open).
 async fn bench_node(id: &str, store: Arc<dyn object_store::ObjectStore>, prefetch: usize, workers: usize) -> TestServer {
@@ -1318,7 +1294,7 @@ async fn bench_node(id: &str, store: Arc<dyn object_store::ObjectStore>, prefetc
         c.cluster = Some(vlpds::cluster::ClusterConfig { node_id: id, addr: peer_url(c), shards: 4, ..Default::default() });
     })
     .await;
-    wait_until("all shards owned", Duration::from_secs(60), || s.app.partitions.owned().len() == 4).await;
+    wait_until("all shards owned", Duration::from_secs(60), || owned(&s) == 4).await;
     s
 }
 
