@@ -20,7 +20,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/internal/v1/cluster", get(cluster_status))
         .route("/internal/v1/cluster/nudge", post(cluster_nudge))
         .route("/internal/v1/cluster/hello", post(cluster_hello))
-        .route("/internal/v1/cluster/prewarm", post(cluster_prewarm))
+        .route("/internal/v1/cluster/prewarm", post(cluster_prewarm).layer(axum::extract::DefaultBodyLimit::max(PREWARM_BODY_MAX)))
         .route("/internal/v1/admin/searchAccounts", get(admin_search_accounts))
         .route("/internal/v1/admin/inviteCodes", get(admin_invite_codes))
         .route("/internal/v1/sync/listRepos", get(sync_list_repos))
@@ -76,12 +76,46 @@ async fn cluster_nudge(State(app): AppState, headers: HeaderMap, axum::Json(inp)
     Ok(Json(json!({})))
 }
 
+/// What one prewarm request carries of the shards' recent repos, in JSON
+/// bytes: about 30k plc DIDs, more than a recipient warms before its
+/// deadline (`node::HANDOFF_WARM_MAX`).
+pub const PREWARM_RECENT_BYTES: usize = 1 << 20;
+/// [`PREWARM_RECENT_BYTES`] plus a few dozen bytes of framing per shard.
+const PREWARM_BODY_MAX: usize = 4 << 20;
+
 #[derive(serde::Serialize, Deserialize)]
 pub struct PrewarmShard {
     pub shard: crate::slots::ShardId,
     /// Its recently written repos, newest first.
     #[serde(default)]
     pub recent: Vec<String>,
+}
+
+/// `shards` with their recent repos (each newest first) cut to
+/// [`PREWARM_RECENT_BYTES`] in all, taken rank by rank across the shards:
+/// the order `Node::warm_handoff` warms them in, so the cut is what the
+/// recipient would reach last.
+pub fn prewarm_request(shards: Vec<(crate::slots::ShardId, Vec<String>)>) -> Vec<PrewarmShard> {
+    let mut out: Vec<PrewarmShard> = shards.iter().map(|(s, _)| PrewarmShard { shard: *s, recent: Vec::new() }).collect();
+    let mut lists: Vec<std::vec::IntoIter<String>> = shards.into_iter().map(|(_, r)| r.into_iter()).collect();
+    let mut left = PREWARM_RECENT_BYTES;
+    loop {
+        let mut more = false;
+        for (o, l) in out.iter_mut().zip(lists.iter_mut()) {
+            let Some(d) = l.next() else { continue };
+            // quotes and a comma; a DID needs no escaping
+            let cost = d.len() + 3;
+            if cost > left {
+                return out;
+            }
+            left -= cost;
+            o.recent.push(d);
+            more = true;
+        }
+        if !more {
+            return out;
+        }
+    }
 }
 
 #[derive(serde::Serialize, Deserialize)]
@@ -98,11 +132,18 @@ async fn cluster_prewarm(State(app): AppState, headers: HeaderMap, axum::Json(in
     Ok(Json(json!({})))
 }
 
-/// Asks each recipient to warm the shards it is about to get, and waits
-/// (each at most `timeout`). Best effort: a recipient that doesn't answer
-/// just starts cold.
-pub async fn prewarm_peers(http: &crate::http::PeerClient, token: &str, plan: Vec<(String, Vec<PrewarmShard>)>, timeout: std::time::Duration) {
+/// Asks each recipient to warm the shards it is about to get (built by
+/// [`prewarm_request`]), and waits (each at most `timeout`). A recipient
+/// that doesn't answer starts cold and the handoff goes on; that is logged
+/// and counted. Each recipient's outcome.
+pub async fn prewarm_peers(
+    http: &crate::http::PeerClient,
+    token: &str,
+    plan: Vec<(String, Vec<PrewarmShard>)>,
+    timeout: std::time::Duration,
+) -> Vec<(String, Result<(), String>)> {
     let sends = plan.into_iter().map(|(addr, shards)| async move {
+        let n = shards.len() as u64;
         let r = http
             .post(format!("{}/internal/v1/cluster/prewarm", addr.trim_end_matches('/')))
             .header(HDR, token)
@@ -111,11 +152,20 @@ pub async fn prewarm_peers(http: &crate::http::PeerClient, token: &str, plan: Ve
             .send()
             .await
             .and_then(|r| r.error_for_status());
-        if let Err(e) = r {
-            tracing::warn!(%addr, "handoff prewarm failed: {e}");
-        }
+        let r = match r {
+            Ok(_) => {
+                crate::metrics::SHARD_PREWARMS.with_label_values(&["ok"]).inc_by(n);
+                Ok(())
+            }
+            Err(e) => {
+                crate::metrics::SHARD_PREWARMS.with_label_values(&["failed"]).inc_by(n);
+                tracing::warn!(%addr, shards = n, "handoff prewarm failed, the recipient starts them cold: {e}");
+                Err(e.to_string())
+            }
+        };
+        (addr, r)
     });
-    futures::future::join_all(sends).await;
+    futures::future::join_all(sends).await
 }
 
 #[derive(serde::Serialize, Deserialize)]

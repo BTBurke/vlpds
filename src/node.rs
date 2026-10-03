@@ -431,15 +431,12 @@ impl ShardHost for Node {
             .map(|(addr, shards)| {
                 let shards = shards
                     .into_iter()
-                    .map(|s| crate::xrpc::internal::PrewarmShard {
-                        shard: s,
-                        recent: self.table.get(s).map(|p| p.recent.snapshot().iter().map(|d| d.to_string()).collect()).unwrap_or_default(),
-                    })
+                    .map(|s| (s, self.table.get(s).map(|p| p.recent.snapshot().iter().map(|d| d.to_string()).collect()).unwrap_or_default()))
                     .collect();
-                (addr, shards)
+                (addr, crate::xrpc::internal::prewarm_request(shards))
             })
             .collect();
-        crate::xrpc::internal::prewarm_peers(&self.http, &self.internal_token, plan, HANDOFF_WAIT).await
+        crate::xrpc::internal::prewarm_peers(&self.http, &self.internal_token, plan, HANDOFF_WAIT).await;
     }
 
     async fn greet(&self, peers: Vec<crate::cluster::NodeLease>) -> Vec<Option<i64>> {

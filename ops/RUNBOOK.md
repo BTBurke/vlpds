@@ -562,6 +562,22 @@ inside a span as an error: someone deleted log objects by hand?
 **Do:** fix the store problem. Do not edit `assign/` or `log/` to "unstick" a
 shard.
 
+### VlpdsShardPrewarmFailed
+
+**Means:** this node handed shards to a peer (graceful stop, handback,
+rebalance) and its `/internal/v1/cluster/prewarm` request to that peer failed
+(`vlpds_shard_prewarm_total{result="failed"}`), so the peer opened them cold.
+The handoff itself went on; expect the cold-start error burst a prewarm avoids.
+
+**Confirm:** `handoff prewarm failed, the recipient starts them cold` warnings
+(peer address, shard count, HTTP error) on this node; the recipient's
+`handoff prewarmed` info line is missing. A timeout means the recipient took
+over 10 s (store latency); a 4xx is a bug (the request is capped at 1 MiB of
+recent repos, the route takes 4 MiB).
+
+**Do:** timeouts: see [VlpdsObjectStoreLatencyHigh](#vlpdsobjectstorelatencyhigh)
+on the recipient. Anything else: file it with the log lines.
+
 ### VlpdsTakeoverReplaySlow
 
 **Means:** a batch of shard opens that replayed a dead owner's log tail took over
@@ -816,7 +832,8 @@ runtime) and the peer network.
 repo load), `ShardMoved` (`moved`) or unreachable owners. Bursts for seconds after a
 restart/handoff are by design; 10 minutes is not.
 
-**Confirm:** `vlpds_writes_abandoned_total` on the owners, `vlpds_repos_loading`,
+**Confirm:** `vlpds_read_retries_total` (queries are resent the same way),
+`vlpds_writes_abandoned_total` on the owners, `vlpds_repos_loading`,
 `vlpds_repo_load_seconds` p99, `vlpds_lease_events_total` (moves).
 
 **Do:** `loading`: cold loads too slow (store latency, repo cache too small: see

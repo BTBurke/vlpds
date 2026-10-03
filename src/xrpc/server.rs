@@ -435,7 +435,8 @@ async fn load_sets(app: &App, did: &str, local: Option<(crate::slots::ShardId, u
 /// [`STALE_MAX_SECS`] old. A shard in flight (moving, reopening) takes no
 /// writes, so a view from before the move is used at once, and without one
 /// the load waits for the move (one probe per shard), then answers
-/// ShardMoved: nothing was done, so the entry node resends a write.
+/// ShardMoved: nothing was done, so the entry node resends the request (a
+/// write or a query) to whoever owns the shard by then.
 pub(super) async fn ctl(app: &App, did: &str) -> XResult<Arc<Ctl>> {
     let e = ext(app);
     let now = now_secs();
@@ -464,7 +465,7 @@ async fn load_ctl(app: &App, e: &Ext, did: &str, gen0: u64, cached: Option<Arc<C
     let start = std::time::Instant::now();
     // waiting out the move here is what lets a read through; a forwarded
     // request still answers before its entry node's deadline (which then
-    // resends a write)
+    // resends it)
     let move_budget = if crate::forward::is_forwarded() { CTL_MOVE_WAIT_FORWARDED } else { CTL_RETRY_FOR };
     let mut wait = std::time::Duration::from_millis(50);
     let failed = loop {

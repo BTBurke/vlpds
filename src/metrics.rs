@@ -122,6 +122,7 @@ lazy!(CACHE_CAPACITY: IntGaugeVec = register_int_gauge_vec!("vlpds_cache_capacit
 lazy!(FORWARDED: IntCounter = register_int_counter!("vlpds_requests_forwarded_total", "Requests proxied to the partition owner"));
 lazy!(CTL_LOADS: IntCounterVec = register_int_counter_vec!("vlpds_security_ctl_loads_total", "Reads of an account's revocations/takedowns past its cached view, by result (loaded; coalesced: shared another request's read; stale_moving / stale_unreachable: a view <= 300 s old stood in while the shard moved / the owner failed; moved / unavailable: 503)", &["result"]));
 lazy!(WRITE_RETRIES: IntCounterVec = register_int_counter_vec!("vlpds_write_retries_total", "Repo writes the entry node resent after a not-applied 503, by reason (loading: RepoLoading; moved: ShardMoved)", &["reason"]));
+lazy!(READ_RETRIES: IntCounterVec = register_int_counter_vec!("vlpds_read_retries_total", "XRPC queries the entry node resent after a 503 that did nothing, by reason (unreachable: owner refused the connection; loading: RepoLoading; moved: ShardMoved, also from a security-controls check waiting out a move)", &["reason"]));
 lazy!(OWNED_PARTITIONS: IntGauge = register_int_gauge!("vlpds_owned_partitions", "Partitions this node owns"));
 lazy!(LEASE_EVENTS: IntCounterVec = register_int_counter_vec!("vlpds_lease_events_total", "Partition lease transitions", &["event"]));
 lazy!(OBJ_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_object_store_requests_total", "Object-store requests sent to the store, by billable op (put, put_create, put_cas, get, get_range, head, list pages, delete, delete_batch, copy, mpu_*), key component, client pool and result (ok, not_found, precondition, timeout, error, cancelled: the caller dropped it unanswered) (objstats.rs)", &["op", "component", "client", "result"]));
@@ -208,6 +209,7 @@ lazy!(SHARDS_OPENED: IntCounterVec = register_int_counter_vec!("vlpds_shards_ope
 lazy!(SHARD_OPEN_SECONDS: HistogramVec = register_histogram_vec!("vlpds_shard_open_seconds", "One batch of shard opens until served (SlateDB open + log replay + flush), by kind: replay (it replayed segments: a takeover after a crash) or clean (nothing to replay: a handback)", &["kind"], exponential_buckets(0.01, 2.0, 14).unwrap()));
 lazy!(SHARD_WARM_SECONDS: Histogram = register_histogram!("vlpds_shard_warm_seconds", "One batch of shard opens: fetching every SST's filters and index (and the newest L0s whole) into the caches before serving (partition::warm)", exponential_buckets(0.01, 2.0, 14).unwrap()));
 lazy!(SHARD_WARM_SSTS: IntCounterVec = register_int_counter_vec!("vlpds_shard_warm_ssts_total", "SSTs warmed before a newly opened shard served, by result", &["result"]));
+lazy!(SHARD_PREWARMS: IntCounterVec = register_int_counter_vec!("vlpds_shard_prewarm_total", "Shards handed to a peer, by whether the peer warmed its caches for them first (ok) or the prewarm request failed and the peer starts them cold (failed)", &["result"]));
 lazy!(REPLAY_SECONDS: Histogram = register_histogram!("vlpds_recovery_replay_seconds", "Replay step of a shard-open batch that replayed at least one segment (previous owners' log tails)", exponential_buckets(0.01, 2.0, 14).unwrap()));
 lazy!(LAYOUT_SHARDS: IntGauge = register_int_gauge!("vlpds_shard_layout_shards", "Shards in the layout this node routes by (changes with each split/merge)"));
 
@@ -415,9 +417,11 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&CLUSTER_STORE_TIMEOUTS, &["get", "put", "list", "delete", "fence", "fence-scan"]),
     (&SHARDS_OPENED, &["ok", "error"]),
     (&SHARD_WARM_SSTS, &["ok", "error"]),
+    (&SHARD_PREWARMS, &["ok", "failed"]),
     (&PUT_ATTEMPTS, &["ok", "already_exists", "error"]),
     (&WRITE_ERRORS, &["repo_not_found", "repo_inactive", "invalid_swap", "invalid", "internal", "unavailable", "key_unavailable", "signature_fault", "not_started"]),
     (&WRITE_RETRIES, &["unreachable", "loading", "moved"]),
+    (&READ_RETRIES, &["unreachable", "loading", "moved"]),
     (&FORWARDS, &["2xx", "3xx", "4xx", "5xx"]),
     (&PROXY_REJECTED, &["account_cap"]),
     (&REPO_CACHE, &["hit", "miss", "loading"]),

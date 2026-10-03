@@ -152,7 +152,12 @@ considered and measurements: "Partial MSTs".
     `close_and_release` picks each shard's recipient first, POSTs
     `/internal/v1/cluster/prewarm` with the shards and their recent-repo
     lists, and waits for the answers (at most 10 s) while it keeps
-    serving. The recipient opens each shard as a `DbReader`
+    serving. The lists are cut to 1 MiB per request (~30k plc DIDs, more
+    than the recipient warms in its 8 s), whole ranks newest first across
+    the shards, and the route takes up to 4 MiB: full lists for 32 shards
+    were over axum's 2 MB default, answered 413, and the recipient started
+    cold (benchbox round 3). A failed prewarm is a warning and
+    `vlpds_shard_prewarm_total{result="failed"}`; the handoff goes on. The recipient opens each shard as a `DbReader`
     (`FollowLatest`: no checkpoint, so the writer never notices it) on the
     block cache its `Db` will use (same cache id), runs `warm`, then reads
     each recent repo's head, account and `M/` read-ahead (128 at a time,
@@ -1140,8 +1145,13 @@ forwarded write for that long), or telling "busy loading" apart from
   `ShardMoved` (after 50 ms) to whoever owns the repo by then, itself
   included, for up to 20 s (`--retry-unapplied-writes`); then the last
   503 + Retry-After goes to the client. Own-account writes route by the
-  token's DID without parsing the body, so they get this too. Metrics:
-  `vlpds_write_retries_total{reason}`, `vlpds_writes_abandoned_total`.
+  token's DID without parsing the body, so they get this too. XRPC
+  queries (GET without a body, not a websocket upgrade) are resent on the
+  same answers: they have no side effects, so a resend is safe whatever
+  the first attempt did, and each attempt is served from scratch (auth and
+  security controls checked where it lands). Metrics:
+  `vlpds_write_retries_total{reason}`, `vlpds_read_retries_total{reason}`,
+  `vlpds_writes_abandoned_total`.
 - Directly received writes (the client called the owner) just wait for
   their load. Every 503 vlpds answers carries `Retry-After: 1`.
 
@@ -3738,10 +3748,25 @@ on a node-local lock or on comparing node clocks:
   land while it moves, and a view from before the move (within the same
   300 s bound) is used at once instead of after a 3 s retry. Without one,
   the load waits for the shard (2.5 s if forwarded, under the entry's 3 s
-  deadline; 3 s otherwise) and then answers 503 ShardMoved, which an entry
-  node resends a write on (the check runs before anything is applied); it
-  used to answer `Unavailable`, which isn't resent, after holding the
-  request 3 s. Loads coalesce: one per DID at a time (joined only by
+  deadline; 3 s otherwise) and then answers 503 ShardMoved, which the entry
+  node resends a write or a query on (the check runs before anything is
+  applied); it used to answer `Unavailable`, which isn't resent, after
+  holding the request 3 s. A kill -9 move takes 6–10 s (the lease TTL),
+  longer than either wait, so before queries were resent every uncached
+  account on the dead node's shards failed its reads for the whole gap
+  (benchbox round 3: 15–19k `moved` per kill -9, 3.7–16k per SIGTERM).
+  The resend is what covers it, not a longer wait: the entry node routes
+  each attempt afresh, so it reaches the new owner as soon as routing
+  follows the move, where a wait on the old owner can't; and it changes
+  nothing about what gets through: every attempt runs the whole check
+  again (a fresh read, or a view from before the move), only later.
+  Rejected: shipping the old owner's cached views (or its `sec/` rows) with
+  the prewarm. The old owner keeps serving, and taking revocations, during
+  the ~10 s prewarm, so a shipped view would be stale by then and the new
+  owner reads its own partition at the new epoch anyway; it does nothing
+  for kill -9, where nobody is left to ship them; and the warm
+  partition the prewarm already gives the new owner makes that read cheap.
+  Loads coalesce: one per DID at a time (joined only by
   requests that arrived before any change on this node, so none misses a
   revocation it could have seen), and once a shard is seen in flight one
   probe per shard at a time (20 ms pause, doubling to 200 ms) while the
@@ -3756,7 +3781,7 @@ on a node-local lock or on comparing node clocks:
   shard's private rows on start (`sec/` rows sit among all of an account's
   private rows, so that needs a new index). Its gain over the above is only
   the uncached account whose shard is in flight past the wait (a kill -9
-  takeover), which the entry's write resend already covers for writes.
+  takeover), which the entry node's resend covers for writes and queries.
 - Not covered here: per-IP/per-client rate limits on `/oauth/par` and
   `/oauth/token` (src/ratelimit.rs).
 

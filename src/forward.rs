@@ -50,7 +50,9 @@ const FORWARD_MAX: Duration = Duration::from_secs(3600);
 /// Well under TTFB_FAST, so a loading repo is never mistaken for a frozen
 /// owner.
 pub const FORWARDED_WRITE_START: Duration = Duration::from_millis(1000);
-pub const WRITE_RETRY_BUDGET: Duration = Duration::from_secs(20);
+/// How long the entry node resends a not-applied write or a query; covers
+/// a kill -9 takeover (lease TTL + skew + reopening the shards).
+pub const RETRY_BUDGET: Duration = Duration::from_secs(20);
 pub const REPO_LOADING: &str = "RepoLoading";
 pub const SHARD_MOVED: &str = "ShardMoved";
 
@@ -77,6 +79,16 @@ fn retryable_write(req: &Request) -> bool {
                 | "/xrpc/com.atproto.repo.deleteRecord"
                 | "/xrpc/com.atproto.repo.applyWrites"
         )
+}
+
+/// An XRPC query: no side effects, so resending one is safe whatever the
+/// first attempt did. Not a websocket upgrade (subscribeRepos), and no body
+/// to buffer.
+fn retryable_read(req: &Request) -> bool {
+    req.method() == Method::GET
+        && req.uri().path().starts_with("/xrpc/")
+        && !req.headers().contains_key(axum::http::header::UPGRADE)
+        && axum::body::HttpBody::size_hint(req.body()).exact() == Some(0)
 }
 
 #[async_trait::async_trait]
@@ -525,9 +537,9 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
         // Served here without the routing work. A write can still find its
         // shard gone before it starts (frozen for a split, or taken by a
         // node that joined after this check): resent like any other, its
-        // routing key worked out only then.
-        if xrpc && retry && retryable_write(&req) {
-            return write_with_retries(router, client, None, req, token, next).await;
+        // routing key worked out only then. A query likewise.
+        if xrpc && retry && (retryable_write(&req) || retryable_read(&req)) {
+            return with_retries(router, client, None, req, token, next).await;
         }
         return next.run(req).await;
     }
@@ -540,8 +552,8 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
         Ok(t) => t,
         Err(r) => return r,
     };
-    if let Some(k) = key.as_deref().filter(|_| retry && retryable_write(&req)) {
-        return write_with_retries(router, client, Some(k), req, token, next).await;
+    if let Some(k) = key.as_deref().filter(|_| retry && (retryable_write(&req) || retryable_read(&req))) {
+        return with_retries(router, client, Some(k), req, token, next).await;
     }
     let Some(owner) = key.as_deref().and_then(|k| router.remote_owner(k)) else {
         return next.run(req).await;
@@ -558,11 +570,13 @@ async fn forward_counted(client: &crate::http::PeerClient, owner: &str, req: Req
     resp
 }
 
-/// Resends a repo write (to whoever owns `key` by then) while the answer
-/// says it was not applied ([`REPO_LOADING`], [`SHARD_MOVED`], or a refused
-/// connection), within [`WRITE_RETRY_BUDGET`]. `key` None: served here first
-/// (a lone node), the key is worked out for a resend.
-async fn write_with_retries(
+/// Resends a repo write or a query (to whoever owns `key` by then) while the
+/// answer says nothing was done ([`REPO_LOADING`], [`SHARD_MOVED`], or a
+/// refused connection), within [`RETRY_BUDGET`]. Every attempt is served
+/// from scratch, its security controls checked again where it lands.
+/// `key` None: served here first (a lone node), the key is worked out for a
+/// resend.
+async fn with_retries(
     router: &dyn Router,
     client: &crate::http::PeerClient,
     key: Option<&str>,
@@ -575,6 +589,7 @@ async fn write_with_retries(
         Err(r) => return r,
     };
     let ttfb = ttfb_for(&req);
+    let retries = if req.method() == Method::GET { &crate::metrics::READ_RETRIES } else { &crate::metrics::WRITE_RETRIES };
     let (parts, _) = req.into_parts();
     let rebuild = || {
         let mut req = Request::new(Body::from(body.clone()));
@@ -618,10 +633,10 @@ async fn write_with_retries(
             Some(SHARD_MOVED) => ("moved", Duration::from_millis(50)),
             _ => return Response::from_parts(rp, Body::from(bytes)),
         };
-        if started.elapsed() + FORWARDED_WRITE_START > WRITE_RETRY_BUDGET {
+        if started.elapsed() + FORWARDED_WRITE_START > RETRY_BUDGET {
             return Response::from_parts(rp, Body::from(bytes));
         }
-        crate::metrics::WRITE_RETRIES.with_label_values(&[reason]).inc();
+        retries.with_label_values(&[reason]).inc();
         tokio::time::sleep((pause * 2u32.pow(attempt.min(6))).min(Duration::from_secs(1))).await;
         attempt += 1;
     }
@@ -818,6 +833,22 @@ async fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_queries_are_resent_as_reads() {
+        let req = |m: Method, path: &str, upgrade: bool, body: &'static str| {
+            let mut b = Request::builder().method(m).uri(path);
+            if upgrade {
+                b = b.header(axum::http::header::UPGRADE, "websocket");
+            }
+            b.body(Body::from(body)).unwrap()
+        };
+        assert!(retryable_read(&req(Method::GET, "/xrpc/com.atproto.repo.getRecord?repo=did:plc:a", false, "")));
+        assert!(!retryable_read(&req(Method::GET, "/xrpc/com.atproto.sync.subscribeRepos", true, "")));
+        assert!(!retryable_read(&req(Method::GET, "/xrpc/com.atproto.repo.getRecord", false, "x")));
+        assert!(!retryable_read(&req(Method::POST, "/xrpc/com.atproto.repo.createRecord", false, "")));
+        assert!(!retryable_read(&req(Method::GET, "/oauth/authorize", false, "")));
+    }
 
     #[test]
     fn query_parsing() {

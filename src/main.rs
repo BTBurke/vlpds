@@ -332,8 +332,9 @@ struct Args {
     #[arg(long, env = "VLPDS_FORWARDED_WRITE_START_MS", default_value_t = vlpds::forward::FORWARDED_WRITE_START.as_millis() as u64)]
     forwarded_write_start_ms: u64,
     /// Resend repo writes answered "not applied" (503 RepoLoading /
-    /// ShardMoved: a cold repo load, a shard moving) from the node the
-    /// client called, for up to 20 s, instead of failing them.
+    /// ShardMoved: a cold repo load, a shard moving, or an owner refusing
+    /// connections), and XRPC queries answered so, from the node the client
+    /// called, for up to 20 s, instead of failing them.
     #[arg(long, env = "VLPDS_RETRY_UNAPPLIED_WRITES", default_value_t = true, action = clap::ArgAction::Set)]
     retry_unapplied_writes: bool,
     /// Default AppView for proxied requests: "<url>,<service did>".
