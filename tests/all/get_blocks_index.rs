@@ -6,12 +6,6 @@
 use crate::common::*;
 use std::collections::HashSet;
 
-async fn get_blocks(s: &TestServer, did: &str, cids: &[Cid]) -> Resp {
-    let mut q = vec![("did", did.to_string())];
-    q.extend(cids.iter().map(|c| ("cids", c.to_string())));
-    s.xrpc.get_multi("com.atproto.sync.getBlocks", &q, &Auth::None).await
-}
-
 /// Every CID of the repo export (commit, MST nodes, records) comes back
 /// with the exported bytes.
 async fn assert_all_served(s: &TestServer, did: &str, repo: &Repo) -> (Vec<Cid>, Vec<Cid>) {
@@ -23,7 +17,7 @@ async fn assert_all_served(s: &TestServer, did: &str, repo: &Repo) -> (Vec<Cid>,
     all.extend(&nodes);
     all.extend(&records);
     for chunk in all.chunks(50) {
-        let r = get_blocks(s, did, chunk).await;
+        let r = s.get_blocks(did, chunk).await;
         assert_eq!(r.status, 200, "{}", r.text());
         let (_, blocks) = vlpds::car::read_car(&r.body).unwrap();
         assert_eq!(blocks.len(), chunk.len());
@@ -36,7 +30,7 @@ async fn assert_all_served(s: &TestServer, did: &str, repo: &Repo) -> (Vec<Cid>,
 
 async fn assert_missing(s: &TestServer, did: &str, cids: &[Cid]) {
     for c in cids {
-        get_blocks(s, did, &[*c]).await.err(400, "BlockNotFound");
+        s.get_blocks(did, &[*c]).await.err(400, "BlockNotFound");
     }
 }
 
@@ -53,15 +47,8 @@ async fn get_blocks_by_index() {
                     "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"}});
     let mut like_cid = None;
     for rkey in ["3l3qo2vuowo2a", "3l3qo2vuowo2b", "3l3qo2vuowo2c"] {
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.repo.createRecord",
-                &json!({"repo": a.did, "collection": "app.bsky.feed.like", "rkey": rkey, "record": like}),
-                &a.auth(),
-            )
-            .await
-            .ok();
+        let body = json!({"repo": a.did, "collection": "app.bsky.feed.like", "rkey": rkey, "record": like});
+        let r = s.xrpc.post("com.atproto.repo.createRecord", &body, &a.auth()).await.ok();
         assert!(like_cid.replace(r["cid"].as_str().unwrap().to_string()).is_none_or(|c| c == r["cid"]));
     }
     let like_cid = Cid::parse(&like_cid.unwrap()).unwrap();
@@ -77,18 +64,10 @@ async fn get_blocks_by_index() {
         s.post(&a, &format!("later {i}")).await;
     }
     let rkey = first_post.0.split_once('/').unwrap().1;
-    s.xrpc
-        .post(
-            "com.atproto.repo.putRecord",
-            &json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": rkey, "record": post_record("edited")}),
-            &a.auth(),
-        )
-        .await
-        .ok();
+    s.put_record(&a, "app.bsky.feed.post", rkey, post_record("edited")).await.ok();
     let delete = |rkey: &'static str| {
-        let body = json!({"repo": a.did, "collection": "app.bsky.feed.like", "rkey": rkey});
-        let (s, auth) = (&s, a.auth());
-        async move { s.xrpc.post("com.atproto.repo.deleteRecord", &body, &auth).await.ok() }
+        let r = s.delete_record(&a, "app.bsky.feed.like", rkey);
+        async move { r.await.ok() }
     };
     delete("3l3qo2vuowo2a").await;
     let repo2 = s.get_repo(&a.did).await;
@@ -98,19 +77,15 @@ async fn get_blocks_by_index() {
     assert_missing(&s, &a.did, &gone).await;
     assert_missing(&s, &a.did, &[first_post.1, repo1.root]).await;
     // the like CID is still at two paths, then at none
-    assert_eq!(get_blocks(&s, &a.did, &[like_cid]).await.status, 200);
+    assert_eq!(s.get_blocks(&a.did, &[like_cid]).await.status, 200);
     delete("3l3qo2vuowo2b").await;
-    assert_eq!(get_blocks(&s, &a.did, &[like_cid]).await.status, 200);
+    assert_eq!(s.get_blocks(&a.did, &[like_cid]).await.status, 200);
     delete("3l3qo2vuowo2c").await;
     assert_missing(&s, &a.did, &[like_cid]).await;
 
     // importRepo puts the first version back (a tree the worker didn't
     // commit node by node): its nodes and records are served again
-    let r = s
-        .xrpc
-        .post_bytes("com.atproto.repo.importRepo", car1.body.to_vec(), "application/vnd.ipld.car", &a.auth())
-        .await;
-    assert_eq!(r.status, 200, "{}", r.text());
+    s.xrpc.post_bytes("com.atproto.repo.importRepo", car1.body.to_vec(), "application/vnd.ipld.car", &a.auth()).await.ok();
     let repo3 = s.get_repo(&a.did).await;
     let (nodes3, records3) = assert_all_served(&s, &a.did, &repo3).await;
     assert_eq!(nodes3.iter().collect::<HashSet<_>>(), nodes1.iter().collect::<HashSet<_>>());

@@ -12,26 +12,7 @@ use std::time::Duration;
 const SHARDS: u32 = 12;
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, clock_offset_ms: i64) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = SHARDS;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: SHARDS,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(200),
-            clock_offset_ms,
-            ..Default::default()
-        });
-    })
-    .await
-}
-
-fn cluster(n: &TestServer) -> &vlpds::cluster::Cluster {
-    n.app.cluster.as_deref().unwrap()
+    cluster_node(id, store.clone(), SHARDS, |c| lease(c).clock_offset_ms = clock_offset_ms).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -88,11 +69,7 @@ async fn skewed_clocks_keep_every_node_live() {
     let fast_owned = cluster(&fast).owned();
     vlpds::server::shutdown(&fast.app).await;
     assert!(cluster(&fast).owned().is_empty());
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while cluster(&mid).owned().len() + cluster(&slow).owned().len() < SHARDS as usize {
-        assert!(tokio::time::Instant::now() < deadline, "drained shards {fast_owned:?} never taken");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_until(&format!("drained shards {fast_owned:?} taken"), Duration::from_secs(10), || cluster(&mid).owned().len() + cluster(&slow).owned().len() >= SHARDS as usize).await;
     tokio::time::sleep(Duration::from_millis(300)).await; // routing tables catch up
     for (i, acct) in accounts.iter().enumerate() {
         let n = [&mid, &slow][i % 2];

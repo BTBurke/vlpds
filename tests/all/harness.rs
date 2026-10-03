@@ -10,9 +10,7 @@ async fn boot_write_and_observe() {
     let mut sub = s.subscribe(Some(0)).await;
     let a = s.create_account("smoke").await;
     let r = s.post(&a, "hello").await;
-    assert!(r
-        .uri
-        .starts_with(&format!("at://{}/app.bsky.feed.post/", a.did)));
+    assert!(r.uri.starts_with(&format!("at://{}/app.bsky.feed.post/", a.did)));
 
     let frames = sub.wait_for(FH_TIMEOUT, &a.did, "#commit").await;
     let c = frames.last().unwrap().commit().unwrap();
