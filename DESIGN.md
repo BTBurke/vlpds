@@ -4610,7 +4610,10 @@ As the reference PDS's `Crawlers`: relays get `com.atproto.sync.requestCrawl
 interval (default 20 min) per relay. A relay is asked when it never was, or
 when there was activity (a firehose batch, or this node starting or taking
 over) since its last ask and the interval has passed; a failed ask waits for
-the same, as the reference's does.
+the same, as the reference's does. A node whose public URL is a local
+address (loopback, private, `localhost`, `.test`) never asks a remote relay
+(recorded as "not sent"): dev and bench runs leave the default bsky.network
+alone, while tests' local stand-in relays are still asked.
 
 **One sender.** Only the node owning slot 0's shard (`leads_slot0`, as
 retention and reshard GC) sends. Its merged firehose head is the cluster's

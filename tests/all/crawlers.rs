@@ -162,3 +162,19 @@ async fn one_node_of_a_cluster_sends() {
     assert_eq!(va["relays"], vb["relays"]);
     assert_eq!(va["relays"][0]["status"]["ok"], true, "{va}");
 }
+
+/// A node on a local address never asks a remote relay (dev and bench runs
+/// keep the default bsky.network off the network). `.invalid` never
+/// resolves, so a broken guard fails here without leaving the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_nodes_skip_remote_relays() {
+    let s = TestServer::spawn_with(|c| c.crawlers = vec!["relay.invalid".into()]).await;
+    let v = retry("skip recorded", || async {
+        let v = get(&s).await;
+        v["relays"][0]["status"]["error"].as_str().is_some_and(|e| e.starts_with("not sent")).then_some(v)
+    })
+    .await;
+    assert_eq!(v["relays"][0]["status"]["ok"], false, "{v}");
+    let m = reqwest::get(format!("{}/metrics", s.url)).await.unwrap().text().await.unwrap();
+    assert!(m.contains(r#"vlpds_request_crawl_total{relay="relay.invalid",result="failed"} 0"#));
+}

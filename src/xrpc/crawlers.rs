@@ -126,6 +126,30 @@ fn endpoint(relay: &str) -> String {
     format!("{base}/xrpc/com.atproto.sync.requestCrawl")
 }
 
+fn host_of(relay: &str) -> String {
+    super::sync::public_hostname(relay)
+}
+
+/// Loopback, private or link-local (`host[:port]`). A dev or bench node's
+/// public URL is one: remote relays (the default bsky.network) are never
+/// asked to crawl it, so local runs stay off the network.
+pub fn is_local(hostport: &str) -> bool {
+    let host = match hostport.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None if hostport.matches(':').count() == 1 => hostport.split(':').next().unwrap_or(hostport),
+        None => hostport,
+    }
+    .to_ascii_lowercase();
+    if host == "localhost" || host.ends_with(".localhost") || host.ends_with(".test") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00,
+        Err(_) => false,
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
@@ -211,8 +235,12 @@ async fn send(app: &App, relays: &[String]) -> Vec<(String, RelayStatus)> {
         async move {
             let url = endpoint(relay);
             let at = now_ms();
-            let r = client.post(&url).json(&json!({"hostname": hostname})).timeout(SEND_TIMEOUT).send().await;
             let mut st = RelayStatus { last_attempt_ms: at, node, ..Default::default() };
+            if is_local(&hostname) && !is_local(&host_of(relay)) {
+                st.error = Some(format!("not sent: {hostname} is a local address, which a remote relay can't crawl"));
+                return (relay.clone(), st);
+            }
+            let r = client.post(&url).json(&json!({"hostname": hostname})).timeout(SEND_TIMEOUT).send().await;
             let result = match r {
                 Ok(r) if r.status().is_success() => {
                     st.ok = true;
@@ -506,6 +534,18 @@ mod tests {
         }
         assert_eq!(endpoint("bsky.network"), "https://bsky.network/xrpc/com.atproto.sync.requestCrawl");
         assert_eq!(endpoint("http://127.0.0.1:9"), "http://127.0.0.1:9/xrpc/com.atproto.sync.requestCrawl");
+    }
+
+    #[test]
+    fn local_addresses() {
+        for h in ["127.0.0.1:2620", "localhost", "[::1]:80", "10.0.0.4", "192.168.1.2:9", "pds.test", "::1"] {
+            assert!(is_local(h), "{h}");
+        }
+        for h in ["bsky.network", "relay.example.com:443", "8.8.8.8", "[2001:db8::1]:443"] {
+            assert!(!is_local(h), "{h}");
+        }
+        assert_eq!(host_of("http://127.0.0.1:9"), "127.0.0.1:9");
+        assert_eq!(host_of("bsky.network"), "bsky.network");
     }
 
     #[test]
