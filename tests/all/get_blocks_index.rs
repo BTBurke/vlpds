@@ -85,7 +85,7 @@ async fn get_blocks_by_index() {
 
     // importRepo puts the first version back (a tree the worker didn't
     // commit node by node): its nodes and records are served again
-    s.xrpc.post_bytes("com.atproto.repo.importRepo", car1.body.to_vec(), "application/vnd.ipld.car", &a.auth()).await.ok();
+    s.import_repo(&a.auth(), car1.body.to_vec()).await.ok();
     let repo3 = s.get_repo(&a.did).await;
     let (nodes3, records3) = assert_all_served(&s, &a.did, &repo3).await;
     assert_eq!(nodes3.iter().collect::<HashSet<_>>(), nodes1.iter().collect::<HashSet<_>>());

@@ -267,8 +267,8 @@ async fn import_with_duplicates_then_delete() {
     create(&s, &a, BLOCK, rec(BLOCK, 51), None).await;
     let w = |coll: &str, rkey: usize, n: usize| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": coll, "rkey": rk(rkey), "value": rec(coll, n)});
     s.apply_writes(&b, json!([w(LIKE, 1, 9), w(LIKE, 2, 9), w(LIKE, 3, 9), w(REPOST, 1, 9), w(FOLLOW, 1, 3)])).await.ok();
-    let car = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &b.did)], &Auth::None).await.body.to_vec();
-    s.xrpc.post_bytes("com.atproto.repo.importRepo", car.clone(), "application/vnd.ipld.car", &a.auth()).await.ok();
+    let car = s.get_repo_car(&b.did).await;
+    s.import_repo(&a.auth(), car.clone()).await.ok();
     assert_eq!(rkeys(&s, &a.did, LIKE).await, vec![rk(1), rk(2), rk(3)]);
     assert_eq!(check_backlinks(&s, &a.did).await, 3);
     let raw = scan_backlinks(&s, &a.did).await;
@@ -281,7 +281,7 @@ async fn import_with_duplicates_then_delete() {
     assert_eq!(rkeys(&s, &a.did, FOLLOW).await.len(), 1);
     assert_eq!(check_backlinks(&s, &a.did).await, 3);
     // imported again: the duplicates are back, the creates' entries gone
-    s.xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &a.auth()).await.ok();
+    s.import_repo(&a.auth(), car).await.ok();
     assert_eq!(rkeys(&s, &a.did, LIKE).await, vec![rk(1), rk(2), rk(3)]);
     assert_eq!(check_backlinks(&s, &a.did).await, 3);
     // rebuildRepo re-derives it the same way

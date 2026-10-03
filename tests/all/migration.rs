@@ -58,7 +58,7 @@ async fn migrate_account_with_records_and_blobs() {
     let (plc, docs) = stub_plc().await;
     let old = pds(&plc, "did:web:old-pds.test").await;
     let new = pds(&plc, "did:web:new-pds.test").await;
-    let new_did = new.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok()["did"].as_str().unwrap().to_string();
+    let new_did = new.pds_did().await;
     assert_eq!(new_did, "did:web:new-pds.test");
 
     // an account on the old PDS: posts, one with an image blob
@@ -68,14 +68,9 @@ async fn migrate_account_with_records_and_blobs() {
     for i in 0..3 {
         posts.push(old.post(&alice, &format!("post {i}")).await);
     }
-    let up = old.xrpc.post_bytes("com.atproto.repo.uploadBlob", PNG.to_vec(), "image/png", &alice.auth()).await.ok();
-    let blob = up["blob"].clone();
+    let blob = old.upload_blob(&alice, PNG, "image/png").await;
     let blob_cid = blob["ref"]["$link"].as_str().unwrap().to_string();
-    let with_image = json!({
-        "$type": "app.bsky.feed.post", "text": "with image", "createdAt": now_iso(),
-        "embed": {"$type": "app.bsky.embed.images", "images": [{"image": blob, "alt": "x"}]},
-    });
-    posts.push(old.create_record(&alice, "app.bsky.feed.post", with_image).await);
+    posts.push(old.create_record(&alice, "app.bsky.feed.post", image_post("with image", &blob)).await);
     // its DID document as published by the old PDS
     let doc = old.xrpc.get("com.atproto.identity.resolveDid", &[("did", &did)], &Auth::None).await.ok()["didDoc"].clone();
     docs.lock().unwrap().insert(did.clone(), doc);
@@ -116,13 +111,11 @@ async fn migrate_account_with_records_and_blobs() {
     let st = account_status(&new, &auth).await;
     assert_eq!((st["activated"].clone(), st["validDid"].clone()), (json!(false), json!(false)), "{st}");
     assert_eq!((st["indexedRecords"].clone(), st["expectedBlobs"].clone()), (json!(0), json!(0)), "{st}");
-    let rs = new.xrpc.get("com.atproto.sync.getRepoStatus", &[("did", &did)], &Auth::None).await.ok();
+    let rs = new.repo_status(&did).await.ok();
     assert_eq!((rs["active"].clone(), rs["status"].clone()), (json!(false), json!("deactivated")), "{rs}");
 
     // repo
-    let car = old.xrpc.get("com.atproto.sync.getRepo", &[("did", &did)], &Auth::None).await;
-    assert_eq!(car.status, 200);
-    new.xrpc.post_bytes("com.atproto.repo.importRepo", car.body.to_vec(), "application/vnd.ipld.car", &auth).await.ok();
+    new.import_repo(&auth, old.get_repo_car(&did).await).await.ok();
     let st = account_status(&new, &auth).await;
     assert_eq!(st["indexedRecords"], json!(4), "{st}");
     assert_eq!((st["expectedBlobs"].clone(), st["importedBlobs"].clone()), (json!(1), json!(0)), "{st}");
@@ -133,7 +126,7 @@ async fn migrate_account_with_records_and_blobs() {
     let missing = new.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &auth).await.ok();
     let missing: Vec<&str> = missing["blobs"].as_array().unwrap().iter().map(|b| b["cid"].as_str().unwrap()).collect();
     assert_eq!(missing, vec![blob_cid.as_str()]);
-    let bytes = old.xrpc.get("com.atproto.sync.getBlob", &[("did", &did), ("cid", &blob_cid)], &Auth::None).await;
+    let bytes = old.get_blob(&did, &blob_cid).await;
     assert_eq!(bytes.status, 200);
     let up = new.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.body.to_vec(), "image/png", &auth).await.ok();
     assert_eq!(up["blob"]["ref"]["$link"], json!(blob_cid));
@@ -182,7 +175,7 @@ async fn migrate_account_with_records_and_blobs() {
         let r = new.get_record(&did, p.collection(), p.rkey()).await.ok();
         assert_eq!(r["cid"], json!(p.cid));
     }
-    let b = new.xrpc.get("com.atproto.sync.getBlob", &[("did", &did), ("cid", &blob_cid)], &Auth::None).await;
+    let b = new.get_blob(&did, &blob_cid).await;
     assert_eq!((b.status, &b.body[..]), (200, PNG));
     let session = TestAccount {
         did: did.clone(),
@@ -206,8 +199,7 @@ async fn import_of_another_dids_repo_is_accepted_like_the_reference() {
     let a = s.create_account("imp").await;
     let b = s.create_account("imp").await;
     let p = s.post(&a, "from a").await;
-    let car = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &a.did)], &Auth::None).await;
-    s.xrpc.post_bytes("com.atproto.repo.importRepo", car.body.to_vec(), "application/vnd.ipld.car", &b.auth()).await.ok();
+    s.import_repo(&b.auth(), s.get_repo_car(&a.did).await).await.ok();
     // re-signed for b, with a's records
     let r = s.get_record(&b.did, p.collection(), p.rkey()).await.ok();
     assert_eq!(r["cid"], json!(p.cid));

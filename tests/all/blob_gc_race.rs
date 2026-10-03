@@ -25,7 +25,7 @@ async fn reference_applied_after_collection_restores_the_blob() {
     let cid = blob["ref"]["$link"].as_str().unwrap().to_string();
     let post = s.create_record(&a, "app.bsky.feed.post", image_post("img", &blob)).await;
     // a repo version that references the blob, for later
-    let car = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &a.did)], &Auth::None).await.body.to_vec();
+    let car = s.get_repo_car(&a.did).await;
     s.delete_record(&a, "app.bsky.feed.post", post.rkey()).await.ok();
 
     // collected: no longer served, and a write checking it now fails
@@ -39,7 +39,7 @@ async fn reference_applied_after_collection_restores_the_blob() {
 
     // the reference lands after the collection (importRepo doesn't check
     // blobs, so it stands in for a write that checked before the move)
-    s.xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &a.auth()).await.ok();
+    s.import_repo(&a.auth(), car).await.ok();
     sweep(&s, Duration::ZERO).await;
     let g = s.get_blob(&a.did, &cid).await;
     assert_eq!(g.status, 200, "restored");

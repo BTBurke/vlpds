@@ -39,10 +39,6 @@ fn cbor(j: J) -> Vec<u8> {
     Value::from_json(&j).unwrap().to_cbor()
 }
 
-async fn import(s: &TestServer, a: &TestAccount, car: Vec<u8>) -> Resp {
-    s.xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &a.auth()).await
-}
-
 /// An old repo's legacy blob refs (`{cid, mimeType}`) are indexed on
 /// import: listBlobs lists them, listMissingBlobs reports the missing ones,
 /// and the blob GC keeps the uploaded one.
@@ -60,7 +56,7 @@ async fn legacy_blob_refs_are_indexed_on_import() {
     let other = cbor(json!({"$type": "app.bsky.feed.post", "text": "x", "createdAt": "2023-01-01T00:00:00Z",
         "x": {"cid": Cid::raw(b"other").to_string(), "mimeType": "image/png", "size": 1}}));
     let car = import_car(&a.did, &[("app.bsky.feed.post/3jzfcijpj2z2a", post(&have)), ("app.bsky.feed.post/3jzfcijpj2z2b", post(&missing)), ("app.bsky.feed.post/3jzfcijpj2z2c", other)]);
-    import(&s, &a, car).await.ok();
+    s.import_repo(&a.auth(), car).await.ok();
     let mut cids = s.list_blobs(&a.did).await;
     cids.sort();
     let mut want = vec![have.clone(), missing.clone()];
@@ -83,10 +79,10 @@ async fn oversized_import_records_are_refused() {
         m.sort_by(|a, b| key_cmp(&a.0, &b.0));
         Value::Map(m).to_cbor()
     };
-    let r = import(&s, &a, import_car(&a.did, &[("com.example.big/a", rec((2 << 20) + 1))])).await;
+    let r = s.import_repo(&a.auth(), import_car(&a.did, &[("com.example.big/a", rec((2 << 20) + 1))])).await;
     r.err(400, "InvalidRequest");
     assert!(r.text().contains("too large"), "{}", r.text());
-    import(&s, &a, import_car(&a.did, &[("com.example.big/a", rec(1 << 20))])).await.ok();
+    s.import_repo(&a.auth(), import_car(&a.did, &[("com.example.big/a", rec(1 << 20))])).await.ok();
 }
 
 /// `Config::max_import_bytes` bounds the CAR.
@@ -95,9 +91,9 @@ async fn import_size_is_configurable() {
     let s = TestServer::spawn_with(|c| c.max_import_bytes = 4096).await;
     let a = s.create_account("capped").await;
     let small = import_car(&a.did, &[("com.example.x/a", cbor(json!({"$type": "com.example.x", "v": 1})))]);
-    import(&s, &a, small).await.ok();
+    s.import_repo(&a.auth(), small).await.ok();
     let big = import_car(&a.did, &[("com.example.x/a", cbor(json!({"$type": "com.example.x", "v": "y".repeat(5000)})))]);
-    assert_eq!(import(&s, &a, big).await.status, 413);
+    assert_eq!(s.import_repo(&a.auth(), big).await.status, 413);
 }
 
 /// Integers past 2^53 - 1 are refused like integral floats there (the

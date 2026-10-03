@@ -239,6 +239,17 @@ impl TestServer {
         (Cid::parse(j["cid"].as_str().unwrap()).unwrap(), j["rev"].as_str().unwrap().to_string())
     }
 
+    /// `sync.getRepo`'s CAR, raw.
+    pub async fn get_repo_car(&self, did: &str) -> Vec<u8> {
+        let r = self.xrpc.get("com.atproto.sync.getRepo", &[("did", did)], &Auth::None).await;
+        assert_eq!(r.status, 200, "getRepo failed: {}", r.text());
+        r.body.to_vec()
+    }
+
+    pub async fn import_repo(&self, auth: &Auth, car: Vec<u8>) -> Resp {
+        self.xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", auth).await
+    }
+
     /// Downloads and parses `sync.getRepo`.
     pub async fn get_repo(&self, did: &str) -> Repo {
         let r = self.xrpc.get("com.atproto.sync.getRepo", &[("did", did)], &Auth::None).await;
