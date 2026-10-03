@@ -89,6 +89,11 @@ const AT_ZERO: &[&str] = &[
     r#"vlpds_upstream_request_seconds_count{service="appview"}"#,
     r#"vlpds_handle_resolutions_total{result="not_found"}"#,
     r#"vlpds_request_crawl_total{result="failed"}"#,
+    r#"vlpds_import_admissions_total{result="rejected"}"#,
+    r#"vlpds_import_growths_total{result="rejected"}"#,
+    r#"vlpds_import_wait_seconds_count{kind="admit"}"#,
+    r#"vlpds_imports{state="running"}"#,
+    "vlpds_import_reserved_bytes",
     r#"vlpds_mail_messages_total{purpose="reset_password",result="failed"}"#,
 ];
 

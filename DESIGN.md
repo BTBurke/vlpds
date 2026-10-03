@@ -335,9 +335,9 @@ swappable.
   firehose and live rings and merge queue, the backfill cache plus
   read-ahead x `--firehose-max-backfills`, exports (8 MiB per
   `--max-exports` slot plus the `M/` read-ahead pool, 16 MiB a slot up to
-  512 MiB), imports (`xrpc::IMPORT_MEMORY_BYTES`, 320 MiB: 4 streamed imports at
-  80 MiB, see "Staged imports"; or
-  `--max-import-mb` if less) and max(15%, 512 MiB) headroom (memtables,
+  512 MiB), imports (the import budget, `--import-memory-mb`, default 1/16
+  of the budget within 192 MiB-1 GiB; see "Import admission") and
+  max(15%, 512 MiB) headroom (memtables,
   bodies in flight, allocator slack). The rest is the cache pool. The
   metadata cache takes what the owned SSTs' filters and indexes need first:
   their encoded size (`vlpds_sst_meta_bytes`) x the decode ratio measured
@@ -2549,8 +2549,8 @@ root through the store).
   refuse, falls back to the buffered parse of the whole body (kept for
   this), which reports the error; so both paths accept exactly the same
   CARs with the same result. No rate limit of its own yet (the
-  rate-limit layer, `ratelimit.rs`, is where one belongs); at most
-  `staged_import::IMPORT_SLOTS` (4) run at once per node. A repo whose `M/` is
+  rate-limit layer, `ratelimit.rs`, is where one belongs); the node's
+  import budget admits them by size ("Import admission"). A repo whose `M/` is
   missing or wrong (a bug, a lost key range) is rebuilt from
   `R/` on open and backfilled through the log
   (`vlpds_lazy_mst_fallbacks_total{reason}`).
@@ -3074,10 +3074,11 @@ worker, so ordered with its commits):
 
 The import itself holds a few batches whatever the repo's size: peak heap
 375 MB at 1M records and ~1 GB at 5M, most of it the write path's own
-bounded buffers, where it was 3.6 and 18 GB (see "Measured" below). At most
-`IMPORT_SLOTS` (4) streamed imports run at once per node, so the memory
-budget reserves 4 x 80 MiB (`xrpc::IMPORT_MEMORY_BYTES`); the buffered
-fallback runs one at a time and holds its whole body on top.
+bounded buffers, where it was 3.6 and 18 GB (see "Measured" below). How
+many run at once is up to the import budget ("Import admission"): each
+reserves its estimated working set, 512 KiB to 80 MiB; the buffered
+fallback runs one at a time and reserves its whole body from the same
+budget.
 
 **Why readers see the old repo or the new one, never a mix.** A reader's
 generation comes from the account; a snapshot or a state apply holds the
@@ -3140,8 +3141,10 @@ staged delete is the natural follow-up.)
 listing its rkeys. Records arrive in key order, so a link's rkeys only
 append: a batch's value is the earlier batches' (from the batches still in
 flight, else one point read of the staged row) plus its own. The read is
-skipped unless a 4 MiB bloom filter of the links staged so far says the
-link may be there (~6% false positives at 5M links).
+skipped unless a bloom filter of the links staged so far says the link may
+be there: sized from the import's estimated record count (10 bits a link,
+64 words up to 4 MiB: ~6% false positives at 5M links), and grown in 4x
+layers if more links come than estimated.
 
 **Other orders.** A CAR not in the streamable order (or one the single pass
 refuses) voids what was handed out: the driver Begins again with the same
@@ -3175,10 +3178,107 @@ not the import: SlateDB's memtables (up to 128 MiB per shard) and
 compactions in flight, the log's live ring (128 MiB). A timeline of the
 5M run (`IMPORT_BENCH_TRACE`) moves between 270 and 800 MB the whole way
 with no upward trend, and drops to ~100 MB once the import is done; the
-import's own buffers are the batches above (`IMPORT_WORKING_SET`, 80 MiB
-with room). (The bench's in-memory bucket first made it look O(n): a
+import's own buffers are the batches above (`import_budget::sizing`, under
+80 MiB for any size). (The bench's in-memory bucket first made it look O(n): a
 compressed segment kept as a slice of its compression-bound buffer pins
 the whole buffer, ~1.4x the object. The bench now stores exact copies.)
+
+## Import admission (`src/xrpc/import_budget.rs`)
+
+Imports used to run in 4 fixed slots of 80 MiB each (320 MiB in the memory
+plan), but real repos are mostly tiny, so a migration wave queued behind 4
+slots while the budget sat unused. Now each import reserves its *estimated
+working set* from one byte budget, and as many run as fit.
+
+**The distribution** (`real_dist.rs`: ClickHouse crawl, 39.0 M repos; CAR
+bytes at the 326 B/record `tests/all/import_burst.rs` measures for
+real-shaped records):
+
+| | all repos | repos with records | CAR | reservation |
+|---|---:|---:|---:|---:|
+| p50 | 7 | 10 | ~3 KB | 512 KiB (floor) |
+| p90 | 324 | 395 | ~110-130 KB | 512 KiB (floor) |
+| p99 | 8,696 | 9,806 | ~2.8-3.2 MB | ~10.7 MiB |
+| p99.9 | 58,787 | 62,855 | ~19-20 MB | ~68-70 MiB |
+| max | 593,772 | | ~194 MB | ~77 MiB |
+
+**The estimate** (`sizing(car)`, from Content-Length): the body kept for
+a fallback (min(CAR, 16 MiB)), the batches alive (2 parsed ahead, 1 being
+built, 1 being staged, 2 in flight: each 2x its record bytes plus ~400 B
+per record of keys and paths, and never more than 3x the whole CAR), the
+backlink bloom filter (10 bits per record counted at 200 B/record, 64 B
+to 4 MiB), and 64 KiB of fixed state; floor 512 KiB, cap 80 MiB. Batch
+bytes scale with the repo (CAR/4, 256 KiB to 4 MiB: a small repo is one
+batch); the record count per batch stays 4,096, because each batch is a log
+round trip and fewer of them keep big imports fast. The StreamBuilder holds
+one open node per height, O(log n) whatever the size, so it is in the
+fixed part.
+
+**Growth.** Without a Content-Length the import starts at 64 KiB's
+estimate. The body pump checks every chunk against what the reservation
+covers; past it, the reservation grows to 1.5x the bytes received
+(`Reservation::cover`), and the batch size and bloom follow the new
+estimate (the bloom adds a 4x layer, so earlier links stay found). Growth
+queues ahead of new admissions (a running import holds memory others wait
+for) and waits at most 10 s, then the import fails with 503 Overloaded and
+aborts like any other failure. (hyper enforces Content-Length framing, so a
+wrong one cuts the body short: a truncated CAR or an aborted body, both 400.
+A body aborted after a whole CAR now fails in the streamed parse too, as
+the buffered one always did.)
+
+**The buffered fallback** (a CAR not in the streamable order) still runs
+one at a time, but reserves 4x its body from the same budget before
+reading the rest (the body, its block map, the loaded and rebuilt trees,
+the record list), capped at the whole budget: a fallback bigger than the
+budget waits for all of it and runs alone.
+
+**The budget** (`--import-memory-mb`; default 1/16 of the node's memory
+budget, 192 MiB to 1 GiB) is a part of the memory plan, so it comes out of
+the cache pool instead of 320 MiB fixed; `--memory-plan` prints it with the
+reservation at each percentile. The tiny profile (2.5 GiB) gets 192 MiB:
+64 imports at p90 (64 x 0.5 = 32 MiB) beside one at p99.9 (~70 MiB) is
+~102 MiB; the rest admits ~180 more small ones, or a max-size one. A 4 GiB
+node gets 256 MiB, 16 GiB and up get 1 GiB.
+
+**Fairness.** One FIFO queue over bytes, plus a *large share*: whatever an
+import reserves past 8 MiB also comes out of half the budget. So large
+imports together hold at most half of it, and small ones always have the
+other half. In the queue, a waiter the budget itself can't hold stops the
+line, so a big one at the head isn't starved by small ones passing it; it
+waits only for those already running (small imports take milliseconds).
+A waiter blocked only by the large share lets the ones behind it that need
+none of it pass (larger ones stay behind it, in order), so a queue of large
+imports doesn't stall the small ones. A request that goes away while
+queued leaves the queue or returns what it was granted.
+
+**Metrics.** `vlpds_imports{state=running|waiting}`,
+`vlpds_import_reserved_bytes`, `vlpds_import_budget_bytes`,
+`vlpds_import_admissions_total{result=admitted|waited|rejected}`,
+`vlpds_import_growths_total{result=granted|waited|rejected}`,
+`vlpds_import_wait_seconds{kind=admit|grow}`; the counters start at 0.
+
+**Measured** (`tests/all/import_burst.rs`: a burst of N imports fired at
+once, sizes drawn from the distribution plus one p99.9 repo, records shaped
+like the network's mix; dev-release, jemalloc, M4 Pro laptop; one node, in-memory
+bucket with segment PUTs delayed 25 ms median (lognormal, sigma 0.3);
+before = 4 slots at a804bda; latency is per import from the burst's start,
+admission wait included):
+
+| N | budget | wall | imports/s | 200 / 503 | latency p50 / p99 (<= p90 repos) | peak heap over baseline |
+|---|---|---:|---:|---|---:|---:|
+| 401 | 4 slots | 16.2 s | 25 | 401 / 0 | 8.2 s / 16.1 s | 201 MB |
+| 401 | 192 MiB | 1.09 s | 369 | 401 / 0 | 0.33 s / 0.58 s | 387 MB |
+| 401 | 1 GiB | 0.66 s | 609 | 401 / 0 | 0.23 s / 0.28 s | 562 MB |
+| 2001 | 4 slots | 30.2 s | 25 | 748 / 1,253 | 30.1 s / 30.1 s | 307 MB |
+| 2001 | 192 MiB | 2.63 s | 762 | 2,001 / 0 | 1.15 s / 2.22 s | 598 MB |
+| 2001 | 1 GiB | 1.18 s | 1,700 | 2,001 / 0 | 0.57 s / 0.86 s | 1,270 MB |
+
+With 4 slots the S3 round trips serialize: 25 imports/s whatever the
+sizes, and past 30 s of queue the rest get 503. Admitting by size runs
+149-236 at once in 192 MiB (932 in 1 GiB) and completes every import. The
+peak heap exceeds the reservation by 200-400 MB: the imported rows sitting
+in memtables and the log's buffers, which the plan's headroom covers, not
+the import budget.
 
 ## Backups and restore (design, not implemented)
 

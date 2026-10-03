@@ -14,15 +14,10 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/com.atproto.repo.importRepo", post(import_repo))
 }
 
-/// The repo is held in memory and written as one log entry about its size.
+/// Largest importRepo body. A streamed import holds a few batches whatever
+/// its size; the buffered fallback holds the whole body, within the import
+/// budget (`import_budget`).
 pub const DEFAULT_MAX_IMPORT_BYTES: usize = 1 << 30;
-
-/// importRepo memory the node's budget reserves (src/memory.rs), when
-/// --max-import-mb allows more: the streamed imports a node runs at once
-/// (`staged_import::IMPORT_SLOTS`) at their working set each. The buffered
-/// fallback (a CAR in another block order, one at a time) holds the whole
-/// body and its parse on top, up to --max-import-mb.
-pub const IMPORT_MEMORY_BYTES: usize = super::staged_import::IMPORT_SLOTS * super::staged_import::IMPORT_WORKING_SET;
 
 /// The reference sets no limit; our own writes refuse a record over 1 MB,
 /// so this leaves room for records made elsewhere while bounding what one

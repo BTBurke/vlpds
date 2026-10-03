@@ -108,9 +108,14 @@ pub struct Config {
     pub rate_limit_bypass_key: Option<String>,
     /// How long a write waits for a lexicon resolution. None: off.
     pub resolve_lexicons: Option<Duration>,
-    /// The CAR is parsed in memory and the import is one log entry, so this
-    /// bounds both.
+    /// Largest importRepo body.
     pub max_import_bytes: usize,
+    /// The import budget (`xrpc::import_budget`). None: the memory plan's
+    /// `import` part.
+    pub import_memory_bytes: Option<u64>,
+    /// How long an import waits for the budget to admit it (then 503); a
+    /// running one waits at most 10 s of it to grow.
+    pub import_wait: Duration,
     /// With `s3: None`: share this store so several in-process nodes form
     /// one cluster (tests).
     pub memory_store: Option<Arc<dyn object_store::ObjectStore>>,
@@ -190,7 +195,7 @@ impl Config {
             backfill_readahead: self.backfill_readahead_bytes as u64,
             max_backfills: self.firehose_max_backfills as u64,
             max_exports: self.max_exports as u64,
-            max_import: self.max_import_bytes as u64,
+            import_memory: self.import_memory_bytes,
         }
     }
 
@@ -273,6 +278,8 @@ impl Default for Config {
             rate_limit_bypass_key: None,
             resolve_lexicons: None,
             max_import_bytes: crate::xrpc::DEFAULT_MAX_IMPORT_BYTES,
+            import_memory_bytes: None,
+            import_wait: crate::xrpc::import_budget::ADMIT_WAIT,
             memory_store: None,
             metrics_listen: None,
             log_retention: Some(crate::retention::Config::default()),
@@ -480,6 +487,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         write_permits: Arc::new(tokio::sync::Semaphore::new(cfg.max_inflight_writes)),
         read_permits: Arc::new(tokio::sync::Semaphore::new(cfg.max_queued_reads.max(1))),
         exports: Arc::new(tokio::sync::Semaphore::new(cfg.max_exports.max(1))),
+        imports: xrpc::ImportBudget::new(cfg.import_memory_bytes.unwrap_or(plan.part("import")), cfg.import_wait),
         admin_token: cfg.admin_token.clone(),
         did_resolver: Arc::new(crate::did_resolver::DidResolver::new(&cfg.plc_url, cfg.dev_mode)),
         http,

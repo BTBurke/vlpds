@@ -11,7 +11,9 @@
 //! `IMPORT_BURST_SEED` picks the draw, `IMPORT_BURST_CAP` caps a repo's
 //! records (default 100,000: above p99.9), and `IMPORT_BURST_BIG` adds that
 //! many p99.9 repos (62,685 records; default 1). `IMPORT_BURST_LATENCY_MS`
-//! (default 25) delays the commit log's object-store writes, as S3 would.
+//! (default 25, the median; lognormal, sigma 0.3) delays the commit log's
+//! segment writes, as S3 would. `IMPORT_BURST_BUDGET_MB` sets the import
+//! budget (default: the memory plan's).
 use crate::common::*;
 use crate::import_bench::{jemalloc, Sized};
 use std::collections::HashMap;
@@ -44,7 +46,7 @@ fn tid(t: u64) -> String {
 /// A record shaped like the network's mix (likes, follows, posts, reposts,
 /// blocks).
 fn record(h: u64, i: usize) -> (&'static str, Vec<u8>) {
-    let did = |x: u64| format!("did:plc:{}", tid(mix(x)).repeat(2)[..24].to_string());
+    let did = |x: u64| format!("did:plc:{}", &tid(mix(x)).repeat(2)[..24]);
     let strong = |x: u64| {
         Value::Map(vec![
             ("cid".to_string(), Value::Text("bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm".into())),
@@ -127,6 +129,7 @@ async fn import_burst() {
     let cap: u32 = env_or("IMPORT_BURST_CAP", 100_000);
     let big: usize = env_or("IMPORT_BURST_BIG", 1);
     let latency: f64 = env_or("IMPORT_BURST_LATENCY_MS", 25.0);
+    let budget: Option<u64> = std::env::var("IMPORT_BURST_BUDGET_MB").ok().and_then(|v| v.parse().ok()).map(|m: u64| m << 20);
     let mut sizes: Vec<usize> = (0..n as u64).map(|i| vlpds::real_dist::draw(unit(mix(seed ^ (i << 1))), unit(mix(seed ^ (i << 1 | 1)))).min(cap) as usize).collect();
     sizes.extend(std::iter::repeat_n(62_685, big));
     let total = sizes.len();
@@ -158,7 +161,8 @@ async fn import_burst() {
         c.memory.meta = Some(16 << 20);
         c.allow_bulk_create = true;
         c.memory_store = Some(store);
-        c.inject_latency = (latency > 0.0).then_some((latency, latency / 5.0));
+        c.inject_latency = (latency > 0.0).then_some((latency, 0.3));
+        c.import_memory_bytes = budget;
     })
     .await;
     let start = 9_000_000u64;
@@ -186,17 +190,23 @@ async fn import_burst() {
         })
     };
     let url = format!("{}/xrpc/com.atproto.repo.importRepo", s.xrpc.base);
+    // the suite's client gives up after 30 s
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(600)).build().unwrap();
     let t0 = Instant::now();
     let tasks: Vec<_> = cars
         .into_iter()
         .zip(tokens)
         .map(|(car, tok)| {
-            let (http, url) = (s.xrpc.http.clone(), url.clone());
+            let (http, url) = (http.clone(), url.clone());
             tokio::spawn(async move {
-                let r = http.post(url).header("content-type", "application/vnd.ipld.car").bearer_auth(tok).body(car).send().await.unwrap();
-                let status = r.status().as_u16();
-                let text = r.text().await.unwrap_or_default();
-                (status, t0.elapsed(), text)
+                match http.post(url).header("content-type", "application/vnd.ipld.car").bearer_auth(tok).body(car).send().await {
+                    Ok(r) => {
+                        let status = r.status().as_u16();
+                        let text = r.text().await.unwrap_or_default();
+                        (status, t0.elapsed(), text)
+                    }
+                    Err(e) => (0, t0.elapsed(), e.to_string()),
+                }
             })
         })
         .collect();
@@ -247,10 +257,11 @@ async fn import_burst() {
     );
     let ld = |i: usize| peaks[i].load(Ordering::Relaxed);
     println!(
-        "  peak over baseline (bucket left out): heap {:.0} MB, resident {:.0} MB; peak import reservation {:.0} MB, peak running {}",
+        "  peak over baseline (bucket left out): heap {:.0} MB, resident {:.0} MB; peak import reservation {:.0} MB of {:.0}, peak running {}",
         mb(ld(0)),
         mb(ld(1)),
         mb(ld(2)),
+        mb(s.app.imports.total()),
         ld(3)
     );
 }

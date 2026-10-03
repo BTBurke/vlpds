@@ -531,10 +531,14 @@ struct Args {
     /// validate those records too, instead of reporting them "unknown".
     #[arg(long, env = "VLPDS_RESOLVE_LEXICONS")]
     resolve_lexicons: bool,
-    /// Largest CAR importRepo accepts, in MiB (parsed in memory; the import
-    /// is written as one log entry).
+    /// Largest CAR importRepo accepts, in MiB.
     #[arg(long, env = "VLPDS_MAX_IMPORT_MB", default_value_t = 1024)]
     max_import_mb: usize,
+    /// Memory importRepo calls may hold at once, in MiB: each reserves an
+    /// estimate from its size (512 KiB to 80 MiB; the buffered fallback its
+    /// whole body). Default: 1/16 of the memory budget, 192 MiB to 1 GiB.
+    #[arg(long, env = "VLPDS_IMPORT_MEMORY_MB")]
+    import_memory_mb: Option<u64>,
     /// Stable node id (keep it across restarts so a restarted node reclaims
     /// its shards immediately). Default "single".
     #[arg(long, env = "VLPDS_NODE_ID")]
@@ -1097,6 +1101,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
             .resolve_lexicons
             .then_some(vlpds::lexicon::RESOLVE_TIMEOUT),
         max_import_bytes: args.max_import_mb << 20,
+        import_memory_bytes: args.import_memory_mb.map(|m| m << 20),
+        import_wait: vlpds::xrpc::import_budget::ADMIT_WAIT,
         trusted_proxies: args.trusted_proxies.clone(),
         peer_connections: args.peer_connections,
         peer_tls,

@@ -96,6 +96,12 @@ lazy!(FIREHOSE_BACKFILLS: IntGaugeVec = register_int_gauge_vec!("vlpds_firehose_
 lazy!(FIREHOSE_REJECTED: IntCounterVec = register_int_counter_vec!("vlpds_firehose_rejected_total", "subscribeRepos connections refused before the upgrade, by reason (per_ip: --firehose-max-per-ip)", &["reason"]));
 lazy!(SYNC_EXPORTS: IntGaugeVec = register_int_gauge_vec!("vlpds_sync_exports", "getRepo exports streaming, and waiting for a slot (--max-exports)", &["state"]));
 lazy!(SYNC_EXPORTS_ENDED: IntCounterVec = register_int_counter_vec!("vlpds_sync_exports_ended_total", "getRepo exports by how they ended: done, client_gone, stalled (the client read nothing for --export-stall-secs), error, shed (no slot within 10 s: 503)", &["reason"]));
+lazy!(IMPORTS: IntGaugeVec = register_int_gauge_vec!("vlpds_imports", "importRepo calls running (admitted by the import budget), and waiting for it", &["state"]));
+lazy!(IMPORT_RESERVED_BYTES: IntGauge = register_int_gauge!("vlpds_import_reserved_bytes", "Import budget reserved by running importRepo calls (their estimated working sets)"));
+lazy!(IMPORT_BUDGET_BYTES: IntGauge = register_int_gauge!("vlpds_import_budget_bytes", "The import budget (--import-memory-mb, or 1/16 of the memory budget within 192 MiB-1 GiB)"));
+lazy!(IMPORT_ADMISSIONS: IntCounterVec = register_int_counter_vec!("vlpds_import_admissions_total", "importRepo admissions by the import budget: admitted (at once), waited (admitted after queueing), rejected (no room in time: 503)", &["result"]));
+lazy!(IMPORT_GROWTHS: IntCounterVec = register_int_counter_vec!("vlpds_import_growths_total", "Running imports' reservations grown past their estimate (no or wrong Content-Length, the buffered fallback): granted, waited, rejected (503)", &["result"]));
+lazy!(IMPORT_WAIT_SECONDS: HistogramVec = register_histogram_vec!("vlpds_import_wait_seconds", "Time importRepo calls queued for the import budget, by kind: admit, grow", &["kind"], latency_buckets()));
 lazy!(IMPORT_REPO_PARSES: IntCounterVec = register_int_counter_vec!("vlpds_import_repo_parses_total", "importRepo bodies parsed, by path: stream (one pass over a CAR in the streamable block order) or buffered (any other order, or a CAR refused)", &["path"]));
 lazy!(FIREHOSE_BACKFILL_RETRIES: IntCounterVec = register_int_counter_vec!("vlpds_firehose_backfill_retries_total", "Cursor backfill retries: seek (a log seek re-run after retention pruned the log's head below the cursor under it), pruned (a whole backfill re-run for the same reason) or error (S3)", &["reason"]));
 lazy!(LOG_LIVE_BYTES: IntGauge = register_int_gauge!("vlpds_log_live_ring_bytes", "Segment bytes pinned by the node log's live ring (peer streams)"));
@@ -347,6 +353,13 @@ pub fn init_counters() {
             }
         }
         LazyLock::force(&RECORD_COUNTERS);
+        for state in ["running", "waiting"] {
+            IMPORTS.with_label_values(&[state]);
+        }
+        for kind in ["admit", "grow"] {
+            IMPORT_WAIT_SECONDS.with_label_values(&[kind]);
+        }
+        LazyLock::force(&IMPORT_RESERVED_BYTES);
         LazyLock::force(&BLOB_UPLOAD_BYTES);
         LazyLock::force(&REQUEST_CRAWL_LAST_OK);
         CPU_CORES.set(std::thread::available_parallelism().map_or(0, |n| n.get()) as f64);
@@ -442,6 +455,8 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&FIREHOSE_REJECTED, &["per_ip"]),
     (&SYNC_EXPORTS_ENDED, &["done", "client_gone", "stalled", "error", "shed"]),
     (&IMPORT_REPO_PARSES, &["stream", "buffered"]),
+    (&IMPORT_ADMISSIONS, &["admitted", "waited", "rejected"]),
+    (&IMPORT_GROWTHS, &["granted", "waited", "rejected"]),
     (&SIGNUPS, &["created", "invite", "email_policy", "handle_policy", "taken", "invalid", "error"]),
     (&ACCOUNT_EVENTS, &["created", "deleted", "deactivated", "reactivated"]),
     (&PASSWORD_RESETS, &["requested", "completed"]),

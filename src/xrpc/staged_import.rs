@@ -12,6 +12,7 @@
 //! the sweeper ([`sweep_pending`], on the shard's owner) aborts an import
 //! whose driver is gone and deletes every garbage generation.
 
+use super::import_budget::Reservation;
 use super::import_stream::{self, Item};
 use super::repo::ImportedRecord;
 use super::*;
@@ -21,7 +22,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 /// Batches staged ahead of their acks.
-const IN_FLIGHT: usize = 2;
+pub(super) const IN_FLIGHT: usize = 2;
 /// Keys deleted per sweep entry.
 const SWEEP_KEYS: usize = 8192;
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
@@ -135,30 +136,22 @@ async fn step(app: &App, did: &str, step: ImportStep) -> XResult<Head> {
     settle(queue(app, did, step)?).await
 }
 
-/// Streamed imports running at once on a node; more wait up to
-/// [`SLOT_WAIT`], then get a retryable 503.
-pub const IMPORT_SLOTS: usize = 4;
-const SLOT_WAIT: Duration = Duration::from_secs(30);
-/// One streamed import's heap: the body queued to the parse and kept for a
-/// fallback until it spills (16 MiB), the batches parsed ahead, being built
-/// and in flight (each up to 4 MiB of records, ~3x that as rows), the bloom
-/// filter (4 MiB): ~70 MiB at most, with room.
-pub const IMPORT_WORKING_SET: usize = 80 << 20;
-static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(IMPORT_SLOTS);
-/// The buffered fallback (a CAR not in the streamable order) holds the
-/// whole body and its parse, so one runs at a time.
-pub(super) static BUFFERED: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-
-/// The import of `body` into `did`'s repo.
+/// The import of `body` into `did`'s repo, once the node's import budget
+/// admits it (`import_budget`).
 pub(super) async fn import(app: &Arc<App>, did: &str, body: Body, headers: &HeaderMap) -> XResult<()> {
-    let _slot = match tokio::time::timeout(SLOT_WAIT, SLOTS.acquire()).await {
-        Ok(p) => p.expect("never closed"),
-        Err(_) => return Err(XrpcError::unavailable("Overloaded", "too many repo imports in progress; retry shortly")),
-    };
+    let max = app.config.max_import_bytes;
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n > max as u64) {
+        return Err(import_stream::too_large(max));
+    }
+    let res = app.imports.admit(declared).await?;
     let driver = Driver::start(did)?;
-    let mut items = import_stream::start(body, headers, app.config.max_import_bytes)?;
+    let mut items = import_stream::start(body, max, res.clone());
     let mut st = Stage { did: did.to_string(), nonce: driver.nonce, ..Default::default() };
-    let r = st.run(app, &mut items).await;
+    let r = st.run(app, &mut items, &res).await;
     if let Err(e) = &r {
         if !crashed(e) {
             st.abort(app).await;
@@ -185,11 +178,11 @@ struct Stage {
 }
 
 impl Stage {
-    async fn run(&mut self, app: &Arc<App>, items: &mut tokio::sync::mpsc::Receiver<XResult<Item>>) -> XResult<()> {
+    async fn run(&mut self, app: &Arc<App>, items: &mut tokio::sync::mpsc::Receiver<XResult<Item>>, res: &Reservation) -> XResult<()> {
         loop {
             let item = items.recv().await.ok_or_else(|| XrpcError::internal("import parse ended early"))??;
             match item {
-                Item::Batch { records, nodes } => self.stage(app, records, nodes).await?,
+                Item::Batch { records, nodes } => self.stage(app, records, nodes, res.sizing().bloom_words).await?,
                 Item::Restart => {
                     self.drain().await?;
                     // a Begin with the same nonce sends the staged
@@ -226,7 +219,7 @@ impl Stage {
         }
     }
 
-    async fn stage(&mut self, app: &Arc<App>, records: Vec<ImportedRecord>, nodes: Vec<(Cid, Arc<[u8]>)>) -> XResult<()> {
+    async fn stage(&mut self, app: &Arc<App>, records: Vec<ImportedRecord>, nodes: Vec<(Cid, Arc<[u8]>)>, bloom_words: usize) -> XResult<()> {
         let t = self.ticket(app).await?;
         let did = self.did.clone();
         let (mut muts, links, colls) = tokio::task::spawn_blocking(move || rows(&did, t, records, nodes)).await.map_err(XrpcError::from_err)?;
@@ -235,7 +228,7 @@ impl Stage {
             self.ack_oldest().await?;
         }
         self.batch += 1;
-        self.backlinks(app, t.gen, links, &mut muts).await?;
+        self.backlinks(app, t.gen, links, &mut muts, bloom_words).await?;
         let rx = queue(app, &self.did, ImportStep::Rows { nonce: self.nonce, epoch: t.epoch, muts })?;
         self.inflight.push_back((self.batch, rx));
         Ok(())
@@ -258,7 +251,7 @@ impl Stage {
     /// The `bl/` values of a batch's links: its rkeys added to what earlier
     /// batches wrote (records come in key order, so a collection's rkeys
     /// only ever append).
-    async fn backlinks(&mut self, app: &App, gen: u64, links: Vec<(Vec<u8>, Box<str>)>, muts: &mut Vec<crate::segment::Mutation>) -> XResult<()> {
+    async fn backlinks(&mut self, app: &App, gen: u64, links: Vec<(Vec<u8>, Box<str>)>, muts: &mut Vec<crate::segment::Mutation>, bloom_words: usize) -> XResult<()> {
         let mut by_link: std::collections::BTreeMap<Vec<u8>, crate::backlinks::Rkeys> = Default::default();
         for (l, rkey) in links {
             by_link.entry(l).or_default().push(rkey);
@@ -277,7 +270,7 @@ impl Stage {
             v.extend(rkeys);
             v.sort();
             v.dedup();
-            self.seen.insert(&l);
+            self.seen.insert(&l, bloom_words);
             muts.push(crate::segment::Mutation { key: state::backlink_key(&self.did, gen, &l).into(), val: Some(crate::backlinks::encode(&v)) });
             self.recent.insert(l, (self.batch, v));
         }
@@ -376,36 +369,64 @@ async fn collections<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, g
     }
 }
 
-/// A fixed-size bloom filter: 4 MiB, allocated on first use (~6% false
-/// positives at 5M links, each costing one point read).
+/// Links staged so far, as bloom filters sized to the repo: the first at
+/// the reservation's estimate when the first link comes, then each 4x the
+/// last once it holds its share (a body larger than estimated), up to 4 MiB
+/// each (~6% false positives at 5M links; each costs one point read).
 #[derive(Default)]
 struct Bloom {
-    bits: Vec<u64>,
+    layers: Vec<BloomLayer>,
     hasher: std::collections::hash_map::RandomState,
 }
 
-impl Bloom {
-    const WORDS: usize = 1 << 19;
+struct BloomLayer {
+    bits: Vec<u64>,
+    keys: usize,
+}
 
-    fn probes(&self, k: &[u8]) -> [usize; 3] {
-        use std::hash::BuildHasher;
-        let h = self.hasher.hash_one(k);
+impl BloomLayer {
+    fn probes(&self, h: u64) -> [usize; 3] {
         let h2 = h.rotate_left(32) | 1;
-        let bits = (Self::WORDS * 64) as u64;
+        let bits = (self.bits.len() * 64) as u64;
         [0u64, 1, 2].map(|i| (h.wrapping_add(i.wrapping_mul(h2)) % bits) as usize)
     }
 
-    fn insert(&mut self, k: &[u8]) {
-        if self.bits.is_empty() {
-            self.bits = vec![0; Self::WORDS];
+    fn full(&self) -> bool {
+        self.bits.len() < super::import_budget::MAX_BLOOM_WORDS && self.keys * super::import_budget::BLOOM_BITS_PER_LINK as usize >= self.bits.len() * 64
+    }
+}
+
+impl Bloom {
+    fn hash(&self, k: &[u8]) -> u64 {
+        use std::hash::BuildHasher;
+        self.hasher.hash_one(k)
+    }
+
+    fn insert(&mut self, k: &[u8], words: usize) {
+        let h = self.hash(k);
+        let words = match self.layers.last() {
+            None => words,
+            Some(l) if l.full() => (l.bits.len() * 4).min(super::import_budget::MAX_BLOOM_WORDS),
+            Some(_) => 0,
+        };
+        if words > 0 {
+            self.layers.push(BloomLayer { bits: vec![0; words.max(1)], keys: 0 });
         }
-        for b in self.probes(k) {
-            self.bits[b / 64] |= 1 << (b % 64);
+        let l = self.layers.last_mut().expect("a layer");
+        for b in l.probes(h) {
+            l.bits[b / 64] |= 1 << (b % 64);
         }
+        l.keys += 1;
     }
 
     fn maybe(&self, k: &[u8]) -> bool {
-        !self.bits.is_empty() && self.probes(k).iter().all(|b| self.bits[b / 64] & (1 << (b % 64)) != 0)
+        let h = self.hash(k);
+        self.layers.iter().any(|l| l.probes(h).iter().all(|b| l.bits[b / 64] & (1 << (b % 64)) != 0))
+    }
+
+    #[cfg(test)]
+    fn words(&self) -> usize {
+        self.layers.iter().map(|l| l.bits.len()).sum()
     }
 }
 
@@ -507,4 +528,25 @@ pub fn spawn_import_gc(app: Arc<App>) -> tokio::task::JoinHandle<()> {
             sweep_pending(&app).await;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sized from the estimate, grown in layers past it, never a false
+    /// negative.
+    #[test]
+    fn bloom_grows_past_its_estimate() {
+        let mut b = Bloom::default();
+        let key = |i: u32| format!("at://did:plc:x/app.bsky.feed.post/{i}").into_bytes();
+        assert!(!b.maybe(&key(0)));
+        for i in 0..100_000 {
+            b.insert(&key(i), 16);
+        }
+        assert!((0..100_000).all(|i| b.maybe(&key(i))));
+        assert!(b.layers.len() > 1 && b.words() < 1 << 18, "{} layers, {} words", b.layers.len(), b.words());
+        let fp = (100_000..110_000).filter(|i| b.maybe(&key(*i))).count();
+        assert!(fp < 1000, "{fp} false positives in 10,000");
+    }
 }

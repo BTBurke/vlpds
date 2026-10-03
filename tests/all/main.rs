@@ -56,6 +56,7 @@ mod handle_validation;
 mod handles;
 mod harness;
 mod identity_races;
+mod import_admission;
 mod import_bench;
 mod import_burst;
 mod import_limits;

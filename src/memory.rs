@@ -104,7 +104,8 @@ pub struct Fixed {
     pub backfill_readahead: u64,
     pub max_backfills: u64,
     pub max_exports: u64,
-    pub max_import: u64,
+    /// None: [`crate::xrpc::import_budget::budget_share`] of the budget.
+    pub import_memory: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -159,7 +160,7 @@ pub fn plan(s: &Settings, f: &Fixed, limit: Option<u64>) -> anyhow::Result<Plan>
         ("firehose", f.firehose_ring + f.live_ring + f.merge_queue),
         ("backfill", f.backfill_cache + f.backfill_readahead * f.max_backfills),
         ("exports", crate::xrpc::export_memory_bytes(f.max_exports as usize)),
-        ("import", f.max_import.min(crate::xrpc::IMPORT_MEMORY_BYTES as u64)),
+        ("import", f.import_memory.unwrap_or(crate::xrpc::import_budget::budget_share(budget))),
         ("headroom", headroom(budget)),
     ];
     let fixed: u64 = parts.iter().map(|(_, b)| b).sum();
@@ -234,6 +235,7 @@ impl Plan {
             "pool_mb": mb(self.pool),
             "explicit_mb": {"block": self.block.map(mb), "meta": self.meta.map(mb), "repo": self.repo.map(mb)},
             "initial_mb": {"meta": mb(s.meta), "block": mb(s.block), "repo": mb(s.repo)},
+            "imports": crate::xrpc::import_budget::plan_json(self.part("import")),
         })
     }
 }
@@ -539,7 +541,7 @@ mod tests {
             backfill_readahead: 64 * MIB,
             max_backfills: 16,
             max_exports: 32,
-            max_import: 1 << 30,
+            import_memory: None,
         }
     }
 
@@ -555,7 +557,8 @@ mod tests {
         assert_eq!(p.part("backfill"), (256 + 64 * 16) * MIB);
         // 32 exports: 8 MiB each + the full 512 MiB read-ahead pool
         assert_eq!(p.part("exports"), (32 * 8 + 512) * MIB);
-        assert_eq!(p.part("import"), crate::xrpc::IMPORT_MEMORY_BYTES as u64);
+        // imports: 1/16 of the budget, at most 1 GiB
+        assert_eq!(p.part("import"), GIB);
         assert_eq!(p.pool + p.fixed(), p.budget);
         // the pool: metadata first, then block and repo evenly
         let s = p.split(GIB);
@@ -576,6 +579,8 @@ mod tests {
         assert_eq!(p.budget, 5 * GIB / 2);
         assert_eq!(p.part("headroom"), MIN_HEADROOM);
         assert_eq!(p.part("exports"), (4 * 8 + 64) * MIB);
+        // imports: 1/16 of 2.5 GiB is under the 192 MiB floor
+        assert_eq!(p.part("import"), 192 * MIB);
         // a tiny node still gets ~1 GB of caches
         assert!(p.pool > 768 * MIB && p.pool < 1280 * MIB, "{}", p.pool >> 20);
 

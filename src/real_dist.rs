@@ -45,7 +45,8 @@ pub const REAL_DIST: &[(u32, u32, u64)] = &[
 ];
 
 
-/// Records at the `q` quantile of repos (0 <= q <= 1), by bucket.
+/// Records at the `q` quantile of all repos (0 <= q <= 1): the low end of
+/// its bucket (the top one at 1).
 pub fn quantile(q: f64) -> u32 {
     let total: u64 = REAL_DIST.iter().map(|b| b.2).sum();
     let want = (q * total as f64).ceil().max(1.0) as u64;
@@ -78,12 +79,14 @@ pub fn draw(u1: f64, u2: f64) -> u32 {
 mod tests {
     use super::*;
 
+    /// Over all repos, the empty ones included (the crawl's figures above
+    /// are over repos with records).
     #[test]
     fn quantiles_match_the_crawl() {
-        assert_eq!(quantile(0.5), 10);
-        assert!((363..=430).contains(&quantile(0.9)), "{}", quantile(0.9));
-        assert!((8934..=10623).contains(&quantile(0.99)), "{}", quantile(0.99));
-        assert!((55110..=65535).contains(&quantile(0.999)), "{}", quantile(0.999));
+        assert_eq!(quantile(0.5), 7);
+        assert!((305..=331).contains(&quantile(0.9)), "{}", quantile(0.9));
+        assert!((8192..=8933).contains(&quantile(0.99)), "{}", quantile(0.99));
+        assert!((55110..=60096).contains(&quantile(0.999)), "{}", quantile(0.999));
         assert_eq!(quantile(1.0), 593772);
     }
 }

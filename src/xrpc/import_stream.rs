@@ -15,6 +15,7 @@
 //! then in a temporary file, so a big streamed import holds only what its
 //! batches in flight reference.
 
+use super::import_budget::Reservation;
 use super::repo::{imported_record_blobs, parse_import, ImportedRecord};
 use super::*;
 use crate::car_order::{Next, Walk};
@@ -26,15 +27,15 @@ use tokio::sync::mpsc;
 
 /// Chunks queued for the parser: hyper's are up to a few hundred KB.
 const QUEUE: usize = 32;
-/// A batch is handed out at this many records or record bytes.
-const BATCH_RECORDS: usize = 4096;
-const BATCH_BYTES: usize = 4 << 20;
+/// A batch is handed out at this many records, or at the import's batch
+/// bytes (`import_budget::sizing`).
+pub(super) const BATCH_RECORDS: usize = 4096;
 /// Batches parsed ahead of the one being staged.
-const ITEMS_AHEAD: usize = 2;
+pub(super) const ITEMS_AHEAD: usize = 2;
 /// Bodies up to this size stay in memory for the fallback.
 pub(super) const SPILL_AFTER: usize = 16 << 20;
 
-fn too_large(max: usize) -> XrpcError {
+pub(super) fn too_large(max: usize) -> XrpcError {
     XrpcError {
         status: StatusCode::PAYLOAD_TOO_LARGE,
         error: "PayloadTooLarge".into(),
@@ -61,18 +62,13 @@ enum Chunk {
 }
 
 /// Reads the body (at most `max` bytes) and parses it on the blocking pool;
-/// the items arrive on the receiver, at most [`ITEMS_AHEAD`] ahead.
-pub(super) fn start(body: Body, headers: &HeaderMap, max: usize) -> XResult<mpsc::Receiver<XResult<Item>>> {
-    let declared = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-    if declared.is_some_and(|n| n > max as u64) {
-        return Err(too_large(max));
-    }
+/// the items arrive on the receiver, at most [`ITEMS_AHEAD`] ahead. The
+/// reservation grows as the body passes what it covers.
+pub(super) fn start(body: Body, max: usize, res: Arc<Reservation>) -> mpsc::Receiver<XResult<Item>> {
     let (tx, rx) = mpsc::channel::<Chunk>(QUEUE);
     let (items_tx, items_rx) = mpsc::channel(ITEMS_AHEAD);
-    tokio::task::spawn_blocking(move || parse(rx, items_tx));
+    let parse_res = res.clone();
+    tokio::task::spawn_blocking(move || parse(rx, items_tx, &parse_res));
     tokio::spawn(async move {
         let mut stream = body.into_data_stream();
         let mut total = 0usize;
@@ -89,13 +85,17 @@ pub(super) fn start(body: Body, headers: &HeaderMap, max: usize) -> XResult<mpsc
                 let _ = tx.send(Chunk::Fail(too_large(max))).await;
                 return;
             }
+            if let Err(e) = res.cover(total as u64).await {
+                let _ = tx.send(Chunk::Fail(e)).await;
+                return;
+            }
             if !chunk.is_empty() && tx.send(Chunk::Data(chunk)).await.is_err() {
                 return;
             }
         }
         let _ = tx.send(Chunk::End).await;
     });
-    Ok(items_rx)
+    items_rx
 }
 
 /// Why the single pass stopped early.
@@ -110,6 +110,7 @@ enum Stop {
 /// Batches records and builds the tree as they come.
 struct Sink<'a> {
     tx: &'a mpsc::Sender<XResult<Item>>,
+    res: &'a Reservation,
     builder: StreamBuilder,
     records: Vec<ImportedRecord>,
     nodes: Vec<(Cid, Arc<[u8]>)>,
@@ -118,8 +119,8 @@ struct Sink<'a> {
 }
 
 impl<'a> Sink<'a> {
-    fn new(tx: &'a mpsc::Sender<XResult<Item>>) -> Self {
-        Sink { tx, builder: StreamBuilder::default(), records: Vec::new(), nodes: Vec::new(), bytes: 0, sent: false }
+    fn new(tx: &'a mpsc::Sender<XResult<Item>>, res: &'a Reservation) -> Self {
+        Sink { tx, res, builder: StreamBuilder::default(), records: Vec::new(), nodes: Vec::new(), bytes: 0, sent: false }
     }
 
     fn record(&mut self, r: ImportedRecord) -> Result<(), Stop> {
@@ -127,7 +128,7 @@ impl<'a> Sink<'a> {
         self.builder.push(key, r.1, &mut self.nodes).map_err(|_| Stop::Depart)?;
         self.bytes += r.2.len();
         self.records.push(r);
-        if self.records.len() >= BATCH_RECORDS || self.bytes >= BATCH_BYTES {
+        if self.records.len() >= BATCH_RECORDS || self.bytes >= self.res.sizing().batch_bytes {
             self.flush()?;
         }
         Ok(())
@@ -145,9 +146,9 @@ impl<'a> Sink<'a> {
 }
 
 /// The parse thread: the single pass, else the buffered parse.
-fn parse(rx: mpsc::Receiver<Chunk>, tx: mpsc::Sender<XResult<Item>>) {
+fn parse(rx: mpsc::Receiver<Chunk>, tx: mpsc::Sender<XResult<Item>>, res: &Reservation) {
     let mut input = Input::new(rx);
-    let mut sink = Sink::new(&tx);
+    let mut sink = Sink::new(&tx, res);
     let sent = match stream(&mut input, &mut sink) {
         Ok((root, records, nodes)) => {
             let _ = tx.blocking_send(Ok(Item::Done { root, records, nodes, path: "stream" }));
@@ -159,7 +160,18 @@ fn parse(rx: mpsc::Receiver<Chunk>, tx: mpsc::Sender<XResult<Item>>) {
     if sent && tx.blocking_send(Ok(Item::Restart)).is_err() {
         return;
     }
-    let _one = futures::executor::block_on(super::staged_import::BUFFERED.acquire()).expect("never closed");
+    if input.end == End::Aborted {
+        if let Err(e) = input.rest() {
+            let _ = tx.blocking_send(Err(e));
+        }
+        return;
+    }
+    let _one = futures::executor::block_on(res.budget().buffered.acquire()).expect("never closed");
+    // the whole body and its parse, counted before reading the rest
+    if let Err(e) = futures::executor::block_on(res.buffered(input.received as u64)) {
+        let _ = tx.blocking_send(Err(e));
+        return;
+    }
     let r = input.rest().and_then(|body| {
         let (records, tree) = parse_import(&body)?;
         drop(tree);
@@ -172,7 +184,7 @@ fn parse(rx: mpsc::Receiver<Chunk>, tx: mpsc::Sender<XResult<Item>>) {
             return;
         }
     };
-    let mut sink = Sink::new(&tx);
+    let mut sink = Sink::new(&tx, res);
     for r in records {
         if sink.record(r).is_err() {
             return;
@@ -252,6 +264,11 @@ fn stream(input: &mut Input, sink: &mut Sink) -> Result<(Bytes, u64, u64), Stop>
     // further blocks are only checked against their CIDs, as there
     while !input.at_end() {
         input.block().ok_or(Stop::Depart)?;
+    }
+    // a body cut short (or refused by the pump) fails as the buffered parse
+    // would, even after a whole CAR
+    if input.end == End::Aborted {
+        return Err(Stop::Depart);
     }
     sink.flush()?;
     let block = root.bytes.as_deref().map(Bytes::copy_from_slice).ok_or(Stop::Depart)?;
@@ -539,6 +556,10 @@ mod tests {
 
     type Parsed = XResult<(Vec<ImportedRecord>, Cid)>;
 
+    fn unbounded() -> Arc<Reservation> {
+        futures::executor::block_on(super::super::import_budget::ImportBudget::new(1 << 40, std::time::Duration::ZERO).admit(None)).ok().expect("room")
+    }
+
     /// Feeds `car` in chunks of `chunk` bytes, as a request body would, and
     /// collects what the parse hands out: the records (those before a
     /// restart dropped), the root, the path. Also checks the batches' nodes
@@ -550,7 +571,7 @@ mod tests {
         }
         tx.try_send(Chunk::End).ok().unwrap();
         let (itx, mut irx) = mpsc::channel(1 << 16);
-        parse(rx, itx);
+        parse(rx, itx, &unbounded());
         let (mut recs, mut nodes) = (Vec::new(), HashMap::new());
         loop {
             match irx.try_recv().expect("an item") {
@@ -607,6 +628,53 @@ mod tests {
                 assert_eq!(summary(&got), want, "n={n} chunk={chunk}");
             }
         }
+    }
+
+    /// A body past its Content-Length's estimate grows the reservation as
+    /// it arrives; with no room to grow the import fails with a retryable
+    /// 503 and holds nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bodies_past_their_estimate_grow_the_reservation() {
+        use super::super::import_budget::{sizing, ImportBudget};
+        let car = repo(20_000).streamed();
+        let chunked = |car: Vec<u8>| Body::from_stream(futures::stream::iter(car.chunks(8192).map(|c| Ok::<_, std::io::Error>(Bytes::copy_from_slice(c))).collect::<Vec<_>>()));
+        let budget = ImportBudget::new(64 << 20, std::time::Duration::from_millis(100));
+        let res = budget.admit(Some(100)).await.ok().expect("room");
+        let before = res.held();
+        let mut items = start(chunked(car.clone()), usize::MAX, res.clone());
+        loop {
+            match items.recv().await.expect("an item") {
+                Ok(Item::Batch { .. }) => {}
+                Ok(Item::Done { records, path, .. }) => {
+                    assert_eq!((records, path), (20_000, "stream"));
+                    break;
+                }
+                Ok(Item::Restart) => panic!("restart"),
+                Err(e) => panic!("{}", e.message),
+            }
+        }
+        assert!(res.car() >= car.len() as u64 && res.held() > before);
+        assert_eq!(res.held(), sizing(res.car()).working_set);
+        drop((items, res));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(budget.reserved(), 0);
+
+        // no room to grow: 503, nothing left reserved
+        let budget = ImportBudget::new(2 << 20, std::time::Duration::from_millis(100));
+        let other = budget.admit(Some(100)).await.ok().expect("room");
+        let res = budget.admit(Some(100)).await.ok().expect("room");
+        let mut items = start(chunked(car), usize::MAX, res);
+        let e = loop {
+            match items.recv().await.expect("an item") {
+                Err(e) => break e,
+                Ok(Item::Done { .. }) => panic!("imported past the budget"),
+                Ok(_) => {}
+            }
+        };
+        assert_eq!((e.status, e.error.as_str()), (StatusCode::SERVICE_UNAVAILABLE, "Overloaded"));
+        drop((items, other));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// Other orders fall back, with the same result.

@@ -19,6 +19,7 @@ pub mod oauth;
 pub(crate) mod proxy;
 mod ratelimits;
 mod repo;
+pub mod import_budget;
 mod import_stream;
 pub mod staged_import;
 mod server;
@@ -31,7 +32,8 @@ pub use blobs::spawn_blob_gc;
 pub use server::{drop_revocation, set_delete_crash_hook, reset_token_did, revocation_expired, set_stale_claim_grace, spawn_reserved_key_gc, sweep_reserved_keys};
 pub use server::{auth_epoch, auth_epoch_cond, epoch_for_login, new_auth_epoch_op, AUTH_EPOCH};
 pub use sync::{export_memory_bytes, request_crawl, set_export_prefetch_max_bytes, size_export_prefetch_pool, DEFAULT_EXPORT_STALL, DEFAULT_MAX_EXPORTS};
-pub use repo::{DEFAULT_MAX_IMPORT_BYTES, IMPORT_MEMORY_BYTES};
+pub use import_budget::ImportBudget;
+pub use repo::DEFAULT_MAX_IMPORT_BYTES;
 pub use server::{LogMailer, Mail, Mailer};
 pub(crate) use server::SEC;
 
@@ -86,6 +88,8 @@ pub struct App {
     /// Repo-view reads queued at the workers, held the same way.
     pub read_permits: Arc<tokio::sync::Semaphore>,
     pub exports: Arc<tokio::sync::Semaphore>,
+    /// importRepo admission (`import_budget`).
+    pub imports: Arc<import_budget::ImportBudget>,
     pub admin_token: String,
     pub config: Arc<crate::server::Config>,
     pub did_resolver: Arc<crate::did_resolver::DidResolver>,
