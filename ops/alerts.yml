@@ -247,16 +247,6 @@ groups:
           summary: "{{ $labels.instance }} failed to open {{ $value | printf \"%.0f\" }} shard(s) in the last 15 minutes"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsshardopenerrors"
 
-      # Planned handoffs whose recipient couldn't be asked to warm its caches
-      # first: it serves those shards cold (an error burst at the move).
-      - alert: VlpdsShardPrewarmFailed
-        expr: sum by (instance) (increase(vlpds_shard_prewarm_total{job="vlpds",result="failed"}[15m])) > 0
-        labels:
-          severity: ticket
-        annotations:
-          summary: "{{ $labels.instance }} handed off {{ $value | printf \"%.0f\" }} shard(s) without prewarming the recipient in the last 15 minutes"
-          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsshardprewarmfailed"
-
       # A batch of shard opens that replayed a dead owner's log tail took over
       # 20 s (the 20.48 s bucket) before serving. Checkpoints every 10 s keep
       # replay to seconds normally (guess).
