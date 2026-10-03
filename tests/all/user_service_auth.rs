@@ -119,8 +119,11 @@ async fn bad_user_service_tokens_are_refused_with_the_reference_errors() {
     }
 
     // expired
-    let t = service_token(&s, &a, &pds, Some(UPLOAD), Some(now() + 1)).await;
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let exp = now() + 1;
+    let t = service_token(&s, &a, &pds, Some(UPLOAD), Some(exp)).await;
+    while vlpds::tid::now_micros() as f64 / 1e6 <= exp as f64 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_err(&upload(&s, &t, body()).await, 401, "JwtExpired", "jwt expired");
 
     // signed by another user's key: bob's token, claiming to be alice's

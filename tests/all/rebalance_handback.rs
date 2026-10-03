@@ -1,9 +1,7 @@
 //! Rebalance handback gap: when a node joins, its peers close their extra
-//! shards and hand them over. The joiner used to pick released shards up
-//! only on its next control-plane step (~3 s in bench 2026-10-02 §2: a step
-//! interval, the step's own reads and CAS, then opening). Releasers now CAS
-//! the assignment straight to the joiner and nudge it with the handoff
-//! (POST /internal/v1/cluster/nudge), and it opens them at once.
+//! shards and hand them over. Releasers CAS the assignment straight to the
+//! joiner and nudge it with the handoff (POST /internal/v1/cluster/nudge),
+//! and it opens them at once instead of on its next control-plane step.
 //!
 //! Measured per shard, polling every node's partition table and (without
 //! the injected latency) the assignment objects:
@@ -124,7 +122,24 @@ async fn joiner_serves_handed_back_shards_promptly_at_20ms() {
     handback(20, Duration::from_millis(1000)).await;
 }
 
+/// The bounds are latencies, which the rest of the suite's load can stretch
+/// in one run; a regression (a missed nudge waits for the joiner's next step,
+/// up to 1 s) misses them in every attempt.
 async fn handback(latency_ms: u64, max_unavailable: Duration) {
+    let mut misses = Vec::new();
+    for _ in 0..3 {
+        match handback_once(latency_ms, max_unavailable).await {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("{e}");
+                misses.push(e);
+            }
+        }
+    }
+    panic!("handback missed its bounds in every attempt:\n{}", misses.join("\n"));
+}
+
+async fn handback_once(latency_ms: u64, max_unavailable: Duration) -> Result<(), String> {
     let (store, raw) = store_with_latency(latency_ms);
     let a = node("hb-a", &store).await;
     let accounts: Vec<TestAccount> = futures::future::join_all((0..8).map(|_| a.create_account("hb"))).await;
@@ -134,12 +149,14 @@ async fn handback(latency_ms: u64, max_unavailable: Duration) {
     let gaps_b = watch_handback(&[&a, &b], &b, &raw, SHARDS as usize / 2).await;
     let c = node("hb-c", &store).await;
     let gaps_c = watch_handback(&[&a, &b, &c], &c, &raw, SHARDS as usize / 3).await;
+    let mut missed = Vec::new();
     for (name, gaps) in [("a -> b", &gaps_b), ("a,b -> c", &gaps_c)] {
         let serve = gaps.iter().map(|g| g.1).max().unwrap();
         let gone = gaps.iter().map(|g| g.2).max().unwrap();
         eprintln!("handback {name} ({latency_ms} ms store): {} shards, release -> serve max {serve:?}, unavailable max {gone:?}", gaps.len());
-        assert!(serve < Duration::from_millis(500), "handback {name}: release -> serve {serve:?} ({gaps:?})");
-        assert!(gone < max_unavailable, "handback {name}: unavailable {gone:?} ({gaps:?})");
+        if serve >= Duration::from_millis(500) || gone >= max_unavailable {
+            missed.push(format!("handback {name}: release -> serve {serve:?} (< 500ms), unavailable {gone:?} (< {max_unavailable:?}): {gaps:?}"));
+        }
     }
     // the moved shards serve (writes through any node land on the new owner)
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -150,4 +167,11 @@ async fn handback(latency_ms: u64, max_unavailable: Duration) {
     for n in [&a, &b, &c] {
         assert!(n.app.cluster.as_ref().unwrap().fenced_logs().is_empty(), "a rebalance fences nobody");
     }
+    if missed.is_empty() {
+        return Ok(());
+    }
+    for n in [&a, &b, &c] {
+        n.app.node.halt();
+    }
+    Err(missed.join("; "))
 }

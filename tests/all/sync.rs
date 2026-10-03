@@ -132,11 +132,10 @@ async fn get_repo_since_returns_diff() {
     let diff = Repo::from_car(&resp.body).unwrap();
     diff.check_block_hashes().unwrap();
     assert_eq!(Some(diff.root.to_string()), r.commit_cid, "diff root is the new commit");
-    // Only new data: no record block from before `since`. (This used to be
-    // `blocks < 10`, which depended on the random MST shape: vlpds sends the
-    // commit, the MST nodes and the new records — a superset of the
-    // reference's rev-filtered block set, by design — so it failed whenever
-    // 20 random TIDs made a wide tree.) Every other block is an MST node.
+    // only new data: no record block from before `since`. vlpds sends the
+    // commit, the MST nodes and the new records (a superset of the
+    // reference's rev-filtered block set, so the count depends on the MST
+    // shape); every other block is an MST node
     let rec_cid = Cid::parse(&r.cid).unwrap();
     for (path, (cid, _)) in &model {
         assert!(!diff.blocks.contains_key(&Cid::parse(cid).unwrap()), "diff carries the unchanged record {path}");
@@ -258,23 +257,12 @@ async fn list_blobs() {
     assert_eq!(lb["cids"], json!([blob_cid]));
 }
 
-async fn takedown(s: &TestServer, did: &str, applied: bool) {
-    s.xrpc
-        .post(
-            "com.atproto.admin.updateSubjectStatus",
-            &json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": did}, "takedown": {"applied": applied}}),
-            &Auth::Admin,
-        )
-        .await
-        .ok();
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn repo_takedown_visibility() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
     let r = s.post(&a, "hi").await;
-    takedown(&s, &a.did, true).await;
+    set_repo_takedown(&s, &a.did, true).await;
 
     let st = s.xrpc.get("com.atproto.sync.getRepoStatus", &[("did", &a.did)], &Auth::None).await.ok();
     assert_eq!(st["active"], json!(false));
@@ -298,7 +286,7 @@ async fn repo_takedown_visibility() {
     assert_eq!(admin.status, 200, "admin getRepo: {}", admin.text());
 
     // restore
-    takedown(&s, &a.did, false).await;
+    set_repo_takedown(&s, &a.did, false).await;
     let st = s.xrpc.get("com.atproto.sync.getRepoStatus", &[("did", &a.did)], &Auth::None).await.ok();
     assert_eq!(st["active"], json!(true));
     s.xrpc.get("com.atproto.sync.getRepo", &[("did", &a.did)], &Auth::None).await.ok();

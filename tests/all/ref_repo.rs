@@ -317,27 +317,13 @@ async fn ref_taken_down_actor_records_not_served() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
     let p = s.post(&a, "hello").await;
-    s.xrpc
-        .post(
-            "com.atproto.admin.updateSubjectStatus",
-            &json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": a.did}, "takedown": {"applied": true}}),
-            &Auth::Admin,
-        )
-        .await
-        .ok();
+    set_repo_takedown(&s, &a.did, true).await;
     let r = s.list_records(&a.did, "app.bsky.feed.post", &[]).await;
     r.err_status(400);
     assert!(r.text().contains("Could not find repo"), "{}", r.text());
     s.get_record(&a.did, "app.bsky.feed.post", p.rkey()).await.err_status(400);
     // restored
-    s.xrpc
-        .post(
-            "com.atproto.admin.updateSubjectStatus",
-            &json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": a.did}, "takedown": {"applied": false}}),
-            &Auth::Admin,
-        )
-        .await
-        .ok();
+    set_repo_takedown(&s, &a.did, false).await;
     let l = s.list_records(&a.did, "app.bsky.feed.post", &[]).await.ok();
     assert_eq!(l["records"].as_array().unwrap().len(), 1);
 }

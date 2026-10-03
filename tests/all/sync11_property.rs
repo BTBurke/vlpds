@@ -19,7 +19,6 @@
 use crate::common::*;
 use rand::{seq::SliceRandom, Rng, SeedableRng};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
 use std::time::Duration;
 
 // Not app.bsky.*: the generated records ({text, createdAt} under arbitrary
@@ -245,6 +244,50 @@ async fn exec(x: &Xrpc, a: &TestAccount, op: &Op) -> Result<Option<Ack>, String>
     }
 }
 
+/// Runs `ops` (account index, op) concurrently; results in the same order.
+async fn concurrently(x: &Xrpc, accts: &[TestAccount], ops: Vec<(usize, Op)>) -> Vec<(usize, Result<Option<Ack>, String>)> {
+    let hs: Vec<_> = ops
+        .into_iter()
+        .map(|(i, op)| {
+            let (x, a) = (x.clone(), accts[i].clone());
+            (i, tokio::spawn(async move { exec(&x, &a, &op).await }))
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (i, h) in hs {
+        out.push((i, h.await.unwrap()));
+    }
+    out
+}
+
+/// Client-side state: per-account models, acked writes, unexpected errors.
+struct Run {
+    models: Vec<Model>,
+    acks: Vec<Ack>,
+    errors: Vec<String>,
+}
+
+impl Run {
+    fn new(accounts: usize) -> Run {
+        Run { models: vec![Model::new(); accounts], acks: Vec::new(), errors: Vec::new() }
+    }
+
+    fn record(&mut self, i: usize, r: Result<Option<Ack>, String>, tag: &str) {
+        match r {
+            Ok(Some(a)) => {
+                apply_ack(&mut self.models[i], &a);
+                self.acks.push(a);
+            }
+            Ok(None) => {}
+            Err(e) => self.errors.push(format!("{tag}: {e}")),
+        }
+    }
+
+    fn assert_no_errors(&self) {
+        assert!(self.errors.is_empty(), "{} write errors:\n  {}", self.errors.len(), self.errors.iter().take(30).cloned().collect::<Vec<_>>().join("\n  "));
+    }
+}
+
 fn apply_ack(model: &mut Model, ack: &Ack) {
     for (p, c) in &ack.effects {
         match c {
@@ -254,20 +297,16 @@ fn apply_ack(model: &mut Model, ack: &Ack) {
     }
 }
 
+/// Per DID: the last event's rev and data.
 #[derive(Default, Clone)]
-#[allow(dead_code)]
 struct Chain {
     rev: Option<String>,
     data: Option<Cid>,
-    commit: Option<Cid>,
 }
 
-/// Validates the whole event stream; returns (failures, per-DID repo state from ops).
-async fn validate_stream(
-    s: &TestServer,
-    frames: &[Frame],
-    keys: &HashMap<String, k256::ecdsa::VerifyingKey>,
-) -> (Vec<String>, HashMap<String, Model>, HashMap<String, Vec<CommitEvt>>) {
+/// Validates the whole event stream; returns (failures, per-DID repo state
+/// from ops, per-DID commits).
+fn validate_stream(frames: &[Frame], keys: &HashMap<String, k256::ecdsa::VerifyingKey>) -> (Vec<String>, HashMap<String, Model>, HashMap<String, Vec<CommitEvt>>) {
     let mut fails = Vec::new();
     let mut chains: HashMap<String, Chain> = HashMap::new();
     let mut state: HashMap<String, Model> = HashMap::new();
@@ -306,9 +345,9 @@ async fn validate_stream(
                         fails.push(format!("seq {seq} #sync {did}: rev {} not after {prev}", ev.rev));
                     }
                 }
-                *ch = Chain { rev: Some(ev.rev.clone()), data: Some(c.data), commit: Some(ev.commit) };
-                // a #sync resets the repo: recover its contents from getRepo is not
-                // possible historically; account creation syncs are empty repos.
+                *ch = Chain { rev: Some(ev.rev.clone()), data: Some(c.data) };
+                // a #sync resets the repo to what its blocks hold (account
+                // creation's: empty)
                 let tree = vlpds::mst::Tree::load_from_blocks(&ev.blocks, c.data);
                 let st = state.entry(did.clone()).or_default();
                 st.clear();
@@ -380,7 +419,7 @@ async fn validate_stream(
                     }
                     Err(e) => fails.push(format!("{tag}: inversion failed: {e}")),
                 }
-                *ch = Chain { rev: Some(ev.rev.clone()), data: Some(c.data), commit: Some(ev.commit) };
+                *ch = Chain { rev: Some(ev.rev.clone()), data: Some(c.data) };
                 let st = state.entry(did.clone()).or_default();
                 for op in &ev.ops {
                     match op.action.as_str() {
@@ -408,7 +447,6 @@ async fn validate_stream(
             other => fails.push(format!("seq {seq}: unexpected event type {other}")),
         }
     }
-    let _ = s;
     (fails, state, commits)
 }
 
@@ -436,74 +474,39 @@ async fn sync11_random_writes_firehose_invariants() {
     for i in 0..n_accounts {
         accts.push(s.create_account(&format!("p{i}")).await);
     }
-    let mut models: Vec<Model> = vec![Model::new(); n_accounts];
-    let mut acks: Vec<Ack> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
+    let mut run = Run::new(n_accounts);
 
     // phase 1: sequential random ops across accounts
     for _ in 0..(150 * scale()) {
         let i = g.rng.gen_range(0..n_accounts);
-        let op = g.op(&models[i], &mut Default::default(), true);
-        match exec(&s.xrpc, &accts[i], &op).await {
-            Ok(Some(a)) => {
-                apply_ack(&mut models[i], &a);
-                acks.push(a);
-            }
-            Ok(None) => {}
-            Err(e) => errors.push(format!("phase1: {e}")),
-        }
+        let op = g.op(&run.models[i], &mut Default::default(), true);
+        let r = exec(&s.xrpc, &accts[i], &op).await;
+        run.record(i, r, "phase1");
     }
 
     // phase 2: coalescing bursts on one hot repo (ops on distinct paths)
     let hot = 0;
-    let x = Arc::new(s.xrpc.clone());
     for burst in 0..(4 * scale()) {
         let mut busy = Default::default();
-        let ops: Vec<Op> = (0..120).map(|_| g.op(&models[hot], &mut busy, burst % 2 == 1)).collect();
-        let handles: Vec<_> = ops
-            .into_iter()
-            .map(|op| {
-                let x = x.clone();
-                let a = accts[hot].clone();
-                tokio::spawn(async move { exec(&x, &a, &op).await })
-            })
-            .collect();
-        for h in handles {
-            match h.await.unwrap() {
-                Ok(Some(a)) => {
-                    apply_ack(&mut models[hot], &a);
-                    acks.push(a);
-                }
-                Ok(None) => {}
-                Err(e) => errors.push(format!("burst {burst}: {e}")),
-            }
+        let ops = (0..120).map(|_| (hot, g.op(&run.models[hot], &mut busy, burst % 2 == 1))).collect();
+        for (i, r) in concurrently(&s.xrpc, &accts, ops).await {
+            run.record(i, r, &format!("burst {burst}"));
         }
     }
 
     // phase 3: concurrent bursts across all repos at once
     for round in 0..(2 * scale()) {
-        let mut handles = Vec::new();
-        for (i, a) in accts.iter().enumerate() {
+        let mut ops = Vec::new();
+        for i in 0..n_accounts {
             let mut busy = Default::default();
-            for _ in 0..40 {
-                let op = g.op(&models[i], &mut busy, false);
-                let x = x.clone();
-                let a = a.clone();
-                handles.push((i, tokio::spawn(async move { exec(&x, &a, &op).await })));
-            }
+            ops.extend((0..40).map(|_| (i, g.op(&run.models[i], &mut busy, false))));
         }
-        for (i, h) in handles {
-            match h.await.unwrap() {
-                Ok(Some(a)) => {
-                    apply_ack(&mut models[i], &a);
-                    acks.push(a);
-                }
-                Ok(None) => {}
-                Err(e) => errors.push(format!("cross-repo round {round}: {e}")),
-            }
+        for (i, r) in concurrently(&s.xrpc, &accts, ops).await {
+            run.record(i, r, &format!("cross-repo round {round}"));
         }
     }
-    assert!(errors.is_empty(), "{} write errors:\n  {}", errors.len(), errors.iter().take(30).cloned().collect::<Vec<_>>().join("\n  "));
+    run.assert_no_errors();
+    let Run { models, acks, .. } = run;
 
     // wait until every repo's latest commit has been seen on the firehose
     let mut want: HashMap<String, String> = HashMap::new();
@@ -530,7 +533,7 @@ async fn sync11_random_writes_firehose_invariants() {
     for a in &accts {
         keys.insert(a.did.clone(), s.signing_key(&a.did).await);
     }
-    let (mut fails, state, commits) = validate_stream(&s, &frames, &keys).await;
+    let (mut fails, state, commits) = validate_stream(&frames, &keys);
 
     // acked writes appear in the commit they were acked with
     let mut by_commit: HashMap<(String, String), &CommitEvt> = HashMap::new();
@@ -630,31 +633,18 @@ async fn sync11_many_seeds_single_repo_bursts() {
     let s = TestServer::spawn().await;
     let mut sub = s.subscribe(Some(0)).await;
     let a = s.create_account("seeds").await;
-    let x = Arc::new(s.xrpc.clone());
-    let mut model = Model::new();
-    let mut errors = Vec::new();
+    let accts = [a.clone()];
+    let mut run = Run::new(1);
     for sd in 0..(12 * scale() as u64) {
         let mut g = Gen { rng: rand::rngs::StdRng::seed_from_u64(seed() ^ (sd * 7919)), n: sd * 100_000 };
         let mut busy = Default::default();
         let k = g.rng.gen_range(5..60);
-        let ops: Vec<Op> = (0..k).map(|_| g.op(&model, &mut busy, false)).collect();
-        let hs: Vec<_> = ops
-            .into_iter()
-            .map(|op| {
-                let x = x.clone();
-                let a = a.clone();
-                tokio::spawn(async move { exec(&x, &a, &op).await })
-            })
-            .collect();
-        for h in hs {
-            match h.await.unwrap() {
-                Ok(Some(ack)) => apply_ack(&mut model, &ack),
-                Ok(None) => {}
-                Err(e) => errors.push(e),
-            }
+        let ops = (0..k).map(|_| (0, g.op(&run.models[0], &mut busy, false))).collect();
+        for (i, r) in concurrently(&s.xrpc, &accts, ops).await {
+            run.record(i, r, &format!("seed {sd}"));
         }
     }
-    assert!(errors.is_empty(), "write errors: {errors:?}");
+    run.assert_no_errors();
     let head = s.latest_commit(&a.did).await.0;
     let frames = sub
         .until(Duration::from_secs(60), |fs| {
@@ -663,9 +653,9 @@ async fn sync11_many_seeds_single_repo_bursts() {
         .await;
     let mut keys = HashMap::new();
     keys.insert(a.did.clone(), s.signing_key(&a.did).await);
-    let (fails, state, _) = validate_stream(&s, &frames, &keys).await;
+    let (fails, state, _) = validate_stream(&frames, &keys);
     assert!(fails.is_empty(), "{} violations:\n  {}", fails.len(), fails.iter().take(40).cloned().collect::<Vec<_>>().join("\n  "));
-    assert_eq!(state.get(&a.did).cloned().unwrap_or_default(), model, "firehose replay != model");
+    assert_eq!(state.get(&a.did).cloned().unwrap_or_default(), run.models[0], "firehose replay != model");
 }
 
 fn set(body: &mut Value, key: &str, v: Value) {
@@ -697,18 +687,18 @@ async fn validator_detects_tampering() {
         .await;
     let mut keys = HashMap::new();
     keys.insert(a.did.clone(), s.signing_key(&a.did).await);
-    let (fails, _, _) = validate_stream(&s, &frames, &keys).await;
+    let (fails, _, _) = validate_stream(&frames, &keys);
     assert!(fails.is_empty(), "untampered stream failed: {fails:?}");
 
     let idx = frames.len() - 1;
     // 1. wrong since
     let mut t = frames.clone();
     set(&mut t[idx].body, "since", Value::Text("2222222222222".into()));
-    assert!(validate_stream(&s, &t, &keys).await.0.iter().any(|f| f.contains("since")), "since tamper not detected");
+    assert!(validate_stream(&t, &keys).0.iter().any(|f| f.contains("since")), "since tamper not detected");
     // 2. wrong prevData
     let mut t = frames.clone();
     set(&mut t[idx].body, "prevData", Value::Link(Cid::dag_cbor(b"nope")));
-    assert!(validate_stream(&s, &t, &keys).await.0.iter().any(|f| f.contains("prevData")), "prevData tamper not detected");
+    assert!(validate_stream(&t, &keys).0.iter().any(|f| f.contains("prevData")), "prevData tamper not detected");
     // 3. drop an MST node from blocks (inversion must fail)
     let ev = frames[idx].commit().unwrap();
     let data = ev.commit_obj().data;
@@ -721,12 +711,12 @@ async fn validator_detects_tampering() {
     }
     let mut t = frames.clone();
     set(&mut t[idx].body, "blocks", Value::Bytes(car));
-    assert!(validate_stream(&s, &t, &keys).await.0.iter().any(|f| f.contains("inversion") || f.contains("inverted")), "missing proof block not detected");
+    assert!(validate_stream(&t, &keys).0.iter().any(|f| f.contains("inversion") || f.contains("inverted")), "missing proof block not detected");
     // 4. wrong signing key
     let other = vlpds::crypto::Keypair::generate();
     let mut k2 = HashMap::new();
     k2.insert(a.did.clone(), k256::ecdsa::VerifyingKey::from_sec1_bytes(&other.public_key_sec1()).unwrap());
-    assert!(validate_stream(&s, &frames, &k2).await.0.iter().any(|f| f.contains("signature")), "bad signature not detected");
+    assert!(validate_stream(&frames, &k2).0.iter().any(|f| f.contains("signature")), "bad signature not detected");
     // 5. op claims a different record CID than the tree holds
     let mut t = frames.clone();
     if let Some(Value::Array(ops)) = t[idx].body.get("ops").cloned() {
@@ -736,13 +726,13 @@ async fn validator_detects_tampering() {
     } else {
         panic!("no ops");
     }
-    assert!(validate_stream(&s, &t, &keys).await.0.iter().any(|f| f.contains("inversion") || f.contains("op says")), "op cid tamper not detected");
+    assert!(validate_stream(&t, &keys).0.iter().any(|f| f.contains("inversion") || f.contains("op says")), "op cid tamper not detected");
     // 6. a dropped event breaks the per-DID chain
     let mut t = frames.clone();
     t.remove(idx - 1);
-    assert!(validate_stream(&s, &t, &keys).await.0.iter().any(|f| f.contains("since") || f.contains("prevData")), "dropped event not detected");
+    assert!(validate_stream(&t, &keys).0.iter().any(|f| f.contains("since") || f.contains("prevData")), "dropped event not detected");
     // 7. reordered events (seq goes backwards)
     let mut t = frames.clone();
     t.swap(idx - 1, idx);
-    assert!(validate_stream(&s, &t, &keys).await.0.iter().any(|f| f.contains("seq not increasing")), "reordering not detected");
+    assert!(validate_stream(&t, &keys).0.iter().any(|f| f.contains("seq not increasing")), "reordering not detected");
 }

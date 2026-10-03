@@ -55,8 +55,7 @@ fn rand_value(rng: &mut impl Rng, depth: usize) -> Value {
 }
 
 fn car_blocks(rel: &str) -> (Vec<Cid>, Vec<(Cid, Vec<u8>)>) {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(rel);
-    let car = std::fs::read(path).unwrap();
+    let car = std::fs::read(fixture_path(rel)).unwrap();
     let (roots, blocks) = vlpds::car::read_car(&car).unwrap();
     (roots, blocks.into_iter().map(|(c, b)| (c, b.to_vec())).collect())
 }

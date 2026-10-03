@@ -16,13 +16,6 @@ fn for_did<'a>(fs: &'a [Frame], did: &str) -> Vec<&'a Frame> {
     fs.iter().filter(|f| f.did() == Some(did)).collect()
 }
 
-/// Subscribes from the current head of the stream: in-flight events from
-/// earlier requests (acked on durability, broadcast a tick later) are skipped.
-async fn subscribe_now(s: &TestServer) -> Sub {
-    let cur = s.current_seq().await;
-    s.subscribe(Some(cur)).await
-}
-
 async fn replay_all(s: &TestServer) -> Vec<Frame> {
     let mut sub = s.subscribe(Some(0)).await;
     sub.drain(IDLE).await
@@ -51,17 +44,6 @@ fn verify_identity_event(f: &Frame, did: &str, handle: &str) {
     assert_eq!(f.did(), Some(did));
     assert!(f.str("time").is_some());
     assert_eq!(f.str("handle"), Some(handle));
-}
-
-async fn admin_takedown(s: &TestServer, did: &str, applied: bool) {
-    s.xrpc
-        .post(
-            "com.atproto.admin.updateSubjectStatus",
-            &json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": did}, "takedown": {"applied": applied}}),
-            &Auth::Admin,
-        )
-        .await
-        .ok();
 }
 
 /// Rebuilds each repo's contents from the commit stream (checking signature,
@@ -256,9 +238,8 @@ async fn live_tail_without_cursor_has_no_backfill() {
     for i in 0..5 {
         s.post(&a, &format!("old {i}")).await;
     }
-    let old_max = s.current_seq().await;
+    let old_max = s.settled_now().await;
     let mut subs = vec![s.subscribe(None).await];
-    // Wait (by polling with probe writes) until the subscription is live.
     let probe_seq = s.sync_subs(&a, &mut subs).await;
     assert!(probe_seq > old_max, "the live tail starts after the old events");
     let mut sub = subs.pop().unwrap();
@@ -332,7 +313,7 @@ async fn identity_events_on_handle_change() {
     let b = s.create_account("bob").await;
     let new_a = format!("{}.{HANDLE_DOMAIN}", unique_name("alice"));
     let new_b = format!("{}.{HANDLE_DOMAIN}", unique_name("bob"));
-    let mut sub = subscribe_now(&s).await;
+    let mut sub = s.subscribe_from_now().await;
     s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": new_a}), &a.auth()).await.ok();
     s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": new_b}), &b.auth()).await.ok();
     // idempotent update re-sends the identity event
@@ -349,11 +330,11 @@ async fn account_events_deactivate_and_takedown() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
     let b = s.create_account("bob").await;
-    let mut sub = subscribe_now(&s).await;
+    let mut sub = s.subscribe_from_now().await;
     s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &a.auth()).await.ok();
     s.xrpc.post_empty("com.atproto.server.activateAccount", &a.auth()).await.ok();
-    admin_takedown(&s, &b.did, true).await;
-    admin_takedown(&s, &b.did, false).await;
+    set_repo_takedown(&s, &b.did, true).await;
+    set_repo_takedown(&s, &b.did, false).await;
     let frames = sub.until(FH_TIMEOUT, |fs| of_kind(fs, "#account").len() >= 4).await;
     let acc = of_kind(&frames, "#account");
     verify_account_event(acc[0], &a.did, false, Some("deactivated"));
@@ -366,10 +347,10 @@ async fn account_events_deactivate_and_takedown() {
 async fn interleaved_account_events() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    let mut sub = subscribe_now(&s).await;
+    let mut sub = s.subscribe_from_now().await;
     s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &a.auth()).await.ok();
-    admin_takedown(&s, &a.did, true).await;
-    admin_takedown(&s, &a.did, false).await;
+    set_repo_takedown(&s, &a.did, true).await;
+    set_repo_takedown(&s, &a.did, false).await;
     // vlpds revokes sessions on takedown (the TS PDS keeps access tokens
     // valid), so log in again to reactivate.
     let sess = s.create_session(&a.did, &a.password).await.ok();
@@ -390,7 +371,7 @@ async fn sync_event_on_account_activation() {
     let a = s.create_account("alice").await;
     s.post(&a, "hi").await;
     s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &a.auth()).await.ok();
-    let mut sub = subscribe_now(&s).await;
+    let mut sub = s.subscribe_from_now().await;
     s.xrpc.post_empty("com.atproto.server.activateAccount", &a.auth()).await.ok();
     let frames = sub.wait_for(FH_TIMEOUT, &a.did, "#sync").await;
     let sy = frames.last().unwrap().sync().unwrap();
@@ -406,7 +387,7 @@ async fn account_deletion_events() {
     let s = TestServer::spawn().await;
     let b1 = s.create_account("baddie").await;
     let b2 = s.create_account("baddie").await;
-    let mut sub = subscribe_now(&s).await;
+    let mut sub = s.subscribe_from_now().await;
 
     // user-initiated deletion with an emailed token
     s.xrpc.post_empty("com.atproto.server.requestAccountDelete", &b1.auth()).await.ok();
@@ -432,9 +413,8 @@ async fn errors_on_future_cursor() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
     s.post(&a, "hi").await;
-    let cur = s.current_seq().await;
-    // seqs are unix_micros*256 + partition; this is far beyond anything issued.
-    let future = cur.max(1) * 2 + 1_000_000_000;
+    // far beyond anything issued
+    let future = s.settled_now().await * 2 + 1_000_000_000;
     let mut sub = s.subscribe(Some(future)).await;
     let frames = sub.drain(Duration::from_secs(2)).await;
     assert_eq!(frames.len(), 1, "exactly one (error) frame: {:?}", frames.iter().map(|f| f.body.clone()).collect::<Vec<_>>());
@@ -445,12 +425,11 @@ async fn errors_on_future_cursor() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn outdated_cursor_info_or_full_replay() {
-    // With a tiny in-memory ring, an old cursor must either be served fully
-    // (from the log) or be preceded by an #info OutdatedCursor frame.
+    // with a tiny in-memory ring, an old cursor is either served fully (from
+    // the log) or preceded by an #info OutdatedCursor frame
     let s = TestServer::spawn_with(|c| c.firehose_ring_bytes = 4096).await;
     let a = s.create_account("alice").await;
-    let first = s.post(&a, "first").await;
-    let _ = first;
+    s.post(&a, "first").await;
     for i in 0..40 {
         s.post(&a, &format!("p {i}")).await;
     }

@@ -5,17 +5,6 @@
 //! the rest keep working.
 use crate::common::*;
 
-async fn take_down(s: &TestServer, did: &str) {
-    s.xrpc
-        .post(
-            "com.atproto.admin.updateSubjectStatus",
-            &json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": did}, "takedown": {"applied": true}}),
-            &Auth::Admin,
-        )
-        .await
-        .ok();
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn check_takedown_routes_refuse_legacy_tokens() {
     let s = TestServer::spawn().await;
@@ -25,7 +14,7 @@ async fn check_takedown_routes_refuse_legacy_tokens() {
     let app_pw = s.create_session(&a.handle, app_pw["password"].as_str().unwrap()).await.ok();
     let app_auth = Auth::Bearer(app_pw["accessJwt"].as_str().unwrap().to_string());
     let car = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &a.did)], &Auth::None).await.body.to_vec();
-    take_down(&s, &a.did).await;
+    set_repo_takedown(&s, &a.did, true).await;
 
     let post = |text: &str| json!({"$type": "app.bsky.feed.post", "text": text, "createdAt": now_iso()});
     let posts: Vec<(&str, J)> = vec![
@@ -86,14 +75,7 @@ async fn check_takedown_routes_refuse_legacy_tokens() {
 
     // the checks follow the account's status: lifting the takedown makes the
     // same (unexpired, unrevoked) access token work again
-    s.xrpc
-        .post(
-            "com.atproto.admin.updateSubjectStatus",
-            &json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": a.did}, "takedown": {"applied": false}}),
-            &Auth::Admin,
-        )
-        .await
-        .ok();
+    set_repo_takedown(&s, &a.did, false).await;
     s.post(&a, "after").await;
     // (the preferences route reads a status cached for up to 2 s)
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

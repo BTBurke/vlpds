@@ -139,6 +139,31 @@ async fn wait_for(what: &str, deadline: Duration, f: impl Fn() -> bool) {
     }
 }
 
+/// `s.create_account`, retried while password hashing sheds load (503
+/// Overloaded: the Argon2 permits are process-wide, shared with every test
+/// running at the time). // candidate for common
+async fn create_account_retrying(s: &TestServer, prefix: &str) -> TestAccount {
+    let t = Instant::now();
+    loop {
+        let handle = format!("{}.{HANDLE_DOMAIN}", unique_name(prefix));
+        let email = format!("{}@example.com", handle.replace('.', "-"));
+        let r = s.xrpc.post("com.atproto.server.createAccount", &json!({"handle": handle, "password": PASSWORD, "email": email}), &Auth::None).await;
+        if r.status == 503 && t.elapsed() < Duration::from_secs(60) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        let j = r.ok();
+        return TestAccount {
+            did: j["did"].as_str().unwrap().into(),
+            handle,
+            password: PASSWORD.into(),
+            email,
+            access: j["accessJwt"].as_str().unwrap().into(),
+            refresh: j["refreshJwt"].as_str().unwrap().into(),
+        };
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn takeover_cold_loads_stay_bounded_and_the_lease_renews() {
     let store = Arc::new(Pressure::default());
@@ -148,7 +173,8 @@ async fn takeover_cold_loads_stay_bounded_and_the_lease_renews() {
     wait_for("b gets its share", Duration::from_secs(10), || owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize).await;
 
     // accounts (a new account's DID lands on a shard of the node creating it)
-    let accounts: Vec<TestAccount> = futures::future::join_all((0..400).map(|_| b.create_account("press"))).await;
+    use futures::StreamExt;
+    let accounts: Vec<TestAccount> = futures::stream::iter(0..400).map(|_| create_account_retrying(&b, "press")).buffer_unordered(32).collect().await;
     let cold: Vec<&TestAccount> = accounts.iter().filter(|x| b.app.partitions.for_key(&x.did).is_some()).collect();
     assert!(cold.len() > 100, "b holds {} of the {} accounts (owns {} shards, a {})", cold.len(), accounts.len(), owned(&b), owned(&a));
     // checkpoints flush b's writes to SSTs: a's loads read them from the store
@@ -165,16 +191,13 @@ async fn takeover_cold_loads_stay_bounded_and_the_lease_renews() {
     let results = futures::future::join_all(cold.iter().map(|x| a.create_record(x, "app.bsky.feed.post", post_record("after the takeover")))).await;
     let took = t.elapsed();
     assert_eq!(results.len(), cold.len());
-    // the renew loop kept going through it
-    tokio::time::sleep(Duration::from_millis(600)).await;
     let (state_peak, total_peak, refused) = (store.state_peak.load(Ordering::SeqCst), store.total_peak.load(Ordering::SeqCst), store.refused.load(Ordering::SeqCst));
     eprintln!("{} cold writes in {took:?}: state requests in flight peak {state_peak}, total {total_peak}, refused {refused}", cold.len());
     assert!(state_peak <= 2 * STATE_INFLIGHT, "state requests in flight peaked at {state_peak} (bound {STATE_INFLIGHT} per node)");
     assert_eq!(refused, 0, "requests past the port budget ({PORT_BUDGET}); total in flight peaked at {total_peak}");
     assert!(ca.lease_valid() && !ca.halted(), "a kept its lease");
-    // validity ends TTL - skew (2.4 s) after a renewal's send: over 1 s left
-    // = renewed within the last 1.4 s
-    let validity = ca.lease_validity_secs();
-    assert!(validity > 1.0, "a's lease validity {validity:.2} s: renewals stalled");
+    // the renew loop kept going: validity ends TTL - skew (2.4 s) after a
+    // renewal's send, so over 1 s left = renewed within the last 1.4 s
+    wait_for("a renews its lease", Duration::from_secs(3), || ca.lease_valid() && ca.lease_validity_secs() > 1.0).await;
     assert_eq!(owned(&a), SHARDS as usize);
 }
