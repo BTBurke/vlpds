@@ -3,6 +3,7 @@
 //! tests/STATUS.md).
 
 mod account;
+mod account_counts;
 mod account_deactivation;
 mod account_races;
 mod account_status;

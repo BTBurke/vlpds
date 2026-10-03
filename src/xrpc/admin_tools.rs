@@ -206,10 +206,10 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
     }
 
     let recs: Vec<(crate::mst_lazy::Key, Cid)> = records.iter().map(|(p, c, ..)| (Arc::from(p.as_bytes()), *c)).collect();
-    let (rebuilt, want) = tokio::task::spawn_blocking(move || -> XResult<(Cid, NodeBlocks)> {
+    let (rebuilt, want, tree_nodes) = tokio::task::spawn_blocking(move || -> XResult<(Cid, NodeBlocks, u64)> {
         let mut tree = crate::mst_lazy::build_tree(&recs).map_err(XrpcError::from_err)?;
         let root = tree.root_cid().map_err(XrpcError::from_err)?;
-        Ok((root, crate::mst_lazy::persisted_nodes(&tree, 1)))
+        Ok((root, crate::mst_lazy::persisted_nodes(&tree, 1), crate::repo_stats::count_tree(&tree).map_err(XrpcError::from_err)?.1))
     })
     .await
     .map_err(XrpcError::from_err)??;
@@ -249,6 +249,16 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
     let (cid_extra, blob_extra) = (n1 - n0, stale_keys.len() - n1);
 
     let (bl_missing, bl_stale, bl_stored) = check_backlinks(snap.as_ref(), did, &records).await?;
+
+    let counted = state::RepoStats {
+        records: (records.len() + bad_records.len()) as u64,
+        nodes: tree_nodes,
+        blobs: records.iter().flat_map(|(_, _, _, bs)| bs.iter()).collect::<HashSet<_>>().len() as u64,
+    };
+    let stored_stats = match get(state::repo_stats_key(did)).await? {
+        Some(v) => Some(state::RepoStats::decode(&v).map_err(XrpcError::from_err)?),
+        None => None,
+    };
     let bl_extra = bl_stale.len();
     stale_keys.extend(bl_stale);
 
@@ -261,6 +271,11 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
     }
     if !bad_records.is_empty() {
         problems.push(format!("{} record(s) don't hash to their CID", bad_records.len()));
+    }
+    match stored_stats {
+        None => problems.push("repo stats (S/) missing".into()),
+        Some(st) if st != counted => problems.push(format!("repo stats (S/) are {st:?}, the repo has {counted:?}")),
+        Some(_) => {}
     }
     if !matches_head {
         problems.push(format!("records rebuild to MST root {rebuilt}, head data is {}", head.data));
@@ -290,6 +305,10 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
         "commit": commit,
         "records": {"count": records.len() + bad_records.len(), "badCount": bad_records.len(), "bad": sample(&bad_records)},
         "mst": {"rebuiltRoot": rebuilt.to_string(), "matchesHead": matches_head},
+        "stats": {
+            "stored": stored_stats.map(|s| json!({"records": s.records, "nodes": s.nodes, "blobs": s.blobs})),
+            "counted": {"records": counted.records, "nodes": counted.nodes, "blobs": counted.blobs},
+        },
         "nodes": {
             "expected": want.len(), "stored": stored.len(),
             "missing": missing.len(), "extra": extra.len(), "corrupt": corrupt.len(),

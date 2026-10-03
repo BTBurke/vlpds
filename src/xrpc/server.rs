@@ -1870,64 +1870,40 @@ async fn assert_valid_did_doc(app: &App, a: &Account) -> XResult<()> {
 
 /// Migration progress. `importedBlobs` counts every stored blob, referenced
 /// or not yet.
+/// O(1) in the repo: the counts are kept with each commit (`S/{did}`,
+/// read with the head from one snapshot). importedBlobs lists the account's
+/// stored blobs (O(blobs / 1000) LISTs): uploads and the blob GC don't go
+/// through the log.
 async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let did = user_did(&creds)?;
     let acct = app.account(&did).await?;
-    let (view, snap) = app.repo_view(&did).await?;
-    let (d, root) = (did.clone(), view.head.data);
-    let (pre, _budget) = super::sync::prefetch_nodes(&snap, &did).await;
-    let nodes = tokio::task::spawn_blocking(move || {
-        let rt = tokio::runtime::Handle::current();
-        let mut nodes = HashSet::new();
-        let src = crate::mst_store::DbSource::new(&*snap, &d, &rt).with_prefetched(Some(&pre));
-        let scan = crate::mst_store::ScanSource::open(&*snap, &d, src, &rt)?;
-        crate::mst_lazy::export_blocks(root, pre.persist_min(), &scan, &mut |c, b| {
-            // the empty tree's root isn't counted
-            if crate::mst::decode_node(b, c).is_ok_and(|n| !n.entries.is_empty()) {
-                nodes.insert(c);
-            }
-        })?;
-        Ok::<_, crate::mst::MstError>(nodes)
-    })
-    .await
-    .map_err(XrpcError::from_err)?
-    .map_err(XrpcError::from_err)?;
     let p = app.partition(&did)?;
-    let prefix = state::record_prefix(&did);
-    let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await.map_err(XrpcError::from_err)?;
-    let mut records = 0u64;
-    let mut record_blocks = HashSet::new();
-    while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
-        records += 1;
-        if let Ok((cid, _)) = state::decode_record_value(&kv.value) {
-            record_blocks.insert(cid);
-        }
-    }
-    let bprefix = state::blob_ref_prefix(&did);
-    let mut iter = p.db.scan(bprefix.clone()..state::prefix_end(&bprefix)).await.map_err(XrpcError::from_err)?;
-    let mut expected = HashSet::new();
-    while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
-        let rest = String::from_utf8_lossy(&kv.key[bprefix.len()..]).to_string();
-        expected.insert(rest.split('\0').next().unwrap_or("").to_string());
-    }
+    let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
+    let (hv, sv) = tokio::try_join!(slatedb::DbReadOps::get(snap.as_ref(), state::head_key(&did)), slatedb::DbReadOps::get(snap.as_ref(), state::repo_stats_key(&did))).map_err(XrpcError::from_err)?;
+    let hv = hv.ok_or_else(|| XrpcError::bad("RepoNotFound", format!("could not find repo: {did}")))?;
+    let head = Head::decode(&hv).map_err(XrpcError::from_err)?;
+    let stats = state::RepoStats::decode(&sv.ok_or_else(|| XrpcError::internal(format!("{did}: repo stats missing")))?).map_err(XrpcError::from_err)?;
     let blob_dir = object_store::path::Path::from(format!("{}/blob/{}", app.store.prefix, did));
-    let mut imported = 0u64;
-    let mut list = app.store.raw.list(Some(&blob_dir));
-    while let Some(meta) = futures::StreamExt::next(&mut list).await {
-        meta.map_err(XrpcError::from_err)?;
-        imported += 1;
-    }
-    let valid_did = assert_valid_did_doc(&app, &acct).await.is_ok();
+    let count_blobs = async {
+        let mut imported = 0u64;
+        let mut list = app.store.raw.list(Some(&blob_dir));
+        while let Some(meta) = futures::StreamExt::next(&mut list).await {
+            meta.map_err(XrpcError::from_err)?;
+            imported += 1;
+        }
+        Ok::<_, XrpcError>(imported)
+    };
+    let (imported, valid_did) = tokio::join!(count_blobs, assert_valid_did_doc(&app, &acct));
     Ok(Json(json!({
         "activated": acct.status.is_none(),
-        "validDid": valid_did,
-        "repoCommit": view.head.commit.to_string(),
-        "repoRev": view.head.rev.to_string(),
-        "repoBlocks": 1 + nodes.len() + record_blocks.len(),
-        "indexedRecords": records,
+        "validDid": valid_did.is_ok(),
+        "repoCommit": head.commit.to_string(),
+        "repoRev": head.rev.to_string(),
+        "repoBlocks": stats.repo_blocks(),
+        "indexedRecords": stats.records,
         "privateStateValues": 0,
-        "expectedBlobs": expected.len(),
-        "importedBlobs": imported,
+        "expectedBlobs": stats.blobs,
+        "importedBlobs": imported?,
     })))
 }
 

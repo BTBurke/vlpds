@@ -224,6 +224,9 @@ swappable.
   - `bl/{did}\0{code}{subject}` → the rkeys of the repo's likes / reposts /
     follows / blocks of that subject: the backlink index createRecord
     prunes duplicates with (see "Backlinks").
+  - `S/{did}` → the repo's counts for checkAccountStatus (records, MST
+    nodes, distinct referenced blobs; 3 × u64), a stored mut of each commit
+    that changes them (see "checkAccountStatus counts").
   - `a/{did}`, `n/{handle}` → account. The account row carries the repo
     signing key only wrapped under the KEK (`Account::wrapped_signing_key`,
     bound to the DID) next to its public key (`signing_pubkey`, which DID
@@ -511,10 +514,11 @@ commit hot path.
 - **References.** `b/{did}\0{cid}\0{record path}` rows, written with the
   commit that adds or removes the reference. The repo worker keeps a repo's
   refs by path to drop the old ones on an update or delete, loaded with
-  one scan of `b/{did}` on the first such write (or account delete /
-  import), not on open: a cold open for a create skips it, and the refs of
-  records created meanwhile (maybe not applied yet) stay over what the scan
-  reads. Dropped again with the repo's paths when it is idle. A cold first
+  one scan of `b/{did}` on the first such write (or a create with blobs, whose
+  other refs `expectedBlobs` counts; or account delete / import), not on
+  open: a cold open for a create without blobs skips it, one for a create
+  with blobs reads it alongside the tree, and the refs of records created
+  meanwhile (maybe not applied yet) stay over what the scan reads. Dropped again with the repo's paths when it is idle. A cold first
   write to the real-repo fixture (`~/repo.car`, 812 blob refs;
   `mst_lazy::bench_cold_open_blobs`), every GET +20 ms: median ~150 ms
   instead of ~270 ms.
@@ -2469,7 +2473,7 @@ root through the store).
   fed anyway (`persist_min` 2: one key hash per record); only nodes above
   height 1 that don't fit either are point reads
   (`tests/all/export_scan.rs`, `mst_store` tests). The getBlocks node
-  index build and checkAccountStatus walk the same way. Measured on a
+  index build walks the same way. Measured on a
   loaded laptop (load 17-45, `--memory`, release builds, interleaved): a
   10M-record export took 9.7-21 s (3.0M node point reads before, ~0 now)
   against 28-84 s before; two at once (both past the grant: height-1
@@ -2790,6 +2794,67 @@ bookkeeping; posts and other collections pay one string compare per
 write. The state bytes are uncompressed key + value with the bench's
 21-character DID: ~123 B per like and ~85 B per follow with a did:plc
 (zstd SST blocks shrink the repeated DID prefixes).
+
+## checkAccountStatus counts (`S/`, `src/repo_stats.rs`)
+
+Migration tools poll checkAccountStatus, and it walked the whole repo on
+every call (every node, every record, every blob ref): about an export's
+work. The counts are now kept by the repo worker and read with the head
+from one snapshot (`state::RepoStats` at `S/{did}`):
+- **records**: ± per net create / delete of a commit.
+- **MST nodes** (with entries, leaves included; the empty tree's root
+  isn't one): a commit's walks note every node they pass, leaves too,
+  under its last written CID. Nodes off the walks are unchanged, so the
+  tree lost exactly the noted nodes it no longer holds (`present`), and
+  gained exactly the written nodes that weren't noted and kept (re-written
+  proof neighbours are): `Persist::node_delta`. The `M/` deletes are the
+  lost ones at persisted heights, as before.
+- **blobs** (distinct CIDs among the records' refs): the worker keeps a
+  refcount per CID of its loaded refs (`blob_cids`). Every change to the
+  refs runs with them loaded: updates and deletes already needed them,
+  and a create with blobs now loads them too (alongside the tree on a
+  cold open).
+- importRepo, rebuildRepo and genesis count the new tree whole
+  (`count_tree`; the records' refs through the same refcounts); account
+  delete deletes the row.
+
+`S/` is a stored mut after the derived ones (replay can't derive it from
+the #commit frame: it needs the previous counts), written only when a
+count changed (`worker::tests::bench_commit_cpu`, base vs this: +50 B
+state and +54-56 B segment per commit, +0.3-0.6 µs of 33-40 µs CPU).
+`repo_stats::walk` counts from scratch (the records, the tree rebuilt from
+them, `b/`). `tests/all/account_counts.rs` runs random histories (creates,
+updates, deletes, applyWrites, coalesced concurrent writes, backlink
+prunes, imports, rebuilds, emptying and refilling, path unloads and cold
+opens, replay after a kill) and checks counts == walk == the exported tree
+after every step. `vlpds admin check-repo` reports a missing or different
+row (rebuildRepo rewrites it); a repo opened without one is counted on
+open and the row written back
+(`vlpds_lazy_mst_fallbacks_total{reason="missing_stats"}`).
+
+Two fields differ from the reference:
+- **repoBlocks** = 1 + nodes + records: one block per record *path*. The
+  reference counts distinct CIDs in `repo_block`, so byte-identical
+  records at two paths count once there (until one is deleted: its
+  `removedCids` then drop the shared block though the other path still
+  links it). Counting distinct record CIDs incrementally needs a lookup of
+  the CID's other paths (a `c/` prefix scan, not bloom-filtered) per
+  created or deleted record on the write path; identical records within
+  one repo are rare, so the count is per path instead.
+- **importedBlobs** is still a LIST of `blob/{did}/` (O(blobs / 1000)
+  requests, independent of the record count): uploads and the blob GC
+  write the object store directly, not through the log, so there is no
+  commit to keep a counter with. An exact counter needs uploads and GC
+  deletes sequenced through the repo's worker (an existence check, then a
+  logged per-blob row).
+
+`privateStateValues` is 0, as in the reference.
+
+Measured (`account_counts::bench_check_account_status`, one 1M-record
+repo, dev-release, laptop at load average ~55 from other builds):
+median 1,125 ms (min 1,008, max 2,081; 5 calls) walking, 0.12 ms (min
+0.11, max 0.75; 50 calls; no blobs, so importedBlobs is one LIST of an
+in-memory store) with the counts.
 
 ## Backups and restore (design, not implemented)
 
@@ -4157,6 +4222,7 @@ effect at the next segment). Not built yet: everything under "Later".
 | Entry muts | inside segments | none: raw SlateDB key/value bytes, plus muts *derived* by the reader from `#commit` frames (`derive_commit_muts`, top bit of `mut_count`) | an old reader writes new-format bytes blindly into state |
 | Head `h/` | `state.rs` `Head::encode` | none (fixed binary: cid ‖ cid ‖ rev ‖ block) | `decode` "short head" or garbage |
 | Record `R/` | `state::record_value` | none (cid ‖ rev ‖ bytes) | garbage |
+| Repo stats `S/` | `state.rs` `RepoStats::encode` | none (fixed binary: 3 × u64) | `decode` of another length is an error |
 | Index `c/ C/ b/ bl/ n/ K/` | `state.rs` | key layout only, empty/plain values | key not found |
 | MST nodes `M/` | `state.rs`, `mst_lazy.rs` | dag-cbor, content-addressed | stable by construction |
 | Account `a/` | `state::Account` JSON | none; tolerant (`#[serde(default)]`, `#[serde(flatten)] extra` keeps unknown fields) | round-trips unknown fields |

@@ -34,6 +34,7 @@ pub mod partition;
 pub mod partitions;
 pub mod peer_tls;
 pub mod plc;
+pub mod repo_stats;
 pub mod reshard;
 pub mod reshard_gc;
 pub mod profiling;

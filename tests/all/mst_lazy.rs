@@ -911,11 +911,10 @@ impl RefRepo {
             .collect();
         listed.sort();
         assert_eq!(listed, colls, "{did}: describeRepo collections");
-        // migration counts: the commit, the nodes (not an empty root), the distinct records
+        // migration counts: the commit, the nodes (not an empty root), a block per record
         let m = s.xrpc.get("com.atproto.server.checkAccountStatus", &[], &a.auth()).await.ok();
         let non_empty = nodes.iter().filter(|(c, b)| !vlpds::mst::decode_node(b, *c).unwrap().entries.is_empty()).count();
-        let distinct: std::collections::HashSet<Cid> = recs.iter().map(|r| r.1).collect();
-        assert_eq!(m["repoBlocks"], json!(1 + non_empty + distinct.len()), "{did}: checkAccountStatus");
+        assert_eq!(m["repoBlocks"], json!(1 + non_empty + recs.len()), "{did}: checkAccountStatus");
     }
 }
 

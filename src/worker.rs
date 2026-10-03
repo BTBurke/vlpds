@@ -313,11 +313,18 @@ pub struct RepoState {
     pub pending: Arc<AtomicU32>,
     pub account: state::Account,
     /// Loaded on first need (an update or delete, which must drop the old
-    /// record's refs, or an account delete / import). Until then it holds
-    /// only paths created since the open, whose refs may not be durable yet,
-    /// so the load keeps them over what it reads.
+    /// record's refs; a create with blobs, which counts their other refs;
+    /// an account delete / import). Until then it holds only paths created
+    /// since the open, whose refs may not be durable yet, so the load keeps
+    /// them over what it reads.
     pub blob_refs: BlobRefs,
     pub blob_refs_loaded: bool,
+    /// Paths referencing each blob of `blob_refs`, once it is loaded (every
+    /// change to the refs runs with them loaded).
+    pub blob_cids: HashMap<Cid, u32>,
+    /// The counts at the in-memory head; `S/{did}` holds them at the
+    /// durable one.
+    pub stats: state::RepoStats,
     pub view: ViewCell,
     pub nodes: crate::mst::SharedNodeIndex,
     /// Approximate heap charged to the worker's cache ([`repo_bytes`]).
@@ -333,6 +340,9 @@ pub struct RepoState {
     /// Rebuilt from its records on open: its interior nodes are written to
     /// `M/` once it is cached.
     pub backfill: bool,
+    /// `S/` was missing on open: `stats` were counted from scratch and are
+    /// written once it is cached.
+    pub backfill_stats: bool,
     /// Log entries in flight that wrote MST state, oldest first: (applied,
     /// the nodes written; None = the whole tree). Paths are unloaded only
     /// outside these sets while commits are in flight.
@@ -710,7 +720,7 @@ impl Worker {
             Ok(Some(mut st)) => {
                 STATS.repo_loads.fetch_add(1, Ordering::Relaxed);
                 metrics::REPO_LOADS.with_label_values(&["ok"]).inc();
-                if st.backfill {
+                if st.backfill || st.backfill_stats {
                     backfill_nodes(&mut st);
                 }
                 self.cache_put(did.clone(), st);
@@ -997,6 +1007,13 @@ impl Worker {
                 return;
             }
         };
+        let stats = match crate::repo_stats::count_tree(&tree) {
+            Ok((records, nodes)) => state::RepoStats { records, nodes, blobs: 0 },
+            Err(e) => {
+                let _ = req.reply.send(Err(WriteError::Internal(e.to_string())));
+                return;
+            }
+        };
         let did = req.did.clone();
         let time = events::now_rfc3339();
         // an account created inactive (migration in) is announced only when
@@ -1020,6 +1037,7 @@ impl Worker {
             }
         }
         replace_nodes_mutations(&did, HashMap::new(), &tree, &mut muts);
+        muts.push(put(state::repo_stats_key(&did), stats.encode()));
         // a new repo's whole tree is in flight until this applies
         let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut backlinks = crate::backlinks::Cache::default();
@@ -1060,6 +1078,8 @@ impl Worker {
             blob_refs: HashMap::new(),
             // a new repo: no refs anywhere yet
             blob_refs_loaded: true,
+            blob_cids: HashMap::new(),
+            stats,
             view,
             nodes,
             charge: 0,
@@ -1067,6 +1087,7 @@ impl Worker {
             backlinks,
             fetching: false,
             backfill: false,
+            backfill_stats: false,
             inflight: [(applied, None)].into(),
         };
         self.cache_put(did.clone(), st);
@@ -1117,7 +1138,8 @@ pub struct Need {
     keys: Vec<Vec<u8>>,
     probes: Vec<Vec<u8>>,
     all: bool,
-    /// An update or delete drops the old record's blob refs.
+    /// An update or delete drops the old record's blob refs; a write adding
+    /// refs counts the blobs' other references.
     blobs: bool,
     /// Backlink index values a write changes, the paths whose old link an
     /// update or delete removes, or the whole index.
@@ -1138,7 +1160,12 @@ impl Need {
             match q {
                 Queued::Write(r) => {
                     for w in &r.writes {
-                        n.blobs |= !matches!(w, Write::Create { .. });
+                        // a create with blobs: whether another record holds
+                        // them already (expectedBlobs counts distinct ones)
+                        n.blobs |= match w {
+                            Write::Create { blobs, .. } => !blobs.is_empty(),
+                            _ => true,
+                        };
                         n.backlinks(w);
                         let p = w.path();
                         let coll = collection_of(&p).as_bytes();
@@ -1308,6 +1335,7 @@ fn unload_repo(st: &mut RepoState) {
     // durable now: read again when next needed
     st.blob_refs = HashMap::new();
     st.blob_refs_loaded = false;
+    st.blob_cids = HashMap::new();
     st.backlinks.prune();
     *st.view.write() = st.durable_view();
     metrics::LAZY_MST_UNLOADS.inc();
@@ -1315,11 +1343,16 @@ fn unload_repo(st: &mut RepoState) {
 }
 
 /// Logs the interior nodes of a repo rebuilt from its records on open (its
-/// `M/` nodes were missing or wrong), so the next open reads them.
+/// `M/` nodes were missing or wrong), and stats counted on open (`S/`
+/// missing), so the next open reads them.
 fn backfill_nodes(st: &mut RepoState) {
-    st.backfill = false;
     let mut muts = Vec::new();
-    replace_nodes_mutations(&st.did, HashMap::new(), &st.mst.tree, &mut muts);
+    if std::mem::take(&mut st.backfill) {
+        replace_nodes_mutations(&st.did, HashMap::new(), &st.mst.tree, &mut muts);
+    }
+    if std::mem::take(&mut st.backfill_stats) {
+        muts.push(put(state::repo_stats_key(&st.did), st.stats.encode()));
+    }
     if muts.is_empty() {
         return;
     }
@@ -1452,6 +1485,7 @@ async fn load_repo_with(
         .await?
         .ok_or_else(|| anyhow::anyhow!("head without account"))?;
     let acct: state::Account = serde_json::from_slice(&av)?;
+    let sv = db.get(state::repo_stats_key(&did)).await?;
     // with the key service down the repo still loads for reads; writes get
     // a 503 and the next one reloads (retries the unwrap)
     let secrets = opts.secrets.clone().unwrap_or_else(Secrets::dev);
@@ -1467,17 +1501,29 @@ async fn load_repo_with(
         Err(e) if e.retryable() => None,
         Err(e) => return Err(anyhow::anyhow!("signing key of {did}: {e}")),
     };
-    let (mst, backfill) = open_lazy(&partition, &did, &head, &opts).await?;
-    // most cold writes are creates: no old refs to drop
-    let blob_refs = match opts.need.as_ref().is_some_and(|n| n.blobs) {
-        true => Some(load_blob_refs(&**db, &did).await?),
-        false => None,
+    // most cold writes are creates without blobs: no refs to read
+    let read_refs = async {
+        match opts.need.as_ref().is_some_and(|n| n.blobs) {
+            true => load_blob_refs(&**db, &did).await.map(Some),
+            false => Ok(None),
+        }
+    };
+    let ((mst, backfill), blob_refs) = tokio::try_join!(open_lazy(&partition, &did, &head, &opts), read_refs)?;
+    let (stats, backfill_stats) = match sv {
+        Some(v) => (state::RepoStats::decode(&v)?, false),
+        None => {
+            tracing::warn!(%did, "repo stats missing: counting the repo");
+            metrics::LAZY_MST_FALLBACKS.with_label_values(&["missing_stats"]).inc();
+            (crate::repo_stats::walk(&**db, &did).await?, true)
+        }
     };
     let backlinks = match opts.need.as_ref() {
         Some(n) => n.load_backlinks(&**db, &did).await?,
         None => None,
     };
     let mut st = finish_load(partition.clone(), did, mst, head, key, acct)?;
+    st.stats = stats;
+    st.backfill_stats = backfill_stats;
     if let Some(b) = blob_refs {
         install_blob_refs(&mut st, b);
     }
@@ -1550,6 +1596,10 @@ fn install_blob_refs(st: &mut RepoState, loaded: BlobRefs) {
         st.blob_refs.entry(path).or_insert(blobs);
     }
     st.blob_refs_loaded = true;
+    st.blob_cids.clear();
+    for b in st.blob_refs.values().flatten() {
+        *st.blob_cids.entry(*b).or_default() += 1;
+    }
 }
 
 pub fn collection_of(path: &str) -> &str {
@@ -1585,6 +1635,8 @@ fn finish_load(
         account,
         blob_refs: HashMap::new(),
         blob_refs_loaded: false,
+        blob_cids: HashMap::new(),
+        stats: Default::default(),
         view,
         nodes,
         charge: 0,
@@ -1592,6 +1644,7 @@ fn finish_load(
         backlinks: Default::default(),
         fetching: false,
         backfill: false,
+        backfill_stats: false,
         inflight: Default::default(),
     })
 }
@@ -1940,6 +1993,8 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
         }
     };
 
+    let stats_before = st.stats;
+    st.stats.nodes = st.stats.nodes.saturating_add_signed(persist.node_delta);
     let mut ops = Vec::with_capacity(batch.ops.len());
     let mut muts = Vec::with_capacity(batch.ops.len() + 1);
     // exact up to the varints: header ~60, each block varint + 36-byte CID
@@ -1974,9 +2029,15 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
             _ => recent = None,
         }
         let action = match (prev, new) {
-            (None, Some(_)) => "create",
+            (None, Some(_)) => {
+                st.stats.records += 1;
+                "create"
+            }
             (Some(_), Some(_)) => "update",
-            _ => "delete",
+            _ => {
+                st.stats.records = st.stats.records.saturating_sub(1);
+                "delete"
+            }
         };
         ops.push(RepoOp { action, path, cid: *new, prev: *prev });
         index_mutations(st, rev.0, path, prev.is_some(), new.is_some(), batch.blobs.get(path.as_str()), &mut extra)?;
@@ -2029,6 +2090,9 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
         extra.push(Mutation { key: state::mst_node_key(&st.did, c).into(), val: None });
     }
     extra.append(&mut coll_muts);
+    if st.stats != stats_before {
+        extra.push(put(state::repo_stats_key(&st.did), st.stats.encode()));
+    }
     let derived = muts.len();
     muts.append(&mut extra);
 
@@ -2127,10 +2191,27 @@ fn send_entry(st: &RepoState, entry: LogEntry) -> anyhow::Result<()> {
 /// record before, whose refs are known only once the repo's are loaded.
 fn index_mutations(st: &mut RepoState, rev: u64, path: &str, existed: bool, exists: bool, new_blobs: Option<&Vec<Cid>>, muts: &mut Vec<Mutation>) -> anyhow::Result<()> {
     anyhow::ensure!(!existed || st.blob_refs_loaded, "blob refs of {} not loaded for a write to {path}", st.did);
+    anyhow::ensure!(st.blob_refs_loaded || new_blobs.is_none_or(|b| b.is_empty()), "blob refs of {} not loaded for a write adding refs to {path}", st.did);
     let old = st.blob_refs.remove(path).unwrap_or_default();
-    let new: Vec<Cid> = if exists { new_blobs.cloned().unwrap_or_default() } else { Vec::new() };
+    let mut new: Vec<Cid> = if exists { new_blobs.cloned().unwrap_or_default() } else { Vec::new() };
+    new.sort();
+    new.dedup();
     for b in old.iter().filter(|b| !new.contains(b)) {
         muts.push(del(state::blob_ref_key(&st.did, b, path)));
+        if let Some(n) = st.blob_cids.get_mut(b) {
+            *n -= 1;
+            if *n == 0 {
+                st.blob_cids.remove(b);
+                st.stats.blobs = st.stats.blobs.saturating_sub(1);
+            }
+        }
+    }
+    for b in new.iter().filter(|b| !old.contains(b)) {
+        let n = st.blob_cids.entry(*b).or_default();
+        *n += 1;
+        if *n == 1 {
+            st.stats.blobs += 1;
+        }
     }
     // rewrite every current ref with the record's rev, so listBlobs `since`
     // sees blobs kept across an update too
@@ -2198,6 +2279,8 @@ fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>, src: &dyn 
         }
     }
     st.blob_refs.clear();
+    st.blob_cids.clear();
+    st.stats = state::RepoStats::default();
     Ok(crate::mst_lazy::persisted_nodes(&st.mst.tree, st.mst.persist_min()))
 }
 
@@ -2350,6 +2433,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             // after the clear's deletes: a link kept is written again
             index_backlinks(&st.did, records.iter().map(|(p, _, b, _)| (p.as_str(), &b[..])), &mut st.backlinks, &Some(done.clone()), &mut muts);
             let data = tree.root_cid()?;
+            let counted = crate::repo_stats::count_tree(&tree)?;
             replace_nodes_mutations(&st.did, old_nodes, &tree, &mut muts);
             let (commit, commit_block) = match sign_commit(&st.did, &rev.to_string(), &data, &key) {
                 Ok(c) => c,
@@ -2359,6 +2443,8 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
                     return Err(e.into());
                 }
             };
+            (st.stats.records, st.stats.nodes) = counted;
+            muts.push(put(state::repo_stats_key(&st.did), st.stats.encode()));
             st.mst = LazyTree::loaded(tree, 1);
             st.head = Head { commit, data, rev, commit_block };
             // a deactivated account (mid-migration) is announced with #sync
@@ -2379,6 +2465,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             muts.push(del(state::account_key(&st.did)));
             muts.push(del(state::handle_key(&st.did, &st.account.handle)));
             muts.push(del(state::key_rotation_key(&st.did)));
+            muts.push(del(state::repo_stats_key(&st.did)));
             frames.push(events::account_frame(&st.did, false, Some("deleted"), &time));
             st.account.status = Some("deleted".into());
         }
@@ -2628,10 +2715,12 @@ mod tests {
         assert!(part.recent.take_dirty().is_some_and(|b| b.as_ref() == b"did:plc:claims\n"), "written repo tracked as recent");
     }
 
-    /// Blob refs are loaded on a repo's first update or delete, not on open:
-    /// a cold open for a create skips them; the refs a create wrote while
-    /// they weren't loaded (still in flight, so not in the scanned `b/`)
-    /// survive the load, so a delete right after drops them.
+    /// Blob refs are loaded on a repo's first update, delete or create with
+    /// blobs, not on open: a cold open for a create without blobs skips
+    /// them; the paths it created (still in flight, so not in the scanned
+    /// `b/`) survive the load. A create with blobs counts their other refs
+    /// (`RepoStats::blobs`), and a delete right after drops its in-flight
+    /// ref.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn blob_refs_load_on_first_need() {
         // the sequencer is this test: it applies entries when it chooses
@@ -2684,10 +2773,17 @@ mod tests {
             w.send(WorkerMsg::CacheInfo { did: did.clone(), reply }).unwrap();
             info
         };
-        let (m, created) = op(rec("p2", vec![blob(2)], false));
+        let (m, plain) = op(rec("p0", Vec::new(), false));
+        w.send(m).unwrap();
+        let e_plain = rx.recv().await.unwrap();
+        assert!(!cached().await.unwrap().unwrap().blob_refs_loaded, "a create without blobs opened the repo with its blob refs");
+        let (m, created) = op(rec("p2", vec![blob(2), blob(1)], false));
         w.send(m).unwrap();
         let e_create = rx.recv().await.unwrap(); // in flight: its b/ row isn't applied
-        assert!(!cached().await.unwrap().unwrap().blob_refs_loaded, "a create opened the repo with its blob refs");
+        assert!(cached().await.unwrap().unwrap().blob_refs_loaded, "a create with blobs ran without the refs");
+        let stats = |e: &LogEntry| e.muts.iter().find(|m| m.key[..] == state::repo_stats_key(&did)[..]).map(|m| state::RepoStats::decode(m.val.as_ref().unwrap()).unwrap());
+        // blob(1) was p1's already
+        assert_eq!(stats(&e_create).map(|s| (s.records, s.blobs)), Some((3, 2)));
         let has = |e: &LogEntry, b: u8, path: &str, put: bool| e.muts.iter().any(|m| m.key[..] == state::blob_ref_key(&did, &blob(b), path)[..] && m.val.is_some() == put);
         let (m, deleted) = op(Write::Delete { collection: "app.test.thing".into(), rkey: "p2".into(), swap: None });
         w.send(m).unwrap();
@@ -2698,10 +2794,13 @@ mod tests {
         w.send(m).unwrap();
         let e_update = rx.recv().await.unwrap();
         assert!(has(&e_update, 1, "app.test.thing/p1", false) && has(&e_update, 3, "app.test.thing/p1", true), "the durable ref isn't replaced");
-        for e in [e_create, e_delete, e_update] {
+        assert_eq!(stats(&e_delete).map(|s| (s.records, s.blobs)), Some((2, 1)));
+        // p1's blob(1) replaced: blob(3) only
+        assert_eq!(stats(&e_update).map(|s| (s.records, s.blobs)), None, "unchanged counts aren't written");
+        for e in [e_plain, e_create, e_delete, e_update] {
             apply(e).await;
         }
-        for r in [created, deleted, updated] {
+        for r in [plain, created, deleted, updated] {
             r.await.unwrap().unwrap();
         }
         let prefix = state::blob_ref_prefix(&did);

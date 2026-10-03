@@ -68,6 +68,9 @@ pub struct Persist {
     /// In write order, re-puts of unchanged proof neighbours included.
     pub puts: Vec<(Cid, Vec<u8>)>,
     pub deletes: Vec<Cid>,
+    /// Change in the tree's node count (nodes with entries, leaves
+    /// included): written nodes it didn't hold, less the ones it lost.
+    pub node_delta: i64,
 }
 
 impl Persist {
@@ -467,9 +470,9 @@ pub fn loaded_nodes(n: &Node) -> usize {
 pub struct LazyTree {
     pub tree: Tree,
     persist_min: i32,
-    /// Persisted nodes on this batch's mutation walks, by their last written
-    /// cid: (cid, a key in the node's subtree, height). Replaced ones are
-    /// deleted.
+    /// Nodes (leaves too) on this batch's mutation walks, by their last
+    /// written cid: (cid, a key in the node's subtree, height). Replaced
+    /// persisted ones are deleted; the rest of the tree is unchanged.
     seen: Vec<(Cid, Key, i32)>,
     pub stats: LoadStats,
 }
@@ -508,8 +511,8 @@ impl LazyTree {
         self.persist_min
     }
 
-    /// With `note` (mutation walks), notes the persisted nodes it passes as
-    /// candidates for deletion.
+    /// With `note` (mutation walks), notes the nodes it passes as candidates
+    /// for deletion.
     fn walk(&mut self, key: &[u8], mut mode: Mode, note: bool, src: &dyn Source) -> Result<()> {
         // most walks find their path loaded: check that without
         // `Arc::make_mut`, which copies every node shared with a view
@@ -530,7 +533,7 @@ impl LazyTree {
             let idx = step(n, key, &mut mode);
             // a dirty node's cid is its last written (persisted) version's:
             // an earlier op of the batch changed it
-            if note && n.height >= persist_min {
+            if note {
                 if let Some(c) = n.cid {
                     path.push((c, n.height));
                 }
@@ -568,7 +571,7 @@ impl LazyTree {
                 return None;
             }
             let idx = step(n, key, &mut mode);
-            if note && n.height >= self.persist_min {
+            if note {
                 if let Some(c) = n.cid {
                     path.push((c, n.height));
                 }
@@ -735,17 +738,29 @@ impl LazyTree {
             }
             rec(&self.tree.root, &written, &mut heights);
         }
+        // the empty tree's root isn't counted: a batch's first insert into an
+        // empty tree leaves the root dirty under that cid
+        let empty = *crate::recent_writes::EMPTY_ROOT;
         let mut kept = HashSet::new();
-        let mut deletes = HashSet::new();
+        let mut gone: HashMap<Cid, i32> = HashMap::new();
         for (c, k, h) in std::mem::take(&mut self.seen) {
-            if kept.contains(&c) || deletes.contains(&c) {
+            if c == empty || kept.contains(&c) || gone.contains_key(&c) {
                 continue;
             }
             match self.present(&c, &k, h) {
-                true => kept.insert(c),
-                false => deletes.insert(c),
+                true => {
+                    kept.insert(c);
+                }
+                false => {
+                    gone.insert(c, h);
+                }
             };
         }
+        // a written node the tree held before was on a walk (a node changes
+        // only below one), and so is in `kept`
+        let added = out[start..].iter().filter(|(c, _)| !kept.contains(c) && *c != empty).count();
+        let node_delta = added as i64 - gone.len() as i64;
+        let deletes = gone.into_iter().filter(|(_, h)| *h >= self.persist_min).map(|(c, _)| c).collect();
         // every written node at a persisted height, proof-only neighbours
         // (already stored) included: exactly what replay derives from the
         // commit's CAR (`persisted_blocks`), in the same order
@@ -754,7 +769,7 @@ impl LazyTree {
             .filter(|(c, _)| heights.get(c).is_some_and(|h| *h >= self.persist_min))
             .cloned()
             .collect();
-        Ok((root, Persist { puts, deletes: deletes.into_iter().collect() }))
+        Ok((root, Persist { puts, deletes, node_delta }))
     }
 
     /// Whether the written tree holds node `cid` (at `height`, on the path

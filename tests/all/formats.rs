@@ -130,6 +130,13 @@ fn backlinks() -> Vec<u8> {
     pretty(&k)
 }
 
+/// A repo's counts (`S/`, checkAccountStatus): its key and value.
+fn repo_stats() -> Vec<u8> {
+    let st = vlpds::state::RepoStats { records: 1_000_003, nodes: 270_001, blobs: 4_096 };
+    let k: BTreeMap<&str, String> = [("key S/", hex::encode(vlpds::state::repo_stats_key(DID))), ("value", hex::encode(st.encode()))].into_iter().collect();
+    pretty(&k)
+}
+
 fn head() -> vlpds::state::Head {
     let (_, commit, commit_block, rev) = commit_frame();
     vlpds::state::Head { commit, data: Cid::dag_cbor(b"\xa1aa\x01"), rev, commit_block: Bytes::from(commit_block) }
@@ -291,6 +298,7 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("segment/fence.bin", segment::fence_object("node-b").to_vec()),
         ("segment/like.seg", segment_like()),
         ("state/backlinks.json", backlinks()),
+        ("state/repo_stats.json", repo_stats()),
         ("state/head.bin", h.encode().to_vec()),
         ("state/record.bin", vlpds::state::record_value(&h.data, h.rev.0, b"\xa1aa\x01").to_vec()),
         ("state/account.json", compact(&account())),
@@ -577,6 +585,17 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             let v = vlpds::backlinks::decode(&hx("value"));
             assert_eq!(v.len(), 2);
             assert!(vlpds::backlinks::encode(&v) == hx("value"));
+        }
+        "state/repo_stats.json" => {
+            let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();
+            assert!(pretty(&k) == b);
+            let key = hex::decode(&k["key S/"]).unwrap();
+            assert_eq!(key, vlpds::state::repo_stats_key(DID));
+            assert_eq!(vlpds::state::key_slot(&key), Some(vlpds::slots::slot_of(DID)));
+            let v = hex::decode(&k["value"]).unwrap();
+            let st = vlpds::state::RepoStats::decode(&v).unwrap();
+            assert_eq!((st.records, st.nodes, st.blobs), (1_000_003, 270_001, 4_096));
+            assert!(st.encode() == v);
         }
         "segment/fence.bin" => {
             let LogObject::Fence { by } = segment::parse(Bytes::copy_from_slice(b), true, None).unwrap() else { panic!("{name}") };

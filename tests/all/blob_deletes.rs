@@ -159,9 +159,10 @@ fn refs_in(v: &J, out: &mut Vec<String>) {
     }
 }
 
-/// The worker loads a repo's blob refs only when a write needs the old ones
-/// (an update or delete; creates run without them, and the refs of what
-/// they create stay in memory until the load). With every idle repo's state
+/// The worker loads a repo's blob refs only when a write needs them (an
+/// update or delete drops the old ones, a create with blobs counts their
+/// other refs; other creates run without them, and the paths they create
+/// stay in memory until the load). With every idle repo's state
 /// dropped after each pass, a one-repo cache, and creates, updates and
 /// deletes racing in the same passes (a load while creates are in flight),
 /// the b/ index (listBlobs) always matches the records' refs.

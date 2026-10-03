@@ -19,6 +19,7 @@
 //! K/{did}                 -> empty (signing-key rotation pending: `Account::pending_signing_key`)
 //! bl/{did}\0{code}{subject} -> rkeys linking `subject` (crate::backlinks, DESIGN.md "Backlinks")
 //! T/                      -> the slot's account totals (crate::totals; keyed by slot alone)
+//! S/{did}                 -> repo counts (`RepoStats`: checkAccountStatus)
 
 use crate::cid::{Cid, CID_BYTES_LEN};
 use crate::tid::Tid;
@@ -97,6 +98,11 @@ pub fn account_key(did: &str) -> Vec<u8> {
 /// In `did`'s slot.
 pub fn handle_key(did: &str, handle: &str) -> Vec<u8> {
     keyed(did, b"n/", &[handle.as_bytes()])
+}
+
+/// Written in the same batch as every head change that changes the counts.
+pub fn repo_stats_key(did: &str) -> Vec<u8> {
+    keyed(did, b"S/", &[did.as_bytes()])
 }
 
 pub const HEAD_FAMILY: &[u8] = b"h/";
@@ -298,6 +304,42 @@ impl Head {
             )),
             commit_block: b.slice(2 * CID_BYTES_LEN + 8..),
         })
+    }
+}
+
+/// What checkAccountStatus reports about a repo's contents, maintained by
+/// the repo worker with each commit (`S/{did}`) instead of walked per call
+/// (`crate::repo_stats::walk` checks it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepoStats {
+    /// `R/` rows.
+    pub records: u64,
+    /// MST nodes with entries, leaves included (the empty tree's root isn't one).
+    pub nodes: u64,
+    /// Distinct blob CIDs the records reference (`b/`).
+    pub blobs: u64,
+}
+
+impl RepoStats {
+    pub const LEN: usize = 24;
+
+    pub fn encode(&self) -> Bytes {
+        let mut b = Vec::with_capacity(Self::LEN);
+        b.put_u64(self.records);
+        b.put_u64(self.nodes);
+        b.put_u64(self.blobs);
+        b.into()
+    }
+
+    pub fn decode(b: &[u8]) -> anyhow::Result<RepoStats> {
+        anyhow::ensure!(b.len() == Self::LEN, "repo stats of {} bytes", b.len());
+        let at = |i: usize| u64::from_be_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+        Ok(RepoStats { records: at(0), nodes: at(1), blobs: at(2) })
+    }
+
+    /// The reference's `repoBlocks`: the commit, the nodes, a block per record.
+    pub fn repo_blocks(&self) -> u64 {
+        1 + self.nodes + self.records
     }
 }
 
