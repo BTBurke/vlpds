@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use vlpds::crypto::Keypair;
 use vlpds::plc::mock::MockPlc;
-use vlpds::plc::{PlcConfig, RotationKey};
 
 /// An AppView stand-in answering resolveHandle from `handles` (400
 /// "Unable to resolve handle" otherwise, 500 for `boom.*`), counting calls.
@@ -60,10 +59,6 @@ async fn register(plc: &MockPlc, handle: &str, key: &Keypair, label: &Keypair) -
     did
 }
 
-async fn resolve(s: &TestServer, handle: &str) -> Resp {
-    s.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", handle)], &Auth::None).await
-}
-
 async fn identity(s: &TestServer, ident: &str) -> Resp {
     s.xrpc.get("com.atproto.identity.resolveIdentity", &[("identifier", ident)], &Auth::None).await
 }
@@ -88,14 +83,14 @@ async fn external_handles_resolve_through_the_appview() {
     .await;
     let a = s.create_account("alice").await;
 
-    assert_eq!(resolve(&s, &a.handle).await.ok()["did"], json!(a.did));
+    assert_eq!(s.resolve_handle(&a.handle).await.ok()["did"], json!(a.did));
     // under our domain: never asked elsewhere
-    resolve(&s, &format!("{}.{HANDLE_DOMAIN}", unique_name("nobody"))).await.err(400, "HandleNotFound");
+    s.resolve_handle(&format!("{}.{HANDLE_DOMAIN}", unique_name("nobody"))).await.err(400, "HandleNotFound");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert_eq!(resolve(&s, "Carol.Elsewhere.Test").await.ok()["did"], json!(ext_did));
-    resolve(&s, "unknown.elsewhere.test").await.err(400, "HandleNotFound");
+    assert_eq!(s.resolve_handle("Carol.Elsewhere.Test").await.ok()["did"], json!(ext_did));
+    s.resolve_handle("unknown.elsewhere.test").await.err(400, "HandleNotFound");
     // an AppView failure falls back to the resolver: none in dev mode
-    resolve(&s, "boom.elsewhere.test").await.err(400, "HandleNotFound");
+    s.resolve_handle("boom.elsewhere.test").await.err(400, "HandleNotFound");
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 
     // resolveIdentity: by handle and by DID, for someone hosted elsewhere
@@ -137,8 +132,8 @@ async fn external_handles_resolve_through_dns_without_an_appview() {
         c.txt_resolver = Some(r);
     })
     .await;
-    assert_eq!(resolve(&s, "dave.dns.test").await.ok()["did"], json!("did:plc:davedavedavedavedavedave"));
-    resolve(&s, "nobody.dns.test").await.err(400, "HandleNotFound");
+    assert_eq!(s.resolve_handle("dave.dns.test").await.ok()["did"], json!("did:plc:davedavedavedavedavedave"));
+    s.resolve_handle("nobody.dns.test").await.err(400, "HandleNotFound");
 }
 
 /// createAccount with an existing DID needs service auth from the DID
@@ -228,20 +223,9 @@ async fn stale_claims_are_taken_over_after_the_grace_period() {
     // the ghost's are taken over
     let j = s.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await.ok();
     assert_eq!(j["handle"], json!(handle));
-    assert_eq!(resolve(&s, &handle).await.ok()["did"], j["did"]);
+    assert_eq!(s.resolve_handle(&handle).await.ok()["did"], j["did"]);
     taken["email"] = json!(email);
     s.xrpc.post("com.atproto.server.createAccount", &taken, &Auth::None).await.err(400, "InvalidRequest");
-}
-
-/// A PDS registering DIDs with `plc` under `key`.
-async fn pds(plc: &MockPlc, key: &Arc<Keypair>) -> TestServer {
-    let (url, key) = (plc.url.clone(), key.clone());
-    TestServer::spawn_with(move |c| {
-        c.plc_url = url;
-        c.service_did = "did:web:pds.test".into();
-        c.plc = PlcConfig { rotation_key: Some(RotationKey::Key(key)), ..Default::default() };
-    })
-    .await
 }
 
 fn plc_handle(plc: &MockPlc, did: &str) -> String {
@@ -253,7 +237,7 @@ fn plc_handle(plc: &MockPlc, did: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_handle_updates_leave_plc_and_account_agreeing() {
     let plc = MockPlc::start().await;
-    let s = Arc::new(pds(&plc, &Arc::new(Keypair::generate())).await);
+    let s = Arc::new(TestServer::spawn_plc(&plc.url, Arc::new(Keypair::generate())).await);
     let a = Arc::new(s.create_account("race").await);
     for _ in 0..4 {
         let hs: Vec<String> = (0..3).map(|_| format!("{}.{HANDLE_DOMAIN}", unique_name("rh"))).collect();
@@ -271,7 +255,7 @@ async fn concurrent_handle_updates_leave_plc_and_account_agreeing() {
         let local = s.app.account(&a.did).await.ok().unwrap().handle;
         assert_eq!(plc_handle(&plc, &a.did), local, "directory and account agree");
         for h in &hs {
-            let r = resolve(&s, h).await;
+            let r = s.resolve_handle(h).await;
             if *h == local {
                 assert_eq!(r.ok()["did"], json!(a.did));
             } else {
@@ -289,7 +273,7 @@ async fn concurrent_handle_updates_leave_plc_and_account_agreeing() {
 async fn plc_ops_during_a_key_rotation() {
     let plc = MockPlc::start().await;
     let rot = Arc::new(Keypair::generate());
-    let s = pds(&plc, &rot).await;
+    let s = TestServer::spawn_plc(&plc.url, rot.clone()).await;
     let a = s.create_account("rk").await;
     s.xrpc.post_empty("com.atproto.identity.requestPlcOperationSignature", &a.auth()).await.ok();
     let token = s.mail_token(&a.email).await.unwrap();
@@ -331,7 +315,7 @@ async fn plc_ops_during_a_key_rotation() {
 async fn signed_ops_make_the_directory_authoritative() {
     let plc = MockPlc::start().await;
     let rot = Arc::new(Keypair::generate());
-    let s = pds(&plc, &rot).await;
+    let s = TestServer::spawn_plc(&plc.url, rot.clone()).await;
     let a = s.create_account("so").await;
     s.xrpc.post_empty("com.atproto.identity.requestPlcOperationSignature", &a.auth()).await.ok();
     let token = s.mail_token(&a.email).await.unwrap();
@@ -352,7 +336,7 @@ async fn signed_ops_make_the_directory_authoritative() {
     assert_eq!(doc["alsoKnownAs"], json!([format!("at://{other}")]), "the directory's document");
     // the directory down: the local document rather than an error
     plc.set_down(true);
-    let sess = s.xrpc.get("com.atproto.server.getSession", &[], &a.auth()).await.ok();
+    let sess = s.get_session(&a.auth()).await.ok();
     assert_eq!(sess["did"], json!(a.did));
     plc.set_down(false);
 

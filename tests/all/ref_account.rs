@@ -188,16 +188,9 @@ async fn ref_preferences_on_deactivated_account() {
 /// Requested").
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ref_plc_operation_signature_mail() {
-    use vlpds::plc::{PlcConfig, RotationKey, mock::MockPlc};
+    use vlpds::plc::mock::MockPlc;
     let plc = MockPlc::start().await;
-    let url = plc.url.clone();
-    let key = Arc::new(vlpds::crypto::Keypair::generate());
-    let s = TestServer::spawn_with(move |c| {
-        c.plc_url = url;
-        c.service_did = "did:web:pds.test".into();
-        c.plc = PlcConfig { rotation_key: Some(RotationKey::Key(key)), ..Default::default() };
-    })
-    .await;
+    let s = TestServer::spawn_plc(&plc.url, Arc::new(vlpds::crypto::Keypair::generate())).await;
     let a = s.create_account("plcmail").await;
     s.xrpc.post_empty("com.atproto.identity.requestPlcOperationSignature", &a.auth()).await.ok();
     let mail = latest_mail(&s, &a.email).await;

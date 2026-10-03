@@ -4,7 +4,6 @@ use crate::common::*;
 use std::sync::Arc;
 use vlpds::crypto::Keypair;
 use vlpds::plc::mock::MockPlc;
-use vlpds::plc::{PlcConfig, RotationKey};
 
 /// "does not allow signing plc operation without a token", "requests a plc
 /// signature", "does not sign a plc operation with a bad token"
@@ -12,13 +11,7 @@ use vlpds::plc::{PlcConfig, RotationKey};
 async fn plc_signature_request_mail_and_token_errors() {
     let plc = MockPlc::start().await;
     let key = Arc::new(Keypair::generate());
-    let url = plc.url.clone();
-    let s = TestServer::spawn_with(move |c| {
-        c.plc_url = url;
-        c.service_did = "did:web:pds.test".into();
-        c.plc = PlcConfig { rotation_key: Some(RotationKey::Key(key)), ..Default::default() };
-    })
-    .await;
+    let s = TestServer::spawn_plc(&plc.url, key).await;
     let a = s.create_account("alice").await;
     let sample = Keypair::generate().did_key();
     let sign = |body: J| {

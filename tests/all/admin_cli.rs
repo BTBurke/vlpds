@@ -166,13 +166,7 @@ async fn publish_identity_and_key_rotation() {
     use vlpds::plc::mock::MockPlc;
     let plc = MockPlc::start().await;
     let rot = Arc::new(vlpds::crypto::Keypair::generate());
-    let (pu, rk) = (plc.url.clone(), rot.clone());
-    let s = TestServer::spawn_with(move |c| {
-        c.plc_url = pu;
-        c.service_did = "did:web:pds.test".into();
-        c.plc = vlpds::plc::PlcConfig { rotation_key: Some(vlpds::plc::RotationKey::Key(rk)), ..Default::default() };
-    })
-    .await;
+    let s = TestServer::spawn_plc(&plc.url, rot.clone()).await;
     let a = s.create_account("pid").await;
     let b = s.create_account("pid").await;
     let local_key = |did: String| {

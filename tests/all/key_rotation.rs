@@ -11,20 +11,12 @@ use crate::common::*;
 use k256::ecdsa::VerifyingKey;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use vlpds::crypto::Keypair;
 use vlpds::plc::mock::MockPlc;
-use vlpds::plc::{PlcConfig, RotationKey};
 
 async fn plc_pds(plc: &MockPlc) -> TestServer {
-    let rot = Arc::new(Keypair::generate());
-    let (p, r) = (plc.url.clone(), rot.clone());
-    TestServer::spawn_with(move |c| {
-        c.plc_url = p;
-        c.service_did = "did:web:pds.test".into();
-        c.plc = PlcConfig { rotation_key: Some(RotationKey::Key(r)), ..Default::default() };
-    })
-    .await
+    TestServer::spawn_plc(&plc.url, Arc::new(Keypair::generate())).await
 }
 
 async fn rotate(s: &TestServer, did: &str) -> Resp {
@@ -44,9 +36,7 @@ fn plc_key(plc: &MockPlc, did: &str) -> String {
 }
 
 async fn create(s: &TestServer, a: &TestAccount, text: &str) -> Resp {
-    s.xrpc
-        .post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record(text)}), &a.auth())
-        .await
+    s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record(text)}), &a.auth()).await
 }
 
 /// The frames of `did` after the cursor, once its `#sync` arrived.
@@ -78,9 +68,8 @@ async fn rotation_under_concurrent_writes() {
             tokio::spawn(async move {
                 let mut i = 0;
                 while !stop.load(Ordering::Relaxed) {
-                    let r = x
-                        .post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record(&format!("w{w} {i}"))}), &a.auth())
-                        .await;
+                    let body = json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record(&format!("w{w} {i}"))});
+                    let r = x.post("com.atproto.repo.createRecord", &body, &a.auth()).await;
                     match r.status {
                         200 => {
                             let j = r.json;
@@ -197,9 +186,7 @@ async fn plc_refusal_and_outage() {
     assert_eq!(local_key(&s, &a.did).await, before);
     plc.set_down(false);
     // the background driver retries (1 s, then backing off)
-    eventually(Duration::from_secs(15), || async { (local_key(&s, &a.did).await == new_did_key).then_some(()) })
-        .await
-        .expect("pending rotation finished in the background");
+    eventually(Duration::from_secs(15), || async { (local_key(&s, &a.did).await == new_did_key).then_some(()) }).await.expect("pending rotation finished in the background");
     assert_eq!(plc_key(&plc, &a.did), new_did_key);
     let repo = s.get_repo(&a.did).await;
     repo.commit().verify(&key_of(&new_did_key)).expect("re-signed with the pending key");
@@ -245,35 +232,16 @@ async fn rotation_while_deactivated() {
     s.get_repo(&a.did).await.commit().verify(&new_key).unwrap();
 }
 
-async fn cluster_node(id: &str, store: &Arc<dyn object_store::ObjectStore>, plc: &MockPlc, rot: &Arc<Keypair>) -> TestServer {
-    let (id, store, plc_url, rot) = (id.to_string(), store.clone(), plc.url.clone(), rot.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = 4;
+async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, plc: &MockPlc, rot: &Arc<Keypair>) -> TestServer {
+    let (plc_url, rot) = (plc.url.clone(), rot.clone());
+    cluster_node(id, store.clone(), 4, |c| {
         // nothing checkpointed: the survivor replays the victim's log
         c.checkpoint_every = Duration::from_secs(3600);
-        c.plc_url = plc_url;
-        c.service_did = "did:web:pds.test".into();
-        c.plc = PlcConfig { rotation_key: Some(RotationKey::Key(rot)), ..Default::default() };
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: 4,
-            ttl: Duration::from_secs(2),
-            renew_every: Duration::from_millis(200),
-            skew: Duration::from_millis(400),
-            ..Default::default()
-        });
+        use_plc(c, plc_url, rot);
+        let l = lease(c);
+        (l.ttl, l.renew_every, l.skew) = (Duration::from_secs(2), Duration::from_millis(200), Duration::from_millis(400));
     })
     .await
-}
-
-async fn wait_until(what: &str, deadline: Duration, f: impl Fn() -> bool) {
-    let t = Instant::now();
-    while !f() {
-        assert!(t.elapsed() < deadline, "{what}: not within {deadline:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 /// The repo's owner dies (`Node::halt`, kill -9) mid-rotation, at `phase`:
@@ -287,13 +255,9 @@ async fn crash_mid_rotation(phase: &'static str) {
     let rot = Arc::new(Keypair::generate());
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let tag = unique_name("kr");
-    let a = cluster_node(&format!("{tag}-a"), &store, &plc, &rot).await;
-    let b = cluster_node(&format!("{tag}-b"), &store, &plc, &rot).await;
-    wait_until("both own shards", Duration::from_secs(15), || {
-        let (na, nb) = (a.app.partitions.owned().len(), b.app.partitions.owned().len());
-        na > 0 && nb > 0 && na + nb == 4
-    })
-    .await;
+    let a = node(&format!("{tag}-a"), &store, &plc, &rot).await;
+    let b = node(&format!("{tag}-b"), &store, &plc, &rot).await;
+    wait_until("both own shards", Duration::from_secs(15), || owned(&a) > 0 && owned(&b) > 0 && owned(&a) + owned(&b) == 4).await;
     // created on b: in a shard b owns
     let x = b.create_account("krx").await;
     assert!(b.app.partition(&x.did).is_ok());
@@ -324,7 +288,7 @@ async fn crash_mid_rotation(phase: &'static str) {
     assert_eq!(plc_key(&plc, &x.did), expect_plc);
     assert_eq!(plc.ops(&x.did).len(), plc_ops + usize::from(phase != "begun"));
 
-    wait_until("a takes every shard", Duration::from_secs(20), || a.app.partitions.owned().len() == 4).await;
+    wait_until("a takes every shard", Duration::from_secs(20), || owned(&a) == 4).await;
     // replayed: the rotation is pending, the head still the old key's
     let acct = a.app.account(&x.did).await.ok().unwrap();
     let pending = acct.pending_signing_key.clone().expect("pending rotation survived the crash");

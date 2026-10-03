@@ -110,6 +110,14 @@ pub fn peer_client() -> &'static vlpds::http::PeerClient {
     &C
 }
 
+/// Config of a PDS (`did:web:pds.test`) registering DIDs with the PLC
+/// directory at `plc_url` under `rotation`.
+pub fn use_plc(c: &mut vlpds::server::Config, plc_url: String, rotation: Arc<vlpds::crypto::Keypair>) {
+    c.plc_url = plc_url;
+    c.service_did = "did:web:pds.test".into();
+    c.plc = vlpds::plc::PlcConfig { rotation_key: Some(vlpds::plc::RotationKey::Key(rotation)), ..Default::default() };
+}
+
 /// In a `TestServer::spawn_with` closure: this node's peer listener URL,
 /// what a cluster test advertises (`ClusterConfig::addr`).
 pub fn peer_url(c: &vlpds::server::Config) -> String {
@@ -127,6 +135,13 @@ impl TestServer {
         let peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let peer_url = format!("https://{}", peer.local_addr().unwrap());
         Self::spawn_inner(Some((peer, peer_url)), f).await
+    }
+
+    /// A PDS (`did:web:pds.test`) registering DIDs with the PLC directory at
+    /// `plc_url` under `rotation`.
+    pub async fn spawn_plc(plc_url: &str, rotation: Arc<vlpds::crypto::Keypair>) -> TestServer {
+        let plc_url = plc_url.to_string();
+        Self::spawn_with(move |c| use_plc(c, plc_url, rotation)).await
     }
 
     /// A lone node: no peer listener, no peer TLS, no `/internal/*`.
