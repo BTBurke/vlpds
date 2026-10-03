@@ -110,21 +110,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> Node {
 async fn node_with(id: &str, store: &Arc<object_store::memory::InMemory>, f: impl FnOnce(&mut vlpds::server::Config)) -> Node {
     let k = Arc::new(Killable { inner: store.clone(), dead: AtomicBool::new(false) });
     let (id, raw) = (id.to_string(), k.clone() as Arc<dyn object_store::ObjectStore>);
-    let s = TestServer::spawn_with(move |c| {
-        f(c);
-        c.memory_store = Some(raw);
-        c.shards = SHARDS;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: SHARDS,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(200),
-            ..Default::default()
-        });
-    })
-    .await;
+    let s = cluster_node(&id, raw, SHARDS, f).await;
     Node { s, store: k }
 }
 

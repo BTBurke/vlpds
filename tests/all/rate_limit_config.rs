@@ -16,22 +16,7 @@ use std::time::Duration;
 const SHARDS: u32 = 8;
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.rate_limits_enabled = true;
-        c.memory_store = Some(store);
-        c.shards = SHARDS;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: SHARDS,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(200),
-            ..Default::default()
-        });
-    })
-    .await
+    cluster_node(id, store.clone(), SHARDS, |c| c.rate_limits_enabled = true).await
 }
 
 /// Both nodes see each other and own shards.

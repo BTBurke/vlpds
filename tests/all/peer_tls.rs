@@ -15,7 +15,6 @@
 //! - a lone node has no peer listener and no `/internal/*`.
 
 use crate::common::*;
-use crate::ha_auth::{balanced, owner_of};
 use std::sync::Arc;
 use std::time::Duration;
 use vlpds::peer_tls::{self, PeerTls};

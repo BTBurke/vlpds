@@ -16,24 +16,12 @@ const SHARDS: u32 = 8;
 const POST: &str = "app.bsky.feed.post";
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = SHARDS;
+    cluster_node(id, store.clone(), SHARDS, |c| {
         // one commit is ~3.5 KB: past max / K, so every commit may start its
         // own PUT while others are in flight
         c.max_segment_bytes = 4096;
         // median 8 ms, sigma 1: PUTs routinely finish out of order
         c.inject_latency = Some((8.0, 1.0));
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: SHARDS,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(200),
-            ..Default::default()
-        });
     })
     .await
 }
@@ -43,7 +31,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
 async fn writes(s: &TestServer, accts: &[TestAccount], per_acct: usize) -> Vec<RecordRef> {
     let futs = accts.iter().flat_map(|a| {
         (0..per_acct).map(move |i| async move {
-            let body = serde_json::json!({"repo": a.did, "collection": POST, "record": post_record(&format!("p{i}"))});
+            let body = json!({"repo": a.did, "collection": POST, "record": post_record(&format!("p{i}"))});
             for _ in 0..100 {
                 let r = s.xrpc.post("com.atproto.repo.createRecord", &body, &a.auth()).await;
                 if r.status == 503 {
@@ -129,13 +117,7 @@ async fn handoff_from_a_pipelined_log() {
     let b_fut = node("pipe-h-b", &raw);
     let (b, more) = tokio::join!(b_fut, writes(&a, &accts, 10));
     acked.extend(more);
-    for _ in 0..200 {
-        if !b.app.partitions.owned().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(!b.app.partitions.owned().is_empty(), "b never took shards");
+    wait_until("b takes shards", Duration::from_secs(10), || owned(&b) > 0).await;
     acked.extend(writes(&a, &accts, 5).await);
     for r in &acked {
         let (did, rkey) = (r.did(), r.rkey());

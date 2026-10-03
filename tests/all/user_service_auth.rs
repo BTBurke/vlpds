@@ -23,10 +23,6 @@ fn mp4(n: usize, seed: u8) -> Vec<u8> {
     b
 }
 
-async fn pds_did(s: &TestServer) -> String {
-    s.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok()["did"].as_str().unwrap().to_string()
-}
-
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -76,7 +72,7 @@ fn video_post(blob: &J) -> J {
 async fn upload_with_user_service_auth_is_owned_by_the_issuer() {
     let s = TestServer::spawn().await;
     let a = s.create_account("usa").await;
-    let pds = pds_did(&s).await;
+    let pds = s.pds_did().await;
     // what the app asks for: lxm uploadBlob, 30 minutes
     let tok = service_token(&s, &a, &pds, Some(UPLOAD), Some(now() + 1800)).await;
     let bytes = mp4(5000, 1);
@@ -104,7 +100,7 @@ async fn bad_user_service_tokens_are_refused_with_the_reference_errors() {
     let s = TestServer::spawn().await;
     let a = s.create_account("usa").await;
     let b = s.create_account("usb").await;
-    let pds = pds_did(&s).await;
+    let pds = s.pds_did().await;
     let body = || mp4(100, 2);
 
     // a token for another method
@@ -165,7 +161,7 @@ async fn foreign_issuers_are_refused() {
     let plc = MockPlc::start().await;
     let url = plc.url.clone();
     let s = TestServer::spawn_with(move |c| c.plc_url = url).await;
-    let pds = pds_did(&s).await;
+    let pds = s.pds_did().await;
     let key = Keypair::generate();
     let op = json!({
         "type": "plc_operation",
@@ -202,7 +198,7 @@ async fn account_status_with_user_service_auth() {
     let s = TestServer::spawn().await;
     let a = s.create_account("usa").await;
     let b = s.create_account("usb").await;
-    let pds = pds_did(&s).await;
+    let pds = s.pds_did().await;
     let ta = service_token(&s, &a, &pds, Some(UPLOAD), Some(now() + 600)).await;
     let tb = service_token(&s, &b, &pds, Some(UPLOAD), Some(now() + 600)).await;
 
@@ -225,7 +221,7 @@ async fn user_service_auth_is_refused_on_every_other_method() {
     let upstream = stub_video_service("http://127.0.0.1:1".into()).await;
     let s = TestServer::spawn_with(move |c| c.appview = Some((upstream, "did:web:appview.test".into()))).await;
     let a = s.create_account("usa").await;
-    let pds = pds_did(&s).await;
+    let pds = s.pds_did().await;
     let upload_tok = service_token(&s, &a, &pds, Some(UPLOAD), None).await;
     let post = || json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x")});
     // (method, is a procedure, body)
@@ -336,7 +332,7 @@ async fn video_upload_flow_through_a_video_service() {
 
     // the app: a service token for its PDS (`did:web:<pds host>`), lxm
     // uploadBlob, 30 minutes
-    let pds = pds_did(&s).await;
+    let pds = s.pds_did().await;
     let tok = service_token(&s, &a, &pds, Some(UPLOAD), Some(now() + 1800)).await;
     // ...and sends the video straight to the video service (not via the PDS)
     let bytes = mp4(9_000_000, 7); // > one 8 MiB part: the multipart path

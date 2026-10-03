@@ -41,6 +41,11 @@ pub fn cluster(n: &TestServer) -> &vlpds::cluster::Cluster {
     n.app.cluster.as_ref().expect("cluster node")
 }
 
+/// How many shards `n` has open.
+pub fn owned(n: &TestServer) -> usize {
+    n.app.partitions.owned().len()
+}
+
 /// The shards `n` has open, sorted.
 pub fn owned_shards(n: &TestServer) -> Vec<ShardId> {
     let mut v: Vec<ShardId> = n.app.partitions.owned().iter().map(|p| p.id).collect();

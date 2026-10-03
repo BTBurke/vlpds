@@ -41,10 +41,6 @@ async fn service_auth(s: &TestServer, auth: &Auth, q: &[(&str, &str)]) -> Resp {
     s.xrpc.get("com.atproto.server.getServiceAuth", q, auth).await
 }
 
-async fn pds_did(s: &TestServer) -> String {
-    s.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok()["did"].as_str().unwrap().to_string()
-}
-
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -53,7 +49,7 @@ fn now() -> i64 {
 async fn issues_verifiable_token_for_bare_did_aud() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    let aud = pds_did(&s).await;
+    let aud = s.pds_did().await;
     let r = service_auth(&s, &a.auth(), &[("aud", &aud), ("lxm", "com.atproto.server.describeServer")]).await;
     let token = r.ok()["token"].as_str().expect("token").to_string();
     let j = decode_jwt(&token);
@@ -83,7 +79,7 @@ async fn issues_verifiable_token_for_bare_did_aud() {
 async fn issues_token_for_did_service_id_aud() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    let aud = format!("{}#atproto_pds", pds_did(&s).await);
+    let aud = format!("{}#atproto_pds", s.pds_did().await);
     let r = service_auth(&s, &a.auth(), &[("aud", &aud), ("lxm", "com.atproto.server.describeServer")]).await;
     let j = decode_jwt(r.ok()["token"].as_str().unwrap());
     assert_eq!(j.claims["aud"], json!(aud));
@@ -95,7 +91,7 @@ async fn issues_token_for_did_service_id_aud() {
 async fn rejects_malformed_aud() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    let pds = pds_did(&s).await;
+    let pds = s.pds_did().await;
     for aud in ["not-a-did".to_string(), "did:foo:bar".to_string(), format!("{pds}#")] {
         let r = service_auth(&s, &a.auth(), &[("aud", &aud), ("lxm", "com.atproto.server.describeServer")]).await;
         r.err(400, "InvalidRequest");
@@ -106,7 +102,7 @@ async fn rejects_malformed_aud() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn requires_auth() {
     let s = TestServer::spawn().await;
-    let pds = pds_did(&s).await;
+    let pds = s.pds_did().await;
     service_auth(&s, &Auth::None, &[("aud", &pds)]).await.err_status(401);
     // admin basic auth is not a user identity
     let r = service_auth(&s, &Auth::Admin, &[("aud", &pds)]).await;
@@ -117,7 +113,7 @@ async fn requires_auth() {
 async fn expiration_rules() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    let pds = pds_did(&s).await;
+    let pds = s.pds_did().await;
     let lxm = "app.bsky.feed.getFeedSkeleton";
 
     // explicit exp within an hour, bound to a method: honored
@@ -144,7 +140,7 @@ async fn expiration_rules() {
 async fn refuses_protected_methods() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    let pds = pds_did(&s).await;
+    let pds = s.pds_did().await;
     for lxm in [
         "com.atproto.server.createAppPassword",
         "com.atproto.identity.updateHandle",
@@ -164,7 +160,7 @@ async fn token_and_commit_key_track_signing_key_rotation() {
     // signed with it, and an #identity event announces the change.
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    let pds = pds_did(&s).await;
+    let pds = s.pds_did().await;
     let old = s.signing_key(&a.did).await;
     let mut sub = s.subscribe(None).await;
     let r = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.ok();

@@ -13,73 +13,14 @@
 //! server sets it); forwards between nodes are real HTTP.
 
 use crate::common::*;
-use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 use tower::ServiceExt;
 
 const SHARDS: u32 = 8;
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.rate_limits_enabled = true;
-        c.memory_store = Some(store);
-        c.shards = SHARDS;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: SHARDS,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(200),
-            ..Default::default()
-        });
-    })
-    .await
-}
-
-/// Waits until the nodes own every shard once at fair share, agree on the
-/// routing, and it has held still for 500 ms (as in ha_auth.rs).
-async fn balanced(nodes: &[&TestServer]) {
-    let mut stable_since: Option<(Vec<Vec<vlpds::slots::ShardId>>, std::time::Instant)> = None;
-    for _ in 0..400 {
-        let owned: Vec<Vec<vlpds::slots::ShardId>> = nodes
-            .iter()
-            .map(|n| {
-                let mut v: Vec<vlpds::slots::ShardId> = n.app.partitions.owned().iter().map(|p| p.id).collect();
-                v.sort();
-                v
-            })
-            .collect();
-        let all: HashSet<vlpds::slots::ShardId> = owned.iter().flatten().copied().collect();
-        let sizes: Vec<usize> = owned.iter().map(|o| o.len()).collect();
-        let fair = sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1;
-        let complete = fair && all.len() == SHARDS as usize && sizes.iter().sum::<usize>() == SHARDS as usize;
-        let routed = complete
-            && nodes.iter().all(|n| {
-                let c = n.app.cluster.as_ref().unwrap();
-                (0..SHARDS).map(vlpds::slots::ShardId).all(|p| {
-                    let owner = nodes.iter().position(|m| m.app.partitions.get(p).is_some()).unwrap();
-                    c.owner_of(p).map(|(id, _)| id) == Some(nodes[owner].app.cluster.as_ref().unwrap().cfg.node_id.clone())
-                })
-            });
-        if routed {
-            match &stable_since {
-                Some((prev, at)) if *prev == owned => {
-                    if at.elapsed() >= Duration::from_millis(500) {
-                        return;
-                    }
-                }
-                _ => stable_since = Some((owned, std::time::Instant::now())),
-            }
-        } else {
-            stable_since = None;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("cluster never balanced");
+    cluster_node(id, store.clone(), SHARDS, |c| c.rate_limits_enabled = true).await
 }
 
 /// An account owned by each node (a node mints DIDs in its own shards):

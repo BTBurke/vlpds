@@ -6,34 +6,18 @@
 //! store (as in admin_cluster.rs).
 
 use crate::common::*;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use base64::Engine;
-use p256::ecdsa::signature::Signer;
-use p256::ecdsa::{Signature, SigningKey};
+use crate::oauth::DpopKey;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 const SHARDS: u32 = 8;
 
 /// A cluster node. `public` overrides the public URL (OAuth: every node
 /// must present the same issuer), the node still forwards to its own address.
 pub(crate) async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, public: Option<&str>) -> TestServer {
-    let (id, store, public) = (id.to_string(), store.clone(), public.map(String::from));
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = SHARDS;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: SHARDS,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(200),
-            ..Default::default()
-        });
+    let public = public.map(String::from);
+    cluster_node(id, store.clone(), SHARDS, |c| {
         if let Some(p) = public {
             c.public_url = p;
         }
@@ -41,95 +25,19 @@ pub(crate) async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, 
     .await
 }
 
-/// Waits until `nodes` own every shard exactly once at fair share (sizes
-/// within one of each other), their routing tables agree on it, and it has
-/// held still for 500 ms. "Each node owns some" can still be mid-rebalance
-/// (e.g. 6/1/1): the hand-backs that follow answer 503 PartitionUnavailable
-/// (retry) while a shard moves, which the single-shot steps below would
-/// take for a failure.
-pub(crate) async fn balanced(nodes: &[&TestServer]) {
-    let mut stable_since: Option<(Vec<Vec<vlpds::slots::ShardId>>, std::time::Instant)> = None;
-    for _ in 0..400 {
-        let owned: Vec<Vec<vlpds::slots::ShardId>> = nodes
-            .iter()
-            .map(|n| {
-                let mut v: Vec<vlpds::slots::ShardId> = n.app.partitions.owned().iter().map(|p| p.id).collect();
-                v.sort();
-                v
-            })
-            .collect();
-        let all: HashSet<vlpds::slots::ShardId> = owned.iter().flatten().copied().collect();
-        let sizes: Vec<usize> = owned.iter().map(|o| o.len()).collect();
-        let fair = sizes.iter().max().unwrap() - sizes.iter().min().unwrap() <= 1;
-        let complete = fair && all.len() == SHARDS as usize && sizes.iter().sum::<usize>() == SHARDS as usize;
-        let routed = complete
-            && nodes.iter().all(|n| {
-                let c = n.app.cluster.as_ref().unwrap();
-                (0..SHARDS).map(vlpds::slots::ShardId).all(|p| {
-                    let owner = nodes.iter().position(|m| m.app.partitions.get(p).is_some()).unwrap();
-                    c.owner_of(p).map(|(id, _)| id) == Some(nodes[owner].app.cluster.as_ref().unwrap().cfg.node_id.clone())
-                })
-            });
-        if routed {
-            match &stable_since {
-                Some((prev, at)) if *prev == owned => {
-                    if at.elapsed() >= Duration::from_millis(500) {
-                        return;
-                    }
-                }
-                _ => stable_since = Some((owned, std::time::Instant::now())),
-            }
-        } else {
-            stable_since = None;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("cluster never balanced");
-}
-
-pub(crate) fn owner_of<'a>(nodes: &[&'a TestServer], key: &str) -> &'a TestServer {
-    let p = vlpds::slots::shard_of(key, SHARDS);
-    nodes.iter().find(|n| n.app.partitions.get(p).is_some()).expect("owned")
-}
-
-/// Retries `f` (through a shard handoff) until it returns Some.
-async fn eventually<T, F, Fut>(what: &str, mut f: F) -> T
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Option<T>>,
-{
-    for _ in 0..200 {
-        if let Some(v) = f().await {
-            return v;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("never: {what}");
-}
-
 async fn get_record(s: &TestServer, r: &RecordRef) -> Resp {
-    s.xrpc
-        .get(
-            "com.atproto.repo.getRecord",
-            &[("repo", r.did()), ("collection", r.collection()), ("rkey", r.rkey())],
-            &Auth::None,
-        )
-        .await
-}
-
-async fn get_blob(s: &TestServer, did: &str, cid: &str) -> Resp {
-    s.xrpc.get("com.atproto.sync.getBlob", &[("did", did), ("cid", cid)], &Auth::None).await
+    s.get_record(r.did(), r.collection(), r.rkey()).await
 }
 
 /// Every node sees `rec` / `blob` taken down and `revoked` rejected, while
 /// `live` still authenticates.
 async fn enforced_everywhere(nodes: &[&TestServer], rec: &RecordRef, did: &str, blob: &str, revoked: &str, live: &str) {
     for s in nodes {
-        eventually("takedowns and revocations enforced", || async {
+        retry("takedowns and revocations enforced", || async {
             let r = get_record(s, rec).await;
-            let b = get_blob(s, did, blob).await;
-            let dead = s.xrpc.get("com.atproto.server.getSession", &[], &Auth::Bearer(revoked.into())).await;
-            let ok = s.xrpc.get("com.atproto.server.getSession", &[], &Auth::Bearer(live.into())).await;
+            let b = s.get_blob(did, blob).await;
+            let dead = s.get_session(&Auth::Bearer(revoked.into())).await;
+            let ok = s.get_session(&Auth::Bearer(live.into())).await;
             (r.error_name() == Some("RecordNotFound")
                 && b.error_name() == Some("BlobNotFound")
                 && dead.error_name() == Some("ExpiredToken")
@@ -150,41 +58,20 @@ async fn takedowns_and_revocations_are_cluster_wide_and_survive_failover() {
 
     // an account owned by a; everything below goes through b and c
     let acct = a.create_account("hat").await;
-    assert!(a.app.partitions.get(vlpds::slots::shard_of(&acct.did, SHARDS)).is_some());
+    assert!(std::ptr::eq(owner_of(&[&a, &b, &c], &acct.did), &a));
     let rec = b.create_record(&acct, "app.bsky.feed.post", post_record("taken down soon")).await;
     let keep = c.create_record(&acct, "app.bsky.feed.post", post_record("stays")).await;
-    let up = c
-        .xrpc
-        .post_bytes("com.atproto.repo.uploadBlob", b"some blob bytes".to_vec(), "image/png", &acct.auth())
-        .await
-        .ok();
-    let blob = up["blob"]["ref"]["$link"].as_str().unwrap().to_string();
+    let blob = c.upload_blob(&acct, b"some blob bytes", "image/png").await["ref"]["$link"].as_str().unwrap().to_string();
 
     // record takedown through b, blob takedown through c (routed by subject)
-    b.xrpc
-        .post(
-            "com.atproto.admin.updateSubjectStatus",
-            &json!({"subject": {"$type": "com.atproto.repo.strongRef", "uri": rec.uri, "cid": rec.cid}, "takedown": {"applied": true, "ref": "t1"}}),
-            &Auth::Admin,
-        )
-        .await
-        .ok();
-    c.xrpc
-        .post(
-            "com.atproto.admin.updateSubjectStatus",
-            &json!({"subject": {"$type": "com.atproto.admin.defs#repoBlobRef", "did": acct.did, "cid": blob}, "takedown": {"applied": true}}),
-            &Auth::Admin,
-        )
-        .await
-        .ok();
+    let strong_ref = json!({"$type": "com.atproto.repo.strongRef", "uri": rec.uri, "cid": rec.cid});
+    let status = |n: &TestServer, subject: J, takedown: J| n.xrpc.post_owned("com.atproto.admin.updateSubjectStatus", json!({"subject": subject, "takedown": takedown}), Auth::Admin);
+    status(&b, strong_ref.clone(), json!({"applied": true, "ref": "t1"})).await.ok();
+    status(&c, json!({"$type": "com.atproto.admin.defs#repoBlobRef", "did": acct.did, "cid": blob}), json!({"applied": true})).await.ok();
     for s in [&a, &b, &c] {
         let st = s.xrpc.get("com.atproto.admin.getSubjectStatus", &[("uri", &rec.uri)], &Auth::Admin).await.ok();
         assert_eq!(st["takedown"], json!({"applied": true, "ref": "t1"}), "{st}");
-        let st = s
-            .xrpc
-            .get("com.atproto.admin.getSubjectStatus", &[("did", &acct.did), ("blob", &blob)], &Auth::Admin)
-            .await
-            .ok();
+        let st = s.xrpc.get("com.atproto.admin.getSubjectStatus", &[("did", &acct.did), ("blob", &blob)], &Auth::Admin).await.ok();
         assert_eq!(st["takedown"]["applied"], true, "{st}");
         let l = s.list_records(&acct.did, "app.bsky.feed.post", &[]).await.ok();
         let uris: Vec<&str> = l["records"].as_array().unwrap().iter().map(|r| r["uri"].as_str().unwrap()).collect();
@@ -196,7 +83,7 @@ async fn takedowns_and_revocations_are_cluster_wide_and_survive_failover() {
     // records the revocation in the account's partition)
     let sess = b.create_session(&acct.handle, PASSWORD).await.ok();
     let (access, refresh) = (sess["accessJwt"].as_str().unwrap().to_string(), sess["refreshJwt"].as_str().unwrap().to_string());
-    c.xrpc.get("com.atproto.server.getSession", &[], &Auth::Bearer(access.clone())).await.ok();
+    c.get_session(&Auth::Bearer(access.clone())).await.ok();
     c.xrpc.post_empty("com.atproto.server.deleteSession", &Auth::Bearer(refresh)).await.ok();
     enforced_everywhere(&[&a, &b, &c], &rec, &acct.did, &blob, &access, &acct.access).await;
 
@@ -214,62 +101,15 @@ async fn takedowns_and_revocations_are_cluster_wide_and_survive_failover() {
     enforced_everywhere(&[&b, &c, &d], &rec, &acct.did, &blob, &access, &acct.access).await;
 
     // lifting the takedown (through any node) is seen everywhere too
-    d.xrpc
-        .post(
-            "com.atproto.admin.updateSubjectStatus",
-            &json!({"subject": {"$type": "com.atproto.repo.strongRef", "uri": rec.uri, "cid": rec.cid}, "takedown": {"applied": false}}),
-            &Auth::Admin,
-        )
-        .await
-        .ok();
+    status(&d, strong_ref, json!({"applied": false})).await.ok();
     for s in [&b, &c, &d] {
-        eventually("takedown lifted", || async { get_record(s, &rec).await.is_ok().then_some(()) }).await;
+        retry("takedown lifted", || async { get_record(s, &rec).await.is_ok().then_some(()) }).await;
     }
 }
 
 // ---------- OAuth across nodes ----------
 
 pub(crate) const PUBLIC: &str = "http://pds.cluster.test";
-
-fn b64(b: impl AsRef<[u8]>) -> String {
-    B64.encode(b)
-}
-
-fn rand_str(n: usize) -> String {
-    b64((0..n).map(|_| rand::random::<u8>()).collect::<Vec<u8>>())
-}
-
-fn form(pairs: &[(&str, &str)]) -> String {
-    let enc = vlpds::oauth::util::form_encode_component;
-    pairs.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&")
-}
-
-pub(crate) struct DpopKey {
-    sk: SigningKey,
-    nonce: parking_lot::Mutex<Option<String>>,
-}
-
-impl DpopKey {
-    fn new() -> DpopKey {
-        DpopKey { sk: SigningKey::random(&mut rand::rngs::OsRng), nonce: Default::default() }
-    }
-
-    fn proof(&self, htm: &str, htu: &str, ath: Option<&str>) -> String {
-        let pt = self.sk.verifying_key().to_encoded_point(false);
-        let jwk = json!({"kty": "EC", "crv": "P-256", "x": b64(pt.x().unwrap()), "y": b64(pt.y().unwrap())});
-        let header = json!({"typ": "dpop+jwt", "alg": "ES256", "jwk": jwk});
-        let mut payload = json!({"jti": rand_str(16), "htm": htm, "htu": htu, "iat": chrono::Utc::now().timestamp()});
-        if let Some(n) = self.nonce.lock().clone() {
-            payload["nonce"] = J::String(n);
-        }
-        if let Some(t) = ath {
-            payload["ath"] = J::String(b64(Sha256::digest(t)));
-        }
-        let input = format!("{}.{}", b64(serde_json::to_vec(&header).unwrap()), b64(serde_json::to_vec(&payload).unwrap()));
-        let sig: Signature = self.sk.sign(input.as_bytes());
-        format!("{input}.{}", b64(sig.to_bytes()))
-    }
-}
 
 fn http() -> reqwest::Client {
     reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap()
@@ -284,7 +124,7 @@ pub(crate) async fn as_post(node: &TestServer, key: &DpopKey, path: &str, pairs:
             .post(format!("{}{path}", node.url))
             .header("content-type", "application/x-www-form-urlencoded")
             .header("dpop", p)
-            .body(form(pairs))
+            .body(form_body(pairs))
             .send()
             .await
             .unwrap();
@@ -346,7 +186,7 @@ impl Browser {
         let rb = http()
             .post(format!("{}{path}", node.url))
             .header("content-type", "application/x-www-form-urlencoded")
-            .body(form(pairs));
+            .body(form_body(pairs));
         self.send(rb).await
     }
 }
@@ -385,8 +225,8 @@ impl Client {
         handle: &str,
         did: &str,
     ) -> (String, String) {
-        let verifier = rand_str(32);
-        let challenge = b64(Sha256::digest(&verifier));
+        let verifier = rand_b64url(32);
+        let challenge = b64url(Sha256::digest(&verifier));
         let (st, j) = as_post(
             par,
             &self.key,
@@ -565,23 +405,16 @@ async fn user_service_auth_uploads_route_to_the_owner() {
     balanced(&nodes).await;
     let acct = a.create_account("husa").await;
     let owner = owner_of(&nodes, &acct.did);
-    let pds = a.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok()["did"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let pds = a.pds_did().await;
     for n in nodes.iter().filter(|n| !std::ptr::eq(**n, owner)) {
         let q = [("aud", pds.as_str()), ("lxm", "com.atproto.repo.uploadBlob")];
-        let tok = n.xrpc.get("com.atproto.server.getServiceAuth", &q, &acct.auth()).await.ok()["token"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let tok = n.xrpc.get("com.atproto.server.getServiceAuth", &q, &acct.auth()).await.ok()["token"].as_str().unwrap().to_string();
         let bytes = format!("video bytes via {}", n.url).into_bytes();
         let up = n.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "video/mp4", &Auth::Bearer(tok)).await.ok();
         let cid = up["blob"]["ref"]["$link"].as_str().unwrap().to_string();
         let embed = json!({"$type": "app.bsky.embed.video", "video": up["blob"]});
-        n.create_record(&acct, "app.bsky.feed.post", json!({"$type": "app.bsky.feed.post", "text": "v", "createdAt": now_iso(), "embed": embed}))
-            .await;
-        let g = get_blob(n, &acct.did, &cid).await;
+        n.create_record(&acct, "app.bsky.feed.post", json!({"$type": "app.bsky.feed.post", "text": "v", "createdAt": now_iso(), "embed": embed})).await;
+        let g = n.get_blob(&acct.did, &cid).await;
         assert_eq!(g.status, 200, "{}", g.text());
         assert_eq!(g.body.as_ref() as &[u8], bytes.as_slice());
     }

@@ -18,28 +18,16 @@ use crate::common::*;
 use crate::firehose_startup::{collect, mismatch, node_with, s3_union, Writers};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const SHARDS: usize = 8;
-
-fn owned(s: &TestServer) -> usize {
-    s.app.partitions.owned().len()
-}
-
-async fn wait_for(what: &str, deadline: Duration, f: impl Fn() -> bool) {
-    let t = Instant::now();
-    while !f() {
-        assert!(t.elapsed() < deadline, "{what}: not within {deadline:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn late_follower_loses_no_joiner_events() {
     let store = Arc::new(object_store::memory::InMemory::new());
     let a = node_with("jf-a", &store, None).await;
     let b = node_with("jf-b", &store, None).await;
-    wait_for("a and b split the shards", Duration::from_secs(10), || owned(&a) == SHARDS / 2 && owned(&b) == SHARDS / 2).await;
+    wait_until("a and b split the shards", Duration::from_secs(10), || owned(&a) == SHARDS / 2 && owned(&b) == SHARDS / 2).await;
     let accounts: Vec<TestAccount> = futures::future::join_all((0..16).map(|_| a.create_account("jf"))).await;
     let target = Arc::new(AtomicI64::new(0));
     let a_live = collect(a.subscribe(None).await, target.clone());
@@ -61,7 +49,7 @@ async fn late_follower_loses_no_joiner_events() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     bc.test_ignore_hellos(false);
     bc.test_hold_steps(false);
-    wait_for("c gets its share once b follows its log", Duration::from_secs(10), || owned(&c) >= 2).await;
+    wait_until("c gets its share once b follows its log", Duration::from_secs(10), || owned(&c) >= 2).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let acked = writers.stop().await;
     assert!(acked.len() > 100, "write load too light: {} acked", acked.len());

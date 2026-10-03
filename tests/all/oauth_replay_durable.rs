@@ -6,54 +6,13 @@
 //! (tests/all/oauth.rs `resource_dpop_checks`; HA notes in src/oauth/mod.rs).
 use crate::common::*;
 use crate::oauth::DpopKey;
-use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 const SHARDS: u32 = 8;
 const PUBLIC: &str = "http://pds.replay.test";
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = SHARDS;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: SHARDS,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(200),
-            ..Default::default()
-        });
-        c.public_url = PUBLIC.into();
-    })
-    .await
-}
-
-/// Every shard owned exactly once between `nodes`, and their routing agrees.
-async fn balanced(nodes: &[&TestServer]) {
-    for _ in 0..400 {
-        let owned: Vec<Vec<vlpds::slots::ShardId>> = nodes.iter().map(|n| n.app.partitions.owned().iter().map(|p| p.id).collect()).collect();
-        let all: HashSet<vlpds::slots::ShardId> = owned.iter().flatten().copied().collect();
-        let complete = owned.iter().all(|o| !o.is_empty())
-            && all.len() == SHARDS as usize
-            && owned.iter().map(|o| o.len()).sum::<usize>() == SHARDS as usize;
-        let routed = complete
-            && nodes.iter().all(|n| {
-                let c = n.app.cluster.as_ref().unwrap();
-                (0..SHARDS).map(vlpds::slots::ShardId).all(|p| {
-                    let o = nodes.iter().position(|m| m.app.partitions.get(p).is_some()).unwrap();
-                    c.owner_of(p).map(|(id, _)| id) == Some(nodes[o].app.cluster.as_ref().unwrap().cfg.node_id.clone())
-                })
-            });
-        if routed {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("cluster never balanced");
+    cluster_node(id, store.clone(), SHARDS, |c| c.public_url = PUBLIC.into()).await
 }
 
 /// A token request that fails after the proof check (unknown refresh

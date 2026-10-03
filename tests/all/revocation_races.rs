@@ -7,7 +7,7 @@
 //! twice nor lost. Two in-process nodes on one in-memory object store.
 
 use crate::common::*;
-use crate::ha_auth::{Browser, Client, PUBLIC, as_post, balanced, csrf_of, node, owner_of};
+use crate::ha_auth::{Browser, Client, PUBLIC, as_post, csrf_of, node};
 use std::sync::Arc;
 
 /// Holds requests of `did` reaching pause point `point` until released.
@@ -204,15 +204,6 @@ fn totp_code(secret: &[u8], step: u64) -> String {
     vlpds::totp::code_for_step(secret, step)
 }
 
-/// Enables TOTP for `acct` (on `s`); returns the secret and the step used.
-async fn enable_totp(s: &TestServer, acct: &TestAccount) -> (Vec<u8>, u64) {
-    let j = s.xrpc.post_empty("vlpds.server.setupTotp", &acct.auth()).await.ok();
-    let secret = vlpds::totp::base32_decode(j["secret"].as_str().unwrap()).unwrap();
-    let step = vlpds::totp::step_at(vlpds::totp::now_secs());
-    s.xrpc.post("vlpds.server.confirmTotp", &json!({"code": totp_code(&secret, step)}), &acct.auth()).await.ok();
-    (secret, step)
-}
-
 /// What another node does with a code (the same steps as a login there):
 /// attempt on the state it reads, written only if unchanged.
 async fn attempt_elsewhere(s: &TestServer, did: &str, code: &str) -> Result<(), String> {
@@ -229,7 +220,7 @@ async fn attempt_elsewhere(s: &TestServer, did: &str, code: &str) -> Result<(), 
 async fn totp_codes_and_failures_are_counted_once_across_nodes() {
     let (a, b) = cluster("rr-totp").await;
     let acct = a.create_account("rrt").await;
-    let (secret, step) = enable_totp(&a, &acct).await;
+    let (secret, step) = a.enable_totp(&acct).await;
     let login = |code: String| {
         let body = json!({"identifier": acct.handle, "password": acct.password, "authFactorToken": code});
         let a = &a;

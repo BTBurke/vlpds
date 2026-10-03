@@ -187,16 +187,19 @@ impl TestServer {
         self.create_account_with(&handle, PASSWORD).await
     }
 
+    /// Retries while password hashing sheds load (503: the Argon2 permits
+    /// are process-wide, shared with every test running at the time).
     pub async fn create_account_with(&self, handle: &str, password: &str) -> TestAccount {
         let email = format!("{}@example.com", handle.replace('.', "-"));
-        let r = self
-            .xrpc
-            .post(
-                "com.atproto.server.createAccount",
-                &json!({"handle": handle, "password": password, "email": email}),
-                &Auth::None,
-            )
-            .await;
+        let body = json!({"handle": handle, "password": password, "email": email});
+        let t = std::time::Instant::now();
+        let r = loop {
+            let r = self.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await;
+            if r.status != 503 || t.elapsed() > Duration::from_secs(60) {
+                break r;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
         let j = r.ok();
         TestAccount {
             did: j["did"].as_str().unwrap_or_else(|| panic!("createAccount failed: {j}")).to_string(),
@@ -432,6 +435,16 @@ impl TestServer {
 
     pub async fn resolve_handle(&self, handle: &str) -> Resp {
         self.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", handle)], &Auth::None).await
+    }
+
+    /// setupTotp + confirmTotp as `a`: (the raw secret, the step confirmed).
+    pub async fn enable_totp(&self, a: &TestAccount) -> (Vec<u8>, u64) {
+        let j = self.xrpc.post_empty("vlpds.server.setupTotp", &a.auth()).await.ok();
+        let secret = vlpds::totp::base32_decode(j["secret"].as_str().unwrap()).unwrap();
+        let step = vlpds::totp::step_at(vlpds::totp::now_secs());
+        let body = json!({"code": vlpds::totp::code_for_step(&secret, step)});
+        self.xrpc.post("vlpds.server.confirmTotp", &body, &a.auth()).await.ok();
+        (secret, step)
     }
 
     /// uploadBlob as `a`; returns the blob ref.
@@ -1517,6 +1530,17 @@ pub fn jwt_claims(tok: &str) -> J {
 pub fn b64url_decode(s: &str) -> Vec<u8> {
     use base64::Engine;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).unwrap()
+}
+
+/// `n` random bytes, base64url (nonces, jtis, PKCE verifiers).
+pub fn rand_b64url(n: usize) -> String {
+    b64url(random_bytes(n))
+}
+
+/// An `application/x-www-form-urlencoded` body.
+pub fn form_body(pairs: &[(&str, &str)]) -> String {
+    let enc = vlpds::oauth::util::form_encode_component;
+    pairs.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&")
 }
 
 /// Standard base64, padded or not.

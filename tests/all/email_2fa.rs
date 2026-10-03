@@ -246,11 +246,7 @@ async fn totp_takes_precedence_over_email() {
     let a = confirmed_account(&s, "kim").await;
     enable(&s, &a).await;
     // enable TOTP as well
-    let j = s.xrpc.post_empty("vlpds.server.setupTotp", &a.auth()).await.ok();
-    let secret = vlpds::totp::base32_decode(j["secret"].as_str().unwrap()).unwrap();
-    let step = vlpds::totp::step_at(vlpds::totp::now_secs());
-    let body = json!({"code": vlpds::totp::code_for_step(&secret, step)});
-    s.xrpc.post("vlpds.server.confirmTotp", &body, &a.auth()).await.ok();
+    let (secret, step) = s.enable_totp(&a).await;
     // no email code: TOTP is asked for
     let (r, _) = mailed_n(&s, &a.email, 0, s.login(&a.handle, &a.password, None)).await;
     r.err(401, "AuthFactorTokenRequired");

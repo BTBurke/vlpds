@@ -8,46 +8,27 @@
 
 use crate::common::*;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use vlpds::metrics as m;
 
 const SHARDS: u32 = 8;
 
-async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, advertise: Option<String>) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = SHARDS;
-        // no checkpoints: a takeover replays everything the dead node wrote
-        c.checkpoint_every = Duration::from_secs(3600);
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: advertise.unwrap_or_else(|| peer_url(c)),
-            shards: SHARDS,
-            ttl: Duration::from_secs(6),
-            renew_every: Duration::from_millis(200),
-            skew: Duration::from_millis(1200),
-            ..Default::default()
-        });
-    })
-    .await
-}
-
-fn owned(s: &TestServer) -> usize {
-    s.app.partitions.owned().len()
-}
-
-async fn wait_for(what: &str, deadline: Duration, f: impl Fn() -> bool) {
-    let t = Instant::now();
-    while !f() {
-        assert!(t.elapsed() < deadline, "{what}: not within {deadline:?}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// The value of the first exposition line starting with `series`.
 fn scraped(text: &str, series: &str) -> Option<f64> {
     text.lines().find(|l| l.starts_with(series)).and_then(|l| l.rsplit(' ').next()?.parse().ok())
+}
+
+async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, advertise: Option<String>) -> TestServer {
+    cluster_node(id, store.clone(), SHARDS, |c| {
+        // no checkpoints: a takeover replays everything the dead node wrote
+        c.checkpoint_every = Duration::from_secs(3600);
+        let l = lease(c);
+        (l.ttl, l.renew_every, l.skew) = (Duration::from_secs(6), Duration::from_millis(200), Duration::from_millis(1200));
+        if let Some(a) = advertise {
+            l.addr = a;
+        }
+    })
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -63,7 +44,7 @@ async fn takeover_replay_and_lease_metrics_move() {
         format!("https://{}", l.local_addr().unwrap())
     };
     let b = node(&idb, &store, Some(refusing)).await;
-    wait_for("b gets its share", Duration::from_secs(10), || owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize).await;
+    wait_until("b gets its share", Duration::from_secs(10), || owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize).await;
 
     // writes in b's shards (a node creates accounts in shards it owns),
     // never checkpointed
@@ -104,7 +85,7 @@ async fn takeover_replay_and_lease_metrics_move() {
     let replay_secs0 = m::REPLAY_SECONDS.get_sample_count();
 
     b.app.node.halt(); // kill -9
-    wait_for("a takes b's shards", Duration::from_secs(10), || owned(&a) == SHARDS as usize).await;
+    wait_until("a takes b's shards", Duration::from_secs(10), || owned(&a) == SHARDS as usize).await;
 
     assert!(m::PEER_TAKEOVERS.with_label_values(&["peer"]).get() > takeovers0, "a fenced b's log as a dead peer's");
     assert!(m::REPLAYED_SEGMENTS.get() > replayed0, "a replayed b's log tail");
@@ -112,7 +93,7 @@ async fn takeover_replay_and_lease_metrics_move() {
     assert!(m::SHARD_OPEN_SECONDS.with_label_values(&["replay"]).get_sample_count() > replay_opens0);
     assert!(m::REPLAY_SECONDS.get_sample_count() > replay_secs0);
     // b's halted lease runs out
-    wait_for("b's validity goes negative", Duration::from_secs(10), || {
+    wait_until("b's validity goes negative", Duration::from_secs(10), || {
         scraped(&m::render(), &format!("vlpds_lease_validity_seconds{{node_id=\"{idb}\"}}")).is_some_and(|v| v < 0.0)
     })
     .await;

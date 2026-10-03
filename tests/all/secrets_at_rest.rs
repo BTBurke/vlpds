@@ -12,25 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use vlpds::secrets::{GcpToken, KekBytes, KekConfig};
 
-async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, kek: KekConfig) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = 4;
-        c.kek = kek;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: 4,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(300),
-            ..Default::default()
-        });
-    })
-    .await
-}
-
 fn local(k: &KekBytes, old: &[&KekBytes]) -> KekConfig {
     KekConfig { local: Some(k.clone()), local_old: old.iter().map(|k| (*k).clone()).collect(), ..Default::default() }
 }
@@ -43,6 +24,10 @@ fn has(hay: &[u8], needle: &[u8]) -> bool {
 /// object in the bucket (log segments decoded: their bodies are zstd), and
 /// every key and value of the owned shards' state, read through SlateDB
 /// (SST blocks are compressed too; this includes the memtable).
+async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, kek: KekConfig) -> TestServer {
+    cluster_node(id, store.clone(), 4, |c| c.kek = kek).await
+}
+
 async fn everything(s: &TestServer) -> Vec<(String, Vec<u8>)> {
     use futures::StreamExt;
     let raw = s.app.store.raw.clone();
@@ -84,15 +69,6 @@ fn forms(raw: &[u8]) -> Vec<Vec<u8>> {
 async fn signing_secret(s: &TestServer, did: &str) -> Vec<u8> {
     let a = s.app.account(did).await.ok().unwrap();
     s.app.secrets.account_signing_key(&a).await.unwrap().to_bytes().to_vec()
-}
-
-/// setupTotp + confirmTotp; returns the raw secret.
-async fn enable_totp(s: &TestServer, a: &TestAccount) -> Vec<u8> {
-    let j = s.xrpc.post_empty("vlpds.server.setupTotp", &a.auth()).await.ok();
-    let secret = vlpds::totp::base32_decode(j["secret"].as_str().unwrap()).unwrap();
-    let code = vlpds::totp::code_for_step(&secret, vlpds::totp::step_at(vlpds::totp::now_secs()));
-    s.xrpc.post("vlpds.server.confirmTotp", &json!({"code": code}), &a.auth()).await.ok();
-    secret
 }
 
 async fn totp_login(s: &TestServer, a: &TestAccount, secret: &[u8], step_offset: u64) -> Resp {
@@ -144,7 +120,7 @@ async fn no_plaintext_secrets_in_bucket_or_state() {
         .to_string();
     needles.push(("reserved key".into(), reserved_secret(&s, &dk).await));
     // a TOTP secret, used once
-    let secret = enable_totp(&s, &accts[1]).await;
+    let (secret, _) = s.enable_totp(&accts[1]).await;
     totp_login(&s, &accts[1], &secret, 1).await.ok();
     needles.push(("totp secret".into(), secret));
     // email tokens (password reset, email confirmation)
@@ -193,7 +169,7 @@ async fn kek_rotation_and_rewrap() {
         a.post(&t, "before rotation").await;
         accts.push(t);
     }
-    let totp = enable_totp(&a, &accts[0]).await;
+    let (totp, _) = a.enable_totp(&accts[0]).await;
     let dk = a.xrpc.post("com.atproto.server.reserveSigningKey", &json!({}), &Auth::None).await.ok()["signingKey"].as_str().unwrap().to_string();
     let keys_before: Vec<Vec<u8>> = futures::future::join_all(accts.iter().map(|t| signing_secret(&a, &t.did))).await;
     a.app.log.checkpoint_all().await;
