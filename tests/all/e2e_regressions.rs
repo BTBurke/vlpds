@@ -152,9 +152,7 @@ async fn well_known_atproto_did_by_host() {
     let (a, b, c) = cluster("e2e-wk").await;
     let acct = a.create_account("wk").await;
     let http = reqwest::Client::new();
-    let get = |n: &TestServer, host: String| {
-        http.get(format!("{}/.well-known/atproto-did", n.url)).header("host", host).send()
-    };
+    let get = |n: &TestServer, host: String| http.get(format!("{}/.well-known/atproto-did", n.url)).header("host", host).send();
     for n in [&a, &b, &c] {
         let r = get(n, acct.handle.clone()).await.unwrap();
         assert_eq!(r.status(), 200);
@@ -226,7 +224,8 @@ async fn admin_account_calls_reach_the_owner() {
         let acct = &accts[(i + 1) % 3];
         assert!(!owns(n, &acct.did));
         let email = format!("{}@example.org", unique_name("new"));
-        let update = |account: &str, email: &str| n.xrpc.post_owned("com.atproto.admin.updateAccountEmail", json!({"account": account, "email": email}), Auth::Admin);
+        let update =
+            |account: &str, email: &str| n.xrpc.post_owned("com.atproto.admin.updateAccountEmail", json!({"account": account, "email": email}), Auth::Admin);
         update(&acct.did, &email).await.ok();
         assert_eq!(n.account_info(&acct.did).await.ok()["email"], json!(email));
         // by handle too

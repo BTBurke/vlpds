@@ -181,9 +181,7 @@ async fn publish_identity_and_key_rotation() {
     let out = ok(admin_cli(&s.url, &["publish-identity", &a.did, "--file", file.to_str().unwrap()]).await);
     let _ = std::fs::remove_file(&file);
     assert!(out.contains(&format!("published identity evt for {} ({})", a.did, a.handle)), "{out}");
-    let frames = sub
-        .until(Duration::from_secs(10), |f| f.iter().filter(|f| f.kind() == "#identity").count() >= 2)
-        .await;
+    let frames = sub.until(Duration::from_secs(10), |f| f.iter().filter(|f| f.kind() == "#identity").count() >= 2).await;
     let ids: Vec<(&str, Option<&str>)> = frames.iter().filter(|f| f.kind() == "#identity").map(|f| (f.did().unwrap(), f.str("handle"))).collect();
     assert_eq!(ids, vec![(a.did.as_str(), Some(a.handle.as_str())), (b.did.as_str(), Some(b.handle.as_str()))]);
     // an unknown DID fails the batch, the others still go out
@@ -236,7 +234,9 @@ async fn rotate_plc_keys_needs_plc() {
 async fn many_records(s: &TestServer, a: &TestAccount, n: usize) {
     for chunk in 0..n.div_ceil(50) {
         let writes: Vec<J> = (0..50.min(n - chunk * 50))
-            .map(|i| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": post_record(&format!("p{chunk}-{i}"))}))
+            .map(
+                |i| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": post_record(&format!("p{chunk}-{i}"))}),
+            )
             .collect();
         s.apply_writes(a, json!(writes)).await.ok();
     }
@@ -301,7 +301,8 @@ async fn check_and_rebuild_repo() {
 
     // the replace is guarded by the head the records were read at
     let stale = Some(Cid::from_bytes(&head0.to_bytes()).unwrap());
-    let r = s.app.account_op(&a.did, vlpds::worker::AccountOp::ReplaceRepo { records: Vec::new(), swap_commit: stale, stale_keys: Vec::new(), tree: None }).await;
+    let r =
+        s.app.account_op(&a.did, vlpds::worker::AccountOp::ReplaceRepo { records: Vec::new(), swap_commit: stale, stale_keys: Vec::new(), tree: None }).await;
     assert_eq!(r.err().map(|e| e.error), Some("InvalidSwap".to_string()));
     assert_eq!(s.list_records(&a.did, "app.bsky.feed.post", &[("limit", "5")]).await.ok()["records"].as_array().unwrap().len(), 5);
 
@@ -363,12 +364,7 @@ async fn the_binary_runs_admin_commands() {
     let a = s.create_account("bin").await;
     let bin = env!("CARGO_BIN_EXE_vlpds");
     let run_bin = |args: Vec<String>| async move {
-        tokio::process::Command::new(bin)
-            .args(args)
-            .env("VLPDS_ADMIN_TOKEN", vlpds::server::DEV_ADMIN_TOKEN)
-            .output()
-            .await
-            .unwrap()
+        tokio::process::Command::new(bin).args(args).env("VLPDS_ADMIN_TOKEN", vlpds::server::DEV_ADMIN_TOKEN).output().await.unwrap()
     };
     let o = run_bin(vec!["admin".into(), "--url".into(), s.url.clone(), "account".into(), "list".into(), "--json".into()]).await;
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));

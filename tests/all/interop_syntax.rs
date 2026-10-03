@@ -18,21 +18,12 @@ impl Mismatches {
     }
     #[track_caller]
     fn assert_none(&self, what: &str) {
-        assert!(
-            self.0.is_empty(),
-            "{what}: {} mismatches:\n  {}",
-            self.0.len(),
-            self.0.join("\n  ")
-        );
+        assert!(self.0.is_empty(), "{what}: {} mismatches:\n  {}", self.0.len(), self.0.join("\n  "));
     }
 }
 
 fn short(s: &str) -> String {
-    if s.len() > 60 {
-        format!("{}…({} chars)", &s[..60], s.len())
-    } else {
-        format!("{s:?}")
-    }
+    if s.len() > 60 { format!("{}…({} chars)", &s[..60], s.len()) } else { format!("{s:?}") }
 }
 
 // ---------------------------------------------------------------------------
@@ -54,20 +45,12 @@ async fn record_keys_valid_accepted_by_put_record() {
             )
             .await;
         if !r.is_ok() {
-            bad.push(format!(
-                "putRecord rkey {} rejected: {}",
-                short(&rkey),
-                r.text()
-            ));
+            bad.push(format!("putRecord rkey {} rejected: {}", short(&rkey), r.text()));
             continue;
         }
         let g = s.get_record(&a.did, "com.example.record", &rkey).await;
         if !g.is_ok() || g.json["value"]["k"] != json!(rkey) {
-            bad.push(format!(
-                "getRecord rkey {} after put: {}",
-                short(&rkey),
-                g.text()
-            ));
+            bad.push(format!("getRecord rkey {} after put: {}", short(&rkey), g.text()));
         }
     }
     bad.assert_none("valid record keys");
@@ -79,20 +62,13 @@ async fn record_keys_invalid_rejected() {
     let a = s.create_account("rki").await;
     let mut bad = Mismatches::new();
     for rkey in fixture_lines("interop/syntax/recordkey_syntax_invalid.txt") {
-        for nsid in [
-            "com.atproto.repo.createRecord",
-            "com.atproto.repo.putRecord",
-        ] {
+        for nsid in ["com.atproto.repo.createRecord", "com.atproto.repo.putRecord"] {
             let r = s
                 .xrpc
                 .post(nsid, &json!({"repo": a.did, "collection": "com.example.record", "rkey": rkey, "record": {"$type": "com.example.record"}}), &a.auth())
                 .await;
             if r.status != 400 {
-                bad.push(format!(
-                    "{nsid} accepted invalid rkey {} -> {}",
-                    short(&rkey),
-                    r.text()
-                ));
+                bad.push(format!("{nsid} accepted invalid rkey {} -> {}", short(&rkey), r.text()));
             }
         }
         let r = s
@@ -104,17 +80,11 @@ async fn record_keys_invalid_rejected() {
             )
             .await;
         if r.status != 400 {
-            bad.push(format!(
-                "applyWrites accepted invalid rkey {} -> {}",
-                short(&rkey),
-                r.text()
-            ));
+            bad.push(format!("applyWrites accepted invalid rkey {} -> {}", short(&rkey), r.text()));
         }
     }
     // Nothing may have been written.
-    let l = s
-        .list_records(&a.did, "com.example.record", &[("limit", "100")])
-        .await;
+    let l = s.list_records(&a.did, "com.example.record", &[("limit", "100")]).await;
     if let Some(recs) = l.json["records"].as_array() {
         for r in recs {
             bad.push(format!("record with invalid key was stored: {}", r["uri"]));
@@ -133,20 +103,9 @@ async fn nsids_valid_accepted_as_collections() {
     let a = s.create_account("nsv").await;
     let mut bad = Mismatches::new();
     for nsid in fixture_lines("interop/syntax/nsid_syntax_valid.txt") {
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.repo.createRecord",
-                &json!({"repo": a.did, "collection": nsid, "record": {"$type": nsid, "x": 1}}),
-                &a.auth(),
-            )
-            .await;
+        let r = s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": nsid, "record": {"$type": nsid, "x": 1}}), &a.auth()).await;
         if !r.is_ok() {
-            bad.push(format!(
-                "collection {} rejected: {}",
-                short(&nsid),
-                r.text()
-            ));
+            bad.push(format!("collection {} rejected: {}", short(&nsid), r.text()));
         }
     }
     bad.assert_none("valid NSIDs as collections");
@@ -158,31 +117,14 @@ async fn nsids_invalid_rejected_as_collections() {
     let a = s.create_account("nsi").await;
     let mut bad = Mismatches::new();
     for nsid in fixture_lines("interop/syntax/nsid_syntax_invalid.txt") {
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.repo.createRecord",
-                &json!({"repo": a.did, "collection": nsid, "record": {"$type": nsid}}),
-                &a.auth(),
-            )
-            .await;
+        let r = s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": nsid, "record": {"$type": nsid}}), &a.auth()).await;
         if r.status != 400 {
-            bad.push(format!(
-                "createRecord accepted collection {} -> {}",
-                short(&nsid),
-                r.text()
-            ));
+            bad.push(format!("createRecord accepted collection {} -> {}", short(&nsid), r.text()));
         }
-        let r = s
-            .xrpc
-            .post("com.atproto.repo.putRecord", &json!({"repo": a.did, "collection": nsid, "rkey": "self", "record": {"$type": nsid}}), &a.auth())
-            .await;
+        let r =
+            s.xrpc.post("com.atproto.repo.putRecord", &json!({"repo": a.did, "collection": nsid, "rkey": "self", "record": {"$type": nsid}}), &a.auth()).await;
         if r.status != 400 {
-            bad.push(format!(
-                "putRecord accepted collection {} -> {}",
-                short(&nsid),
-                r.text()
-            ));
+            bad.push(format!("putRecord accepted collection {} -> {}", short(&nsid), r.text()));
         }
     }
     bad.assert_none("invalid NSIDs as collections");
@@ -206,11 +148,7 @@ async fn handles_invalid_rejected_by_create_account() {
             )
             .await;
         if r.status != 400 {
-            bad.push(format!(
-                "createAccount accepted handle {} -> {}",
-                short(&h),
-                r.text()
-            ));
+            bad.push(format!("createAccount accepted handle {} -> {}", short(&h), r.text()));
         }
         // and the same label under our own domain
         let under = format!("{h}.{HANDLE_DOMAIN}");
@@ -224,18 +162,10 @@ async fn handles_invalid_rejected_by_create_account() {
             .await;
         // Some invalid handles become valid with a suffix (e.g. a bare TLD); only
         // flag success for strings that are invalid in any position.
-        let still_invalid = h.contains(' ')
-            || h.contains("..")
-            || h.starts_with('.')
-            || h.starts_with('-')
-            || h.contains("_")
-            || h.chars().any(|c| !c.is_ascii());
+        let still_invalid =
+            h.contains(' ') || h.contains("..") || h.starts_with('.') || h.starts_with('-') || h.contains("_") || h.chars().any(|c| !c.is_ascii());
         if still_invalid && r.status != 400 {
-            bad.push(format!(
-                "createAccount accepted handle {} -> {}",
-                short(&under),
-                r.text()
-            ));
+            bad.push(format!("createAccount accepted handle {} -> {}", short(&under), r.text()));
         }
     }
     bad.assert_none("invalid handles");
@@ -246,37 +176,16 @@ async fn handles_resolve_handle_param_validation() {
     let s = TestServer::spawn().await;
     let mut bad = Mismatches::new();
     for h in fixture_lines("interop/syntax/handle_syntax_invalid.txt") {
-        let r = s
-            .xrpc
-            .get(
-                "com.atproto.identity.resolveHandle",
-                &[("handle", &h)],
-                &Auth::None,
-            )
-            .await;
+        let r = s.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", &h)], &Auth::None).await;
         if !(r.status == 400 && r.error_name() == Some("InvalidRequest")) {
-            bad.push(format!(
-                "resolveHandle({}) -> {} (want 400 InvalidRequest)",
-                short(&h),
-                r.text()
-            ));
+            bad.push(format!("resolveHandle({}) -> {} (want 400 InvalidRequest)", short(&h), r.text()));
         }
     }
     for h in fixture_lines("interop/syntax/handle_syntax_valid.txt") {
-        let r = s
-            .xrpc
-            .get(
-                "com.atproto.identity.resolveHandle",
-                &[("handle", &h)],
-                &Auth::None,
-            )
-            .await;
+        let r = s.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", &h)], &Auth::None).await;
         // Unknown but syntactically valid: must not be a param validation error.
         if r.error_name() == Some("InvalidRequest") {
-            bad.push(format!(
-                "resolveHandle rejected valid handle {} as InvalidRequest",
-                short(&h)
-            ));
+            bad.push(format!("resolveHandle rejected valid handle {} as InvalidRequest", short(&h)));
         }
     }
     bad.assert_none("resolveHandle handle syntax");
@@ -308,10 +217,7 @@ async fn handles_valid_labels_under_service_domain_accepted() {
         } else if !r.is_ok() {
             bad.push(format!("createAccount rejected {handle}: {}", r.text()));
         } else if r.json["handle"] != json!(handle) {
-            bad.push(format!(
-                "createAccount {handle} returned handle {}",
-                r.json["handle"]
-            ));
+            bad.push(format!("createAccount {handle} returned handle {}", r.json["handle"]));
         }
     }
     bad.assert_none("valid handle labels");
@@ -326,36 +232,17 @@ async fn dids_param_validation() {
     let s = TestServer::spawn().await;
     let mut bad = Mismatches::new();
     for did in fixture_lines("interop/syntax/did_syntax_invalid.txt") {
-        for nsid in [
-            "com.atproto.sync.getLatestCommit",
-            "com.atproto.sync.getRepoStatus",
-            "com.atproto.sync.getRepo",
-        ] {
+        for nsid in ["com.atproto.sync.getLatestCommit", "com.atproto.sync.getRepoStatus", "com.atproto.sync.getRepo"] {
             let r = s.xrpc.get(nsid, &[("did", &did)], &Auth::None).await;
             if !(r.status == 400 && r.error_name() == Some("InvalidRequest")) {
-                bad.push(format!(
-                    "{nsid}(did={}) -> {} (want 400 InvalidRequest)",
-                    short(&did),
-                    r.text()
-                ));
+                bad.push(format!("{nsid}(did={}) -> {} (want 400 InvalidRequest)", short(&did), r.text()));
             }
         }
     }
     for did in fixture_lines("interop/syntax/did_syntax_valid.txt") {
-        let r = s
-            .xrpc
-            .get(
-                "com.atproto.sync.getLatestCommit",
-                &[("did", &did)],
-                &Auth::None,
-            )
-            .await;
+        let r = s.xrpc.get("com.atproto.sync.getLatestCommit", &[("did", &did)], &Auth::None).await;
         if !(r.status == 400 || r.status == 404) || r.error_name() == Some("InvalidRequest") {
-            bad.push(format!(
-                "getLatestCommit(valid unknown did {}) -> {} (want RepoNotFound)",
-                short(&did),
-                r.text()
-            ));
+            bad.push(format!("getLatestCommit(valid unknown did {}) -> {} (want RepoNotFound)", short(&did), r.text()));
         }
     }
     bad.assert_none("DID params");
@@ -366,35 +253,13 @@ async fn at_identifiers_as_repo_param() {
     let s = TestServer::spawn().await;
     let mut bad = Mismatches::new();
     for id in fixture_lines("interop/syntax/atidentifier_syntax_invalid.txt") {
-        let r = s
-            .xrpc
-            .get(
-                "com.atproto.repo.describeRepo",
-                &[("repo", &id)],
-                &Auth::None,
-            )
-            .await;
+        let r = s.xrpc.get("com.atproto.repo.describeRepo", &[("repo", &id)], &Auth::None).await;
         if !(r.status == 400 && r.error_name() == Some("InvalidRequest")) {
-            bad.push(format!(
-                "describeRepo(repo={}) -> {} (want 400 InvalidRequest)",
-                short(&id),
-                r.text()
-            ));
+            bad.push(format!("describeRepo(repo={}) -> {} (want 400 InvalidRequest)", short(&id), r.text()));
         }
-        let r = s
-            .xrpc
-            .get(
-                "com.atproto.repo.listRecords",
-                &[("repo", &id), ("collection", "app.bsky.feed.post")],
-                &Auth::None,
-            )
-            .await;
+        let r = s.xrpc.get("com.atproto.repo.listRecords", &[("repo", &id), ("collection", "app.bsky.feed.post")], &Auth::None).await;
         if !(r.status == 400 && r.error_name() == Some("InvalidRequest")) {
-            bad.push(format!(
-                "listRecords(repo={}) -> {} (want 400 InvalidRequest)",
-                short(&id),
-                r.text()
-            ));
+            bad.push(format!("listRecords(repo={}) -> {} (want 400 InvalidRequest)", short(&id), r.text()));
         }
     }
     bad.assert_none("at-identifier params");
@@ -472,34 +337,21 @@ async fn cids_invalid_rejected_in_params() {
     for c in fixture_lines("interop/syntax/cid_syntax_invalid.txt") {
         let r = s
             .xrpc
-            .get(
-                "com.atproto.repo.getRecord",
-                &[
-                    ("repo", &a.did),
-                    ("collection", "app.bsky.feed.post"),
-                    ("rkey", p.rkey()),
-                    ("cid", &c),
-                ],
-                &Auth::None,
-            )
+            .get("com.atproto.repo.getRecord", &[("repo", &a.did), ("collection", "app.bsky.feed.post"), ("rkey", p.rkey()), ("cid", &c)], &Auth::None)
             .await;
         if !(r.status == 400 && r.error_name() == Some("InvalidRequest")) {
-            bad.push(format!(
-                "getRecord(cid={}) -> {} (want 400 InvalidRequest)",
-                short(&c),
-                r.text()
-            ));
+            bad.push(format!("getRecord(cid={}) -> {} (want 400 InvalidRequest)", short(&c), r.text()));
         }
         let r = s
             .xrpc
-            .post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x"), "swapCommit": c}), &a.auth())
+            .post(
+                "com.atproto.repo.createRecord",
+                &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x"), "swapCommit": c}),
+                &a.auth(),
+            )
             .await;
         if r.status != 400 {
-            bad.push(format!(
-                "createRecord(swapCommit={}) -> {}",
-                short(&c),
-                r.text()
-            ));
+            bad.push(format!("createRecord(swapCommit={}) -> {}", short(&c), r.text()));
         }
     }
     bad.assert_none("CID params");
@@ -519,27 +371,27 @@ async fn datetimes_in_known_records() {
     for dt in fixture_lines("interop/syntax/datetime_syntax_valid.txt") {
         let r = s
             .xrpc
-            .post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": {"$type": "app.bsky.feed.post", "text": "t", "createdAt": dt}}), &a.auth())
+            .post(
+                "com.atproto.repo.createRecord",
+                &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": {"$type": "app.bsky.feed.post", "text": "t", "createdAt": dt}}),
+                &a.auth(),
+            )
             .await;
         if !r.is_ok() {
-            bad.push(format!(
-                "valid datetime {} rejected: {}",
-                short(&dt),
-                r.text()
-            ));
+            bad.push(format!("valid datetime {} rejected: {}", short(&dt), r.text()));
         }
     }
     for dt in fixture_lines("interop/syntax/datetime_syntax_invalid.txt") {
         let r = s
             .xrpc
-            .post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": {"$type": "app.bsky.feed.post", "text": "t", "createdAt": dt}}), &a.auth())
+            .post(
+                "com.atproto.repo.createRecord",
+                &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": {"$type": "app.bsky.feed.post", "text": "t", "createdAt": dt}}),
+                &a.auth(),
+            )
             .await;
         if r.status != 400 {
-            bad.push(format!(
-                "invalid datetime {} accepted: {}",
-                short(&dt),
-                r.text()
-            ));
+            bad.push(format!("invalid datetime {} accepted: {}", short(&dt), r.text()));
         }
     }
     bad.assert_none("datetimes in app.bsky.feed.post");
@@ -575,11 +427,7 @@ async fn at_uris_in_known_records() {
             )
             .await;
         if r.status != 400 {
-            bad.push(format!(
-                "invalid at-uri {} accepted: {}",
-                short(&u),
-                r.text()
-            ));
+            bad.push(format!("invalid at-uri {} accepted: {}", short(&u), r.text()));
         }
     }
     bad.assert_none("at-uris in app.bsky.feed.like");

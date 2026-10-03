@@ -7,8 +7,8 @@
 //!   N6: commits chained on the stale state, then "rebuilt MST root != head
 //!   data" forever).
 use crate::common::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use vlpds::cluster::ShardHost;
 
 /// Hammers `nsid` as the account from 8 tasks while an admin takes it down;
@@ -127,11 +127,7 @@ async fn load_straddling_shard_bounce_is_dropped() {
     bounce(&s, &old).await;
     assert!(!Arc::ptr_eq(&old, &s.app.partition(&a.did).unwrap_or_else(|e| panic!("{}", e.message))));
     // ...and the load completes (ahead of the next write in the worker's queue)
-    s.app
-        .workers
-        .route(&a.did)
-        .send(vlpds::worker::WorkerMsg::Loaded { did: a.did.as_str().into(), res: Ok(Some(stale)) })
-        .unwrap();
+    s.app.workers.route(&a.did).send(vlpds::worker::WorkerMsg::Loaded { did: a.did.as_str().into(), res: Ok(Some(stale)) }).unwrap();
     let three = s.post(&a, "three").await;
     let rev3 = three.rev.clone().unwrap();
     let mut sub = s.subscribe(Some(0)).await;

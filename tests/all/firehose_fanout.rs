@@ -6,8 +6,8 @@ use crate::common::*;
 use futures::{SinkExt, StreamExt};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::Role;
 
 /// A websocket client that does the handshake and then reads nothing: its
 /// receive window fills and the server's writes to it block.

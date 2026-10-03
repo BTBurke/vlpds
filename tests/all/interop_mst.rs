@@ -2,7 +2,7 @@
 //! commit-proof fixtures (testdata/interop/{mst,firehose}).
 use crate::common::*;
 use std::collections::HashMap;
-use vlpds::mst::{height_for_key, Tree};
+use vlpds::mst::{Tree, height_for_key};
 
 #[derive(serde::Deserialize)]
 struct KeyHeight {
@@ -12,15 +12,9 @@ struct KeyHeight {
 
 #[test]
 fn key_heights() {
-    let cases: Vec<KeyHeight> =
-        serde_json::from_str(&read_fixture("interop/mst/key_heights.json")).unwrap();
+    let cases: Vec<KeyHeight> = serde_json::from_str(&read_fixture("interop/mst/key_heights.json")).unwrap();
     for c in cases {
-        assert_eq!(
-            height_for_key(c.key.as_bytes()),
-            c.height,
-            "height of {:?}",
-            c.key
-        );
+        assert_eq!(height_for_key(c.key.as_bytes()), c.height, "height of {:?}", c.key);
     }
 }
 
@@ -38,10 +32,7 @@ fn example_keys_encode_their_height() {
 #[test]
 fn empty_tree_root_cid() {
     let mut t = Tree::new();
-    assert_eq!(
-        t.root_cid().unwrap().to_string(),
-        "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"
-    );
+    assert_eq!(t.root_cid().unwrap().to_string(), "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm");
 }
 
 #[test]
@@ -49,10 +40,7 @@ fn invalid_keys_rejected() {
     let leaf = Cid::parse("bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454").unwrap();
     let mut t = Tree::new();
     assert!(t.insert(b"", leaf).is_err(), "empty key");
-    assert!(
-        t.insert(&vec![b'a'; 1025], leaf).is_err(),
-        "key over 1024 bytes"
-    );
+    assert!(t.insert(&vec![b'a'; 1025], leaf).is_err(), "key over 1024 bytes");
 }
 
 #[derive(serde::Deserialize)]
@@ -80,34 +68,14 @@ fn commit_proof_roots() {
         for k in &f.keys {
             t.insert_no_proof(k.as_bytes(), v).unwrap();
         }
-        assert_eq!(
-            t.root_cid().unwrap().to_string(),
-            f.root_before_commit,
-            "{}: root before",
-            f.comment
-        );
+        assert_eq!(t.root_cid().unwrap().to_string(), f.root_before_commit, "{}: root before", f.comment);
         for k in &f.adds {
-            assert_eq!(
-                t.insert(k.as_bytes(), v).unwrap(),
-                None,
-                "{}: add {k}",
-                f.comment
-            );
+            assert_eq!(t.insert(k.as_bytes(), v).unwrap(), None, "{}: add {k}", f.comment);
         }
         for k in &f.dels {
-            assert_eq!(
-                t.remove(k.as_bytes()).unwrap(),
-                Some(v),
-                "{}: del {k}",
-                f.comment
-            );
+            assert_eq!(t.remove(k.as_bytes()).unwrap(), Some(v), "{}: del {k}", f.comment);
         }
-        assert_eq!(
-            t.root_cid().unwrap().to_string(),
-            f.root_after_commit,
-            "{}: root after",
-            f.comment
-        );
+        assert_eq!(t.root_cid().unwrap().to_string(), f.root_after_commit, "{}: root after", f.comment);
     }
 }
 
@@ -129,18 +97,9 @@ fn commit_proof_blocks_emitted() {
         }
         let mut blocks = Vec::new();
         t.write_diff_blocks(&mut blocks).unwrap();
-        let have: std::collections::HashSet<String> =
-            blocks.iter().map(|(c, _)| c.to_string()).collect();
-        let missing: Vec<_> = f
-            .blocks_in_proof
-            .iter()
-            .filter(|b| !have.contains(*b))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "{}: diff is missing proof blocks {missing:?}",
-            f.comment
-        );
+        let have: std::collections::HashSet<String> = blocks.iter().map(|(c, _)| c.to_string()).collect();
+        let missing: Vec<_> = f.blocks_in_proof.iter().filter(|b| !have.contains(*b)).collect();
+        assert!(missing.is_empty(), "{}: diff is missing proof blocks {missing:?}", f.comment);
     }
 }
 
@@ -174,37 +133,18 @@ fn commit_proof_reference_blocks_suffice_for_inversion() {
             .iter()
             .map(|s| {
                 let c = Cid::parse(s).unwrap();
-                (
-                    c,
-                    all.get(&c)
-                        .unwrap_or_else(|| panic!("{}: proof block {s} not in tree", f.comment))
-                        .clone(),
-                )
+                (c, all.get(&c).unwrap_or_else(|| panic!("{}: proof block {s} not in tree", f.comment)).clone())
             })
             .collect();
-        let mut inv = Tree::load_from_blocks(&proof, root)
-            .unwrap_or_else(|e| panic!("{}: load: {e}", f.comment));
+        let mut inv = Tree::load_from_blocks(&proof, root).unwrap_or_else(|e| panic!("{}: load: {e}", f.comment));
         // invert in reverse order of application
         for k in f.dels.iter().rev() {
-            assert_eq!(
-                inv.insert(k.as_bytes(), v)
-                    .unwrap_or_else(|e| panic!("{}: reinsert {k}: {e}", f.comment)),
-                None
-            );
+            assert_eq!(inv.insert(k.as_bytes(), v).unwrap_or_else(|e| panic!("{}: reinsert {k}: {e}", f.comment)), None);
         }
         for k in f.adds.iter().rev() {
-            assert_eq!(
-                inv.remove(k.as_bytes())
-                    .unwrap_or_else(|e| panic!("{}: remove {k}: {e}", f.comment)),
-                Some(v)
-            );
+            assert_eq!(inv.remove(k.as_bytes()).unwrap_or_else(|e| panic!("{}: remove {k}: {e}", f.comment)), Some(v));
         }
-        assert_eq!(
-            inv.root_cid().unwrap().to_string(),
-            f.root_before_commit,
-            "{}: inverted root",
-            f.comment
-        );
+        assert_eq!(inv.root_cid().unwrap().to_string(), f.root_before_commit, "{}: inverted root", f.comment);
     }
 }
 
@@ -227,8 +167,5 @@ fn canonical_shape_independent_of_insertion_order() {
         }
         roots.push(t.root_cid().unwrap());
     }
-    assert!(
-        roots.windows(2).all(|w| w[0] == w[1]),
-        "roots differ by insertion order: {roots:?}"
-    );
+    assert!(roots.windows(2).all(|w| w[0] == w[1]), "roots differ by insertion order: {roots:?}");
 }

@@ -69,10 +69,7 @@ async fn resolved_lexicons_validate_third_party_records() {
 
     let r = create(&s, &a, &nsid, json!({"text": "far too long here"}), None).await;
     r.err(400, "InvalidRequest");
-    assert_eq!(
-        r.json["message"],
-        format!("Invalid {nsid} record: record/text must not be longer than 10 characters")
-    );
+    assert_eq!(r.json["message"], format!("Invalid {nsid} record: record/text must not be longer than 10 characters"));
     // refs inside the resolved document are followed
     let r = create(&s, &a, &nsid, json!({"text": "hi", "sub": {"n": 0}}), None).await;
     r.err(400, "InvalidRequest");
@@ -156,26 +153,14 @@ async fn procedure_inputs_are_validated() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
     for (nsid, body, msg) in [
-        (
-            "com.atproto.repo.createRecord",
-            json!({"repo": a.did, "record": {}}),
-            "Input must have the property \"collection\"",
-        ),
-        (
-            "com.atproto.repo.createRecord",
-            json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": "x"}),
-            "Input/record must be an object",
-        ),
+        ("com.atproto.repo.createRecord", json!({"repo": a.did, "record": {}}), "Input must have the property \"collection\""),
+        ("com.atproto.repo.createRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": "x"}), "Input/record must be an object"),
         (
             "com.atproto.repo.createRecord",
             json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": {}, "validate": "yes"}),
             "Input/validate must be a boolean",
         ),
-        (
-            "com.atproto.repo.deleteRecord",
-            json!({"repo": a.did, "collection": "not an nsid", "rkey": "x"}),
-            "Input/collection must be a valid nsid",
-        ),
+        ("com.atproto.repo.deleteRecord", json!({"repo": a.did, "collection": "not an nsid", "rkey": "x"}), "Input/collection must be a valid nsid"),
         (
             "com.atproto.repo.applyWrites",
             json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#nope"}]}),
@@ -203,18 +188,9 @@ async fn query_params_are_validated() {
     let a = s.create_account("alice").await;
     for (q, msg) in [
         (vec![("repo", a.did.as_str())], "Params must have the property \"collection\""),
-        (
-            vec![("repo", a.did.as_str()), ("collection", "app.bsky.feed.post"), ("limit", "500")],
-            "limit can not be greater than 100",
-        ),
-        (
-            vec![("repo", a.did.as_str()), ("collection", "app.bsky.feed.post"), ("reverse", "maybe")],
-            "reverse must be a boolean",
-        ),
-        (
-            vec![("repo", a.did.as_str()), ("collection", "nope")],
-            "collection must be a valid nsid",
-        ),
+        (vec![("repo", a.did.as_str()), ("collection", "app.bsky.feed.post"), ("limit", "500")], "limit can not be greater than 100"),
+        (vec![("repo", a.did.as_str()), ("collection", "app.bsky.feed.post"), ("reverse", "maybe")], "reverse must be a boolean"),
+        (vec![("repo", a.did.as_str()), ("collection", "nope")], "collection must be a valid nsid"),
     ] {
         let r = s.xrpc.get("com.atproto.repo.listRecords", &q, &Auth::None).await;
         r.err(400, "InvalidRequest");
@@ -224,11 +200,7 @@ async fn query_params_are_validated() {
     r.err(400, "InvalidRequest");
     assert_eq!(r.json["message"], "Params must have the property \"repo\"");
     s.xrpc
-        .get(
-            "com.atproto.repo.listRecords",
-            &[("repo", &a.did), ("collection", "app.bsky.feed.post"), ("reverse", "true"), ("limit", "2")],
-            &Auth::None,
-        )
+        .get("com.atproto.repo.listRecords", &[("repo", &a.did), ("collection", "app.bsky.feed.post"), ("reverse", "true"), ("limit", "2")], &Auth::None)
         .await
         .ok();
 }
@@ -239,15 +211,12 @@ async fn query_params_are_validated() {
 async fn handler_outputs_are_checked_in_debug_builds() {
     use axum::routing::get;
     use tower::ServiceExt;
-    use vlpds::xrpc::extract::{debug_output_layer, Json};
+    use vlpds::xrpc::extract::{Json, debug_output_layer};
 
     let router = debug_output_layer(
         axum::Router::new()
             .route("/xrpc/com.atproto.repo.describeRepo", get(|| async { Json(json!({"handle": "x.test"})) }))
-            .route(
-                "/xrpc/com.atproto.server.describeServer",
-                get(|| async { Json(json!({"did": "did:web:x", "availableUserDomains": []})) }),
-            )
+            .route("/xrpc/com.atproto.server.describeServer", get(|| async { Json(json!({"did": "did:web:x", "availableUserDomains": []})) }))
             // piped-through bodies (not built by a handler's Json) are not checked
             .route("/xrpc/com.atproto.repo.getRecord", get(|| async { axum::Json(json!({})) })),
     );
@@ -263,10 +232,7 @@ async fn handler_outputs_are_checked_in_debug_builds() {
     };
     let (status, body) = call("/xrpc/com.atproto.repo.describeRepo").await;
     assert_eq!(status, 500);
-    assert_eq!(
-        body["message"],
-        "Invalid com.atproto.repo.describeRepo output: Output must have the property \"did\""
-    );
+    assert_eq!(body["message"], "Invalid com.atproto.repo.describeRepo output: Output must have the property \"did\"");
     assert_eq!(call("/xrpc/com.atproto.server.describeServer").await.0, 200);
     assert_eq!(call("/xrpc/com.atproto.repo.getRecord").await.0, 200);
 }

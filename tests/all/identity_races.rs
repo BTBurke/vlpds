@@ -8,8 +8,8 @@
 use crate::common::*;
 use axum::extract::{Query, State};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use vlpds::crypto::Keypair;
 use vlpds::plc::mock::MockPlc;
 
@@ -244,9 +244,7 @@ async fn concurrent_handle_updates_leave_plc_and_account_agreeing() {
         let mut tasks = Vec::new();
         for h in hs.clone() {
             let (s, a) = (s.clone(), a.clone());
-            tasks.push(tokio::spawn(async move {
-                s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": h}), &a.auth()).await
-            }));
+            tasks.push(tokio::spawn(async move { s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": h}), &a.auth()).await }));
         }
         for t in tasks {
             let r = t.await.unwrap();

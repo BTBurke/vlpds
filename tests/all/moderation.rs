@@ -4,9 +4,7 @@
 use crate::common::*;
 
 async fn update_status(s: &TestServer, subject: J, takedown: J) -> Resp {
-    s.xrpc
-        .post("com.atproto.admin.updateSubjectStatus", &json!({"subject": subject, "takedown": takedown}), &Auth::Admin)
-        .await
+    s.xrpc.post("com.atproto.admin.updateSubjectStatus", &json!({"subject": subject, "takedown": takedown}), &Auth::Admin).await
 }
 
 async fn subject_status(s: &TestServer, q: &[(&str, &str)]) -> Resp {
@@ -18,11 +16,7 @@ fn repo_ref(did: &str) -> J {
 }
 
 async fn upload_png(s: &TestServer, a: &TestAccount, bytes: Vec<u8>) -> J {
-    s.xrpc
-        .post_bytes("com.atproto.repo.uploadBlob", bytes, "image/png", &a.auth())
-        .await
-        .ok()["blob"]
-        .clone()
+    s.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes, "image/png", &a.auth()).await.ok()["blob"].clone()
 }
 
 fn image_post(blob: &J) -> J {
@@ -110,20 +104,12 @@ async fn blob_takedown_lifecycle() {
 
     // prevents the blob from being re-uploaded
     let r = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "image/png", &carol.auth()).await;
-    assert!(
-        !r.is_ok(),
-        "re-upload of a taken-down blob must fail (reference: 'Blob has been takendown, cannot re-upload'); got {}",
-        r.text()
-    );
+    assert!(!r.is_ok(), "re-upload of a taken-down blob must fail (reference: 'Blob has been takendown, cannot re-upload'); got {}", r.text());
 
     // prevents the blob from being referenced again
     let r = s
         .xrpc
-        .post(
-            "com.atproto.repo.createRecord",
-            &json!({"repo": carol.did, "collection": "app.bsky.feed.post", "record": image_post(&blob)}),
-            &carol.auth(),
-        )
+        .post("com.atproto.repo.createRecord", &json!({"repo": carol.did, "collection": "app.bsky.feed.post", "record": image_post(&blob)}), &carol.auth())
         .await;
     assert!(!r.is_ok(), "referencing a taken-down blob must fail (reference: 'Could not find blob'); got {}", r.text());
 
@@ -153,10 +139,7 @@ async fn subject_status_errors() {
     let a = s.create_account("dan").await;
     // admin only
     s.xrpc.get("com.atproto.admin.getSubjectStatus", &[("did", &a.did)], &a.auth()).await.client_err();
-    s.xrpc
-        .post("com.atproto.admin.updateSubjectStatus", &json!({"subject": repo_ref(&a.did), "takedown": {"applied": true}}), &a.auth())
-        .await
-        .client_err();
+    s.xrpc.post("com.atproto.admin.updateSubjectStatus", &json!({"subject": repo_ref(&a.did), "takedown": {"applied": true}}), &a.auth()).await.client_err();
     // unknown subject type
     update_status(&s, json!({"$type": "com.example.nope", "did": a.did}), json!({"applied": true})).await.err(400, "InvalidRequest");
     // blob status needs a did
@@ -178,14 +161,8 @@ async fn takendown_actor_cannot_report_or_write() {
     r.err(401, "AccountTakedown");
 
     // allowTakendown yields a restricted session (reference behaviour)
-    let r = s
-        .xrpc
-        .post(
-            "com.atproto.server.createSession",
-            &json!({"identifier": jeff.handle, "password": PASSWORD, "allowTakendown": true}),
-            &Auth::None,
-        )
-        .await;
+    let r =
+        s.xrpc.post("com.atproto.server.createSession", &json!({"identifier": jeff.handle, "password": PASSWORD, "allowTakendown": true}), &Auth::None).await;
     assert!(r.is_ok(), "createSession allowTakendown=true should succeed for a taken-down account: {}", r.text());
     let tok = Auth::Bearer(r.json["accessJwt"].as_str().unwrap().to_string());
 
@@ -198,14 +175,8 @@ async fn takendown_actor_cannot_report_or_write() {
         )
         .await;
     r.client_err();
-    let r = s
-        .xrpc
-        .post(
-            "com.atproto.repo.createRecord",
-            &json!({"repo": jeff.did, "collection": "app.bsky.feed.post", "record": post_record("test")}),
-            &tok,
-        )
-        .await;
+    let r =
+        s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": jeff.did, "collection": "app.bsky.feed.post", "record": post_record("test")}), &tok).await;
     r.client_err();
 }
 
@@ -213,10 +184,7 @@ async fn takendown_actor_cannot_report_or_write() {
 /// reference's 401 AccountTakedown, and so do proxied calls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn suspended_account_cannot_write_or_proxy() {
-    let s = TestServer::spawn_with(|c| {
-        c.appview = Some(("http://127.0.0.1:1".into(), "did:web:appview.test".into()))
-    })
-    .await;
+    let s = TestServer::spawn_with(|c| c.appview = Some(("http://127.0.0.1:1".into(), "did:web:appview.test".into()))).await;
     let a = s.create_account("susp").await;
     s.app
         .mutate_account(&a.did, false, false, false, |acct| {
@@ -249,7 +217,10 @@ async fn takendown_repo_write_is_account_takedown() {
     for (nsid, body) in [
         ("com.atproto.repo.createRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x")})),
         ("com.atproto.repo.deleteRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": "3jzfcijpj2z2a"})),
-        ("com.atproto.repo.applyWrites", json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": post_record("x")}]})),
+        (
+            "com.atproto.repo.applyWrites",
+            json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": post_record("x")}]}),
+        ),
     ] {
         s.xrpc.post(nsid, &body, &a.auth()).await.err(401, "AccountTakedown");
     }

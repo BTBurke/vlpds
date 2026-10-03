@@ -4,8 +4,8 @@
 //! checked against `vlpds::crypto` and against the same verification rules
 //! the harness applies to commits (compact 64-byte, low-S). P-256 vectors are
 //! only checked for being recognized as non-K-256 keys.
-use base64::Engine;
 use crate::common::*;
+use base64::Engine;
 use k256::ecdsa::signature::Verifier;
 
 #[derive(serde::Deserialize)]
@@ -27,9 +27,7 @@ struct DidKeyFixture {
 }
 
 fn b64(s: &str) -> Vec<u8> {
-    base64::engine::general_purpose::STANDARD_NO_PAD
-        .decode(s.trim_end_matches('='))
-        .unwrap()
+    base64::engine::general_purpose::STANDARD_NO_PAD.decode(s.trim_end_matches('=')).unwrap()
 }
 
 /// atproto signature rules: 64-byte compact (r||s), low-S, ES256K over sha256(msg).
@@ -48,13 +46,10 @@ fn atproto_verify_k256(key: &k256::ecdsa::VerifyingKey, msg: &[u8], sig: &[u8]) 
 
 #[test]
 fn w3c_did_key_k256_from_private_key() {
-    let cases: Vec<DidKeyFixture> =
-        serde_json::from_str(&read_fixture("interop/crypto/w3c_didkey_K256.json")).unwrap();
+    let cases: Vec<DidKeyFixture> = serde_json::from_str(&read_fixture("interop/crypto/w3c_didkey_K256.json")).unwrap();
     assert!(!cases.is_empty());
     for c in cases {
-        let kp =
-            vlpds::crypto::Keypair::from_bytes(&hex::decode(&c.private_key_bytes_hex).unwrap())
-                .unwrap();
+        let kp = vlpds::crypto::Keypair::from_bytes(&hex::decode(&c.private_key_bytes_hex).unwrap()).unwrap();
         assert_eq!(kp.did_key(), c.public_did_key);
         // and the did:key decodes back to the same public key
         let vk = decode_did_key_k256(&c.public_did_key).unwrap();
@@ -71,21 +66,15 @@ fn w3c_did_key_p256_not_mistaken_for_k256() {
     struct P {
         public_did_key: String,
     }
-    let cases: Vec<P> =
-        serde_json::from_str(&read_fixture("interop/crypto/w3c_didkey_P256.json")).unwrap();
+    let cases: Vec<P> = serde_json::from_str(&read_fixture("interop/crypto/w3c_didkey_P256.json")).unwrap();
     for c in cases {
-        assert!(
-            decode_did_key_k256(&c.public_did_key).is_err(),
-            "{} parsed as K-256",
-            c.public_did_key
-        );
+        assert!(decode_did_key_k256(&c.public_did_key).is_err(), "{} parsed as K-256", c.public_did_key);
     }
 }
 
 #[test]
 fn signature_fixtures_k256() {
-    let cases: Vec<SigFixture> =
-        serde_json::from_str(&read_fixture("interop/crypto/signature-fixtures.json")).unwrap();
+    let cases: Vec<SigFixture> = serde_json::from_str(&read_fixture("interop/crypto/signature-fixtures.json")).unwrap();
     let mut n = 0;
     for c in cases.iter().filter(|c| c.algorithm == "ES256K") {
         n += 1;
@@ -104,12 +93,8 @@ fn signature_fixtures_k256() {
 #[test]
 fn harness_commit_verifier_rejects_high_s() {
     // CommitObj::verify (used across the suite) must reject the high-S vector.
-    let cases: Vec<SigFixture> =
-        serde_json::from_str(&read_fixture("interop/crypto/signature-fixtures.json")).unwrap();
-    let c = cases
-        .iter()
-        .find(|c| c.algorithm == "ES256K" && c.comment.contains("non-low-S"))
-        .unwrap();
+    let cases: Vec<SigFixture> = serde_json::from_str(&read_fixture("interop/crypto/signature-fixtures.json")).unwrap();
+    let c = cases.iter().find(|c| c.algorithm == "ES256K" && c.comment.contains("non-low-S")).unwrap();
     let sig = k256::ecdsa::Signature::from_slice(&b64(&c.signature_base64)).unwrap();
     assert!(sig.normalize_s().is_some(), "fixture should be high-S");
 }
@@ -121,10 +106,7 @@ fn vlpds_signatures_are_low_s_compact_and_verify() {
     for i in 0..256u32 {
         let msg = format!("message {i}");
         let sig = kp.sign(msg.as_bytes());
-        assert!(
-            atproto_verify_k256(&vk, msg.as_bytes(), &sig),
-            "signature {i} not valid under atproto rules"
-        );
+        assert!(atproto_verify_k256(&vk, msg.as_bytes(), &sig), "signature {i} not valid under atproto rules");
     }
 }
 
@@ -132,10 +114,7 @@ fn vlpds_signatures_are_low_s_compact_and_verify() {
 fn multibase_and_did_key_agree() {
     let kp = vlpds::crypto::Keypair::generate();
     assert_eq!(kp.did_key(), format!("did:key:{}", kp.public_multibase()));
-    assert!(
-        kp.did_key().starts_with("did:key:zQ3s"),
-        "K-256 did:key prefix"
-    );
+    assert!(kp.did_key().starts_with("did:key:zQ3s"), "K-256 did:key prefix");
     let kp2 = vlpds::crypto::Keypair::from_bytes(&kp.to_bytes()).unwrap();
     assert_eq!(kp2.did_key(), kp.did_key());
 }
@@ -143,21 +122,10 @@ fn multibase_and_did_key_agree() {
 #[test]
 fn service_auth_jwt_is_es256k_and_verifies() {
     let kp = vlpds::crypto::Keypair::generate();
-    let tok = vlpds::auth::service_auth_jwt(
-        &kp,
-        "did:plc:abc",
-        "did:web:example.com",
-        Some("com.example.method"),
-        60,
-    )
-    .unwrap();
+    let tok = vlpds::auth::service_auth_jwt(&kp, "did:plc:abc", "did:web:example.com", Some("com.example.method"), 60).unwrap();
     let parts: Vec<&str> = tok.split('.').collect();
     assert_eq!(parts.len(), 3);
-    let dec = |s: &str| {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(s)
-            .unwrap()
-    };
+    let dec = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).unwrap();
     let header: J = serde_json::from_slice(&dec(parts[0])).unwrap();
     assert_eq!(header["alg"], "ES256K");
     let claims: J = serde_json::from_slice(&dec(parts[1])).unwrap();
@@ -166,11 +134,7 @@ fn service_auth_jwt_is_es256k_and_verifies() {
     assert_eq!(claims["lxm"], "com.example.method");
     assert!(claims["exp"].as_u64().unwrap() > claims["iat"].as_u64().unwrap());
     let vk = decode_did_key_k256(&kp.did_key()).unwrap();
-    assert!(atproto_verify_k256(
-        &vk,
-        format!("{}.{}", parts[0], parts[1]).as_bytes(),
-        &dec(parts[2])
-    ));
+    assert!(atproto_verify_k256(&vk, format!("{}.{}", parts[0], parts[1]).as_bytes(), &dec(parts[2])));
 }
 
 #[test]
@@ -182,10 +146,7 @@ fn signatures_byte_identical_to_rustcrypto_k256() {
     for k in 0..16u32 {
         let kp = vlpds::crypto::Keypair::generate();
         let sk = k256::ecdsa::SigningKey::from_slice(&kp.to_bytes()).unwrap();
-        assert_eq!(
-            sk.verifying_key().to_encoded_point(true).as_bytes(),
-            &kp.public_key_sec1()[..]
-        );
+        assert_eq!(sk.verifying_key().to_encoded_point(true).as_bytes(), &kp.public_key_sec1()[..]);
         for i in 0..64u32 {
             let msg = format!("commit {k} {i} {}", "x".repeat(i as usize));
             let theirs: k256::ecdsa::Signature = sk.sign(msg.as_bytes());

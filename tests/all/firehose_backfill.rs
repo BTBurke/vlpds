@@ -19,9 +19,7 @@ async fn backfill_beyond_ring_is_served_from_the_log() {
         last = Some(s.post(&a, &format!("backfill {i} {}", "x".repeat(64))).await);
     }
     let head = Cid::parse(last.unwrap().commit_cid.as_deref().unwrap()).unwrap();
-    let live_frames = live
-        .until(FH_TIMEOUT, |fs| fs.last().map(|f| matches!(f.body.get("commit"), Some(Value::Link(c)) if *c == head)).unwrap_or(false))
-        .await;
+    let live_frames = live.until(FH_TIMEOUT, |fs| fs.last().map(|f| matches!(f.body.get("commit"), Some(Value::Link(c)) if *c == head)).unwrap_or(false)).await;
     let live_seq: Vec<(i64, Vec<u8>)> = live_frames.iter().filter_map(|f| f.seq().map(|q| (q, f.raw.clone()))).collect();
     assert!(live_seq.len() >= 63, "expected #identity/#account/#sync + 60 commits, got {}", live_seq.len());
 

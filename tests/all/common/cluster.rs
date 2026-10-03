@@ -8,12 +8,7 @@ use vlpds::slots::ShardId;
 
 /// Cluster node `id` on `store` with `shards` shards and fast leases (1.5 s
 /// TTL, 100 ms renewals, 200 ms skew); `f` adjusts the config afterwards.
-pub async fn cluster_node(
-    id: &str,
-    store: Arc<dyn object_store::ObjectStore>,
-    shards: u32,
-    f: impl FnOnce(&mut vlpds::server::Config),
-) -> TestServer {
+pub async fn cluster_node(id: &str, store: Arc<dyn object_store::ObjectStore>, shards: u32, f: impl FnOnce(&mut vlpds::server::Config)) -> TestServer {
     let id = id.to_string();
     TestServer::spawn_with(move |c| {
         c.memory_store = Some(store);

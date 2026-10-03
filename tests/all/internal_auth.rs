@@ -14,10 +14,7 @@ async fn cluster_status(s: &TestServer, token: &str) -> u16 {
 
 async fn private_put(s: &TestServer, routing: &str, key: &[u8]) -> Resp {
     let body = json!({"routing": routing, "muts": [[B64.encode(key), B64.encode(b"x")]]});
-    let rb = peer_client()
-        .post(format!("{}/internal/v1/private/put", s.peer_url))
-        .header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN)
-        .json(&body);
+    let rb = peer_client().post(format!("{}/internal/v1/private/put", s.peer_url)).header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN).json(&body);
     s.xrpc.send(rb).await
 }
 

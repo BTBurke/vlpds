@@ -68,10 +68,8 @@ async fn stalled_export_readers_dont_block_commits() {
         }
         worst
     };
-    let (responses, worst) = tokio::join!(
-        async { tokio::time::timeout(Duration::from_secs(20), futures::future::join_all(heads)).await.expect("export heads") },
-        writer
-    );
+    let (responses, worst) =
+        tokio::join!(async { tokio::time::timeout(Duration::from_secs(20), futures::future::join_all(heads)).await.expect("export heads") }, writer);
     assert!(worst < Duration::from_secs(2), "a commit took {worst:?} during stalled exports");
     let mut bodies = Vec::new();
     for r in responses {

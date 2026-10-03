@@ -38,11 +38,8 @@ async fn enforced_everywhere(nodes: &[&TestServer], rec: &RecordRef, did: &str, 
             let b = s.get_blob(did, blob).await;
             let dead = s.get_session(&Auth::Bearer(revoked.into())).await;
             let ok = s.get_session(&Auth::Bearer(live.into())).await;
-            (r.error_name() == Some("RecordNotFound")
-                && b.error_name() == Some("BlobNotFound")
-                && dead.error_name() == Some("ExpiredToken")
-                && ok.is_ok())
-            .then_some(())
+            (r.error_name() == Some("RecordNotFound") && b.error_name() == Some("BlobNotFound") && dead.error_name() == Some("ExpiredToken") && ok.is_ok())
+                .then_some(())
         })
         .await;
     }
@@ -65,7 +62,9 @@ async fn takedowns_and_revocations_are_cluster_wide_and_survive_failover() {
 
     // record takedown through b, blob takedown through c (routed by subject)
     let strong_ref = json!({"$type": "com.atproto.repo.strongRef", "uri": rec.uri, "cid": rec.cid});
-    let status = |n: &TestServer, subject: J, takedown: J| n.xrpc.post_owned("com.atproto.admin.updateSubjectStatus", json!({"subject": subject, "takedown": takedown}), Auth::Admin);
+    let status = |n: &TestServer, subject: J, takedown: J| {
+        n.xrpc.post_owned("com.atproto.admin.updateSubjectStatus", json!({"subject": subject, "takedown": takedown}), Auth::Admin)
+    };
     status(&b, strong_ref.clone(), json!({"applied": true, "ref": "t1"})).await.ok();
     status(&c, json!({"$type": "com.atproto.admin.defs#repoBlobRef", "did": acct.did, "cid": blob}), json!({"applied": true})).await.ok();
     for s in [&a, &b, &c] {
@@ -183,10 +182,7 @@ impl Browser {
     }
 
     pub(crate) async fn post(&mut self, node: &TestServer, path: &str, pairs: &[(&str, &str)]) -> (u16, reqwest::header::HeaderMap, String) {
-        let rb = http()
-            .post(format!("{}{path}", node.url))
-            .header("content-type", "application/x-www-form-urlencoded")
-            .body(form_body(pairs));
+        let rb = http().post(format!("{}{path}", node.url)).header("content-type", "application/x-www-form-urlencoded").body(form_body(pairs));
         self.send(rb).await
     }
 }
@@ -218,13 +214,7 @@ impl Client {
 
     /// PAR on `par`, then the browser: authorization page on `page`, sign-in
     /// on `sign_in`, consent on `consent`. Returns (code, verifier).
-    pub(crate) async fn authorize(
-        &self,
-        b: &mut Browser,
-        [par, page, sign_in, consent]: [&TestServer; 4],
-        handle: &str,
-        did: &str,
-    ) -> (String, String) {
+    pub(crate) async fn authorize(&self, b: &mut Browser, [par, page, sign_in, consent]: [&TestServer; 4], handle: &str, did: &str) -> (String, String) {
         let verifier = rand_b64url(32);
         let challenge = b64url(Sha256::digest(&verifier));
         let (st, j) = as_post(
@@ -246,9 +236,7 @@ impl Client {
         assert_eq!(st, 201, "PAR: {j}");
         let request_uri = j["request_uri"].as_str().unwrap().to_string();
         let enc = vlpds::oauth::util::form_encode_component;
-        let (st, _, html) = b
-            .get(page, &format!("/oauth/authorize?client_id={}&request_uri={}", enc(&self.id), enc(&request_uri)))
-            .await;
+        let (st, _, html) = b.get(page, &format!("/oauth/authorize?client_id={}&request_uri={}", enc(&self.id), enc(&request_uri))).await;
         assert_eq!(st, 200, "{html}");
         assert!(html.contains("name=\"password\""), "sign-in page: {html}");
         let (st, _, html) = b
@@ -260,9 +248,8 @@ impl Client {
             .await;
         assert_eq!(st, 200, "{html}");
         assert!(html.contains("Authorize access"), "consent page: {html}");
-        let (st, h, html) = b
-            .post(consent, "/oauth/authorize/consent", &[("request_uri", &request_uri), ("csrf", &csrf_of(&html)), ("did", did), ("action", "allow")])
-            .await;
+        let (st, h, html) =
+            b.post(consent, "/oauth/authorize/consent", &[("request_uri", &request_uri), ("csrf", &csrf_of(&html)), ("did", did), ("action", "allow")]).await;
         assert_eq!(st, 303, "{html}");
         let q = location_params(&h);
         assert_eq!(q.get("iss").map(String::as_str), Some(PUBLIC));

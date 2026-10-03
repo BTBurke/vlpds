@@ -9,7 +9,7 @@ use crate::common::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use vlpds::nodelog::{read_head, Head};
+use vlpds::nodelog::{Head, read_head};
 use vlpds::store::Store;
 
 const SHARDS: u32 = 8;

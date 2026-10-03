@@ -4,7 +4,7 @@
 //! stream's seqs, order and cursor semantics (DESIGN.md §5).
 use crate::common::*;
 use std::time::Duration;
-use vlpds::slots::{slot_of, SlotRange};
+use vlpds::slots::{SlotRange, slot_of};
 
 const IDLE: Duration = Duration::from_millis(600);
 
@@ -105,11 +105,8 @@ async fn sharded_streams_partition_the_full_stream() {
     for k in 0..2 {
         let range = SlotRange::new(k, 2).unwrap();
         let got = events(&read_to(sub_shard(&s, mid, k, 2).await, last_in(&full, range).filter(|q| *q > mid)).await);
-        let want: Vec<(i64, Vec<u8>)> = after
-            .iter()
-            .filter(|f| f.did().is_some_and(|d| range.contains(slot_of(d))))
-            .filter_map(|f| f.seq().map(|q| (q, f.raw.clone())))
-            .collect();
+        let want: Vec<(i64, Vec<u8>)> =
+            after.iter().filter(|f| f.did().is_some_and(|d| range.contains(slot_of(d)))).filter_map(|f| f.seq().map(|q| (q, f.raw.clone()))).collect();
         assert_eq!(got, want, "shard {k}/2 from cursor {mid}");
         carried += want.len();
     }
@@ -137,9 +134,7 @@ async fn sharded_backfill_hands_off_to_live() {
         last = Some(s.post(a, &format!("live {i} {}", "y".repeat(200))).await);
     }
     let head = Cid::parse(last.unwrap().commit_cid.as_deref().unwrap()).unwrap();
-    let full_frames = full_sub
-        .until(FH_TIMEOUT, |fs| fs.last().is_some_and(|f| matches!(f.body.get("commit"), Some(Value::Link(c)) if *c == head)))
-        .await;
+    let full_frames = full_sub.until(FH_TIMEOUT, |fs| fs.last().is_some_and(|f| matches!(f.body.get("commit"), Some(Value::Link(c)) if *c == head))).await;
     let full = events(&full_frames);
     assert!(full.len() >= 6 * 7 + 6, "{} events", full.len());
     let shards = futures::future::join_all(subs.iter_mut().map(|sub| sub.drain(IDLE))).await;

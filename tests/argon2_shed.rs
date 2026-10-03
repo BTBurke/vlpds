@@ -24,10 +24,7 @@ fn csrf_of(html: &str) -> String {
 }
 
 fn device_cookie(h: &reqwest::header::HeaderMap) -> Option<String> {
-    h.get_all("set-cookie")
-        .iter()
-        .map(|sc| sc.to_str().unwrap().split(';').next().unwrap().to_string())
-        .find(|c| c.starts_with("vlpds-device="))
+    h.get_all("set-cookie").iter().map(|sc| sc.to_str().unwrap().split(';').next().unwrap().to_string()).find(|c| c.starts_with("vlpds-device="))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -56,9 +53,7 @@ async fn saturated_argon2_sheds_with_503() {
 
     // createSession: XRPC 503 Overloaded + Retry-After, after the permit wait
     let t = Instant::now();
-    let r = tokio::time::timeout(SHED_BOUND, s.create_session(&acct.handle, PASSWORD))
-        .await
-        .expect("createSession hung on a saturated Argon2 pool");
+    let r = tokio::time::timeout(SHED_BOUND, s.create_session(&acct.handle, PASSWORD)).await.expect("createSession hung on a saturated Argon2 pool");
     r.err(503, "Overloaded");
     assert!(r.header("retry-after").is_some(), "Retry-After on {r:?}");
     assert!(t.elapsed() >= vlpds::state::ARGON2_MAX_WAIT - Duration::from_millis(100), "{:?}", t.elapsed());

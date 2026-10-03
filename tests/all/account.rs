@@ -7,8 +7,7 @@ use crate::common::*;
 #[track_caller]
 fn handle_taken(r: &Resp) {
     assert_eq!(r.status, 400, "{}", r.text());
-    let ok = r.error_name() == Some("HandleNotAvailable")
-        || (r.error_name() == Some("InvalidRequest") && r.text().to_lowercase().contains("taken"));
+    let ok = r.error_name() == Some("HandleNotAvailable") || (r.error_name() == Some("InvalidRequest") && r.text().to_lowercase().contains("taken"));
     assert!(ok, "expected handle-taken error, got {}", r.text());
 }
 
@@ -189,7 +188,8 @@ async fn allows_an_admin_to_update_password() {
 async fn allows_administrative_email_updates() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    let update = |account: &str, email: &str, auth: Auth| s.xrpc.post_owned("com.atproto.admin.updateAccountEmail", json!({"account": account, "email": email}), auth);
+    let update =
+        |account: &str, email: &str, auth: Auth| s.xrpc.post_owned("com.atproto.admin.updateAccountEmail", json!({"account": account, "email": email}), auth);
     update(&a.handle, "alIce-NEw@teST.com", Auth::Admin).await.ok();
     let info = s.account_info(&a.did).await.ok();
     assert_eq!(info["email"], json!("alice-new@test.com"));
@@ -208,9 +208,8 @@ async fn create_account_emits_identity_and_account_events() {
     let mut sub = s.subscribe(None).await;
     let a = s.create_account("fh").await;
     let did = a.did.clone();
-    let frames = sub
-        .until(FH_TIMEOUT, move |fs| ["#identity", "#account"].iter().all(|k| fs.iter().any(|f| f.did() == Some(did.as_str()) && f.kind() == *k)))
-        .await;
+    let frames =
+        sub.until(FH_TIMEOUT, move |fs| ["#identity", "#account"].iter().all(|k| fs.iter().any(|f| f.did() == Some(did.as_str()) && f.kind() == *k))).await;
     let mine: Vec<_> = frames.iter().filter(|f| f.did() == Some(a.did.as_str())).collect();
     let ident = mine.iter().find(|f| f.kind() == "#identity").expect("#identity event for new account");
     assert_eq!(ident.str("handle"), Some(a.handle.as_str()));
@@ -223,10 +222,7 @@ async fn create_account_emits_identity_and_account_events() {
 async fn requires_an_email() {
     let s = TestServer::spawn().await;
     let handle = fresh_handle("noemail");
-    for body in [
-        json!({"handle": handle, "password": PASSWORD}),
-        json!({"handle": handle, "password": PASSWORD, "email": ""}),
-    ] {
+    for body in [json!({"handle": handle, "password": PASSWORD}), json!({"handle": handle, "password": PASSWORD, "email": ""})] {
         let r = s.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await;
         r.err(400, "InvalidRequest");
         assert!(r.text().contains("Email is required"), "{}", r.text());

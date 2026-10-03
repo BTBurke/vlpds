@@ -68,11 +68,7 @@ async fn account_changes_apply_to_the_next_proxied_request() {
 
     let k1 = s.signing_key(&a.did).await;
     assert!(verifies(seen.lock().last().unwrap(), &k1));
-    let r = s
-        .xrpc
-        .post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin)
-        .await
-        .ok();
+    let r = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.ok();
     assert!(r["signingKey"].is_string(), "{r}");
     let k2 = s.signing_key(&a.did).await;
     assert_ne!(k1, k2);

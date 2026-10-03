@@ -175,20 +175,12 @@ async fn invalid_and_expired_access_tokens_are_rejected() {
     let s = TestServer::spawn().await;
     let a = s.create_account("ivan").await;
     let t = now_secs();
-    let expired = forge(
-        &json!({"scope": "com.atproto.access", "sub": a.did, "aud": SERVICE_DID, "iat": t - 100, "exp": t - 1}),
-        "at+jwt",
-        JWT_SECRET,
-    );
+    let expired = forge(&json!({"scope": "com.atproto.access", "sub": a.did, "aud": SERVICE_DID, "iat": t - 100, "exp": t - 1}), "at+jwt", JWT_SECRET);
     let r = get_session(&s, &expired).await;
     assert!(matches!(r.status, 400 | 401), "{}", r.text());
     assert!(matches!(r.error_name(), Some("ExpiredToken" | "InvalidToken" | "AuthenticationRequired")), "{}", r.text());
 
-    let wrong_key = forge(
-        &json!({"scope": "com.atproto.access", "sub": a.did, "aud": SERVICE_DID, "iat": t, "exp": t + 600}),
-        "at+jwt",
-        "not-the-secret",
-    );
+    let wrong_key = forge(&json!({"scope": "com.atproto.access", "sub": a.did, "aud": SERVICE_DID, "iat": t, "exp": t + 600}), "at+jwt", "not-the-secret");
     for tok in [wrong_key.as_str(), "garbage", "a.b.c", ""] {
         let r = get_session(&s, tok).await;
         assert!(matches!(r.status, 400 | 401), "token {tok:?}: {}", r.text());

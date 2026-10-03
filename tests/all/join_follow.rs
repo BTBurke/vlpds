@@ -15,9 +15,9 @@
 //! node's stream is the union of all logs.
 
 use crate::common::*;
-use crate::firehose_startup::{collect, mismatch, node_with, s3_union, Writers};
-use std::sync::atomic::{AtomicI64, Ordering};
+use crate::firehose_startup::{Writers, collect, mismatch, node_with, s3_union};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 const SHARDS: usize = 8;

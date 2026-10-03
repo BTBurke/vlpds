@@ -15,11 +15,11 @@
 //!   sync 1.1 commit inversion.
 #![allow(dead_code)]
 
-pub use serde_json::{json, Value as J};
+pub use serde_json::{Value as J, json};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 pub use vlpds::cbor::Value;
 pub use vlpds::cid::Cid;
@@ -67,10 +67,7 @@ fn radix36(mut n: u64) -> String {
 
 pub fn init_tracing() {
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("VLPDS_TEST_LOG")
-                .unwrap_or_else(|_| "off".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("VLPDS_TEST_LOG").unwrap_or_else(|_| "off".into()))
         .with_test_writer()
         .try_init();
 }
@@ -91,8 +88,7 @@ pub struct TestServer {
 /// The suite's cluster CA (one per test binary): every [`TestServer`]'s
 /// node certificate comes from it.
 pub fn test_ca() -> &'static vlpds::peer_tls::Issued {
-    static CA: std::sync::LazyLock<vlpds::peer_tls::Issued> =
-        std::sync::LazyLock::new(|| vlpds::peer_tls::create_ca("vlpds test cluster CA", 30).unwrap());
+    static CA: std::sync::LazyLock<vlpds::peer_tls::Issued> = std::sync::LazyLock::new(|| vlpds::peer_tls::create_ca("vlpds test cluster CA", 30).unwrap());
     &CA
 }
 
@@ -151,9 +147,7 @@ impl TestServer {
 
     async fn spawn_inner(peer: Option<(tokio::net::TcpListener, String)>, f: impl FnOnce(&mut vlpds::server::Config)) -> TestServer {
         init_tracing();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}");
         let peer_url = peer.as_ref().map(|(_, u)| u.clone()).unwrap_or_default();
@@ -173,24 +167,13 @@ impl TestServer {
             let id = cfg.cluster.as_ref().map_or("single".to_string(), |c| c.node_id.clone());
             cfg.peer_tls = Some(node_tls(&id));
         }
-        let (app, addr) = vlpds::server::spawn(cfg, listener, peer.map(|(l, _)| l))
-            .await
-            .expect("spawn server");
-        TestServer {
-            app,
-            addr,
-            url: url.clone(),
-            peer_url,
-            xrpc: Xrpc::new(&url),
-        }
+        let (app, addr) = vlpds::server::spawn(cfg, listener, peer.map(|(l, _)| l)).await.expect("spawn server");
+        TestServer { app, addr, url: url.clone(), peer_url, xrpc: Xrpc::new(&url) }
     }
 
     pub fn ws_url(&self, cursor: Option<i64>) -> String {
         match cursor {
-            Some(c) => format!(
-                "ws://{}/xrpc/com.atproto.sync.subscribeRepos?cursor={c}",
-                self.addr
-            ),
+            Some(c) => format!("ws://{}/xrpc/com.atproto.sync.subscribeRepos?cursor={c}", self.addr),
             None => format!("ws://{}/xrpc/com.atproto.sync.subscribeRepos", self.addr),
         }
     }
@@ -227,102 +210,47 @@ impl TestServer {
     }
 
     pub async fn create_session(&self, identifier: &str, password: &str) -> Resp {
-        self.xrpc
-            .post(
-                "com.atproto.server.createSession",
-                &json!({"identifier": identifier, "password": password}),
-                &Auth::None,
-            )
-            .await
+        self.xrpc.post("com.atproto.server.createSession", &json!({"identifier": identifier, "password": password}), &Auth::None).await
     }
 
     // ---- record helpers ----
 
     pub async fn create_record(&self, a: &TestAccount, collection: &str, record: J) -> RecordRef {
-        let r = self
-            .xrpc
-            .post(
-                "com.atproto.repo.createRecord",
-                &json!({"repo": a.did, "collection": collection, "record": record}),
-                &a.auth(),
-            )
-            .await
-            .ok();
+        let r = self.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": collection, "record": record}), &a.auth()).await.ok();
         RecordRef::from_json(&r)
     }
 
     pub async fn post(&self, a: &TestAccount, text: &str) -> RecordRef {
-        self.create_record(a, "app.bsky.feed.post", post_record(text))
-            .await
+        self.create_record(a, "app.bsky.feed.post", post_record(text)).await
     }
 
     pub async fn get_record(&self, did: &str, collection: &str, rkey: &str) -> Resp {
-        self.xrpc
-            .get(
-                "com.atproto.repo.getRecord",
-                &[("repo", did), ("collection", collection), ("rkey", rkey)],
-                &Auth::None,
-            )
-            .await
+        self.xrpc.get("com.atproto.repo.getRecord", &[("repo", did), ("collection", collection), ("rkey", rkey)], &Auth::None).await
     }
 
     pub async fn list_records(&self, did: &str, collection: &str, extra: &[(&str, &str)]) -> Resp {
         let mut q = vec![("repo", did), ("collection", collection)];
         q.extend_from_slice(extra);
-        self.xrpc
-            .get("com.atproto.repo.listRecords", &q, &Auth::None)
-            .await
+        self.xrpc.get("com.atproto.repo.listRecords", &q, &Auth::None).await
     }
 
     pub async fn latest_commit(&self, did: &str) -> (Cid, String) {
-        let j = self
-            .xrpc
-            .get(
-                "com.atproto.sync.getLatestCommit",
-                &[("did", did)],
-                &Auth::None,
-            )
-            .await
-            .ok();
-        (
-            Cid::parse(j["cid"].as_str().unwrap()).unwrap(),
-            j["rev"].as_str().unwrap().to_string(),
-        )
+        let j = self.xrpc.get("com.atproto.sync.getLatestCommit", &[("did", did)], &Auth::None).await.ok();
+        (Cid::parse(j["cid"].as_str().unwrap()).unwrap(), j["rev"].as_str().unwrap().to_string())
     }
 
     /// Downloads and parses `sync.getRepo`.
     pub async fn get_repo(&self, did: &str) -> Repo {
-        let r = self
-            .xrpc
-            .get("com.atproto.sync.getRepo", &[("did", did)], &Auth::None)
-            .await;
+        let r = self.xrpc.get("com.atproto.sync.getRepo", &[("did", did)], &Auth::None).await;
         assert_eq!(r.status, 200, "getRepo failed: {}", r.text());
         Repo::from_car(&r.body).expect("parse getRepo CAR")
     }
 
     /// Signing key from the account's DID document (via describeRepo).
     pub async fn signing_key(&self, did: &str) -> k256::ecdsa::VerifyingKey {
-        let j = self
-            .xrpc
-            .get(
-                "com.atproto.repo.describeRepo",
-                &[("repo", did)],
-                &Auth::None,
-            )
-            .await
-            .ok();
-        let vms = j["didDoc"]["verificationMethod"]
-            .as_array()
-            .expect("verificationMethod");
-        let vm = vms
-            .iter()
-            .find(|v| {
-                v["id"]
-                    .as_str()
-                    .map(|s| s.ends_with("#atproto"))
-                    .unwrap_or(false)
-            })
-            .unwrap_or(&vms[0]);
+        let j = self.xrpc.get("com.atproto.repo.describeRepo", &[("repo", did)], &Auth::None).await.ok();
+        let vms = j["didDoc"]["verificationMethod"].as_array().expect("verificationMethod");
+        let vm = vms.iter().find(|v| v["id"].as_str().map(|s| s.ends_with("#atproto")).unwrap_or(false)).unwrap_or(&vms[0]);
         decode_k256_multibase(vm["publicKeyMultibase"].as_str().unwrap()).expect("k256 multikey")
     }
 
@@ -330,9 +258,7 @@ impl TestServer {
 
     /// Messages "sent" to `email` in dev mode (vlpds.admin.getDevMail).
     pub async fn dev_mail(&self, email: &str) -> Resp {
-        self.xrpc
-            .get("vlpds.admin.getDevMail", &[("email", email)], &Auth::Admin)
-            .await
+        self.xrpc.get("vlpds.admin.getDevMail", &[("email", email)], &Auth::Admin).await
     }
 
     /// Latest emailed token for `email` (searches the dev-mail JSON for a
@@ -540,10 +466,7 @@ fn find_token(j: &J) -> Option<String> {
                 let b = s.as_bytes();
                 (0..b.len().saturating_sub(10)).rev().find_map(|i| {
                     let w = &b[i..i + 11];
-                    let ok = w[5] == b'-'
-                        && w[..5].iter().chain(&w[6..]).all(|c| {
-                            c.is_ascii_uppercase() || c.is_ascii_digit() || c.is_ascii_lowercase()
-                        });
+                    let ok = w[5] == b'-' && w[..5].iter().chain(&w[6..]).all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c.is_ascii_lowercase());
                     ok.then(|| String::from_utf8_lossy(w).to_string())
                 })
             }
@@ -604,11 +527,7 @@ impl RecordRef {
         it.next().unwrap()
     }
     pub fn did(&self) -> &str {
-        self.uri
-            .trim_start_matches("at://")
-            .split('/')
-            .next()
-            .unwrap()
+        self.uri.trim_start_matches("at://").split('/').next().unwrap()
     }
 }
 
@@ -648,11 +567,7 @@ impl std::fmt::Debug for Resp {
 impl Resp {
     pub fn text(&self) -> String {
         let s = String::from_utf8_lossy(&self.body);
-        if s.len() > 2000 {
-            format!("{}…", &s[..2000])
-        } else {
-            s.to_string()
-        }
+        if s.len() > 2000 { format!("{}…", &s[..2000]) } else { s.to_string() }
     }
 
     pub fn is_ok(&self) -> bool {
@@ -662,12 +577,7 @@ impl Resp {
     /// Asserts 2xx and returns the JSON body.
     #[track_caller]
     pub fn ok(&self) -> J {
-        assert!(
-            self.is_ok(),
-            "expected success, got {} {}",
-            self.status,
-            self.text()
-        );
+        assert!(self.is_ok(), "expected success, got {} {}", self.status, self.text());
         self.json.clone()
     }
 
@@ -678,12 +588,7 @@ impl Resp {
     /// Asserts an XRPC error with this HTTP status and error name.
     #[track_caller]
     pub fn err(&self, status: u16, name: &str) {
-        assert_eq!(
-            (self.status, self.error_name()),
-            (status, Some(name)),
-            "unexpected response: {}",
-            self.text()
-        );
+        assert_eq!((self.status, self.error_name()), (status, Some(name)), "unexpected response: {}", self.text());
     }
 
     /// Asserts an XRPC error with this status (any error name).
@@ -695,31 +600,17 @@ impl Resp {
     /// Asserts a 4xx failure (any).
     #[track_caller]
     pub fn client_err(&self) {
-        assert!(
-            (400..500).contains(&self.status),
-            "expected 4xx, got {} {}",
-            self.status,
-            self.text()
-        );
+        assert!((400..500).contains(&self.status), "expected 4xx, got {} {}", self.status, self.text());
     }
 
     pub fn header(&self, name: &str) -> Option<String> {
-        self.headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(String::from)
+        self.headers.get(name).and_then(|v| v.to_str().ok()).map(String::from)
     }
 }
 
 impl Xrpc {
     pub fn new(base: &str) -> Xrpc {
-        Xrpc {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            base: base.trim_end_matches('/').to_string(),
-        }
+        Xrpc { http: reqwest::Client::builder().timeout(Duration::from_secs(30)).build().unwrap(), base: base.trim_end_matches('/').to_string() }
     }
 
     fn url(&self, nsid: &str) -> String {
@@ -731,21 +622,8 @@ impl Xrpc {
         match auth {
             Auth::None => rb,
             Auth::Bearer(t) => rb.header("authorization", format!("Bearer {t}")),
-            Auth::Admin => rb.header(
-                "authorization",
-                format!(
-                    "Basic {}",
-                    base64::engine::general_purpose::STANDARD
-                        .encode(format!("admin:{ADMIN_TOKEN}"))
-                ),
-            ),
-            Auth::Basic(u, p) => rb.header(
-                "authorization",
-                format!(
-                    "Basic {}",
-                    base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"))
-                ),
-            ),
+            Auth::Admin => rb.header("authorization", format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("admin:{ADMIN_TOKEN}")))),
+            Auth::Basic(u, p) => rb.header("authorization", format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}")))),
             Auth::Raw(h) => rb.header("authorization", h.clone()),
         }
     }
@@ -762,12 +640,7 @@ impl Xrpc {
         let headers = r.headers().clone();
         let body = r.bytes().await.unwrap_or_default();
         let json = serde_json::from_slice(&body).unwrap_or(J::Null);
-        Ok(Resp {
-            status,
-            headers,
-            body,
-            json,
-        })
+        Ok(Resp { status, headers, body, json })
     }
 
     pub async fn get(&self, nsid: &str, query: &[(&str, &str)], auth: &Auth) -> Resp {
@@ -799,34 +672,14 @@ impl Xrpc {
         self.send(Self::apply(rb, auth)).await
     }
 
-    pub async fn post_bytes(
-        &self,
-        nsid: &str,
-        body: Vec<u8>,
-        content_type: &str,
-        auth: &Auth,
-    ) -> Resp {
-        let rb = self
-            .http
-            .post(self.url(nsid))
-            .header("content-type", content_type)
-            .body(body);
+    pub async fn post_bytes(&self, nsid: &str, body: Vec<u8>, content_type: &str, auth: &Auth) -> Resp {
+        let rb = self.http.post(self.url(nsid)).header("content-type", content_type).body(body);
         self.send(Self::apply(rb, auth)).await
     }
 
     /// `post_bytes` that tolerates the server closing early (see `try_send`).
-    pub async fn try_post_bytes(
-        &self,
-        nsid: &str,
-        body: Vec<u8>,
-        content_type: &str,
-        auth: &Auth,
-    ) -> reqwest::Result<Resp> {
-        let rb = self
-            .http
-            .post(self.url(nsid))
-            .header("content-type", content_type)
-            .body(body);
+    pub async fn try_post_bytes(&self, nsid: &str, body: Vec<u8>, content_type: &str, auth: &Auth) -> reqwest::Result<Resp> {
+        let rb = self.http.post(self.url(nsid)).header("content-type", content_type).body(body);
         self.try_send(Self::apply(rb, auth)).await
     }
 }
@@ -854,12 +707,7 @@ impl Frame {
             _ => anyhow::bail!("frame header without op"),
         };
         let t = header.get("t").and_then(|v| v.as_str()).map(String::from);
-        Ok(Frame {
-            op,
-            t,
-            body,
-            raw: raw.to_vec(),
-        })
+        Ok(Frame { op, t, body, raw: raw.to_vec() })
     }
 
     pub fn kind(&self) -> &str {
@@ -875,10 +723,7 @@ impl Frame {
 
     /// `repo` for #commit, `did` for everything else.
     pub fn did(&self) -> Option<&str> {
-        self.body
-            .get("repo")
-            .or_else(|| self.body.get("did"))
-            .and_then(|v| v.as_str())
+        self.body.get("repo").or_else(|| self.body.get("did")).and_then(|v| v.as_str())
     }
 
     pub fn str(&self, k: &str) -> Option<&str> {
@@ -893,8 +738,7 @@ impl Frame {
     }
 
     pub fn commit(&self) -> Option<CommitEvt> {
-        (self.kind() == "#commit")
-            .then(|| CommitEvt::from_body(&self.body).expect("decode #commit"))
+        (self.kind() == "#commit").then(|| CommitEvt::from_body(&self.body).expect("decode #commit"))
     }
 
     pub fn sync(&self) -> Option<SyncEvt> {
@@ -903,17 +747,13 @@ impl Frame {
 }
 
 pub struct Sub {
-    ws: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    ws: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     pub closed: bool,
 }
 
 impl Sub {
     pub async fn connect(url: &str) -> Sub {
-        let (ws, _) = tokio_tungstenite::connect_async(url)
-            .await
-            .expect("ws connect");
+        let (ws, _) = tokio_tungstenite::connect_async(url).await.expect("ws connect");
         Sub { ws, closed: false }
     }
 
@@ -952,11 +792,7 @@ impl Sub {
     /// Collects frames until `pred` holds for the collected list (checked after
     /// each frame). Panics with what it has on timeout.
     #[track_caller]
-    pub fn until<'a>(
-        &'a mut self,
-        timeout: Duration,
-        mut pred: impl FnMut(&[Frame]) -> bool + 'a,
-    ) -> impl std::future::Future<Output = Vec<Frame>> + 'a {
+    pub fn until<'a>(&'a mut self, timeout: Duration, mut pred: impl FnMut(&[Frame]) -> bool + 'a) -> impl std::future::Future<Output = Vec<Frame>> + 'a {
         let loc = std::panic::Location::caller();
         async move {
             let deadline = tokio::time::Instant::now() + timeout;
@@ -980,11 +816,7 @@ impl Sub {
     }
 
     /// Like `until` but returns whatever arrived instead of panicking.
-    pub async fn try_until(
-        &mut self,
-        timeout: Duration,
-        mut pred: impl FnMut(&[Frame]) -> bool,
-    ) -> (Vec<Frame>, bool) {
+    pub async fn try_until(&mut self, timeout: Duration, mut pred: impl FnMut(&[Frame]) -> bool) -> (Vec<Frame>, bool) {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut out = Vec::new();
         loop {
@@ -1012,12 +844,7 @@ impl Sub {
     pub async fn wait_for(&mut self, timeout: Duration, did: &str, kind: &str) -> Vec<Frame> {
         let did = did.to_string();
         let kind = kind.to_string();
-        self.until(timeout, move |fs| {
-            fs.last()
-                .map(|f| f.did() == Some(did.as_str()) && f.kind() == kind)
-                .unwrap_or(false)
-        })
-        .await
+        self.until(timeout, move |fs| fs.last().map(|f| f.did() == Some(did.as_str()) && f.kind() == kind).unwrap_or(false)).await
     }
 }
 
@@ -1064,16 +891,8 @@ impl CommitEvt {
             Some(Value::Array(a)) => a
                 .iter()
                 .map(|o| RepoOp {
-                    action: o
-                        .get("action")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    path: o
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
+                    action: o.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    path: o.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                     cid: link(o.get("cid")),
                     prev: link(o.get("prev")),
                 })
@@ -1089,16 +908,8 @@ impl CommitEvt {
                 Some(Value::Int(i)) => *i,
                 _ => anyhow::bail!("no seq"),
             },
-            repo: b
-                .get("repo")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            rev: b
-                .get("rev")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            repo: b.get("repo").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            rev: b.get("rev").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             since: b.get("since").and_then(|v| v.as_str()).map(String::from),
             commit: link(b.get("commit")).ok_or_else(|| anyhow::anyhow!("no commit"))?,
             prev_data: link(b.get("prevData")),
@@ -1108,63 +919,39 @@ impl CommitEvt {
             blobs,
             too_big: matches!(b.get("tooBig"), Some(Value::Bool(true))),
             rebase: matches!(b.get("rebase"), Some(Value::Bool(true))),
-            time: b
-                .get("time")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            time: b.get("time").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         })
     }
 
     pub fn commit_obj(&self) -> CommitObj {
-        CommitObj::decode(
-            self.blocks
-                .get(&self.commit)
-                .expect("commit block missing from #commit blocks"),
-        )
-        .expect("decode commit")
+        CommitObj::decode(self.blocks.get(&self.commit).expect("commit block missing from #commit blocks")).expect("decode commit")
     }
 
     /// sync 1.1 inversion: undo `ops` on the partial tree from `blocks` and
     /// return the resulting root (must equal prevData).
     pub fn invert(&self) -> anyhow::Result<Cid> {
         let c = self.commit_obj();
-        let mut tree = Tree::load_from_blocks(&self.blocks, c.data)
-            .map_err(|e| anyhow::anyhow!("load partial tree: {e}"))?;
+        let mut tree = Tree::load_from_blocks(&self.blocks, c.data).map_err(|e| anyhow::anyhow!("load partial tree: {e}"))?;
         // Check the post-state of each op first.
         for op in &self.ops {
-            let got = tree
-                .get(op.path.as_bytes())
-                .map_err(|e| anyhow::anyhow!("get {}: {e}", op.path))?;
+            let got = tree.get(op.path.as_bytes()).map_err(|e| anyhow::anyhow!("get {}: {e}", op.path))?;
             let want = if op.action == "delete" { None } else { op.cid };
-            anyhow::ensure!(
-                got == want,
-                "op {} {}: tree has {:?}, op says {:?}",
-                op.action,
-                op.path,
-                got,
-                want
-            );
+            anyhow::ensure!(got == want, "op {} {}: tree has {:?}, op says {:?}", op.action, op.path, got, want);
         }
         for op in &self.ops {
             match op.action.as_str() {
                 "create" => {
                     anyhow::ensure!(op.prev.is_none(), "create {} has prev", op.path);
-                    tree.remove(op.path.as_bytes())
-                        .map_err(|e| anyhow::anyhow!("invert create {}: {e}", op.path))?;
+                    tree.remove(op.path.as_bytes()).map_err(|e| anyhow::anyhow!("invert create {}: {e}", op.path))?;
                 }
                 "update" | "delete" => {
-                    let p = op
-                        .prev
-                        .ok_or_else(|| anyhow::anyhow!("{} {} without prev", op.action, op.path))?;
-                    tree.insert(op.path.as_bytes(), p)
-                        .map_err(|e| anyhow::anyhow!("invert {} {}: {e}", op.action, op.path))?;
+                    let p = op.prev.ok_or_else(|| anyhow::anyhow!("{} {} without prev", op.action, op.path))?;
+                    tree.insert(op.path.as_bytes(), p).map_err(|e| anyhow::anyhow!("invert {} {}: {e}", op.action, op.path))?;
                 }
                 a => anyhow::bail!("unknown action {a}"),
             }
         }
-        tree.root_cid()
-            .map_err(|e| anyhow::anyhow!("root after inversion: {e}"))
+        tree.root_cid().map_err(|e| anyhow::anyhow!("root after inversion: {e}"))
     }
 }
 
@@ -1189,26 +976,15 @@ impl SyncEvt {
                 Some(Value::Int(i)) => *i,
                 _ => anyhow::bail!("no seq"),
             },
-            did: b
-                .get("did")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            rev: b
-                .get("rev")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            commit: *roots
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("#sync blocks without root"))?,
+            did: b.get("did").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            rev: b.get("rev").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            commit: *roots.first().ok_or_else(|| anyhow::anyhow!("#sync blocks without root"))?,
             blocks: blocks.into_iter().map(|(c, d)| (c, d.to_vec())).collect(),
         })
     }
 
     pub fn commit_obj(&self) -> CommitObj {
-        CommitObj::decode(self.blocks.get(&self.commit).expect("#sync commit block"))
-            .expect("decode commit")
+        CommitObj::decode(self.blocks.get(&self.commit).expect("#sync commit block")).expect("decode commit")
     }
 }
 
@@ -1250,9 +1026,7 @@ impl CommitObj {
     /// The unsigned commit bytes (commit object minus `sig`).
     pub fn unsigned_bytes(&self) -> Vec<u8> {
         match &self.value {
-            Value::Map(m) => {
-                Value::Map(m.iter().filter(|(k, _)| k != "sig").cloned().collect()).to_cbor()
-            }
+            Value::Map(m) => Value::Map(m.iter().filter(|(k, _)| k != "sig").cloned().collect()).to_cbor(),
             _ => panic!("commit is not a map"),
         }
     }
@@ -1268,23 +1042,13 @@ impl CommitObj {
 }
 
 pub fn decode_k256_multibase(s: &str) -> anyhow::Result<k256::ecdsa::VerifyingKey> {
-    let b = bs58::decode(
-        s.strip_prefix('z')
-            .ok_or_else(|| anyhow::anyhow!("not base58btc"))?,
-    )
-    .into_vec()?;
-    anyhow::ensure!(
-        b.len() == 35 && b[0] == 0xe7 && b[1] == 0x01,
-        "not a secp256k1 multikey"
-    );
+    let b = bs58::decode(s.strip_prefix('z').ok_or_else(|| anyhow::anyhow!("not base58btc"))?).into_vec()?;
+    anyhow::ensure!(b.len() == 35 && b[0] == 0xe7 && b[1] == 0x01, "not a secp256k1 multikey");
     Ok(k256::ecdsa::VerifyingKey::from_sec1_bytes(&b[2..])?)
 }
 
 pub fn decode_did_key_k256(did: &str) -> anyhow::Result<k256::ecdsa::VerifyingKey> {
-    decode_k256_multibase(
-        did.strip_prefix("did:key:")
-            .ok_or_else(|| anyhow::anyhow!("not did:key"))?,
-    )
+    decode_k256_multibase(did.strip_prefix("did:key:").ok_or_else(|| anyhow::anyhow!("not did:key"))?)
 }
 
 /// A parsed repo CAR (getRepo / getRecord / getBlocks / firehose blocks).
@@ -1299,9 +1063,7 @@ impl Repo {
         let (roots, blocks) = vlpds::car::read_car(b)?;
         let order = blocks.iter().map(|(c, _)| *c).collect();
         Ok(Repo {
-            root: *roots
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("CAR without root"))?,
+            root: *roots.first().ok_or_else(|| anyhow::anyhow!("CAR without root"))?,
             blocks: blocks.into_iter().map(|(c, d)| (c, d.to_vec())).collect(),
             order,
         })
@@ -1318,26 +1080,19 @@ impl Repo {
     /// All (path, cid) entries of a complete repo.
     pub fn entries(&self) -> Vec<(String, Cid)> {
         let mut out = Vec::new();
-        self.tree()
-            .walk(&mut |k, v| out.push((String::from_utf8_lossy(k).to_string(), v)));
+        self.tree().walk(&mut |k, v| out.push((String::from_utf8_lossy(k).to_string(), v)));
         out
     }
 
     pub fn record(&self, path: &str) -> Option<J> {
         let c = self.tree().get(path.as_bytes()).ok()??;
-        self.blocks
-            .get(&c)
-            .map(|b| Value::decode(b).unwrap().to_json())
+        self.blocks.get(&c).map(|b| Value::decode(b).unwrap().to_json())
     }
 
     /// Every block's CID matches its content hash.
     pub fn check_block_hashes(&self) -> anyhow::Result<()> {
         for (c, b) in &self.blocks {
-            let want = if c.codec == vlpds::cid::CODEC_RAW {
-                Cid::raw(b)
-            } else {
-                Cid::dag_cbor(b)
-            };
+            let want = if c.codec == vlpds::cid::CODEC_RAW { Cid::raw(b) } else { Cid::dag_cbor(b) };
             anyhow::ensure!(*c == want, "block {c} hashes to {want}");
         }
         Ok(())
@@ -1346,12 +1101,7 @@ impl Repo {
 
 /// Checks that `path` maps to `cid` (or is absent when None) in the proof CAR
 /// returned by sync.getRecord, and that the commit is signed by `key`.
-pub fn verify_record_proof(
-    car: &[u8],
-    did: &str,
-    path: &str,
-    key: Option<&k256::ecdsa::VerifyingKey>,
-) -> anyhow::Result<Option<Cid>> {
+pub fn verify_record_proof(car: &[u8], did: &str, path: &str, key: Option<&k256::ecdsa::VerifyingKey>) -> anyhow::Result<Option<Cid>> {
     let repo = Repo::from_car(car)?;
     repo.check_block_hashes()?;
     let c = repo.commit();
@@ -1360,14 +1110,9 @@ pub fn verify_record_proof(
         c.verify(k)?;
     }
     let tree = Tree::load_from_blocks(&repo.blocks, c.data).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let got = tree
-        .get(path.as_bytes())
-        .map_err(|e| anyhow::anyhow!("proof incomplete for {path}: {e}"))?;
+    let got = tree.get(path.as_bytes()).map_err(|e| anyhow::anyhow!("proof incomplete for {path}: {e}"))?;
     if let Some(cid) = got {
-        anyhow::ensure!(
-            repo.blocks.contains_key(&cid),
-            "record block {cid} missing from proof CAR"
-        );
+        anyhow::ensure!(repo.blocks.contains_key(&cid), "record block {cid} missing from proof CAR");
     }
     Ok(got)
 }
@@ -1397,10 +1142,7 @@ pub async fn retry<T, F: std::future::Future<Output = Option<T>>>(what: &str, f:
 }
 
 /// Waits until `f` returns Some or the timeout passes.
-pub async fn eventually<T, F: std::future::Future<Output = Option<T>>>(
-    timeout: Duration,
-    mut f: impl FnMut() -> F,
-) -> Option<T> {
+pub async fn eventually<T, F: std::future::Future<Output = Option<T>>>(timeout: Duration, mut f: impl FnMut() -> F) -> Option<T> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Some(v) = f().await {
@@ -1417,9 +1159,7 @@ pub const SEC: Duration = Duration::from_secs(1);
 pub const FH_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn fixture_path(rel: &str) -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("testdata")
-        .join(rel)
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(rel)
 }
 
 pub fn read_fixture(rel: &str) -> String {
@@ -1447,20 +1187,14 @@ pub fn data_model_fixtures() -> Vec<DataModelFixture> {
 
 /// Non-comment, non-empty lines of an interop syntax fixture.
 pub fn fixture_lines(rel: &str) -> Vec<String> {
-    read_fixture(rel)
-        .lines()
-        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-        .map(String::from)
-        .collect()
+    read_fixture(rel).lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()).map(String::from).collect()
 }
 
 /// A minimal 1x1 PNG.
 pub const PNG_1X1: &[u8] = &[
-    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
-    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
-    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
-    0x42, 0x60, 0x82,
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
+    0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d,
+    0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ];
 
 // ---- ref group A helpers ----
@@ -1506,10 +1240,7 @@ pub async fn age_email_token(s: &TestServer, did: &str, purpose: &str, ms: u64) 
     s.app
         .put_private(
             did,
-            vec![vlpds::segment::Mutation {
-                key: vlpds::state::private_key(did, &name).into(),
-                val: Some(serde_json::to_vec(&rec).unwrap().into()),
-            }],
+            vec![vlpds::segment::Mutation { key: vlpds::state::private_key(did, &name).into(), val: Some(serde_json::to_vec(&rec).unwrap().into()) }],
         )
         .await
         .unwrap_or_else(|e| panic!("put_private: {}", e.message));
@@ -1572,8 +1303,8 @@ pub fn b64_decode(s: &str) -> Vec<u8> {
 /// order ("$"-keys, prefixes of each other).
 pub fn rand_text(rng: &mut impl rand::Rng) -> String {
     const PIECES: &[&str] = &[
-        "a", "b", "z", "aa", "ab", "$type", "$link", "$bytes", "text", "\"", "\\", "\n", "\t", "\u{0}", "\u{1f}", "\u{7f}", "é", "日本",
-        "😀", "\u{2028}", "/", "<", " ",
+        "a", "b", "z", "aa", "ab", "$type", "$link", "$bytes", "text", "\"", "\\", "\n", "\t", "\u{0}", "\u{1f}", "\u{7f}", "é", "日本", "😀", "\u{2028}", "/",
+        "<", " ",
     ];
     (0..rng.gen_range(0..6)).map(|_| PIECES[rng.gen_range(0..PIECES.len())]).collect()
 }
@@ -1617,7 +1348,13 @@ pub fn env_or<T: std::str::FromStr>(k: &str, d: T) -> T {
 /// An in-memory store adding `ms` to every request (S3-like latency).
 pub fn throttled_store(ms: u64) -> object_store::throttle::ThrottledStore<object_store::memory::InMemory> {
     let d = Duration::from_millis(ms);
-    let cfg = object_store::throttle::ThrottleConfig { wait_get_per_call: d, wait_put_per_call: d, wait_list_per_call: d, wait_delete_per_call: d, ..Default::default() };
+    let cfg = object_store::throttle::ThrottleConfig {
+        wait_get_per_call: d,
+        wait_put_per_call: d,
+        wait_list_per_call: d,
+        wait_delete_per_call: d,
+        ..Default::default()
+    };
     object_store::throttle::ThrottledStore::new(object_store::memory::InMemory::new(), cfg)
 }
 

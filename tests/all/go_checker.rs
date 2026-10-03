@@ -17,12 +17,7 @@ fn build_checker() -> Option<std::path::PathBuf> {
 fn build_checker_once() -> Option<std::path::PathBuf> {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("checker");
     let out = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("vlpds-sync-checker");
-    let st = std::process::Command::new("go")
-        .args(["build", "-o"])
-        .arg(&out)
-        .arg(".")
-        .current_dir(&src)
-        .status();
+    let st = std::process::Command::new("go").args(["build", "-o"]).arg(&out).arg(".").current_dir(&src).status();
     match st {
         Ok(s) if s.success() => Some(out),
         Ok(s) => panic!("go build of checker failed: {s}"),
@@ -100,7 +95,9 @@ async fn go_checker_accepts_firehose() {
         want.insert(a.did.clone(), s.latest_commit(&a.did).await.0);
     }
     let mut frames = sub
-        .until(Duration::from_secs(60), |fs| want.iter().all(|(d, c)| fs.iter().any(|f| f.did() == Some(d.as_str()) && matches!(f.body.get("commit"), Some(Value::Link(x)) if x == c))))
+        .until(Duration::from_secs(60), |fs| {
+            want.iter().all(|(d, c)| fs.iter().any(|f| f.did() == Some(d.as_str()) && matches!(f.body.get("commit"), Some(Value::Link(x)) if x == c)))
+        })
         .await;
     // plus anything trailing (e.g. #account/#identity after the last commit)
     frames.extend(sub.drain(Duration::from_millis(500)).await);
@@ -116,9 +113,7 @@ async fn go_checker_accepts_firehose() {
 
     let out = tokio::time::timeout(
         Duration::from_secs(120),
-        tokio::process::Command::new(&bin)
-            .args(["-host", &s.url, "-cursor", "0", "-max-events", &n.to_string(), "-strict", "-quiet"])
-            .output(),
+        tokio::process::Command::new(&bin).args(["-host", &s.url, "-cursor", "0", "-max-events", &n.to_string(), "-strict", "-quiet"]).output(),
     )
     .await
     .expect("checker timed out")
