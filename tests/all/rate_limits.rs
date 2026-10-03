@@ -233,3 +233,38 @@ async fn forwarded_for_only_from_trusted_proxies() {
         .json(&json!({"identifier": "fwd.vlpds.test", "password": "x"}));
     s.xrpc.send(rb).await.err(429, "RateLimitExceeded");
 }
+
+/// uploadBlob's per-IP daily budget (1000, as the reference) would stop an
+/// account with more images than that from moving in on the same day: blobs
+/// a deactivated account's repo references don't count; anything else does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upload_blob_budget_spares_blobs_an_arriving_repo_references() {
+    let s = limited().await;
+    let cfg = json!({"limiters": {"com.atproto.repo.uploadBlob-0": {"points": 3}}});
+    s.xrpc.post("vlpds.admin.updateRateLimits", &json!({"config": cfg, "ifVersion": 0, "actor": "it-test"}), &Auth::Admin).await.ok();
+    let up = |a: &TestAccount, bytes: Vec<u8>| {
+        let (x, auth) = (s.xrpc.clone(), a.auth());
+        async move { x.post_bytes("com.atproto.repo.uploadBlob", bytes, "image/png", &auth).await }
+    };
+    let img = |i: u8| [b"\x89PNG\r\n\x1a\n".as_slice(), &[i; 64]].concat();
+
+    // an active account spends the budget on three images it posts
+    let a = s.create_account("rlb").await;
+    for i in 0..3 {
+        let blob = up(&a, img(i)).await.ok()["blob"].clone();
+        s.create_record(&a, "app.bsky.feed.post", image_post("pic", &blob)).await;
+    }
+    up(&a, img(9)).await.err(429, "RateLimitExceeded");
+
+    // another account takes that repo in while deactivated, as a migration does
+    let b = s.create_account("rlb").await;
+    s.import_repo(&b.auth(), s.get_repo_car(&a.did).await).await.ok();
+    s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &b.auth()).await.ok();
+    for i in 0..3 {
+        up(&b, img(i)).await.ok();
+    }
+    let missing = s.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &b.auth()).await.ok();
+    assert_eq!(missing["blobs"], json!([]));
+    // a blob its repo doesn't reference still counts
+    up(&b, img(8)).await.err(429, "RateLimitExceeded");
+}

@@ -6,7 +6,6 @@ import { useLoad } from '../../lib/hooks'
 import { Link, navigate, useSearch } from '../../lib/router'
 import { call, errText, setSession, XrpcError } from '../../lib/xrpc'
 import {
-  authHostFor,
   clearSecrets,
   copyBlobs,
   copyRepo,
@@ -65,7 +64,7 @@ export function Migrate() {
     setOldPassword('')
   }
 
-  const oldPds = useMemo(() => (saved ? new Pds('old', saved.oldPds, saved.did, saved.oldAuth) : null), [saved?.did, saved?.oldPds])
+  const oldPds = useMemo(() => (saved ? new Pds('old', saved.oldPds, saved.did) : null), [saved?.did, saved?.oldPds])
   const newPds = useMemo(() => (saved ? new Pds('new', '', saved.did) : null), [saved?.did])
   const refresh = () => bump((n) => n + 1)
 
@@ -266,7 +265,6 @@ function FindStep({ onFound, invite }: { onFound: (s: Saved) => void; invite: st
       onFound({
         did: f.did,
         oldPds: f.pds,
-        oldAuth: authHostFor(f.pds),
         oldHandle: f.handle,
         oldDomains: domains,
         invite: invite || undefined,
@@ -400,7 +398,7 @@ function SignInStep({
   const [needCode, setNeedCode] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>()
-  const host = side === 'old' ? hostOf(saved.oldAuth) : here
+  const host = side === 'old' ? hostOf(saved.oldPds) : here
 
   const submit = async (e: FormEvent) => {
     e.preventDefault()
@@ -539,7 +537,7 @@ function CheckStep({
     oldPds
       .call('com.atproto.server.getSession')
       .then((s) => {
-        if (!s.email) put('email', { state: 'bad', title: 'No email on your account', detail: `Moving needs a code emailed by ${hostOf(saved.oldAuth)}. Add an email there first.` })
+        if (!s.email) put('email', { state: 'bad', title: 'No email on your account', detail: `Moving needs a code emailed by ${hostOf(saved.oldPds)}. Add an email there first.` })
         else {
           update({ email: saved.email ?? s.email })
           put('email', {
@@ -809,7 +807,7 @@ function CreateStep({
         {oldPassword && (
           <label className="check">
             <input type="checkbox" name="same-password" checked={same} onChange={(e) => setSame(e.target.checked)} />
-            <span>Use the same password as on {hostOf(saved.oldAuth)}</span>
+            <span>Use the same password as on {hostOf(saved.oldPds)}</span>
           </label>
         )}
         {!same && (
@@ -898,7 +896,7 @@ function SignInInline({ pds, onDone }: { pds: Pds; onDone: (handle: string) => v
 
 type CopyView = {
   repo: { phase?: 'download' | 'upload' | 'verify'; bytes: number; total?: number; records?: [number, number] }
-  blobs: { done: number; total?: number; bytes: number; failed: { cid: string; reason: string }[] }
+  blobs: { done: number; total?: number; bytes: number; failed: { cid: string; reason: string }[]; pausedUntil?: number }
   prefs?: number
   error?: unknown
   mismatch?: string
@@ -943,8 +941,9 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
                 oldPds,
                 newPds,
                 skip,
-                (_cid, bytes) => set((x) => ({ ...x, blobs: { ...x.blobs, done: x.blobs.done + 1, bytes: x.blobs.bytes + bytes } })),
+                (_cid, bytes) => set((x) => ({ ...x, blobs: { ...x.blobs, done: x.blobs.done + 1, bytes: x.blobs.bytes + bytes, pausedUntil: undefined } })),
                 () => stop.current,
+                (until) => set((x) => ({ ...x, blobs: { ...x.blobs, pausedUntil: until } })),
               )
               failed = r.failed
               if (r.copied === 0) break
@@ -1022,6 +1021,11 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
               {fmtNum(v.blobs.done)}
               {v.blobs.total !== undefined ? ` of ${fmtNum(v.blobs.total)}` : ''} copied{v.blobs.bytes ? ` (${fmtBytes(v.blobs.bytes)} this session)` : ''}
               <Bar value={v.blobs.done} total={v.blobs.total || undefined} label="Images and videos" />
+              {v.blobs.pausedUntil && v.blobs.pausedUntil > Date.now() && (
+                <div>
+                  A server asked us to slow down (rate limit). Resuming by {new Date(v.blobs.pausedUntil).toLocaleTimeString()}; keep this tab open.
+                </div>
+              )}
             </>
           )}
         </Checkline>
@@ -1185,7 +1189,7 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
             </tr>
             <tr>
               <th>Rotation keys</th>
-              <td className="muted">{hostOf(saved.oldAuth)}'s key{d ? '' : ''}</td>
+              <td className="muted">{hostOf(saved.oldPds)}'s key{d ? '' : ''}</td>
               <td className="mono">
                 {r.rotationKeys.map((k) => (
                   <div key={k} title={k}>
@@ -1199,7 +1203,7 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
       )}
       <Notice kind="warn">
         <p>
-          <b>This is the point of no return for this page.</b> Once the directory accepts the change, {here} controls your identity: {hostOf(saved.oldAuth)}{' '}
+          <b>This is the point of no return for this page.</b> Once the directory accepts the change, {here} controls your identity: {hostOf(saved.oldPds)}{' '}
           can't move it back for you. Rotation keys you added yourself are replaced by the ones above (add them again later from here). Going back
           later means moving again, from {here}.
         </p>
@@ -1218,7 +1222,7 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
       ) : !requested ? (
         <>
           <p>
-            {hostOf(saved.oldAuth)} has to approve the change: it emails a confirmation code to {saved.email ? maskEmail(saved.email) : 'your account email'}.
+            {hostOf(saved.oldPds)} has to approve the change: it emails a confirmation code to {saved.email ? maskEmail(saved.email) : 'your account email'}.
           </p>
           <ErrorNotice error={error} />
           <div className="row end">
@@ -1230,7 +1234,7 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
         </>
       ) : (
         <form onSubmit={move}>
-          {sentNow && <Notice kind="ok">Code sent. Check your inbox (and spam) for mail from {hostOf(saved.oldAuth)}.</Notice>}
+          {sentNow && <Notice kind="ok">Code sent. Check your inbox (and spam) for mail from {hostOf(saved.oldPds)}.</Notice>}
           {tokenError ? (
             <Notice kind="err">
               {(error as XrpcError).error === 'ExpiredToken' ? 'That code has expired.' : "That code isn't right."} Check it, or send a new code.

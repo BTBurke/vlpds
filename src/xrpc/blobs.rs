@@ -83,8 +83,16 @@ async fn upload_blob(
     // Deactivated accounts may upload (migration). Unlike the reference this
     // applies to user service JWTs too: one issued before a takedown would
     // otherwise still upload for up to an hour.
-    if super::server::is_takendown_account(&app.account(&did).await?) {
+    let acct = app.account(&did).await?;
+    if super::server::is_takendown_account(&acct) {
         return Err(super::takedown_error());
+    }
+    // An account moving in uploads every blob its imported repo references;
+    // those don't count against the per-IP daily budget (checked below, once
+    // the CID is known), so a big account can arrive in one sitting.
+    let moving_in = acct.status.as_deref() == Some("deactivated");
+    if !moving_in {
+        crate::ratelimit::check_ip(&[&crate::ratelimit::UPLOAD_BLOB], 1)?;
     }
     let max = app.config.max_blob_size;
     let declared = headers
@@ -123,6 +131,9 @@ async fn upload_blob(
     }
     // checked after storing: the bytes are content-addressed, so that changed nothing
     let c = cid.to_string();
+    if moving_in && !referenced(&*app.partition(&did)?, &did, &c).await.map_err(XrpcError::from_err)? {
+        crate::ratelimit::check_ip(&[&crate::ratelimit::UPLOAD_BLOB], 1)?;
+    }
     let (recorded, takendown) = tokio::join!(app.put_private(&did, vec![stored(&did, &c, true)]), super::admin::is_blob_takendown(&app, &did, &c));
     recorded?;
     if takendown? {

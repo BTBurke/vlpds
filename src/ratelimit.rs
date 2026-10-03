@@ -92,7 +92,7 @@ limit!(DELETE_ACCOUNT, 5, "com.atproto.server.deleteAccount-0", Ip, "server.dele
 limit!(REQUEST_PASSWORD_RESET_DAY, 6, "com.atproto.server.requestPasswordReset-0", Ip, "server.requestPasswordReset", DAY, 50);
 limit!(REQUEST_PASSWORD_RESET_HOUR, 7, "com.atproto.server.requestPasswordReset-1", Ip, "server.requestPasswordReset", HOUR, 15);
 limit!(RESET_PASSWORD, 8, "com.atproto.server.resetPassword-0", Ip, "server.resetPassword", 5 * MINUTE, 50);
-limit!(UPLOAD_BLOB, 9, "com.atproto.repo.uploadBlob-0", Ip, "repo.uploadBlob", DAY, 1000);
+limit!(UPLOAD_BLOB, 9, "com.atproto.repo.uploadBlob-0", Ip, "repo.uploadBlob, except an account moving in sending blobs its repo references", DAY, 1000);
 limit!(UPDATE_HANDLE_5MIN, 10, "com.atproto.identity.updateHandle-0", Did, "identity.updateHandle", 5 * MINUTE, 10);
 limit!(UPDATE_HANDLE_DAY, 11, "com.atproto.identity.updateHandle-1", Did, "identity.updateHandle", DAY, 50);
 limit!(REQUEST_ACCOUNT_DELETE_DAY, 12, "com.atproto.server.requestAccountDelete-0", Did, "server.requestAccountDelete", DAY, 15);
@@ -157,7 +157,6 @@ fn ip_route_limits(path: &str) -> &'static [&'static Limit] {
             &[&REQUEST_PASSWORD_RESET_DAY, &REQUEST_PASSWORD_RESET_HOUR]
         }
         "/xrpc/com.atproto.server.resetPassword" => &[&RESET_PASSWORD],
-        "/xrpc/com.atproto.repo.uploadBlob" => &[&UPLOAD_BLOB],
         "/xrpc/com.atproto.server.reserveSigningKey" => &[&RESERVE_SIGNING_KEY_IP],
         _ => &[],
     }

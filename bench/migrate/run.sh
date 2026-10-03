@@ -48,7 +48,7 @@ docker compose up -d --build --wait
 
 mkdir -p out
 # a fixed dev rotation key: vlpds signs PLC operations with it (local PLC only)
-"$bin" --memory --dev-mode --no-rate-limits \
+"$bin" --memory --dev-mode \
   --listen "127.0.0.1:$VLPDS_PORT" --public-url "$VLPDS" \
   --handle-domain vlpds.test --service-did did:web:vlpds.test \
   --plc-url "$PLC" --plc-mode directory \

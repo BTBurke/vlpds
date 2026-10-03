@@ -26,8 +26,6 @@ export type Saved = {
   did: string
   /** The old PDS's origin. */
   oldPds: string
-  /** Where the old account signs in (differs for an entryway like bsky.social). */
-  oldAuth: string
   oldHandle: string
   oldDomains: string[]
   checkedAt?: number
@@ -122,15 +120,14 @@ const expiredJwt = (jwt: string) => {
   return typeof exp === 'number' && exp * 1000 < Date.now() + 10_000
 }
 
-/** A signed-in account on one PDS. `base` '' is this server. */
+/** A signed-in account on one PDS. `base` '' is this server. A PDS behind
+ * an entryway (bsky.social's) passes sign-in and PLC calls through to it. */
 export class Pds {
   tokens?: Tokens
   constructor(
     readonly side: 'old' | 'new',
     readonly base: string,
     readonly did: string,
-    /** createSession / refreshSession go here (an entryway may hold the password). */
-    readonly authBase: string = base,
   ) {
     const s = loadSecrets()
     if (s.did === did && s[side]) this.tokens = s[side]
@@ -149,7 +146,7 @@ export class Pds {
   /** Throws XrpcError AuthFactorTokenRequired when the account wants an emailed code. */
   async login(password: string, authFactorToken?: string): Promise<Session & Record<string, any>> {
     const out = await call('com.atproto.server.createSession', {
-      base: this.authBase,
+      base: this.base,
       body: { identifier: this.did, password, authFactorToken: authFactorToken || undefined },
     })
     if (out.did !== this.did) throw new Error(`Signed in as ${out.did}, not ${this.did}. Check the account you entered.`)
@@ -174,7 +171,7 @@ export class Pds {
     const t = this.tokens
     if (!t) throw new XrpcError(401, 'AuthenticationRequired', 'Sign in again')
     try {
-      const out = await call('com.atproto.server.refreshSession', { base: this.authBase, method: 'POST', auth: `Bearer ${t.refreshJwt}` })
+      const out = await call('com.atproto.server.refreshSession', { base: this.base, method: 'POST', auth: `Bearer ${t.refreshJwt}` })
       this.keep({ accessJwt: out.accessJwt, refreshJwt: out.refreshJwt })
     } catch (e) {
       if (e instanceof XrpcError && e.status < 500) this.forget()
@@ -225,17 +222,6 @@ export function signingKeyOf(doc: DidDoc): string | undefined {
 
 export function handleOf(doc: DidDoc): string | undefined {
   return doc.alsoKnownAs?.find((a) => a.startsWith('at://'))?.slice(5)
-}
-
-/** bsky.social accounts live on *.host.bsky.network PDSes but sign in, and
- * sign PLC operations, at the entryway. */
-export function authHostFor(pds: string): string {
-  try {
-    if (new URL(pds).hostname.endsWith('.host.bsky.network')) return 'https://bsky.social'
-  } catch {
-    /* not a URL: left to fail on use */
-  }
-  return pds
 }
 
 export function normalizeHost(input: string): string {
@@ -309,6 +295,23 @@ async function readAll(r: Response, onBytes: (n: number) => void): Promise<Blob>
   return new Blob(parts, { type: 'application/vnd.ipld.car' })
 }
 
+/** Seconds a 429 asks us to wait: Retry-After, else RateLimit-Reset (epoch seconds). */
+function waitSecs(get: (h: string) => string | null): number | undefined {
+  const ra = Number(get('retry-after'))
+  if (ra > 0) return ra
+  const reset = Number(get('ratelimit-reset'))
+  if (reset > 0) return Math.max(1, reset - Date.now() / 1000)
+  return undefined
+}
+
+function httpError(status: number, body: any, text: string, get: (h: string) => string | null): XrpcError {
+  const e = new XrpcError(status, body?.error ?? `HTTP ${status}`, body?.message ?? text)
+  if (status === 429) (e as RateLimited).retryAfter = waitSecs(get)
+  return e
+}
+
+type RateLimited = XrpcError & { retryAfter?: number }
+
 /** POSTs a body here with upload progress (fetch has none). */
 function upload(nsid: string, body: Blob, contentType: string, auth: string, onBytes: (n: number) => void): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -326,7 +329,7 @@ function upload(nsid: string, body: Blob, contentType: string, auth: string, onB
         /* not JSON */
       }
       if (x.status >= 200 && x.status < 300) resolve(j)
-      else reject(new XrpcError(x.status, j?.error ?? `HTTP ${x.status}`, j?.message ?? x.responseText))
+      else reject(httpError(x.status, j, x.responseText, (h) => x.getResponseHeader(h)))
     }
     x.send(body)
   })
@@ -346,7 +349,7 @@ export async function fetchOk(url: string): Promise<Response> {
     } catch {
       /* not JSON */
     }
-    throw new XrpcError(r.status, body.error ?? `HTTP ${r.status}`, body.message ?? '')
+    throw httpError(r.status, body, '', (h) => r.headers.get(h))
   }
   return r
 }
@@ -365,19 +368,29 @@ export type BlobResult = { copied: number; failed: { cid: string; reason: string
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-async function retry<T>(fn: () => Promise<T>, tries = 4): Promise<T> {
-  let last: unknown
-  for (let i = 0; i < tries; i++) {
+/** Shared by the copy workers: one 429 pauses them all until the window resets. */
+let pausedUntil = 0
+
+async function retry<T>(fn: () => Promise<T>, onPause: (until: number) => void, tries = 4): Promise<T> {
+  let failures = 0
+  for (let limited = 0; ; ) {
+    const wait = pausedUntil - Date.now()
+    if (wait > 0) await sleep(wait)
     try {
       return await fn()
     } catch (e) {
-      last = e
+      if (e instanceof XrpcError && e.status === 429 && ++limited < 50) {
+        const secs = Math.min(Math.max((e as RateLimited).retryAfter ?? 60, 2), 900)
+        pausedUntil = Math.max(pausedUntil, Date.now() + secs * 1000)
+        onPause(pausedUntil)
+        continue
+      }
       // a definite "no" doesn't change on retry
-      if (e instanceof XrpcError && e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429) throw e
-      await sleep(500 * 2 ** i)
+      if (e instanceof XrpcError && e.status >= 400 && e.status < 500 && e.status !== 408) throw e
+      if (++failures >= tries) throw e
+      await sleep(500 * 2 ** failures)
     }
   }
-  throw last
 }
 
 /** One pass over listMissingBlobs: copy each blob the new server lacks.
@@ -388,6 +401,7 @@ export async function copyBlobs(
   skip: Set<string>,
   onCopied: (cid: string, bytes: number) => void,
   shouldStop: () => boolean,
+  onPause: (until: number) => void,
   concurrency = 4,
 ): Promise<BlobResult> {
   const failed: { cid: string; reason: string }[] = []
@@ -411,7 +425,7 @@ export async function copyBlobs(
         if (got && got !== cid) throw new Error(`the copy hashed to ${got}, not ${cid}`)
         copied++
         onCopied(cid, body.size)
-      })
+      }, onPause)
     } catch (e) {
       failed.push({ cid, reason: e instanceof Error ? e.message : String(e) })
     }

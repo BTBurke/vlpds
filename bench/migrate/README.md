@@ -13,7 +13,7 @@ It starts, in docker (`docker-compose.yml`, project `vlpds-migrate-e2e`):
 - **Reference PDS** (`ghcr.io/bluesky-social/pds:0.4`, dev mode, hostname `localhost`, handles `*.test`) on `localhost:2783`. It registers DIDs with the local PLC.
 - **Mailpit** on `127.0.0.1:2785`. It catches the reference PDS's email, so the harness can read the 2FA and PLC codes.
 
-It then builds the UI and `vlpds`, and runs vlpds on `127.0.0.1:2784` with these flags: `--memory --dev-mode --plc-mode directory --plc-url <local PLC> --invite-required`. Then `e2e.mjs` runs three phases.
+It then builds the UI and `vlpds`, and runs vlpds on `127.0.0.1:2784` (rate limits on) with these flags: `--memory --dev-mode --plc-mode directory --plc-url <local PLC> --invite-required`. Then `e2e.mjs` runs three phases.
 
 1. **Seed.** It creates four accounts on the reference PDS. They have posts (some with images), a profile with an avatar and a banner, follows and likes between the accounts, and preferences. Bob also has email 2FA turned on. The harness records every record CID, blob hash and preference.
 2. **Drive.** Headless Chromium (Playwright) goes through the whole wizard for each account:
