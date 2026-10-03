@@ -772,6 +772,40 @@ pub enum KeyRotation {
     Foreign,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryKeyOutcome {
+    Present,
+    /// Inserted (or, in a dry run, would be).
+    Added,
+    /// Lists none of this server's keys: migrated away, or never ours.
+    Foreign,
+    /// No room left (MAX_ROTATION_ENTRIES).
+    Full,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecoveryKeyChange {
+    pub outcome: RecoveryKeyOutcome,
+    pub before: Vec<String>,
+    pub after: Vec<String>,
+}
+
+/// `keys` with `recovery` inserted just ahead of the first server key.
+pub fn with_recovery_key(keys: &[String], recovery: &str, is_server_key: impl Fn(&str) -> bool) -> (RecoveryKeyOutcome, Vec<String>) {
+    if keys.iter().any(|k| k == recovery) {
+        return (RecoveryKeyOutcome::Present, keys.to_vec());
+    }
+    let Some(at) = keys.iter().position(|k| is_server_key(k)) else {
+        return (RecoveryKeyOutcome::Foreign, keys.to_vec());
+    };
+    if keys.len() >= MAX_ROTATION_ENTRIES {
+        return (RecoveryKeyOutcome::Full, keys.to_vec());
+    }
+    let mut out = keys.to_vec();
+    out.insert(at, recovery.to_string());
+    (RecoveryKeyOutcome::Added, out)
+}
+
 impl std::fmt::Debug for Plc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Plc").field("url", &self.client.url).field("rotation_key", &self.did_key).finish()
@@ -887,6 +921,15 @@ impl Plc {
         &self.did_key
     }
 
+    /// Current first, then retired.
+    pub fn server_did_keys(&self) -> Vec<String> {
+        [self.did_key.clone()].into_iter().chain(self.old.iter().map(|(_, d)| d.clone())).collect()
+    }
+
+    pub fn recovery_did_key(&self) -> Option<&str> {
+        self.recovery_did_key.as_deref()
+    }
+
     /// getRecommendedDidCredentials `rotationKeys`.
     pub fn recommended_rotation_keys(&self) -> Vec<String> {
         self.recovery_did_key.iter().cloned().chain([self.did_key.clone()]).collect()
@@ -954,6 +997,38 @@ impl Plc {
             .await?;
         }
         Ok(KeyRotation::Rotated)
+    }
+
+    /// Lists the operator recovery key in `did`'s rotation keys where a new
+    /// account would have it: just ahead of the server key, behind any keys
+    /// the user added (which keep their higher priority).
+    pub async fn ensure_recovery_key(&self, did: &str, dry: bool) -> Result<RecoveryKeyChange, PlcError> {
+        let recovery = self.recovery_did_key.clone().ok_or_else(|| invalid("no operator recovery key configured (--plc-recovery-did-key)"))?;
+        let last = self.last_op(did).await?;
+        let before = rotation_keys(&last);
+        let (outcome, after) = with_recovery_key(&before, &recovery, |k| self.is_server_key(k));
+        let change = RecoveryKeyChange { outcome, before, after };
+        if dry || outcome != RecoveryKeyOutcome::Added {
+            return Ok(change);
+        }
+        let submitted: parking_lot::Mutex<Option<RecoveryKeyChange>> = parking_lot::Mutex::new(None);
+        self.update(did, "ensure_recovery_key", |last| {
+            let before = rotation_keys(not_tombstone(last)?);
+            let (outcome, after) = with_recovery_key(&before, &recovery, |k| self.is_server_key(k));
+            if outcome != RecoveryKeyOutcome::Added {
+                *submitted.lock() = Some(RecoveryKeyChange { outcome, before, after });
+                return Ok(None);
+            }
+            let op = self.update_op(last, |m| {
+                m.insert("rotationKeys".into(), json!(after));
+                Ok(())
+            })?;
+            // a retired signer is swapped for the current key by update_op
+            *submitted.lock() = Some(RecoveryKeyChange { outcome, before, after: rotation_keys(&op) });
+            Ok(Some(op))
+        })
+        .await?;
+        Ok(submitted.into_inner().unwrap_or(change))
     }
 
     /// `ensureLastOp`.
@@ -1086,6 +1161,21 @@ mod tests {
             let want: Vec<bool> = entries.iter().map(|e| e["nullified"].as_bool().unwrap()).collect();
             assert_eq!(flags, want, "{name}: nullified flags");
         }
+    }
+
+    #[test]
+    fn recovery_key_goes_just_ahead_of_the_server_key() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let srv = |k: &str| k == "srv" || k == "old";
+        use RecoveryKeyOutcome::*;
+        assert_eq!(with_recovery_key(&s(&["srv"]), "rec", srv), (Added, s(&["rec", "srv"])));
+        assert_eq!(with_recovery_key(&s(&["u1", "u2", "srv"]), "rec", srv), (Added, s(&["u1", "u2", "rec", "srv"])));
+        assert_eq!(with_recovery_key(&s(&["u1", "old", "u2"]), "rec", srv), (Added, s(&["u1", "rec", "old", "u2"])));
+        assert_eq!(with_recovery_key(&s(&["rec", "srv"]), "rec", srv).0, Present);
+        assert_eq!(with_recovery_key(&s(&["srv", "rec"]), "rec", srv).0, Present, "anywhere counts");
+        assert_eq!(with_recovery_key(&s(&["other"]), "rec", srv).0, Foreign);
+        let full: Vec<String> = (0..MAX_ROTATION_ENTRIES - 1).map(|i| format!("u{i}")).chain(["srv".into()]).collect();
+        assert_eq!(with_recovery_key(&full, "rec", srv).0, Full);
     }
 
     #[test]

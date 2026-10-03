@@ -90,6 +90,20 @@ pub enum Cmd {
         #[arg(long)]
         node_only: bool,
     },
+    /// Add the operator recovery key (--plc-recovery-did-key) to every
+    /// account's PLC rotation keys that lacks it, ahead of the server key
+    /// and behind any keys the user added, on every node
+    /// (vlpds.admin.ensureRecoveryKey).
+    EnsureRecoveryKey {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        node_only: bool,
+        /// Accounts started per second on each node (the directory
+        /// rate-limits).
+        #[arg(long)]
+        per_second: Option<f64>,
+    },
     /// Rewrap every secret at rest under the current KEK, on every node
     /// (vlpds.admin.rewrapSecrets).
     RewrapSecrets {
@@ -405,6 +419,11 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
         Cmd::RotatePlcKeys { dry_run, node_only } => {
             let cols = ["accounts", "current", "rotated", "foreign", "failed"];
             per_node(&c, node_only, opts, out, "vlpds.admin.rotatePlcKeys", json!({"dryRun": dry_run}), &cols).await
+        }
+        Cmd::EnsureRecoveryKey { dry_run, node_only, per_second } => {
+            let cols = ["accounts", "present", "added", "foreign", "full", "failed"];
+            let body = json!({"dryRun": dry_run, "perSecond": per_second});
+            per_node(&c, node_only, opts, out, "vlpds.admin.ensureRecoveryKey", body, &cols).await
         }
         Cmd::RewrapSecrets { dry_run, check_versions, node_only } => {
             let cols = ["accounts", "stale", "signingKeys", "totpSecrets", "reservedKeys", "failed"];

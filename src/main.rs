@@ -513,6 +513,11 @@ struct Args {
     /// --plc-rotation-key-file form, and exit. Its did:key goes to stderr.
     #[arg(long)]
     wrap_plc_rotation_key: bool,
+    /// Print a new secp256k1 private key (64 hex chars) and its did:key,
+    /// and exit. Needs no other configuration: run it offline to make an
+    /// operator recovery key (--plc-recovery-did-key) or a rotation key.
+    #[arg(long)]
+    generate_did_key: bool,
     /// Require an invite code for createAccount.
     #[arg(long, env = "VLPDS_INVITE_REQUIRED")]
     invite_required: bool,
@@ -803,6 +808,12 @@ fn main() -> anyhow::Result<()> {
         return admin_main(AdminArgs::parse_from(std::env::args().skip(1)));
     }
     let args = Args::parse();
+    if args.generate_did_key {
+        let key = vlpds::crypto::Keypair::generate();
+        println!("private key (hex): {}", hex::encode(key.to_bytes().as_slice()));
+        println!("did:key: {}", key.did_key());
+        return Ok(());
+    }
     init_logging(args.log_format)?;
     vlpds::lifecycle::install_panic_hook();
     raise_nofile_limit();

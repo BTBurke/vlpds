@@ -4310,6 +4310,28 @@ PDS's recommended credentials, the new PDS submits it and activates, and
 the account is deactivated here (`tests/all/plc.rs` runs it end to end
 between two servers).
 
+**User and operator recovery keys.** The order of `rotationKeys` is
+priority: a key earlier in the list can nullify ops signed by a later one
+within 72 h. Keys the user holds go first, then `--plc-recovery-did-key`
+(the operator's offline key), then the server key. Only presence of the
+server key is checked (submit, activation), so a DID may list user keys
+ahead of it: /migrate's advanced option signs the move with `[userKey,
+...recommended]`, and the account page adds or removes a user key through
+request/sign/submitPlcOperation on this PDS with `[userKey, ...current
+server/operator keys]`. `vlpds.identity.getPlcData` (same credentials as
+signPlcOperation) returns the directory's current `/data` for the caller
+plus `serverKeys` (current, retired), `recoveryKey` and
+`recommendedRotationKeys`, so a client can compose that list without
+dropping keys. A DID listing a key that is not the server's or operator's
+is marked `plcExternalOps` (its document is the directory's).
+`vlpds.admin.ensureRecoveryKey` (per node, like `rotatePlcKeys`; paced
+`perSecond`, 4 in flight, `dryRun`) adds `--plc-recovery-did-key` to DIDs
+that lack it (accounts from before it was set, migrations in with other
+keys), inserting it just before the first server key so user keys keep
+their priority; DIDs listing none of our keys are `foreign` and left
+alone; `full` ones (10 keys) are reported. `vlpds --generate-did-key`
+prints a fresh secp256k1 key and its did:key for making it offline.
+
 **The rotation key** is one secp256k1 key for the whole deployment
 (reference `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`). It comes from
 `--plc-rotation-key` / `VLPDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` (hex;

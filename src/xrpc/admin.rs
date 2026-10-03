@@ -14,6 +14,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/vlpds.admin.bulkCreate", post(bulk_create))
         .route("/xrpc/vlpds.admin.rewrapSecrets", post(rewrap_secrets))
         .route("/xrpc/vlpds.admin.rotatePlcKeys", post(rotate_plc_keys))
+        .route("/xrpc/vlpds.admin.ensureRecoveryKey", post(ensure_recovery_key))
         .route("/xrpc/vlpds.admin.getDevMail", get(get_dev_mail))
         .route("/xrpc/com.atproto.admin.getAccountInfo", get(get_account_info))
         .route("/xrpc/com.atproto.admin.getAccountInfos", get(get_account_infos))
@@ -1265,6 +1266,101 @@ async fn rotate_plc_keys(State(app): AppState, Auth(creds): Auth, body: Option<J
         "foreign": foreign,
         "failed": failed,
         "errors": errors,
+    }))))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct EnsureRecoveryIn {
+    #[serde(default)]
+    dry_run: bool,
+    shards: Option<Vec<crate::slots::ShardId>>,
+    /// DIDs started per second (each is a directory read, plus a submit
+    /// when the key is added).
+    per_second: Option<f64>,
+}
+
+const ENSURE_RECOVERY_PER_SECOND: f64 = 4.0;
+const ENSURE_RECOVERY_CHANGES_SHOWN: usize = 50;
+
+/// Lists `--plc-recovery-did-key` in the rotation keys of this node's
+/// did:plc accounts that lack it (accounts made before it was set, or that
+/// arrived with other keys), just ahead of the server key so keys the user
+/// added stay first. Idempotent.
+async fn ensure_recovery_key(State(app): AppState, Auth(creds): Auth, body: Option<Json<EnsureRecoveryIn>>) -> XResult<Json<J>> {
+    use crate::plc::RecoveryKeyOutcome as O;
+    use futures::StreamExt;
+    require_admin(&creds)?;
+    let plc = app.plc.clone().ok_or_else(|| invalid_request("PLC registration is off on this PDS"))?;
+    let recovery = plc
+        .recovery_did_key()
+        .map(str::to_string)
+        .ok_or_else(|| invalid_request("no operator recovery key configured: set --plc-recovery-did-key"))?;
+    let inp = body.map(|Json(b)| b).unwrap_or_default();
+    let dry = inp.dry_run;
+    let per_second = inp.per_second.unwrap_or(ENSURE_RECOVERY_PER_SECOND);
+    if !(per_second > 0.0 && per_second <= 1000.0) {
+        return Err(invalid_request("perSecond must be within (0, 1000]"));
+    }
+    let period = std::time::Duration::from_secs_f64(1.0 / per_second);
+    let next = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
+    let (parts, coverage) = scan_set(&app, &inp.shards);
+    let dids: Vec<String> = accounts_of(&parts).await?.into_iter().map(|a| a.did).filter(|d| crate::plc::valid_plc_did(d)).collect();
+    let accounts = dids.len();
+    let results: Vec<(String, Result<crate::plc::RecoveryKeyChange, crate::plc::PlcError>)> = futures::stream::iter(dids)
+        .map(|did| {
+            let (plc, next) = (plc.clone(), next.clone());
+            async move {
+                let at = {
+                    let mut n = next.lock().await;
+                    let at = (*n).max(tokio::time::Instant::now());
+                    *n = at + period;
+                    at
+                };
+                tokio::time::sleep_until(at).await;
+                let r = plc.ensure_recovery_key(&did, dry).await;
+                (did, r)
+            }
+        })
+        .buffer_unordered(ROTATE_PLC_CONCURRENCY)
+        .collect()
+        .await;
+    let (mut present, mut added, mut foreign, mut full) = (0u64, 0u64, 0u64, 0u64);
+    let (mut errors, mut changes) = (Vec::new(), Vec::new());
+    for (did, r) in results {
+        match r {
+            Ok(c) => match c.outcome {
+                O::Present => present += 1,
+                O::Foreign => foreign += 1,
+                O::Full => {
+                    full += 1;
+                    errors.push(format!("{did}: rotation keys full, nothing added"));
+                }
+                O::Added => {
+                    added += 1;
+                    if changes.len() < ENSURE_RECOVERY_CHANGES_SHOWN {
+                        changes.push(json!({"did": did, "before": c.before, "after": c.after}));
+                    }
+                }
+            },
+            Err(crate::plc::PlcError::NotFound(_)) => foreign += 1,
+            Err(e) => errors.push(format!("{did}: {e}")),
+        }
+    }
+    let failed = errors.len() as u64 - full;
+    tracing::info!(accounts, present, added, foreign, full, failed, dry_run = dry, recovery_key = %recovery, "ensure PLC recovery key");
+    errors.truncate(20);
+    Ok(Json(with_coverage(coverage, json!({
+        "recoveryKey": recovery,
+        "dryRun": dry,
+        "accounts": accounts,
+        "present": present,
+        "added": added,
+        "foreign": foreign,
+        "full": full,
+        "failed": failed,
+        "errors": errors,
+        "changes": changes,
     }))))
 }
 

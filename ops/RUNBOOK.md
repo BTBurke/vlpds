@@ -240,6 +240,7 @@ refuse without `--yes`.
 | `rotate-keys DID...` / `rotate-keys-file F` | `vlpds admin rotate-keys [DID...] [--file F]` | `vlpds.admin.publishIdentity {syncPlc: true}`: a did:plc whose PLC `atproto` key isn't the signing key held here gets a PLC update (server rotation key), then the repo is re-signed (an empty commit) with `#identity` + `#sync`, as the reference, so relays that failed commits against the old document resync |
 | (admin `updateAccountSigningKey`) | `vlpds admin rotate-keys --generate DID...` | a fresh signing key: recorded as pending (the account's writes get a retryable 503 `KeyUnavailable` meanwhile), PLC updated, then the repo re-signed with `#identity` + `#sync`. A PLC refusal changes nothing; after an outage or a crash the rotation stays pending and the node finishes it (DESIGN "Signing-key rotation") |
 | (`PDS_PLC_ROTATION_KEY` change) | `vlpds admin rotate-plc-keys [--dry-run]` | `vlpds.admin.rotatePlcKeys` on every node ([PLC rotation key rotation](#plc-rotation-key-rotation)) |
+| (`PDS_RECOVERY_DID_KEY` set after accounts exist) | `vlpds admin ensure-recovery-key [--dry-run] [--per-second N]` | `vlpds.admin.ensureRecoveryKey` on every node ([Operator recovery key](#operator-recovery-key)) |
 | (none) | `vlpds admin rewrap-secrets [--dry-run] [--check-versions]` | `vlpds.admin.rewrapSecrets` on every node ([KEK rotation](#kek-rotation)) |
 | `rebuild-repo DID` | `vlpds admin rebuild-repo DID [--dry-run] [--yes]` | `vlpds.admin.rebuildRepo`: see below |
 | (none) | `vlpds admin check-repo DID` | `vlpds.admin.checkRepo`: see below |
@@ -1555,7 +1556,8 @@ migrations out); users with their own recovery key can still recover.
    `VLPDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` (plaintext in the
    environment; not recommended).
 3. Optional: `--plc-recovery-did-key did:key:...` (an offline key the
-   operator holds) goes ahead of the server key in every new DID.
+   operator holds) goes ahead of the server key in every new DID
+   ([Operator recovery key](#operator-recovery-key)).
 4. Check after start: the `PLC registration on` log line shows `plc_url` and
    `rotation_key` (the did:key from step 1) on every node;
    `getRecommendedDidCredentials` returns it in `rotationKeys`.
@@ -1588,6 +1590,44 @@ For local e2e runs, point `--plc-url` at a local did-method-plc server
    list it. For a **compromised** key, also consider the 72 h recovery
    window: a higher-priority key (the user's or `--plc-recovery-did-key`)
    can undo ops the attacker signed within 72 h.
+
+### Operator recovery key
+
+A secp256k1 key the operator keeps **offline**, listed in every hosted
+DID's rotation keys just ahead of the server rotation key. It outranks the
+server key: within 72 h of an op signed by the server key (a leaked
+rotation key, a bad deploy), an op signed by the recovery key can replace
+it. Keys a user added themselves (the account page, /migrate's advanced
+option, createAccount `recoveryKey`) stay ahead of it.
+
+1. Make it on an offline machine: `vlpds --generate-did-key` prints
+   `private key (hex): ...` and `did:key: ...` (needs no other config).
+   Store the hex offline (paper / hardware vault, two copies); it never
+   goes on a node.
+2. Roll every node with `--plc-recovery-did-key did:key:...`
+   (`VLPDS_PLC_RECOVERY_DID_KEY`, or the reference's
+   `PDS_RECOVERY_DID_KEY`). New accounts and `getRecommendedDidCredentials`
+   (migrations in) list it from then on.
+3. Existing accounts: `vlpds admin ensure-recovery-key --dry-run` (every
+   node; `--node-only` for the one at `--url`) reports per node `present`,
+   `added` (would be added), `foreign` (DIDs that list none of our server
+   keys: migrated away, synthetic), `full` (already 10 rotation keys;
+   nothing added, listed in the errors) and `failed`; `--json` shows up to
+   50 `{did, before, after}` changes per node. Then run it without
+   `--dry-run`: each DID that lacks the key gets one PLC update signed by
+   the server key, inserting it just before the server key (`[user keys...,
+   recovery, server]`). Paced at `--per-second` DIDs per node (default 4,
+   4 in flight). Re-run until `failed` is 0, then a dry run shows `added` 0.
+   Idempotent; a race with another update is rebuilt on the new log.
+4. Using it (emergency only): build the corrective `plc_operation` (prev =
+   the last good op's CID, the good rotation keys/services/signing key),
+   sign it with the recovery key offline (e.g. `goat plc` tooling) and POST
+   it to the directory within 72 h of the bad op. Then fix the server side
+   (rotate the server rotation key: [PLC rotation key rotation](#plc-rotation-key-rotation)).
+
+Changing the recovery key: roll the new `--plc-recovery-did-key`, run
+`ensure-recovery-key` (adds the new one); the old one stays listed until
+the DID's keys are rewritten (remove it from DIDs only if it leaked).
 
 ### PLC directory outage
 

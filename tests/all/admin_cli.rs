@@ -212,6 +212,8 @@ async fn publish_identity_and_key_rotation() {
     assert_eq!(j.as_array().unwrap().len(), 1, "{j}");
     let r = &j[0]["result"];
     assert_eq!((r["accounts"].as_u64(), r["current"].as_u64(), r["rotated"].as_u64()), (Some(2), Some(2), Some(0)), "{j}");
+    let (r, out) = admin_cli(&s.url, &["ensure-recovery-key", "--dry-run", "--per-second", "20"]).await;
+    assert!(r.is_err() && out.contains("no operator recovery key configured"), "{out}");
     let out = ok(admin_cli(&s.url, &["rewrap-secrets", "--dry-run"]).await);
     assert!(out.starts_with("node") && out.contains("(dry run: nothing changed)"), "{out}");
     let j = admin_json(&s.url, &["rewrap-secrets", "--dry-run", "--node-only"]).await;
@@ -222,6 +224,8 @@ async fn publish_identity_and_key_rotation() {
 async fn rotate_plc_keys_needs_plc() {
     let s = TestServer::spawn().await;
     let (r, out) = admin_cli(&s.url, &["rotate-plc-keys", "--dry-run"]).await;
+    assert!(r.is_err() && out.contains("PLC registration is off"), "{out}");
+    let (r, out) = admin_cli(&s.url, &["ensure-recovery-key", "--dry-run"]).await;
     assert!(r.is_err() && out.contains("PLC registration is off"), "{out}");
     // publish-identity of a non-PLC setup still works; rotate-keys refuses
     // to sync PLC without it

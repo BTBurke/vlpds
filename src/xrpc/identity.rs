@@ -35,6 +35,7 @@ pub fn routes() -> Router<Arc<App>> {
             "/xrpc/com.atproto.identity.submitPlcOperation",
             post(submit_plc_operation),
         )
+        .route("/xrpc/vlpds.identity.getPlcData", get(get_plc_data))
         .route("/.well-known/atproto-did", get(well_known_atproto_did))
         .route("/.well-known/did.json", get(well_known_did_json))
         .route("/tls-check", get(tls_check))
@@ -635,6 +636,28 @@ fn plc_signer(creds: &Credentials) -> XResult<String> {
             Err(XrpcError::auth("user credentials required"))
         }
     }
+}
+
+/// The caller's current PLC data, for a client composing a
+/// signPlcOperation that keeps what is there (the account page's recovery
+/// keys), plus which rotation keys are this server's and its operator's.
+async fn get_plc_data(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+    let plc = plc_service(&app)?.clone();
+    let did = plc_signer(&creds)?;
+    if !did.starts_with("did:plc:") {
+        return Err(XrpcError::bad("InvalidRequest", format!("not a did:plc: {did}")));
+    }
+    let data = plc.client.document_data(&did).await?;
+    Ok(Json(json!({
+        "did": did,
+        "rotationKeys": data["rotationKeys"],
+        "verificationMethods": data["verificationMethods"],
+        "alsoKnownAs": data["alsoKnownAs"],
+        "services": data["services"],
+        "serverKeys": plc.server_did_keys(),
+        "recoveryKey": plc.recovery_did_key(),
+        "recommendedRotationKeys": plc.recommended_rotation_keys(),
+    })))
 }
 
 /// Deactivated and taken-down accounts too.
