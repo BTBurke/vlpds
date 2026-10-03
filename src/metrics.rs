@@ -207,6 +207,9 @@ lazy!(SIGNATURE_VERIFY_FAILURES: IntCounterVec = register_int_counter_vec!("vlpd
 
 lazy!(SHARDS_OPENED: IntCounterVec = register_int_counter_vec!("vlpds_shards_opened_total", "Shard opens (acquire, adopt, takeover, reshard children) by result", &["result"]));
 lazy!(SHARD_OPEN_SECONDS: HistogramVec = register_histogram_vec!("vlpds_shard_open_seconds", "One batch of shard opens until served (SlateDB open + log replay + flush), by kind: replay (it replayed segments: a takeover after a crash) or clean (nothing to replay: a handback)", &["kind"], exponential_buckets(0.01, 2.0, 14).unwrap()));
+lazy!(SHARD_OPEN_PHASE_SECONDS: HistogramVec = register_histogram_vec!("vlpds_shard_open_phase_seconds", "One batch of shard opens, by phase: open (SlateDB opens), replay (log tails), flush (memtables after a replay), warm_wait (the rest of the warm-up, capped)", &["phase"], exponential_buckets(0.001, 2.0, 18).unwrap()));
+lazy!(TOTALS_LOAD_SECONDS: Histogram = register_histogram!("vlpds_account_totals_load_seconds", "Opening a shard until its account totals are loaded (in the background: the shard serves meanwhile, and is left out of vlpds_accounts and vlpds_repos_written_within until then)", exponential_buckets(0.01, 2.0, 14).unwrap()));
+lazy!(TOTALS_LOADING: IntGauge = register_int_gauge!("vlpds_account_totals_loading_shards", "Shards open here whose account totals are still loading, left out of vlpds_accounts and vlpds_repos_written_within"));
 lazy!(SHARD_WARM_SECONDS: Histogram = register_histogram!("vlpds_shard_warm_seconds", "One batch of shard opens: fetching every SST's filters and index (and the newest L0s whole) into the caches before serving (partition::warm)", exponential_buckets(0.01, 2.0, 14).unwrap()));
 lazy!(SHARD_WARM_SSTS: IntCounterVec = register_int_counter_vec!("vlpds_shard_warm_ssts_total", "SSTs warmed before a newly opened shard served, by result", &["result"]));
 lazy!(SHARD_PREWARMS: IntCounterVec = register_int_counter_vec!("vlpds_shard_prewarm_total", "Shards handed to a peer, by whether the peer warmed its caches for them first (ok) or the prewarm request failed and the peer starts them cold (failed)", &["result"]));
@@ -329,6 +332,9 @@ pub fn init_counters() {
         }
         for kind in ["replay", "clean"] {
             SHARD_OPEN_SECONDS.with_label_values(&[kind]);
+        }
+        for phase in ["open", "replay", "flush", "warm_wait"] {
+            SHARD_OPEN_PHASE_SECONDS.with_label_values(&[phase]);
         }
         for kind in ["filter", "index", "stats"] {
             for r in ["fetched", "shared"] {

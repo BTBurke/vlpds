@@ -10,6 +10,13 @@
 //! appends the slot's new row to the entry's mutations, so the row lands in
 //! the same batch as the change. Rows are absolute, not increments: replaying
 //! an entry twice is harmless, as for every other mutation.
+//!
+//! A shard opens without reading the rows (one seek per slot through every
+//! L0 and sorted run: seconds after a day of writes). Until the background
+//! load is done, a change is written as a delta row keyed by its entry's
+//! seq, `0x01 ‖ slot ‖ T/ ‖ seq`, which is just as idempotent; the load adds
+//! a slot's delta rows to its row, and the slot's next row write deletes
+//! them.
 
 use crate::segment::Mutation;
 use crate::state::{self, Account, Head};
@@ -201,50 +208,190 @@ fn get_varint(b: &mut &[u8]) -> anyhow::Result<u64> {
     anyhow::bail!("totals row: varint too long")
 }
 
-/// A shard's totals: its slots' rows as of the last entry the sequencer
-/// took, and their sum. Loaded when the shard opens, after its replay.
+/// A delta row's key: the slot's row key, then the seq of the entry that
+/// wrote it (unique: seqs only grow across a shard's owners).
+fn delta_key(slot: u16, seq: i64) -> Bytes {
+    let mut k = key(slot);
+    k.extend_from_slice(&seq.to_be_bytes());
+    k.into()
+}
+
+/// A loaded slot: its totals, and the delta rows the DB still holds (or
+/// will, once their entries apply), deleted with the next row write.
 #[derive(Default)]
+struct Slot {
+    row: Totals,
+    deltas: Vec<Bytes>,
+}
+
+/// A shard's totals as of the last entry the sequencer took. They load in
+/// the background after the shard opens (`spawn_load`); until then a slot's
+/// change is written as a delta row next to its row, and the load adds the
+/// slot's delta rows (those in the DB and those taken since the open) to
+/// its row.
 pub struct ShardTotals {
-    slots: HashMap<u16, Totals>,
+    slots: HashMap<u16, Slot>,
+    /// Delta rows taken for slots not loaded yet.
+    pending: HashMap<u16, Vec<(Bytes, Totals)>>,
+    /// Over the loaded slots; every slot once `loaded`.
     sum: Totals,
+    loaded: bool,
+}
+
+impl Default for ShardTotals {
+    /// Loaded, with no rows: a shard with nothing in it yet.
+    fn default() -> ShardTotals {
+        ShardTotals { slots: HashMap::new(), pending: HashMap::new(), sum: Totals::default(), loaded: true }
+    }
 }
 
 impl ShardTotals {
-    pub async fn load<R: slatedb::DbReadOps + ?Sized>(db: &R) -> anyhow::Result<ShardTotals> {
-        let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, ..Default::default() };
-        let mut scan = state::FamilyScan::new(db, FAMILY, None, &opts).await?;
-        let mut t = ShardTotals::default();
-        while let Some(kv) = scan.next().await? {
-            let Some(slot) = state::key_slot(&kv.key) else { continue };
-            if state::key_body(&kv.key) != FAMILY {
-                continue;
-            }
-            let row = Totals::decode(&kv.value).map_err(|e| e.context(format!("slot {slot}")))?;
-            t.sum.merge(&row);
-            t.slots.insert(slot, row);
-        }
-        t.sum.prune(cutoff(today()));
-        Ok(t)
+    /// For a shard opened over existing state, before [`spawn_load`].
+    pub fn unloaded() -> ShardTotals {
+        ShardTotals { loaded: false, ..Default::default() }
     }
 
-    /// The slot's new row.
-    pub fn apply(&mut self, d: &Delta, today: u32) -> Mutation {
+    /// Every slot's rows: (slot, its row, its delta rows). One family scan;
+    /// delta rows sort right after their slot's row.
+    pub async fn read<R: slatedb::DbReadOps + ?Sized>(db: &R) -> anyhow::Result<Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)>> {
+        let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, ..Default::default() };
+        let mut scan = state::FamilyScan::new(db, FAMILY, None, &opts).await?;
+        let mut out: Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)> = Vec::new();
+        while let Some(kv) = scan.next().await? {
+            let Some(slot) = state::key_slot(&kv.key) else { continue };
+            let body = state::key_body(&kv.key);
+            let row = Totals::decode(&kv.value).map_err(|e| e.context(format!("slot {slot}")))?;
+            if out.last().is_none_or(|o| o.0 != slot) {
+                out.push((slot, None, Vec::new()));
+            }
+            let o = out.last_mut().unwrap();
+            match body.len() - FAMILY.len() {
+                0 => o.1 = Some(row),
+                8 => o.2.push((kv.key, row)),
+                n => anyhow::bail!("slot {slot}: totals key with a {n}-byte suffix"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Installs what [`ShardTotals::read`] found, read after the shard opened.
+    /// A slot's row only changes once it is loaded, and until then its
+    /// delta rows only accumulate, all of them in `pending` since the open:
+    /// so the read plus the pending rows it missed is the slot's state.
+    pub fn install(&mut self, rows: Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)>, today: u32) {
+        if self.loaded {
+            return;
+        }
         let cut = cutoff(today);
-        let row = self.slots.entry(d.slot).or_default();
+        for (slot, base, deltas) in rows {
+            let pending = self.pending.remove(&slot).unwrap_or_default();
+            self.install_slot(slot, base, deltas, pending, cut);
+        }
+        for (slot, pending) in std::mem::take(&mut self.pending) {
+            self.install_slot(slot, None, Vec::new(), pending, cut);
+        }
+        self.sum.prune(cut);
+        self.loaded = true;
+    }
+
+    fn install_slot(&mut self, slot: u16, base: Option<Totals>, deltas: Vec<(Bytes, Totals)>, pending: Vec<(Bytes, Totals)>, cut: u32) {
+        let mut s = Slot { row: base.unwrap_or_default(), deltas: Vec::new() };
+        for (k, d) in deltas.into_iter().chain(pending) {
+            if !s.deltas.contains(&k) {
+                s.row.merge(&d);
+                s.deltas.push(k);
+            }
+        }
+        s.row.prune(cut);
+        self.sum.merge(&s.row);
+        self.slots.insert(slot, s);
+    }
+
+    /// Appends the slot's new row (and the deletes of its delta rows) to
+    /// `muts`, or a delta row while the shard's totals are loading. `seq`
+    /// is the entry's.
+    pub fn apply(&mut self, d: &Delta, today: u32, seq: i64, muts: &mut Vec<Mutation>) {
+        let cut = cutoff(today);
+        if !self.loaded {
+            let mut delta = Totals::default();
+            for (k, n) in [(d.before, -1), (d.after, 1)] {
+                if let Some(k) = k {
+                    delta.add(k, n, cut);
+                }
+            }
+            let k = delta_key(d.slot, seq);
+            muts.push(Mutation { key: k.clone(), val: Some(delta.encode()) });
+            self.pending.entry(d.slot).or_default().push((k, delta));
+            return;
+        }
+        let s = self.slots.entry(d.slot).or_default();
         for (k, n) in [(d.before, -1), (d.after, 1)] {
             if let Some(k) = k {
-                row.add(k, n, cut);
+                s.row.add(k, n, cut);
                 self.sum.add(k, n, cut);
             }
         }
-        row.prune(cut);
+        s.row.prune(cut);
         self.sum.prune(cut);
-        Mutation { key: key(d.slot).into(), val: Some(row.encode()) }
+        muts.push(Mutation { key: key(d.slot).into(), val: Some(s.row.encode()) });
+        muts.extend(s.deltas.drain(..).map(|key| Mutation { key, val: None }));
     }
 
-    pub fn sum(&self) -> &Totals {
-        &self.sum
+    /// None while loading.
+    pub fn sum(&self) -> Option<&Totals> {
+        self.loaded.then_some(&self.sum)
     }
+}
+
+/// Nodes whose totals loads wait (tests: writes while loading).
+static HELD: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
+/// Until dropped, node `node_id`'s totals loads wait before reading.
+#[doc(hidden)]
+pub fn hold_loads(node_id: &str) -> HeldLoads {
+    HELD.lock().insert(node_id.to_string());
+    HeldLoads(node_id.to_string())
+}
+
+#[doc(hidden)]
+pub struct HeldLoads(String);
+
+impl Drop for HeldLoads {
+    fn drop(&mut self) {
+        HELD.lock().remove(&self.0);
+    }
+}
+
+/// Loads `sink`'s totals in the background, retrying until they load or the
+/// shard closes.
+pub fn spawn_load(sink: &std::sync::Arc<crate::nodelog::ShardSink>, node_id: &str) {
+    let weak = std::sync::Arc::downgrade(sink);
+    let (id, db, node_id) = (sink.id, sink.db.clone(), node_id.to_string());
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut backoff = std::time::Duration::from_millis(200);
+        while HELD.lock().contains(&node_id) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        loop {
+            match ShardTotals::read(db.as_ref()).await {
+                Ok(rows) => {
+                    let Some(sink) = weak.upgrade() else { return };
+                    sink.totals.lock().install(rows, today());
+                    crate::metrics::TOTALS_LOAD_SECONDS.observe(started.elapsed().as_secs_f64());
+                    return;
+                }
+                Err(e) => {
+                    if weak.upgrade().is_none_or(|s| s.barrier_taken()) {
+                        return;
+                    }
+                    tracing::warn!(shard = id.0, "loading account totals: {e:#}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(10));
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -278,6 +425,12 @@ mod tests {
         Some(RepoKey { status, day })
     }
 
+    fn apply(s: &mut ShardTotals, d: Delta, today: u32) -> Vec<Mutation> {
+        let mut muts = Vec::new();
+        s.apply(&d, today, 0, &mut muts);
+        muts
+    }
+
     /// Rows and their sum follow creates, writes on later days, status
     /// changes and deletes; days past the cutoff are dropped, and a repo
     /// whose last write is older than that leaves no trace in the days.
@@ -286,75 +439,119 @@ mod tests {
         let mut s = ShardTotals::default();
         let d = |slot, before, after| Delta { slot, before, after };
         let today = 20_000;
-        s.apply(&d(1, None, k(0, today - 40)), today);
-        s.apply(&d(1, None, k(0, today - 3)), today);
-        s.apply(&d(2, None, k(0, today)), today);
-        s.apply(&d(2, k(0, today), k(1, today)), today);
-        s.apply(&d(2, None, k(2, today - 1)), today);
-        let m = s.apply(&d(1, k(0, today - 3), k(0, today)), today);
-        assert_eq!(Totals::decode(m.val.as_ref().unwrap()).unwrap(), Totals { accounts: [2, 0, 0, 0, 0], days: vec![(today, 1)] });
-        let sum = s.sum().clone();
+        apply(&mut s, d(1, None, k(0, today - 40)), today);
+        apply(&mut s, d(1, None, k(0, today - 3)), today);
+        apply(&mut s, d(2, None, k(0, today)), today);
+        apply(&mut s, d(2, k(0, today), k(1, today)), today);
+        apply(&mut s, d(2, None, k(2, today - 1)), today);
+        let m = apply(&mut s, d(1, k(0, today - 3), k(0, today)), today);
+        assert_eq!(Totals::decode(m[0].val.as_ref().unwrap()).unwrap(), Totals { accounts: [2, 0, 0, 0, 0], days: vec![(today, 1)] });
+        let sum = s.sum().unwrap().clone();
         assert_eq!(sum.accounts, [2, 1, 1, 0, 0]);
         assert_eq!(sum.repos(), 4);
         assert_eq!(sum.written_within(0, today), 2);
         assert_eq!(sum.written_within(1, today), 3);
         assert_eq!(sum.written_within(30, today), 3);
         // the 40-day-old repo is deleted: only its status count moves
-        s.apply(&d(1, k(0, today - 40), None), today);
-        assert_eq!(s.sum().accounts, [1, 1, 1, 0, 0]);
-        assert_eq!(s.sum().written_within(30, today), 3);
+        apply(&mut s, d(1, k(0, today - 40), None), today);
+        assert_eq!(s.sum().unwrap().accounts, [1, 1, 1, 0, 0]);
+        assert_eq!(s.sum().unwrap().written_within(30, today), 3);
         // a month on, nothing is within 1d and the old days are gone
         let later = today + 33;
-        s.apply(&d(2, k(1, today), k(3, today)), later);
-        assert_eq!(s.sum().written_within(30, later), 0);
-        assert!(s.sum().days.is_empty(), "{:?}", s.sum().days);
-        assert_eq!(s.sum().accounts, [1, 0, 1, 1, 0]);
+        apply(&mut s, d(2, k(1, today), k(3, today)), later);
+        assert_eq!(s.sum().unwrap().written_within(30, later), 0);
+        assert!(s.sum().unwrap().days.is_empty(), "{:?}", s.sum().unwrap().days);
+        assert_eq!(s.sum().unwrap().accounts, [1, 0, 1, 1, 0]);
     }
 
-    /// Randomized deltas against the per-repo truth, through a reload from
-    /// the rows.
+    /// What [`ShardTotals::read`] returns, from a key-value map.
+    fn read(db: &std::collections::BTreeMap<Bytes, Bytes>) -> Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)> {
+        let mut out: Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)> = Vec::new();
+        for (k, v) in db {
+            let slot = state::key_slot(k).unwrap();
+            if out.last().is_none_or(|o| o.0 != slot) {
+                out.push((slot, None, Vec::new()));
+            }
+            let o = out.last_mut().unwrap();
+            let row = Totals::decode(v).unwrap();
+            match state::key_body(k).len() - FAMILY.len() {
+                0 => o.1 = Some(row),
+                _ => o.2.push((k.clone(), row)),
+            }
+        }
+        out
+    }
+
+    /// Randomized deltas against the per-repo truth, through reopens of the
+    /// shard whose totals load at a random later point (from a read taken
+    /// before more deltas, as the background load's scan can be), and
+    /// sometimes never before the next reopen.
     #[test]
-    fn matches_truth() {
+    fn matches_truth_through_lazy_loads() {
         use rand::{Rng, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
-        let mut repos: HashMap<u32, (u16, RepoKey)> = HashMap::new();
+        let mut repos: HashMap<u32, RepoKey> = HashMap::new();
+        let mut db = std::collections::BTreeMap::<Bytes, Bytes>::new();
         let mut s = ShardTotals::default();
-        let mut rows: HashMap<u16, Bytes> = HashMap::new();
+        let mut snapshot: Option<Vec<_>> = None;
         let mut today = 20_000u32;
-        for step in 0..20_000u32 {
+        let mut seq = 0i64;
+        for step in 0..30_000u32 {
             if rng.gen_ratio(1, 500) {
                 today += 1;
             }
+            if rng.gen_ratio(1, 700) {
+                s = ShardTotals::unloaded();
+                snapshot = None;
+            }
+            if s.sum().is_none() {
+                if snapshot.is_none() && rng.gen_ratio(1, 20) {
+                    snapshot = Some(read(&db));
+                } else if snapshot.is_some() && rng.gen_ratio(1, 20) {
+                    s.install(snapshot.take().unwrap(), today);
+                }
+            }
             let id = rng.gen_range(0..300u32);
             let slot = (id % 17) as u16;
-            let before = repos.get(&id).map(|r| r.1);
+            let before = repos.get(&id).copied();
             let after = if rng.gen_ratio(1, 10) { None } else { Some(RepoKey { status: rng.gen_range(0..5), day: today - rng.gen_range(0..2) }) };
             match after {
-                Some(a) => repos.insert(id, (slot, a)),
+                Some(a) => repos.insert(id, a),
                 None => repos.remove(&id),
             };
             if before != after {
-                let m = s.apply(&Delta { slot, before, after }, today);
-                rows.insert(slot, m.val.unwrap());
+                seq += 1;
+                let mut muts = Vec::new();
+                s.apply(&Delta { slot, before, after }, today, seq, &mut muts);
+                for m in muts {
+                    match m.val {
+                        Some(v) => db.insert(m.key, v),
+                        None => db.remove(&m.key),
+                    };
+                }
             }
-            if step % 997 == 0 || step == 19_999 {
+            if step % 997 == 0 || step == 29_999 {
+                if s.sum().is_none() {
+                    s.install(read(&db), today);
+                    snapshot = None;
+                }
                 let mut want = Totals::default();
-                for (_, r) in repos.values() {
+                for r in repos.values() {
                     want.accounts[r.status as usize] += 1;
                 }
+                let sum = s.sum().unwrap();
+                assert_eq!(sum.accounts, want.accounts, "step {step}");
                 for (_, days) in WINDOWS {
-                    let n = repos.values().filter(|(_, r)| r.day + days >= today).count() as i64;
-                    assert_eq!(s.sum().written_within(days, today), n, "step {step}");
+                    let n = repos.values().filter(|r| r.day + days >= today).count() as i64;
+                    assert_eq!(sum.written_within(days, today), n, "step {step}");
                 }
-                assert_eq!(s.sum().accounts, want.accounts, "step {step}");
-                let mut reloaded = Totals::default();
-                for r in rows.values() {
-                    reloaded.merge(&Totals::decode(r).unwrap());
-                }
-                assert_eq!(reloaded.accounts, want.accounts);
+                let mut reloaded = ShardTotals::unloaded();
+                reloaded.install(read(&db), today);
+                assert_eq!(reloaded.sum().unwrap().accounts, want.accounts, "step {step}");
                 for (_, days) in WINDOWS {
-                    assert_eq!(reloaded.written_within(days, today), s.sum().written_within(days, today));
+                    assert_eq!(reloaded.sum().unwrap().written_within(days, today), sum.written_within(days, today));
                 }
+                assert!(db.len() <= 17 + s.pending.values().map(Vec::len).sum::<usize>() + s.slots.values().map(|x| x.deltas.len()).sum::<usize>());
             }
         }
     }

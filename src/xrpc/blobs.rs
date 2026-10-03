@@ -30,6 +30,29 @@ pub(super) fn blob_path(app: &App, did: &str, cid: impl std::fmt::Display) -> ob
     object_store::path::Path::from(format!("{}/blob/{}/{}", app.store.prefix, did, cid))
 }
 
+/// Private row names `blob/{cid}`: the blobs the account stores, what
+/// checkAccountStatus counts as `importedBlobs` (DESIGN.md
+/// "checkAccountStatus counts"). Written after the upload's PUT, deleted
+/// before the GC's delete, so a failed step leaves the object (which the
+/// next upload or sweep repeats) rather than a row without one.
+pub(super) const STORED: &str = "blob/";
+
+fn stored(did: &str, cid: &str, present: bool) -> crate::segment::Mutation {
+    super::server::pmut(did, &format!("{STORED}{cid}"), present.then(Vec::new))
+}
+
+/// `importedBlobs`: the account's stored-blob rows in `db`.
+pub(super) async fn count_stored<R: slatedb::DbReadOps + ?Sized>(db: &R, did: &str) -> anyhow::Result<u64> {
+    let lo = state::private_key(did, STORED);
+    let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, ..Default::default() };
+    let mut iter = db.scan_with_options(lo.clone()..state::prefix_end(&lo), &opts).await?;
+    let mut n = 0;
+    while iter.next().await?.is_some() {
+        n += 1;
+    }
+    Ok(n)
+}
+
 fn too_large(max: u64) -> XrpcError {
     XrpcError {
         status: StatusCode::PAYLOAD_TOO_LARGE,
@@ -99,7 +122,10 @@ async fn upload_blob(
         tracing::debug!(%did, declared = ?declared, size, "uploadBlob: content-length mismatch");
     }
     // checked after storing: the bytes are content-addressed, so that changed nothing
-    if super::admin::is_blob_takendown(&app, &did, &cid.to_string()).await? {
+    let c = cid.to_string();
+    let (recorded, takendown) = tokio::join!(app.put_private(&did, vec![stored(&did, &c, true)]), super::admin::is_blob_takendown(&app, &did, &c));
+    recorded?;
+    if takendown? {
         return Err(XrpcError::bad(
             "InvalidRequest",
             "Blob has been takendown, cannot re-upload",
@@ -577,6 +603,10 @@ pub async fn sweep_blobs_settle(app: &App, grace: Duration, settle: Duration) ->
             }
             continue;
         }
+        if let Err(e) = app.put_private(&did, vec![stored(&did, &cid, false)]).await {
+            tracing::warn!(path = %meta.location, "blob gc: dropping the stored row: {}", e.message);
+            continue;
+        }
         match store.delete(&meta.location).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => deleted += 1,
             Err(e) => tracing::warn!(path = %meta.location, "blob gc delete: {e}"),
@@ -597,6 +627,10 @@ pub async fn sweep_blobs_settle(app: &App, grace: Duration, settle: Duration) ->
         if referenced(&p, &did, &cid).await? {
             // a write that checked the blob before the move: put it back
             let Ok(c) = Cid::parse(&cid) else { continue };
+            if let Err(e) = app.put_private(&did, vec![stored(&did, &cid, true)]).await {
+                tracing::warn!(path = %meta.location, "blob gc restore: {}", e.message);
+                continue;
+            }
             if let Err(e) = store.copy(&meta.location, &blob_path(app, &did, c)).await {
                 tracing::warn!(path = %meta.location, "blob gc restore: {e}");
                 continue;

@@ -1873,10 +1873,9 @@ async fn assert_valid_did_doc(app: &App, a: &Account) -> XResult<()> {
 
 /// Migration progress. `importedBlobs` counts every stored blob, referenced
 /// or not yet.
-/// O(1) in the repo: the counts are kept with each commit (`S/{did}`,
-/// read with the head from one snapshot). importedBlobs lists the account's
-/// stored blobs (O(blobs / 1000) LISTs): uploads and the blob GC don't go
-/// through the log.
+/// O(1) in the repo: the counts are kept with each commit (`S/{did}`), and
+/// the stored blobs are private rows (`blobs::STORED`) counted from the
+/// same snapshot as the head.
 async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let did = user_did(&creds)?;
     let acct = app.account(&did).await?;
@@ -1886,16 +1885,7 @@ async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResul
     let hv = hv.ok_or_else(|| XrpcError::bad("RepoNotFound", format!("could not find repo: {did}")))?;
     let head = Head::decode(&hv).map_err(XrpcError::from_err)?;
     let stats = state::RepoStats::decode(&sv.ok_or_else(|| XrpcError::internal(format!("{did}: repo stats missing")))?).map_err(XrpcError::from_err)?;
-    let blob_dir = object_store::path::Path::from(format!("{}/blob/{}", app.store.prefix, did));
-    let count_blobs = async {
-        let mut imported = 0u64;
-        let mut list = app.store.raw.list(Some(&blob_dir));
-        while let Some(meta) = futures::StreamExt::next(&mut list).await {
-            meta.map_err(XrpcError::from_err)?;
-            imported += 1;
-        }
-        Ok::<_, XrpcError>(imported)
-    };
+    let count_blobs = async { super::blobs::count_stored(snap.as_ref(), &did).await.map_err(XrpcError::from_err) };
     let (imported, valid_did) = tokio::join!(count_blobs, assert_valid_did_doc(&app, &acct));
     Ok(Json(json!({
         "activated": acct.status.is_none(),

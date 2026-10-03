@@ -240,10 +240,13 @@ swappable.
   - `K/{did}` → empty: a signing-key rotation is pending
     (`Account::pending_signing_key`; see "Signing-key rotation").
   - `T/` → the slot's account totals (keyed by slot alone; see "Account
-    totals").
+    totals"); `T/{seq}` → a delta row written while the shard's totals
+    were loading.
   - `p/{routing}\0{name}` → private per-account state: sessions, app
     password hashes, email-token digests, TOTP state (secret wrapped),
-    reserved signing keys (`p/_reserved:{did:key}\0k`, wrapped), OAuth rows.
+    reserved signing keys (`p/_reserved:{did:key}\0k`, wrapped), OAuth rows,
+    `blob/{cid}` (empty: a blob the account stores; checkAccountStatus
+    `importedBlobs`).
   - `meta/applied2` → applied marker (`nodelog::encode_marker`: log id,
     ordinal): everything for this shard in that log up to the ordinal is
     applied. `meta/recent` → the shard's recently written DIDs, which its
@@ -2959,12 +2962,26 @@ Two fields differ from the reference:
   the CID's other paths (a `c/` prefix scan, not bloom-filtered) per
   created or deleted record on the write path; identical records within
   one repo are rare, so the count is per path instead.
-- **importedBlobs** is still a LIST of `blob/{did}/` (O(blobs / 1000)
-  requests, independent of the record count): uploads and the blob GC
-  write the object store directly, not through the log, so there is no
-  commit to keep a counter with. An exact counter needs uploads and GC
-  deletes sequenced through the repo's worker (an existence check, then a
-  logged per-blob row).
+- **importedBlobs** counts the account's private rows `blob/{cid}`
+  (`blobs::STORED`), scanned from the snapshot the head is read from. As in
+  the reference (rows of its `blob` table, not files), it is what the PDS
+  recorded as stored, referenced or not. uploadBlob writes the row through
+  the log (`put_private`, at the owner) after the object's PUT, alongside
+  the takedown check; the GC deletes it before deleting the object
+  (quarantine) and writes it again before a restore. Rows are idempotent,
+  so a re-upload or a retried step counts once, and a failed step leaves
+  an object the next upload or sweep repeats rather than a row with no
+  object. It used to be a LIST of `blob/{did}/` (O(blobs / 1000) requests
+  per call). It is still O(blobs), but a scan of ~100-byte rows instead of
+  LIST pages: at 10,000 blobs (laptop, MinIO, dev-release) 145 ms -> 4.5 ms.
+  The price is a log commit on each upload (laptop MinIO: uploadBlob p50
+  3.1 -> 4.8 ms; on S3 add about one segment PUT). A per-repo counter would
+  make it O(1) but needs uploads and GC deletes sequenced through the
+  repo's worker with an existence check per CID.
+  Left inexact: an upload of a blob the GC is collecting at that moment
+  can end with a row and no object, or the reverse (the same race already
+  loses the upload's blob), and a crash between the PUT and the row
+  leaves an uncounted object until it is uploaded again or collected.
 
 `privateStateValues` is 0, as in the reference.
 
@@ -4286,12 +4303,45 @@ the next count. Now the totals are kept exact as part of the state:
   as the change. Rows are values, not increments, so replaying an entry
   twice (span boundaries replay more than needed) is harmless. A rejected
   entry (shard closing) never reaches the fold.
-- **Loaded when a shard opens**, after its replay and before its sink
-  takes entries. This is one `T/` family scan: one row per slot, i.e.
-  `65,536 / shards` rows, read while the open already waits for its warm-up.
-- **Exported at scrape**: the sum over the node's open shards. A shard's
-  totals are reported by whichever node has it open, so after a failover
-  they return as soon as the shards reopen.
+- **Loaded in the background after a shard opens** (`totals::spawn_load`):
+  one `T/` family scan, `65,536 / shards` rows. It used to run on the open
+  path, before the sink took entries, and became its slowest part: slot-major
+  keys put every other row of a slot between two `T/` rows, so the scan
+  seeks once per slot through every L0 and sorted run, and each row is
+  rewritten by the first commit of the day of each of its repos, so after a
+  day of writes its versions sit in most L0s. Benchbox round 3 measured
+  7.6–10.5 s of post-replay open at 16–64 shards (0 s on a fresh
+  population) and a 57 s restart at 77M accounts. Point reads per slot
+  instead of the scan were slower still locally (1M accounts, 64 shards,
+  a day's first writes to half the repos: 5.6–7.2 s against 0.7–4.1 s
+  for the scan; one block fetch per slot, bloom filters or not). Off the
+  open path, the same restart (64 shards, from one snapshot, 3 rounds)
+  opens in 0.96–1.03 s instead of 1.8–2.6 s with a warm disk cache
+  (1.5–2.3 s instead of 2.1–3.0 s cold), and each shard's totals load
+  0.6–1.2 s after its open.
+- **Delta rows while loading.** Until a shard's rows are loaded, the
+  sequencer can't write a slot's absolute row, so it writes the change as a
+  delta row `0x01 ‖ slot ‖ T/ ‖ seq` (the entry's seq: unique, and as
+  idempotent under replay as an absolute row) and keeps it in memory too.
+  The load adds a slot's delta rows to its row: those its scan read, and
+  those taken since the open that it missed (a union by key). That is
+  exact because an unloaded slot's row never changes and its delta rows
+  only accumulate. A loaded slot's next row write deletes its delta rows
+  in the same batch. Delta rows split, merge and move with their slot, and
+  a shard that closes before its load finishes leaves them for its next
+  owner's load. (`totals::tests::matches_truth_through_lazy_loads`:
+  random deltas through reopens and loads from stale reads;
+  `tests/all/account_totals_lazy.rs`: writes on two nodes while their
+  loads are held, a move back, then the scan.)
+- **Exported at scrape**: the sum over the node's open shards whose totals
+  are loaded. A loading shard is left out whole, never partly counted, and
+  `vlpds_account_totals_loading_shards` says how many are; once loaded it
+  counts every change since it opened. A shard's totals are reported by
+  whichever node has it open, so during a failover the moved shards'
+  totals are missing from the sum until the new owner has opened and
+  loaded them (`vlpds_account_totals_load_seconds`: open to loaded); they
+  are never counted twice, since a shard is open on one node at a time.
+  Shard opens by phase: `vlpds_shard_open_phase_seconds{phase}`.
 - **Day windows.** A window counts repos whose latest commit's UTC day is
   within N days of today's, so "1d" covers yesterday and today (24–48 h).
   Exact counts for a rolling 24 h window would need hour buckets, which

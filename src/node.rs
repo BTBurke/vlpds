@@ -236,37 +236,40 @@ impl ShardHost for Node {
             crate::metrics::REPLAY_SECONDS.observe(replay_started.elapsed().as_secs_f64());
         }
         let replayed_ms = started.elapsed().as_millis() as u64;
-        // make replayed state durable before serving; the sequencer needs
-        // the totals as of the replayed state before it takes an entry
-        let flushed: Vec<(ShardId, u64, Arc<slatedb::Db>, anyhow::Result<crate::totals::ShardTotals>)> = futures::stream::iter(ready)
+        let phase = |name: &str, t: Instant| crate::metrics::SHARD_OPEN_PHASE_SECONDS.with_label_values(&[name]).observe(t.elapsed().as_secs_f64());
+        crate::metrics::SHARD_OPEN_PHASE_SECONDS.with_label_values(&["open"]).observe(opened_ms as f64 / 1000.0);
+        phase("replay", replay_started);
+        // make replayed state durable before serving, and before the totals
+        // load reads it
+        let flush_started = Instant::now();
+        let flushed: Vec<(ShardId, u64, Arc<slatedb::Db>, anyhow::Result<()>)> = futures::stream::iter(ready)
             .map(|(s, e, _, db)| async move {
-                let r = async {
-                    if replayed > 0 {
-                        db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await?;
-                    }
-                    crate::totals::ShardTotals::load(db.as_ref()).await.map_err(|e| e.context("loading account totals"))
-                }
-                .await;
+                let r = match replayed > 0 {
+                    true => db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.map_err(Into::into),
+                    false => Ok(()),
+                };
                 (s, e, db, r)
             })
             .buffer_unordered(32)
             .collect()
             .await;
+        phase("flush", flush_started);
         // past the cap the warm-up goes on behind the first requests
+        let warm_wait = Instant::now();
         let _ = tokio::time::timeout_at((started + WARM_MAX).into(), warm).await;
+        phase("warm_wait", warm_wait);
         let mut preload = Vec::new();
         for (shard, epoch, db, r) in flushed {
-            let totals = match r {
-                Ok(t) => t,
-                Err(e) => {
-                    results.push((shard, Err(e)));
-                    continue;
-                }
-            };
+            if let Err(e) = r {
+                results.push((shard, Err(e)));
+                continue;
+            }
             let recent = Arc::new(partition::RecentRepos::new(self.recent_cap));
             preload.push((shard, db.clone(), recent.clone()));
             let apply_lock = Arc::new(tokio::sync::RwLock::new(()));
-            self.log.sinks.insert(Arc::new(ShardSink { id: shard, epoch, db: db.clone(), apply_lock: apply_lock.clone(), applied: Default::default(), recent: recent.clone(), barrier: Default::default(), totals: Mutex::new(totals) }));
+            let sink = Arc::new(ShardSink { id: shard, epoch, db: db.clone(), apply_lock: apply_lock.clone(), applied: Default::default(), recent: recent.clone(), barrier: Default::default(), totals: Mutex::new(crate::totals::ShardTotals::unloaded()) });
+            crate::totals::spawn_load(&sink, &self.cluster.cfg.node_id);
+            self.log.sinks.insert(sink);
             self.table.set(
                 shard,
                 Some(Arc::new(Partition {

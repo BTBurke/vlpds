@@ -60,7 +60,7 @@ pub struct LogEntry {
     /// Per-repo in-flight counter, decremented once durable.
     pub pending: Option<Arc<AtomicU32>>,
     pub enqueued: Instant,
-    /// The sequencer appends the slot's new totals row to `muts`.
+    /// The sequencer appends the slot's totals row (or delta row) to `muts`.
     pub totals: Option<crate::totals::Delta>,
 }
 
@@ -736,16 +736,17 @@ impl Open {
             e.pending = None;
         }
         let epoch = sink.epoch;
-        if let Some(d) = e.totals.take() {
-            e.muts.push(sink.totals.lock().apply(&d, crate::totals::today()));
-        }
         if e.frames.is_empty() {
             // private-state write: an empty frame, skipped by the firehose
             e.frames.push(Frame { prefix: Vec::new(), suffix: Vec::new(), derived_muts: 0 });
         }
         let n = e.frames.len();
+        let seqs: Vec<i64> = (0..n).map(|_| wm.assign()).collect();
+        if let Some(d) = e.totals.take() {
+            sink.totals.lock().apply(&d, crate::totals::today(), seqs[n - 1], &mut e.muts);
+        }
         for (i, f) in e.frames.iter().enumerate() {
-            let seq = wm.assign();
+            let seq = seqs[i];
             let (muts, derived): (&[Mutation], usize) = if i + 1 == n { (&e.muts, f.derived_muts) } else { (&[], 0) };
             let empty = f.prefix.is_empty() && f.suffix.is_empty();
             let range = self.seg.push_derived(seq, e.shard, epoch, |out| if !empty { f.finish(seq, out) }, muts, derived);

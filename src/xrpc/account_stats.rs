@@ -7,18 +7,27 @@
 use super::*;
 use crate::totals::{self, Totals};
 
-/// The totals of the shards this node has open, as of the last entry each
-/// one's sequencer took.
-pub fn totals(app: &App) -> Totals {
-    let mut t = Totals::default();
+/// The totals of the shards this node has open and whose totals are
+/// loaded, as of the last entry each one's sequencer took, and how many
+/// are still loading (left out: a shard counts whole or not at all).
+pub fn totals_loading(app: &App) -> (Totals, usize) {
+    let (mut t, mut loading) = (Totals::default(), 0);
     for s in app.log.sinks.all() {
-        t.merge(s.totals.lock().sum());
+        match s.totals.lock().sum() {
+            Some(sum) => t.merge(sum),
+            None => loading += 1,
+        }
     }
-    t
+    (t, loading)
+}
+
+pub fn totals(app: &App) -> Totals {
+    totals_loading(app).0
 }
 
 fn export(app: &App) {
-    let t = totals(app);
+    let (t, loading) = totals_loading(app);
+    metrics::TOTALS_LOADING.set(loading as i64);
     for (i, s) in totals::STATUSES.iter().enumerate() {
         metrics::ACCOUNTS.with_label_values(&[s]).set(t.accounts[i]);
     }
