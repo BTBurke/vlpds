@@ -33,6 +33,7 @@ mod e2e_regressions;
 mod email_2fa;
 mod email_flows;
 mod export_limits;
+mod export_order;
 mod export_scan;
 mod fast_failover;
 mod feature_levels;

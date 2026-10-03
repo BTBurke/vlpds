@@ -2416,19 +2416,37 @@ root through the store).
   pair it with the SlateDB snapshot `App::repo_view` takes under the apply
   lock, so `M/` and `R/` there are exactly the view's version. getRecord
   proofs walk asynchronously (`mst_store::proof_blocks`), never touching the
-  shared tree. getRepo streams from the snapshot with one forward `R/`
-  scan (`xrpc::sync::export_repo`): the scan hands each record's key and
-  CID, in batches, to the MST walk on a blocking thread
-  (`mst_lazy::export_blocks` over `mst_store::FedSource`: the `M/` range
-  read ahead, leaves encoded straight from their records and checked
-  against their links, one path in memory; the root is checked against the
-  commit, the `M/` nodes below it are not re-hashed: see "Measured"), and keeps the record blocks in
-  a bounded buffer until the nodes are out (the CAR puts every node first:
-  same bytes as before). The buffer is 1 MiB grants from a process-wide
-  256 MiB, at most 64 MiB per export; records past it are read again by a
-  second scan (`tests/all/mst_lazy.rs` `export_buffer_caps_give_same_bytes`).
-  Records with identical contents share a CID: the export writes that block
-  once (a per-export set of written record CIDs, 16 B each).
+  shared tree. getRepo streams from the snapshot in one pass, in the
+  repository spec's streamable CAR order ("Streamable CAR Block Ordering",
+  atproto.com/specs/repository; work in progress as of Feb 2026, readers
+  must still accept any order): the commit first, then the MST pre-order
+  from the root, each node followed by its entries as the node lists them,
+  a child subtree by recursing and a record by its block. So a node's
+  left subtree (`l`) comes before its first record, and each entry's
+  record before that entry's right subtree (`t`): records come in key
+  order, right after the node naming them
+  (`mst_lazy::export_blocks`; `tests/all/export_order.rs` checks the order
+  against the loaded tree and the block set against the old
+  nodes-then-records export's). The header and commit go out before
+  anything is read (time to first byte ~0). One forward `R/` scan
+  (`xrpc::sync::feed_records`, on its own task) hands each record's key,
+  CID and block (none for records `since` excludes), in batches of 512 or
+  256 KiB, 16 queued (~4 MiB ahead), to the MST walk on a blocking thread
+  (`mst_store::FedSource`: the `M/` range read ahead, leaves encoded
+  straight from their records and checked against their links, one path in
+  memory; the root is checked against the commit, the `M/` nodes below it
+  are not re-hashed: see "Measured"). The walk puts each record block in
+  as it passes that key, a leaf's right after the leaf: the MST walk in key
+  order and the `R/` scan in key order are one sequence, so nothing waits
+  for a second scan and only the batches between the leaf being built and
+  the scan's lead are held. A record `R/` holds that no node names (`R/`
+  and the tree disagreeing) still comes at its key's place, as it came in
+  the old record tail; one missing from a leaf fails the leaf's link check
+  and aborts the export, as before. With `since`, every node and only the
+  records written after it (the same set as before). Records with
+  identical contents share a CID: the block comes by each entry naming it
+  (the order's point is that a single-pass reader finds each record by its
+  node), where the nodes-first CAR wrote it once.
   The walk visits every node, so it first reads the repo's whole `M/`
   range with one scan (`mst_store::prefetch_tree`: blocks packed in large
   buffers behind a sorted digest index, ~32 B/record held, ~320 MB at 10M
@@ -2448,10 +2466,12 @@ root through the store).
   `--max-exports` (32) stream at once (each holds a blocking-pool thread for
   its walk; more wait up to 10 s for a slot, then 503 `Overloaded`); the
   `M/` read-ahead takes 1 MiB grants from a process-wide 512 MiB budget as
-  it grows; and an export whose
+  it grows; past that an export holds ~4 MiB of records ahead of its walk,
+  one path of nodes, and 4 queued 1 MiB body chunks (no record buffer, no
+  per-export CID set); and an export whose
   client is gone, or has read nothing for `--export-stall-secs` (60; an h2
   stream at a zero window), stops at once: the walk at its next read, the
-  scans, and its queued body chunks are freed, and the body ends with an
+  scan, and its queued body chunks are freed, and the body ends with an
   error rather than a short CAR. Before, a client that never read parked
   its walk's blocking thread forever (and a gone client's walk ran to the
   end): ~512 such streams emptied tokio's blocking pool, which segment

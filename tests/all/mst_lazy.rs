@@ -852,16 +852,19 @@ impl RefRepo {
         self.tree.walk_blocks(&mut |c, b| nodes.push((c, b.to_vec()))).unwrap();
         let mut recs: Vec<(Vec<u8>, Cid)> = Vec::new();
         self.tree.walk(&mut |k, c| recs.push((k.to_vec(), c)));
-        // getRepo
+        // getRepo: every node byte for byte, each followed by its entries
         let r = get("com.atproto.sync.getRepo", vec![("did", did.clone())]).await;
         assert_eq!(r.status, 200, "{}", r.text());
         let tail = car_tail(&r.body);
-        assert!(tail.len() >= nodes.len() && tail[..nodes.len()] == nodes[..], "{did}: getRepo MST blocks differ ({} vs {} nodes)", tail.len(), nodes.len());
-        let got: Vec<Cid> = tail[nodes.len()..].iter().map(|b| b.0).collect();
-        // in key order, each block once (records with the same contents share one)
-        let mut seen = std::collections::HashSet::new();
-        assert_eq!(got, recs.iter().map(|r| r.1).filter(|c| seen.insert(*c)).collect::<Vec<_>>(), "{did}: getRepo records");
-        let record_bytes: HashMap<Cid, Vec<u8>> = tail[nodes.len()..].iter().cloned().collect();
+        let want = streamable(&self.tree);
+        assert_eq!(tail.len(), want.len(), "{did}: getRepo blocks");
+        for (i, (got, want)) in tail.iter().zip(&want).enumerate() {
+            match want {
+                Slot::Node(c, b) => assert!(got.0 == *c && got.1 == *b, "{did}: getRepo block {i}: node {c} differs"),
+                Slot::Record(k, c) => assert_eq!(got.0, *c, "{did}: getRepo block {i}: record {}", String::from_utf8_lossy(k)),
+            }
+        }
+        let record_bytes: HashMap<Cid, Vec<u8>> = tail.iter().cloned().collect();
         for (c, b) in &record_bytes {
             assert_eq!(Cid::dag_cbor(b), *c);
         }
@@ -916,8 +919,33 @@ impl RefRepo {
     }
 }
 
+pub(crate) enum Slot {
+    Node(Cid, Vec<u8>),
+    Record(Vec<u8>, Cid),
+}
+
+/// A loaded tree in the spec's streamable CAR order (after the commit):
+/// each node, then its entries as the node lists them, a child recursively
+/// and a record (key, CID) in place.
+pub(crate) fn streamable(t: &Tree) -> Vec<Slot> {
+    fn rec(n: &vlpds::mst::Node, out: &mut Vec<Slot>) {
+        out.push(Slot::Node(n.cid.unwrap(), n.block().unwrap().into_owned()));
+        for e in &n.entries {
+            match e {
+                vlpds::mst::Entry::Child { node: Some(c), .. } => rec(c, out),
+                vlpds::mst::Entry::Child { cid: Some(c), .. } => panic!("child {c} not loaded"),
+                vlpds::mst::Entry::Child { .. } => {}
+                vlpds::mst::Entry::Value { key, val } => out.push(Slot::Record(key.to_vec(), *val)),
+            }
+        }
+    }
+    let mut out = Vec::new();
+    rec(&t.root, &mut out);
+    out
+}
+
 /// CAR blocks after the first (the commit), in order.
-fn car_tail(body: &[u8]) -> Vec<(Cid, Vec<u8>)> {
+pub(crate) fn car_tail(body: &[u8]) -> Vec<(Cid, Vec<u8>)> {
     let (_, blocks) = vlpds::car::read_car(body).unwrap();
     blocks.into_iter().skip(1).map(|(c, b)| (c, b.to_vec())).collect()
 }
@@ -1238,47 +1266,6 @@ async fn import_and_delete_leave_no_stale_nodes() {
     let left = stored_nodes(&s, &a.did).await;
     assert!(left.is_empty(), "{} M/ nodes left after the account delete", left.len());
     check_stored_nodes(&s, &b.did).await;
-}
-
-/// getRepo buffers record blocks from its one `R/` scan while it writes the
-/// nodes, up to a cap; past it (or with no budget) the rest is read again.
-/// Every split gives the same bytes, with and without `since`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn export_buffer_caps_give_same_bytes() {
-    let s = lazy_node(1 << 20).await;
-    let a = s.create_account("exbuf").await;
-    let mut since = String::new();
-    for batch in 0..12 {
-        let writes: Vec<J> = (0..200)
-            .map(|i| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "com.example.thing", "value": {"$type": "com.example.thing", "n": batch * 1000 + i, "pad": "x".repeat(400)}}))
-            .collect();
-        let r = s.apply_writes(&a, json!(writes)).await.ok();
-        if batch == 5 {
-            since = r["commit"]["rev"].as_str().unwrap().to_string();
-        }
-    }
-    let get = |q: Vec<(&'static str, String)>| {
-        let x = s.xrpc.clone();
-        async move {
-            let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
-            let r = x.get("com.atproto.sync.getRepo", &q, &Auth::None).await;
-            assert_eq!(r.status, 200, "{}", r.text());
-            r.body.to_vec()
-        }
-    };
-    let full = get(vec![("did", a.did.clone())]).await;
-    let diff = get(vec![("did", a.did.clone()), ("since", since.clone())]).await;
-    assert!(full.len() > 1_200_000 && diff.len() < full.len(), "{} / {}", full.len(), diff.len());
-    let repo = Repo::from_car(&full).unwrap();
-    assert_eq!(repo.blocks.len(), car_tail(&full).len() + 1, "no duplicate blocks");
-    for cap in [0, 1] {
-        vlpds::xrpc::set_export_buffer_max_mb(cap);
-        let f = get(vec![("did", a.did.clone())]).await;
-        let d = get(vec![("did", a.did.clone()), ("since", since.clone())]).await;
-        vlpds::xrpc::set_export_buffer_max_mb(64);
-        assert!(f == full, "cap {cap} MiB: full export differs");
-        assert!(d == diff, "cap {cap} MiB: since export differs");
-    }
 }
 
 /// A single node (id `id`, 4 shards) on `store`, with nothing preloaded

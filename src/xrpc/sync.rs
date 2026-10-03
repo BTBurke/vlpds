@@ -200,68 +200,24 @@ const EXPORT_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(10)
 /// Body chunks queued between an export and its response body.
 const EXPORT_QUEUE: usize = 4;
 
-/// MiB of record blocks exports may hold while they stream the MST nodes
-/// (the CAR puts every node before any record), process-wide and per
-/// export. An export that can't get more reads the rest with a second scan
-/// afterwards.
-static EXPORT_BUFFER_MB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(256);
-static EXPORT_BUFFER_MAX_MB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(64);
-
-/// Tests: 0 makes every export read its records twice.
-pub fn set_export_buffer_max_mb(mb: u32) {
-    EXPORT_BUFFER_MAX_MB.store(mb, std::sync::atomic::Ordering::Relaxed);
-}
-
+/// Records per batch to the walk, and their bytes past which a batch goes
+/// early; with [`EXPORT_FEED`] batches queued, an export's records ahead of
+/// its walk stay within ~4 MiB (and one record).
 const EXPORT_BATCH: usize = 512;
+const EXPORT_BATCH_BYTES: usize = 256 << 10;
+const EXPORT_FEED: usize = 16;
 
 const EXPORT_CHUNK: usize = 1 << 20;
 
-/// Record CIDs an export has written, by the first 128 bits of their
-/// digest (which hash well as they are): identical records share a block,
-/// carried once.
-type SeenCids = HashSet<u128, std::hash::BuildHasherDefault<DigestHasher>>;
-
-#[derive(Default)]
-struct DigestHasher(u64);
-
-impl std::hash::Hasher for DigestHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for b in bytes {
-            self.0 = self.0.rotate_left(8) ^ *b as u64;
-        }
-    }
-    fn write_u128(&mut self, v: u128) {
-        self.0 = v as u64;
-    }
-}
-
-fn cid_key(c: &Cid) -> u128 {
-    let mut k = [0u8; 16];
-    k.copy_from_slice(&c.digest[..16]);
-    u128::from_le_bytes(k)
-}
-
-/// Record blocks an export's `R/` scan kept for the CAR's tail, and the
-/// first record it didn't keep (read again from there).
-struct Buffered {
-    chunks: Vec<Vec<u8>>,
-    bytes: usize,
-    resume_at: Option<Vec<u8>>,
-    seen: SeenCids,
-    _permit: Option<tokio::sync::SemaphorePermit<'static>>,
-}
-
-/// Feeds every record's (key, CID) to the MST walk (`tx`: it rebuilds the
-/// leaves from them) while buffering record blocks for after the nodes.
-async fn scan_records(
+/// Feeds every record to the MST walk (`tx`) in key order: its key and CID
+/// (the walk rebuilds the leaves from them) and, unless `since` excludes
+/// it, its block (the walk puts it by its entry).
+async fn feed_records(
     snap: &slatedb::DbSnapshot,
     did: &str,
     since: Option<u64>,
     tx: tokio::sync::mpsc::Sender<crate::mst_store::RecordBatch>,
-) -> anyhow::Result<Buffered> {
+) -> anyhow::Result<()> {
     let prefix = state::record_prefix(did);
     let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, cache_blocks: true, ..Default::default() };
     let mut iter = match snap.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await {
@@ -271,8 +227,6 @@ async fn scan_records(
             return Err(e.into());
         }
     };
-    let mut out = Buffered { chunks: Vec::new(), bytes: 0, resume_at: None, seen: SeenCids::default(), _permit: None };
-    let (mut held_mb, cap) = (0u32, EXPORT_BUFFER_MAX_MB.load(std::sync::atomic::Ordering::Relaxed));
     let new_batch = || crate::mst_store::Records::with_capacity(EXPORT_BATCH);
     let mut batch = new_batch();
     loop {
@@ -291,48 +245,19 @@ async fn scan_records(
                 return Err(e);
             }
         };
-        let key = &kv.key[prefix.len()..];
-        batch.push(key, cid);
-        if batch.len() == EXPORT_BATCH && tx.send(Ok(std::mem::replace(&mut batch, new_batch()))).await.is_err() {
-            // the walk is gone (it failed: a finished one has read every
-            // record): stop, leaving the rest to a second scan
-            out.resume_at.get_or_insert_with(|| key.to_vec());
-            return Ok(out);
+        let carried = since.is_none_or(|s| state::record_value_rev(&kv.value) > s);
+        batch.push(&kv.key[prefix.len()..], cid, carried.then_some(bytes));
+        if (batch.len() == EXPORT_BATCH || batch.bytes() >= EXPORT_BATCH_BYTES) && tx.send(Ok(std::mem::replace(&mut batch, new_batch()))).await.is_err() {
+            // the walk is gone: its result says why
+            return Ok(());
         }
-        if out.resume_at.is_some() || since.is_some_and(|s| state::record_value_rev(&kv.value) <= s) {
-            continue;
-        }
-        let k = cid_key(&cid);
-        if out.seen.contains(&k) {
-            continue;
-        }
-        let need = (out.bytes + bytes.len() + 64).div_ceil(1 << 20) as u32;
-        while held_mb < need {
-            let Some(p) = (held_mb < cap).then(|| EXPORT_BUFFER_MB.try_acquire().ok()).flatten() else { break };
-            match &mut out._permit {
-                Some(h) => h.merge(p),
-                None => out._permit = Some(p),
-            }
-            held_mb += 1;
-        }
-        if held_mb < need {
-            out.resume_at = Some(key.to_vec());
-            continue;
-        }
-        out.seen.insert(k);
-        if out.chunks.last().is_none_or(|c| c.len() >= EXPORT_CHUNK) {
-            out.chunks.push(Vec::with_capacity(EXPORT_CHUNK + 4096));
-        }
-        let Some(chunk) = out.chunks.last_mut() else { unreachable!() };
-        let was = chunk.len();
-        car::write_block(chunk, &cid, bytes);
-        out.bytes += chunk.len() - was;
     }
     if !batch.is_empty() {
         let _ = tx.send(Ok(batch)).await;
     }
-    Ok(out)
+    Ok(())
 }
+
 
 struct ExportSlot(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
 
@@ -472,14 +397,19 @@ impl<S: crate::mst_lazy::Source> crate::mst_lazy::Source for Stoppable<'_, S> {
         self.check()?;
         self.inner.leaf_records(lo, hi, enc)
     }
+    fn record_blocks(&self, upto: Option<&[u8]>, f: &mut dyn FnMut(Cid, &[u8])) -> Result<(), crate::mst::MstError> {
+        self.check()?;
+        self.inner.record_blocks(upto, f)
+    }
 }
 
-/// Streams the repo CAR (commit, MST nodes, then records) from one SlateDB
-/// snapshot. One forward `R/` scan feeds the MST walk, which runs alongside
-/// it on a blocking thread, while record blocks wait in a bounded buffer
-/// ([`EXPORT_BUFFER_MB`]) for the nodes to be written. An export whose
-/// client goes away or stalls for `Config::export_stall` stops at once, so
-/// slow readers can't pin blocking threads, snapshots or memory.
+/// Streams the repo CAR from one SlateDB snapshot in one pass, in the
+/// spec's streamable order (commit, then each MST node followed by its
+/// entries: see [`crate::mst_lazy::export_blocks`]). One forward `R/` scan
+/// feeds the MST walk on a blocking thread both its leaves' keys and the
+/// record blocks it puts by their entries. An export whose client goes away
+/// or stalls for `Config::export_stall` stops at once, so slow readers
+/// can't pin blocking threads, snapshots or memory.
 async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Response> {
     let slot = export_slot(app).await?;
     let (view, snap) = app.repo_view(did).await?;
@@ -522,17 +452,18 @@ async fn stream_export(
     stall: std::time::Duration,
 ) -> Result<(), &'static str> {
     const CHUNK: usize = EXPORT_CHUNK;
-    let prefix = state::record_prefix(&did);
-    let mut buf = Vec::with_capacity(CHUNK + 4096);
-    car::write_header(&mut buf, &head.commit);
-    car::write_block(&mut buf, &head.commit, &head.commit_block);
-    let (ktx, krx) = tokio::sync::mpsc::channel(64);
+    let mut first = Vec::with_capacity(64 + head.commit_block.len());
+    car::write_header(&mut first, &head.commit);
+    car::write_block(&mut first, &head.commit, &head.commit_block);
+    send_chunk(tx, first, stall).await?;
+    let (ktx, krx) = tokio::sync::mpsc::channel(EXPORT_FEED);
     let walk = async {
         let (pre, budget) = prefetch_nodes(&snap, &did).await;
         let (snap2, did2, root, tx2) = (snap.clone(), did.clone(), head.data, tx.clone());
         let r = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             let stop = std::cell::Cell::new(None);
+            let mut buf = Vec::with_capacity(CHUNK + 4096);
             let mut emit = |c: Cid, b: &[u8]| {
                 if stop.get().is_some() {
                     return;
@@ -554,8 +485,8 @@ async fn stream_export(
         drop(budget);
         r
     };
-    let (walked, scanned) = tokio::join!(walk, scan_records(&snap, &did, since, ktx));
-    let mut buf = match walked {
+    let (walked, fed) = tokio::join!(walk, feed_records(&snap, &did, since, ktx));
+    let buf = match walked {
         Ok((_, Some(reason), _)) => return Err(reason),
         Ok((Ok(()), None, buf)) => buf,
         Ok((Err(e), None, _)) => {
@@ -567,60 +498,17 @@ async fn stream_export(
             return Err("error");
         }
     };
-    let scanned = scanned.map_err(|e| {
+    // a walk that ended well took every record, so the scan ended well too
+    if let Err(e) = fed {
         tracing::warn!(%did, "getRepo: record scan failed: {e:#}");
-        "error"
-    })?;
-    let Buffered { chunks, resume_at, mut seen, _permit: permit, .. } = scanned;
-    if !chunks.is_empty() {
-        if !buf.is_empty() {
-            send_chunk(tx, std::mem::take(&mut buf), stall).await?;
-        }
-        for c in chunks {
-            send_chunk(tx, c, stall).await?;
-        }
-    }
-    drop(permit);
-    let Some(start) = resume_at else {
-        if !buf.is_empty() {
-            send_chunk(tx, buf, stall).await?;
-        }
-        return Ok(());
-    };
-    let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, ..Default::default() };
-    let mut iter = match snap.scan_with_options([&prefix[..], &start[..]].concat()..state::prefix_end(&prefix), &opts).await {
-        Ok(it) => state::BatchedScan::new(it),
-        Err(e) => {
-            tracing::warn!(%did, "getRepo: record rescan failed: {e}");
-            return Err("error");
-        }
-    };
-    loop {
-        match iter.next().await {
-            Ok(Some(kv)) => {
-                if since.is_none_or(|s| state::record_value_rev(&kv.value) > s) {
-                    if let Ok((cid, bytes)) = state::record_value_parts(&kv.value) {
-                        if seen.insert(cid_key(&cid)) {
-                            car::write_block(&mut buf, &cid, bytes);
-                        }
-                    }
-                }
-                if buf.len() >= CHUNK {
-                    send_chunk(tx, std::mem::replace(&mut buf, Vec::with_capacity(CHUNK + 4096)), stall).await?;
-                }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                tracing::warn!(%did, "getRepo: record rescan failed: {e}");
-                return Err("error");
-            }
-        }
+        return Err("error");
     }
     if !buf.is_empty() {
         send_chunk(tx, buf, stall).await?;
     }
     Ok(())
 }
+
 
 /// Only the current state's blocks: ones only reachable from older revisions
 /// aren't kept and report BlockNotFound.

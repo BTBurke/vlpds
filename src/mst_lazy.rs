@@ -44,6 +44,12 @@ pub trait Source {
         }
         Ok(())
     }
+    /// The blocks of the records with keys up to `upto` (None: all) not
+    /// given yet, in key order, for [`export_blocks`] to put by their
+    /// entries. A source without record blocks gives none.
+    fn record_blocks(&self, _upto: Option<&[u8]>, _f: &mut dyn FnMut(Cid, &[u8])) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Cumulative per [`LazyTree`] or export.
@@ -875,8 +881,13 @@ pub fn persisted_blocks<'a>(root: &Cid, blocks: &[(Cid, &'a [u8])], persist_min:
     Ok(blocks.iter().filter(|(c, _)| keep.contains(c)).map(|(c, b)| (*c, *b)).collect())
 }
 
-/// Every node block of the tree at `root`, in `Tree::walk_blocks` order
-/// (pre-order), streamed with one root-to-leaf path of nodes in memory.
+/// The tree at `root` in the streamable CAR order of the atproto repository
+/// spec ("Streamable CAR Block Ordering"): each node block, then its
+/// entries in order, a child by recursing and a record by its block, which
+/// [`Source::record_blocks`] gives (none from a source without them: node
+/// blocks alone, in `Tree::walk_blocks` order). Records come in key order,
+/// as a forward `R/` scan reads them, with one root-to-leaf path of nodes in
+/// memory. A record the tree doesn't name still comes at its key's place.
 ///
 /// The root is hash-checked against `root`, and every subtree rebuilt from
 /// records against its parent's link, so the records exported are the ones
@@ -893,13 +904,23 @@ pub fn export_blocks(
     f: &mut dyn FnMut(Cid, &[u8]),
 ) -> Result<LoadStats> {
     let mut stats = LoadStats::default();
-    let Some(r) = read_node(src, &root, None, &mut stats)? else {
-        let t = LazyTree::open(root, persist_min, src)?;
-        t.tree.walk_blocks(f)?;
-        return Ok(t.stats);
-    };
     fn emit(n: &Node, f: &mut dyn FnMut(Cid, &[u8])) -> Result<()> {
         f(n.cid.ok_or(MstError::Invalid("unwritten node"))?, &n.block()?);
+        Ok(())
+    }
+    /// A fully loaded subtree.
+    fn walk_loaded(n: &Node, src: &dyn Source, f: &mut dyn FnMut(Cid, &[u8]), depth: usize) -> Result<()> {
+        if depth > MAX_DEPTH {
+            return Err(MstError::Invalid("tree too deep"));
+        }
+        emit(n, f)?;
+        for e in &n.entries {
+            match e {
+                Entry::Value { key, .. } => src.record_blocks(Some(key), f)?,
+                Entry::Child { node: Some(c), .. } => walk_loaded(c, src, f, depth + 1)?,
+                Entry::Child { .. } => return Err(MstError::Partial),
+            }
+        }
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
@@ -919,11 +940,19 @@ pub fn export_blocks(
         }
         emit(n, f)?;
         for (i, e) in n.entries.iter().enumerate() {
-            let Entry::Child { cid: Some(c), .. } = e else { continue };
+            let c = match e {
+                Entry::Value { key, .. } => {
+                    src.record_blocks(Some(key), f)?;
+                    continue;
+                }
+                Entry::Child { cid: Some(c), .. } => c,
+                Entry::Child { cid: None, .. } => continue,
+            };
             let (clo, chi) = child_bounds(n, i, &lo, &hi);
             if n.height == 1 && persist_min >= 1 {
                 // a leaf, encoded straight from its records: its link checks
-                // it, so no key heights or node to build
+                // it, so no key heights or node to build. Its records' blocks
+                // follow with the next key's (or at the end).
                 src.leaf_records(clo.as_deref(), chi.as_deref(), enc)?;
                 stats.scans += 1;
                 stats.scanned_records += enc.len() as u64;
@@ -939,16 +968,23 @@ pub fn export_blocks(
                 visit(&child, clo, chi, persist_min, src, f, stats, enc, depth + 1)?;
             } else {
                 // rebuilt from records: fully loaded, blocks kept
-                let mut t = Tree::new();
-                t.root = child;
-                t.walk_blocks(f)?;
+                walk_loaded(&child, src, f, depth + 1)?;
             }
         }
         Ok(())
     }
-    visit(&r, None, None, persist_min, src, f, &mut stats, &mut LeafEncoder::default(), 0)?;
+    match read_node(src, &root, None, &mut stats)? {
+        Some(r) => visit(&r, None, None, persist_min, src, f, &mut stats, &mut LeafEncoder::default(), 0)?,
+        None => {
+            let t = LazyTree::open(root, persist_min, src)?;
+            stats = t.stats;
+            walk_loaded(&t.tree.root, src, f, 0)?;
+        }
+    }
+    src.record_blocks(None, f)?;
     Ok(stats)
 }
+
 
 /// `M/` and `R/` of one repo, in memory (tests, benches).
 #[derive(Clone, Default)]

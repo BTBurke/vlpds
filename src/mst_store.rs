@@ -383,22 +383,25 @@ impl<N: Source> Source for ScanSource<'_, N> {
     }
 }
 
-/// Records in key order, the keys back to back in one buffer (no allocation
-/// per record).
+/// Records in key order, each with its block if the export carries it, the
+/// bytes back to back in one buffer (no allocation per record).
 #[derive(Default)]
 pub struct Records {
-    keys: Vec<u8>,
-    recs: Vec<(u32, Cid)>,
+    bytes: Vec<u8>,
+    /// Where each record's key and block end (the next record starts there).
+    recs: Vec<(u32, u32, Cid)>,
 }
 
 impl Records {
     pub fn with_capacity(n: usize) -> Self {
-        Records { keys: Vec::with_capacity(n * 32), recs: Vec::with_capacity(n) }
+        Records { bytes: Vec::with_capacity(n * 32), recs: Vec::with_capacity(n) }
     }
 
-    pub fn push(&mut self, key: &[u8], cid: Cid) {
-        self.keys.extend_from_slice(key);
-        self.recs.push((self.keys.len() as u32, cid));
+    pub fn push(&mut self, key: &[u8], cid: Cid, block: Option<&[u8]>) {
+        self.bytes.extend_from_slice(key);
+        let key_end = self.bytes.len() as u32;
+        self.bytes.extend_from_slice(block.unwrap_or_default());
+        self.recs.push((key_end, self.bytes.len() as u32, cid));
     }
 
     pub fn len(&self) -> usize {
@@ -409,56 +412,108 @@ impl Records {
         self.recs.is_empty()
     }
 
-    fn get(&self, i: usize) -> (&[u8], &Cid) {
+    pub fn bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// A record block is never empty, so an empty one is none.
+    fn get(&self, i: usize) -> (&[u8], &Cid, Option<&[u8]>) {
         let start = match i {
             0 => 0,
-            _ => self.recs[i - 1].0 as usize,
+            _ => self.recs[i - 1].1 as usize,
         };
-        let (end, cid) = &self.recs[i];
-        (&self.keys[start..*end as usize], cid)
+        let (key_end, end, cid) = &self.recs[i];
+        let block = &self.bytes[*key_end as usize..*end as usize];
+        (&self.bytes[start..*key_end as usize], cid, (!block.is_empty()).then_some(block))
     }
 }
 
 pub type RecordBatch = std::result::Result<Records, String>;
 
-/// [`ScanSource`] fed by a producer on the runtime (`export_repo`), so the
-/// scan runs ahead of the walk instead of one `block_on` per record on the
-/// walking thread.
+/// A repo's records in key order, from one forward `R/` scan by a producer
+/// on the runtime (`export_repo`), so the scan runs ahead of the walk
+/// instead of one `block_on` per record on the walking thread. The walk
+/// reads keys for its leaves and takes record blocks in the same order a
+/// little behind: only the batches between the two stay in memory.
 pub struct FedSource<N: Source> {
     pub nodes: N,
-    rx: RefCell<tokio::sync::mpsc::Receiver<RecordBatch>>,
-    /// The batch being read and its next record.
-    cur: RefCell<(Records, usize)>,
+    feed: RefCell<Feed>,
+}
+
+struct Feed {
+    rx: tokio::sync::mpsc::Receiver<RecordBatch>,
+    batches: std::collections::VecDeque<Records>,
+    /// The first record of `batches[0]`, counted from the start of the scan.
+    base: usize,
+    /// The next record whose block to give.
+    given: usize,
+    /// The next record for a leaf; never behind `given`.
+    read: usize,
+    closed: bool,
+}
+
+impl Feed {
+    /// Where record `i` is; None past the last. Blocking.
+    fn at(&mut self, i: usize) -> Result<Option<(usize, usize)>> {
+        loop {
+            let mut off = i - self.base;
+            for (b, batch) in self.batches.iter().enumerate() {
+                if off < batch.len() {
+                    return Ok(Some((b, off)));
+                }
+                off -= batch.len();
+            }
+            if self.closed {
+                return Ok(None);
+            }
+            match self.rx.blocking_recv() {
+                Some(Ok(b)) => self.batches.push_back(b),
+                Some(Err(e)) => return Err(MstError::Store(e)),
+                None => self.closed = true,
+            }
+        }
+    }
+
+    /// Records at or below `lo` are passed over (their blocks are still
+    /// given); the first at or above `hi` stays for the next range.
+    fn range(&mut self, lo: Option<&[u8]>, hi: Option<&[u8]>, mut f: impl FnMut(&[u8], &Cid)) -> Result<()> {
+        while let Some((b, p)) = self.at(self.read)? {
+            let (k, c, _) = self.batches[b].get(p);
+            if hi.is_some_and(|hi| k >= hi) {
+                break;
+            }
+            if lo.is_none_or(|lo| k > lo) {
+                f(k, c);
+            }
+            self.read += 1;
+        }
+        Ok(())
+    }
+
+    fn give(&mut self, upto: Option<&[u8]>, f: &mut dyn FnMut(Cid, &[u8])) -> Result<()> {
+        while let Some((b, p)) = self.at(self.given)? {
+            let (k, c, block) = self.batches[b].get(p);
+            if upto.is_some_and(|u| k > u) {
+                break;
+            }
+            if let Some(block) = block {
+                f(*c, block);
+            }
+            self.given += 1;
+            self.read = self.read.max(self.given);
+            if b == 0 && p + 1 == self.batches[0].len() {
+                self.base += self.batches[0].len();
+                self.batches.pop_front();
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<N: Source> FedSource<N> {
     pub fn new(nodes: N, rx: tokio::sync::mpsc::Receiver<RecordBatch>) -> Self {
-        FedSource { nodes, rx: RefCell::new(rx), cur: RefCell::new((Records::default(), 0)) }
-    }
-
-    /// Records at or below `lo` are skipped (a range the caller had, or the
-    /// parent's own keys); the first at or above `hi` stays for the next
-    /// range. Blocking.
-    fn range(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, mut f: impl FnMut(&[u8], &Cid)) -> Result<()> {
-        let mut cur = self.cur.borrow_mut();
-        let (batch, pos) = &mut *cur;
-        loop {
-            while *pos < batch.len() {
-                let (k, c) = batch.get(*pos);
-                if hi.is_some_and(|hi| k >= hi) {
-                    return Ok(());
-                }
-                if lo.is_none_or(|lo| k > lo) {
-                    f(k, c);
-                }
-                *pos += 1;
-            }
-            match self.rx.borrow_mut().blocking_recv() {
-                Some(Ok(b)) => (*batch, *pos) = (b, 0),
-                Some(Err(e)) => return Err(MstError::Store(e)),
-                None => return Ok(()),
-            }
-        }
+        let feed = Feed { rx, batches: Default::default(), base: 0, given: 0, read: 0, closed: false };
+        FedSource { nodes, feed: RefCell::new(feed) }
     }
 }
 
@@ -468,14 +523,19 @@ impl<N: Source> Source for FedSource<N> {
     }
 
     fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()> {
-        self.range(lo, hi, |k, c| out.push((Arc::from(k), *c)))
+        self.feed.borrow_mut().range(lo, hi, |k, c| out.push((Arc::from(k), *c)))
     }
 
     fn leaf_records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, enc: &mut LeafEncoder) -> Result<()> {
         enc.clear();
-        self.range(lo, hi, |k, c| enc.push(k, c))
+        self.feed.borrow_mut().range(lo, hi, |k, c| enc.push(k, c))
+    }
+
+    fn record_blocks(&self, upto: Option<&[u8]>, f: &mut dyn FnMut(Cid, &[u8])) -> Result<()> {
+        self.feed.borrow_mut().give(upto, f)
     }
 }
+
 
 /// One scan of `did`'s `M/` range, up to `max_bytes` (0 = none), instead of
 /// 7-11 dependent node reads. Also returns whether the range was read to its

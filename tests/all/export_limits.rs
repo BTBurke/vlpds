@@ -1,6 +1,6 @@
 //! Bounded serving paths: getRepo exports whose readers stop reading end
 //! (and free their slot, blocking thread and buffers) while commits keep
-//! acking; identical record blocks go into an export once; subscribeRepos
+//! acking; identical record blocks come by each entry; subscribeRepos
 //! connections are capped per client address, and a bad cursor is an XRPC
 //! error.
 
@@ -86,9 +86,11 @@ async fn stalled_export_readers_dont_block_commits() {
     drop(bodies);
 }
 
-/// Records with identical contents share a block: the export carries it once.
+/// Records with identical contents share a block: the streamable order puts
+/// it by each entry naming it (a single-pass reader finds every record by
+/// its node), so it comes once per entry and nothing else repeats.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn identical_records_are_exported_once() {
+async fn identical_records_come_by_each_entry() {
     let s = TestServer::spawn().await;
     let a = s.create_account("dup").await;
     let same = json!({"$type": BIG, "same": true});
@@ -96,16 +98,11 @@ async fn identical_records_are_exported_once() {
     let r2 = s.create_record(&a, BIG, same).await;
     assert_eq!(r1.cid, r2.cid);
     s.post(&a, "different").await;
-    // both the buffered path and the rescan (buffer cap 0) dedupe
-    for cap in [64, 0] {
-        vlpds::xrpc::set_export_buffer_max_mb(cap);
-        let repo = s.get_repo(&a.did).await;
-        vlpds::xrpc::set_export_buffer_max_mb(64);
-        let cid: Cid = Cid::parse(&r1.cid).unwrap();
-        assert_eq!(repo.order.iter().filter(|c| **c == cid).count(), 1, "buffer cap {cap}");
-        assert_eq!(repo.order.len(), repo.blocks.len(), "no block twice (buffer cap {cap})");
-        assert_eq!(repo.entries().len(), 3);
-    }
+    let repo = s.get_repo(&a.did).await;
+    let cid: Cid = Cid::parse(&r1.cid).unwrap();
+    assert_eq!(repo.order.iter().filter(|c| **c == cid).count(), 2);
+    assert_eq!(repo.order.len(), repo.blocks.len() + 1, "no other block twice");
+    assert_eq!(repo.entries().len(), 3);
 }
 
 /// subscribeRepos: at most `firehose_max_per_ip` connections per client
