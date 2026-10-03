@@ -61,6 +61,11 @@ pub const SHARD_MOVED: &str = "ShardMoved";
 #[derive(Clone, Copy, Debug)]
 pub struct NotSent;
 
+/// Response extension on a 503 [`REPO_LOADING`] or [`SHARD_MOVED`] answer:
+/// nothing was done.
+#[derive(Clone, Copy, Debug)]
+pub struct NotApplied;
+
 tokio::task_local! {
     static FORWARDED: ();
 }
@@ -68,6 +73,11 @@ tokio::task_local! {
 /// Its client waits on the peer's time-to-first-byte deadline.
 pub fn is_forwarded() -> bool {
     FORWARDED.try_with(|_| ()).is_ok()
+}
+
+/// What [`with_retries`] resends.
+pub(crate) fn resendable(req: &Request) -> bool {
+    retryable_write(req) || retryable_read(req)
 }
 
 fn retryable_write(req: &Request) -> bool {

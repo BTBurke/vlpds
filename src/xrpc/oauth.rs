@@ -2064,9 +2064,17 @@ async fn revoke_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(),
     Ok(())
 }
 
+#[derive(Default)]
+struct DpopCtx {
+    /// XrpcError can't carry headers.
+    challenge: Option<String>,
+    /// The proof's replay claim, held by this request.
+    claim: Option<ou::Replay>,
+}
+
 tokio::task_local! {
-    /// For the response layer: XrpcError can't carry headers.
-    static DPOP_CHALLENGE: RefCell<Option<String>>;
+    /// Shared with the response layer.
+    static DPOP_CTX: RefCell<DpopCtx>;
 }
 
 fn dpop_fail(error: &str, desc: &str) -> XrpcError {
@@ -2074,7 +2082,7 @@ fn dpop_fail(error: &str, desc: &str) -> XrpcError {
         "DPoP algs=\"ES256\", error=\"{error}\", error_description=\"{}\"",
         desc.replace('"', "'")
     );
-    let _ = DPOP_CHALLENGE.try_with(|c| *c.borrow_mut() = Some(challenge));
+    let _ = DPOP_CTX.try_with(|c| c.borrow_mut().challenge = Some(challenge));
     XrpcError {
         status: StatusCode::UNAUTHORIZED,
         error: error.into(),
@@ -2085,14 +2093,34 @@ fn dpop_fail(error: &str, desc: &str) -> XrpcError {
 /// Adds a fresh `DPoP-Nonce` (RFC 9449 §8.2/§9) and, when verification
 /// failed, the `WWW-Authenticate` challenge. [`with_dpop_layer`] clones the
 /// app only for DPoP requests, not once per request.
+///
+/// A request the entry node resends (`forward::with_retries`) carries the
+/// same proof, already claimed when the first attempt was answered
+/// ShardMoved / RepoLoading after authenticating. That answer means
+/// nothing was done, so the claim is given back before the answer leaves
+/// and the resend can claim it again. The proof still authorizes at most
+/// one request that does something: until the release a replay is
+/// refused; after it the proof is as if never presented, and only
+/// whichever request claims it next (the resend, or a replay racing it)
+/// is served.
 async fn dpop_layer(app: Option<Arc<App>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let Some(app) = app else {
         return next.run(req).await;
     };
-    DPOP_CHALLENGE
-        .scope(RefCell::new(None), async move {
+    let resendable = crate::forward::resendable(&req);
+    DPOP_CTX
+        .scope(RefCell::new(DpopCtx::default()), async move {
             let mut r = next.run(req).await;
-            let challenge = DPOP_CHALLENGE.with(|c| c.borrow_mut().take());
+            let (challenge, claim) = DPOP_CTX.with(|c| {
+                let mut c = c.borrow_mut();
+                (c.challenge.take(), c.claim.take())
+            });
+            let not_applied = r.extensions().get::<crate::forward::NotApplied>().is_some();
+            if let Some(claim) = claim.filter(|_| resendable && not_applied) {
+                if let Err(e) = super::internal::release_replay_anywhere(&app, &claim.routing, &claim.key).await {
+                    tracing::debug!(error = %e.message, "DPoP claim not released: a resend of its proof is refused");
+                }
+            }
             let h = r.headers_mut();
             if let Ok(v) = HeaderValue::from_str(&keys(&app).nonces.next()) {
                 h.insert(HeaderName::from_static("dpop-nonce"), v);
@@ -2119,6 +2147,12 @@ pub fn with_dpop_layer(r: axum::Router<Arc<App>>, app: &Arc<App>) -> axum::Route
         let is_dpop = req.headers().get(header::AUTHORIZATION).is_some_and(|v| v.as_bytes().starts_with(b"DPoP "));
         dpop_layer(is_dpop.then(|| app.clone()), req, next)
     }))
+}
+
+/// The DID of a validly signed access token, nothing else checked.
+pub fn access_token_sub(app: &App, token: &str) -> Option<String> {
+    let jwt = super::authn::verify_access_token(&keys(app).server, token).ok()?;
+    jwt.claim_str("sub").map(String::from)
 }
 
 pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Credentials> {
@@ -2171,7 +2205,9 @@ pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Crede
     // routed by that DID), in memory only (crate::oauth: residual risk)
     let replay = checked.replay(did.to_string());
     match super::internal::claim_transient_anywhere(app, &replay.routing, &replay.key, replay.until).await {
-        Ok(true) => {}
+        Ok(true) => {
+            let _ = DPOP_CTX.try_with(|c| c.borrow_mut().claim = Some(replay));
+        }
         Ok(false) => return Err(dpop_fail("invalid_dpop_proof", "DPoP proof replayed")),
         Err(e) => return Err(e),
     }

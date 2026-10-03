@@ -47,6 +47,7 @@ mod firehose_startup;
 mod formats;
 mod get_blocks_index;
 mod go_checker;
+mod dpop_resend;
 mod ha_auth;
 mod ha_liveness;
 mod handle_validation;

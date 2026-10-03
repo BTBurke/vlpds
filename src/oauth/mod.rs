@@ -34,6 +34,10 @@
 //!   request. Residual risk: right after a failover, a captured proof could
 //!   be replayed once, within its `iat` window and nonce lifetime, and only
 //!   with the (short-lived, revocable) access token it is bound to.
+//! - A resource request answered ShardMoved / RepoLoading (nothing done)
+//!   gives its proof's claim back, so the entry node's resend of the same
+//!   proof is served (`xrpc::oauth::dpop_layer`; DESIGN.md "Forwarding
+//!   deadlines and not-applied writes").
 
 pub mod client;
 pub mod gc;

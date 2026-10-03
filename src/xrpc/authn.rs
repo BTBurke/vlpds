@@ -317,17 +317,24 @@ const FORWARDED_AUTH_WAIT: std::time::Duration = std::time::Duration::from_milli
 /// nothing was done, so the entry node resends it rather than failing it at
 /// its deadline. That wait is the account's security controls loading cold
 /// (every account of a shard after a takeover); the load goes on in the
-/// background, so the resend finds it cached. Not DPoP: its check claims the
-/// proof against replay first, so a resend of the same proof would fail.
+/// background, so the resend finds it cached. A DPoP proof claimed by then
+/// is given back with that answer (`oauth::dpop_layer`), so the resend's
+/// same proof is accepted; one cancelled while its claim was in flight
+/// stays claimed, and its resend is refused.
 async fn authenticate_within(app: &Arc<App>, parts: &Parts) -> XResult<Credentials> {
-    let bearer = parts.headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
-    if bearer.is_none() || app.config.forwarded_write_start.is_none() || !crate::forward::is_forwarded() {
+    let h = parts.headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
+    let (bearer, dpop) = (h.and_then(|h| h.strip_prefix("Bearer ")), h.and_then(|h| h.strip_prefix("DPoP ")));
+    if (bearer.is_none() && dpop.is_none()) || app.config.forwarded_write_start.is_none() || !crate::forward::is_forwarded() {
         return authenticate(app, parts).await;
     }
     match tokio::time::timeout(FORWARDED_AUTH_WAIT, authenticate(app, parts)).await {
         Ok(r) => r,
         Err(_) => {
-            let sub = bearer.and_then(|t| app.jwt.verify_signature_cached(t.trim())).map(|c| c.sub.clone());
+            let sub = match (bearer, dpop) {
+                (Some(t), _) => app.jwt.verify_signature_cached(t.trim()).map(|c| c.sub.clone()),
+                (_, Some(t)) => super::oauth::access_token_sub(app, t.trim()),
+                _ => None,
+            };
             if let Some(did) = sub.filter(|d| d.starts_with("did:")) {
                 let app = app.clone();
                 tokio::spawn(async move {

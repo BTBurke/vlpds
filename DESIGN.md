@@ -1160,9 +1160,42 @@ forwarded write for that long), or telling "busy loading" apart from
   load on in the background, so the resend finds them cached
   (`xrpc::authn::authenticate_within`). Without it, a takeover's forwarded
   writes waited in that scan past the 3 s deadline: an ambiguous 503 the
-  entry node can't resend. DPoP requests wait as before: their check
-  claims the proof against replay before the reads, so a resend of the
-  same proof would be refused.
+  entry node can't resend. DPoP requests get the same 1.5 s answer; see
+  the next point for their proof.
+- **A resent OAuth request reuses its DPoP proof.** The entry node
+  resends the client's bytes, proof included, and the owner's DPoP check
+  claims the proof's `jti` (cluster-wide, at the token DID's owner) before
+  its reads. So a first attempt answered `ShardMoved` / `RepoLoading`
+  *after* authenticating (a write not started in 1 s, a query whose repo's
+  shard left, the 1.5 s auth answer above) left the proof claimed, and the
+  resend was refused 401 `invalid_dpop_proof` "DPoP proof replayed": every
+  OAuth client lost the resend (`tests/all/dpop_resend.rs` reproduced it).
+  Now the request remembers the claim it made, and when its answer is a
+  503 `ShardMoved` / `RepoLoading` for a request the entry node resends,
+  the DPoP layer gives the claim back (`/internal/v1/oauth/replay`
+  release) before the answer leaves (`xrpc::oauth::dpop_layer`).
+  Security: replay protection's job is that one proof authorizes at most
+  one request that does something. Those answers mean nothing was done
+  (the same guarantee the resend itself relies on), so after the release
+  the proof is exactly as if it had never been presented: a replay racing
+  the resend can win the claim, and then the resend is refused, but never
+  both are served. Until the release, any replay is refused as before.
+  Only a claim this request made is released (never one it found taken),
+  and only on those two answers to resendable requests (repo writes and
+  queries), not other endpoints, whose 503s promise nothing.
+  Alternatives rejected: an entry-node "retry token" letting the owner
+  accept a claimed `jti` once more needs the claim bound to a request id
+  (or a replay racing the first attempt gets served alongside the
+  resend), and verifying DPoP at the entry node and forwarding an
+  assertion would move every proof check off the owner, which reads the
+  session it checks anyway. Residual: an auth wait cancelled at 1.5 s
+  while its claim call to the DID's owner was in flight (that owner
+  frozen) leaves the claim in place; that resend is refused. Service-auth
+  JWTs track no `jti` (as the reference), Bearer access tokens are
+  reusable, and the remaining single-use tokens (refresh tokens,
+  authorization-server DPoP proofs, client assertions, codes, email and
+  2FA tokens) are spent on `/oauth/*` or on procedures the entry node
+  never resends.
 - Directly received writes (the client called the owner) just wait for
   their load. Every 503 vlpds answers carries `Retry-After: 1`.
 
