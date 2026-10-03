@@ -4594,7 +4594,7 @@ new commit and `#sync`, also deleting the stale `M/` nodes and index entries
 the snapshot showed; `ReplaceRepo.swap_commit` makes it refuse if a
 commit landed after the snapshot, so a concurrent acked write is never
 dropped) and `vlpds.admin.requestCrawl {relays?}` (the node's own public
-host, per-relay results).
+host, per-relay results; see "Relay crawl requests").
 
 **Not done.** rebuild-repo refuses a repo whose records no longer rebuild
 to its head's data root (records lost): such a repo can't be loaded by its
@@ -4602,6 +4602,41 @@ worker, and re-signing the remainder would drop data silently, unlike the
 reference, which trusts its records table. The sequencer-recovery scripts
 have no counterpart (no single sequencer DB; see "Backups and restore").
 `pdsadmin update` is a deploy concern.
+
+## Relay crawl requests (`src/xrpc/crawlers.rs`)
+
+As the reference PDS's `Crawlers`: relays get `com.atproto.sync.requestCrawl
+{hostname}` at startup and again after new activity, at most once per
+interval (default 20 min) per relay. A relay is asked when it never was, or
+when there was activity (a firehose batch, or this node starting or taking
+over) since its last ask and the interval has passed; a failed ask waits for
+the same, as the reference's does.
+
+**One sender.** Only the node owning slot 0's shard (`leads_slot0`, as
+retention and reshard GC) sends. Its merged firehose head is the cluster's
+activity; other nodes only re-check leadership every 60 s. A takeover counts
+as activity, but the throttle reads the last ask from the bucket, so a new
+leader doesn't repeat one inside the interval (and a restart within the
+interval doesn't ask again either).
+
+**State.** `{prefix}/config/crawlers.json` (the rate-limit config's
+neighbour, CAS on the ETag): `relays` and `intervalSecs` when set in the
+console, and per relay the last ask (time, node, accepted or the HTTP status
+and body, the last success). Fields not set fall back to the node's flags,
+`--crawlers` (default `bsky.network`; empty for none) and
+`--crawl-interval-secs`; the flag list is not copied in, so changing the
+flag still takes effect until an operator stores a list, and
+`setCrawlers {relays: null}` returns to it. The leader reads the object
+before each round (about once per interval, and every 60 s while idle).
+
+**Admin.** `vlpds.admin.getCrawlers` (list, interval, their sources, each
+relay's last ask), `vlpds.admin.setCrawlers {relays?, intervalSecs?}`
+(hostnames or http(s) origins, normalized; at most 32; 1 s to 7 days), and
+`vlpds.admin.requestCrawl {relays?}`, which asks now whatever the throttle
+and records results for configured relays. The console's Relays page drives
+all three. `vlpds_request_crawl_total{relay,result}` and
+`vlpds_request_crawl_last_success_time_seconds{relay}` exist at 0 for every
+configured relay.
 
 ## Account totals (`src/totals.rs`)
 

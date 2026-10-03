@@ -8,6 +8,7 @@ import { Metrics } from './Metrics'
 import { AccountDetail, Accounts } from './Accounts'
 import { Invites } from './Invites'
 import { RateLimits } from './RateLimits'
+import { Relays } from './Relays'
 
 const TABS = [
   { to: '/admin', label: 'Cluster' },
@@ -15,6 +16,7 @@ const TABS = [
   { to: '/admin/accounts', label: 'Accounts' },
   { to: '/admin/invites', label: 'Invite codes' },
   { to: '/admin/ratelimits', label: 'Rate limits' },
+  { to: '/admin/relays', label: 'Relays' },
 ]
 
 export function AdminApp({ path }: { path: string }) {
@@ -29,6 +31,7 @@ export function AdminApp({ path }: { path: string }) {
   else if ((m = match('/admin/accounts/:did', p))) page = <AccountDetail did={m.did} />
   else if (p === '/admin/invites') page = <Invites />
   else if (p === '/admin/ratelimits') page = <RateLimits />
+  else if (p === '/admin/relays') page = <Relays />
   else page = <Notice kind="warn">There is no console page at {p}.</Notice>
   const current = (to: string) => (to === '/admin' ? p === '/admin' : p === to || p.startsWith(`${to}/`))
   return (
