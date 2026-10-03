@@ -697,7 +697,7 @@ Note: vlpds deletes blob bytes in a GC sweep with a grace period (`blob_deletes:
 | blob takedown > prevents blob from being reuploaded | covered | `moderation::blob_takedown_lifecycle` |
 | blob takedown > prevents image blob from being served. | covered | `moderation::blob_takedown_lifecycle` |
 | blob takedown > restores blob when takedown is removed | covered | `moderation::blob_takedown_lifecycle` |
-| blob takedown > prevents blobs of takendown accounts from being served. | ported | `ref_moderation::takendown_account_blobs_are_served_to_owner_and_admin_only`. `moderation::blob_takedown_lifecycle` lacked the "owner may still fetch" leg; it passes |
+| blob takedown > prevents blobs of takendown accounts from being served. | ported | `ref_moderation::takendown_account_blobs_are_served_to_owner_and_admin_only` |
 
 ### invite-codes.test.ts
 
