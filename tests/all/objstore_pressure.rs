@@ -1,9 +1,7 @@
-//! Object-store pressure during a takeover (bench/results/benchbox-2026-10-02-head,
-//! "Failover: survivors fail-stop after a kill -9"): the survivor opens the
-//! dead node's shards and then gets a cold repo load for every write to
-//! them. Unbounded, each request opened its own connection, the host ran
-//! out of ephemeral ports, lease renewals failed with everything else and
-//! the survivors fail-stopped. Here the store emulates S3 latency and a
+//! Object-store pressure during a takeover: the survivor opens the dead
+//! node's shards and then gets a cold repo load for every write to them.
+//! Unbounded, each request opens its own connection, the host runs out of
+//! ephemeral ports, and lease renewals fail with everything else. Here the store emulates S3 latency and a
 //! host's port budget (requests past it fail like a refused connect); the
 //! survivor must keep its requests in flight bounded (`objlimit`), never
 //! hit the budget, keep its lease, and answer every write.

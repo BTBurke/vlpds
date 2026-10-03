@@ -1,6 +1,6 @@
 //! Repo data from untrusted CARs: a crafted MST deep enough to overflow the
-//! stack used to abort the whole process (load_from_blocks recursion). It is
-//! rejected by both paths that load attacker-chosen CARs: importRepo and the
+//! stack of a recursive loader (aborting the whole process) is rejected by
+//! both paths that load attacker-chosen CARs: importRepo and the
 //! record-proof check behind OAuth `include:` scopes.
 use crate::common::*;
 use vlpds::cbor::{self, key_cmp};

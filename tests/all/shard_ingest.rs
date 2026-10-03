@@ -1,9 +1,7 @@
-//! Single-shard ingest (bench 2026-10-02 §4 "Single-shard ingest stalls at
-//! 10M"): a whole repo lives in one shard, so a huge import pushes all of its
-//! state through one SlateDB. Before the tuning in `partition::open_db` the
-//! fill ran in bursts and then stopped for 4–11 s on memtable backpressure
-//! (L0 full; the compactor only looked every 5 s, and the writer saw the
-//! compacted manifest only on its next 1 s poll).
+//! Single-shard ingest: a whole repo lives in one shard, so a huge import
+//! pushes all of its state through one SlateDB, where memtable backpressure
+//! (L0 full until the compactor and the writer's manifest poll catch up) can
+//! stall writes for seconds (the tuning in `partition::open_db`).
 //!
 //! This drives one shard DB the way the node log's finalizer does (one
 //! `WriteBatch` per segment, `db.write`), with the rows a createRecord

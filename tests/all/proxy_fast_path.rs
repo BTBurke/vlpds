@@ -292,8 +292,8 @@ async fn proxied_requests_in_flight_are_capped_per_account() {
 /// must not keep the upstream connection: a small response is read whole
 /// and its connection pooled at once; a large one is dropped (and its
 /// connection closed) once the client hasn't taken any of it for the
-/// write-stall deadline. Before, both held a pooled AppView connection for
-/// as long as the client kept the socket open.
+/// write-stall deadline, rather than holding a pooled AppView connection for
+/// as long as the client keeps the socket open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unread_proxied_responses_free_upstream_connections() {
     use tokio::io::AsyncWriteExt;
