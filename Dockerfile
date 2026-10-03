@@ -27,6 +27,8 @@ FROM rust:1.98.1-bookworm AS build
 # Extra cargo features, e.g. --build-arg VLPDS_FEATURES=profiling for
 # --pyroscope-url (continuous CPU profiles).
 ARG VLPDS_FEATURES=""
+# vlpds_build_info's rev label: the build context has no .git to describe.
+ARG VLPDS_GIT_REV=""
 
 # cmake/clang: aws-lc-sys (rustls) and the vendored libsecp256k1 / jemalloc C builds
 RUN apt-get update \
@@ -45,7 +47,8 @@ COPY --from=ui /src/ui/dist ./ui/dist
 # no debug info in the image (Cargo.toml keeps debug = 1 for local profiling;
 # with debug = 0 cargo also strips std's): ~half the image. Symbols stay, so
 # panics and backtraces still name functions.
-ENV CARGO_PROFILE_RELEASE_DEBUG=0
+ENV CARGO_PROFILE_RELEASE_DEBUG=0 \
+    VLPDS_GIT_REV=${VLPDS_GIT_REV}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \

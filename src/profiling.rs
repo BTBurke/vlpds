@@ -20,7 +20,7 @@ static ON_DEMAND: AtomicBool = AtomicBool::new(false);
 
 /// VLPDS_GIT_REV at build time, else the source tree's `git describe`.
 pub fn git_rev() -> String {
-    if let Some(r) = option_env!("VLPDS_GIT_REV") {
+    if let Some(r) = option_env!("VLPDS_GIT_REV").filter(|r| !r.is_empty()) {
         return r.to_string();
     }
     std::process::Command::new("git")

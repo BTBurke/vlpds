@@ -72,7 +72,7 @@ docker-build tag="vlpds:local":
 
 # Build + push the production image for deploy/ansible's vlpds_image (docker login ghcr.io first; features e.g. profiling)
 docker-push tag=`git rev-parse --short=12 HEAD` image="ghcr.io/jazware/vlpds" platform="linux/amd64" features="":
-    docker buildx build --platform {{platform}} --build-arg VLPDS_FEATURES={{features}} -t {{image}}:{{tag}} --push .
+    docker buildx build --platform {{platform}} --build-arg VLPDS_FEATURES={{features}} --build-arg VLPDS_GIT_REV=`git rev-parse --short=12 HEAD` -t {{image}}:{{tag}} --push .
 
 # Observability stack for load tests (bench/obs/README.md): Prometheus (1 s scrapes) :9090,
 # Grafana (vlpds dashboard, anonymous admin) :3300, Pyroscope :4040, all on 127.0.0.1
