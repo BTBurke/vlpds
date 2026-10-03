@@ -261,14 +261,14 @@ async fn check_and_rebuild_repo() {
 
     // break M/: one node gone, one stray; c/ loses an entry
     let Ok(p) = s.app.partition(&a.did) else { panic!("not owned") };
-    let prefix = vlpds::state::mst_node_prefix(&a.did);
+    let prefix = vlpds::state::mst_node_prefix(&a.did, 0);
     let first = {
         let mut it = p.db.scan(prefix.clone()..vlpds::state::prefix_end(&prefix)).await.unwrap();
         it.next().await.unwrap().unwrap().key
     };
     p.db.delete(first).await.unwrap();
     let stray = Cid::dag_cbor(b"\xa0");
-    p.db.put(vlpds::state::mst_node_key(&a.did, &stray), b"\xa0".to_vec()).await.unwrap();
+    p.db.put(vlpds::state::mst_node_key(&a.did, 0, &stray), b"\xa0".to_vec()).await.unwrap();
     let (r, out) = admin_cli(u, &["check-repo", &a.did]).await;
     assert!(r.unwrap_err().to_string().contains("2 problem(s)"), "{out}");
     assert!(out.contains("1 persisted MST node(s) missing") && out.contains("1 persisted MST node(s) not in the tree"), "{out}");
@@ -307,7 +307,7 @@ async fn check_and_rebuild_repo() {
     assert_eq!(s.list_records(&a.did, "app.bsky.feed.post", &[("limit", "5")]).await.ok()["records"].as_array().unwrap().len(), 5);
 
     // a lost record: the check says so, and rebuild refuses
-    let rprefix = vlpds::state::record_prefix(&a.did);
+    let rprefix = vlpds::state::record_prefix(&a.did, 0);
     let rec = {
         let mut it = p.db.scan(rprefix.clone()..vlpds::state::prefix_end(&rprefix)).await.unwrap();
         it.next().await.unwrap().unwrap().key

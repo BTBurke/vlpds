@@ -30,8 +30,8 @@ pub fn count_tree(tree: &Tree) -> Result<(u64, u64), MstError> {
 }
 
 /// Records and the tree rebuilt from them (`R/`), distinct blob CIDs (`b/`).
-pub async fn walk<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str) -> anyhow::Result<RepoStats> {
-    let prefix = state::record_prefix(did);
+pub async fn walk<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64) -> anyhow::Result<RepoStats> {
+    let prefix = state::record_prefix(did, gen);
     let mut it = state::BatchedScan::new(db.scan(prefix.clone()..state::prefix_end(&prefix)).await?);
     let mut recs = Vec::new();
     while let Some(kv) = it.next().await? {
@@ -40,7 +40,7 @@ pub async fn walk<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str) -> a
     }
     let tree = tokio::task::spawn_blocking(move || crate::mst_lazy::build_tree(&recs)).await??;
     let (records, nodes) = count_tree(&tree)?;
-    let bprefix = state::blob_ref_prefix(did);
+    let bprefix = state::blob_ref_prefix(did, gen);
     let mut it = db.scan(bprefix.clone()..state::prefix_end(&bprefix)).await?;
     let mut blobs = HashSet::new();
     while let Some(kv) = it.next().await? {

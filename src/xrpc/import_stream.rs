@@ -1,21 +1,38 @@
 //! importRepo's body, parsed as it arrives when the CAR is in the
 //! streamable block order (src/car_order.rs): one pass verifies the commit
 //! block, every node's and record's CID, and key order, holding only the
-//! nodes on the path from the root, and builds the tree as records arrive.
-//! Anything else (another order, a malformed or refused CAR) falls back to
-//! the buffered [`parse_import`] of the whole body. The fast path accepts
-//! only CARs that one accepts, with the same records and tree, so the result
-//! and every error are the buffered parse's.
+//! nodes on the path from the root, and hands the records out in batches as
+//! they arrive (to `staged_import`, which stages them), with the canonical
+//! tree rebuilt alongside by a [`StreamBuilder`] (one open node per height).
+//! The rebuilt root must be the commit's `data`, which proves every node
+//! streamed was the canonical one. Anything else (another order, a
+//! malformed or refused CAR) voids what was handed out ([`Item::Restart`])
+//! and falls back to the buffered [`parse_import`] of the whole body, which
+//! reports the error or hands the records out again. So both paths accept
+//! exactly the same CARs with the same records and tree.
+//!
+//! The body is kept for that fallback: in memory up to [`SPILL_AFTER`],
+//! then in a temporary file, so a big streamed import holds only what its
+//! batches in flight reference.
 
 use super::repo::{imported_record_blobs, parse_import, ImportedRecord};
 use super::*;
 use crate::car_order::{Next, Walk};
-use crate::mst::{self, Tree};
+use crate::mst::{self, Node};
+use crate::mst_lazy::StreamBuilder;
 use futures::StreamExt;
+use std::io::{Read, Write as _};
 use tokio::sync::mpsc;
 
 /// Chunks queued for the parser: hyper's are up to a few hundred KB.
 const QUEUE: usize = 32;
+/// A batch is handed out at this many records or record bytes.
+const BATCH_RECORDS: usize = 4096;
+const BATCH_BYTES: usize = 4 << 20;
+/// Batches parsed ahead of the one being staged.
+const ITEMS_AHEAD: usize = 2;
+/// Bodies up to this size stay in memory for the fallback.
+pub(super) const SPILL_AFTER: usize = 16 << 20;
 
 fn too_large(max: usize) -> XrpcError {
     XrpcError {
@@ -25,8 +42,27 @@ fn too_large(max: usize) -> XrpcError {
     }
 }
 
-/// Reads the body (at most `max` bytes) and parses it off the async runtime.
-pub(super) async fn read(body: Body, headers: &HeaderMap, max: usize) -> XResult<(Vec<ImportedRecord>, Tree)> {
+/// What the parse hands out, in order; an error ends it.
+pub(super) enum Item {
+    /// Records in key order, and the tree's persisted nodes (height >= 1)
+    /// finished meanwhile.
+    Batch { records: Vec<ImportedRecord>, nodes: Vec<(Cid, Arc<[u8]>)> },
+    /// Everything handed out so far is void: the buffered parse follows.
+    Restart,
+    /// The whole repo was handed out: the root's block (its CID is the
+    /// commit's `data`), the counts, and which parse took it.
+    Done { root: Bytes, records: u64, nodes: u64, path: &'static str },
+}
+
+enum Chunk {
+    Data(Bytes),
+    End,
+    Fail(XrpcError),
+}
+
+/// Reads the body (at most `max` bytes) and parses it on the blocking pool;
+/// the items arrive on the receiver, at most [`ITEMS_AHEAD`] ahead.
+pub(super) fn start(body: Body, headers: &HeaderMap, max: usize) -> XResult<mpsc::Receiver<XResult<Item>>> {
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -34,85 +70,172 @@ pub(super) async fn read(body: Body, headers: &HeaderMap, max: usize) -> XResult
     if declared.is_some_and(|n| n > max as u64) {
         return Err(too_large(max));
     }
-    // None marks the end of the body; a closed channel without it, an abort
-    let (tx, rx) = mpsc::channel::<Option<Bytes>>(QUEUE);
-    let parser = tokio::task::spawn_blocking(move || parse(rx));
-    let mut stream = body.into_data_stream();
-    let mut total = 0usize;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| XrpcError::bad("InvalidRequest", format!("error reading body: {e}")))?;
-        total += chunk.len();
-        if total > max {
-            return Err(too_large(max));
+    let (tx, rx) = mpsc::channel::<Chunk>(QUEUE);
+    let (items_tx, items_rx) = mpsc::channel(ITEMS_AHEAD);
+    tokio::task::spawn_blocking(move || parse(rx, items_tx));
+    tokio::spawn(async move {
+        let mut stream = body.into_data_stream();
+        let mut total = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(Chunk::Fail(XrpcError::bad("InvalidRequest", format!("error reading body: {e}")))).await;
+                    return;
+                }
+            };
+            total += chunk.len();
+            if total > max {
+                let _ = tx.send(Chunk::Fail(too_large(max))).await;
+                return;
+            }
+            if !chunk.is_empty() && tx.send(Chunk::Data(chunk)).await.is_err() {
+                return;
+            }
         }
-        if !chunk.is_empty() && tx.send(Some(chunk)).await.is_err() {
-            break;
-        }
-    }
-    let _ = tx.send(None).await;
-    let (r, path) = parser.await.map_err(XrpcError::from_err)?;
-    metrics::IMPORT_REPO_PARSES.with_label_values(&[path]).inc();
-    r
+        let _ = tx.send(Chunk::End).await;
+    });
+    Ok(items_rx)
 }
 
-/// The parse and which path took it (`stream` or `buffered`).
-fn parse(rx: mpsc::Receiver<Option<Bytes>>) -> (XResult<(Vec<ImportedRecord>, Tree)>, &'static str) {
-    let mut input = Input { rx, chunks: Vec::new(), at: 0, off: 0, avail: 0, end: End::Open };
-    if let Some(r) = stream(&mut input) {
-        return (Ok(r), "stream");
+/// Why the single pass stopped early.
+enum Stop {
+    /// A departure from the order, or anything the buffered parse would
+    /// refuse (it then reports why).
+    Depart,
+    /// The receiver is gone (the import failed).
+    Gone,
+}
+
+/// Batches records and builds the tree as they come.
+struct Sink<'a> {
+    tx: &'a mpsc::Sender<XResult<Item>>,
+    builder: StreamBuilder,
+    records: Vec<ImportedRecord>,
+    nodes: Vec<(Cid, Arc<[u8]>)>,
+    bytes: usize,
+    sent: bool,
+}
+
+impl<'a> Sink<'a> {
+    fn new(tx: &'a mpsc::Sender<XResult<Item>>) -> Self {
+        Sink { tx, builder: StreamBuilder::default(), records: Vec::new(), nodes: Vec::new(), bytes: 0, sent: false }
     }
-    let r = match input.rest() {
-        Some(body) => parse_import(&body),
-        None => Err(XrpcError::bad("InvalidRequest", "request body aborted")),
+
+    fn record(&mut self, r: ImportedRecord) -> Result<(), Stop> {
+        let key: crate::mst_lazy::Key = Arc::from(r.0.as_bytes());
+        self.builder.push(key, r.1, &mut self.nodes).map_err(|_| Stop::Depart)?;
+        self.bytes += r.2.len();
+        self.records.push(r);
+        if self.records.len() >= BATCH_RECORDS || self.bytes >= BATCH_BYTES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), Stop> {
+        if self.records.is_empty() && self.nodes.is_empty() {
+            return Ok(());
+        }
+        let item = Item::Batch { records: std::mem::take(&mut self.records), nodes: std::mem::take(&mut self.nodes) };
+        self.bytes = 0;
+        self.sent = true;
+        self.tx.blocking_send(Ok(item)).map_err(|_| Stop::Gone)
+    }
+}
+
+/// The parse thread: the single pass, else the buffered parse.
+fn parse(rx: mpsc::Receiver<Chunk>, tx: mpsc::Sender<XResult<Item>>) {
+    let mut input = Input::new(rx);
+    let mut sink = Sink::new(&tx);
+    let sent = match stream(&mut input, &mut sink) {
+        Ok((root, records, nodes)) => {
+            let _ = tx.blocking_send(Ok(Item::Done { root, records, nodes, path: "stream" }));
+            return;
+        }
+        Err(Stop::Gone) => return,
+        Err(Stop::Depart) => sink.sent,
     };
-    (r, "buffered")
+    if sent && tx.blocking_send(Ok(Item::Restart)).is_err() {
+        return;
+    }
+    let _one = futures::executor::block_on(super::staged_import::BUFFERED.acquire()).expect("never closed");
+    let r = input.rest().and_then(|body| {
+        let (records, tree) = parse_import(&body)?;
+        drop(tree);
+        Ok(records)
+    });
+    let records = match r {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.blocking_send(Err(e));
+            return;
+        }
+    };
+    let mut sink = Sink::new(&tx);
+    for r in records {
+        if sink.record(r).is_err() {
+            return;
+        }
+    }
+    // the buffered parse checked the tree: this rebuilds the same root
+    let records = sink.builder.records;
+    let (root, nodes) = match std::mem::take(&mut sink.builder).finish(&mut sink.nodes) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tx.blocking_send(Err(XrpcError::from_err(e)));
+            return;
+        }
+    };
+    if sink.flush().is_err() {
+        return;
+    }
+    let root = root.bytes.as_deref().map(Bytes::copy_from_slice).unwrap_or_default();
+    let _ = tx.blocking_send(Ok(Item::Done { root, records, nodes, path: "buffered" }));
 }
 
-/// The single pass; None on any departure from the order, or anything the
-/// buffered parse would refuse (it then reports why).
-fn stream(input: &mut Input) -> Option<(Vec<ImportedRecord>, Tree)> {
-    let hlen = input.varint()?;
-    let header = input.take(usize::try_from(hlen).ok()?)?;
-    let roots = car::read_header(&header).ok()?;
-    let [root] = roots[..] else { return None };
-    let (c, commit) = input.block()?;
+/// The single pass, handing records to `sink`.
+fn stream(input: &mut Input, sink: &mut Sink) -> Result<(Bytes, u64, u64), Stop> {
+    let hlen = input.varint().ok_or(Stop::Depart)?;
+    let header = input.take(usize::try_from(hlen).map_err(|_| Stop::Depart)?).ok_or(Stop::Depart)?;
+    let roots = car::read_header(&header).map_err(|_| Stop::Depart)?;
+    let [root] = roots[..] else { return Err(Stop::Depart) };
+    let (c, commit) = input.block().ok_or(Stop::Depart)?;
     if c != root {
-        return None;
+        return Err(Stop::Depart);
     }
-    let commit = Value::decode(&commit).ok()?;
+    let commit = Value::decode(&commit).map_err(|_| Stop::Depart)?;
     if !matches!(commit.get("version"), Some(Value::Int(2 | 3))) {
-        return None;
+        return Err(Stop::Depart);
     }
-    let Some(Value::Link(data)) = commit.get("data") else { return None };
+    let Some(Value::Link(data)) = commit.get("data") else { return Err(Stop::Depart) };
     let data = *data;
     let mut walk = Walk::new(data);
-    let mut tree = Tree::new();
-    let mut records: Vec<ImportedRecord> = Vec::new();
     let mut prev: Option<Arc<[u8]>> = None;
     loop {
         match walk.next() {
             Next::Node(want) => {
-                let (c, b) = input.block()?;
+                let (c, b) = input.block().ok_or(Stop::Depart)?;
                 if c != want {
-                    return None;
+                    return Err(Stop::Depart);
                 }
-                walk.enter(mst::decode_node(&b, c).ok()?).ok()?;
+                let n: Node = mst::decode_node(&b, c).map_err(|_| Stop::Depart)?;
+                walk.enter(n).map_err(|_| Stop::Depart)?;
             }
             Next::Record { key, cid } => {
                 if prev.as_ref().is_some_and(|p| key <= *p) {
-                    return None;
+                    return Err(Stop::Depart);
                 }
-                let path = std::str::from_utf8(&key).ok()?;
+                let path = std::str::from_utf8(&key).map_err(|_| Stop::Depart)?;
                 if !super::syntax::valid_record_path(path) {
-                    return None;
+                    return Err(Stop::Depart);
                 }
-                let (c, b) = input.block()?;
+                let (c, b) = input.block().ok_or(Stop::Depart)?;
                 if c != cid {
-                    return None;
+                    return Err(Stop::Depart);
                 }
-                let blobs = imported_record_blobs(path, &b).ok()?;
-                tree.insert_no_proof(&key, cid).ok()?;
-                records.push((path.to_string(), cid, b, blobs));
+                let blobs = imported_record_blobs(path, &b).map_err(|_| Stop::Depart)?;
+                sink.record((path.to_string(), cid, b, blobs))?;
                 prev = Some(key);
             }
             Next::Done => break,
@@ -120,14 +243,19 @@ fn stream(input: &mut Input) -> Option<(Vec<ImportedRecord>, Tree)> {
     }
     // The tree rebuilt from the records reproduces `data` only if every node
     // streamed was the canonical one: the same tree the buffered parse loads.
-    if tree.root_cid().ok()? != data {
-        return None;
+    let builder = std::mem::take(&mut sink.builder);
+    let records = builder.records;
+    let (root, nodes) = builder.finish(&mut sink.nodes).map_err(|_| Stop::Depart)?;
+    if root.cid != Some(data) {
+        return Err(Stop::Depart);
     }
     // further blocks are only checked against their CIDs, as there
     while !input.at_end() {
-        input.block()?;
+        input.block().ok_or(Stop::Depart)?;
     }
-    Some((records, tree))
+    sink.flush()?;
+    let block = root.bytes.as_deref().map(Bytes::copy_from_slice).ok_or(Stop::Depart)?;
+    Ok((block, records, nodes))
 }
 
 #[derive(PartialEq)]
@@ -137,37 +265,104 @@ enum End {
     Aborted,
 }
 
-/// The body as received so far, kept whole for a fallback; a block within
-/// one chunk is a slice of it.
+/// The body as received so far, kept whole for a fallback: in memory (a
+/// block within one chunk is a slice of it), or once over [`SPILL_AFTER`]
+/// in a temporary file, the chunks read past dropped.
 struct Input {
-    rx: mpsc::Receiver<Option<Bytes>>,
+    rx: mpsc::Receiver<Chunk>,
     chunks: Vec<Bytes>,
     /// Read position: chunk index and offset in it.
     at: usize,
     off: usize,
     /// Bytes received past the read position.
     avail: usize,
+    received: usize,
     end: End,
+    /// Why the body ended early (the pump's error).
+    fail: Option<XrpcError>,
+    spill: Option<Spill>,
+}
+
+/// An unlinked-on-drop temporary file holding the body.
+struct Spill {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+impl Drop for Spill {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl Input {
+    fn new(rx: mpsc::Receiver<Chunk>) -> Input {
+        Input { rx, chunks: Vec::new(), at: 0, off: 0, avail: 0, received: 0, end: End::Open, fail: None, spill: None }
+    }
+
     fn recv(&mut self) -> bool {
         if self.end != End::Open {
             return false;
         }
         match self.rx.blocking_recv() {
-            Some(Some(c)) => {
+            Some(Chunk::Data(c)) => {
                 self.avail += c.len();
+                self.received += c.len();
+                if let Some(s) = &mut self.spill {
+                    if s.file.write_all(&c).is_err() {
+                        self.spill_failed();
+                        return false;
+                    }
+                }
                 self.chunks.push(c);
+                if self.spill.is_none() && self.received > SPILL_AFTER {
+                    self.start_spill();
+                }
+                self.drop_read();
                 true
             }
-            Some(None) => {
+            Some(Chunk::End) => {
                 self.end = End::Done;
+                false
+            }
+            Some(Chunk::Fail(e)) => {
+                self.fail = Some(e);
+                self.end = End::Aborted;
                 false
             }
             None => {
                 self.end = End::Aborted;
                 false
+            }
+        }
+    }
+
+    fn start_spill(&mut self) {
+        let path = std::env::temp_dir().join(format!("vlpds-import-{:016x}.car", rand::random::<u64>()));
+        let opened = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path);
+        let Ok(file) = opened else { return self.spill_failed() };
+        let mut s = Spill { file, path };
+        for c in &self.chunks {
+            if s.file.write_all(c).is_err() {
+                return self.spill_failed();
+            }
+        }
+        self.spill = Some(s);
+    }
+
+    /// Without a file the body can't be kept for a fallback past the
+    /// memory bound: the import fails rather than hold it.
+    fn spill_failed(&mut self) {
+        self.spill = None;
+        self.fail = Some(XrpcError::internal("could not buffer the import body"));
+        self.end = End::Aborted;
+    }
+
+    /// Spilled: the chunks before the read position are in the file only.
+    fn drop_read(&mut self) {
+        if self.spill.is_some() {
+            for c in &mut self.chunks[..self.at] {
+                *c = Bytes::new();
             }
         }
     }
@@ -240,22 +435,27 @@ impl Input {
         car::block_matches(&c, &data).then_some((c, data))
     }
 
-    /// The whole body; None if it was aborted.
-    fn rest(mut self) -> Option<Bytes> {
+    /// The whole body.
+    fn rest(mut self) -> XResult<Bytes> {
         while self.recv() {}
         if self.end == End::Aborted {
-            return None;
+            return Err(self.fail.take().unwrap_or_else(|| XrpcError::bad("InvalidRequest", "request body aborted")));
+        }
+        if let Some(mut s) = self.spill.take() {
+            let mut out = Vec::with_capacity(self.received);
+            let read = std::io::Seek::rewind(&mut s.file).and_then(|_| s.file.read_to_end(&mut out));
+            read.map_err(|e| XrpcError::internal(format!("reading back the import body: {e}")))?;
+            return Ok(Bytes::from(out));
         }
         if self.chunks.len() == 1 {
-            return self.chunks.pop();
+            return Ok(self.chunks.pop().expect("one chunk"));
         }
-        let total = self.chunks.iter().map(Bytes::len).sum();
-        let mut out = Vec::with_capacity(total);
+        let mut out = Vec::with_capacity(self.received);
         // freed as copied, so the copy adds little
         for c in self.chunks.drain(..) {
             out.extend_from_slice(&c);
         }
-        Some(Bytes::from(out))
+        Ok(Bytes::from(out))
     }
 }
 
@@ -264,6 +464,7 @@ mod tests {
     use super::*;
     use crate::cbor::key_cmp;
     use std::collections::HashMap;
+    use crate::mst::Tree;
 
     struct Repo {
         commit: (Cid, Vec<u8>),
@@ -336,25 +537,59 @@ mod tests {
         }
     }
 
-    /// Feeds `car` in chunks of `chunk` bytes, as a request body would.
-    fn run(car: &[u8], chunk: usize) -> (XResult<(Vec<ImportedRecord>, Tree)>, &'static str) {
+    type Parsed = XResult<(Vec<ImportedRecord>, Cid)>;
+
+    /// Feeds `car` in chunks of `chunk` bytes, as a request body would, and
+    /// collects what the parse hands out: the records (those before a
+    /// restart dropped), the root, the path. Also checks the batches' nodes
+    /// are the persisted nodes of the tree.
+    fn run(car: &[u8], chunk: usize) -> (Parsed, &'static str) {
         let (tx, rx) = mpsc::channel(car.len() / chunk + 2);
         for c in car.chunks(chunk) {
-            tx.try_send(Some(Bytes::copy_from_slice(c))).unwrap();
+            tx.try_send(Chunk::Data(Bytes::copy_from_slice(c))).ok().unwrap();
         }
-        tx.try_send(None).unwrap();
-        parse(rx)
+        tx.try_send(Chunk::End).ok().unwrap();
+        let (itx, mut irx) = mpsc::channel(1 << 16);
+        parse(rx, itx);
+        let (mut recs, mut nodes) = (Vec::new(), HashMap::new());
+        loop {
+            match irx.try_recv().expect("an item") {
+                Ok(Item::Batch { records, nodes: n }) => {
+                    recs.extend(records);
+                    nodes.extend(n);
+                }
+                Ok(Item::Restart) => {
+                    recs.clear();
+                    nodes.clear();
+                }
+                Ok(Item::Done { root, records, nodes: count, path }) => {
+                    let root_cid = Cid::dag_cbor(&root);
+                    assert_eq!(records as usize, recs.len());
+                    let mut t = Tree::new();
+                    for (p, c, ..) in &recs {
+                        t.insert_no_proof(p.as_bytes(), *c).unwrap();
+                    }
+                    assert_eq!(t.root_cid().unwrap(), root_cid);
+                    assert_eq!(count, crate::repo_stats::count_tree(&t).unwrap().1);
+                    let want = crate::mst_lazy::persisted_nodes(&t, 1);
+                    assert_eq!(nodes.len(), want.len());
+                    assert!(want.keys().all(|c| nodes.contains_key(c)));
+                    return (Ok((recs, root_cid)), path);
+                }
+                Err(e) => return (Err(e), "buffered"),
+            }
+        }
     }
 
-    fn summary(r: &XResult<(Vec<ImportedRecord>, Tree)>) -> Result<(Vec<ImportedRecord>, Cid), String> {
+    fn summary(r: &Parsed) -> Result<(Vec<ImportedRecord>, Cid), String> {
         match r {
-            Ok((recs, t)) => Ok((recs.clone(), t.clone().root_cid().unwrap())),
+            Ok(v) => Ok(v.clone()),
             Err(e) => Err(format!("{} {}: {}", e.status, e.error, e.message)),
         }
     }
 
     fn buffered(car: &[u8]) -> Result<(Vec<ImportedRecord>, Cid), String> {
-        summary(&parse_import(&Bytes::copy_from_slice(car)))
+        summary(&parse_import(&Bytes::copy_from_slice(car)).map(|(r, mut t)| (r, t.root_cid().unwrap())))
     }
 
     /// A streamed CAR takes the fast path at any chunking (blocks split

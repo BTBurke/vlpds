@@ -122,6 +122,69 @@ fn build(recs: &[(Key, Cid)], heights: &[i32], height: i32, keep_leaves: bool) -
     finish(height, entries, keep_leaves)
 }
 
+/// The canonical tree of records pushed in ascending key order, as
+/// [`build_tree`] builds it, holding only one open node per height: a key of
+/// height h closes every open node below h (its run of lower keys ends
+/// there), each becoming a child of the node above. So a node is finished,
+/// counted and handed out as soon as it is complete, and memory is the
+/// tree's right spine whatever the repo's size (a staged import,
+/// `xrpc::staged_import`).
+#[derive(Default)]
+pub struct StreamBuilder {
+    open: Vec<Vec<Entry>>,
+    /// Nodes with entries finished so far (`count_tree`'s count).
+    pub nodes: u64,
+    pub records: u64,
+}
+
+impl StreamBuilder {
+    /// `key` must be above every key pushed before. Finished nodes of
+    /// height >= 1 (the persisted ones) go to `out`.
+    pub fn push(&mut self, key: Key, val: Cid, out: &mut Vec<(Cid, Arc<[u8]>)>) -> Result<()> {
+        let h = height_for_key(&key) as usize;
+        if h > 4 * MAX_DEPTH {
+            return Err(MstError::Invalid("key too high"));
+        }
+        while self.open.len() <= h {
+            self.open.push(Vec::new());
+        }
+        for l in 0..h {
+            self.close(l, out)?;
+        }
+        self.open[h].push(Entry::Value { key, val });
+        self.records += 1;
+        Ok(())
+    }
+
+    fn close(&mut self, l: usize, out: &mut Vec<(Cid, Arc<[u8]>)>) -> Result<()> {
+        if self.open[l].is_empty() {
+            return Ok(());
+        }
+        let n = finish(l as i32, std::mem::take(&mut self.open[l]), false)?;
+        self.nodes += 1;
+        let cid = n.cid.ok_or(MstError::Invalid("unwritten node"))?;
+        if let Some(b) = &n.bytes {
+            out.push((cid, b.clone()));
+        }
+        self.open[l + 1].push(Entry::Child { node: None, cid: Some(cid) });
+        Ok(())
+    }
+
+    /// The root (its block kept whatever its height) and the tree's node
+    /// count; a root of height >= 1 goes to `out` too.
+    pub fn finish(mut self, out: &mut Vec<(Cid, Arc<[u8]>)>) -> Result<(Arc<Node>, u64)> {
+        let Some(top) = self.open.len().checked_sub(1) else { return Ok((finish(0, Vec::new(), true)?, 0)) };
+        for l in 0..top {
+            self.close(l, out)?;
+        }
+        let root = finish(top as i32, std::mem::take(&mut self.open[top]), true)?;
+        if top >= 1 {
+            out.push((root.cid.ok_or(MstError::Invalid("unwritten node"))?, root.bytes.clone().ok_or(MstError::Invalid("root without its block"))?));
+        }
+        Ok((root, self.nodes + 1))
+    }
+}
+
 /// From all of a repo's records, sorted.
 pub fn build_tree(recs: &[(Key, Cid)]) -> Result<Tree> {
     let heights: Vec<i32> = recs.iter().map(|(k, _)| height_for_key(k)).collect();
@@ -1069,5 +1132,43 @@ impl Source for MemStore {
         let hi = hi.map_or(Bound::Unbounded, Bound::Excluded);
         out.extend(self.records.range::<[u8], _>((lo, hi)).map(|(k, c)| (k.clone(), *c)));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The streamed build is `build_tree`'s tree: same root, node count and
+    /// persisted nodes, whatever the sizes and key heights.
+    #[test]
+    fn stream_builder_matches_build_tree() {
+        for n in [0usize, 1, 2, 3, 5, 17, 100, 1000, 5000] {
+            let mut recs: Vec<(Key, Cid)> = (0..n)
+                .map(|i| {
+                    let k = format!("app.test.c{}/{:08}", i % 3, i.wrapping_mul(2654435761) % 100_000_000);
+                    (Key::from(k.as_bytes()), Cid::dag_cbor(k.as_bytes()))
+                })
+                .collect();
+            recs.sort();
+            recs.dedup_by(|a, b| a.0 == b.0);
+            let mut tree = build_tree(&recs).unwrap();
+            let mut sb = StreamBuilder::default();
+            let mut out = Vec::new();
+            for (k, c) in &recs {
+                sb.push(k.clone(), *c, &mut out).unwrap();
+            }
+            let (root, nodes) = sb.finish(&mut out).unwrap();
+            assert_eq!(root.cid, Some(tree.root_cid().unwrap()), "n={n}");
+            assert_eq!(nodes, crate::repo_stats::count_tree(&tree).unwrap().1, "n={n}");
+            let want = persisted_nodes(&tree, 1);
+            let got: HashMap<Cid, Arc<[u8]>> = out.into_iter().collect();
+            assert_eq!(got.len(), want.len(), "n={n}");
+            for (c, b) in &want {
+                assert_eq!(got.get(c).map(|b| &b[..]), Some(&b[..]), "n={n}");
+            }
+            let block = root.bytes.clone().unwrap();
+            assert_eq!(Cid::dag_cbor(&block), root.cid.unwrap());
+        }
     }
 }

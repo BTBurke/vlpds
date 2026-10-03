@@ -85,12 +85,12 @@ fn commit_frame() -> (Vec<u8>, Cid, Vec<u8>, vlpds::tid::Tid) {
 
 fn segment_plain() -> Vec<u8> {
     let (frame, ..) = commit_frame();
-    let derived = segment::derive_commit_muts(&frame).unwrap();
+    let derived = segment::derive_commit_muts(&frame, 2).unwrap();
     let mut muts = derived.clone();
     muts.push(Mutation { key: Bytes::from(vlpds::state::collection_key("app.bsky.feed.post", DID)), val: Some(Bytes::new()) });
     let m = |k: &str, v: Option<&str>| Mutation { key: Bytes::from(k.to_string()), val: v.map(|v| Bytes::from(v.to_string())) };
     let mut b = SegmentBuilder::for_log(LOG);
-    b.push_derived(1000 << 8, ShardId(3), 7, |o| o.extend_from_slice(&frame), &muts, derived.len());
+    b.push_derived(1000 << 8, ShardId(3), 7, |o| o.extend_from_slice(&frame), &muts, derived.len(), 2);
     b.push(1001 << 8, ShardId(70_000), 1, |o| o.extend_from_slice(b"not a frame"), &[m("k-put", Some("v")), m("k-del", None)]);
     b.push(1002 << 8, ShardId(3), 7, |_| {}, &[]);
     b.seal(LOG, 5, 4)
@@ -108,9 +108,9 @@ fn segment_like() -> Vec<u8> {
     let (rec, commit, _, car) = commit_car(&like_record());
     let ops = [vlpds::events::RepoOp { action: "create", path: "app.bsky.feed.like/3l3qo2vutsw2b", cid: Some(rec), prev: None }];
     let bytes = finish_commit("3l3qo2vutsw2c", commit, &car, &ops, 1010 << 8);
-    let derived = segment::derive_commit_muts(&bytes).unwrap();
+    let derived = segment::derive_commit_muts(&bytes, 0).unwrap();
     let mut b = SegmentBuilder::for_log(LOG);
-    b.push_derived(1010 << 8, ShardId(3), 7, |o| o.extend_from_slice(&bytes), &derived, derived.len());
+    b.push_derived(1010 << 8, ShardId(3), 7, |o| o.extend_from_slice(&bytes), &derived, derived.len(), 0);
     b.seal(LOG, 6, 6)
 }
 
@@ -122,7 +122,7 @@ fn backlinks() -> Vec<u8> {
     let k: BTreeMap<&str, String> = [
         ("record", hex::encode(&rec)),
         ("link", hex::encode(&link)),
-        ("key bl/", hex::encode(vlpds::state::backlink_key(DID, &link))),
+        ("key bl/", hex::encode(vlpds::state::backlink_key(DID, 0, &link))),
         ("value", hex::encode(vlpds::backlinks::encode(&rkeys))),
     ]
     .into_iter()
@@ -153,6 +153,7 @@ fn account() -> vlpds::state::Account {
         status: Some("deactivated".into()),
         email: Some("fixture@example.com".into()),
         email_confirmed: true,
+        repo_gen: 2,
         pending_signing_key: None,
         extra: Default::default(),
     };
@@ -175,12 +176,13 @@ fn keys() -> Vec<u8> {
         ("head h/", state::head_key(DID)),
         ("account a/", state::account_key(DID)),
         ("handle", state::handle_key(DID, "fixture.test")),
-        ("record R/", state::record_key(DID, "app.bsky.feed.post/1")),
-        ("record cid c/", state::record_cid_key(DID, &cid, "app.bsky.feed.post/1")),
+        ("record R/", state::record_key(DID, 300, "app.bsky.feed.post/1")),
+        ("record cid c/", state::record_cid_key(DID, 300, &cid, "app.bsky.feed.post/1")),
         ("collection C/", state::collection_key("app.bsky.feed.post", DID)),
-        ("blob ref b/", state::blob_ref_key(DID, &cid, "app.bsky.feed.post/1")),
+        ("blob ref b/", state::blob_ref_key(DID, 300, &cid, "app.bsky.feed.post/1")),
+        ("import G/", state::import_key(DID)),
         ("private p/", state::private_key(DID, "session/abc")),
-        ("mst node M/", state::mst_node_key(DID, &cid)),
+        ("mst node M/", state::mst_node_key(DID, 300, &cid)),
     ]
     .into_iter()
     .map(|(n, k)| (n, hex::encode(k)))
@@ -363,9 +365,9 @@ fn slatedb_rows() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     let h = head();
     vec![
         (vlpds::state::head_key(DID), Some(h.encode().to_vec())),
-        (vlpds::state::record_key(DID, "app.bsky.feed.post/1"), Some(vlpds::state::record_value(&h.data, h.rev.0, b"\xa1aa\x01").to_vec())),
+        (vlpds::state::record_key(DID, 0, "app.bsky.feed.post/1"), Some(vlpds::state::record_value(&h.data, h.rev.0, b"\xa1aa\x01").to_vec())),
         (vlpds::state::collection_key("app.bsky.feed.post", DID), Some(Vec::new())),
-        (vlpds::state::record_key(DID, "app.bsky.feed.post/2"), None),
+        (vlpds::state::record_key(DID, 0, "app.bsky.feed.post/2"), None),
     ]
 }
 
@@ -533,7 +535,7 @@ fn reseal(h: &segment::SegHeader, entries: &[segment::SegEntry], level: u32) -> 
     let mut sb = SegmentBuilder::for_log_at(&h.log_id, level);
     for e in entries {
         let frame = e.frame.clone();
-        sb.push_derived(e.seq, e.shard, e.epoch, |o| o.extend_from_slice(&frame), &e.muts, e.derived);
+        sb.push_derived(e.seq, e.shard, e.epoch, |o| o.extend_from_slice(&frame), &e.muts, e.derived, e.gen);
     }
     sb.seal(&h.log_id, h.ordinal, h.prefix_end)
 }
@@ -580,7 +582,7 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             let hx = |n: &str| hex::decode(&k[n]).unwrap();
             let link = vlpds::backlinks::link("app.bsky.feed.like", &hx("record")).unwrap();
             assert_eq!(link, hx("link"));
-            assert_eq!(vlpds::state::backlink_key(DID, &link), hx("key bl/"));
+            assert_eq!(vlpds::state::backlink_key(DID, 0, &link), hx("key bl/"));
             assert_eq!(vlpds::state::key_slot(&hx("key bl/")), Some(vlpds::slots::slot_of(DID)));
             let v = vlpds::backlinks::decode(&hx("value"));
             assert_eq!(v.len(), 2);

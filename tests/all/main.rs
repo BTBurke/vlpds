@@ -122,6 +122,7 @@ mod shard_ingest;
 mod shrike_adopt;
 mod signature_faults;
 mod smtp_mail;
+mod staged_import;
 mod subscribe_repos;
 mod sync11_property;
 mod sync;

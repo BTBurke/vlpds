@@ -691,7 +691,7 @@ mod tests {
                 let (atx, arx) = tokio::sync::oneshot::channel();
                 let e = nodelog::LogEntry {
                     shard: ShardId(3),
-                    frames: vec![crate::events::Frame { prefix: format!("e{i}").into_bytes(), suffix: Vec::new(), derived_muts: 0 }],
+                    frames: vec![crate::events::Frame { prefix: format!("e{i}").into_bytes(), suffix: Vec::new(), derived_muts: 0, derived_gen: 0 }],
                     muts: vec![Mutation { key: Bytes::from(format!("k{i}")), val: Some(Bytes::from_static(b"v")) }],
                     ack: Some(Box::new(move |r| {
                         let _ = atx.send(r.is_ok());

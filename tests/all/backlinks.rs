@@ -52,7 +52,7 @@ async fn check_backlinks(s: &TestServer, did: &str) -> u64 {
 /// The repo's `bl/` entries, raw.
 async fn scan_backlinks(s: &TestServer, did: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     let Ok(p) = s.app.partition(did) else { panic!("shard of {did} not owned") };
-    let prefix = vlpds::state::backlink_prefix(did);
+    let prefix = vlpds::state::backlink_prefix(did, s.app.repo_gen(did).await.ok().unwrap());
     let mut it = p.db.scan(prefix.clone()..vlpds::state::prefix_end(&prefix)).await.unwrap();
     let mut out = Vec::new();
     while let Some(kv) = it.next().await.unwrap() {

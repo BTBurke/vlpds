@@ -20,6 +20,7 @@ pub(crate) mod proxy;
 mod ratelimits;
 mod repo;
 mod import_stream;
+pub mod staged_import;
 mod server;
 mod ctl_load;
 mod sync;
@@ -145,6 +146,41 @@ impl App {
         let v = p.db.get(state::account_key(did)).await.map_err(XrpcError::from_err)?;
         let v = v.ok_or_else(|| XrpcError::bad("AccountNotFound", format!("no account {did}")))?;
         serde_json::from_slice(&v).map_err(XrpcError::from_err)
+    }
+
+    /// The generation the repo's rows are under (0 without an account).
+    pub async fn repo_gen(&self, did: &str) -> Result<u64, XrpcError> {
+        match self.account(did).await {
+            Ok(a) => Ok(a.repo_gen),
+            Err(e) if e.error == "AccountNotFound" => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// A record's `R/` value, at generation `gen` (None: the account's).
+    /// The generation and the row aren't read from one snapshot, so a
+    /// reader could read the generation just before an import commits and
+    /// the row once the old generation is swept: a miss re-reads the
+    /// generation and tries again if it moved. (It moves only with the
+    /// commit, and no row of the generation it left is swept before that
+    /// commit is applied, so a miss at an unchanged generation is real.)
+    pub async fn record_value(&self, did: &str, gen: Option<u64>, path: &str) -> Result<Option<Bytes>, XrpcError> {
+        let p = self.partition(did)?;
+        let mut gen = match gen {
+            Some(g) => g,
+            None => self.repo_gen(did).await?,
+        };
+        loop {
+            let v = p.db.get(state::record_key(did, gen, path)).await.map_err(XrpcError::from_err)?;
+            if v.is_some() {
+                return Ok(v);
+            }
+            let now = self.repo_gen(did).await?;
+            if now == gen {
+                return Ok(None);
+            }
+            gen = now;
+        }
     }
 }
 

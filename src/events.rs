@@ -15,6 +15,8 @@ pub struct Frame {
     /// this #commit frame (`segment::derive_commit_muts`), so the segment
     /// doesn't store them twice. 0 = all stored.
     pub derived_muts: usize,
+    /// The repo generation the derived muts' keys carry (`state::Gen`).
+    pub derived_gen: u64,
 }
 
 impl Frame {
@@ -113,6 +115,7 @@ pub fn commit_frame(c: &CommitFrame) -> Frame {
         prefix: p,
         suffix: s,
         derived_muts: 0,
+        derived_gen: 0,
     }
 }
 
@@ -134,6 +137,7 @@ pub fn sync_frame(did: &str, rev: &str, blocks: &[u8], time: &str) -> Frame {
         prefix: p,
         suffix: s,
         derived_muts: 0,
+        derived_gen: 0,
     }
 }
 
@@ -154,6 +158,7 @@ pub fn identity_frame(did: &str, handle: &str, time: &str) -> Frame {
         prefix: p,
         suffix: s,
         derived_muts: 0,
+        derived_gen: 0,
     }
 }
 
@@ -178,6 +183,7 @@ pub fn account_frame(did: &str, active: bool, status: Option<&str>, time: &str) 
         prefix: p,
         suffix: s,
         derived_muts: 0,
+        derived_gen: 0,
     }
 }
 

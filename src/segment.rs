@@ -40,7 +40,8 @@ pub struct Mutation {
 // mut_count with its top bit set: bits 0-15 count the muts stored, bits
 // 16-30 the muts *derived* from the #commit frame, which come first (see
 // `derive_commit_muts`): a commit's record and head values repeat blocks its
-// CAR already carries.
+// CAR already carries. Such a mut_count is followed by the repo's generation
+// (LEB128, `state::Gen`), which the derived keys carry and the frame doesn't.
 //
 // "VLFENCE\n" | fenced_by (utf8)
 //
@@ -105,6 +106,8 @@ pub struct SegEntry {
     /// How many of `muts` (the first ones) were derived from the #commit
     /// frame (0 when parsed without muts).
     pub derived: usize,
+    /// The repo generation the derived muts are keyed under.
+    pub gen: u64,
 }
 
 pub enum LogObject {
@@ -170,11 +173,13 @@ impl SegmentBuilder {
         write_frame: impl FnOnce(&mut Vec<u8>),
         muts: &[Mutation],
     ) -> std::ops::Range<usize> {
-        self.push_derived(seq, shard, epoch, write_frame, muts, 0)
+        self.push_derived(seq, shard, epoch, write_frame, muts, 0, 0)
     }
 
     /// [`push`](Self::push) where the first `derived` muts are left out:
-    /// replay rebuilds them from the #commit frame (`derive_commit_muts`).
+    /// replay rebuilds them from the #commit frame and the repo's generation
+    /// `gen` (`derive_commit_muts`).
+    #[allow(clippy::too_many_arguments)]
     pub fn push_derived(
         &mut self,
         seq: i64,
@@ -183,6 +188,7 @@ impl SegmentBuilder {
         write_frame: impl FnOnce(&mut Vec<u8>),
         muts: &[Mutation],
         derived: usize,
+        gen: u64,
     ) -> std::ops::Range<usize> {
         let stored = &muts[derived.min(muts.len())..];
         let derived = if derived > 0 && derived <= muts.len() && derived < 1 << 15 && stored.len() < 1 << 16 { derived } else { 0 };
@@ -203,6 +209,7 @@ impl SegmentBuilder {
         self.body[len_at..start].copy_from_slice(&((end - start) as u32).to_be_bytes());
         if derived > 0 {
             self.body.put_u32(DERIVED | (derived as u32) << 16 | stored.len() as u32);
+            self.body.put_slice(&crate::state::Gen(gen).bytes());
         } else {
             self.body.put_u32(stored.len() as u32);
         }
@@ -440,10 +447,25 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<ShardId>) -> anyhow::Re
         let nm = u32::from_be_bytes(data[pos..pos + 4].try_into()?);
         pos += 4;
         let (derived, nm) = if nm & DERIVED != 0 { (((nm & !DERIVED) >> 16) as usize, (nm & 0xffff) as usize) } else { (0, nm as usize) };
+        let mut gen = 0u64;
+        if derived > 0 {
+            let mut shift = 0;
+            loop {
+                need(pos, 1)?;
+                let b = data[pos];
+                pos += 1;
+                anyhow::ensure!(shift < 64, "segment entry {seq}: bad generation");
+                gen |= ((b & 0x7f) as u64) << shift;
+                shift += 7;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+        }
         let keep = shard.is_none_or(|s| s == sh);
         let mut muts = Vec::new();
         if derived > 0 && with_muts && keep {
-            muts = derive_commit_muts_n(&frame, derived).map_err(|e| anyhow::anyhow!("segment entry {seq}: {e:#}"))?;
+            muts = derive_commit_muts_n(&frame, derived, gen).map_err(|e| anyhow::anyhow!("segment entry {seq}: {e:#}"))?;
         }
         for _ in 0..nm {
             need(pos, 2)?;
@@ -468,7 +490,7 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<ShardId>) -> anyhow::Re
         }
         if keep {
             let derived = if with_muts { derived } else { 0 };
-            out.push(SegEntry { seq, shard: sh, epoch, frame, muts, derived });
+            out.push(SegEntry { seq, shard: sh, epoch, frame, muts, derived, gen });
         }
     }
     Ok(LogObject::Segment(h, out))
@@ -483,21 +505,22 @@ pub fn events(entries: Vec<SegEntry>) -> Vec<(i64, Bytes)> {
 /// The state mutations of a #commit, rebuilt from its frame: for each op,
 /// the record CID index keys, the record or its delete, and the record's
 /// backlink put; then the head. Exactly what the repo worker writes for a
-/// commit, in the same order (checked in debug builds).
-pub fn derive_commit_muts(frame: &[u8]) -> anyhow::Result<Vec<Mutation>> {
-    derive(frame, None)
+/// commit, in the same order (checked in debug builds). `gen` is the repo's
+/// generation, which the frame doesn't carry.
+pub fn derive_commit_muts(frame: &[u8], gen: u64) -> anyhow::Result<Vec<Mutation>> {
+    derive(frame, None, gen)
 }
 
 /// The `n` muts an entry derives from its #commit frame: those of
 /// [`derive_commit_muts`], then (when `n` is larger) the `M/` puts of the
 /// commit's interior MST nodes in CAR order.
-pub fn derive_commit_muts_n(frame: &[u8], n: usize) -> anyhow::Result<Vec<Mutation>> {
-    let muts = derive(frame, Some(n))?;
+pub fn derive_commit_muts_n(frame: &[u8], n: usize, gen: u64) -> anyhow::Result<Vec<Mutation>> {
+    let muts = derive(frame, Some(n), gen)?;
     anyhow::ensure!(muts.len() == n, "{} muts derived from the #commit frame, {n} expected", muts.len());
     Ok(muts)
 }
 
-fn derive(frame: &[u8], want: Option<usize>) -> anyhow::Result<Vec<Mutation>> {
+fn derive(frame: &[u8], want: Option<usize>, gen: u64) -> anyhow::Result<Vec<Mutation>> {
     // borrowed decoding: replay runs this for every #commit it applies
     use crate::cbor::ValueRef as Value;
     use crate::cid::Cid;
@@ -522,12 +545,12 @@ fn derive(frame: &[u8], want: Option<usize>) -> anyhow::Result<Vec<Mutation>> {
         let path = op.get("path").and_then(Value::as_str).ok_or_else(|| anyhow::anyhow!("op without path"))?;
         let (prev, new) = (link(op.get("prev")), link(op.get("cid")));
         if let Some(p) = &prev {
-            muts.push(Mutation { key: state::record_cid_key(did, p, path).into(), val: None });
+            muts.push(Mutation { key: state::record_cid_key(did, gen, p, path).into(), val: None });
         }
         if let Some(c) = &new {
-            muts.push(Mutation { key: state::record_cid_key(did, c, path).into(), val: Some(Bytes::new()) });
+            muts.push(Mutation { key: state::record_cid_key(did, gen, c, path).into(), val: Some(Bytes::new()) });
         }
-        let key = Bytes::from(state::record_key(did, path));
+        let key = Bytes::from(state::record_key(did, gen, path));
         muts.push(match &new {
             Some(c) => Mutation { key, val: Some(state::record_value(c, rev.0, block(c)?)) },
             None => Mutation { key, val: None },
@@ -538,7 +561,7 @@ fn derive(frame: &[u8], want: Option<usize>) -> anyhow::Result<Vec<Mutation>> {
             let coll = crate::worker::collection_of(path);
             if let Some(l) = crate::backlinks::link(coll, block(c)?) {
                 let rkey = path.split_once('/').map_or(path, |(_, r)| r);
-                muts.push(Mutation { key: state::backlink_key(did, &l).into(), val: Some(Bytes::copy_from_slice(rkey.as_bytes())) });
+                muts.push(Mutation { key: state::backlink_key(did, gen, &l).into(), val: Some(Bytes::copy_from_slice(rkey.as_bytes())) });
             }
         }
     }
@@ -548,7 +571,7 @@ fn derive(frame: &[u8], want: Option<usize>) -> anyhow::Result<Vec<Mutation>> {
     muts.push(Mutation { key: state::head_key(did).into(), val: Some(head.encode()) });
     if want.is_some_and(|n| n > muts.len()) {
         for (c, b) in crate::mst_lazy::persisted_blocks(&data, &blocks, 1)? {
-            muts.push(Mutation { key: state::mst_node_key(did, &c).into(), val: Some(Bytes::copy_from_slice(b)) });
+            muts.push(Mutation { key: state::mst_node_key(did, gen, &c).into(), val: Some(Bytes::copy_from_slice(b)) });
         }
     }
     Ok(muts)
@@ -612,7 +635,7 @@ mod tests {
         });
         let mut bytes = Vec::new();
         frame.finish(5, &mut bytes);
-        let derived = derive_commit_muts(&bytes).unwrap();
+        let derived = derive_commit_muts(&bytes, 0).unwrap();
         let keys: Vec<&[u8]> = derived.iter().map(|m| &crate::state::key_body(&m.key)[..2]).collect();
         assert_eq!(keys, vec![b"c/" as &[u8], b"c/", b"R/", b"h/"]);
         assert_eq!(derived[2].val.as_deref(), Some(&crate::state::record_value(&rec, rev.0, &rec_block)[..]));
@@ -624,7 +647,7 @@ mod tests {
         all.push(extra);
         for in_place in [false, true] {
             let mut b = if in_place { SegmentBuilder::for_log("L") } else { SegmentBuilder::new() };
-            let r = b.push_derived(5, ShardId(1), 2, |o| frame.finish(5, o), &all, derived.len());
+            let r = b.push_derived(5, ShardId(1), 2, |o| frame.finish(5, o), &all, derived.len(), 0);
             b.push(6, ShardId(1), 2, |o| o.extend_from_slice(b"plain"), &all[..1]);
             let level = b.level();
             let obj = b.seal("L", 9, 9);

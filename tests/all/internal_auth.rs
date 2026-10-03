@@ -33,7 +33,7 @@ async fn internal_token_and_private_put_scope() {
     let r = private_put(&s, &a.did, &vlpds::state::private_key(&a.did, "scratch")).await;
     assert_eq!(r.status, 200, "{}", r.text());
     private_put(&s, &a.did, &vlpds::state::head_key(&a.did)).await.err(400, "InvalidRequest");
-    private_put(&s, &a.did, &vlpds::state::record_key(&a.did, "app.bsky.feed.post/x")).await.err(400, "InvalidRequest");
+    private_put(&s, &a.did, &vlpds::state::record_key(&a.did, 0, "app.bsky.feed.post/x")).await.err(400, "InvalidRequest");
     private_put(&s, &a.did, &vlpds::state::private_key(&b.did, "totp")).await.err(400, "InvalidRequest");
     // a DID that is a prefix of another's can't reach into it
     private_put(&s, &a.did[..a.did.len() - 1], &vlpds::state::private_key(&a.did, "totp")).await.err(400, "InvalidRequest");

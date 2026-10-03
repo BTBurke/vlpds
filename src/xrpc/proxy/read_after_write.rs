@@ -326,7 +326,8 @@ async fn records_since(app: &App, did: &str, part: recent_writes::Part, since: u
     }
     // no rev index: scan the repo's records for those written after `since`,
     // keeping only the oldest MAX_RECS of them (a max-heap on (rev, path))
-    let prefix = state::record_prefix(did);
+    let repo_gen = app.repo_gen(did).await.map_err(|e| anyhow::anyhow!(e.message))?;
+    let prefix = state::record_prefix(did, repo_gen);
     let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await?;
     let mut kept = std::collections::BinaryHeap::<ByRev>::with_capacity(recent_writes::MAX_RECS + 1);
     let (mut above, mut old, mut top) = (0usize, false, head.rev.0);
@@ -491,8 +492,7 @@ impl Viewer<'_> {
     /// profile record (None: no account).
     async fn profile_basic(&self) -> M<Option<J>> {
         let Ok(acct) = self.app.account(self.did).await else { return Ok(None) };
-        let p = self.app.partition(self.did).map_err(|_| Abort)?;
-        let raw = p.db.get(state::record_key(self.did, recent_writes::PROFILE_PATH)).await.map_err(|_| Abort)?;
+        let raw = self.app.record_value(self.did, Some(acct.repo_gen), recent_writes::PROFILE_PATH).await.map_err(|_| Abort)?;
         let profile = match raw {
             Some(v) => state::decode_record_value(&v).ok().and_then(|(_, b)| record_json(&b)),
             None => None,

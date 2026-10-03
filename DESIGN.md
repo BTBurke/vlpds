@@ -214,19 +214,22 @@ swappable.
 - Keys (each prefixed by `0x01 ‖ slot` of its account, so a shard's state is
   one key range: see "Online shard split/merge"):
   - `h/{did}` → head `{commit cid, signed commit bytes, rev, data cid, status}`
-  - `R/{did}\0{collection}/{rkey}` → `{cid, record bytes}`
-  - `c/{did}\0{cid8}{path}` → empty: record CID index for `getBlocks` (`cid8` =
+  - `{gen}` below is the repo's generation (`Account::repo_gen`, LEB128,
+    one byte below 128): an import stages the new repo under a fresh one
+    (see "Staged imports").
+  - `R/{did}\0{gen}{collection}/{rkey}` → `{cid, record bytes}`
+  - `c/{did}\0{gen}{cid8}{path}` → empty: record CID index for `getBlocks` (`cid8` =
     first 8 bytes of the CID's digest). Written in the same batch as the `R/` key,
     one per path (a CID can sit at several). A lookup prefix-scans
-    `c/{did}\0{cid8}` on the snapshot and checks each path's record CID.
+    `c/{did}\0{gen}{cid8}` on the snapshot and checks each path's record CID.
   - `C/{collection}\0{did}` → empty: collection index (which repos have
     records in a collection; `sync.listReposByCollection`).
-  - `b/{did}\0{blob cid}\0{record path}` → empty: blob-ref index (which
+  - `b/{did}\0{gen}{blob cid}\0{record path}` → rev: blob-ref index (which
     records reference a blob; blob listing and GC).
-  - `M/{did}\0{cid digest}` → MST node block (lazy MSTs): exactly the
+  - `M/{did}\0{gen}{cid digest}` → MST node block (lazy MSTs): exactly the
     interior nodes of the tree at `h/{did}`'s data root, put and deleted in
     the commit's batch (puts derived from the #commit CAR at replay).
-  - `bl/{did}\0{code}{subject}` → the rkeys of the repo's likes / reposts /
+  - `bl/{did}\0{gen}{code}{subject}` → the rkeys of the repo's likes / reposts /
     follows / blocks of that subject: the backlink index createRecord
     prunes duplicates with (see "Backlinks").
   - `S/{did}` → the repo's counts for checkAccountStatus (records, MST
@@ -237,6 +240,9 @@ swappable.
     bound to the DID) next to its public key (`signing_pubkey`, which DID
     documents and service-auth checks read without unwrapping); account
     rows in log segments carry the same wrapped form. See "Secrets at rest".
+  - `G/{did}` → `ImportState`: a staged import (generation, driver nonce,
+    reserved rev) and the generations left to sweep; absent otherwise (see
+    "Staged imports").
   - `T/` → the slot's account totals (keyed by slot alone; see "Account
     totals"); `T/{seq}` → a delta row written while the shard's totals
     were loading.
@@ -329,7 +335,8 @@ swappable.
   firehose and live rings and merge queue, the backfill cache plus
   read-ahead x `--firehose-max-backfills`, exports (8 MiB per
   `--max-exports` slot plus the `M/` read-ahead pool, 16 MiB a slot up to
-  512 MiB), imports (`xrpc::IMPORT_MEMORY_BYTES`, 256 MiB, or
+  512 MiB), imports (`xrpc::IMPORT_MEMORY_BYTES`, 320 MiB: 4 streamed imports at
+  80 MiB, see "Staged imports"; or
   `--max-import-mb` if less) and max(15%, 512 MiB) headroom (memtables,
   bodies in flight, allocator slack). The rest is the cache pool. The
   metadata cache takes what the owned SSTs' filters and indexes need first:
@@ -2527,31 +2534,23 @@ root through the store).
   #commit frame (`segment::derive_commit_muts_n`: an entry deriving more
   muts than the base set derives the node puts too). The deletes (the
   replaced nodes, from `LazyTree::write_diff_blocks`) are stored muts.
-  Repo creation with genesis records, `importRepo` (`ReplaceRepo`) and
-  account deletion write or clear the whole set. importRepo parses the
-  CAR, checks it and builds the new tree on the blocking pool (record
-  bytes are slices of the body, no copies; a record block over 2 MiB is
-  refused; the CAR is capped by `--max-import-mb`, 1 GiB default, counted
-  as the body streams in). A CAR in the spec's streamable block order
-  (`car_order.rs`: commit, then the MST in preorder with each record
-  after the slot that names it) is parsed as it arrives in one pass that
-  holds only the root-to-current path: each node and record must be the
-  block its parent named, keys must ascend, and the tree rebuilt from the
-  records must reproduce the commit's `data`, which proves every node
-  streamed was the canonical one (`xrpc/import_stream.rs`). Any other
-  order, and any CAR it would refuse, falls back to the buffered parse of
-  the whole body (kept as received for this), which reports the error; so
-  both paths accept exactly the same CARs with the same result. The
-  stream skips the buffered parse's block map and its second tree: for 1M
-  records (299 MB CAR, laptop, `tests/all/import_bench.rs`) the parse
-  peaks ~665 MB over baseline vs ~825 MB and finishes ~1.0 s after the
-  request starts vs ~1.5 s; but the worker's single log entry then peaks
-  ~3.6 GB either way, so streaming `ReplaceRepo` itself (a multi-entry
-  atomic import) is where the memory is. Either way the parse
-  hands the worker the built tree, which only writes it: still one log
-  entry for the whole repo (a segment of its own when over the segment
-  size), so the cap also bounds that entry. No rate limit of its own yet
-  (the rate-limit layer, `ratelimit.rs`, is where one belongs). A repo whose `M/` is
+  Repo creation with genesis records and account deletion write or clear
+  the whole set; importRepo writes a new generation's (see "Staged
+  imports"). importRepo parses the CAR off the worker (a record block over
+  2 MiB is refused; the CAR is capped by `--max-import-mb`, 1 GiB default,
+  counted as the body streams in). A CAR in the spec's streamable block
+  order (`car_order.rs`: commit, then the MST in preorder with each
+  record after the slot that names it) is parsed as it arrives in one
+  pass that holds only the root-to-current path: each node and record
+  must be the block its parent named, keys must ascend, and the tree
+  rebuilt from the records must reproduce the commit's `data`, which
+  proves every node streamed was the canonical one
+  (`xrpc/import_stream.rs`). Any other order, and any CAR it would
+  refuse, falls back to the buffered parse of the whole body (kept for
+  this), which reports the error; so both paths accept exactly the same
+  CARs with the same result. No rate limit of its own yet (the
+  rate-limit layer, `ratelimit.rs`, is where one belongs); at most
+  `staged_import::IMPORT_SLOTS` (4) run at once per node. A repo whose `M/` is
   missing or wrong (a bug, a lost key range) is rebuilt from
   `R/` on open and backfilled through the log
   (`vlpds_lazy_mst_fallbacks_total{reason}`).
@@ -2913,9 +2912,9 @@ ordinary ops of the same #commit.
   after it and wins in the batch: removals (an unlike, unfollow or update
   needs the old record, which the frame doesn't carry) and keys holding
   several rkeys. A create costs no segment bytes; a delete stores one key
-  delete (~115 B for a like, ~80 B for a follow, with a did:plc). Imports, account deletes and creations with
-  records write the whole index as stored muts (an import or delete first
-  reads the repo's whole `bl/` range).
+  delete (~115 B for a like, ~80 B for a follow, with a did:plc). Account deletes and creations with
+  records write the whole index as stored muts (a delete first
+  reads the repo's whole `bl/` range); an import writes its generation's in batches ("Staged imports").
 - **Checks.** `vlpds.admin.checkRepo` compares `bl/` with the records
   (`backlinkMissing`, `backlinkExtra`); rebuildRepo rewrites it.
   `tests/all/backlinks.rs`: the reference cases, the firehose commit with
@@ -2965,9 +2964,10 @@ from one snapshot (`state::RepoStats` at `S/{did}`):
   refs runs with them loaded: updates and deletes already needed them,
   and a create with blobs now loads them too (alongside the tree on a
   cold open).
-- importRepo, rebuildRepo and genesis count the new tree whole
+- rebuildRepo and genesis count the new tree whole
   (`count_tree`; the records' refs through the same refcounts); account
-  delete deletes the row.
+  delete deletes the row; an import counts its staged tree as it streams
+  ("Staged imports").
 
 `S/` is a stored mut after the derived ones (replay can't derive it from
 the #commit frame: it needs the previous counts), written only when a
@@ -3020,6 +3020,165 @@ repo, dev-release, laptop at load average ~55 from other builds):
 median 1,125 ms (min 1,008, max 2,081; 5 calls) walking, 0.12 ms (min
 0.11, max 0.75; 50 calls; no blobs, so importedBlobs is one LIST of an
 in-memory store) with the counts.
+
+## Staged imports (`src/xrpc/staged_import.rs`)
+
+importRepo used to hand the repo worker the whole parsed repo
+(`ReplaceRepo`), which built **one** log entry with every row: `R/`, `c/`,
+`b/`, `bl/`, `M/`, `S/`, `C/`. Atomic by construction (one entry is one
+apply batch, one replay unit), but its memory was the entry: a 1M-record
+import (299 MB CAR) peaked at ~3.6 GB of heap, 5M at ~18 GB, so a big
+account's migration could take a node down. Now an import is written in
+bounded batches under a key space no reader looks at, and becomes the repo
+with one small entry.
+
+**Repo generations.** Every per-repo row family that an import replaces
+wholesale carries the repo's *generation* right after the DID:
+`R/{did}\0{gen}{path}`, and the same for `c/`, `b/`, `bl/` and `M/`
+(`state::GEN_FAMILIES`; LEB128, so one byte below 128 and prefix-free: no
+generation's range holds another's keys). `Account::repo_gen` names the
+repo's current one. Only the repo's worker writes the account, in the same
+entry as the head, so `a/` and `h/` always agree. Readers key by it:
+getRecord, listRecords and describeRepo read the account anyway
+(`assert_available`); exports, getBlocks and proofs take it from the
+`DurableView` paired with their snapshot; the worker from its `RepoState`.
+`h/`, `a/`, `S/`, `C/`, `T/` and `p/` have no generation (one row per repo or
+not repo content).
+
+**The steps** (`worker::ImportStep`, each a log entry through the repo's
+worker, so ordered with its commits):
+1. *Begin*: reserves a generation above the current one and every one staged
+   or awaiting a sweep (`ImportState::next_gen`), the rev of the import's
+   commit, and the driver's nonce: `G/{did}` = `{staging: {gen, nonce, rev},
+   garbage: [..]}`.
+2. *Rows*, one entry per batch of the parse (4,096 records or 4 MiB of
+   record bytes, two in flight): the records' `R/`, `c/`, `b/`, `bl/` rows
+   and the finished MST nodes' `M/` rows, all under the staged generation
+   (the worker checks every key is), no frame. The parse
+   (`xrpc/import_stream.rs`) hands records out as it verifies them, and a
+   `mst_lazy::StreamBuilder` rebuilds the canonical tree alongside with one
+   open node per height, handing out each node as it completes (memory: the
+   right spine) and counting them for `S/`. The rebuilt root must be the
+   commit's `data`, which proves the streamed nodes were the canonical ones;
+   the builder's nodes are what `M/` stores (the same blocks).
+3. *Commit*: one entry with the new head (a commit over the rebuilt root at
+   the reserved rev, signed with our key), the account at the new generation,
+   `S/` (records and nodes counted by the builder, distinct blobs by one scan
+   of the staged `b/`, which sorts by CID), the `C/` rows of collections
+   added and removed (the old generation's by one seek per collection), `G/`
+   (the old generation to the garbage), the `T/` delta, and #sync unless the
+   account is deactivated: the same single firehose event as before.
+4. *Sweep*: the old generation's rows deleted in entries of 8,192 keys, then
+   *Swept* forgets it. The worker takes a sweep only for a generation in the
+   garbage that isn't the account's.
+
+The import itself holds a few batches whatever the repo's size: peak heap
+375 MB at 1M records and ~1 GB at 5M, most of it the write path's own
+bounded buffers, where it was 3.6 and 18 GB (see "Measured" below). At most
+`IMPORT_SLOTS` (4) streamed imports run at once per node, so the memory
+budget reserves 4 x 80 MiB (`xrpc::IMPORT_MEMORY_BYTES`); the buffered
+fallback runs one at a time and holds its whole body on top.
+
+**Why readers see the old repo or the new one, never a mix.** A reader's
+generation comes from the account; a snapshot or a state apply holds the
+Commit entry whole or not at all. Before it, the account names the old
+generation, whose rows nothing touches (writes are refused meanwhile,
+below). After it, everything under the new generation is complete: every
+Rows entry was applied before the Commit entry (log order; the driver
+commits after their acks), and nothing writes a generation except while it
+is staged. A generation is swept only once it is in the garbage, i.e.
+after the Commit is applied. Readers whose generation and rows come from two
+reads (not one snapshot) could still read the generation just before the
+Commit and a row after the sweep deleted it: a miss reads the generation
+again and retries if it moved (`App::record_value`), and listRecords,
+describeRepo and listBlobs redo a scan whose generation moved under it.
+Exports and getBlocks read one snapshot. Replay derives a #commit's rows
+under the generation its entry names (segment entries with derived muts
+carry it: a frame doesn't), so a replayed commit lands where the live one
+did.
+
+**Writes while an import stages** are refused (400, "a repo import is in
+progress"), as are a key rotation's begin and finish and rebuildRepo: the
+import's commit takes the rev it reserved at Begin, so nothing may commit
+first (the Commit also checks that the head's rev is still below it). Only
+an import driven on this node holds writes up (`staged_import::driving`): a
+staged import left by a crash or a moved shard can never commit, so it
+doesn't. A second import of the same repo while one runs is refused the
+same way.
+
+**Crashes and shard moves.** Every step but Begin names the import's nonce
+and the shard epoch it began in; a moved shard (or a moved-and-back one, a
+new epoch) refuses the next step, so a driver that lost its shard aborts
+and can't commit; nothing resumes on the new owner. The client gets 503
+ShardMoved (retryable: nothing was imported) and imports again (an entry
+node doesn't resend an import: its body isn't buffered). A crash leaves
+the entries it made durable; replay applies them, so the survivor has the
+old repo (crash before the Commit) or the new one (after), and `G/` says
+what is staged or left to sweep. The sweeper (`sweep_pending`, every 60 s on
+each node over its shards' `G/` rows, one family scan) aborts a
+staged import no driver here is running (its generation joins the garbage)
+and sweeps every garbage generation. The driver itself aborts and sweeps
+on any failure, and sweeps the old generation after its Commit.
+`tests/all/staged_import.rs` crashes the owner (kill -9 of an in-process
+node) after Begin, after the first and after the last batch, after the
+Commit and mid-sweep, moves the shard between two batches, and checks each
+time that the survivor's export, listRecords, getRecord, counts, the admin
+check of every index and the firehose (nothing, or one #sync) are the old
+repo's or the new one's, and that once swept no row outside the current
+generation remains and `G/` is gone. Readers polling exports, listRecords
+and checkAccountStatus all through an import see one repo or the other.
+
+**Account deletes and re-creation.** Deleting an account mid-import sends
+the staged generation to the garbage (the import's next step is refused).
+A DID with no repo but a `G/` row loads as a deleted "husk", so its sweep
+runs on its worker, ordered with a createAccount bringing the DID back,
+which starts at a generation above every one in `G/`. (Account delete still
+deletes the current generation's rows in its own entry, as before; a
+staged delete is the natural follow-up.)
+
+**Backlinks across batches.** `bl/` holds one key per (collection, subject)
+listing its rkeys. Records arrive in key order, so a link's rkeys only
+append: a batch's value is the earlier batches' (from the batches still in
+flight, else one point read of the staged row) plus its own. The read is
+skipped unless a 4 MiB bloom filter of the links staged so far says the
+link may be there (~6% false positives at 5M links).
+
+**Other orders.** A CAR not in the streamable order (or one the single pass
+refuses) voids what was handed out: the driver Begins again with the same
+nonce (the worker moves the staged generation to the garbage and reserves
+another), and the buffered parse of the whole body follows, then the same
+batches. So that path needs the body: it is kept in memory up to 16 MiB,
+then in a temporary file (`import_stream::Input`), never in memory past
+that for a streamed import. The buffered path itself is O(CAR) as before.
+
+**Costs.** One more key byte per row of the five families (generations
+below 128); one more byte per #commit entry in segments (the generation);
+one more point read (`G/`, alongside `S/`) per cold repo load; getRecord
+none (a miss reads the account again), listRecords, describeRepo and
+listBlobs one account read. The import itself is faster: the rows are
+built off the worker thread and written while the body is still arriving.
+
+**Measured** (`tests/all/import_bench.rs`, dev-release, jemalloc, M4 Pro
+laptop shared with other builds; streamed CAR of posts and likes; one
+node, in-memory bucket whose objects are counted apart and left out, SST
+caches pinned at 64 + 16 MiB; peak heap over the process's baseline, total
+from the request to the 200; the before binary is 487e5a8 with the same
+bench):
+
+| records (CAR) | before: time, peak heap | after: time, peak heap |
+|---|---:|---:|
+| 1M (299 MB) | 3.87 s, 3,551 MB | 1.11 s, 375 MB |
+| 5M (1.5 GB) | 22.8 s, 18,090 MB | 18.1 s, 1,014 MB |
+
+What the after column holds is mostly the write path running flat out,
+not the import: SlateDB's memtables (up to 128 MiB per shard) and
+compactions in flight, the log's live ring (128 MiB). A timeline of the
+5M run (`IMPORT_BENCH_TRACE`) moves between 270 and 800 MB the whole way
+with no upward trend, and drops to ~100 MB once the import is done; the
+import's own buffers are the batches above (`IMPORT_WORKING_SET`, 80 MiB
+with room). (The bench's in-memory bucket first made it look O(n): a
+compressed segment kept as a slice of its compression-bound buffer pins
+the whole buffer, ~1.4x the object. The bench now stores exact copies.)
 
 ## Backups and restore (design, not implemented)
 
@@ -4473,11 +4632,11 @@ effect at the next segment). Not built yet: everything under "Later".
 |---|---|---|---|
 | Log segment | `log/{log_id}/{ord:012}.seg`, `src/segment.rs` | magic `VLSEG06\n` (level 1) is the whole version; `codec` byte (0 none, 1 zstd) | **(built)** `parse_header` accepts every magic of the build's levels (`version::segment_magics`, `SegHeader.level`); others: "bad segment magic", `vlpds_format_errors_total{format="segment"}`, as is an unknown codec. Replay: shard can't open; apply: fail-stop 4; follower: retry loop |
 | Fence | same path, `VLFENCE\n` + node id | magic | n/a (stable) |
-| Entry muts | inside segments | none: raw SlateDB key/value bytes, plus muts *derived* by the reader from `#commit` frames (`derive_commit_muts`, top bit of `mut_count`) | an old reader writes new-format bytes blindly into state |
+| Entry muts | inside segments | none: raw SlateDB key/value bytes, plus muts *derived* by the reader from `#commit` frames and the repo generation the entry carries (`derive_commit_muts`, top bit of `mut_count`, then the generation) | an old reader writes new-format bytes blindly into state |
 | Head `h/` | `state.rs` `Head::encode` | none (fixed binary: cid ‖ cid ‖ rev ‖ block) | `decode` "short head" or garbage |
 | Record `R/` | `state::record_value` | none (cid ‖ rev ‖ bytes) | garbage |
 | Repo stats `S/` | `state.rs` `RepoStats::encode` | none (fixed binary: 3 × u64) | `decode` of another length is an error |
-| Index `c/ C/ b/ bl/ n/` | `state.rs` | key layout only, empty/plain values | key not found |
+| Index `c/ C/ b/ bl/ n/ G/` | `state.rs` | key layout only (repo generation in `R/ c/ b/ bl/ M/` keys), plain values; `G/` a fixed binary `ImportState` | key not found |
 | MST nodes `M/` | `state.rs`, `mst_lazy.rs` | dag-cbor, content-addressed | stable by construction |
 | Account `a/` | `state::Account` JSON | none; tolerant (`#[serde(default)]`, `#[serde(flatten)] extra` keeps unknown fields) | round-trips unknown fields |
 | Private `p/` rows | sessions, app passwords, tokens, TOTP (`totp.rs`), OAuth (`oauth/store.rs`), `sec/` revocations/takedowns, `deleting` (`xrpc/server.rs`) | none; mostly JSON | per type; mostly serde-default |

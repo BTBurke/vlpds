@@ -48,7 +48,7 @@ fn count(j: &J, k: &str) -> u64 {
 async fn check(s: &TestServer, a: &TestAccount, what: &str) {
     let st = s.xrpc.get("com.atproto.server.checkAccountStatus", &[], &a.auth()).await.ok();
     let p = s.app.partition(&a.did).unwrap_or_else(|_| panic!("shard not owned"));
-    let walked = vlpds::repo_stats::walk(&*p.db, &a.did).await.unwrap();
+    let walked = vlpds::repo_stats::walk(&*p.db, &a.did, s.app.repo_gen(&a.did).await.ok().unwrap()).await.unwrap();
     let car = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &a.did)], &Auth::None).await;
     assert_eq!(car.status, 200, "{}", car.text());
     let repo = Repo::from_car(&car.body).unwrap();

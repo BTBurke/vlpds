@@ -1315,8 +1315,8 @@ mod tests {
                         let mut wb = slatedb::WriteBatch::new();
                         for (path, cid) in chunk {
                             let v = crate::state::record_value(cid, 1, &blocks[cid]);
-                            let k = crate::state::record_key(&did, path);
-                            let ck = crate::state::record_cid_key(&did, cid, path);
+                            let k = crate::state::record_key(&did, 0, path);
+                            let ck = crate::state::record_cid_key(&did, 0, cid, path);
                             logical += k.len() + v.len() + ck.len();
                             wb.put(&k, &v);
                             wb.put(&ck, b"");
@@ -1355,7 +1355,7 @@ mod tests {
             for r in 0..copies {
                 let did = crate::state::bulk_did(r as u64);
                 for (path, _) in records.iter().skip(r).step_by(step * copies) {
-                    assert!(db.get(crate::state::record_key(&did, path)).await.unwrap().is_some());
+                    assert!(db.get(crate::state::record_key(&did, 0, path)).await.unwrap().is_some());
                     gets += 1;
                 }
             }

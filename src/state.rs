@@ -10,15 +10,20 @@
 //! h/{did}                 -> head: commit cid | data cid | rev u64 | signed commit block
 //! a/{did}                 -> account JSON (signing key wrapped: src/secrets.rs)
 //! n/{handle}              -> did (slot of the account's DID)
-//! R/{did}\0{coll}/{rkey}  -> record cid | rev | record bytes
-//! c/{did}\0{cid8}{path}   -> empty (record CID index for getBlocks)
+//! R/{did}\0{gen}{coll}/{rkey}  -> record cid | rev | record bytes
+//! c/{did}\0{gen}{cid8}{path}   -> empty (record CID index for getBlocks)
 //! C/{coll}\0{did}         -> empty (collection index; slot of the DID)
-//! b/{did}\0{cid}\0{path}  -> empty (blob references)
+//! b/{did}\0{gen}{cid}\0{path}  -> rev (blob references)
 //! p/{routing}\0{name}     -> private per-account state (slot of the routing key)
-//! M/{did}\0{cid digest}   -> MST node block, height >= 1 (DESIGN.md "Partial MSTs")
-//! bl/{did}\0{code}{subject} -> rkeys linking `subject` (crate::backlinks, DESIGN.md "Backlinks")
+//! M/{did}\0{gen}{cid digest}   -> MST node block, height >= 1 (DESIGN.md "Partial MSTs")
+//! bl/{did}\0{gen}{code}{subject} -> rkeys linking `subject` (crate::backlinks, DESIGN.md "Backlinks")
 //! T/                      -> the slot's account totals (crate::totals; keyed by slot alone)
 //! S/{did}                 -> repo counts (`RepoStats`: checkAccountStatus)
+//! G/{did}                 -> `ImportState`: a staged import, generations left to sweep
+//!
+//! `{gen}` is the repo's generation (`Account::repo_gen`, LEB128): importRepo
+//! stages the new repo under a fresh one and moves the account to it in one
+//! entry (DESIGN.md "Staged imports").
 
 use crate::cid::{Cid, CID_BYTES_LEN};
 use crate::tid::Tid;
@@ -117,12 +122,12 @@ pub fn collection_family(collection: &str) -> Vec<u8> {
     [b"C/", collection.as_bytes(), b"\0"].concat()
 }
 
-pub fn blob_ref_key(did: &str, blob: &crate::cid::Cid, path: &str) -> Vec<u8> {
-    keyed(did, b"b/", &[did.as_bytes(), b"\0", blob.to_string().as_bytes(), b"\0", path.as_bytes()])
+pub fn blob_ref_key(did: &str, gen: u64, blob: &crate::cid::Cid, path: &str) -> Vec<u8> {
+    keyed(did, BLOB_REF_FAMILY, &[did.as_bytes(), b"\0", &Gen(gen).bytes(), blob.to_string().as_bytes(), b"\0", path.as_bytes()])
 }
 
-pub fn blob_ref_prefix(did: &str) -> Vec<u8> {
-    keyed(did, b"b/", &[did.as_bytes(), b"\0"])
+pub fn blob_ref_prefix(did: &str, gen: u64) -> Vec<u8> {
+    gen_prefix(BLOB_REF_FAMILY, did, gen)
 }
 
 pub fn private_key(did: &str, name: &str) -> Vec<u8> {
@@ -136,30 +141,30 @@ pub fn private_prefix(did: &str) -> Vec<u8> {
 /// Keyed by the CID's digest alone: every node is dag-cbor sha-256.
 /// Written and deleted in the commit's state batch, so `M/{did}` holds
 /// exactly the interior nodes of the tree at `h/{did}`'s data root.
-pub fn mst_node_key(did: &str, cid: &Cid) -> Vec<u8> {
-    keyed(did, MST_NODE_FAMILY, &[did.as_bytes(), b"\0", &cid.digest])
+pub fn mst_node_key(did: &str, gen: u64, cid: &Cid) -> Vec<u8> {
+    keyed(did, MST_NODE_FAMILY, &[did.as_bytes(), b"\0", &Gen(gen).bytes(), &cid.digest])
 }
 
-pub fn mst_node_prefix(did: &str) -> Vec<u8> {
-    keyed(did, MST_NODE_FAMILY, &[did.as_bytes(), b"\0"])
+pub fn mst_node_prefix(did: &str, gen: u64) -> Vec<u8> {
+    gen_prefix(MST_NODE_FAMILY, did, gen)
 }
 
 pub const MST_NODE_FAMILY: &[u8] = b"M/";
 
-pub fn backlink_key(did: &str, link: &[u8]) -> Vec<u8> {
-    keyed(did, b"bl/", &[did.as_bytes(), b"\0", link])
+pub fn backlink_key(did: &str, gen: u64, link: &[u8]) -> Vec<u8> {
+    keyed(did, BACKLINK_FAMILY, &[did.as_bytes(), b"\0", &Gen(gen).bytes(), link])
 }
 
-pub fn backlink_prefix(did: &str) -> Vec<u8> {
-    keyed(did, b"bl/", &[did.as_bytes(), b"\0"])
+pub fn backlink_prefix(did: &str, gen: u64) -> Vec<u8> {
+    gen_prefix(BACKLINK_FAMILY, did, gen)
 }
 
-pub fn record_prefix(did: &str) -> Vec<u8> {
-    keyed(did, b"R/", &[did.as_bytes(), b"\0"])
+pub fn record_prefix(did: &str, gen: u64) -> Vec<u8> {
+    gen_prefix(RECORD_FAMILY, did, gen)
 }
 
-pub fn record_key(did: &str, path: &str) -> Vec<u8> {
-    keyed(did, b"R/", &[did.as_bytes(), b"\0", path.as_bytes()])
+pub fn record_key(did: &str, gen: u64, path: &str) -> Vec<u8> {
+    keyed(did, RECORD_FAMILY, &[did.as_bytes(), b"\0", &Gen(gen).bytes(), path.as_bytes()])
 }
 
 /// Bytes of a record CID's digest in its index key: enough to make
@@ -169,12 +174,136 @@ const RECORD_CID_KEY_BYTES: usize = 8;
 
 /// The same CID can sit at several paths (one key each), so lookups scan
 /// [`record_cid_prefix`].
-pub fn record_cid_key(did: &str, cid: &Cid, path: &str) -> Vec<u8> {
-    [&record_cid_prefix(did, cid)[..], path.as_bytes()].concat()
+pub fn record_cid_key(did: &str, gen: u64, cid: &Cid, path: &str) -> Vec<u8> {
+    [&record_cid_prefix(did, gen, cid)[..], path.as_bytes()].concat()
 }
 
-pub fn record_cid_prefix(did: &str, cid: &Cid) -> Vec<u8> {
-    keyed(did, b"c/", &[did.as_bytes(), b"\0", &cid.digest[..RECORD_CID_KEY_BYTES]])
+pub fn record_cid_prefix(did: &str, gen: u64, cid: &Cid) -> Vec<u8> {
+    keyed(did, RECORD_CID_FAMILY, &[did.as_bytes(), b"\0", &Gen(gen).bytes(), &cid.digest[..RECORD_CID_KEY_BYTES]])
+}
+
+pub const RECORD_FAMILY: &[u8] = b"R/";
+pub const RECORD_CID_FAMILY: &[u8] = b"c/";
+pub const BLOB_REF_FAMILY: &[u8] = b"b/";
+pub const BACKLINK_FAMILY: &[u8] = b"bl/";
+
+/// The families whose keys carry the repo's generation: a generation's rows
+/// are exactly these prefixes ([`gen_prefix`]).
+pub const GEN_FAMILIES: [&[u8]; 5] = [RECORD_FAMILY, RECORD_CID_FAMILY, BLOB_REF_FAMILY, BACKLINK_FAMILY, MST_NODE_FAMILY];
+
+/// A repo generation in keys: LEB128, which is prefix-free, so no
+/// generation's range holds another's keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gen(pub u64);
+
+impl Gen {
+    pub fn bytes(self) -> GenBytes {
+        let mut b = GenBytes { buf: [0; 10], len: 0 };
+        let mut v = self.0;
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                b.buf[b.len] = byte;
+                b.len += 1;
+                return b;
+            }
+            b.buf[b.len] = byte | 0x80;
+            b.len += 1;
+        }
+    }
+}
+
+pub struct GenBytes {
+    buf: [u8; 10],
+    len: usize,
+}
+
+impl std::ops::Deref for GenBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+/// `fam ‖ did ‖ \0 ‖ gen`: one generation's rows of a [`GEN_FAMILIES`] family.
+pub fn gen_prefix(fam: &[u8], did: &str, gen: u64) -> Vec<u8> {
+    keyed(did, fam, &[did.as_bytes(), b"\0", &Gen(gen).bytes()])
+}
+
+/// Present while an import is staged or a generation awaits its sweep, so
+/// the sweeper finds them with one family scan (`crate::import`).
+pub fn import_key(did: &str) -> Vec<u8> {
+    keyed(did, IMPORT_FAMILY, &[did.as_bytes()])
+}
+
+pub const IMPORT_FAMILY: &[u8] = b"G/";
+
+/// An import being staged: its generation, its driver's nonce, and the rev
+/// its records carry and its commit will have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Staging {
+    pub gen: u64,
+    pub nonce: u64,
+    pub rev: u64,
+}
+
+/// `G/{did}`, absent when nothing is staged or left to sweep.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ImportState {
+    pub staging: Option<Staging>,
+    /// Generations no account points at whose rows may remain.
+    pub garbage: Vec<u64>,
+}
+
+impl ImportState {
+    pub fn is_empty(&self) -> bool {
+        self.staging.is_none() && self.garbage.is_empty()
+    }
+
+    /// A generation no row can be under: above the current one and every
+    /// one staged or left to sweep (a swept one may be handed out again).
+    pub fn next_gen(&self, current: Option<u64>) -> u64 {
+        let top = self.garbage.iter().copied().chain(self.staging.map(|s| s.gen)).chain(current).max();
+        top.map_or(0, |g| g + 1)
+    }
+
+    pub fn encode(&self) -> Bytes {
+        let mut b = Vec::with_capacity(1 + 24 + 4 + 8 * self.garbage.len());
+        match &self.staging {
+            Some(s) => {
+                b.put_u8(1);
+                b.put_u64(s.gen);
+                b.put_u64(s.nonce);
+                b.put_u64(s.rev);
+            }
+            None => b.put_u8(0),
+        }
+        b.put_u32(self.garbage.len() as u32);
+        for g in &self.garbage {
+            b.put_u64(*g);
+        }
+        b.into()
+    }
+
+    pub fn decode(b: &[u8]) -> anyhow::Result<ImportState> {
+        let u64_at = |i: usize| -> anyhow::Result<u64> { Ok(u64::from_be_bytes(b.get(i..i + 8).ok_or_else(|| anyhow::anyhow!("short import state"))?.try_into()?)) };
+        let (staging, mut at) = match b.first() {
+            Some(0) => (None, 1),
+            Some(1) => (Some(Staging { gen: u64_at(1)?, nonce: u64_at(9)?, rev: u64_at(17)? }), 25),
+            _ => anyhow::bail!("bad import state"),
+        };
+        let n = u32::from_be_bytes(b.get(at..at + 4).ok_or_else(|| anyhow::anyhow!("short import state"))?.try_into()?) as usize;
+        at += 4;
+        anyhow::ensure!(b.len() == at + 8 * n, "import state of {} bytes", b.len());
+        let garbage = (0..n).map(|i| u64_at(at + 8 * i)).collect::<anyhow::Result<_>>()?;
+        Ok(ImportState { staging, garbage })
+    }
+
+    /// The row's mutation: a delete once empty.
+    pub fn mutation(&self, did: &str) -> crate::segment::Mutation {
+        crate::segment::Mutation { key: import_key(did).into(), val: (!self.is_empty()).then(|| self.encode()) }
+    }
 }
 
 const SCAN_BATCH: usize = 256;
@@ -379,6 +508,10 @@ pub struct Account {
     pub email: Option<String>,
     #[serde(default)]
     pub email_confirmed: bool,
+    /// The generation the repo's rows are keyed under ([`Gen`]); an import
+    /// moves it. Written only by the repo's worker, with the head.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub repo_gen: u64,
     /// Recorded before the DID document changes and cleared when the repo is
     /// re-signed with it or the rotation is abandoned; repo writes are
     /// refused meanwhile (DESIGN.md "Signing-key rotation").
@@ -386,6 +519,10 @@ pub struct Account {
     pub pending_signing_key: Option<PendingSigningKey>,
     #[serde(default, flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -16,7 +16,7 @@ const COLLS: [&str; 3] = ["com.example.a", "com.example.bb", "app.example.c"];
 /// Each record's CID, rev and block, by key, as `R/` holds them.
 async fn stored_records(s: &TestServer, did: &str) -> BTreeMap<Vec<u8>, (Cid, u64, Vec<u8>)> {
     let Ok(p) = s.app.partition(did) else { panic!("shard not owned") };
-    let prefix = vlpds::state::record_prefix(did);
+    let prefix = vlpds::state::record_prefix(did, s.app.repo_gen(did).await.ok().unwrap());
     let mut it = p.db.scan(prefix.clone()..vlpds::state::prefix_end(&prefix)).await.unwrap();
     let mut out = BTreeMap::new();
     while let Some(kv) = it.next().await.unwrap() {
@@ -113,7 +113,7 @@ async fn exports_stream_in_spec_order_with_the_same_blocks() {
     assert!(carried > 0 && carried < recs.len(), "{carried} of {} records after since", recs.len());
 
     let Ok(p) = s.app.partition(&a.did) else { panic!("shard not owned") };
-    let prefix = vlpds::state::mst_node_prefix(&a.did);
+    let prefix = vlpds::state::mst_node_prefix(&a.did, s.app.repo_gen(&a.did).await.ok().unwrap());
     let mut it = p.db.scan(prefix.clone()..vlpds::state::prefix_end(&prefix)).await.unwrap();
     let (mut keys, mut node_bytes) = (Vec::new(), 0);
     while let Some(kv) = it.next().await.unwrap() {

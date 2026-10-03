@@ -96,9 +96,9 @@ pub(crate) async fn unpaced_ingest(db: &slatedb::Db, records: u64) -> Ingest {
             let cid: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(n.to_le_bytes()).into();
             let mut val = cid.to_vec();
             val.extend_from_slice(&record);
-            wb.put(vlpds::state::record_key(did, &path), val);
+            wb.put(vlpds::state::record_key(did, 0, &path), val);
             let c = vlpds::cid::Cid::dag_cbor(&cid);
-            wb.put(vlpds::state::record_cid_key(did, &c, &path), b"");
+            wb.put(vlpds::state::record_cid_key(did, 0, &c, &path), b"");
         }
         let t = Instant::now();
         if tokio::time::timeout(Duration::from_secs(60), db.write(wb)).await.is_err() {

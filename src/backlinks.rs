@@ -134,11 +134,11 @@ pub struct Fetched {
 
 /// Reads `links`' index values, the links of the records at `paths` (and
 /// those links' values), or with `all` the repo's whole index.
-pub async fn fetch<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, links: &[Vec<u8>], paths: &[String], all: bool) -> anyhow::Result<Fetched> {
+pub async fn fetch<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, links: &[Vec<u8>], paths: &[String], all: bool) -> anyhow::Result<Fetched> {
     let mut out = Fetched { all, ..Default::default() };
     let mut want: Vec<Vec<u8>> = Vec::new();
     if all {
-        let prefix = crate::state::backlink_prefix(did);
+        let prefix = crate::state::backlink_prefix(did, gen);
         let mut it = db.scan(prefix.clone()..crate::state::prefix_end(&prefix)).await?;
         while let Some(kv) = it.next().await? {
             out.vals.push((kv.key[prefix.len()..].into(), decode(&kv.value)));
@@ -147,7 +147,7 @@ pub async fn fetch<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, lin
         want.extend(links.iter().cloned());
     }
     for p in paths {
-        let l = match db.get(crate::state::record_key(did, p)).await? {
+        let l = match db.get(crate::state::record_key(did, gen, p)).await? {
             Some(v) => {
                 let (_, bytes) = crate::state::decode_record_value(&v)?;
                 link(crate::worker::collection_of(p), &bytes)
@@ -162,7 +162,7 @@ pub async fn fetch<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, lin
     want.sort();
     want.dedup();
     for l in want {
-        let v = db.get(crate::state::backlink_key(did, &l)).await?;
+        let v = db.get(crate::state::backlink_key(did, gen, &l)).await?;
         out.vals.push((l.into(), v.map(|v| decode(&v)).unwrap_or_default()));
     }
     Ok(out)

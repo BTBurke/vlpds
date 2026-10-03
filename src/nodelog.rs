@@ -738,7 +738,7 @@ impl Open {
         let epoch = sink.epoch;
         if e.frames.is_empty() {
             // private-state write: an empty frame, skipped by the firehose
-            e.frames.push(Frame { prefix: Vec::new(), suffix: Vec::new(), derived_muts: 0 });
+            e.frames.push(Frame { prefix: Vec::new(), suffix: Vec::new(), derived_muts: 0, derived_gen: 0 });
         }
         let n = e.frames.len();
         let seqs: Vec<i64> = (0..n).map(|_| wm.assign()).collect();
@@ -749,7 +749,7 @@ impl Open {
             let seq = seqs[i];
             let (muts, derived): (&[Mutation], usize) = if i + 1 == n { (&e.muts, f.derived_muts) } else { (&[], 0) };
             let empty = f.prefix.is_empty() && f.suffix.is_empty();
-            let range = self.seg.push_derived(seq, e.shard, epoch, |out| if !empty { f.finish(seq, out) }, muts, derived);
+            let range = self.seg.push_derived(seq, e.shard, epoch, |out| if !empty { f.finish(seq, out) }, muts, derived, f.derived_gen);
             self.frames.push((seq, range));
         }
         self.muts.entry(e.shard).or_default().append(&mut e.muts);
@@ -1601,7 +1601,7 @@ mod tests {
     fn entry(shard: ShardId, key: String, val_len: usize, ack: Option<AckFn>) -> LogEntry {
         LogEntry {
             shard,
-            frames: vec![Frame { prefix: key.clone().into_bytes(), suffix: Vec::new(), derived_muts: 0 }],
+            frames: vec![Frame { prefix: key.clone().into_bytes(), suffix: Vec::new(), derived_muts: 0, derived_gen: 0 }],
             muts: vec![Mutation { key: Bytes::from(key), val: Some(Bytes::from(vec![7u8; val_len])) }],
             ack,
             pending: None,

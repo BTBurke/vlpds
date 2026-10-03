@@ -115,8 +115,8 @@ fn check_commit(did: &str, head: &Head, pubkey: &str) -> J {
 }
 
 /// (records, paths of records that don't decode or hash to their CID).
-async fn read_records<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str) -> XResult<(Vec<StoredRecord>, Vec<String>)> {
-    let rprefix = state::record_prefix(did);
+async fn read_records<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64) -> XResult<(Vec<StoredRecord>, Vec<String>)> {
+    let rprefix = state::record_prefix(did, gen);
     let (mut records, mut bad) = (Vec::new(), Vec::new());
     for (k, v) in scan_keys(db, &rprefix).await? {
         let path = String::from_utf8_lossy(&k[rprefix.len()..]).into_owned();
@@ -142,9 +142,10 @@ async fn read_records<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str) 
 async fn check_backlinks<R: slatedb::DbReadOps + Sync + ?Sized>(
     db: &R,
     did: &str,
+    gen: u64,
     records: &[StoredRecord],
 ) -> XResult<(usize, Vec<Bytes>, usize)> {
-    let stored: HashMap<Bytes, Bytes> = scan_keys(db, &state::backlink_prefix(did)).await?.into_iter().collect();
+    let stored: HashMap<Bytes, Bytes> = scan_keys(db, &state::backlink_prefix(did, gen)).await?.into_iter().collect();
     let mut want: BTreeMap<Vec<u8>, crate::backlinks::Rkeys> = BTreeMap::new();
     for (path, _, bytes, _) in records {
         let coll = crate::worker::collection_of(path);
@@ -156,7 +157,7 @@ async fn check_backlinks<R: slatedb::DbReadOps + Sync + ?Sized>(
         .into_iter()
         .map(|(l, mut rkeys)| {
             rkeys.sort();
-            (Bytes::from(state::backlink_key(did, &l)), crate::backlinks::encode(&rkeys))
+            (Bytes::from(state::backlink_key(did, gen, &l)), crate::backlinks::encode(&rkeys))
         })
         .collect();
     let missing = want.iter().filter(|(k, v)| stored.get(*k) != Some(*v)).count();
@@ -183,17 +184,18 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
         Some(v) => serde_json::from_slice(&v).map_err(XrpcError::from_err)?,
         None => return Err(XrpcError::internal(format!("{did}: head without account"))),
     };
+    let gen = acct.repo_gen;
 
-    let (records, bad_records) = read_records(snap.as_ref(), did).await?;
+    let (records, bad_records) = read_records(snap.as_ref(), did, gen).await?;
 
-    let mprefix = state::mst_node_prefix(did);
+    let mprefix = state::mst_node_prefix(did, gen);
     let stored: Vec<(Bytes, Bytes)> = scan_keys(snap.as_ref(), &mprefix).await?;
     let cprefix = {
-        let k = state::record_cid_prefix(did, &head.data);
+        let k = state::record_cid_prefix(did, gen, &head.data);
         k[..k.len() - 8].to_vec()
     };
     let cid_index: HashSet<Bytes> = scan_keys(snap.as_ref(), &cprefix).await?.into_iter().map(|(k, _)| k).collect();
-    let blob_index: HashSet<Bytes> = scan_keys(snap.as_ref(), &state::blob_ref_prefix(did)).await?.into_iter().map(|(k, _)| k).collect();
+    let blob_index: HashSet<Bytes> = scan_keys(snap.as_ref(), &state::blob_ref_prefix(did, gen)).await?.into_iter().map(|(k, _)| k).collect();
     let mut colls = BTreeSet::new();
     for (path, ..) in &records {
         colls.insert(crate::worker::collection_of(path).to_string());
@@ -234,10 +236,10 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
     }
     let missing: Vec<&Cid> = want.keys().filter(|c| !have.contains(*c)).collect();
 
-    let want_cids: HashSet<Bytes> = records.iter().map(|(p, c, ..)| Bytes::from(state::record_cid_key(did, c, p))).collect();
+    let want_cids: HashSet<Bytes> = records.iter().map(|(p, c, ..)| Bytes::from(state::record_cid_key(did, gen, c, p))).collect();
     let want_blobs: HashSet<Bytes> = records
         .iter()
-        .flat_map(|(p, _, _, bs)| bs.iter().map(move |b| Bytes::from(state::blob_ref_key(did, b, p))))
+        .flat_map(|(p, _, _, bs)| bs.iter().map(move |b| Bytes::from(state::blob_ref_key(did, gen, b, p))))
         .collect();
     let cid_missing = want_cids.difference(&cid_index).count();
     let blob_missing = want_blobs.difference(&blob_index).count();
@@ -248,7 +250,7 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
     stale_keys.extend(blob_index.difference(&want_blobs).cloned());
     let (cid_extra, blob_extra) = (n1 - n0, stale_keys.len() - n1);
 
-    let (bl_missing, bl_stale, bl_stored) = check_backlinks(snap.as_ref(), did, &records).await?;
+    let (bl_missing, bl_stale, bl_stored) = check_backlinks(snap.as_ref(), did, gen, &records).await?;
 
     let counted = state::RepoStats {
         records: (records.len() + bad_records.len()) as u64,

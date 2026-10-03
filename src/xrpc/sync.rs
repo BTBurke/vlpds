@@ -238,10 +238,11 @@ const EXPORT_CHUNK: usize = 1 << 20;
 async fn feed_records(
     snap: &slatedb::DbSnapshot,
     did: &str,
+    gen: u64,
     since: Option<u64>,
     tx: tokio::sync::mpsc::Sender<crate::mst_store::RecordBatch>,
 ) -> anyhow::Result<()> {
-    let prefix = state::record_prefix(did);
+    let prefix = state::record_prefix(did, gen);
     let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, cache_blocks: true, ..Default::default() };
     let mut iter = match snap.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await {
         Ok(it) => state::BatchedScan::new(it),
@@ -324,14 +325,14 @@ async fn export_slot(app: &App) -> XResult<ExportSlot> {
 
 /// A whole-tree walk's `M/` read-ahead, and its grants from
 /// [`EXPORT_PREFETCH_MB`]. Walk with its `persist_min()`.
-pub(crate) async fn prefetch_nodes(snap: &slatedb::DbSnapshot, did: &str) -> (crate::mst_store::Prefetched, Option<tokio::sync::SemaphorePermit<'static>>) {
+pub(crate) async fn prefetch_nodes(snap: &slatedb::DbSnapshot, did: &str, gen: u64) -> (crate::mst_store::Prefetched, Option<tokio::sync::SemaphorePermit<'static>>) {
     let (mut held, mut mb) = (None::<tokio::sync::SemaphorePermit<'static>>, 0usize);
     let max = EXPORT_PREFETCH_MAX.load(Ordering::Relaxed);
     if max == 0 {
         return (Default::default(), None);
     }
     let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, cache_blocks: true, ..Default::default() };
-    let r = crate::mst_store::prefetch_tree(snap, did, &opts, |bytes| {
+    let r = crate::mst_store::prefetch_tree(snap, did, gen, &opts, |bytes| {
         if bytes > max {
             return false;
         }
@@ -436,7 +437,7 @@ impl<S: crate::mst_lazy::Source> crate::mst_lazy::Source for Stoppable<'_, S> {
 async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Response> {
     let slot = export_slot(app).await?;
     let (view, snap) = app.repo_view(did).await?;
-    let head = view.head.clone();
+    let (head, gen) = (view.head.clone(), view.gen);
     drop(view);
     let did: Arc<str> = did.into();
     let stall = app.config.export_stall;
@@ -445,7 +446,7 @@ async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Respon
     let ours = body.clone();
     tokio::spawn(async move {
         let _slot = slot;
-        let reason = match stream_export(snap, did.clone(), head, since, &tx, stall).await {
+        let reason = match stream_export(snap, did.clone(), gen, head, since, &tx, stall).await {
             Ok(()) => "done",
             Err(r) => r,
         };
@@ -469,6 +470,7 @@ async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Respon
 async fn stream_export(
     snap: Arc<slatedb::DbSnapshot>,
     did: Arc<str>,
+    gen: u64,
     head: Head,
     since: Option<u64>,
     tx: &ChunkTx,
@@ -481,7 +483,7 @@ async fn stream_export(
     send_chunk(tx, first, stall).await?;
     let (ktx, krx) = tokio::sync::mpsc::channel(EXPORT_FEED);
     let walk = async {
-        let (pre, budget) = prefetch_nodes(&snap, &did).await;
+        let (pre, budget) = prefetch_nodes(&snap, &did, gen).await;
         let (snap2, did2, root, tx2) = (snap.clone(), did.clone(), head.data, tx.clone());
         let r = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -499,7 +501,7 @@ async fn stream_export(
                     }
                 }
             };
-            let nodes = crate::mst_store::DbSource::new(&*snap2, &did2, &rt).with_prefetched(Some(&pre));
+            let nodes = crate::mst_store::DbSource::new(&*snap2, &did2, gen, &rt).with_prefetched(Some(&pre));
             let src = Stoppable { inner: crate::mst_store::FedSource::new(nodes, krx), stop: &stop };
             let r = crate::mst_lazy::export_blocks(root, pre.persist_min(), &src, &mut emit).map(|_| ());
             (r, stop.get(), buf)
@@ -508,7 +510,7 @@ async fn stream_export(
         drop(budget);
         r
     };
-    let (walked, fed) = tokio::join!(walk, feed_records(&snap, &did, since, ktx));
+    let (walked, fed) = tokio::join!(walk, feed_records(&snap, &did, gen, since, ktx));
     let buf = match walked {
         Ok((_, Some(reason), _)) => return Err(reason),
         Ok((Ok(()), None, buf)) => buf,
@@ -573,7 +575,7 @@ async fn get_blocks(
     // records, by the record CID index (c/ keys) of the matching snapshot
     for c in rest(&found) {
         if c.codec == crate::cid::CODEC_DAG_CBOR {
-            if let Some(b) = find_record(&snap, &did, &c).await? {
+            if let Some(b) = find_record(&snap, &did, view.gen, &c).await? {
                 found.insert(c, b);
             }
         }
@@ -605,8 +607,8 @@ async fn get_blocks(
 
 /// The c/ index names the paths holding that CID (or one sharing its key
 /// prefix), so the record at a path must match.
-async fn find_record(snap: &slatedb::DbSnapshot, did: &str, cid: &Cid) -> XResult<Option<Vec<u8>>> {
-    let prefix = state::record_cid_prefix(did, cid);
+async fn find_record(snap: &slatedb::DbSnapshot, did: &str, gen: u64, cid: &Cid) -> XResult<Option<Vec<u8>>> {
+    let prefix = state::record_cid_prefix(did, gen, cid);
     let mut iter = snap
         .scan(prefix.clone()..state::prefix_end(&prefix))
         .await
@@ -615,7 +617,7 @@ async fn find_record(snap: &slatedb::DbSnapshot, did: &str, cid: &Cid) -> XResul
         let Ok(path) = std::str::from_utf8(&kv.key[prefix.len()..]) else {
             continue;
         };
-        if let Some(v) = snap.get(state::record_key(did, path)).await.map_err(XrpcError::from_err)? {
+        if let Some(v) = snap.get(state::record_key(did, gen, path)).await.map_err(XrpcError::from_err)? {
             let (c, bytes) = state::decode_record_value(&v).map_err(XrpcError::from_err)?;
             if c == *cid {
                 return Ok(Some(bytes.to_vec()));
@@ -647,12 +649,12 @@ async fn sync_get_record(
     let mut out = Vec::new();
     car::write_header(&mut out, &head.commit);
     car::write_block(&mut out, &head.commit, &head.commit_block);
-    let proof = crate::mst_store::proof_blocks(&view.tree.root, &*snap, &q.did, path.as_bytes()).await;
+    let proof = crate::mst_store::proof_blocks(&view.tree.root, &*snap, &q.did, view.gen, path.as_bytes()).await;
     for (c, b) in proof.map_err(XrpcError::from_err)? {
         car::write_block(&mut out, &c, &b);
     }
     if let Some(v) =
-        snap.get(state::record_key(&q.did, &path))
+        snap.get(state::record_key(&q.did, view.gen, &path))
             .await
             .map_err(XrpcError::from_err)?
     {
@@ -702,7 +704,7 @@ async fn lazy_nodes(
             if c.codec != crate::cid::CODEC_DAG_CBOR {
                 continue;
             }
-            if let Some(b) = snap.get(state::mst_node_key(did, &c)).await.map_err(XrpcError::from_err)? {
+            if let Some(b) = snap.get(state::mst_node_key(did, view.gen, &c)).await.map_err(XrpcError::from_err)? {
                 if Cid::dag_cbor(&b) == c {
                     out.push((c, b.to_vec()));
                 }
@@ -739,13 +741,13 @@ async fn lazy_nodes(
         Some(r) => r,
         None => {
             let _slot = INDEX_BUILDS.acquire().await.expect("never closed");
-            let (pre, _budget) = prefetch_nodes(snap, did).await;
-            let (snap, did, root) = (snap.clone(), did.to_string(), view.head.data);
+            let (pre, _budget) = prefetch_nodes(snap, did, view.gen).await;
+            let (snap, did, root, gen) = (snap.clone(), did.to_string(), view.head.data, view.gen);
             let ix = tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Handle::current();
                 let mut map = HashMap::new();
-                let nodes = crate::mst_store::DbSource::new(&*snap, &did, &rt).with_prefetched(Some(&pre));
-                let scan = crate::mst_store::ScanSource::open(&*snap, &did, nodes, &rt)?;
+                let nodes = crate::mst_store::DbSource::new(&*snap, &did, gen, &rt).with_prefetched(Some(&pre));
+                let scan = crate::mst_store::ScanSource::open(&*snap, &did, gen, nodes, &rt)?;
                 crate::mst_lazy::export_blocks(root, pre.persist_min(), &scan, &mut |c, b| {
                     // nodes with keys of their own (all leaves): where they sit
                     if let Ok(n) = crate::mst::decode_node(b, c) {
@@ -794,7 +796,7 @@ fn index_build_gate(cell: &crate::mst::SharedNodeIndex) -> Arc<tokio::sync::Mute
 /// The block of node `c` if it ends `key`'s path in the view's tree (a node
 /// holding its own first key does).
 async fn path_end_block(view: &crate::worker::DurableView, snap: &slatedb::DbSnapshot, did: &str, key: &[u8], c: &Cid) -> XResult<Option<Vec<u8>>> {
-    let n = crate::mst_store::path_end(&view.tree.root, snap, did, key).await.map_err(XrpcError::from_err)?;
+    let n = crate::mst_store::path_end(&view.tree.root, snap, did, view.gen, key).await.map_err(XrpcError::from_err)?;
     if n.cid != Some(*c) {
         return Ok(None);
     }

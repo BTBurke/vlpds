@@ -792,8 +792,7 @@ fn status_attr(applied: bool, r: Option<&str>) -> J {
 async fn current_record_cid(app: &App, uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("at://")?;
     let (did, path) = rest.split_once('/')?;
-    let p = app.partition(did).ok()?;
-    let v = p.db.get(state::record_key(did, path)).await.ok()??;
+    let v = app.record_value(did, None, path).await.ok()??;
     let (cid, _) = state::decode_record_value(&v).ok()?;
     Some(cid.to_string())
 }

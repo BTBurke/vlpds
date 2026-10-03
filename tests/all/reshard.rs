@@ -311,7 +311,7 @@ async fn verify_readable_on(nodes: &[&Node], acked: &[Acked]) {
 /// open DB was lost by that shard's state, not misrouted.
 async fn diagnose(n: &TestServer, a: &Acked) {
     let path = a.uri.splitn(4, '/').nth(3).unwrap().to_string();
-    let rk = vlpds::state::record_key(&a.did, &path);
+    let rk = vlpds::state::record_key(&a.did, 0, &path);
     let l = n.app.partitions.layout();
     eprintln!("DIAG {} slot {} rev {} layout v{} routes to shard {} of {:?}", a.uri, vlpds::slots::slot_of(&a.did), a.rev, l.version, l.shard_of(&a.did), l.ids());
     for p in n.app.partitions.owned() {

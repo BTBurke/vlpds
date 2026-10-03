@@ -18,9 +18,11 @@ pub fn routes() -> Router<Arc<App>> {
 pub const DEFAULT_MAX_IMPORT_BYTES: usize = 1 << 30;
 
 /// importRepo memory the node's budget reserves (src/memory.rs), when
-/// --max-import-mb allows more: the imports in flight are expected to hold
-/// about this much together. Change it with the import path's working set.
-pub const IMPORT_MEMORY_BYTES: usize = 256 << 20;
+/// --max-import-mb allows more: the streamed imports a node runs at once
+/// (`staged_import::IMPORT_SLOTS`) at their working set each. The buffered
+/// fallback (a CAR in another block order, one at a time) holds the whole
+/// body and its parse on top, up to --max-import-mb.
+pub const IMPORT_MEMORY_BYTES: usize = super::staged_import::IMPORT_SLOTS * super::staged_import::IMPORT_WORKING_SET;
 
 /// The reference sets no limit; our own writes refuse a record over 1 MB,
 /// so this leaves room for records made elsewhere while bounding what one
@@ -392,13 +394,7 @@ async fn put_record(
     let path = format!("{}/{}", inp.collection, inp.rkey);
     // Writing the record it already holds is a no-op with no `commit` field
     // and no swap checks (reference putRecord).
-    let p = app.partition(&did)?;
-    if let Some(cur) = p
-        .db
-        .get(state::record_key(&did, &path))
-        .await
-        .map_err(XrpcError::from_err)?
-    {
+    if let Some(cur) = app.record_value(&did, None, &path).await? {
         let (cur, _) = state::decode_record_value(&cur).map_err(XrpcError::from_err)?;
         if cur == cid {
             app.ensure_active(&did).await?;
@@ -453,13 +449,7 @@ async fn delete_record(
     // A no-op, as in the reference: the worker would otherwise emit an empty
     // commit whose CAR lacks the unchanged MST root, which relays reject.
     let path = format!("{}/{}", inp.collection, inp.rkey);
-    let p = app.partition(&did)?;
-    if p.db
-        .get(state::record_key(&did, &path))
-        .await
-        .map_err(XrpcError::from_err)?
-        .is_none()
-    {
+    if app.record_value(&did, None, &path).await?.is_none() {
         app.ensure_active(&did).await?;
         return Ok(Json(json!({})));
     }
@@ -610,11 +600,10 @@ async fn get_record(
         }
         return super::proxy::pipethrough_unauthed(&app, &headers, &req_uri, "com.atproto.repo.getRecord").await;
     };
-    super::sync::assert_available(&app, &did, creds.as_ref()).await?;
-    let p = app.partition(&did)?;
+    let acct = super::sync::assert_available(&app, &did, creds.as_ref()).await?;
     let path = format!("{}/{}", q.collection, q.rkey);
     let not_found = || XrpcError::bad("RecordNotFound", format!("Could not locate record: at://{did}/{path}"));
-    let v = p.db.get(state::record_key(&did, &path)).await.map_err(XrpcError::from_err)?.ok_or_else(not_found)?;
+    let v = app.record_value(&did, Some(acct.repo_gen), &path).await?.ok_or_else(not_found)?;
     let (cid, bytes) = state::decode_record_value(&v).map_err(XrpcError::from_err)?;
     if super::admin::is_record_takendown(&app, &did, &path).await? || q.cid.as_ref().is_some_and(|want| *want != cid.to_string()) {
         return Err(not_found());
@@ -664,16 +653,30 @@ async fn list_records(
         }
     };
     let did = app.resolve_repo(&q.repo).await.map_err(not_found)?;
-    super::sync::assert_available(&app, &did, creds.as_ref())
+    let acct = super::sync::assert_available(&app, &did, creds.as_ref())
         .await
         .map_err(not_found)?;
-    let p = app.partition(&did)?;
     let limit = match q.limit {
         None => 50,
         Some(n @ 1..=100) => n as usize,
         Some(n) => return Err(XrpcError::bad("InvalidRequest", format!("limit must be between 1 and 100, got {n}"))),
     };
-    let prefix = state::record_key(&did, &format!("{}/", q.collection));
+    // redone at the new generation if an import moved it under the scan
+    // (the old one may be part swept)
+    let mut gen = acct.repo_gen;
+    loop {
+        let out = list_records_at(&app, &did, gen, &q, limit).await?;
+        let now = app.repo_gen(&did).await?;
+        if now == gen {
+            return Ok(json_bytes(out));
+        }
+        gen = now;
+    }
+}
+
+async fn list_records_at(app: &App, did: &str, gen: u64, q: &ListRecordsQ, limit: usize) -> XResult<Vec<u8>> {
+    let p = app.partition(did)?;
+    let prefix = state::record_key(did, gen, &format!("{}/", q.collection));
     let end = state::prefix_end(&prefix);
     // newest first (descending rkey) unless reverse
     let ascending = q.reverse.unwrap_or(false);
@@ -724,7 +727,7 @@ async fn list_records(
         serde_json::to_writer(&mut out, c).map_err(XrpcError::from_err)?;
     }
     out.push(b'}');
-    Ok(json_bytes(out))
+    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -732,10 +735,22 @@ struct RepoQ {
     repo: String,
 }
 
-/// One seek per collection over its contiguous key range.
-async fn list_collections(app: &App, did: &str) -> XResult<Vec<String>> {
+/// One seek per collection over its contiguous key range, at the
+/// account's generation (redone if an import moved it meanwhile).
+async fn list_collections(app: &App, did: &str, mut gen: u64) -> XResult<Vec<String>> {
+    loop {
+        let out = list_collections_at(app, did, gen).await?;
+        let now = app.repo_gen(did).await?;
+        if now == gen {
+            return Ok(out);
+        }
+        gen = now;
+    }
+}
+
+async fn list_collections_at(app: &App, did: &str, gen: u64) -> XResult<Vec<String>> {
     let p = app.partition(did)?;
-    let prefix = state::record_prefix(did);
+    let prefix = state::record_prefix(did, gen);
     let end = state::prefix_end(&prefix);
     let mut lo = prefix.clone();
     let mut out = Vec::new();
@@ -749,7 +764,7 @@ async fn list_collections(app: &App, did: &str) -> XResult<Vec<String>> {
         };
         let path = String::from_utf8_lossy(&kv.key[prefix.len()..]).into_owned();
         let coll = crate::worker::collection_of(&path).to_string();
-        lo = state::prefix_end(&state::record_key(did, &format!("{coll}/")));
+        lo = state::prefix_end(&state::record_key(did, gen, &format!("{coll}/")));
         out.push(coll);
     }
     Ok(out)
@@ -767,15 +782,16 @@ async fn describe_repo(State(app): AppState, Query(q): Query<RepoQ>) -> XResult<
         "handle": if handle_is_correct { acct.handle.as_str() } else { "handle.invalid" },
         "did": acct.did,
         "didDoc": did_doc,
-        "collections": list_collections(&app, &did).await?,
+        "collections": list_collections(&app, &did, acct.repo_gen).await?,
         "handleIsCorrect": handle_is_correct,
     })))
 }
 
-/// The worker writes a new commit signed with our key, and emits `#sync`
-/// unless the account is deactivated (migration in: activation announces
-/// it). Like the reference, neither the imported commit's signature nor its
-/// `did` is checked: only its contents are used.
+/// Staged under a new repo generation (`staged_import`), then a new commit
+/// signed with our key, and `#sync` unless the account is deactivated
+/// (migration in: activation announces it). Like the reference, neither the
+/// imported commit's signature nor its `did` is checked: only its contents
+/// are used.
 async fn import_repo(
     State(app): AppState,
     Auth(creds): Auth,
@@ -787,13 +803,7 @@ async fn import_repo(
     if super::server::is_takendown_account(&app.account(&did).await?) {
         return Err(super::takedown_error());
     }
-    // parsed off the repo's worker, which only writes the result
-    let (records, tree) = super::import_stream::read(body, &headers, app.config.max_import_bytes).await?;
-    app.account_op(
-        &did,
-        crate::worker::AccountOp::ReplaceRepo { records, swap_commit: None, stale_keys: Vec::new(), tree: Some(tree) },
-    )
-    .await?;
+    super::staged_import::import(&app, &did, body, &headers).await?;
     Ok(StatusCode::OK)
 }
 

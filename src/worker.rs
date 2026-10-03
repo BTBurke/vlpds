@@ -211,6 +211,46 @@ pub enum AccountOp {
     /// reference's sequenceAccountActivation.
     Activate { mutate: AccountMutation },
     SigningKey(KeyStep),
+    /// importRepo staged under a new generation (`crate::import`, DESIGN.md
+    /// "Staged imports").
+    Import(ImportStep),
+}
+
+/// The steps of a staged import, each its own log entry. Every step but
+/// `Begin` names the import by its driver's nonce (and the shard epoch it
+/// began in), so a driver whose import was aborted, or whose shard moved,
+/// can't touch the repo again.
+pub enum ImportStep {
+    /// Reserves a generation and the rev of the import's commit (`G/`).
+    /// Refused as an import is (inactive account, key rotating or
+    /// unavailable) and while another driver's import is staged here; one
+    /// whose driver is gone is moved to the garbage first.
+    Begin { nonce: u64, ticket: oneshot::Sender<ImportTicket> },
+    /// Rows of the staged generation, no frame.
+    Rows { nonce: u64, epoch: u64, muts: Vec<Mutation> },
+    /// Makes the staged generation the repo's in one entry: a commit over
+    /// `root` (its block; None: the empty tree) at the reserved rev, the
+    /// account's generation, `S/`, the collection index changes, the old
+    /// generation to the garbage, and #sync unless deactivated.
+    Commit { nonce: u64, epoch: u64, root: Option<Bytes>, stats: state::RepoStats, colls_add: Vec<String>, colls_del: Vec<String> },
+    /// The staged generation becomes garbage. A no-op for another nonce.
+    Abort { nonce: u64 },
+    /// Deletes of a garbage generation's rows.
+    Sweep { gen: u64, muts: Vec<Mutation> },
+    /// A garbage generation's rows are gone: forget it.
+    Swept { gen: u64 },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ImportTicket {
+    pub gen: u64,
+    /// What the account's generation was: the commit sends it to the garbage.
+    pub old_gen: u64,
+    pub rev: Tid,
+    pub epoch: u64,
+    /// A staged import this Begin sent to the garbage (its driver gone, or
+    /// this driver starting over).
+    pub stale: Option<u64>,
 }
 
 /// The repo side of a signing-key rotation (DESIGN.md "Signing-key
@@ -306,6 +346,8 @@ pub struct CachedRepo {
 /// commit that could still be lost.
 pub struct DurableView {
     pub head: Head,
+    /// The generation the head's rows are under (`state::Gen`).
+    pub gen: u64,
     /// Only partly loaded: readers load the rest into a private copy from a
     /// SlateDB snapshot taken with the view (`App::repo_view`).
     pub tree: Tree,
@@ -367,11 +409,17 @@ pub struct RepoState {
     /// the nodes written; None = the whole tree). Paths are unloaded only
     /// outside these sets while commits are in flight.
     pub inflight: std::collections::VecDeque<(Arc<std::sync::atomic::AtomicBool>, Option<HashSet<Cid>>)>,
+    /// `G/{did}` at the in-memory head: a staged import, generations to sweep.
+    pub imports: state::ImportState,
 }
 
 impl RepoState {
+    pub fn gen(&self) -> u64 {
+        self.account.repo_gen
+    }
+
     fn durable_view(&self) -> Arc<DurableView> {
-        Arc::new(DurableView { head: self.head.clone(), tree: self.mst.tree.clone(), nodes: self.nodes.clone() })
+        Arc::new(DurableView { head: self.head.clone(), gen: self.gen(), tree: self.mst.tree.clone(), nodes: self.nodes.clone() })
     }
 }
 
@@ -434,8 +482,8 @@ impl From<usize> for CacheLimits {
     }
 }
 
-fn new_view(head: &Head, mst: &LazyTree, nodes: &crate::mst::SharedNodeIndex) -> ViewCell {
-    Arc::new(parking_lot::RwLock::new(Arc::new(DurableView { head: head.clone(), tree: mst.tree.clone(), nodes: nodes.clone() })))
+fn new_view(head: &Head, gen: u64, mst: &LazyTree, nodes: &crate::mst::SharedNodeIndex) -> ViewCell {
+    Arc::new(parking_lot::RwLock::new(Arc::new(DurableView { head: head.clone(), gen, tree: mst.tree.clone(), nodes: nodes.clone() })))
 }
 
 #[derive(Clone)]
@@ -654,11 +702,18 @@ impl Worker {
                 };
                 let wrote = reqs.iter().any(|q| matches!(q, Queued::Write(_)));
                 let had_key = st.key.is_some();
-                if let Err(e) = process(st, reqs, self.clock_id, &self.rt) {
-                    // in-memory state can't be trusted: reload from durable
-                    // state once nothing is in flight
-                    tracing::error!(%did, "commit failed, evicting repo: {e:#}");
-                    self.discard(did);
+                let leftover = match process(st, reqs, self.clock_id, &self.rt) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        // in-memory state can't be trusted: reload from durable
+                        // state once nothing is in flight
+                        tracing::error!(%did, "commit failed, evicting repo: {e:#}");
+                        self.discard(did);
+                        continue;
+                    }
+                };
+                if !leftover.is_empty() {
+                    self.reload(did, leftover);
                     continue;
                 }
                 // without its signing key writes are refused: reload, which
@@ -978,17 +1033,17 @@ impl Worker {
         };
         st.fetching = true;
         let mut mst = (!need.tree_loaded).then(|| st.mst.clone());
-        let db = st.partition.db.clone();
+        let (db, gen) = (st.partition.db.clone(), st.gen());
         let (rt, me, d) = (self.rt.clone(), self.me.clone(), did.clone());
         self.loading.insert(did, reqs);
         self.rt.spawn_blocking(move || {
             let store_err = |e: anyhow::Error| crate::mst::MstError::Store(e.to_string());
-            let res = mst.as_mut().map_or(Ok(()), |m| need.load(m, &*db, &d, &rt)).and_then(|_| {
+            let res = mst.as_mut().map_or(Ok(()), |m| need.load(m, &*db, &d, gen, &rt)).and_then(|_| {
                 let blobs = match need.blobs {
-                    true => Some(rt.block_on(load_blob_refs(&*db, &d)).map_err(store_err)?),
+                    true => Some(rt.block_on(load_blob_refs(&*db, &d, gen)).map_err(store_err)?),
                     false => None,
                 };
-                let bl = rt.block_on(need.load_backlinks(&*db, &d)).map_err(store_err)?;
+                let bl = rt.block_on(need.load_backlinks(&*db, &d, gen)).map_err(store_err)?;
                 Ok(Box::new((mst, blobs, bl)))
             });
             let _ = me.send(WorkerMsg::Fetched { did: d, res });
@@ -1041,7 +1096,7 @@ impl Worker {
     }
 
     fn create_repo(&mut self, req: CreateRepoReq) {
-        let (partition, tree, head, account) = match self.check_create(&req) {
+        let (partition, tree, head, account, imports) = match self.check_create(&req) {
             Ok(v) => v,
             Err(e) => {
                 let _ = req.reply.send(Err(e));
@@ -1069,22 +1124,33 @@ impl Worker {
             ]
         };
         let mut muts = Vec::with_capacity(3 + req.records.len());
+        let gen = account.repo_gen;
         let mut colls = HashSet::new();
         for (path, cid, bytes) in &req.records {
-            muts.push(put(state::record_key(&did, path), state::record_value(cid, head.rev.0, bytes)));
-            muts.push(put(state::record_cid_key(&did, cid, path), Bytes::new()));
+            muts.push(put(state::record_key(&did, gen, path), state::record_value(cid, head.rev.0, bytes)));
+            muts.push(put(state::record_cid_key(&did, gen, cid, path), Bytes::new()));
             if colls.insert(collection_of(path)) {
                 muts.push(put(state::collection_key(collection_of(path), &did), Bytes::new()));
             }
         }
-        replace_nodes_mutations(&did, HashMap::new(), &tree, &mut muts);
+        replace_nodes_mutations(&did, gen, HashMap::new(), &tree, &mut muts);
         muts.push(put(state::repo_stats_key(&did), stats.encode()));
         // a new repo's whole tree is in flight until this applies
         let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut backlinks = crate::backlinks::Cache::default();
-        index_backlinks(&did, req.records.iter().map(|(p, _, b)| (p.as_str(), &b[..])), &mut backlinks, &Some(applied.clone()), &mut muts);
+        index_backlinks(&did, gen, req.records.iter().map(|(p, _, b)| (p.as_str(), &b[..])), &mut backlinks, &Some(applied.clone()), &mut muts);
+        let account_json = match gen {
+            0 => req.account_json.clone(),
+            _ => match account_mutation(&did, &account) {
+                Ok(m) => m.val.expect("a put"),
+                Err(e) => {
+                    let _ = req.reply.send(Err(WriteError::Internal(e.to_string())));
+                    return;
+                }
+            },
+        };
         muts.extend([
-            put(state::account_key(&did), req.account_json.clone()),
+            put(state::account_key(&did), account_json),
             put(state::handle_key(&did, &req.handle), Bytes::from(did.to_string())),
             put(state::head_key(&did), head.encode()),
         ]);
@@ -1107,7 +1173,7 @@ impl Worker {
         };
         let nodes = crate::mst::SharedNodeIndex::default();
         let mst = LazyTree::loaded(tree, 1);
-        let view = new_view(&head, &mst, &nodes);
+        let view = new_view(&head, gen, &mst, &nodes);
         let st = RepoState {
             did: did.clone(),
             partition: partition.clone(),
@@ -1130,6 +1196,7 @@ impl Worker {
             backfill: false,
             backfill_stats: false,
             inflight: [(applied, None)].into(),
+            imports,
         };
         self.cache_put(did.clone(), st);
         if partition.tx.blocking_send(entry).is_err() {
@@ -1140,7 +1207,7 @@ impl Worker {
 
     /// Everything a CreateRepo needs before it writes: the partition, the
     /// genesis tree, the signed head and the account.
-    fn check_create(&mut self, req: &CreateRepoReq) -> Result<(Arc<Partition>, Tree, Head, state::Account), WriteError> {
+    fn check_create(&mut self, req: &CreateRepoReq) -> Result<(Arc<Partition>, Tree, Head, state::Account, state::ImportState), WriteError> {
         // a deleted repo's cached state doesn't block its DID coming back
         // (migration in), once nothing of it is in flight
         if self.cache.peek(&req.did).is_some_and(|st| st.account.status.as_deref() == Some("deleted") && st.pending.load(Ordering::Acquire) == 0) {
@@ -1154,11 +1221,19 @@ impl Worker {
         // is only in durable state, and two createAccounts for one DID can
         // both pass the handler's check. Not cached also means nothing of it
         // is in flight, so durable state is current.
-        match self.rt.block_on(partition.db.get(state::head_key(&req.did))) {
-            Ok(None) => {}
-            Ok(Some(_)) => return Err(WriteError::Invalid(REPO_EXISTS.into())),
+        let (hv, gv) = match self.rt.block_on(async { tokio::try_join!(partition.db.get(state::head_key(&req.did)), partition.db.get(state::import_key(&req.did))) }) {
+            Ok(v) => v,
             Err(e) => return Err(WriteError::Unavailable(format!("repo existence check failed: {e}"))),
+        };
+        if hv.is_some() {
+            return Err(WriteError::Invalid(REPO_EXISTS.into()));
         }
+        // a DID coming back while an earlier incarnation's generations
+        // await their sweep starts above them
+        let imports = match gv {
+            Some(v) => state::ImportState::decode(&v).map_err(|e| WriteError::Internal(e.to_string()))?,
+            None => state::ImportState::default(),
+        };
         let mut tree = Tree::new();
         for (path, cid, _) in &req.records {
             tree.insert_no_proof(path.as_bytes(), *cid).map_err(|e| WriteError::Invalid(e.to_string()))?;
@@ -1166,8 +1241,9 @@ impl Worker {
         let data = tree.root_cid().map_err(|e| WriteError::Internal(e.to_string()))?;
         let rev = tid::next_rev(None, self.clock_id);
         let (commit, commit_block) = sign_commit(&req.did, &rev.to_string(), &data, &req.key).map_err(|e| signature_fault(&e))?;
-        let account: state::Account = serde_json::from_slice(&req.account_json).map_err(|e| WriteError::Internal(format!("bad account json: {e}")))?;
-        Ok((partition, tree, Head { commit, data, rev, commit_block }, account))
+        let mut account: state::Account = serde_json::from_slice(&req.account_json).map_err(|e| WriteError::Internal(format!("bad account json: {e}")))?;
+        account.repo_gen = imports.next_gen(None);
+        Ok((partition, tree, Head { commit, data, rev, commit_block }, account, imports))
     }
 }
 
@@ -1272,26 +1348,26 @@ impl Need {
         self.bl_links.extend(more);
     }
 
-    async fn load_backlinks<R: slatedb::DbReadOps + Sync + ?Sized>(&self, db: &R, did: &str) -> anyhow::Result<Option<crate::backlinks::Fetched>> {
+    async fn load_backlinks<R: slatedb::DbReadOps + Sync + ?Sized>(&self, db: &R, did: &str, gen: u64) -> anyhow::Result<Option<crate::backlinks::Fetched>> {
         if !self.backlinks_needed() {
             return Ok(None);
         }
-        crate::backlinks::fetch(db, did, &self.bl_links, &self.bl_paths, self.bl_all).await.map(Some)
+        crate::backlinks::fetch(db, did, gen, &self.bl_links, &self.bl_paths, self.bl_all).await.map(Some)
     }
 
     /// Blocking: the blocking pool only. A persisted node found missing is
     /// an error too: the repo is then reopened, which rebuilds the tree and
     /// backfills `M/`.
-    fn load<R: slatedb::DbReadOps + Sync + ?Sized>(&self, mst: &mut LazyTree, db: &R, did: &str, rt: &tokio::runtime::Handle) -> Result<(), crate::mst::MstError> {
+    fn load<R: slatedb::DbReadOps + Sync + ?Sized>(&self, mst: &mut LazyTree, db: &R, did: &str, gen: u64, rt: &tokio::runtime::Handle) -> Result<(), crate::mst::MstError> {
         let fallbacks = mst.stats.fallbacks;
         if self.all && !mst.fully_loaded() {
             // one forward scan of the records serves every unloaded leaf
-            let scan = ScanSource::open(db, did, DbSource::new(db, did, rt), rt)?;
+            let scan = ScanSource::open(db, did, gen, DbSource::new(db, did, gen, rt), rt)?;
             mst.load_all(&scan)?;
         }
         let keys: Vec<&[u8]> = self.keys.iter().map(|k| &k[..]).collect();
         let probes: Vec<&[u8]> = self.probes.iter().map(|k| &k[..]).collect();
-        mst.fetch(&keys, &probes, &DbSource::new(db, did, rt))?;
+        mst.fetch(&keys, &probes, &DbSource::new(db, did, gen, rt))?;
         match mst.stats.fallbacks > fallbacks {
             true => Err(crate::mst::MstError::Invalid("persisted MST nodes missing")),
             false => Ok(()),
@@ -1389,7 +1465,7 @@ fn unload_repo(st: &mut RepoState) {
 fn backfill_nodes(st: &mut RepoState) {
     let mut muts = Vec::new();
     if std::mem::take(&mut st.backfill) {
-        replace_nodes_mutations(&st.did, HashMap::new(), &st.mst.tree, &mut muts);
+        replace_nodes_mutations(&st.did, st.gen(), HashMap::new(), &st.mst.tree, &mut muts);
     }
     if std::mem::take(&mut st.backfill_stats) {
         muts.push(put(state::repo_stats_key(&st.did), st.stats.encode()));
@@ -1498,8 +1574,11 @@ fn signature_fault(e: &crate::crypto::SignatureFault) -> WriteError {
 /// read-ahead), only for their blocks to land in the block cache.
 pub async fn warm_repo<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str) -> anyhow::Result<()> {
     db.get(state::head_key(did)).await?;
-    db.get(state::account_key(did)).await?;
-    crate::mst_store::prefetch(db, did, DEFAULT_PREFETCH_BYTES).await?;
+    let gen = match db.get(state::account_key(did)).await? {
+        Some(v) => serde_json::from_slice::<state::Account>(&v)?.repo_gen,
+        None => return Ok(()),
+    };
+    crate::mst_store::prefetch(db, did, gen, DEFAULT_PREFETCH_BYTES).await?;
     warm_security(db, did).await
 }
 
@@ -1530,7 +1609,7 @@ async fn load_repo_with(
 ) -> anyhow::Result<Option<RepoState>> {
     let db = &partition.db;
     let Some(hv) = db.get(state::head_key(&did)).await? else {
-        return Ok(None);
+        return load_husk(partition.clone(), did).await;
     };
     let head = Head::decode(&hv)?;
     let av = db
@@ -1538,7 +1617,9 @@ async fn load_repo_with(
         .await?
         .ok_or_else(|| anyhow::anyhow!("head without account"))?;
     let acct: state::Account = serde_json::from_slice(&av)?;
-    let sv = db.get(state::repo_stats_key(&did)).await?;
+    let gen = acct.repo_gen;
+    let (sv, gv) = tokio::try_join!(db.get(state::repo_stats_key(&did)), db.get(state::import_key(&did)))?;
+    let imports = gv.map(|v| state::ImportState::decode(&v)).transpose()?.unwrap_or_default();
     // with the key service down the repo still loads for reads; writes get
     // a 503 and the next one reloads (retries the unwrap)
     let secrets = opts.secrets.clone().unwrap_or_else(Secrets::dev);
@@ -1557,24 +1638,25 @@ async fn load_repo_with(
     // most cold writes are creates without blobs: no refs to read
     let read_refs = async {
         match opts.need.as_ref().is_some_and(|n| n.blobs) {
-            true => load_blob_refs(&**db, &did).await.map(Some),
+            true => load_blob_refs(&**db, &did, gen).await.map(Some),
             false => Ok(None),
         }
     };
-    let ((mst, backfill), blob_refs) = tokio::try_join!(open_lazy(&partition, &did, &head, &opts), read_refs)?;
+    let ((mst, backfill), blob_refs) = tokio::try_join!(open_lazy(&partition, &did, gen, &head, &opts), read_refs)?;
     let (stats, backfill_stats) = match sv {
         Some(v) => (state::RepoStats::decode(&v)?, false),
         None => {
             tracing::warn!(%did, "repo stats missing: counting the repo");
             metrics::LAZY_MST_FALLBACKS.with_label_values(&["missing_stats"]).inc();
-            (crate::repo_stats::walk(&**db, &did).await?, true)
+            (crate::repo_stats::walk(&**db, &did, gen).await?, true)
         }
     };
     let backlinks = match opts.need.as_ref() {
-        Some(n) => n.load_backlinks(&**db, &did).await?,
+        Some(n) => n.load_backlinks(&**db, &did, gen).await?,
         None => None,
     };
     let mut st = finish_load(partition.clone(), did, mst, head, key, acct)?;
+    st.imports = imports;
     st.stats = stats;
     st.backfill_stats = backfill_stats;
     if let Some(b) = blob_refs {
@@ -1593,15 +1675,15 @@ async fn load_repo_with(
 /// link rebuilds the whole tree from the records (nothing is in flight
 /// during a cold open, so `R/` is at the head); the bool tells the caller to
 /// backfill `M/`.
-async fn open_lazy(partition: &Arc<Partition>, did: &Arc<str>, head: &Head, opts: &LoadOpts) -> anyhow::Result<(LazyTree, bool)> {
+async fn open_lazy(partition: &Arc<Partition>, did: &Arc<str>, gen: u64, head: &Head, opts: &LoadOpts) -> anyhow::Result<(LazyTree, bool)> {
     let _permit = LOAD_PERMITS.acquire().await?;
-    let (pre, _) = crate::mst_store::prefetch(&*partition.db, did, opts.prefetch_bytes).await?;
+    let (pre, _) = crate::mst_store::prefetch(&*partition.db, did, gen, opts.prefetch_bytes).await?;
     let (db, did, root, need) = (partition.db.clone(), did.clone(), head.data, opts.need.clone().unwrap_or_default());
     let rt = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || -> anyhow::Result<(LazyTree, bool)> {
-        let src = DbSource::new(&*db, &did, &rt).with_prefetched(Some(&pre));
+        let src = DbSource::new(&*db, &did, gen, &rt).with_prefetched(Some(&pre));
         let opened = LazyTree::open(root, 1, &src).and_then(|mut t| {
-            need.load(&mut t, &*db, &did, &rt)?;
+            need.load(&mut t, &*db, &did, gen, &rt)?;
             Ok(t)
         });
         let err = match opened {
@@ -1625,8 +1707,28 @@ async fn open_lazy(partition: &Arc<Partition>, did: &Arc<str>, head: &Head, opts
     .await?
 }
 
-async fn load_blob_refs<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str) -> anyhow::Result<BlobRefs> {
-    let prefix = state::blob_ref_prefix(did);
+/// A DID without a repo whose earlier generations still await their sweep
+/// (`G/`): loaded as a deleted repo, so the sweep's ops run on its worker,
+/// ordered with a createAccount bringing the DID back.
+async fn load_husk(partition: Arc<Partition>, did: Arc<str>) -> anyhow::Result<Option<RepoState>> {
+    let Some(gv) = partition.db.get(state::import_key(&did)).await? else {
+        return Ok(None);
+    };
+    let imports = state::ImportState::decode(&gv)?;
+    let tree = Tree::new();
+    let mut tree_c = tree.clone();
+    let data = tree_c.root_cid()?;
+    let head = Head { commit: data, data, rev: Tid(0), commit_block: Bytes::new() };
+    let account = state::Account { did: did.to_string(), status: Some("deleted".into()), ..Default::default() };
+    let mut st = finish_load(partition, did, LazyTree::loaded(tree, 1), head, None, account)?;
+    st.imports = imports;
+    st.blob_refs_loaded = true;
+    st.backlinks.all = true;
+    Ok(Some(st))
+}
+
+async fn load_blob_refs<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64) -> anyhow::Result<BlobRefs> {
+    let prefix = state::blob_ref_prefix(did, gen);
     let mut iter = db.scan(prefix.clone()..state::prefix_end(&prefix)).await?;
     let mut out = BlobRefs::new();
     while let Some(kv) = iter.next().await? {
@@ -1677,7 +1779,7 @@ fn finish_load(
         head.data
     );
     let nodes = crate::mst::SharedNodeIndex::default();
-    let view = new_view(&head, &mst, &nodes);
+    let view = new_view(&head, account.repo_gen, &mst, &nodes);
     Ok(RepoState {
         did,
         partition,
@@ -1699,6 +1801,7 @@ fn finish_load(
         backfill: false,
         backfill_stats: false,
         inflight: Default::default(),
+        imports: Default::default(),
     })
 }
 
@@ -1742,11 +1845,11 @@ fn valid_path_part(s: &str) -> bool {
 }
 
 /// Coalesces a repo's queued requests into as few commits as possible.
-fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, rt: &tokio::runtime::Handle) -> anyhow::Result<()> {
+fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, rt: &tokio::runtime::Handle) -> anyhow::Result<Leftover> {
     // `lazy_needs` loaded the paths before; the source reads only if an op
     // still finds one missing, on the worker thread (metered)
     let (part, did) = (st.partition.clone(), st.did.clone());
-    let db_src = DbSource::new(&*part.db, &did, rt);
+    let db_src = DbSource::new(&*part.db, &did, st.gen(), rt);
     let r = process_with(st, reqs, clock_id, &db_src);
     if db_src.reads.get() > 0 {
         metrics::LAZY_MST_FETCHES.with_label_values(&["inline"]).inc_by(db_src.reads.get());
@@ -1762,7 +1865,173 @@ fn key_rotating(did: &str) -> WriteError {
     WriteError::KeyUnavailable(format!("signing key of {did} is being rotated; retry"))
 }
 
-fn process_with(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, src: &dyn Source) -> anyhow::Result<()> {
+/// An import's driver is staging the repo on this node. Its commit takes
+/// the rev reserved at its start, so no other commit may come first; a
+/// staged import whose driver is gone holds nothing up (it can no longer
+/// commit, and the sweeper moves it to the garbage).
+fn importing(st: &RepoState) -> bool {
+    st.imports.staging.is_some_and(|s| crate::xrpc::staged_import::driving(&st.did, s.nonce))
+}
+
+fn import_in_progress() -> WriteError {
+    WriteError::Invalid("a repo import is in progress; retry once it is done".into())
+}
+
+fn import_interrupted() -> WriteError {
+    WriteError::Unavailable("the repo import was interrupted (its shard moved, or the account was deleted); nothing was imported: retry the import".into())
+}
+
+/// Every key under `gen` of the repo's generation families.
+fn under_gen(did: &str, gen: u64, muts: &[Mutation]) -> bool {
+    let prefixes: Vec<Vec<u8>> = state::GEN_FAMILIES.iter().map(|f| state::gen_prefix(f, did, gen)).collect();
+    muts.iter().all(|m| prefixes.iter().any(|p| m.key.starts_with(p)))
+}
+
+/// An [`ImportStep`]: its entry's mutations and frames (`Ok(true)`), a
+/// no-op (`Ok(false)`) or a refusal; a refused step changed nothing.
+fn import_step(
+    st: &mut RepoState,
+    step: ImportStep,
+    clock_id: u64,
+    time: &str,
+    frames: &mut Vec<events::Frame>,
+    muts: &mut Vec<Mutation>,
+) -> Result<bool, WriteError> {
+    let epoch_ok = |st: &RepoState, nonce: u64, epoch: u64| st.imports.staging.is_some_and(|s| s.nonce == nonce) && st.partition.epoch == epoch;
+    match step {
+        ImportStep::Begin { nonce, ticket } => {
+            if let Some(status) = st.account.status.as_ref().filter(|s| *s != "deactivated") {
+                return Err(if status == "deleted" { WriteError::RepoNotFound } else { WriteError::RepoInactive(status.clone()) });
+            }
+            if st.account.pending_signing_key.is_some() {
+                return Err(key_rotating(&st.did));
+            }
+            if st.key.is_none() {
+                return Err(key_unavailable(&st.did));
+            }
+            let stale = st.imports.staging.map(|s| s.gen);
+            if let Some(s) = st.imports.staging {
+                if s.nonce != nonce && crate::xrpc::staged_import::driving(&st.did, s.nonce) {
+                    return Err(import_in_progress());
+                }
+                st.imports.staging = None;
+                st.imports.garbage.push(s.gen);
+            }
+            let gen = st.imports.next_gen(Some(st.gen()));
+            let rev = tid::next_rev(Some(st.head.rev), clock_id);
+            st.imports.staging = Some(state::Staging { gen, nonce, rev: rev.0 });
+            muts.push(st.imports.mutation(&st.did));
+            let _ = ticket.send(ImportTicket { gen, old_gen: st.gen(), rev, epoch: st.partition.epoch, stale });
+            Ok(true)
+        }
+        ImportStep::Rows { nonce, epoch, muts: rows } => {
+            if !epoch_ok(st, nonce, epoch) {
+                return Err(import_interrupted());
+            }
+            let gen = st.imports.staging.map(|s| s.gen).unwrap_or_default();
+            if !under_gen(&st.did, gen, &rows) {
+                return Err(WriteError::Internal("staged import rows outside their generation".into()));
+            }
+            *muts = rows;
+            Ok(true)
+        }
+        ImportStep::Commit { nonce, epoch, root, stats, colls_add, colls_del } => {
+            if !epoch_ok(st, nonce, epoch) {
+                return Err(import_interrupted());
+            }
+            if let Some(status) = st.account.status.as_ref().filter(|s| *s != "deactivated") {
+                return Err(WriteError::RepoInactive(status.clone()));
+            }
+            if st.account.pending_signing_key.is_some() {
+                return Err(key_rotating(&st.did));
+            }
+            let Some(key) = st.key.clone() else { return Err(key_unavailable(&st.did)) };
+            let staged = st.imports.staging.expect("checked");
+            let rev = Tid(staged.rev);
+            if rev <= st.head.rev {
+                return Err(import_interrupted());
+            }
+            let mut tree = Tree::new();
+            if let Some(b) = root {
+                let cid = Cid::dag_cbor(&b);
+                match crate::mst_lazy::persisted_node(Arc::from(&b[..]), &cid, None) {
+                    Ok(Some(n)) => tree.root = n,
+                    Ok(None) => {}
+                    Err(e) => return Err(WriteError::Internal(format!("staged import root: {e}"))),
+                }
+            }
+            let data = tree.root_cid().map_err(|e| WriteError::Internal(e.to_string()))?;
+            let (commit, commit_block) = sign_commit(&st.did, &rev.to_string(), &data, &key).map_err(|e| signature_fault(&e))?;
+            let old_gen = st.gen();
+            let mut account = st.account.clone();
+            account.repo_gen = staged.gen;
+            muts.push(account_mutation(&st.did, &account).map_err(|e| WriteError::Internal(e.to_string()))?);
+            st.account = account;
+            st.imports.staging = None;
+            st.imports.garbage.push(old_gen);
+            muts.push(st.imports.mutation(&st.did));
+            for c in &colls_del {
+                muts.push(del(state::collection_key(c, &st.did)));
+            }
+            for c in &colls_add {
+                muts.push(put(state::collection_key(c, &st.did), Bytes::new()));
+            }
+            st.stats = stats;
+            muts.push(put(state::repo_stats_key(&st.did), st.stats.encode()));
+            st.head = Head { commit, data, rev, commit_block };
+            muts.push(put(state::head_key(&st.did), st.head.encode()));
+            // a deactivated account (mid-migration) is announced with #sync
+            // when activated (reference importRepo sequences nothing)
+            if st.account.status.is_none() {
+                frames.push(sync_frame(&st.did, &st.head, time));
+            }
+            // nothing of the old generation is in memory any more
+            st.mst = LazyTree::loaded(tree, 1);
+            st.heap = Default::default();
+            st.blob_refs = HashMap::new();
+            st.blob_refs_loaded = false;
+            st.blob_cids = HashMap::new();
+            st.backlinks = Default::default();
+            st.nodes = Default::default();
+            st.inflight.clear();
+            Ok(true)
+        }
+        ImportStep::Abort { nonce } => {
+            let Some(s) = st.imports.staging.filter(|s| s.nonce == nonce) else { return Ok(false) };
+            st.imports.staging = None;
+            st.imports.garbage.push(s.gen);
+            muts.push(st.imports.mutation(&st.did));
+            Ok(true)
+        }
+        ImportStep::Sweep { gen, muts: dels } => {
+            if !st.imports.garbage.contains(&gen) || gen == st.gen() && st.account.status.as_deref() != Some("deleted") {
+                return Err(import_interrupted());
+            }
+            if !under_gen(&st.did, gen, &dels) || dels.iter().any(|m| m.val.is_some()) {
+                return Err(WriteError::Internal("sweep outside its generation".into()));
+            }
+            *muts = dels;
+            Ok(true)
+        }
+        ImportStep::Swept { gen } => {
+            let n = st.imports.garbage.len();
+            st.imports.garbage.retain(|g| *g != gen);
+            if st.imports.garbage.len() == n {
+                return Ok(false);
+            }
+            muts.push(st.imports.mutation(&st.did));
+            Ok(true)
+        }
+    }
+}
+
+/// The requests left unprocessed: those after an import's commit, which
+/// moved the repo to another generation (the loaded paths, the source's keys
+/// and the needs computed for them were the old one's). The repo reloads
+/// before they run.
+pub(crate) type Leftover = Vec<Queued>;
+
+fn process_with(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, src: &dyn Source) -> anyhow::Result<Leftover> {
     let mut rest = reqs.into_iter();
     let r = process_reqs(st, &mut rest, clock_id, src);
     // after a signature fault the requests not reached yet weren't applied
@@ -1772,9 +2041,10 @@ fn process_with(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, src: &dyn 
             for q in rest {
                 q.fail(signature_fault(f));
             }
+            return r.map(|_| Vec::new());
         }
     }
-    r
+    r.map(|_| rest.collect())
 }
 
 /// Commits `batch`, if it holds anything, and starts a new one.
@@ -1804,7 +2074,11 @@ fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock
             }
             Queued::Account(a) => {
                 flush_pending(st, &mut batch, clock_id, src)?;
+                let gen = st.gen();
                 apply_account(st, a, clock_id, src)?;
+                if st.gen() != gen {
+                    break;
+                }
                 continue;
             }
         };
@@ -1814,6 +2088,10 @@ fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock
         }
         if st.account.pending_signing_key.is_some() {
             let _ = req.reply.send(Err(key_rotating(&st.did)));
+            continue;
+        }
+        if importing(st) {
+            let _ = req.reply.send(Err(import_in_progress()));
             continue;
         }
         if st.key.is_none() {
@@ -2004,6 +2282,7 @@ fn validate(st: &mut RepoState, writes: &[Write], paths: &[String], src: &dyn So
 /// Builds, signs and enqueues one commit for the batch.
 fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> anyhow::Result<()> {
     let build_start = Instant::now();
+    let gen = st.gen();
     let mut mst_blocks = Vec::with_capacity(16);
     let prev_data = st.head.data;
     let before = crate::totals::RepoKey::of(&st.account, &st.head);
@@ -2094,12 +2373,12 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
         };
         ops.push(RepoOp { action, path, cid: *new, prev: *prev });
         index_mutations(st, rev.0, path, prev.is_some(), new.is_some(), batch.blobs.get(path.as_str()), &mut extra)?;
-        let key = Bytes::from(state::record_key(&st.did, path));
+        let key = Bytes::from(state::record_key(&st.did, gen, path));
         if let Some(p) = prev {
-            muts.push(Mutation { key: state::record_cid_key(&st.did, p, path).into(), val: None });
+            muts.push(Mutation { key: state::record_cid_key(&st.did, gen, p, path).into(), val: None });
         }
         if let Some(c) = new {
-            muts.push(Mutation { key: state::record_cid_key(&st.did, c, path).into(), val: Some(Bytes::new()) });
+            muts.push(Mutation { key: state::record_cid_key(&st.did, gen, c, path).into(), val: Some(Bytes::new()) });
         }
         match new {
             Some(c) => {
@@ -2115,7 +2394,7 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
         // (replay derives it); `bl_init` below stores what differs
         if let (Some(_), Some(Some(l))) = (new, batch.links.get(path.as_str())) {
             let rkey = path.split_once('/').map_or(path.as_str(), |(_, r)| r);
-            muts.push(Mutation { key: state::backlink_key(&st.did, l).into(), val: Some(Bytes::copy_from_slice(rkey.as_bytes())) });
+            muts.push(Mutation { key: state::backlink_key(&st.did, gen, l).into(), val: Some(Bytes::copy_from_slice(rkey.as_bytes())) });
             derived_bl.insert(&l[..], rkey);
         }
     }
@@ -2127,7 +2406,7 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
             None => now == before,
         };
         if !as_derived {
-            extra.push(Mutation { key: state::backlink_key(&st.did, l).into(), val: (!now.is_empty()).then(|| crate::backlinks::encode(now)) });
+            extra.push(Mutation { key: state::backlink_key(&st.did, gen, l).into(), val: (!now.is_empty()).then(|| crate::backlinks::encode(now)) });
         }
     }
     let head = Head { commit, data, rev, commit_block };
@@ -2137,10 +2416,10 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
     for (c, b) in std::mem::take(&mut persist.puts) {
         // exact-size: the memtable keeps the value's allocation, and encode
         // buffers are sized generously
-        muts.push(Mutation { key: state::mst_node_key(&st.did, &c).into(), val: Some(Bytes::from(b.into_boxed_slice())) });
+        muts.push(Mutation { key: state::mst_node_key(&st.did, gen, &c).into(), val: Some(Bytes::from(b.into_boxed_slice())) });
     }
     for c in &persist.deletes {
-        extra.push(Mutation { key: state::mst_node_key(&st.did, c).into(), val: None });
+        extra.push(Mutation { key: state::mst_node_key(&st.did, gen, c).into(), val: None });
     }
     extra.append(&mut coll_muts);
     if st.stats != stats_before {
@@ -2161,11 +2440,12 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
         time: &time,
     });
     frame.derived_muts = derived;
+    frame.derived_gen = gen;
     #[cfg(debug_assertions)]
     {
         let mut f = Vec::new();
         frame.finish(0, &mut f);
-        let d = crate::segment::derive_commit_muts_n(&f, derived).expect("derive commit muts");
+        let d = crate::segment::derive_commit_muts_n(&f, derived, gen).expect("derive commit muts");
         assert!(
             d.len() == derived && d.iter().zip(&muts).all(|(a, b)| a.key == b.key && a.val == b.val),
             "muts derived from the #commit frame differ from the commit's"
@@ -2245,12 +2525,13 @@ fn send_entry(st: &RepoState, entry: LogEntry) -> anyhow::Result<()> {
 fn index_mutations(st: &mut RepoState, rev: u64, path: &str, existed: bool, exists: bool, new_blobs: Option<&Vec<Cid>>, muts: &mut Vec<Mutation>) -> anyhow::Result<()> {
     anyhow::ensure!(!existed || st.blob_refs_loaded, "blob refs of {} not loaded for a write to {path}", st.did);
     anyhow::ensure!(st.blob_refs_loaded || new_blobs.is_none_or(|b| b.is_empty()), "blob refs of {} not loaded for a write adding refs to {path}", st.did);
+    let gen = st.gen();
     let old = st.blob_refs.remove(path).unwrap_or_default();
     let mut new: Vec<Cid> = if exists { new_blobs.cloned().unwrap_or_default() } else { Vec::new() };
     new.sort();
     new.dedup();
     for b in old.iter().filter(|b| !new.contains(b)) {
-        muts.push(del(state::blob_ref_key(&st.did, b, path)));
+        muts.push(del(state::blob_ref_key(&st.did, gen, b, path)));
         if let Some(n) = st.blob_cids.get_mut(b) {
             *n -= 1;
             if *n == 0 {
@@ -2269,7 +2550,7 @@ fn index_mutations(st: &mut RepoState, rev: u64, path: &str, existed: bool, exis
     // rewrite every current ref with the record's rev, so listBlobs `since`
     // sees blobs kept across an update too
     for b in new.iter() {
-        muts.push(put(state::blob_ref_key(&st.did, b, path), Bytes::copy_from_slice(&rev.to_be_bytes())));
+        muts.push(put(state::blob_ref_key(&st.did, gen, b, path), Bytes::copy_from_slice(&rev.to_be_bytes())));
     }
     if !new.is_empty() {
         st.blob_refs.insert(path.to_string(), new);
@@ -2312,12 +2593,12 @@ fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>, src: &dyn 
         st.mst.load_all(src)?;
     }
     anyhow::ensure!(st.blob_refs_loaded, "blob refs of {} not loaded to clear them", st.did);
-    let did = st.did.clone();
+    let (did, gen) = (st.did.clone(), st.gen());
     let mut colls = std::collections::BTreeSet::new();
     st.mst.tree.walk(&mut |k, cid| {
         if let Ok(path) = std::str::from_utf8(k) {
-            muts.push(del(state::record_key(&did, path)));
-            muts.push(del(state::record_cid_key(&did, &cid, path)));
+            muts.push(del(state::record_key(&did, gen, path)));
+            muts.push(del(state::record_cid_key(&did, gen, &cid, path)));
             if !colls.contains(collection_of(path)) {
                 colls.insert(collection_of(path).to_string());
             }
@@ -2328,7 +2609,7 @@ fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>, src: &dyn 
     }
     for (path, blobs) in &st.blob_refs {
         for b in blobs {
-            muts.push(del(state::blob_ref_key(&did, b, path)));
+            muts.push(del(state::blob_ref_key(&did, gen, b, path)));
         }
     }
     st.blob_refs.clear();
@@ -2341,9 +2622,10 @@ fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>, src: &dyn 
 /// until `done` (the clearing entry) is applied.
 fn clear_backlinks(st: &mut RepoState, muts: &mut Vec<Mutation>, done: &Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
     anyhow::ensure!(st.backlinks.all, "backlink index of {} not loaded to clear it", st.did);
+    let gen = st.gen();
     for (l, (v, t)) in st.backlinks.vals.iter_mut() {
         if !v.is_empty() {
-            muts.push(del(state::backlink_key(&st.did, l)));
+            muts.push(del(state::backlink_key(&st.did, gen, l)));
             v.clear();
             *t = Some(done.clone());
         }
@@ -2354,7 +2636,7 @@ fn clear_backlinks(st: &mut RepoState, muts: &mut Vec<Mutation>, done: &Arc<std:
 
 /// The backlink index of a whole repo's `records` (path, bytes): its puts,
 /// and the cache entries (tagged `tag`: durable state may not have them).
-fn index_backlinks<'a>(did: &str, records: impl Iterator<Item = (&'a str, &'a [u8])>, cache: &mut crate::backlinks::Cache, tag: &crate::backlinks::Tag, muts: &mut Vec<Mutation>) {
+fn index_backlinks<'a>(did: &str, gen: u64, records: impl Iterator<Item = (&'a str, &'a [u8])>, cache: &mut crate::backlinks::Cache, tag: &crate::backlinks::Tag, muts: &mut Vec<Mutation>) {
     let mut vals: BTreeMap<Vec<u8>, crate::backlinks::Rkeys> = BTreeMap::new();
     for (path, bytes) in records {
         let coll = collection_of(path);
@@ -2369,20 +2651,20 @@ fn index_backlinks<'a>(did: &str, records: impl Iterator<Item = (&'a str, &'a [u
     }
     for (l, mut rkeys) in vals {
         rkeys.sort();
-        muts.push(put(state::backlink_key(did, &l), crate::backlinks::encode(&rkeys)));
+        muts.push(put(state::backlink_key(did, gen, &l), crate::backlinks::encode(&rkeys)));
         cache.vals.insert(l.into(), (rkeys, tag.clone()));
     }
 }
 
 /// `M/` mutations replacing a repo's persisted nodes `old` by those of the
 /// fully loaded `tree`.
-fn replace_nodes_mutations(did: &str, old: HashMap<Cid, Arc<[u8]>>, tree: &Tree, muts: &mut Vec<Mutation>) {
+fn replace_nodes_mutations(did: &str, gen: u64, old: HashMap<Cid, Arc<[u8]>>, tree: &Tree, muts: &mut Vec<Mutation>) {
     let new = crate::mst_lazy::persisted_nodes(tree, 1);
     for c in old.keys().filter(|c| !new.contains_key(c)) {
-        muts.push(del(state::mst_node_key(did, c)));
+        muts.push(del(state::mst_node_key(did, gen, c)));
     }
     for (c, b) in new {
-        muts.push(put(state::mst_node_key(did, &c), Bytes::copy_from_slice(&b)));
+        muts.push(put(state::mst_node_key(did, gen, &c), Bytes::copy_from_slice(&b)));
     }
 }
 
@@ -2405,6 +2687,8 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
     let mut muts = Vec::new();
     let before = crate::totals::RepoKey::of(&st.account, &st.head);
     let whole_tree = matches!(req.op, AccountOp::ReplaceRepo { .. } | AccountOp::Delete);
+    let new_repo = whole_tree || matches!(req.op, AccountOp::Import(ImportStep::Commit { .. }));
+    let gen = st.gen();
     // a re-signed head (KeyStep::Finish) extends read-after-write's log at the ack
     let mut resigned: Option<crate::recent_writes::Commit> = None;
     // tags the backlink cache entries a whole-tree op writes
@@ -2413,7 +2697,17 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
         let _ = reply.send(Err(e));
         Ok(())
     };
+    // a staged import's commit takes the rev it reserved: nothing else may
+    // sign a commit first
+    if matches!(req.op, AccountOp::ReplaceRepo { .. } | AccountOp::SigningKey(KeyStep::Begin(_) | KeyStep::Finish { .. })) && importing(st) {
+        return refuse(req.reply, import_in_progress());
+    }
     match req.op {
+        AccountOp::Import(step) => match import_step(st, step, clock_id, &time, &mut frames, &mut muts) {
+            Ok(true) => {}
+            Ok(false) => return ack_noop(st, req.reply),
+            Err(e) => return refuse(req.reply, e),
+        },
         AccountOp::Update { mutate, identity_event, account_event } => {
             let account = match mutate_account(st, mutate) {
                 Ok(Some(a)) => a,
@@ -2479,15 +2773,15 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
                 if build {
                     tree.insert_no_proof(path.as_bytes(), *cid)?;
                 }
-                muts.push(put(state::record_key(&st.did, path), state::record_value(cid, rev.0, bytes)));
-                muts.push(put(state::record_cid_key(&st.did, cid, path), Bytes::new()));
+                muts.push(put(state::record_key(&st.did, gen, path), state::record_value(cid, rev.0, bytes)));
+                muts.push(put(state::record_cid_key(&st.did, gen, cid, path), Bytes::new()));
                 index_mutations(st, rev.0, path, false, true, Some(blobs), &mut muts)?;
             }
             // after the clear's deletes: a link kept is written again
-            index_backlinks(&st.did, records.iter().map(|(p, _, b, _)| (p.as_str(), &b[..])), &mut st.backlinks, &Some(done.clone()), &mut muts);
+            index_backlinks(&st.did, gen, records.iter().map(|(p, _, b, _)| (p.as_str(), &b[..])), &mut st.backlinks, &Some(done.clone()), &mut muts);
             let data = tree.root_cid()?;
             let counted = crate::repo_stats::count_tree(&tree)?;
-            replace_nodes_mutations(&st.did, old_nodes, &tree, &mut muts);
+            replace_nodes_mutations(&st.did, gen, old_nodes, &tree, &mut muts);
             let (commit, commit_block) = match sign_commit(&st.did, &rev.to_string(), &data, &key) {
                 Ok(c) => c,
                 Err(e) => {
@@ -2511,13 +2805,18 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             let old_nodes = clear_repo_mutations(st, &mut muts, src)?;
             clear_backlinks(st, &mut muts, &done)?;
             for c in old_nodes.keys() {
-                muts.push(del(state::mst_node_key(&st.did, c)));
+                muts.push(del(state::mst_node_key(&st.did, gen, c)));
             }
             st.mst = LazyTree::loaded(Tree::new(), 1);
             muts.push(del(state::head_key(&st.did)));
             muts.push(del(state::account_key(&st.did)));
             muts.push(del(state::handle_key(&st.did, &st.account.handle)));
             muts.push(del(state::repo_stats_key(&st.did)));
+            // a staged import's rows are left to the sweeper
+            if let Some(s) = st.imports.staging.take() {
+                st.imports.garbage.push(s.gen);
+                muts.push(st.imports.mutation(&st.did));
+            }
             frames.push(events::account_frame(&st.did, false, Some("deleted"), &time));
             st.account.status = Some("deleted".into());
         }
@@ -2548,7 +2847,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             // acks follow the state apply: drop cached copies of the
             // account (status, signing key)
             crate::xrpc::proxy::account_changed(&did);
-            if whole_tree {
+            if new_repo {
                 crate::recent_writes::invalidate(&did);
             }
             inner(r)
@@ -2849,7 +3148,7 @@ mod tests {
         let stats = |e: &LogEntry| e.muts.iter().find(|m| m.key[..] == state::repo_stats_key(&did)[..]).map(|m| state::RepoStats::decode(m.val.as_ref().unwrap()).unwrap());
         // blob(1) was p1's already
         assert_eq!(stats(&e_create).map(|s| (s.records, s.blobs)), Some((3, 2)));
-        let has = |e: &LogEntry, b: u8, path: &str, put: bool| e.muts.iter().any(|m| m.key[..] == state::blob_ref_key(&did, &blob(b), path)[..] && m.val.is_some() == put);
+        let has = |e: &LogEntry, b: u8, path: &str, put: bool| e.muts.iter().any(|m| m.key[..] == state::blob_ref_key(&did, 0, &blob(b), path)[..] && m.val.is_some() == put);
         let (m, deleted) = op(Write::Delete { collection: "app.test.thing".into(), rkey: "p2".into(), swap: None });
         w.send(m).unwrap();
         let e_delete = rx.recv().await.unwrap();
@@ -2868,13 +3167,13 @@ mod tests {
         for r in [plain, created, deleted, updated] {
             r.await.unwrap().unwrap();
         }
-        let prefix = state::blob_ref_prefix(&did);
+        let prefix = state::blob_ref_prefix(&did, 0);
         let mut it = db.scan(prefix.clone()..state::prefix_end(&prefix)).await.unwrap();
         let mut left = Vec::new();
         while let Some(kv) = it.next().await.unwrap() {
             left.push(kv.key.to_vec());
         }
-        assert_eq!(left, vec![state::blob_ref_key(&did, &blob(3), "app.test.thing/p1")]);
+        assert_eq!(left, vec![state::blob_ref_key(&did, 0, &blob(3), "app.test.thing/p1")]);
     }
 
     /// The path cache: over the byte budget, idle repos drop back to their
@@ -3143,7 +3442,7 @@ mod tests {
                     Ok(reqs) => reqs,
                     // the backlink read a fetch does off the worker thread
                     Err((reqs, Some(need))) => {
-                        if let Some(f) = rt.block_on(need.load_backlinks(&*st.partition.db, &st.did)).unwrap() {
+                        if let Some(f) = rt.block_on(need.load_backlinks(&*st.partition.db, &st.did, st.gen())).unwrap() {
                             st.backlinks.install(f);
                         }
                         let Ok(reqs) = lazy_needs(st, reqs) else { panic!("paths not loaded") };

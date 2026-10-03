@@ -358,8 +358,29 @@ async fn referenced_blobs(
     limit: usize,
     since: Option<u64>,
 ) -> XResult<Vec<(String, String)>> {
+    // the generation moved under the scan (an import committed): its rows
+    // may be part swept, so the scan is redone at the new one
+    let mut gen = app.repo_gen(did).await?;
+    loop {
+        let out = referenced_blobs_at(app, did, gen, cursor, limit, since).await?;
+        let now = app.repo_gen(did).await?;
+        if now == gen {
+            return Ok(out);
+        }
+        gen = now;
+    }
+}
+
+async fn referenced_blobs_at(
+    app: &App,
+    did: &str,
+    gen: u64,
+    cursor: Option<&str>,
+    limit: usize,
+    since: Option<u64>,
+) -> XResult<Vec<(String, String)>> {
     let p = app.partition(did)?;
-    let prefix = state::blob_ref_prefix(did);
+    let prefix = state::blob_ref_prefix(did, gen);
     let lo = match cursor {
         // skip every key of the cursor cid: b/{did}\0{cursor}\0...
         Some(c) => state::prefix_end(&[prefix.as_slice(), c.as_bytes(), b"\0"].concat()),
@@ -547,10 +568,31 @@ fn quarantine_path(app: &App, did: &str, cid: &str) -> object_store::path::Path 
     object_store::path::Path::from(format!("{}/blob-gc/{}/{}", app.store.prefix, did, cid))
 }
 
+/// Referenced by the repo or by an import staged into it. The generation is
+/// re-read after a miss, as `App::record_value` does: an import's commit
+/// may have moved it, and the generation it left be swept since.
 async fn referenced(p: &Partition, did: &str, cid: &str) -> anyhow::Result<bool> {
-    let prefix = [state::blob_ref_prefix(did).as_slice(), cid.as_bytes(), b"\0"].concat();
-    let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await?;
-    Ok(iter.next().await?.is_some())
+    let gens = || async {
+        let (a, g) = tokio::try_join!(p.db.get(state::account_key(did)), p.db.get(state::import_key(did)))?;
+        let current = a.map(|a| serde_json::from_slice::<state::Account>(&a)).transpose()?.map_or(0, |a| a.repo_gen);
+        let staged = g.map(|g| state::ImportState::decode(&g)).transpose()?.and_then(|s| s.staging).map(|s| s.gen);
+        anyhow::Ok((current, staged))
+    };
+    let mut at = gens().await?;
+    loop {
+        for g in std::iter::once(at.0).chain(at.1) {
+            let prefix = [state::blob_ref_prefix(did, g).as_slice(), cid.as_bytes(), b"\0"].concat();
+            let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await?;
+            if iter.next().await?.is_some() {
+                return Ok(true);
+            }
+        }
+        let now = gens().await?;
+        if now.0 == at.0 {
+            return Ok(false);
+        }
+        at = now;
+    }
 }
 
 /// (did, cid) of a `.../{did}/{cid}` object path.

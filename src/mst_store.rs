@@ -222,6 +222,7 @@ fn store_err(e: impl std::fmt::Display) -> MstError {
 pub struct DbSource<'a, R: DbReadOps + Sync + ?Sized> {
     pub db: &'a R,
     pub did: &'a str,
+    pub gen: u64,
     pub rt: &'a tokio::runtime::Handle,
     /// Misses read `db`.
     pub prefetched: Option<&'a Prefetched>,
@@ -230,8 +231,8 @@ pub struct DbSource<'a, R: DbReadOps + Sync + ?Sized> {
 }
 
 impl<'a, R: DbReadOps + Sync + ?Sized> DbSource<'a, R> {
-    pub fn new(db: &'a R, did: &'a str, rt: &'a tokio::runtime::Handle) -> Self {
-        DbSource { db, did, rt, prefetched: None, reads: Cell::new(0) }
+    pub fn new(db: &'a R, did: &'a str, gen: u64, rt: &'a tokio::runtime::Handle) -> Self {
+        DbSource { db, did, gen, rt, prefetched: None, reads: Cell::new(0) }
     }
 
     pub fn with_prefetched(mut self, p: Option<&'a Prefetched>) -> Self {
@@ -257,8 +258,8 @@ impl Source for CachedOnly {
 }
 
 /// Strictly between `lo` and `hi` (None = open).
-fn record_range(did: &str, lo: Option<&[u8]>, hi: Option<&[u8]>) -> std::ops::Range<Vec<u8>> {
-    let prefix = state::record_prefix(did);
+fn record_range(did: &str, gen: u64, lo: Option<&[u8]>, hi: Option<&[u8]>) -> std::ops::Range<Vec<u8>> {
+    let prefix = state::record_prefix(did, gen);
     let start = match lo {
         // the smallest key above `lo`
         Some(lo) => [&prefix[..], lo, b"\0"].concat(),
@@ -277,9 +278,9 @@ fn record_entry(prefix_len: usize, kv: &slatedb::KeyValue) -> Result<(Key, Cid)>
 }
 
 /// Scans `did`'s records strictly between `lo` and `hi`.
-async fn scan_records<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()> {
-    let plen = state::record_prefix(did).len();
-    let mut it = state::BatchedScan::new(db.scan(record_range(did, lo, hi)).await.map_err(store_err)?);
+async fn scan_records<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()> {
+    let plen = state::record_prefix(did, gen).len();
+    let mut it = state::BatchedScan::new(db.scan(record_range(did, gen, lo, hi)).await.map_err(store_err)?);
     while let Some(kv) = it.next().await.map_err(store_err)? {
         out.push(record_entry(plen, &kv)?);
     }
@@ -306,14 +307,14 @@ impl<R: DbReadOps + Sync + ?Sized> Source for DbSource<'_, R> {
         }
         self.reads.set(self.reads.get() + 1);
         metrics::LAZY_MST_READS.with_label_values(&["node"]).inc();
-        let v = self.rt.block_on(self.db.get(state::mst_node_key(self.did, cid))).map_err(store_err)?;
+        let v = self.rt.block_on(self.db.get(state::mst_node_key(self.did, self.gen, cid))).map_err(store_err)?;
         Ok(v.map(|b| Arc::from(&b[..])))
     }
 
     fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()> {
         self.reads.set(self.reads.get() + 1);
         metrics::LAZY_MST_READS.with_label_values(&["leaf"]).inc();
-        self.rt.block_on(scan_records(self.db, self.did, lo, hi, out))
+        self.rt.block_on(scan_records(self.db, self.did, self.gen, lo, hi, out))
     }
 }
 
@@ -332,8 +333,8 @@ pub struct ScanSource<'a, N: Source> {
 
 impl<'a, N: Source> ScanSource<'a, N> {
     /// Blocking.
-    pub fn open<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, nodes: N, rt: &'a tokio::runtime::Handle) -> Result<Self> {
-        let prefix = state::record_prefix(did);
+    pub fn open<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, nodes: N, rt: &'a tokio::runtime::Handle) -> Result<Self> {
+        let prefix = state::record_prefix(did, gen);
         let iter = rt.block_on(db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &read_ahead_opts())).map_err(store_err)?;
         Ok(ScanSource { nodes, rt, prefix_len: prefix.len(), iter: RefCell::new(state::BatchedScan::new(iter)), peeked: RefCell::new(None), done: Cell::new(false) })
     }
@@ -540,11 +541,11 @@ impl<N: Source> Source for FedSource<N> {
 /// One scan of `did`'s `M/` range, up to `max_bytes` (0 = none), instead of
 /// 7-11 dependent node reads. Also returns whether the range was read to its
 /// end.
-pub async fn prefetch<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, max_bytes: usize) -> anyhow::Result<(Prefetched, bool)> {
+pub async fn prefetch<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, max_bytes: usize) -> anyhow::Result<(Prefetched, bool)> {
     if max_bytes == 0 {
         return Ok((Prefetched::default(), false));
     }
-    scan_nodes(db, did, &read_ahead_opts(), false, |b| b <= max_bytes).await
+    scan_nodes(db, did, gen, &read_ahead_opts(), false, |b| b <= max_bytes).await
 }
 
 /// For a walk of the whole tree (an export): `did`'s `M/` range for as long
@@ -555,21 +556,23 @@ pub async fn prefetch<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, max_bytes
 pub async fn prefetch_tree<R: DbReadOps + Sync + ?Sized>(
     db: &R,
     did: &str,
+    gen: u64,
     opts: &slatedb::config::ScanOptions,
     admit: impl FnMut(usize) -> bool,
 ) -> anyhow::Result<Prefetched> {
-    Ok(scan_nodes(db, did, opts, true, admit).await?.0)
+    Ok(scan_nodes(db, did, gen, opts, true, admit).await?.0)
 }
 
 async fn scan_nodes<R: DbReadOps + Sync + ?Sized>(
     db: &R,
     did: &str,
+    gen: u64,
     opts: &slatedb::config::ScanOptions,
     split: bool,
     mut admit: impl FnMut(usize) -> bool,
 ) -> anyhow::Result<(Prefetched, bool)> {
     let mut out = Prefetched::default();
-    let prefix = state::mst_node_prefix(did);
+    let prefix = state::mst_node_prefix(did, gen);
     let mut it = state::BatchedScan::new(db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), opts).await?);
     let mut complete = true;
     while let Some(kv) = it.next().await? {
@@ -611,9 +614,9 @@ async fn scan_nodes<R: DbReadOps + Sync + ?Sized>(
 /// `Tree::proof_blocks` of `key` on a lazy tree at `root`, without blocking
 /// and without touching the tree: unloaded children are read from `db` (a
 /// snapshot at the tree's version), each checked against its link.
-pub async fn proof_blocks<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R, did: &str, key: &[u8]) -> Result<Vec<(Cid, Vec<u8>)>> {
+pub async fn proof_blocks<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R, did: &str, gen: u64, key: &[u8]) -> Result<Vec<(Cid, Vec<u8>)>> {
     let mut out = Vec::new();
-    walk_path(root, db, did, key, &mut |n| {
+    walk_path(root, db, did, gen, key, &mut |n| {
         out.push((n.cid.ok_or(MstError::Invalid("unwritten node"))?, crate::mst_lazy::node_block(n)?));
         Ok(())
     })
@@ -622,14 +625,15 @@ pub async fn proof_blocks<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R
 }
 
 /// The leaf, or the node holding `key`.
-pub async fn path_end<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R, did: &str, key: &[u8]) -> Result<Arc<Node>> {
-    walk_path(root, db, did, key, &mut |_| Ok(())).await
+pub async fn path_end<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R, did: &str, gen: u64, key: &[u8]) -> Result<Arc<Node>> {
+    walk_path(root, db, did, gen, key, &mut |_| Ok(())).await
 }
 
 async fn walk_path<R: DbReadOps + Sync + ?Sized>(
     root: &Arc<Node>,
     db: &R,
     did: &str,
+    gen: u64,
     key: &[u8],
     visit: &mut (dyn FnMut(&Node) -> Result<()> + Send),
 ) -> Result<Arc<Node>> {
@@ -644,9 +648,9 @@ async fn walk_path<R: DbReadOps + Sync + ?Sized>(
         let child = match &n.entries[i] {
             Entry::Child { node: Some(c), .. } => c.clone(),
             Entry::Child { node: None, cid: Some(c) } if n.height == 1 && NODE_CACHE.get(c).is_none() => {
-                load_leaves(db, did, &n, lo.as_deref(), hi.as_deref(), i).await?
+                load_leaves(db, did, gen, &n, lo.as_deref(), hi.as_deref(), i).await?
             }
-            Entry::Child { node: None, cid: Some(c) } => load_child(db, did, c, n.height - 1, clo.as_deref(), chi.as_deref()).await?,
+            Entry::Child { node: None, cid: Some(c) } => load_child(db, did, gen, c, n.height - 1, clo.as_deref(), chi.as_deref()).await?,
             _ => return Err(MstError::Partial),
         };
         (n, lo, hi) = (child, clo, chi);
@@ -658,10 +662,10 @@ async fn walk_path<R: DbReadOps + Sync + ?Sized>(
 /// record range rebuilds its unloaded siblings too (a range scan costs
 /// mostly its setup), and those that match their links are cached for
 /// nearby proofs and getBlocks.
-async fn load_leaves<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, n: &Node, lo: Option<&[u8]>, hi: Option<&[u8]>, want: usize) -> Result<Arc<Node>> {
+async fn load_leaves<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, n: &Node, lo: Option<&[u8]>, hi: Option<&[u8]>, want: usize) -> Result<Arc<Node>> {
     metrics::LAZY_MST_READS.with_label_values(&["leaf"]).inc();
     let mut recs = Vec::new();
-    scan_records(db, did, lo, hi, &mut recs).await?;
+    scan_records(db, did, gen, lo, hi, &mut recs).await?;
     let mut pos = 0;
     let mut found = None;
     for (i, e) in n.entries.iter().enumerate() {
@@ -697,19 +701,19 @@ async fn load_leaves<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, n: &Node, 
 
 /// Interior nodes from `M/`; a leaf (or a missing interior node) rebuilt
 /// from its record range.
-async fn load_child<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, cid: &Cid, height: i32, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<Arc<Node>> {
+async fn load_child<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, cid: &Cid, height: i32, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<Arc<Node>> {
     if let Some(n) = NODE_CACHE.get(cid).filter(|n| n.height == height) {
         return Ok(n);
     }
-    let n = load_child_uncached(db, did, cid, height, lo, hi).await?;
+    let n = load_child_uncached(db, did, gen, cid, height, lo, hi).await?;
     NODE_CACHE.put(&n);
     Ok(n)
 }
 
-async fn load_child_uncached<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, cid: &Cid, height: i32, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<Arc<Node>> {
+async fn load_child_uncached<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, cid: &Cid, height: i32, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<Arc<Node>> {
     if height >= 1 {
         metrics::LAZY_MST_READS.with_label_values(&["node"]).inc();
-        if let Some(b) = db.get(state::mst_node_key(did, cid)).await.map_err(store_err)? {
+        if let Some(b) = db.get(state::mst_node_key(did, gen, cid)).await.map_err(store_err)? {
             if let Some(n) = crate::mst_lazy::persisted_node(Arc::from(&b[..]), cid, Some(height))? {
                 return Ok(n);
             }
@@ -717,7 +721,7 @@ async fn load_child_uncached<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, ci
     }
     metrics::LAZY_MST_READS.with_label_values(&["leaf"]).inc();
     let mut recs = Vec::new();
-    scan_records(db, did, lo, hi, &mut recs).await?;
+    scan_records(db, did, gen, lo, hi, &mut recs).await?;
     crate::mst_lazy::rebuilt_subtree(&recs, height, cid)
 }
 
@@ -755,7 +759,7 @@ mod tests {
         tree.walk_blocks(&mut |c, b| want.push((c, b.to_vec()))).unwrap();
         let nodes = persisted_nodes(&tree, 1);
         for (c, b) in &nodes {
-            db.put(state::mst_node_key(did, c), b).await.unwrap();
+            db.put(state::mst_node_key(did, 0, c), b).await.unwrap();
         }
         let h1 = nodes.values().filter(|b| crate::mst::first_key_height(b) == Some(1)).count();
         assert!(h1 > nodes.len() / 2, "{h1} of {} nodes at height 1", nodes.len());
@@ -763,7 +767,7 @@ mod tests {
         let opts = read_ahead_opts();
         // the most it asked for (a growing index briefly holds two arrays)
         let mut peak = 0;
-        let full = prefetch_tree(&db, did, &opts, |b| {
+        let full = prefetch_tree(&db, did, 0, &opts, |b| {
             peak = peak.max(b);
             true
         })
@@ -774,13 +778,13 @@ mod tests {
         let db = Arc::new(db);
         let mem = Arc::new(mem);
         for cap in [usize::MAX, peak, all / 2, all / 5, 1] {
-            let pre = prefetch_tree(&*db, did, &opts, |b| b <= cap).await.unwrap();
+            let pre = prefetch_tree(&*db, did, 0, &opts, |b| b <= cap).await.unwrap();
             assert!(pre.heap_bytes() <= cap, "cap {cap}: holds {}", pre.heap_bytes());
             let (persist_min, held) = (pre.persist_min(), pre.len());
             let (db, mem) = (db.clone(), mem.clone());
             let (got, reads) = tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Handle::current();
-                let src = Split { nodes: DbSource::new(&*db, did, &rt).with_prefetched(Some(&pre)), recs: &mem };
+                let src = Split { nodes: DbSource::new(&*db, did, 0, &rt).with_prefetched(Some(&pre)), recs: &mem };
                 let mut got = Vec::new();
                 export_blocks(root, pre.persist_min(), &src, &mut |c, b| got.push((c, b.to_vec()))).unwrap();
                 (got, src.nodes.reads.get())

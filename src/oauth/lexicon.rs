@@ -162,13 +162,8 @@ async fn resolve_authority(nsid: &str) -> Result<String, String> {
 async fn fetch_record(app: &App, did: &str, nsid: &str) -> Result<J, String> {
     let rpath = format!("{LEXICON_COLLECTION}/{nsid}");
     // hosted here: no proof needed
-    if app.account(did).await.is_ok() {
-        let p = app.partition(did).map_err(|e| e.message)?;
-        let v =
-            p.db.get(crate::state::record_key(did, &rpath))
-                .await
-                .map_err(|e| e.to_string())?
-                .ok_or("Record not found")?;
+    if let Ok(a) = app.account(did).await {
+        let v = app.record_value(did, Some(a.repo_gen), &rpath).await.map_err(|e| e.message)?.ok_or("Record not found")?;
         let (_, bytes) = crate::state::decode_record_value(&v).map_err(|e| e.to_string())?;
         let rec = Value::decode(&bytes).map_err(|e| e.to_string())?;
         return check_record_type(rec.to_json());

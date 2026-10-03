@@ -56,7 +56,7 @@ async fn one_shard_sustains_bulk_ingest() {
             let cid: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(n.to_le_bytes()).into();
             let mut val = cid.to_vec();
             val.extend_from_slice(&record);
-            wb.put(vlpds::state::record_key(did, &path), val);
+            wb.put(vlpds::state::record_key(did, 0, &path), val);
             let mut ck = b"C/".to_vec();
             ck.extend_from_slice(did.as_bytes());
             ck.push(0);

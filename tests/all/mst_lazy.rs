@@ -957,7 +957,7 @@ pub(crate) fn car_tail(body: &[u8]) -> Vec<(Cid, Vec<u8>)> {
 /// `did`'s persisted MST nodes, scanned from its shard on `s`.
 async fn stored_nodes(s: &TestServer, did: &str) -> HashMap<Cid, Vec<u8>> {
     let Ok(p) = s.app.partition(did) else { panic!("shard of {did} not owned") };
-    let prefix = vlpds::state::mst_node_prefix(did);
+    let prefix = vlpds::state::mst_node_prefix(did, s.app.repo_gen(did).await.ok().unwrap());
     let mut it = p.db.scan(prefix.clone()..vlpds::state::prefix_end(&prefix)).await.unwrap();
     let mut out = HashMap::new();
     while let Some(kv) = it.next().await.unwrap() {
@@ -1214,7 +1214,7 @@ async fn lazy_open_rebuilds_missing_or_bad_nodes() {
         let other = s.create_account("fbx").await;
         s.create_record(&other, "com.example.thing", json!({"$type": "com.example.thing", "n": 1})).await;
         for (c, b) in &nodes {
-            let k = vlpds::state::mst_node_key(&a.did, c);
+            let k = vlpds::state::mst_node_key(&a.did, 0, c);
             match case {
                 "missing" => {
                     p.db.delete(k).await.unwrap();
@@ -1795,7 +1795,7 @@ async fn bench_cold_open_blobs() {
             dids.push(a.did);
         }
         let Ok(p) = s.app.partition(&dids[0]) else { panic!("shard not owned") };
-        let prefix = vlpds::state::blob_ref_prefix(&dids[0]);
+        let prefix = vlpds::state::blob_ref_prefix(&dids[0], s.app.repo_gen(&dids[0]).await.ok().unwrap());
         let mut it = p.db.scan(prefix.clone()..vlpds::state::prefix_end(&prefix)).await.unwrap();
         let mut n = 0;
         while it.next().await.unwrap().is_some() {

@@ -1164,6 +1164,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     vlpds::xrpc::export_account_totals(&app);
     vlpds::xrpc::spawn_reserved_key_gc(app.clone());
     vlpds::oauth::gc::spawn_gc(app.clone());
+    vlpds::xrpc::staged_import::spawn_import_gc(app.clone());
     tokio::spawn(vlpds::xrpc::request_crawl(app.clone()));
     // Keep serving through a graceful shutdown: peers forward to us until
     // our handoff nudges reach them, and a forward we drop mid-request is
