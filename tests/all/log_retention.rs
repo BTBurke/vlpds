@@ -139,36 +139,17 @@ async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>) -> TestServe
 }
 
 async fn node_with(id: &str, store: &Arc<dyn object_store::ObjectStore>, retention: Option<vlpds::retention::Config>, ring_bytes: usize) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = 8;
+    cluster_node(id, store.clone(), 8, |c| {
         c.log_retention = retention;
         c.firehose_ring_bytes = ring_bytes;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: 8,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(300),
-            ..Default::default()
-        });
     })
     .await
 }
 
 /// Waits until `log` holds exactly `want` (a dead log retired to its fence).
 async fn wait_for_objects(store: &vlpds::store::Store, log: &str, want: &[u64]) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let now = ordinals(store, log).await;
-        if now == want {
-            return;
-        }
-        assert!(Instant::now() < deadline, "log {log}: {now:?}, want {want:?}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let r = eventually(Duration::from_secs(15), || async { (ordinals(store, log).await == want).then_some(()) }).await;
+    assert!(r.is_some(), "log {log}: {:?}, want {want:?}", ordinals(store, log).await);
 }
 
 /// Node `a` leaves (graceful: hands its shards to `b`, fences its log). Once
@@ -188,11 +169,7 @@ async fn dead_log_pruned_after_takeover() {
     let a_log = a.app.log.log_id.to_string();
     let vs = b.app.store.clone();
     vlpds::server::shutdown(&a.app).await;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while b.app.partitions.owned().len() < 8 {
-        assert!(Instant::now() < deadline, "b never took a's shards");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_until("b takes a's shards", Duration::from_secs(15), || owned(&b) >= 8).await;
     let (fence, fenced) = vlpds::nodelog::first_free(&vs, &a_log).await.unwrap();
     assert!(fenced, "a fenced its own log on shutdown");
     wait_for_objects(&vs, &a_log, &[fence]).await;
@@ -225,11 +202,8 @@ async fn restart_after_pruning() {
     let vs = first.app.store.clone();
     first.app.log.checkpoint_all().await;
     // pruned while alive: all but the newest durable segment
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while ordinals(&vs, &old_log).await.len() > 1 {
-        assert!(Instant::now() < deadline, "own log never pruned: {:?}", ordinals(&vs, &old_log).await);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let pruned = eventually(Duration::from_secs(10), || async { (ordinals(&vs, &old_log).await.len() <= 1).then_some(()) }).await;
+    assert!(pruned.is_some(), "own log never pruned: {:?}", ordinals(&vs, &old_log).await);
     vlpds::server::shutdown(&first.app).await;
     let second = node("ret-r", &store).await;
     assert_ne!(second.app.log.log_id.as_ref(), old_log.as_str());
@@ -263,11 +237,7 @@ async fn fence_deleted_then_takeover_replays() {
     let a_log = a.app.log.log_id.to_string();
     let vs = b.app.store.clone();
     vlpds::server::shutdown(&a.app).await;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while b.app.partitions.owned().len() < 8 {
-        assert!(Instant::now() < deadline, "b never took a's shards");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_until("b takes a's shards", Duration::from_secs(15), || owned(&b) >= 8).await;
     wait_for_objects(&vs, &a_log, &[]).await;
     assert!(!vlpds::backfill::list_logs(&vs).await.unwrap().contains(&a_log), "a's log left log/");
     for (i, acct) in accounts.iter().enumerate() {
@@ -275,11 +245,7 @@ async fn fence_deleted_then_takeover_replays() {
     }
     let c = node_with("retf-c", &store, no_fences(), 64 << 20).await;
     vlpds::server::shutdown(&b.app).await;
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while c.app.partitions.owned().len() < 8 {
-        assert!(Instant::now() < deadline, "c never took b's shards");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_until("c takes b's shards", Duration::from_secs(15), || owned(&c) >= 8).await;
     for (did, p) in &posts {
         c.get_record(did, p.collection(), p.rkey()).await.ok();
     }
@@ -408,20 +374,9 @@ async fn pruning_below_the_cursor_under_a_seek_is_not_outdated() {
     let race = PruneRace::new(Duration::ZERO);
     let store: Arc<dyn object_store::ObjectStore> = race.clone();
     let spawn = |store: Arc<dyn object_store::ObjectStore>| {
-        TestServer::spawn_with(move |c| {
-            c.memory_store = Some(store);
-            c.shards = 4;
+        cluster_node("race", store, 4, |c| {
             c.firehose_ring_bytes = 2048;
             c.log_retention = None; // PruneRace is the only deleter
-            c.cluster = Some(vlpds::cluster::ClusterConfig {
-                node_id: "race".into(),
-                addr: peer_url(c),
-                shards: 4,
-                ttl: Duration::from_millis(1500),
-                renew_every: Duration::from_millis(100),
-                skew: Duration::from_millis(300),
-                ..Default::default()
-            });
         })
     };
     // the previous incarnation: its log is dead (fenced) once it leaves
