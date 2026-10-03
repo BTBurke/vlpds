@@ -709,7 +709,7 @@ Note: vlpds deletes blob bytes in a GC sweep with a grace period (`blob_deletes:
 | fails on invite code from takendown account | covered | `invite_codes::fails_on_invite_code_from_takendown_account` |
 | fails on used up invite code | covered | `invite_codes::fails_on_used_up_invite_code` |
 | handles racing invite code uses | covered | `invite_codes::handles_racing_invite_code_uses` |
-| allow users to get available user invites | ported | `invite_codes::ref_earns_invite_codes_on_an_interval` (`--invite-interval-ms` 2 s, waited out, in place of backdating `actor.createdAt` in SQL); the reference's exact day/epoch arithmetic in `xrpc::server::invite_interval_tests::earns_one_code_per_interval` (lib) |
+| allow users to get available user invites | ported | `invite_codes::ref_earns_invite_codes_on_an_interval` (a 1 h `--invite-interval-ms`, the account backdated 2.5 h as the reference backdates `actor.createdAt` in SQL); the reference's exact day/epoch arithmetic in `xrpc::server::invite_interval_tests::earns_one_code_per_interval` (lib) |
 | admin gifted codes to not impact a users available codes | covered | `invite_codes::ref_earns_invite_codes_on_an_interval` (3 admin + 2 earned), `invite_codes::admin_gifted_codes_are_listed_for_the_account`, `invite_interval_tests::admin_codes_do_not_count` |
 | creates invites based on epoch | ported | `xrpc::server::invite_interval_tests::counts_only_age_since_the_epoch` (lib): the reference's backdated account and SQL-inserted codes, as inputs to `codes_to_create` (its `calculateCodesToCreate`) |
 | prevents use of disabled codes | covered | `invite_codes::prevents_use_of_disabled_codes` |
