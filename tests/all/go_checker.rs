@@ -5,7 +5,6 @@
 //! no Go toolchain is installed the test fails with a clear message unless
 //! VLPDS_SKIP_GO_CHECKER=1 is set.
 use crate::common::*;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Builds the checker once per test binary: both tests call this, and two
@@ -51,64 +50,34 @@ async fn workload(s: &TestServer) -> Vec<TestAccount> {
         }
         // updates and deletes
         for r in refs.iter().step_by(3) {
-            s.xrpc
-                .post(
-                    "com.atproto.repo.putRecord",
-                    &json!({"repo": a.did, "collection": r.collection(), "rkey": r.rkey(), "record": post_record("edited")}),
-                    &a.auth(),
-                )
-                .await
-                .ok();
+            s.put_record(a, r.collection(), r.rkey(), post_record("edited")).await.ok();
         }
         for r in refs.iter().skip(1).step_by(4) {
-            s.xrpc
-                .post(
-                    "com.atproto.repo.deleteRecord",
-                    &json!({"repo": a.did, "collection": r.collection(), "rkey": r.rkey()}),
-                    &a.auth(),
-                )
-                .await
-                .ok();
+            s.delete_record(a, r.collection(), r.rkey()).await.ok();
         }
         // a multi-op applyWrites
         let writes: Vec<J> = (0..10)
             .map(|k| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.like", "rkey": format!("like{k}"), "value": {"$type": "app.bsky.feed.like", "subject": {"uri": refs[0].uri, "cid": refs[0].cid}, "createdAt": now_iso()}}))
             .chain(refs.iter().skip(2).step_by(5).map(|r| json!({"$type": "com.atproto.repo.applyWrites#delete", "collection": r.collection(), "rkey": r.rkey()})))
             .collect();
-        s.xrpc
-            // validate:false: likes need TID rkeys under lexicon validation
-            .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "validate": false, "writes": writes}), &a.auth())
-            .await
-            .ok();
+        // validate:false: likes need TID rkeys under lexicon validation
+        s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "validate": false, "writes": writes}), &a.auth()).await.ok();
     }
     // concurrent burst on one repo (coalesced commits)
-    let x = Arc::new(s.xrpc.clone());
-    let hot = accts[0].clone();
+    let hot = &accts[0];
     let hs: Vec<_> = (0..150)
         .map(|k| {
-            let x = x.clone();
-            let a = hot.clone();
-            tokio::spawn(async move {
-                x.post(
-                    "com.atproto.repo.createRecord",
-                    &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record(&format!("burst {k}"))}),
-                    &a.auth(),
-                )
-                .await
-                .ok();
-            })
+            let body = json!({"repo": hot.did, "collection": "app.bsky.feed.post", "record": post_record(&format!("burst {k}"))});
+            tokio::spawn(s.xrpc.post_owned("com.atproto.repo.createRecord", body, hot.auth()))
         })
         .collect();
     for h in hs {
-        h.await.unwrap();
+        h.await.unwrap().ok();
     }
     // identity + account events in the stream
     let a = &accts[1];
     let new_handle = format!("{}.{HANDLE_DOMAIN}", unique_name("gcren"));
-    s.xrpc
-        .post("com.atproto.identity.updateHandle", &json!({"handle": new_handle}), &a.auth())
-        .await
-        .ok();
+    s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": new_handle}), &a.auth()).await.ok();
     s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &a.auth()).await.ok();
     s.xrpc.post_empty("com.atproto.server.activateAccount", &a.auth()).await.ok();
     s.post(a, "after reactivation").await;
@@ -130,21 +99,16 @@ async fn go_checker_accepts_firehose() {
     for a in &accts {
         want.insert(a.did.clone(), s.latest_commit(&a.did).await.0);
     }
-    let frames = sub
-        .until(Duration::from_secs(60), |fs| {
-            want.iter().all(|(d, c)| {
-                fs.iter().any(|f| f.did() == Some(d.as_str()) && matches!(f.body.get("commit"), Some(Value::Link(x)) if x == c))
-            })
-        })
+    let mut frames = sub
+        .until(Duration::from_secs(60), |fs| want.iter().all(|(d, c)| fs.iter().any(|f| f.did() == Some(d.as_str()) && matches!(f.body.get("commit"), Some(Value::Link(x)) if x == c))))
         .await;
     // plus anything trailing (e.g. #account/#identity after the last commit)
-    let mut frames = frames;
     frames.extend(sub.drain(Duration::from_millis(500)).await);
     let n = frames.iter().filter(|f| f.seq().is_some()).count();
-    let kinds: std::collections::BTreeMap<String, usize> = frames.iter().fold(Default::default(), |mut m, f| {
-        *m.entry(f.kind().to_string()).or_default() += 1;
-        m
-    });
+    let mut kinds = std::collections::BTreeMap::<String, usize>::new();
+    for f in &frames {
+        *kinds.entry(f.kind().to_string()).or_default() += 1;
+    }
     eprintln!("firehose: {n} events {kinds:?}");
     for k in ["#commit", "#sync", "#identity", "#account"] {
         assert!(kinds.contains_key(k), "workload produced no {k} events: {kinds:?}");
@@ -162,11 +126,7 @@ async fn go_checker_accepts_firehose() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     eprintln!("checker stdout:\n{stdout}\nchecker stderr:\n{stderr}");
-    assert!(
-        out.status.success(),
-        "Go sync 1.1 checker reported failures (exit {:?}):\n{stdout}\n{stderr}",
-        out.status.code()
-    );
+    assert!(out.status.success(), "Go sync 1.1 checker reported failures (exit {:?}):\n{stdout}\n{stderr}", out.status.code());
     assert!(stdout.contains(&format!("max-events {n} reached")), "checker did not read all {n} events:\n{stdout}");
 }
 
@@ -192,11 +152,8 @@ async fn go_checker_accepts_key_rotation_resync() {
         s.post(&a, &format!("after {i}")).await;
     }
     // an update and a delete of records written before the rotation
-    s.xrpc
-        .post("com.atproto.repo.putRecord", &json!({"repo": a.did, "collection": refs[0].collection(), "rkey": refs[0].rkey(), "record": post_record("edited")}), &a.auth())
-        .await
-        .ok();
-    s.xrpc.post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": refs[1].collection(), "rkey": refs[1].rkey()}), &a.auth()).await.ok();
+    s.put_record(&a, refs[0].collection(), refs[0].rkey(), post_record("edited")).await.ok();
+    s.delete_record(&a, refs[1].collection(), refs[1].rkey()).await.ok();
     let frames = sub.until(Duration::from_secs(20), |fs| fs.len() >= 12).await;
     let kinds: Vec<&str> = frames.iter().map(|f| f.kind()).collect();
     assert_eq!(&kinds[..3], &["#identity", "#sync", "#commit"], "{kinds:?}");
@@ -234,10 +191,7 @@ async fn go_checker_rejects_wrong_signing_key() {
     let mut sub = s.subscribe(Some(0)).await;
     let n = sub.drain(Duration::from_millis(500)).await.iter().filter(|f| f.seq().is_some()).count();
     // rotate the key: historical commits no longer verify against describeRepo's key
-    s.xrpc
-        .post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin)
-        .await
-        .ok();
+    s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.ok();
     let out = tokio::process::Command::new(&bin)
         .args(["-host", &s.url, "-cursor", "0", "-max-events", &n.to_string(), "-strict", "-quiet", "-workers", "1"])
         .output()

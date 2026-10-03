@@ -185,12 +185,12 @@ None.
 | generates a properly formatted PLC DID | covered | `plc::create_account_registers_the_genesis_op` (DID = hash of genesis op; handle, signing key, PDS endpoint) |
 | allows a custom set recovery key | covered | `plc::server_recovery_key_is_ahead_of_the_rotation_key` ([recoveryKey, server recovery key, rotation key]), `plc::create_account_registers_the_genesis_op` |
 | allows administrative email updates | covered | `account::allows_administrative_email_updates` |
-| disallows duplicate email addresses and handles | covered | `account::disallows_duplicate_email_addresses_and_handles`; exact messages: `ref_account::ref_create_account_error_messages` (product fix: echo the request's email spelling) |
+| disallows duplicate email addresses and handles | covered | `ref_account::ref_create_account_error_messages` (exact messages; product fix: echo the request's email spelling) |
 | disallows the email and handle of a deactivated account | covered | `account::disallows_the_email_and_handle_of_a_deactivated_account` |
 | validates input through lexicon schema | covered | `account::fails_on_invalid_handles` (all nine handles) |
-| disallows improperly formatted handles | covered | `account::disallows_improperly_formatted_handles`; messages in `ref_account::ref_create_account_error_messages` |
-| disallows reserved handles (john.bsky.io → UnsupportedDomain) | covered | `account::disallows_unsupported_domains`; message in `ref_account::ref_create_account_error_messages` |
-| disallows reserved handles (about/atp) | covered | `account::disallows_reserved_handles`; message in `ref_account::ref_create_account_error_messages` |
+| disallows improperly formatted handles | covered | `ref_account::ref_create_account_error_messages` (with messages) |
+| disallows reserved handles (john.bsky.io → UnsupportedDomain) | covered | `ref_account::ref_create_account_error_messages` (with message) |
+| disallows reserved handles (about/atp) | covered | `ref_account::ref_create_account_error_messages` (with message) |
 | handles racing signups for same handle | covered | `account::handles_racing_signups_for_same_handle` |
 | fails on unauthenticated requests | covered | `account::login_and_authenticated_requests` |
 | logs in | covered | `account::login_and_authenticated_requests` |
@@ -564,7 +564,7 @@ Note: vlpds deletes blob bytes in a GC sweep with a grace period (`blob_deletes:
 | does not allow taking a handle that already exists | covered | `handles::cannot_take_existing_handle`; exact message in `ref_handles::ref_handle_error_messages` |
 | handle updates are idempotent | covered | `handles::handle_updates_are_idempotent` |
 | if handle update fails, it does not update their did document | covered | `handles::cannot_take_existing_handle` |
-| disallows handles that do not resolve to a DID | covered | `handles::external_handle_must_resolve`; message in `ref_handles::ref_unresolvable_external_handle_message` |
+| disallows handles that do not resolve to a DID | covered | `ref_handles::ref_unresolvable_external_handle_message` (with message; handle unchanged) |
 | validates input through lexicon schema | covered | `handles::validates_input_handle_syntax` |
 | applies PDS specific handle length constraints | covered | `handles::applies_pds_length_constraints` |
 | disallows reserved handles | covered | `handles::disallows_reserved_handles` |

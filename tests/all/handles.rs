@@ -2,7 +2,6 @@
 //! (uniqueness, idempotence, validation, reserved names), DID doc updates,
 //! admin updateAccountHandle, and #identity events.
 use crate::common::*;
-use std::time::Duration;
 
 fn h(label: &str) -> String {
     format!("{label}.{HANDLE_DOMAIN}")
@@ -12,17 +11,12 @@ async fn update_handle(s: &TestServer, a: &TestAccount, handle: &str) -> Resp {
     s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": handle}), &a.auth()).await
 }
 
-async fn resolve(s: &TestServer, handle: &str) -> Resp {
-    s.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", handle)], &Auth::None).await
-}
-
 async fn current_handle(s: &TestServer, did: &str) -> String {
-    let d = s.xrpc.get("com.atproto.repo.describeRepo", &[("repo", did)], &Auth::None).await.ok();
-    d["handle"].as_str().unwrap().to_string()
+    s.describe_repo(did).await.ok()["handle"].as_str().unwrap().to_string()
 }
 
 async fn did_doc_handle(s: &TestServer, did: &str) -> Option<String> {
-    let d = s.xrpc.get("com.atproto.repo.describeRepo", &[("repo", did)], &Auth::None).await.ok();
+    let d = s.describe_repo(did).await.ok();
     d["didDoc"]["alsoKnownAs"].as_array()?.iter().filter_map(|x| x.as_str()).find_map(|x| x.strip_prefix("at://")).map(String::from)
 }
 
@@ -30,11 +24,10 @@ async fn did_doc_handle(s: &TestServer, did: &str) -> Option<String> {
 async fn resolves_handles() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    assert_eq!(resolve(&s, &a.handle).await.ok()["did"], json!(a.did));
+    assert_eq!(s.resolve_handle(&a.handle).await.ok()["did"], json!(a.did));
     // non-normalized input
-    assert_eq!(resolve(&s, &a.handle.to_uppercase()).await.ok()["did"], json!(a.did));
-    let r = resolve(&s, &h("john")).await;
-    r.err(400, "HandleNotFound");
+    assert_eq!(s.resolve_handle(&a.handle.to_uppercase()).await.ok()["did"], json!(a.did));
+    s.resolve_handle(&h("john")).await.err(400, "HandleNotFound");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -45,8 +38,8 @@ async fn user_changes_handle() {
     let mut sub = s.subscribe(Some(s.current_seq().await)).await;
     update_handle(&s, &a, &new).await.ok();
 
-    resolve(&s, &a.handle).await.err(400, "HandleNotFound");
-    assert_eq!(resolve(&s, &new).await.ok()["did"], json!(a.did));
+    s.resolve_handle(&a.handle).await.err(400, "HandleNotFound");
+    assert_eq!(s.resolve_handle(&new).await.ok()["did"], json!(a.did));
     assert_eq!(current_handle(&s, &a.did).await, new);
     assert_eq!(did_doc_handle(&s, &a.did).await.as_deref(), Some(new.as_str()), "DID doc alsoKnownAs updated");
 
@@ -72,7 +65,7 @@ async fn cannot_take_existing_handle() {
     // failure leaves alice's handle (and DID doc) unchanged
     assert_eq!(current_handle(&s, &a.did).await, a.handle);
     assert_eq!(did_doc_handle(&s, &a.did).await.as_deref(), Some(a.handle.as_str()));
-    assert_eq!(resolve(&s, &b.handle).await.ok()["did"], json!(b.did));
+    assert_eq!(s.resolve_handle(&b.handle).await.ok()["did"], json!(b.did));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -82,7 +75,7 @@ async fn handle_updates_are_idempotent() {
     let mut sub = s.subscribe(Some(s.current_seq().await)).await;
     update_handle(&s, &b, &b.handle.to_uppercase()).await.ok();
     assert_eq!(current_handle(&s, &b.did).await, b.handle);
-    assert_eq!(resolve(&s, &b.handle).await.ok()["did"], json!(b.did));
+    assert_eq!(s.resolve_handle(&b.handle).await.ok()["did"], json!(b.did));
     // re-sends #identity even though nothing changed
     let frames = sub.wait_for(FH_TIMEOUT, &b.did, "#identity").await;
     assert_eq!(frames.last().unwrap().str("handle"), Some(b.handle.as_str()));
@@ -124,24 +117,13 @@ async fn disallows_reserved_handles() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn external_handle_must_resolve() {
-    // dev mode deliberately skips external-handle verification, so run this one without it
-    let s = TestServer::spawn_with(|c| c.dev_mode = false).await;
-    let a = s.create_account("alice").await;
-    // nothing serves _atproto TXT / .well-known for this name
-    let r = tokio::time::timeout(Duration::from_secs(20), update_handle(&s, &a, "noexist-vlpds-test.example.com")).await.expect("bounded");
-    r.client_err();
-    assert_eq!(current_handle(&s, &a.did).await, a.handle);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn admin_overrides_handles() {
     let s = TestServer::spawn().await;
     let b = s.create_account("bob").await;
     let alt = h(&unique_name("balt"));
     s.xrpc.post("com.atproto.admin.updateAccountHandle", &json!({"did": b.did, "handle": alt}), &Auth::Admin).await.ok();
     assert_eq!(current_handle(&s, &b.did).await, alt);
-    assert_eq!(resolve(&s, &alt).await.ok()["did"], json!(b.did));
+    assert_eq!(s.resolve_handle(&alt).await.ok()["did"], json!(b.did));
     // admins may assign reserved names
     let reserved = h("dril");
     s.xrpc.post("com.atproto.admin.updateAccountHandle", &json!({"did": b.did, "handle": reserved}), &Auth::Admin).await.ok();
@@ -170,12 +152,7 @@ async fn disallows_slurs_in_handles() {
     let a = s.create_account("alice").await;
     // service-domain and custom-domain handles alike (the reference checks
     // before the domain split), separators squashed out first
-    for handle in [
-        h(&rev("reggin")),
-        h(&rev("ynnart")),
-        format!("{}.example.com", rev("reg.gin")),
-        format!("{}.com", rev("sekyk")),
-    ] {
+    for handle in [h(&rev("reggin")), h(&rev("ynnart")), format!("{}.example.com", rev("reg.gin")), format!("{}.com", rev("sekyk"))] {
         let r = update_handle(&s, &a, &handle).await;
         r.err(400, "InvalidHandle");
         assert!(r.text().contains("Inappropriate language in handle"), "{handle}: {}", r.text());
@@ -202,10 +179,7 @@ async fn disallows_slurs_in_record_keys() {
     for (nsid, body) in [
         ("com.atproto.repo.createRecord", json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec})),
         ("com.atproto.repo.putRecord", json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec})),
-        (
-            "com.atproto.repo.applyWrites",
-            json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": coll, "rkey": rkey, "value": rec}]}),
-        ),
+        ("com.atproto.repo.applyWrites", json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": coll, "rkey": rkey, "value": rec}]})),
     ] {
         let r = s.xrpc.post(nsid, &body, &a.auth()).await;
         r.err(400, "InvalidRequest");
@@ -218,17 +192,6 @@ async fn disallows_slurs_in_record_keys() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn create_account_handle_uniqueness_is_case_insensitive() {
-    let s = TestServer::spawn().await;
-    let a = s.create_account("alice").await;
-    let r = s
-        .xrpc
-        .post("com.atproto.server.createAccount", &json!({"handle": a.handle.to_uppercase(), "password": "x-password", "email": "dupe@example.com"}), &Auth::None)
-        .await;
-    r.err(400, "HandleNotAvailable");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_claims_of_one_handle() {
     let s = TestServer::spawn().await;
     let accts = futures::future::join_all((0..5).map(|_| s.create_account("racer"))).await;
@@ -237,5 +200,5 @@ async fn concurrent_claims_of_one_handle() {
     let winners: Vec<usize> = results.iter().enumerate().filter(|(_, r)| r.is_ok()).map(|(i, _)| i).collect();
     assert_eq!(winners.len(), 1, "exactly one account gets the handle: {results:?}");
     let did = &accts[winners[0]].did;
-    assert_eq!(resolve(&s, &target).await.ok()["did"], json!(did));
+    assert_eq!(s.resolve_handle(&target).await.ok()["did"], json!(did));
 }

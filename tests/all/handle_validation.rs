@@ -31,11 +31,7 @@ async fn rejects_handles_outside_service_domains() {
     for handle in ["john.bsky.io", "john.com", "john.test"] {
         let r = try_create(&s, handle).await;
         assert_eq!(r.status, 400, "{handle}: {}", r.text());
-        assert!(
-            matches!(r.error_name(), Some("InvalidHandle") | Some("UnsupportedDomain")),
-            "{handle}: {}",
-            r.text()
-        );
+        assert!(matches!(r.error_name(), Some("InvalidHandle") | Some("UnsupportedDomain")), "{handle}: {}", r.text());
     }
 }
 
@@ -63,15 +59,7 @@ async fn validates_handle_length() {
 async fn rejects_invalid_handle_syntax() {
     let s = TestServer::spawn().await;
     let d = HANDLE_DOMAIN;
-    for bad in [
-        format!("jo_hn.{d}"),
-        format!("jo hn.{d}"),
-        format!("-john.{d}"),
-        format!("john-.{d}"),
-        format!("{}.{d}", "a".repeat(64)),
-        "did:plc:abc".to_string(),
-        format!("john..{d}"),
-    ] {
+    for bad in [format!("jo_hn.{d}"), format!("jo hn.{d}"), format!("-john.{d}"), format!("john-.{d}"), format!("{}.{d}", "a".repeat(64)), "did:plc:abc".to_string(), format!("john..{d}")] {
         let r = try_create(&s, &bad).await;
         assert_eq!(r.status, 400, "{bad}: {}", r.text());
         assert!(matches!(r.error_name(), Some("InvalidHandle") | Some("InvalidRequest")), "{bad}: {}", r.text());

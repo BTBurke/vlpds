@@ -41,10 +41,6 @@ fn profile(n: &str) -> J {
     json!({"$type": PROFILE, "displayName": n})
 }
 
-async fn describe(s: &TestServer, repo: &str) -> Resp {
-    s.xrpc.get("com.atproto.repo.describeRepo", &[("repo", repo)], &Auth::None).await
-}
-
 async fn count(s: &TestServer, did: &str, coll: &str) -> usize {
     s.list_records(did, coll, &[]).await.ok()["records"].as_array().unwrap().len()
 }
@@ -87,15 +83,15 @@ async fn registers_and_describes_repo() {
     assert_ne!(a.did, b.did);
     assert!(a.did.starts_with("did:"));
     assert!(!a.access.is_empty());
-    let d = describe(&s, &a.did).await.ok();
+    let d = s.describe_repo(&a.did).await.ok();
     assert_eq!(d["handle"], json!(a.handle));
     assert_eq!(d["did"], json!(a.did));
     assert_eq!(d["handleIsCorrect"], json!(true));
     assert_eq!(d["didDoc"]["id"], json!(a.did));
-    assert_eq!(describe(&s, &b.handle).await.ok()["did"], json!(b.did));
+    assert_eq!(s.describe_repo(&b.handle).await.ok()["did"], json!(b.did));
     // collections reflect the repo's contents
     s.post(&a, "hi").await;
-    assert_eq!(describe(&s, &a.did).await.ok()["collections"], json!([POST]), "describeRepo.collections");
+    assert_eq!(s.describe_repo(&a.did).await.ok()["collections"], json!([POST]), "describeRepo.collections");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -364,7 +360,7 @@ async fn missing_repo_errors() {
     let ghost = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     s.get_record(ghost, POST, "3jzfcijpj2z2a").await.err_status(400);
     s.list_records(ghost, POST, &[]).await.err_status(400);
-    describe(&s, ghost).await.err_status(400);
+    s.describe_repo(ghost).await.err_status(400);
     s.get_record("nobody.vlpds.test", POST, "3jzfcijpj2z2a").await.err_status(400);
     // writing to another (nonexistent) repo with your token
     create(&s, &a, json!({"repo": ghost, "collection": POST, "record": post_record("x")})).await.client_err();

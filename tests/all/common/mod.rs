@@ -433,6 +433,10 @@ impl TestServer {
         self.xrpc.get("com.atproto.admin.getAccountInfo", &[("did", did)], &Auth::Admin).await
     }
 
+    pub async fn describe_repo(&self, repo: &str) -> Resp {
+        self.xrpc.get("com.atproto.repo.describeRepo", &[("repo", repo)], &Auth::None).await
+    }
+
     pub async fn resolve_handle(&self, handle: &str) -> Resp {
         self.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", handle)], &Auth::None).await
     }

@@ -54,7 +54,7 @@ async fn creates_an_account_with_plc_shaped_did_and_did_doc() {
     assert!(!a.access.is_empty() && !a.refresh.is_empty());
 
     // DID document via describeRepo: handle, PDS endpoint and the repo signing key.
-    let j = s.xrpc.get("com.atproto.repo.describeRepo", &[("repo", &a.did)], &Auth::None).await.ok();
+    let j = s.describe_repo(&a.did).await.ok();
     assert_eq!(j["did"], json!(a.did));
     assert_eq!(j["handle"], json!(a.handle));
     let doc = &j["didDoc"];
@@ -90,42 +90,6 @@ async fn fails_on_invalid_handles() {
         assert_eq!(r.status, 400, "handle {h:?}: {}", r.text());
         assert!(matches!(r.error_name(), Some("InvalidHandle" | "InvalidRequest")), "handle {h:?}: {}", r.text());
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn disallows_improperly_formatted_handles() {
-    let s = TestServer::spawn().await;
-    // too short / too long first label on the service domain
-    try_handle(&s, &format!("j.{HANDLE_DOMAIN}")).await.err(400, "InvalidHandle");
-    try_handle(&s, &format!("jayromy-johnber12345678910.{HANDLE_DOMAIN}")).await.err(400, "InvalidHandle");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn disallows_unsupported_domains() {
-    let s = TestServer::spawn().await;
-    try_handle(&s, "john.bsky.io").await.err(400, "UnsupportedDomain");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn disallows_reserved_handles() {
-    let s = TestServer::spawn().await;
-    try_handle(&s, &format!("about.{HANDLE_DOMAIN}")).await.err(400, "HandleNotAvailable");
-    try_handle(&s, &format!("atp.{HANDLE_DOMAIN}")).await.err(400, "HandleNotAvailable");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn disallows_duplicate_email_addresses_and_handles() {
-    let s = TestServer::spawn().await;
-    let name = unique_name("bob");
-    let handle = format!("{name}.{HANDLE_DOMAIN}");
-    let email = format!("{name}@test.com");
-    signup(&s, &handle, &email).await.ok();
-    // same email, different case
-    let r = signup(&s, &fresh_handle("carol"), &email.to_uppercase()).await;
-    r.client_err();
-    assert!(r.text().to_lowercase().contains("email"), "{}", r.text());
-    // same handle, different case
-    handle_taken(&signup(&s, &handle.to_uppercase(), &format!("{}@test.com", unique_name("carol"))).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
