@@ -19,22 +19,7 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
 
 /// `put_ms`: every segment PUT of this node's log takes that long.
 pub(crate) async fn node_with(id: &str, store: &Arc<object_store::memory::InMemory>, put_ms: Option<f64>) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.inject_latency = put_ms.map(|ms| (ms, 0.0));
-        c.shards = SHARDS;
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: SHARDS,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(200),
-            ..Default::default()
-        });
-    })
-    .await
+    cluster_node(id, store.clone(), SHARDS, |c| c.inject_latency = put_ms.map(|ms| (ms, 0.0))).await
 }
 
 /// Collects (seq, raw frame) from a subscription until `target` is set and
@@ -118,13 +103,10 @@ pub(crate) async fn s3_union(s: &TestServer, acked: &[String]) -> Vec<(i64, Vec<
             all.push((seq, frame.to_vec()));
         }
         job.await.unwrap().unwrap();
-        let commits: HashMap<String, usize> = all
-            .iter()
-            .filter_map(|(_, raw)| Frame::decode(raw).unwrap().commit().map(|c| c.commit.to_string()))
-            .fold(HashMap::new(), |mut m, c| {
-                *m.entry(c).or_default() += 1;
-                m
-            });
+        let mut commits: HashMap<String, usize> = HashMap::new();
+        for c in all.iter().filter_map(|(_, raw)| Frame::decode(raw).unwrap().commit()) {
+            *commits.entry(c.commit.to_string()).or_default() += 1;
+        }
         if acked.iter().all(|c| commits.contains_key(c)) {
             for c in acked {
                 assert_eq!(commits[c], 1, "acked commit {c} logged more than once");
@@ -254,12 +236,10 @@ async fn stopped_node_still_serving_does_not_stall_its_peers() {
     let a = node("sd-a", &store).await;
     let b = node("sd-b", &store).await;
     let c = node("sd-c", &store).await;
-    let owned = |s: &TestServer| s.app.partitions.owned().len();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !(owned(&a) > 0 && owned(&b) > 0 && owned(&c) > 0 && owned(&a) + owned(&b) + owned(&c) == SHARDS as usize) {
-        assert!(tokio::time::Instant::now() < deadline, "the shards never spread over 3 nodes");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_until("the shards spread over 3 nodes", Duration::from_secs(10), || {
+        owned(&a) > 0 && owned(&b) > 0 && owned(&c) > 0 && owned(&a) + owned(&b) + owned(&c) == SHARDS as usize
+    })
+    .await;
     let accounts: Vec<TestAccount> = futures::future::join_all((0..8).map(|_| a.create_account("sd"))).await;
     let target = Arc::new(AtomicI64::new(0));
     let subs = vec![
@@ -273,11 +253,7 @@ async fn stopped_node_still_serving_does_not_stall_its_peers() {
     let c_log = c.app.log.log_id.to_string();
     vlpds::server::shutdown(&c.app).await; // and no halt: c keeps serving
     for (name, n) in [("a", &a), ("b", &b)] {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while n.app.node.follow_floors().contains_key(&c_log) {
-            assert!(tokio::time::Instant::now() < deadline, "{name} never drained c's log to its fence");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_until(&format!("{name} drains c's log to its fence"), Duration::from_secs(10), || !n.app.node.follow_floors().contains_key(&c_log)).await;
     }
     // the peers' firehoses settle past now, twice over, while writes go on
     for _ in 0..2 {

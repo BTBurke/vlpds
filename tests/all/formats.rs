@@ -53,32 +53,34 @@ const TIME: &str = "2026-10-01T00:00:00.000Z";
 const KEK: [u8; 32] = [7; 32];
 const SECRET: &[u8] = b"level-1 wrapped secret fixture";
 
-/// A #commit frame (one update) and the record/commit blocks it carries.
-fn commit_frame() -> (Vec<u8>, Cid, Vec<u8>, vlpds::tid::Tid) {
-    let rec_block = b"\xa1aa\x01".to_vec();
-    let rec = Cid::dag_cbor(&rec_block);
+/// A commit over one record block: (record cid, commit cid, commit block,
+/// the CAR of both).
+fn commit_car(rec_block: &[u8]) -> (Cid, Cid, Vec<u8>, Vec<u8>) {
+    let rec = Cid::dag_cbor(rec_block);
     let mut commit_block = Vec::new();
     vlpds::cbor::Value::Map(vec![("did".into(), vlpds::cbor::Value::Text(DID.into())), ("data".into(), vlpds::cbor::Value::Link(rec))]).encode(&mut commit_block);
     let commit = Cid::dag_cbor(&commit_block);
     let mut car = Vec::new();
     vlpds::car::write_header(&mut car, &commit);
     vlpds::car::write_block(&mut car, &commit, &commit_block);
-    vlpds::car::write_block(&mut car, &rec, &rec_block);
+    vlpds::car::write_block(&mut car, &rec, rec_block);
+    (rec, commit, commit_block, car)
+}
+
+/// A finished #commit frame of `ops` at `seq`.
+fn finish_commit(rev: &str, commit: Cid, car: &[u8], ops: &[vlpds::events::RepoOp], seq: i64) -> Vec<u8> {
+    let frame = vlpds::events::commit_frame(&vlpds::events::CommitFrame { repo: DID, rev, since: None, commit, prev_data: None, blocks: car, ops, time: TIME });
+    let mut bytes = Vec::new();
+    frame.finish(seq, &mut bytes);
+    bytes
+}
+
+/// A #commit frame (one update) and the record/commit blocks it carries.
+fn commit_frame() -> (Vec<u8>, Cid, Vec<u8>, vlpds::tid::Tid) {
+    let (rec, commit, commit_block, car) = commit_car(b"\xa1aa\x01");
     let rev = vlpds::tid::Tid::parse("3l3qo2vutsw2b").unwrap();
     let ops = [vlpds::events::RepoOp { action: "update", path: "app.bsky.feed.post/1", cid: Some(rec), prev: Some(commit) }];
-    let frame = vlpds::events::commit_frame(&vlpds::events::CommitFrame {
-        repo: DID,
-        rev: &rev.to_string(),
-        since: None,
-        commit,
-        prev_data: None,
-        blocks: &car,
-        ops: &ops,
-        time: TIME,
-    });
-    let mut bytes = Vec::new();
-    frame.finish(1000 << 8, &mut bytes);
-    (bytes, commit, commit_block, rev)
+    (finish_commit(&rev.to_string(), commit, &car, &ops, 1000 << 8), commit, commit_block, rev)
 }
 
 fn segment_plain() -> Vec<u8> {
@@ -103,28 +105,9 @@ fn like_record() -> Vec<u8> {
 /// A segment of one #commit creating a like: its derived muts include the
 /// backlink put (`bl/`, `segment::derive_commit_muts`).
 fn segment_like() -> Vec<u8> {
-    let rec_block = like_record();
-    let rec = Cid::dag_cbor(&rec_block);
-    let mut commit_block = Vec::new();
-    vlpds::cbor::Value::Map(vec![("did".into(), vlpds::cbor::Value::Text(DID.into())), ("data".into(), vlpds::cbor::Value::Link(rec))]).encode(&mut commit_block);
-    let commit = Cid::dag_cbor(&commit_block);
-    let mut car = Vec::new();
-    vlpds::car::write_header(&mut car, &commit);
-    vlpds::car::write_block(&mut car, &commit, &commit_block);
-    vlpds::car::write_block(&mut car, &rec, &rec_block);
+    let (rec, commit, _, car) = commit_car(&like_record());
     let ops = [vlpds::events::RepoOp { action: "create", path: "app.bsky.feed.like/3l3qo2vutsw2b", cid: Some(rec), prev: None }];
-    let frame = vlpds::events::commit_frame(&vlpds::events::CommitFrame {
-        repo: DID,
-        rev: "3l3qo2vutsw2c",
-        since: None,
-        commit,
-        prev_data: None,
-        blocks: &car,
-        ops: &ops,
-        time: TIME,
-    });
-    let mut bytes = Vec::new();
-    frame.finish(1010 << 8, &mut bytes);
+    let bytes = finish_commit("3l3qo2vutsw2c", commit, &car, &ops, 1010 << 8);
     let derived = segment::derive_commit_muts(&bytes).unwrap();
     let mut b = SegmentBuilder::for_log(LOG);
     b.push_derived(1010 << 8, ShardId(3), 7, |o| o.extend_from_slice(&bytes), &derived, derived.len());
@@ -537,6 +520,16 @@ fn cbor_reencode(name: &str, b: &[u8]) {
     assert!(out == b, "{name}: dag-cbor re-encode differs");
 }
 
+/// A parsed segment re-sealed by this build at `level`.
+fn reseal(h: &segment::SegHeader, entries: &[segment::SegEntry], level: u32) -> Vec<u8> {
+    let mut sb = SegmentBuilder::for_log_at(&h.log_id, level);
+    for e in entries {
+        let frame = e.frame.clone();
+        sb.push_derived(e.seq, e.shard, e.epoch, |o| o.extend_from_slice(&frame), &e.muts, e.derived);
+    }
+    sb.seal(&h.log_id, h.ordinal, h.prefix_end)
+}
+
 fn json_reencode<T: serde::Serialize + serde::de::DeserializeOwned>(name: &str, b: &[u8]) -> T {
     let v: T = serde_json::from_slice(b).unwrap_or_else(|e| panic!("{name}: {e}"));
     assert!(compact(&v) == b, "{name}: JSON re-encode differs");
@@ -552,13 +545,8 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             assert_eq!((h.level, h.codec, h.ordinal, h.prefix_end, h.count), (level, segment::CODEC_NONE, 5, 4, 3));
             assert_eq!(h.checksum.is_some(), level == version::TEST_LEVEL, "only the test level's header has a checksum");
             let LogObject::Segment(h, entries) = segment::parse(Bytes::copy_from_slice(b), true, None).unwrap() else { panic!("{name}") };
-            let mut sb = SegmentBuilder::for_log_at(&h.log_id, level);
-            for e in &entries {
-                let frame = e.frame.clone();
-                sb.push_derived(e.seq, e.shard, e.epoch, |o| o.extend_from_slice(&frame), &e.muts, e.derived);
-            }
             assert_eq!(entries[0].derived, 4, "#commit muts are derived, not stored");
-            assert!(sb.seal(&h.log_id, h.ordinal, h.prefix_end) == b, "{name}: re-encode differs");
+            assert!(reseal(&h, &entries, level) == b, "{name}: re-encode differs");
         }
         "segment/zstd.seg" => {
             let (h, _) = segment::parse_header(b).unwrap().unwrap();
@@ -576,10 +564,7 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             let bl = &e.muts[2];
             assert_eq!(vlpds::state::key_body(&bl.key)[..3], *b"bl/", "{name}: the like's backlink put");
             assert_eq!(bl.val.as_deref(), Some(&b"3l3qo2vutsw2b"[..]));
-            let mut sb = SegmentBuilder::for_log_at(&h.log_id, level);
-            let frame = e.frame.clone();
-            sb.push_derived(e.seq, e.shard, e.epoch, |o| o.extend_from_slice(&frame), &e.muts, e.derived);
-            assert!(sb.seal(&h.log_id, h.ordinal, h.prefix_end) == b, "{name}: re-encode differs");
+            assert!(reseal(&h, &entries, level) == b, "{name}: re-encode differs");
         }
         "state/backlinks.json" => {
             let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();
