@@ -307,6 +307,41 @@ pub fn verify_access_token(
     Ok(jwt)
 }
 
+/// A forwarded request's authentication waits at most this long, leaving
+/// the owner's write start (`--forwarded-write-start-ms`) its time before
+/// the entry node's [`crate::forward::TTFB_FAST`].
+const FORWARDED_AUTH_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// [`authenticate`]; on a forwarded Bearer request (with not-applied answers
+/// on), past [`FORWARDED_AUTH_WAIT`] it answers 503 `RepoLoading` instead:
+/// nothing was done, so the entry node resends it rather than failing it at
+/// its deadline. That wait is the account's security controls loading cold
+/// (every account of a shard after a takeover); the load goes on in the
+/// background, so the resend finds it cached. Not DPoP: its check claims the
+/// proof against replay first, so a resend of the same proof would fail.
+async fn authenticate_within(app: &Arc<App>, parts: &Parts) -> XResult<Credentials> {
+    let bearer = parts.headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|h| h.strip_prefix("Bearer "));
+    if bearer.is_none() || app.config.forwarded_write_start.is_none() || !crate::forward::is_forwarded() {
+        return authenticate(app, parts).await;
+    }
+    match tokio::time::timeout(FORWARDED_AUTH_WAIT, authenticate(app, parts)).await {
+        Ok(r) => r,
+        Err(_) => {
+            let sub = bearer.and_then(|t| app.jwt.verify_signature_cached(t.trim())).map(|c| c.sub.clone());
+            if let Some(did) = sub.filter(|d| d.starts_with("did:")) {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let _ = super::server::ctl(&app, &did).await;
+                });
+            }
+            Err(XrpcError::unavailable(
+                crate::forward::REPO_LOADING,
+                format!("account state still loading after {} ms; not applied, retry", FORWARDED_AUTH_WAIT.as_millis()),
+            ))
+        }
+    }
+}
+
 pub struct Auth(pub Credentials);
 
 impl FromRequestParts<Arc<App>> for Auth {
@@ -315,7 +350,7 @@ impl FromRequestParts<Arc<App>> for Auth {
         parts: &mut Parts,
         app: &Arc<App>,
     ) -> Result<Self, Self::Rejection> {
-        authenticate(app, parts).await.map(Auth)
+        authenticate_within(app, parts).await.map(Auth)
     }
 }
 
@@ -330,7 +365,7 @@ impl FromRequestParts<Arc<App>> for MaybeAuth {
         if parts.headers.get(header::AUTHORIZATION).is_none() {
             return Ok(MaybeAuth(None));
         }
-        authenticate(app, parts).await.map(|c| MaybeAuth(Some(c)))
+        authenticate_within(app, parts).await.map(|c| MaybeAuth(Some(c)))
     }
 }
 

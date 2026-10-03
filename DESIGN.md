@@ -1152,6 +1152,17 @@ forwarded write for that long), or telling "busy loading" apart from
   security controls checked where it lands). Metrics:
   `vlpds_write_retries_total{reason}`, `vlpds_read_retries_total{reason}`,
   `vlpds_writes_abandoned_total`.
+- **Authentication answers early too.** Before a forwarded request reaches
+  its handler, the owner reads the account's security controls
+  (`xrpc::server::ctl`, a `sec/` scan), cold for every account of a shard
+  it just took over. A forwarded Bearer request still authenticating after
+  1.5 s is answered 503 `RepoLoading` (nothing was done), and the controls
+  load on in the background, so the resend finds them cached
+  (`xrpc::authn::authenticate_within`). Without it, a takeover's forwarded
+  writes waited in that scan past the 3 s deadline: an ambiguous 503 the
+  entry node can't resend. DPoP requests wait as before: their check
+  claims the proof against replay before the reads, so a resend of the
+  same proof would be refused.
 - Directly received writes (the client called the owner) just wait for
   their load. Every 503 vlpds answers carries `Retry-After: 1`.
 
@@ -1167,6 +1178,70 @@ moves; 1,736 resends), 1,991 recently written repos preloaded. Cold loads
 in-process stay well under 1 s (the processes share one block cache), so
 `RepoLoading` didn't fire there; it is what the capacity dry run's 20 s
 restart stall needs.
+
+### Crash takeovers: where the errors came from
+
+A crash takeover makes every repo of the dead node's shards cold on the
+survivors at once, with nothing to prewarm from. Benchbox round 3 lost
+72–97k writes per kill -9 of the benchbox node at 12k/s. The local repro
+(`bench/ha/storm.py`: 3 nodes on one MinIO with 30/40 ms injected state latency, 1M
+accounts, 100k active, 64 shards, writes through n1 + n2, kill -9 of n3 at
++100 s, restart 20 s later; the loadgens classify every error by status and
+XRPC error) splits them:
+
+- **The lease gap costs nothing.** Writes to the dead owner are refused at
+  connect and resent until routing follows the takeover (`unreachable`):
+  latency, not errors. The only errors around the kill are writes already
+  sent to n3 when it died (200–520 per kill at 6–9k/s): ambiguous, so
+  never resent.
+- **Every error after the takeover came from the owner's security check.**
+  Each request on an owner first reads the account's security controls
+  (`xrpc::server::ctl`, a `sec/` scan), cold for every account of a taken
+  shard. Forwarded writes waited in that scan, before the write's own
+  `RepoLoading` timer starts, past the entry node's 3 s deadline (an
+  ambiguous 503, not resent). Now forwarded authentication answers
+  `RepoLoading` after 1.5 s and the load finishes in the background (see
+  "Forwarding deadlines").
+- **Abandoned writes held their admission permit.** A write answered
+  `RepoLoading` stays queued behind its repo's load until the load ends,
+  and its permit (`--max-inflight-writes`, 20k) went with it; every resend
+  queued another copy. Through a few seconds of cold loads that filled the
+  cap and the owner shed everything else `Overloaded`: three quarters of
+  the errors at 9k/s, and the rejoin's whole storm (the restarted node's
+  handed-back shards are prewarmed, so they pass authentication fast and
+  wait on their loads). The permit now lives in the write's `Claim`, freed
+  the moment it is abandoned.
+- **`sec/` scans re-fetched their block every time.** `scan_private` used
+  SlateDB's default `cache_blocks: false`, so each security-control
+  re-read (every active account once per `LOCAL_RELOAD_SECS` = 60 s on
+  its owner) was an SST GET: ~600 re-reads/s per node at 6k writes/s,
+  most of a steady node's state GETs. Cached, steady SST GETs per node
+  fell from 760–950/s to 570–620/s (6k/s) and from 925–1,017/s to
+  626–719/s (9k/s). Preloads after a takeover and the handoff prewarm
+  (`worker::warm_repo`) read the `sec/` rows into the cache too.
+- **The cold reads themselves remain.** The storm still lasts 4–9 s of
+  multi-second p99 (worst 1 s p99 9–11 s now, 12–15 s before) while the
+  survivors' state pools work through the cold loads. A gate admitting
+  cold reads in priority order (repo loads, then security scans, then
+  preloads, so a saturated pool doesn't re-queue every GET of each load's
+  chain) changed neither the errors nor the storm's length here (9k/s: 0
+  errors after the takeover and 13.2 vs 12.7 s worst p99 without and with
+  it; cold opens already take one of 256 `LOAD_PERMITS`), and sized at
+  half the pool it halved throughput, so it was left out. Shortening the
+  storm needs fewer cold GETs: a warm standby of the shards a node would
+  inherit, or a prefix filter so a `sec/` scan of an account with no rows
+  (nearly all) reads nothing.
+
+Errors per kill -9 (each row a run; "before" is deafc78, which already
+resends queries; 7daf6d5 had 0.9–3.7k after the takeover at 6k/s):
+
+| Shape | Build | At the kill | After takeover | At the rejoin | Worst 1 s p99 |
+|---|---|---|---|---|---|
+| 6k writes/s, `--store-inflight 192` | before | 233 / 313 | 236 / 210 | 1,289 / 1,407 (deadline) | 11.6 / 12.0 s |
+| | now | 244 / 204 | 0 / 0 | 0 / 0 | 9.3 / 9.5 s |
+| 9k writes/s, `--store-inflight 160` | before | 474 / 346 | 31,720 / 30,572 | 18,584 / 15,181 | 15.0 / 15.1 s |
+| | without the permit fix | 313 / 523 | 0 / 0 | 7,749 / 6,720 (`Overloaded`) | 11.8 / 13.9 s |
+| | now | 372 / 460 | 0 / 0 | 0 / 0 | 11.3 / 11.4 s |
 
 ### Pipelined segment PUTs (K in flight per log)
 

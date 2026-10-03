@@ -32,6 +32,7 @@ pub use server::{auth_epoch, auth_epoch_cond, epoch_for_login, new_auth_epoch_op
 pub use sync::{request_crawl, set_export_prefetch_max_bytes, DEFAULT_EXPORT_STALL, DEFAULT_MAX_EXPORTS};
 pub use repo::DEFAULT_MAX_IMPORT_BYTES;
 pub use server::{LogMailer, Mail, Mailer};
+pub(crate) use server::SEC;
 
 #[allow(unused_imports)]
 mod prelude {

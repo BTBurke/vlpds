@@ -120,7 +120,7 @@ pub struct WriteReq {
     /// None = always applied once queued.
     pub claim: Option<Arc<Claim>>,
     /// Admission permit, released when the request is consumed rather than
-    /// when the handler goes away.
+    /// when the handler goes away (in `claim` when there is one).
     pub permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -129,21 +129,36 @@ pub struct WriteReq {
 /// the forwarding node retries). Exactly one wins, so an abandoned write is
 /// never applied and a taken one is always answered.
 #[derive(Default)]
-pub struct Claim(std::sync::atomic::AtomicU8);
+pub struct Claim {
+    state: std::sync::atomic::AtomicU8,
+    /// The write's admission permit: freed when the write is abandoned, not
+    /// when its queued copy is dropped after the repo's load. Every resend
+    /// queues another copy, and abandoned copies holding permits through a
+    /// takeover's multi-second loads filled the cap (`Overloaded`).
+    permit: parking_lot::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+}
 
 impl Claim {
     const PENDING: u8 = 0;
     const TAKEN: u8 = 1;
     const ABANDONED: u8 = 2;
 
+    pub fn holding(permit: tokio::sync::OwnedSemaphorePermit) -> Claim {
+        Claim { state: Default::default(), permit: parking_lot::Mutex::new(Some(permit)) }
+    }
+
     /// The worker starts the write: false if it was abandoned.
     pub fn take(&self) -> bool {
-        self.0.compare_exchange(Self::PENDING, Self::TAKEN, Ordering::AcqRel, Ordering::Acquire).is_ok()
+        self.state.compare_exchange(Self::PENDING, Self::TAKEN, Ordering::AcqRel, Ordering::Acquire).is_ok()
     }
 
     /// False if the worker took it already.
     pub fn abandon(&self) -> bool {
-        self.0.compare_exchange(Self::PENDING, Self::ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_ok()
+        let won = self.state.compare_exchange(Self::PENDING, Self::ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_ok();
+        if won {
+            self.permit.lock().take();
+        }
+        won
     }
 }
 
@@ -673,7 +688,7 @@ impl Worker {
                 } else {
                     self.loading.insert(did.clone(), Vec::new());
                     self.preloads.insert(did.clone(), done);
-                    self.spawn_load(did, None);
+                    self.spawn_load(did, None, true);
                 }
             }
             WorkerMsg::DropPartition(p, done) => {
@@ -835,12 +850,14 @@ impl Worker {
         let did = req.did().clone();
         let need = Some(Need::of(std::slice::from_ref(&req)));
         self.loading.insert(did.clone(), vec![req]);
-        self.spawn_load(did, need);
+        self.spawn_load(did, need, false);
     }
 
     /// Loads `did` (and what `need` visits) in the background; its `loading`
     /// entry is set. The result comes back as [`WorkerMsg::Loaded`].
-    fn spawn_load(&mut self, did: Arc<str>, need: Option<Need>) {
+    /// A preload also reads the repo's security controls into the block
+    /// cache: its first request reads them before anything else.
+    fn spawn_load(&mut self, did: Arc<str>, need: Option<Need>, preload: bool) {
         let opts = LoadOpts { prefetch_bytes: self.limits.prefetch_bytes, need, secrets: Some(self.secrets.clone()) };
         metrics::LOADING_REPOS.inc();
         let (me, fallbacks) = (self.me.clone(), self.fallbacks.clone());
@@ -848,6 +865,7 @@ impl Worker {
             let _ = me.send(WorkerMsg::Loaded { did, res: Err(anyhow::anyhow!("partition not owned by this node")) });
             return;
         };
+        let db = preload.then(|| partition.db.clone());
         self.rt.spawn(async move {
             let t = Instant::now();
             // a shard closed under the load moved: retryable like "not owned"
@@ -865,7 +883,11 @@ impl Worker {
             let _ = STATS.load_us.lock().record(t.elapsed().as_micros().max(1) as u64);
             metrics::REPO_LOAD_DURATION.observe(t.elapsed().as_secs_f64());
             metrics::LOADING_REPOS.dec();
-            let _ = me.send(WorkerMsg::Loaded { did, res });
+            let found = matches!(res, Ok(Some(_)));
+            let _ = me.send(WorkerMsg::Loaded { did: did.clone(), res });
+            if let Some(db) = db.filter(|_| found) {
+                let _ = warm_security(&*db, &did).await;
+            }
         });
     }
 
@@ -1459,6 +1481,18 @@ pub async fn warm_repo<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str)
     db.get(state::head_key(did)).await?;
     db.get(state::account_key(did)).await?;
     crate::mst_store::prefetch(db, did, DEFAULT_PREFETCH_BYTES).await?;
+    warm_security(db, did).await
+}
+
+/// Reads the account's security controls (`sec/` private rows), which
+/// every authenticated request on its owner reads first, into the block
+/// cache.
+pub async fn warm_security<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str) -> anyhow::Result<()> {
+    let lo = [state::private_prefix(did), crate::xrpc::SEC.as_bytes().to_vec()].concat();
+    let hi = state::prefix_end(&lo);
+    let opts = slatedb::config::ScanOptions { cache_blocks: true, ..Default::default() };
+    let mut it = db.scan_with_options(lo..hi, &opts).await?;
+    while it.next().await?.is_some() {}
     Ok(())
 }
 
@@ -2605,6 +2639,20 @@ fn sync_frame(did: &str, head: &Head, time: &str) -> events::Frame {
 mod tests {
     use super::*;
     use crate::nodelog::{NodeLog, NodeLogConfig};
+
+    #[test]
+    fn an_abandoned_claim_frees_its_permit_at_once() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let c = Claim::holding(sem.clone().try_acquire_owned().unwrap());
+        assert!(c.abandon());
+        assert_eq!(sem.available_permits(), 1, "freed while the queued copy still holds the claim");
+        let c = Claim::holding(sem.clone().try_acquire_owned().unwrap());
+        assert!(c.take());
+        assert!(!c.abandon());
+        assert_eq!(sem.available_permits(), 0, "a taken write keeps it until consumed");
+        drop(c);
+        assert_eq!(sem.available_permits(), 1);
+    }
 
     fn settle(e: LogEntry) {
         if let Some(p) = e.pending {

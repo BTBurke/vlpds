@@ -503,7 +503,31 @@ struct Run {
     fh_events: AtomicU64,
     fh_lag: Mutex<Histogram<u64>>,
     first_err: Mutex<Option<String>>,
+    /// Errors by [`err_kind`]: this report window's, and the run's.
+    err_kinds: Mutex<(std::collections::BTreeMap<String, u64>, std::collections::BTreeMap<String, u64>)>,
     measure_from: std::sync::OnceLock<Instant>,
+}
+
+/// "503 ShardMoved", "timeout", ...: the status and XRPC error name of a
+/// failed write, or the transport failure.
+fn err_kind(e: &anyhow::Error) -> String {
+    if let Some(r) = e.downcast_ref::<reqwest::Error>() {
+        return if r.is_timeout() { "timeout" } else if r.is_connect() { "connect" } else { "transport" }.into();
+    }
+    let s = e.to_string();
+    let mut it = s.splitn(2, ": ");
+    let head = it.next().unwrap_or("");
+    let status = head.split(' ').nth(1).unwrap_or("?");
+    let v = it.next().and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok()).unwrap_or_default();
+    let msg = v["message"].as_str().unwrap_or("");
+    let why = if msg.contains("did not answer") {
+        ":deadline"
+    } else if msg.contains("unreachable") {
+        ":unreachable"
+    } else {
+        ""
+    };
+    format!("{status} {}{why}", v["error"].as_str().unwrap_or(""))
 }
 
 fn hist() -> Histogram<u64> {
@@ -574,6 +598,7 @@ async fn run(
         fh_events: AtomicU64::new(0),
         fh_lag: Mutex::new(hist()),
         first_err: Mutex::new(None),
+        err_kinds: Mutex::new(Default::default()),
         measure_from: std::sync::OnceLock::new(),
     });
 
@@ -623,8 +648,9 @@ async fn run(
                     w.reset();
                     r
                 };
+                let kinds: String = std::mem::take(&mut st.err_kinds.lock().0).into_iter().map(|(k, n)| format!(" [{k}]={n}")).collect();
                 eprintln!(
-                    "[{:>4.0}s] ok/s {:>7.0} err {} dropped {} inflight {} | p50 {:.1}ms p99 {:.1}ms max {:.0}ms | firehose ev/s {:.0}",
+                    "[{:>4.0}s] ok/s {:>7.0} err {} dropped {} inflight {} | p50 {:.1}ms p99 {:.1}ms max {:.0}ms | firehose ev/s {:.0}{}{kinds}",
                     start.elapsed().as_secs_f64(),
                     (ok - last_ok) as f64 / every,
                     st.err.load(Ordering::Relaxed),
@@ -633,7 +659,8 @@ async fn run(
                     p50 as f64 / 1000.0,
                     p99 as f64 / 1000.0,
                     max as f64 / 1000.0,
-                    (fh - last_fh) as f64 / every
+                    (fh - last_fh) as f64 / every,
+                    if kinds.is_empty() { "" } else { " | errs" },
                 );
                 last_ok = ok;
                 last_fh = fh;
@@ -750,6 +777,12 @@ async fn run(
                             }
                             Err(e) => {
                                 st.err.fetch_add(1, Ordering::Relaxed);
+                                let k = err_kind(&e);
+                                {
+                                    let mut ks = st.err_kinds.lock();
+                                    *ks.0.entry(k.clone()).or_default() += 1;
+                                    *ks.1.entry(k).or_default() += 1;
+                                }
                                 st.first_err.lock().get_or_insert_with(|| e.to_string());
                             }
                         }
@@ -802,6 +835,9 @@ async fn run(
     }
     if let Some(e) = st.first_err.lock().as_ref() {
         println!("first error: {e}");
+    }
+    for (k, n) in &st.err_kinds.lock().1 {
+        println!("errors [{k}]: {n}");
     }
     if !acked_out.is_empty() {
         let m: std::collections::HashMap<&str, Vec<String>> =

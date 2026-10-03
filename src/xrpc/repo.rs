@@ -204,7 +204,10 @@ async fn submit(
     // write can't start soon (cold repo load), give it up unapplied and say
     // so; the peer resends it (crate::forward, "RepoLoading").
     let start_wait = app.config.forwarded_write_start.filter(|_| crate::forward::is_forwarded());
-    let claim = start_wait.map(|_| Arc::new(crate::worker::Claim::default()));
+    let (claim, permit) = match start_wait {
+        Some(_) => (Some(Arc::new(crate::worker::Claim::holding(permit))), None),
+        None => (None, Some(permit)),
+    };
     app.workers
         .route(&did)
         .send(WorkerMsg::Write(WriteReq {
@@ -213,7 +216,7 @@ async fn submit(
             swap_commit,
             reply: tx,
             claim: claim.clone(),
-            permit: Some(permit),
+            permit,
         }))
         .map_err(XrpcError::from_err)?;
     let r = match (start_wait, &claim) {

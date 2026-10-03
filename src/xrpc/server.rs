@@ -97,7 +97,7 @@ const EMAIL_TOKEN_TTL_MS: u64 = 15 * 60 * 1000;
 pub(super) const NEW_PASSWORD_MAX_LENGTH: usize = 256;
 pub(super) const OLD_PASSWORD_MAX_LENGTH: usize = 512;
 
-pub(super) const SEC: &str = "sec/";
+pub(crate) const SEC: &str = "sec/";
 /// `sec/rvk/d/{before:016x}`: every session issued at or before `before`
 /// (micros) is revoked until `exp`. One immutable row per revocation (the
 /// newest dominates), so the GC can delete an expired one without racing a
@@ -173,13 +173,15 @@ pub(super) async fn get_json<T: serde::de::DeserializeOwned>(app: &App, routing:
 }
 
 /// (name, value) of `routing`'s private rows under `name_prefix`, from this
-/// node's partition.
+/// node's partition. Blocks are cached: a security-control view is re-read
+/// every LOCAL_RELOAD_SECS, and an uncached scan GETs a block per sorted run.
 pub(super) async fn scan_private(app: &App, routing: &str, name_prefix: &str) -> XResult<Vec<(String, Bytes)>> {
     let p = app.partition(routing)?;
     let base = state::private_prefix(routing);
     let lo = [base.as_slice(), name_prefix.as_bytes()].concat();
     let hi = state::prefix_end(&lo);
-    let mut iter = p.db.scan(lo..hi).await.map_err(XrpcError::from_err)?;
+    let opts = slatedb::config::ScanOptions { cache_blocks: true, ..Default::default() };
+    let mut iter = p.db.scan_with_options(lo..hi, &opts).await.map_err(XrpcError::from_err)?;
     let mut out = Vec::new();
     while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
         out.push((String::from_utf8_lossy(&kv.key[base.len()..]).to_string(), kv.value));
