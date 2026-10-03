@@ -1,24 +1,13 @@
-//! vlpds conformance suite, built as ONE test binary.
-//!
-//! Every file here used to be its own `tests/*.rs` integration test, which
-//! linked the whole crate once per file. They are modules of this binary now,
-//! so a full run is a single link. Filter by module:
-//! `cargo test --test all crud::` (see tests/STATUS.md).
+//! The vlpds conformance suite, one test binary (one link for the whole
+//! suite). Filter by module: `cargo test --test all crud::` (see
+//! tests/STATUS.md).
 
-mod common;
-
-/// `--features bench-jemalloc`: the server's allocator, for benches
-/// (CPU per op); the suite otherwise runs on the system allocator.
-#[cfg(feature = "bench-jemalloc")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
+mod account;
 mod account_deactivation;
 mod account_races;
+mod account_status;
 mod admin_cli;
 mod admin_cluster;
-mod account_status;
-mod account;
 mod app_passwords;
 mod auth;
 mod auth_caches;
@@ -30,35 +19,37 @@ mod bulk_create;
 mod cache_caps;
 mod cbor_transcode;
 mod checkpoint_stall;
-mod commit_cpu;
 mod cold_start;
+mod commit_cpu;
+mod common;
 mod compaction_polling;
 mod cost_defaults;
 mod create_post;
-mod ctl_shard_move;
 mod crud;
+mod ctl_shard_move;
 mod differential_shrike;
 mod e2e_regressions;
-mod fast_failover;
-mod email_flows;
 mod email_2fa;
+mod email_flows;
 mod export_limits;
-mod smtp_mail;
+mod export_scan;
+mod fast_failover;
+mod feature_levels;
 mod file_uploads;
 mod firehose_backfill;
-mod feature_levels;
 mod firehose_fanout;
-mod formats;
 mod firehose_shards;
 mod firehose_startup;
+mod formats;
 mod get_blocks_index;
 mod go_checker;
 mod ha_auth;
 mod ha_liveness;
 mod handle_validation;
 mod handles;
-mod identity_races;
 mod harness;
+mod identity_races;
+mod import_limits;
 mod internal_auth;
 mod interop_crypto;
 mod interop_data_model;
@@ -78,23 +69,33 @@ mod moderation;
 mod move_warm;
 mod mst_lazy;
 mod oauth;
+mod oauth_replay_durable;
 mod objstore_pressure;
 mod ops_metrics;
-mod oauth_replay_durable;
 mod peer_tls;
 mod plc;
 mod preferences;
 mod proxy;
-mod push;
 mod proxy_fast_path;
+mod push;
 mod races;
-mod read_after_write;
-mod ref_proxy;
-mod rebalance_handback;
 mod rate_limit_config;
 mod rate_limits;
 mod rate_limits_cluster;
+mod read_after_write;
+mod rebalance_handback;
 mod record_encode;
+mod ref_account;
+mod ref_auth;
+mod ref_handles;
+mod ref_invites;
+mod ref_moderation;
+mod ref_moderator_auth;
+mod ref_plc;
+mod ref_proxy;
+mod ref_repo;
+mod ref_ssrf;
+mod ref_sync;
 mod reshard;
 mod revocation_gc;
 mod revocation_races;
@@ -102,28 +103,24 @@ mod secrets_at_rest;
 mod segment_bytes;
 mod segment_compression;
 mod sequencer;
-mod shrike_adopt;
 mod server_basics;
 mod service_auth;
-mod signature_faults;
 mod shard_ingest;
+mod shrike_adopt;
+mod signature_faults;
+mod smtp_mail;
 mod subscribe_repos;
-mod sync_list;
-mod sync;
 mod sync11_property;
+mod sync;
+mod sync_list;
 mod takedown_routes;
 mod totp;
 mod untrusted_repo_data;
-mod import_limits;
 mod user_service_auth;
-mod ref_auth;
-mod ref_ssrf;
-mod ref_invites;
-mod ref_moderation;
-mod ref_moderator_auth;
-mod ref_plc;
-mod ref_sync;
-mod ref_handles;
-mod ref_repo;
-mod ref_account;
-mod export_scan;
+
+/// `--features bench-jemalloc`: the server's allocator, for benches
+/// (CPU per op); the suite otherwise runs on the system allocator.
+#[cfg(feature = "bench-jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
