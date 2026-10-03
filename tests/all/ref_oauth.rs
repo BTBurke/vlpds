@@ -5,21 +5,10 @@
 
 use super::*;
 
-/// A loopback client authorized for `scope` by `acct`; returns the DPoP key
-/// and the access token.
-async fn authorize(s: &Srv, acct: &Account, scope: &str) -> (DpopKey, String) {
-    let key = DpopKey::new();
-    let redirect = "http://127.0.0.1/cb";
-    let cid = loopback_client_id(scope, redirect);
-    let t = {
-        let f = Flow::new(&cid, redirect, scope, &key);
-        let mut b = Browser::default();
-        let p = pkce();
-        let code = authorize_interactive(s, &mut b, &f, acct, &p).await;
-        tokens(&exchange(s, &f, &code, &p, &[]).await)
-    };
-    assert_eq!(t.scope, scope);
-    (key, t.access)
+async fn create_app_password(s: &Srv, acct: &Account, name: &str) -> String {
+    let (st, j) = s.bearer(&acct.jwt, "com.atproto.server.createAppPassword", true, Some(json!({"name": name}))).await;
+    assert_eq!(st, 200, "{j}");
+    j["password"].as_str().unwrap().to_string()
 }
 
 /// oauth-deactivation.test.ts, all five cases in order: the status scope
@@ -29,8 +18,8 @@ async fn authorize(s: &Srv, acct: &Account, scope: &str) -> (DpopKey, String) {
 async fn ref_account_deactivation_over_oauth() {
     let s = spawn().await;
     let acct = create_account(&s, "deact").await;
-    let (ukey, unscoped) = authorize(&s, &acct, "atproto").await;
-    let (skey, scoped) = authorize(&s, &acct, "atproto account:status?action=manage").await;
+    let (ukey, unscoped) = login(&s, &acct, "atproto").await;
+    let (skey, scoped) = login(&s, &acct, "atproto account:status?action=manage").await;
 
     // rejects deactivation when the session lacks the status scope
     let r = xrpc_dpop(&s, &ukey, &unscoped, "POST", "com.atproto.server.deactivateAccount", Some(json!({}))).await;
@@ -44,23 +33,14 @@ async fn ref_account_deactivation_over_oauth() {
     assert!(r.body["message"].as_str().unwrap().contains("account management page"), "{}", r.body);
 
     // deactivates the account when the status scope is granted
-    let ap = s
-        .http
-        .post(format!("{}/xrpc/com.atproto.server.createAppPassword", s.base))
-        .bearer_auth(&acct.jwt)
-        .json(&json!({"name": "before-deactivation"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ap.status(), 200);
-    let ap_password = ap.json::<J>().await.unwrap()["password"].as_str().unwrap().to_string();
+    let ap_password = create_app_password(&s, &acct, "before-deactivation").await;
     let r = xrpc_dpop(&s, &skey, &scoped, "POST", "com.atproto.server.deactivateAccount", Some(json!({}))).await;
     assert_eq!(r.status, 200, "{}", r.body);
-    let status: J = s.http.get(format!("{}/xrpc/com.atproto.sync.getRepoStatus?did={}", s.base, acct.did)).send().await.unwrap().json().await.unwrap();
+    let status = s.get_json(&format!("/xrpc/com.atproto.sync.getRepoStatus?did={}", acct.did)).await;
     assert_eq!(status, json!({"did": acct.did, "active": false, "status": "deactivated"}));
 
     // revokes app passwords on OAuth deactivation
-    let list: J = s.http.get(format!("{}/xrpc/com.atproto.server.listAppPasswords", s.base)).bearer_auth(&acct.jwt).send().await.unwrap().json().await.unwrap();
+    let (_, list) = s.bearer(&acct.jwt, "com.atproto.server.listAppPasswords", false, None).await;
     assert_eq!(list["passwords"], json!([]), "{list}");
     let login = s
         .http
@@ -72,13 +52,12 @@ async fn ref_account_deactivation_over_oauth() {
     assert_eq!(login.status(), 401);
 
     // revokes the OAuth session that performed the deactivation (and every other one)
-    let r = xrpc_dpop(&s, &skey, &scoped, "GET", "com.atproto.server.getSession", None).await;
-    assert_eq!(r.status, 401, "{}", r.body);
-    let r = xrpc_dpop(&s, &ukey, &unscoped, "GET", "com.atproto.server.getSession", None).await;
-    assert_eq!(r.status, 401, "{}", r.body);
+    for (key, tok) in [(&skey, &scoped), (&ukey, &unscoped)] {
+        let r = xrpc_dpop(&s, key, tok, "GET", "com.atproto.server.getSession", None).await;
+        assert_eq!(r.status, 401, "{}", r.body);
+    }
     // the password session is kept (the reference deletes only OAuth/app-password credentials)
-    let r = s.http.get(format!("{}/xrpc/com.atproto.server.getSession", s.base)).bearer_auth(&acct.jwt).send().await.unwrap();
-    assert_eq!(r.status(), 200);
+    assert_eq!(s.bearer(&acct.jwt, "com.atproto.server.getSession", false, None).await.0, 200);
 }
 
 /// A password-session deactivation keeps OAuth sessions and app passwords
@@ -87,19 +66,10 @@ async fn ref_account_deactivation_over_oauth() {
 async fn ref_password_session_deactivation_keeps_credentials() {
     let s = spawn().await;
     let acct = create_account(&s, "deact2").await;
-    let (key, tok) = authorize(&s, &acct, "atproto").await;
-    let ap = s
-        .http
-        .post(format!("{}/xrpc/com.atproto.server.createAppPassword", s.base))
-        .bearer_auth(&acct.jwt)
-        .json(&json!({"name": "kept"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ap.status(), 200);
-    let r = s.http.post(format!("{}/xrpc/com.atproto.server.deactivateAccount", s.base)).bearer_auth(&acct.jwt).json(&json!({})).send().await.unwrap();
-    assert_eq!(r.status(), 200);
-    let list: J = s.http.get(format!("{}/xrpc/com.atproto.server.listAppPasswords", s.base)).bearer_auth(&acct.jwt).send().await.unwrap().json().await.unwrap();
+    let (key, tok) = login(&s, &acct, "atproto").await;
+    create_app_password(&s, &acct, "kept").await;
+    assert_eq!(s.bearer(&acct.jwt, "com.atproto.server.deactivateAccount", true, Some(json!({}))).await.0, 200);
+    let (_, list) = s.bearer(&acct.jwt, "com.atproto.server.listAppPasswords", false, None).await;
     assert_eq!(list["passwords"].as_array().map(Vec::len), Some(1), "{list}");
     let r = xrpc_dpop(&s, &key, &tok, "GET", "com.atproto.server.getSession", None).await;
     assert_eq!(r.status, 200, "{}", r.body);
@@ -121,8 +91,7 @@ async fn ref_oauth_sign_in_errors_are_indistinguishable() {
     for ident in [unknown.as_str(), acct.handle.as_str()] {
         let mut b = Browser::default();
         let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1", s.base)).await;
-        let csrf = csrf_of(&html);
-        let (st, h, _) = b.post(&s, "/oauth/account/sign-in", &[("csrf", &csrf), ("identifier", ident), ("password", "wrong-password")]).await;
+        let (st, h, _) = b.post(&s, "/oauth/account/sign-in", &[("csrf", &csrf_of(&html)), ("identifier", ident), ("password", "wrong-password")]).await;
         outcomes.push((st, h.get("location").map(|v| v.to_str().unwrap().to_string())));
     }
     assert_eq!(outcomes[0], outcomes[1]);
@@ -130,24 +99,13 @@ async fn ref_oauth_sign_in_errors_are_indistinguishable() {
 
     // the authorization page
     let key = DpopKey::new();
-    let redirect = "http://127.0.0.1/cb";
-    let cid = loopback_client_id("atproto", redirect);
-    let f = Flow::new(&cid, redirect, "atproto", &key);
+    let f = Flow::loopback("atproto", &key);
     let mut outcomes = Vec::new();
     for ident in [unknown.as_str(), acct.handle.as_str()] {
-        let par = f.par(&s, &pkce(), "st").await;
-        assert_eq!(par.status, 201, "{}", par.body);
-        let ru = par.body["request_uri"].as_str().unwrap().to_string();
+        let ru = f.request_uri(&s, &pkce(), "st").await;
         let mut b = Browser::default();
-        let (_, _, html) = b.get(&s, &f.authorize_url(&s, &ru)).await;
-        let csrf = csrf_of(&html);
-        let (st, _, html) = b
-            .post(
-                &s,
-                "/oauth/authorize/sign-in",
-                &[("request_uri", &ru), ("csrf", &csrf), ("identifier", ident), ("password", "wrong-password"), ("action", "sign-in")],
-            )
-            .await;
+        let csrf = csrf_of(&b.authorize(&s, &f, &ru).await.2);
+        let (st, _, html) = b.sign_in(&s, &ru, &csrf, ident, "wrong-password").await;
         assert!(html.contains("Invalid handle or password"), "{html}");
         outcomes.push(st);
     }

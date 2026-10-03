@@ -5,11 +5,7 @@
 //! its predecessor accepted. Resource-request proofs are memory-only claims
 //! (tests/all/oauth.rs `resource_dpop_checks`; HA notes in src/oauth/mod.rs).
 use crate::common::*;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use base64::Engine;
-use p256::ecdsa::signature::Signer;
-use p256::ecdsa::{Signature, SigningKey};
-use sha2::{Digest, Sha256};
+use crate::oauth::DpopKey;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,44 +56,8 @@ async fn balanced(nodes: &[&TestServer]) {
     panic!("cluster never balanced");
 }
 
-fn b64(b: impl AsRef<[u8]>) -> String {
-    B64.encode(b)
-}
-
-struct DpopKey {
-    sk: SigningKey,
-    nonce: Option<String>,
-}
-
-impl DpopKey {
-    fn jwk(&self) -> (String, String) {
-        let pt = self.sk.verifying_key().to_encoded_point(false);
-        (b64(pt.x().unwrap()), b64(pt.y().unwrap()))
-    }
-
-    /// RFC 7638 thumbprint (the routing of the key's proofs at the AS).
-    fn jkt(&self) -> String {
-        let (x, y) = self.jwk();
-        b64(Sha256::digest(format!(r#"{{"crv":"P-256","kty":"EC","x":"{x}","y":"{y}"}}"#)))
-    }
-
-    fn proof(&self, htu: &str) -> String {
-        let (x, y) = self.jwk();
-        let header = json!({"typ": "dpop+jwt", "alg": "ES256", "jwk": {"kty": "EC", "crv": "P-256", "x": x, "y": y}});
-        let jti = b64(rand::random::<[u8; 16]>());
-        let mut payload = json!({"jti": jti, "htm": "POST", "htu": htu, "iat": chrono::Utc::now().timestamp()});
-        if let Some(n) = &self.nonce {
-            payload["nonce"] = json!(n);
-        }
-        let input = format!("{}.{}", b64(serde_json::to_vec(&header).unwrap()), b64(serde_json::to_vec(&payload).unwrap()));
-        let sig: Signature = self.sk.sign(input.as_bytes());
-        format!("{input}.{}", b64(sig.to_bytes()))
-    }
-}
-
 /// A token request that fails after the proof check (unknown refresh
-/// token): Ok = the proof was accepted, Err = its `error` (and the nonce
-/// the server sent, if any).
+/// token): its `error` and the nonce the server sent, if any.
 async fn token_request(node: &TestServer, proof: &str) -> (String, Option<String>) {
     let r = reqwest::Client::new()
         .post(format!("{}/oauth/token", node.url))
@@ -121,18 +81,18 @@ async fn dpop_proof_replay_refused_after_owner_change() {
     let htu = format!("{PUBLIC}/oauth/token");
 
     // a key whose proofs are claimed on a; requests go through b
-    let mut key = loop {
-        let k = DpopKey { sk: SigningKey::random(&mut rand::rngs::OsRng), nonce: None };
+    let key = loop {
+        let k = DpopKey::new();
         let p = vlpds::slots::shard_of(&format!("oauth:jkt:{}", k.jkt()), SHARDS);
         if a.app.partitions.get(p).is_some() {
             break k;
         }
     };
-    let (e, nonce) = token_request(&b, &key.proof(&htu)).await;
+    let (e, nonce) = token_request(&b, &key.proof("POST", &htu, None)).await;
     if e == "use_dpop_nonce" {
-        key.nonce = nonce;
+        *key.nonce.lock() = nonce;
     }
-    let proof = key.proof(&htu);
+    let proof = key.proof("POST", &htu, None);
     let (e, _) = token_request(&b, &proof).await;
     assert_ne!(e, "invalid_dpop_proof", "first use");
     assert_ne!(e, "use_dpop_nonce");
@@ -146,7 +106,7 @@ async fn dpop_proof_replay_refused_after_owner_change() {
     vlpds::oauth::util::forget_replays(&b.app);
     assert_eq!(token_request(&b, &proof).await.0, "invalid_dpop_proof", "replay with an empty set");
     // and fresh proofs of the key still work
-    let (e, _) = token_request(&b, &key.proof(&htu)).await;
+    let (e, _) = token_request(&b, &key.proof("POST", &htu, None)).await;
     assert!(e != "invalid_dpop_proof" && e != "use_dpop_nonce", "{e}");
 }
 

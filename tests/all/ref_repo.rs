@@ -405,6 +405,8 @@ async fn ref_preferences_error_messages() {
     let r = put(a.auth(), json!([adult, {"label": "dogs", "visibility": "warn"}])).await;
     r.err(400, "InvalidRequest");
     assert!(r.text().contains("$type"), "{}", r.text());
+    let r = s.xrpc.get("app.bsky.actor.getPreferences", &[], &a.auth()).await;
+    assert_eq!(r.ok(), json!({"preferences": []}), "failed puts must not change prefs");
 
     let ap = s.xrpc.post("com.atproto.server.createAppPassword", &json!({"name": "ap"}), &a.auth()).await.ok();
     let sess = s.create_session(&a.handle, ap["password"].as_str().unwrap()).await.ok();

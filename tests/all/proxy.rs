@@ -9,9 +9,8 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use k256::ecdsa::signature::Verifier;
 use parking_lot::Mutex;
-use serde_json::{Value as J, json};
+use crate::common::*;
 use std::sync::Arc;
-use vlpds::server::{self, Config};
 
 const APPVIEW_DID: &str = "did:web:appview.test";
 const REPORT_DID: &str = "did:web:mod.test";
@@ -107,8 +106,7 @@ async fn spawn_fake() -> (Fake, String) {
 }
 
 struct Env {
-    url: String,
-    http: reqwest::Client,
+    s: TestServer,
     appview: Fake,
     reports: Fake,
 }
@@ -116,58 +114,36 @@ struct Env {
 async fn spawn_env(dev_mode: bool) -> Env {
     let (appview, av_url) = spawn_fake().await;
     let (reports, rep_url) = spawn_fake().await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let cfg = Config {
-        public_url: format!("http://{addr}"),
-        appview: Some((av_url, APPVIEW_DID.into())),
-        report_service: Some((rep_url, REPORT_DID.into())),
-        dev_mode,
-        plc_url: "http://127.0.0.1:1".into(),
-        ..Default::default()
-    };
-    server::spawn(cfg, listener, None).await.unwrap();
-    Env { url: format!("http://{addr}"), http: reqwest::Client::new(), appview, reports }
-}
-
-struct User {
-    did: String,
-    jwt: String,
+    let s = TestServer::spawn_lone(|c| {
+        c.appview = Some((av_url, APPVIEW_DID.into()));
+        c.report_service = Some((rep_url, REPORT_DID.into()));
+        c.dev_mode = dev_mode;
+        c.plc_url = "http://127.0.0.1:1".into();
+    })
+    .await;
+    Env { s, appview, reports }
 }
 
 impl Env {
-    async fn create_account(&self, name: &str) -> User {
-        let r = self
-            .http
-            .post(format!("{}/xrpc/com.atproto.server.createAccount", self.url))
-            .json(&json!({"handle": format!("{name}.vlpds.test"), "password": "hunter22", "email": format!("{name}@example.com")}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(r.status(), 200, "createAccount: {}", r.text().await.unwrap());
-        let v: J = r.json().await.unwrap();
-        User { did: v["did"].as_str().unwrap().into(), jwt: v["accessJwt"].as_str().unwrap().into() }
-    }
-
-    fn get(&self, user: Option<&User>, nsid_and_query: &str) -> reqwest::RequestBuilder {
-        let rb = self.http.get(format!("{}/xrpc/{nsid_and_query}", self.url));
+    fn get(&self, user: Option<&TestAccount>, nsid_and_query: &str) -> reqwest::RequestBuilder {
+        let rb = self.s.xrpc.http.get(format!("{}/xrpc/{nsid_and_query}", self.s.url));
         match user {
-            Some(u) => rb.bearer_auth(&u.jwt),
+            Some(u) => rb.bearer_auth(&u.access),
             None => rb,
         }
     }
 
-    fn post(&self, user: &User, nsid: &str) -> reqwest::RequestBuilder {
-        self.http.post(format!("{}/xrpc/{nsid}", self.url)).bearer_auth(&user.jwt)
+    fn post(&self, user: &TestAccount, nsid: &str) -> reqwest::RequestBuilder {
+        self.s.xrpc.http.post(format!("{}/xrpc/{nsid}", self.s.url)).bearer_auth(&user.access)
     }
 
-    /// The account's atproto verification key, from describeRepo's didDoc.
-    async fn signing_key(&self, did: &str) -> k256::ecdsa::VerifyingKey {
-        let v: J = self.get(None, &format!("com.atproto.repo.describeRepo?repo={did}")).send().await.unwrap().json().await.unwrap();
-        let mb = v["didDoc"]["verificationMethod"][0]["publicKeyMultibase"].as_str().unwrap();
-        let raw = bs58::decode(mb.strip_prefix('z').unwrap()).into_vec().unwrap();
-        assert_eq!(&raw[..2], &[0xe7, 0x01], "secp256k1-pub multicodec");
-        k256::ecdsa::VerifyingKey::from_sec1_bytes(&raw[2..]).unwrap()
+    /// A session of `u` logged in with `password` (an app password), plus
+    /// extra createSession input.
+    async fn session(&self, u: &TestAccount, password: &str, extra: J) -> TestAccount {
+        let mut input = json!({"identifier": u.did, "password": password});
+        input.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let v = self.s.xrpc.post("com.atproto.server.createSession", &input, &Auth::None).await.ok();
+        TestAccount { access: v["accessJwt"].as_str().unwrap().into(), ..u.clone() }
     }
 }
 
@@ -197,8 +173,8 @@ async fn err_of(r: reqwest::Response) -> (u16, J) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proxies_to_default_appview_with_service_auth_and_header_rules() {
     let env = spawn_env(true).await;
-    let alice = env.create_account("alice").await;
-    let key = env.signing_key(&alice.did).await;
+    let alice = env.s.create_account("alice").await;
+    let key = env.s.signing_key(&alice.did).await;
 
     let r = env
         .get(Some(&alice), "app.bsky.feed.getTimeline?limit=5&cursor=abc")
@@ -246,7 +222,7 @@ async fn proxies_to_default_appview_with_service_auth_and_header_rules() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn streams_post_bodies() {
     let env = spawn_env(true).await;
-    let bob = env.create_account("bob").await;
+    let bob = env.s.create_account("bob").await;
     let payload = vec![7u8; 300_000];
     let r = env
         .post(&bob, "app.bsky.test.echo")
@@ -288,7 +264,7 @@ async fn streams_post_bodies() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn maps_upstream_errors() {
     let env = spawn_env(true).await;
-    let u = env.create_account("carol").await;
+    let u = env.s.create_account("carol").await;
 
     let r = env.get(Some(&u), "app.bsky.test.err400").send().await.unwrap();
     assert_eq!(r.headers().get("retry-after").unwrap(), "7");
@@ -309,30 +285,16 @@ async fn maps_upstream_errors() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unreachable_upstream_is_502() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    // Port 1 on loopback: connection refused.
-    let cfg = Config { appview: Some(("http://127.0.0.1:1".into(), APPVIEW_DID.into())), dev_mode: true, ..Default::default() };
-    server::spawn(cfg, listener, None).await.unwrap();
-    let http = reqwest::Client::new();
-    let v: J = http
-        .post(format!("http://{addr}/xrpc/com.atproto.server.createAccount"))
-        .json(&json!({"handle": "dave.vlpds.test", "password": "pw", "email": "dave@example.com"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let r = http.get(format!("http://{addr}/xrpc/app.bsky.feed.getTimeline")).bearer_auth(v["accessJwt"].as_str().unwrap()).send().await.unwrap();
-    let (s, b) = err_of(r).await;
-    assert_eq!((s, b["error"].as_str()), (502, Some("UpstreamFailure")));
+    // port 1 on loopback: connection refused
+    let s = TestServer::spawn_lone(|c| c.appview = Some(("http://127.0.0.1:1".into(), APPVIEW_DID.into()))).await;
+    let u = s.create_account("dave").await;
+    s.xrpc.get("app.bsky.feed.getTimeline", &[], &u.auth()).await.err(502, "UpstreamFailure");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn target_selection_and_rejections() {
     let env = spawn_env(true).await;
-    let u = env.create_account("erin").await;
+    let u = env.s.create_account("erin").await;
 
     // Unauthenticated.
     let (s, b) = err_of(env.get(None, "app.bsky.feed.getTimeline").send().await.unwrap()).await;
@@ -370,7 +332,7 @@ async fn target_selection_and_rejections() {
     assert_eq!(env.appview.count(), 0);
 
     // did:web target resolved via /.well-known/did.json (dev mode allows http + loopback).
-    let key = env.signing_key(&u.did).await;
+    let key = env.s.signing_key(&u.did).await;
     let other_did = env.reports.did.lock().clone();
     let r = env.get(Some(&u), "chat.bsky.convo.listConvos?limit=1").header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap();
     assert_eq!(r.status(), 200);
@@ -384,29 +346,8 @@ async fn target_selection_and_rejections() {
     let (s, b) = err_of(env.get(Some(&u), "Chat.Bsky.convo.listConvos").send().await.unwrap()).await;
     assert_eq!((s, b["error"].as_str()), (400, Some("InvalidRequest")), "{b}");
     // ...and a non-privileged app password can't reach any of them
-    let pw = env
-        .post(&u, "com.atproto.server.createAppPassword")
-        .json(&json!({"name": "plain", "privileged": false}))
-        .send()
-        .await
-        .unwrap()
-        .json::<J>()
-        .await
-        .unwrap()["password"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let session: J = env
-        .http
-        .post(format!("{}/xrpc/com.atproto.server.createSession", env.url))
-        .json(&json!({"identifier": u.did, "password": pw}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let app_pw = User { did: u.did.clone(), jwt: session["accessJwt"].as_str().unwrap().to_string() };
+    let pw = env.s.xrpc.post("com.atproto.server.createAppPassword", &json!({"name": "plain", "privileged": false}), &u.auth()).await.ok();
+    let app_pw = env.session(&u, pw["password"].as_str().unwrap(), json!({})).await;
     let before = env.reports.seen.lock().len();
     for lxm in ["chat.bsky.convo.addReaction", "CHAT.bsky.convo.addReaction", "Chat.Bsky.Convo.AddReaction"] {
         let (s, _) = err_of(env.get(Some(&app_pw), lxm).header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap()).await;
@@ -421,7 +362,7 @@ async fn target_selection_and_rejections() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ssrf_guard_outside_dev_mode() {
     let env = spawn_env(false).await;
-    let u = env.create_account("frank").await;
+    let u = env.s.create_account("frank").await;
     // A local account's #atproto_pds endpoint is plain http on loopback:
     // refused before connecting.
     let (s, b) = err_of(env.get(Some(&u), "app.bsky.feed.getTimeline").header("atproto-proxy", format!("{}#atproto_pds", u.did)).send().await.unwrap()).await;
@@ -438,7 +379,7 @@ async fn ssrf_guard_outside_dev_mode() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preferences_round_trip_and_validation() {
     let env = spawn_env(true).await;
-    let u = env.create_account("gina").await;
+    let u = env.s.create_account("gina").await;
 
     let get = || async { env.get(Some(&u), "app.bsky.actor.getPreferences").send().await.unwrap().json::<J>().await.unwrap() };
     assert_eq!(get().await, json!({"preferences": []}));
@@ -488,7 +429,7 @@ async fn preferences_round_trip_and_validation() {
     assert_eq!(get().await["preferences"].as_array().unwrap().len(), 1);
     assert_eq!(env.appview.count(), 0);
     // Preferences are per-account.
-    let other = env.create_account("hank").await;
+    let other = env.s.create_account("hank").await;
     let v: J = env.get(Some(&other), "app.bsky.actor.getPreferences").send().await.unwrap().json().await.unwrap();
     assert_eq!(v, json!({"preferences": []}));
     // Auth required.
@@ -498,21 +439,21 @@ async fn preferences_round_trip_and_validation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preferences_for_another_appview_are_proxied() {
     let env = spawn_env(true).await;
-    let u = env.create_account("ivy").await;
+    let u = env.s.create_account("ivy").await;
     let other_did = env.reports.did.lock().clone();
     let r = env.get(Some(&u), "app.bsky.actor.getPreferences").header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let seen = env.reports.last();
     assert_eq!(seen.uri, "/xrpc/app.bsky.actor.getPreferences");
-    let claims = verify_service_jwt(&seen.headers, &env.signing_key(&u.did).await);
+    let claims = verify_service_jwt(&seen.headers, &env.s.signing_key(&u.did).await);
     assert_eq!(claims["lxm"], "app.bsky.actor.getPreferences");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_report_goes_to_report_service() {
     let env = spawn_env(true).await;
-    let u = env.create_account("jack").await;
-    let key = env.signing_key(&u.did).await;
+    let u = env.s.create_account("jack").await;
+    let key = env.s.signing_key(&u.did).await;
     let report =
         json!({"reasonType": "com.atproto.moderation.defs#reasonSpam", "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:spammer"}});
     let r = env.post(&u, "com.atproto.moderation.createReport").json(&report).send().await.unwrap();
@@ -538,26 +479,9 @@ async fn create_report_goes_to_report_service() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn takendown_session_can_appeal() {
     let env = spawn_env(true).await;
-    let u = env.create_account("appealer").await;
-    let r = env
-        .http
-        .post(format!("{}/xrpc/com.atproto.admin.updateSubjectStatus", env.url))
-        .basic_auth("admin", Some(server::DEV_ADMIN_TOKEN))
-        .json(&json!({"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": u.did}, "takedown": {"applied": true}}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200);
-    let r = env
-        .http
-        .post(format!("{}/xrpc/com.atproto.server.createSession", env.url))
-        .json(&json!({"identifier": "appealer.vlpds.test", "password": "hunter22", "allowTakendown": true}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 200);
-    let v: J = r.json().await.unwrap();
-    let tk = User { did: u.did.clone(), jwt: v["accessJwt"].as_str().unwrap().into() };
+    let u = env.s.create_account("appealer").await;
+    set_repo_takedown(&env.s, &u.did, true).await;
+    let tk = env.session(&u, PASSWORD, json!({"allowTakendown": true})).await;
 
     let r = env
         .post(&tk, "tools.ozone.inbox.appealActionedSubject")
@@ -577,7 +501,7 @@ async fn takendown_session_can_appeal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn get_record_for_unhosted_repo_goes_to_appview() {
     let env = spawn_env(true).await;
-    let u = env.create_account("hoster").await;
+    let u = env.s.create_account("hoster").await;
     for repo in ["did:plc:z72i7hdynmk6r22z27h6tvur", "someone.elsewhere.test"] {
         let q = format!("com.atproto.repo.getRecord?repo={repo}&collection=app.bsky.actor.profile&rkey=self");
         let r = env.get(Some(&u), &q).send().await.unwrap();

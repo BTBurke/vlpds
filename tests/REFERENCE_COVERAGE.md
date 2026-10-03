@@ -530,14 +530,14 @@ Note: vlpds deletes blob bytes in a GC sweep with a grace period (`blob_deletes:
 
 | case | status | vlpds |
 |---|---|---|
-| requires auth to set or put preferences. | covered | `preferences::requires_auth`; message in `ref_repo::ref_preferences_error_messages` (**fix**: missing-auth message "authentication required" -> the reference's "Authentication Required". Note: the reference's error *name* for a missing Authorization header is `AuthMissing` (auth-verifier.ts `AuthRequiredError(undefined, 'AuthMissing')`); vlpds and its suite use `AuthenticationRequired`, left as is) |
+| requires auth to set or put preferences. | covered | `ref_repo::ref_preferences_error_messages` (**fix**: missing-auth message "authentication required" -> the reference's "Authentication Required". Note: the reference's error *name* for a missing Authorization header is `AuthMissing` (auth-verifier.ts `AuthRequiredError(undefined, 'AuthMissing')`); vlpds and its suite use `AuthenticationRequired`, left as is) |
 | gets preferences, before any are set. | covered | `preferences::put_get_update_and_clear` |
-| only gets preferences in app.bsky namespace. | N/A | seeds a `com.atproto` pref through the TS actor store directly; over XRPC vlpds (like the reference) refuses non-app.bsky prefs, so there is no external way to plant one (`preferences::fails_outside_namespace`) |
+| only gets preferences in app.bsky namespace. | N/A | seeds a `com.atproto` pref through the TS actor store directly; over XRPC vlpds (like the reference) refuses non-app.bsky prefs, so there is no external way to plant one (`ref_repo::ref_preferences_error_messages`) |
 | puts preferences, all creates. | covered | `preferences::put_get_update_and_clear` (the "other namespace not clobbered" half is the same internal-store N/A) |
 | puts preferences, updates and removals. | covered | `preferences::put_get_update_and_clear` |
 | puts preferences, clearing them. | covered | `preferences::put_get_update_and_clear` |
-| fails putting preferences outside namespace. | covered | `preferences::fails_outside_namespace`; message in `ref_repo::ref_preferences_error_messages` |
-| fails putting preferences without $type. | covered | `preferences::fails_without_type`; message in `ref_repo::ref_preferences_error_messages` |
+| fails putting preferences outside namespace. | covered | `ref_repo::ref_preferences_error_messages` (refused with the message; prefs unchanged) |
+| fails putting preferences without $type. | covered | `ref_repo::ref_preferences_error_messages` |
 | does not read permissioned preferences with an app password | covered | `preferences::app_password_cannot_read_write_or_remove_personal_details` |
 | does not write permissioned preferences with an app password | covered | same; message in `ref_repo::ref_preferences_error_messages` |
 | does not remove permissioned preferences with an app password | covered | same |
