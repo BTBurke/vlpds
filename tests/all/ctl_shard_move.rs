@@ -6,7 +6,6 @@
 //! or revocation made just before the move lapse.
 
 use crate::common::*;
-use crate::ha_auth::balanced;
 use object_store::memory::InMemory;
 use object_store::throttle::{ThrottleConfig, ThrottledStore};
 use parking_lot::Mutex;
