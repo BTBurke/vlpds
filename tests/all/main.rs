@@ -75,6 +75,7 @@ mod log_pipeline;
 mod log_retention;
 mod migration;
 mod moderation;
+mod move_warm;
 mod mst_lazy;
 mod oauth;
 mod objstore_pressure;

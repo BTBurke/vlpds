@@ -18,6 +18,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 const SEQ_FLOOR_MAX_WAIT: Duration = Duration::from_secs(30);
+/// How long newly opened shards wait for `partition::warm` before serving,
+/// counted from the start of the open. Writes for them meanwhile are
+/// answered `ShardMoved` and resent by their entry node.
+const WARM_MAX: Duration = Duration::from_secs(5);
+/// How long a handoff's recipient warms before answering (the sender waits
+/// a little longer for the answer, then hands over anyway).
+const HANDOFF_WARM_MAX: Duration = Duration::from_secs(8);
+const HANDOFF_WAIT: Duration = Duration::from_secs(10);
+const HANDOFF_WARM_REPOS: usize = 128;
 
 pub struct Node {
     pub cluster: Arc<Cluster>,
@@ -89,6 +98,51 @@ impl Node {
         self.close_many(vec![shard]).await.pop().map_or(Ok(()), |(_, r)| r)
     }
 
+    /// Before a peer hands us `shards`: reads them through read-only views
+    /// into the block cache their `Db`s will share, every SST's filters and
+    /// index, the newest L0s whole, then the blocks of the repos the peer
+    /// wrote most recently (newest first, across shards), until
+    /// [`HANDOFF_WARM_MAX`]. The peer serves them meanwhile.
+    pub async fn warm_handoff(&self, shards: Vec<crate::xrpc::internal::PrewarmShard>) {
+        use futures::StreamExt;
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + HANDOFF_WARM_MAX;
+        let opened: Vec<(Arc<slatedb::DbReader>, Vec<String>)> = futures::stream::iter(shards)
+            .map(|s| async move {
+                match partition::open_reader(&self.state_store, s.shard).await {
+                    Ok(r) => Some((Arc::new(r), s.recent)),
+                    Err(e) => {
+                        tracing::warn!(shard = s.shard.0, "handoff prewarm: open failed: {e:#}");
+                        None
+                    }
+                }
+            })
+            .buffer_unordered(32)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
+        let readers: Vec<Arc<slatedb::DbReader>> = opened.iter().map(|(r, _)| r.clone()).collect();
+        let _ = tokio::time::timeout_at(deadline, partition::warm(&readers)).await;
+        let mut order = Vec::new();
+        for k in 0..opened.iter().map(|(_, v)| v.len()).max().unwrap_or(0) {
+            order.extend(opened.iter().filter_map(|(r, v)| v.get(k).map(|d| (r.clone(), d.clone()))));
+        }
+        let n = order.len();
+        let warmed = futures::stream::iter(order)
+            .map(|(r, did)| async move { crate::worker::warm_repo(&*r, &did).await.is_ok() })
+            .buffer_unordered(HANDOFF_WARM_REPOS)
+            .take_until(tokio::time::sleep_until(deadline))
+            .filter(|ok| std::future::ready(*ok))
+            .count()
+            .await;
+        for r in readers {
+            if let Err(e) = r.close().await {
+                tracing::debug!("handoff prewarm: reader close: {e}");
+            }
+        }
+        tracing::info!(shards = opened.len(), recent = n, warmed, elapsed_ms = started.elapsed().as_millis() as u64, "handoff prewarmed");
+    }
+
     async fn purge_worker_caches(&self, shards: &[ShardId]) {
         let mut acks = Vec::new();
         for w in self.workers.senders.iter() {
@@ -140,6 +194,10 @@ impl ShardHost for Node {
             }
         }
         let opened_ms = started.elapsed().as_millis() as u64;
+        let warm = {
+            let dbs: Vec<Arc<slatedb::Db>> = ready.iter().map(|r| r.3.clone()).collect();
+            tokio::spawn(async move { partition::warm(&dbs).await })
+        };
         let plan: Vec<(ShardId, &slatedb::Db, &[Span])> = ready.iter().map(|(s, _, h, db)| (*s, db.as_ref(), h.as_slice())).collect();
         let replay_started = Instant::now();
         let replayed = match nodelog::replay_many(&self.store, &plan).await {
@@ -171,6 +229,8 @@ impl ShardHost for Node {
             .buffer_unordered(32)
             .collect()
             .await;
+        // past the cap the warm-up goes on behind the first requests
+        let _ = tokio::time::timeout_at((started + WARM_MAX).into(), warm).await;
         let mut preload = Vec::new();
         for (shard, epoch, db, r) in flushed {
             if let Err(e) = r {
@@ -337,6 +397,23 @@ impl ShardHost for Node {
 
     async fn nudge(&self, nudges: Vec<(String, Vec<crate::cluster::Handoff>)>) {
         crate::xrpc::internal::nudge_peers(&self.http, &self.internal_token, nudges).await;
+    }
+
+    async fn prewarm(&self, plan: Vec<(String, Vec<ShardId>)>) {
+        let plan = plan
+            .into_iter()
+            .map(|(addr, shards)| {
+                let shards = shards
+                    .into_iter()
+                    .map(|s| crate::xrpc::internal::PrewarmShard {
+                        shard: s,
+                        recent: self.table.get(s).map(|p| p.recent.snapshot().iter().map(|d| d.to_string()).collect()).unwrap_or_default(),
+                    })
+                    .collect();
+                (addr, shards)
+            })
+            .collect();
+        crate::xrpc::internal::prewarm_peers(&self.http, &self.internal_token, plan, HANDOFF_WAIT).await
     }
 
     async fn greet(&self, peers: Vec<crate::cluster::NodeLease>) -> Vec<Option<i64>> {

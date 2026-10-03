@@ -178,6 +178,10 @@ pub trait ShardHost: Send + Sync + 'static {
     /// POSTs /internal/v1/cluster/nudge to each `(addr, handoffs)`. Best
     /// effort: a missed nudge costs a step interval.
     async fn nudge(&self, _nudges: Vec<(String, Vec<Handoff>)>) {}
+    /// Before we hand `(addr, shards)` over: each recipient warms its caches
+    /// from their state while we still serve them. Returns once every
+    /// recipient answered or ran out of time.
+    async fn prewarm(&self, _plan: Vec<(String, Vec<ShardId>)>) {}
     fn on_layout(&self, _layout: Arc<Layout>) {}
     /// Creates `op`'s children from its frozen parents (in `layout`).
     /// Idempotent.
@@ -1991,6 +1995,28 @@ impl Cluster {
         }
         let n = shards.len();
         let started = Instant::now();
+        // round-robin over the peers still short, so each gets a fair slice
+        let mut dest: HashMap<ShardId, NodeLease> = HashMap::new();
+        let mut i = 0;
+        for &s in &shards {
+            for _ in 0..to.len() {
+                let k = i % to.len();
+                i += 1;
+                if to[k].1 > 0 {
+                    to[k].1 -= 1;
+                    dest.insert(s, to[k].0.clone());
+                    break;
+                }
+            }
+        }
+        if !dest.is_empty() {
+            let mut plan: HashMap<String, Vec<ShardId>> = HashMap::new();
+            for (s, l) in &dest {
+                plan.entry(l.addr.clone()).or_default().push(*s);
+            }
+            host.prewarm(plan.into_iter().collect()).await;
+            tracing::info!(shards = dest.len(), elapsed_ms = started.elapsed().as_millis() as u64, "recipients prewarmed");
+        }
         let closed = host.close_many(shards).await;
         if frozen.is_some() && crate::reshard::crash_at(&self.cfg.node_id, "closed") {
             return false;
@@ -2010,22 +2036,7 @@ impl Cluster {
                 }
             }
         }
-        // round-robin over the peers still short, so each gets a fair slice
-        let mut plan = Vec::with_capacity(done.len());
-        let mut i = 0;
-        for s in done {
-            let mut dest = None;
-            for _ in 0..to.len() {
-                let k = i % to.len();
-                i += 1;
-                if to[k].1 > 0 {
-                    to[k].1 -= 1;
-                    dest = Some(to[k].0.clone());
-                    break;
-                }
-            }
-            plan.push((s, dest));
-        }
+        let plan: Vec<(ShardId, Option<NodeLease>)> = done.into_iter().map(|s| (s, dest.remove(&s))).collect();
         let released: Vec<(Option<NodeLease>, anyhow::Result<Option<Handoff>>)> = futures::stream::iter(plan)
             .map(|(s, dest)| async move {
                 let r = self.release(s, end, floor, dest.as_ref(), frozen).await;
@@ -2306,6 +2317,8 @@ mod tests {
         /// every shard checkpointed inside its span (`ShardHost::checkpointed`)
         checkpointed: std::sync::atomic::AtomicBool,
         nudged: Mutex<Vec<(String, Vec<Handoff>)>>,
+        /// (addr, shards, closes done before it)
+        prewarmed: Mutex<Vec<(String, Vec<ShardId>, usize)>>,
         /// peers answer our greetings "not following"
         unheard: std::sync::atomic::AtomicBool,
         /// peer logs our "firehose" follows (published in our lease)
@@ -2351,6 +2364,10 @@ mod tests {
         }
         async fn nudge(&self, nudges: Vec<(String, Vec<Handoff>)>) {
             self.nudged.lock().extend(nudges);
+        }
+        async fn prewarm(&self, plan: Vec<(String, Vec<ShardId>)>) {
+            let closes = self.closed.lock().len();
+            self.prewarmed.lock().extend(plan.into_iter().map(|(a, s)| (a, s, closes)));
         }
         async fn greet(&self, peers: Vec<NodeLease>) -> Vec<Option<i64>> {
             let ok = !self.unheard.load(Ordering::SeqCst);
@@ -2574,6 +2591,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         a.step(&ha_dyn).await.unwrap(); // hands 4 to b; the nudge is dropped
         assert_eq!(ha.nudged.lock()[0].1.len(), 4);
+        // b was asked to warm exactly those, before a closed them
+        let mut handed: Vec<ShardId> = ha.nudged.lock()[0].1.iter().map(|h| h.shard).collect();
+        handed.sort();
+        let pw = ha.prewarmed.lock().clone();
+        assert_eq!(pw.len(), 1, "{pw:?}");
+        let mut warmed = pw[0].1.clone();
+        warmed.sort();
+        assert_eq!((pw[0].0.as_str(), warmed, pw[0].2), (b.cfg.addr.as_str(), handed, 0));
         b.step(&hb_dyn).await.unwrap();
         assert_eq!(b.owned(), [4, 5, 6, 7].map(ShardId).to_vec());
         for (_, epoch, hist) in hb.opened.lock().iter() {

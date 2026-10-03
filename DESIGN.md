@@ -129,6 +129,40 @@ considered and measurements: "Partial MSTs".
   of all newly opened shards' sets run at once, so they don't queue
   behind the request-driven loads they are meant to spare. Bulk creation
   doesn't touch the set. Metric: `vlpds_repo_preloads_total{result}`.
+- **Moved shards start with warm caches.** A shard's new owner starts with
+  none of its SSTs' filters, indexes or blocks cached, and every SlateDB
+  point read or prefix scan touches every L0 plus each sorted run's filter
+  and index. Cross-host at 12k writes/s (bench
+  `benchbox-2026-10-02-round2` block 1) each cold repo load on a new owner
+  made 10–65 SST range GETs (~1 warm), the 1,024 state permits sat
+  saturated for 5–16 s, forwards hit their 3 s deadline: 76–140k errors
+  over 30–45 s per takeover, and again per rejoin. Three parts:
+  - The shared meta cache (`partition::MetaCache`) is single-flight:
+    concurrent misses of one filter/index share one fetch (SlateDB's
+    default `fetch_*` doesn't dedup; foyer, the block cache, does).
+  - `partition::warm`, run by `open_many` alongside the log replay: every
+    SST's filters and index, and the newest L0s whole (one ranged GET
+    each; at most 64 MiB per shard and a quarter of the block cache per
+    batch), 64 SSTs at a time. Shards wait for it at most 5 s from the
+    start of the open before serving (writes meanwhile are `ShardMoved`,
+    resent). Metrics: `vlpds_shard_warm_seconds`,
+    `vlpds_shard_warm_ssts_total{result}`.
+  - Planned moves (handback, graceful shutdown) warm before the flip:
+    `close_and_release` picks each shard's recipient first, POSTs
+    `/internal/v1/cluster/prewarm` with the shards and their recent-repo
+    lists, and waits for the answers (at most 10 s) while it keeps
+    serving. The recipient opens each shard as a `DbReader`
+    (`FollowLatest`: no checkpoint, so the writer never notices it) on the
+    block cache its `Db` will use (same cache id), runs `warm`, then reads
+    each recent repo's head, account and `M/` read-ahead (128 at a time,
+    newest first across shards) for 8 s at most.
+  Laptop repro (3 local nodes, 64 shards, 500k accounts real/128, MinIO
+  with 20/30 ms injected state latency, 3k writes/s through two nodes,
+  kill -9 of the third and a restart 20 s later): takeover 5.2–9.8k
+  errors over 13–19 s → 0.3–1.2k, rejoin 3.5–31k errors over 10–36 s →
+  0.06–0.3k, SST GETs per new-owner load ~30 → <1. The rest is the
+  in-flight writes on the killed node and the session-control lookup
+  failing closed with `ShardMoved`.
 
 Persisted state per commit: the records, the repo head and the commit's
 interior nodes (~3.3–3.5 KB into SlateDB per commit, ~7 node puts and ~7

@@ -201,6 +201,8 @@ lazy!(SIGNATURE_VERIFY_FAILURES: IntCounterVec = register_int_counter_vec!("vlpd
 
 lazy!(SHARDS_OPENED: IntCounterVec = register_int_counter_vec!("vlpds_shards_opened_total", "Shard opens (acquire, adopt, takeover, reshard children) by result", &["result"]));
 lazy!(SHARD_OPEN_SECONDS: HistogramVec = register_histogram_vec!("vlpds_shard_open_seconds", "One batch of shard opens until served (SlateDB open + log replay + flush), by kind: replay (it replayed segments: a takeover after a crash) or clean (nothing to replay: a handback)", &["kind"], exponential_buckets(0.01, 2.0, 14).unwrap()));
+lazy!(SHARD_WARM_SECONDS: Histogram = register_histogram!("vlpds_shard_warm_seconds", "One batch of shard opens: fetching every SST's filters and index (and the newest L0s whole) into the caches before serving (partition::warm)", exponential_buckets(0.01, 2.0, 14).unwrap()));
+lazy!(SHARD_WARM_SSTS: IntCounterVec = register_int_counter_vec!("vlpds_shard_warm_ssts_total", "SSTs warmed before a newly opened shard served, by result", &["result"]));
 lazy!(REPLAY_SECONDS: Histogram = register_histogram!("vlpds_recovery_replay_seconds", "Replay step of a shard-open batch that replayed at least one segment (previous owners' log tails)", exponential_buckets(0.01, 2.0, 14).unwrap()));
 lazy!(LAYOUT_SHARDS: IntGauge = register_int_gauge!("vlpds_shard_layout_shards", "Shards in the layout this node routes by (changes with each split/merge)"));
 
@@ -403,6 +405,7 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&LEASE_RENEW_ERRORS, &["timeout", "error", "conflict", "lapsed"]),
     (&CLUSTER_STORE_TIMEOUTS, &["get", "put", "list", "delete", "fence", "fence-scan"]),
     (&SHARDS_OPENED, &["ok", "error"]),
+    (&SHARD_WARM_SSTS, &["ok", "error"]),
     (&PUT_ATTEMPTS, &["ok", "already_exists", "error"]),
     (&WRITE_ERRORS, &["repo_not_found", "repo_inactive", "invalid_swap", "invalid", "internal", "unavailable", "key_unavailable", "signature_fault", "not_started"]),
     (&WRITE_RETRIES, &["unreachable", "loading", "moved"]),

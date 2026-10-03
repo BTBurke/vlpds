@@ -79,6 +79,11 @@ impl RecentRepos {
         }
     }
 
+    /// Newest first.
+    pub fn snapshot(&self) -> Vec<Arc<str>> {
+        self.inner.lock().0.iter().map(|(d, _)| d.clone()).collect()
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.inner.lock().1
     }
@@ -139,10 +144,16 @@ fn shared_db_cache() -> Arc<dyn slatedb::db_cache::DbCache> {
 /// Foyer takes its shard's mutex on every hit, and every point read of a
 /// repo checks the same few SSTs' filters: threads serialized on those hot
 /// keys.
+///
+/// Misses are single-flight: a shard's new owner starts with none of its
+/// SSTs' filters and indexes cached, and every cold repo load in the shard
+/// misses the same ones at once. Without dedup each load fetched them all
+/// itself (10–65 range GETs per load after a move).
 pub struct MetaCache {
     shards: Vec<parking_lot::RwLock<MetaShard>>,
     shard_bytes: usize,
     hasher: std::hash::RandomState,
+    loading: parking_lot::Mutex<std::collections::HashMap<slatedb::db_cache::CachedKey, tokio::sync::watch::Sender<Option<slatedb::db_cache::CachedEntry>>>>,
 }
 
 #[derive(Default)]
@@ -166,6 +177,79 @@ impl MetaCache {
             shards: (0..META_SHARDS).map(|_| Default::default()).collect(),
             shard_bytes: (bytes as usize / META_SHARDS).max(1 << 20),
             hasher: Default::default(),
+            loading: Default::default(),
+        }
+    }
+
+    async fn fetch(&self, key: slatedb::db_cache::CachedKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        use slatedb::db_cache::CacheFetch;
+        if let Some(e) = self.get(&key) {
+            return Ok(CacheFetch::hit(e));
+        }
+        let follow = {
+            let mut l = self.loading.lock();
+            // a leader inserts before it leaves `loading`: checked under the
+            // lock, a load that just finished is never repeated
+            if let Some(e) = self.get(&key) {
+                return Ok(CacheFetch::hit(e));
+            }
+            match l.get(&key) {
+                Some(tx) => Some(tx.subscribe()),
+                None => {
+                    l.insert(key.clone(), tokio::sync::watch::channel(None).0);
+                    None
+                }
+            }
+        };
+        if let Some(mut rx) = follow {
+            if let Ok(e) = rx.wait_for(Option::is_some).await {
+                return Ok(CacheFetch::hit(e.clone().expect("waited for Some")));
+            }
+            // the leader failed or was dropped
+            let e = loader().await?;
+            self.put(key, e.clone());
+            return Ok(CacheFetch::miss(e));
+        }
+        struct Leader<'a>(&'a MetaCache, &'a slatedb::db_cache::CachedKey);
+        impl Drop for Leader<'_> {
+            fn drop(&mut self) {
+                self.0.loading.lock().remove(self.1);
+            }
+        }
+        let _leader = Leader(self, &key);
+        let e = loader().await?;
+        self.put(key.clone(), e.clone());
+        if let Some(tx) = self.loading.lock().get(&key) {
+            tx.send_replace(Some(e.clone()));
+        }
+        Ok(CacheFetch::miss(e))
+    }
+
+    fn put(&self, key: slatedb::db_cache::CachedKey, value: slatedb::db_cache::CachedEntry) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let size = value.size();
+        let mut s = self.shard(&key).write();
+        let slot = MetaSlot { entry: value, size, used: std::sync::atomic::AtomicBool::new(false) };
+        if let Some(old) = s.map.insert(key, slot) {
+            s.bytes -= old.size;
+        }
+        s.bytes += size;
+        // CLOCK over the shard: drop entries not hit since the last sweep,
+        // clear the bit of the rest; a second pass evicts if all were hot
+        for _ in 0..2 {
+            if s.bytes <= self.shard_bytes {
+                break;
+            }
+            let mut freed = 0;
+            s.map.retain(|_, v| {
+                if v.used.swap(false, Relaxed) {
+                    true
+                } else {
+                    freed += v.size;
+                    false
+                }
+            });
+            s.bytes -= freed;
         }
     }
 
@@ -202,31 +286,19 @@ impl slatedb::db_cache::DbCache for MetaCache {
         Ok(self.get(key))
     }
     async fn insert(&self, key: slatedb::db_cache::CachedKey, value: slatedb::db_cache::CachedEntry) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let size = value.size();
-        let mut s = self.shard(&key).write();
-        let slot = MetaSlot { entry: value, size, used: std::sync::atomic::AtomicBool::new(false) };
-        if let Some(old) = s.map.insert(key, slot) {
-            s.bytes -= old.size;
-        }
-        s.bytes += size;
-        // CLOCK over the shard: drop entries not hit since the last sweep,
-        // clear the bit of the rest; a second pass evicts if all were hot
-        for _ in 0..2 {
-            if s.bytes <= self.shard_bytes {
-                break;
-            }
-            let mut freed = 0;
-            s.map.retain(|_, v| {
-                if v.used.swap(false, Relaxed) {
-                    true
-                } else {
-                    freed += v.size;
-                    false
-                }
-            });
-            s.bytes -= freed;
-        }
+        self.put(key, value);
+    }
+    async fn fetch_block(&self, key: slatedb::db_cache::CachedKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        self.fetch(key, loader).await
+    }
+    async fn fetch_index(&self, key: slatedb::db_cache::CachedKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        self.fetch(key, loader).await
+    }
+    async fn fetch_filter(&self, key: slatedb::db_cache::CachedKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        self.fetch(key, loader).await
+    }
+    async fn fetch_stats(&self, key: slatedb::db_cache::CachedKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        self.fetch(key, loader).await
     }
     async fn remove(&self, key: &slatedb::db_cache::CachedKey) {
         let mut s = self.shard(key).write();
@@ -436,25 +508,86 @@ pub async fn open_db(
 ) -> anyhow::Result<Db> {
     let settings = shard_settings(partition, cache);
     let path = db_path(store, partition);
-    // cache ids only need to be distinct per DB in this process (tests open
-    // several prefixes with the same shard numbers)
-    let cache_id = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::hash::DefaultHasher::new();
-        path.hash(&mut h);
-        CACHE_EPOCH.load(std::sync::atomic::Ordering::Relaxed).hash(&mut h);
-        h.finish()
-    };
     let codec = settings.compression_codec;
     let db = crate::metrics::with_slatedb_metrics(Db::builder(path.clone(), store.raw.clone()))
         .with_settings(settings)
-        .with_db_cache(shared_db_cache(), cache_id)
+        .with_db_cache(shared_db_cache(), cache_id(&path))
         .with_sst_block_size(SST_BLOCK_SIZE)
         .build()
         .await?;
     let raw = external_sst_redirect(&db, &path, store.raw.clone());
     spawn_compactor(&db, path, raw, codec);
     Ok(db)
+}
+
+/// What a shard's next owner warms, per shard: L0 SSTs (newest first) are
+/// fetched whole up to this many bytes, and at most a quarter of the block
+/// cache over the whole batch. Every point read and prefix scan touches
+/// every L0, so the first cold repo loads would otherwise each fetch their
+/// own block of each one.
+const WARM_L0_BYTES: u64 = 64 << 20;
+const WARM_CONCURRENCY: usize = 64;
+
+/// Fetches the filters and index of every SST of `dbs` into the shared
+/// meta cache, and their newest L0s whole into the block cache: one ranged
+/// GET per SST component, in bulk, instead of the 10–65 random ones each
+/// cold repo load of a freshly moved shard made. Best effort.
+pub async fn warm<D: slatedb::DbCacheManagerOps + slatedb::DbMetadataOps + Send + Sync>(dbs: &[Arc<D>]) {
+    use futures::StreamExt;
+    use slatedb::CacheTarget;
+    let started = std::time::Instant::now();
+    let l0_budget = WARM_L0_BYTES.min(BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed) / 4 / dbs.len().max(1) as u64);
+    let mut jobs = Vec::new();
+    for db in dbs {
+        let m = db.manifest();
+        let mut l0_bytes = 0;
+        for v in m.l0() {
+            l0_bytes += v.estimate_size();
+            jobs.push((db.clone(), v.sst.id, l0_bytes <= l0_budget));
+        }
+        for r in m.compacted() {
+            jobs.extend(r.sst_views().iter().map(|v| (db.clone(), v.sst.id, false)));
+        }
+    }
+    let n = jobs.len();
+    let failed = futures::stream::iter(jobs)
+        .map(|(db, id, whole)| async move {
+            let targets: &[CacheTarget] = if whole { &[CacheTarget::Filters, CacheTarget::Data((std::ops::Bound::Unbounded, std::ops::Bound::Unbounded))] } else { &[CacheTarget::Filters, CacheTarget::Index] };
+            db.warm_sst(id, targets).await.is_err()
+        })
+        .buffer_unordered(WARM_CONCURRENCY)
+        .filter(|f| std::future::ready(*f))
+        .count()
+        .await;
+    crate::metrics::SHARD_WARM_SECONDS.observe(started.elapsed().as_secs_f64());
+    crate::metrics::SHARD_WARM_SSTS.with_label_values(&["ok"]).inc_by((n - failed) as u64);
+    crate::metrics::SHARD_WARM_SSTS.with_label_values(&["error"]).inc_by(failed as u64);
+    tracing::info!(shards = dbs.len(), ssts = n, failed, elapsed_ms = started.elapsed().as_millis() as u64, "shards warmed");
+}
+
+/// A read-only view of a shard another node still writes, sharing the
+/// block cache with the `Db` this node opens for it later (same cache id):
+/// what a handoff's recipient warms before the shard moves. No checkpoint
+/// (the writer never waits on it), and nothing to replay (no WAL).
+pub async fn open_reader(store: &Store, partition: ShardId) -> anyhow::Result<slatedb::DbReader> {
+    let path = db_path(store, partition);
+    let opts = slatedb::config::DbReaderOptions { skip_wal_replay: true, manifest_poll_interval: Duration::from_secs(3600), ..Default::default() };
+    Ok(slatedb::DbReader::builder(path.clone(), store.raw.clone())
+        .with_reader_mode(slatedb::DbReaderMode::FollowLatest)
+        .with_options(opts)
+        .with_db_cache(shared_db_cache(), cache_id(&path))
+        .build()
+        .await?)
+}
+
+/// Cache ids only need to be distinct per DB in this process (tests open
+/// several prefixes with the same shard numbers).
+fn cache_id(path: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    path.hash(&mut h);
+    CACHE_EPOCH.load(std::sync::atomic::Ordering::Relaxed).hash(&mut h);
+    h.finish()
 }
 
 /// A cloned shard reads its ancestors' SSTs in place until compaction
@@ -917,6 +1050,130 @@ mod tests {
         db.close().await.unwrap();
         let db = open_db(&store, ShardId(0), None).await.unwrap();
         assert_eq!(db.get(b"k0123").await.unwrap().as_deref(), Some(format!("value 7 123 {}", "x".repeat(100)).as_bytes()));
+        db.close().await.unwrap();
+    }
+
+    /// Counts GETs of SST objects.
+    #[derive(Debug)]
+    struct SstGets {
+        inner: Arc<dyn object_store::ObjectStore>,
+        n: std::sync::atomic::AtomicU64,
+    }
+
+    impl SstGets {
+        fn take(&self) -> u64 {
+            self.n.swap(0, std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl std::fmt::Display for SstGets {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "SstGets")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl object_store::ObjectStore for SstGets {
+        async fn put_opts(&self, l: &object_store::path::Path, p: object_store::PutPayload, o: object_store::PutOptions) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(l, p, o).await
+        }
+        async fn put_multipart_opts(&self, l: &object_store::path::Path, o: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(l, o).await
+        }
+        async fn get_opts(&self, l: &object_store::path::Path, o: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+            if l.as_ref().ends_with(".sst") {
+                self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // a store round trip, so concurrent readers overlap
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            self.inner.get_opts(l, o).await
+        }
+        fn delete_stream(&self, l: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+            self.inner.delete_stream(l)
+        }
+        fn list(&self, p: Option<&object_store::path::Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+            self.inner.list(p)
+        }
+        async fn list_with_delimiter(&self, p: Option<&object_store::path::Path>) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(p).await
+        }
+        async fn copy_opts(&self, f: &object_store::path::Path, t: &object_store::path::Path, o: object_store::CopyOptions) -> object_store::Result<()> {
+            self.inner.copy_opts(f, t, o).await
+        }
+    }
+
+    /// A shard with `l0s` L0 SSTs of 200 keys each, closed: (store, counter).
+    async fn shard_with_l0s(prefix: &str, l0s: u32) -> (Store, Arc<SstGets>) {
+        let gets = Arc::new(SstGets { inner: Arc::new(object_store::memory::InMemory::new()), n: Default::default() });
+        let store = Store { prefix: prefix.into(), raw: gets.clone(), ..Store::memory(None) };
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
+        for i in 0..l0s {
+            for j in 0..200u32 {
+                db.put(format!("k{i:02}-{j:04}"), "v".repeat(64)).await.unwrap();
+            }
+            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
+        }
+        db.close().await.unwrap();
+        (store, gets)
+    }
+
+    /// Concurrent cold reads of one shard share each SST's filter fetch
+    /// (the meta cache is single-flight) instead of each fetching them all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cold_reads_fetch_each_filter_once() {
+        let (store, gets) = shard_with_l0s("singleflight", 6).await;
+        let db = Arc::new(open_db(&store, ShardId(0), None).await.unwrap());
+        let m = db.manifest();
+        let ssts = (m.l0().len() + m.compacted().iter().map(|r| r.sst_views().len()).sum::<usize>()) as u64;
+        gets.take();
+        // absent keys: each get reads every L0's filter and nothing else
+        let reads: Vec<_> = (0..64).map(|i| {
+            let db = db.clone();
+            tokio::spawn(async move { db.get(format!("absent-{i}")).await.unwrap() })
+        }).collect();
+        for r in reads {
+            assert!(r.await.unwrap().is_none());
+        }
+        let n = gets.take();
+        assert!(n <= 2 * ssts, "{n} SST GETs for 64 concurrent cold reads over {ssts} SSTs");
+        db.close().await.unwrap();
+    }
+
+    /// After `warm`, reading every key of a reopened shard (all in L0s)
+    /// needs no SST GET at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn warm_fetches_l0s_whole() {
+        let (store, gets) = shard_with_l0s("warm", 3).await;
+        let db = Arc::new(open_db(&store, ShardId(0), None).await.unwrap());
+        gets.take();
+        warm(std::slice::from_ref(&db)).await;
+        let l0 = db.manifest().l0().len() as u64;
+        let n = gets.take();
+        assert!(n <= 3 * l0, "warm made {n} SST GETs for {l0} L0s");
+        for i in 0..3u32 {
+            for j in (0..200u32).step_by(7) {
+                assert!(db.get(format!("k{i:02}-{j:04}")).await.unwrap().is_some());
+            }
+        }
+        assert_eq!(gets.take(), 0, "reads after warm went to the store");
+        db.close().await.unwrap();
+    }
+
+    /// A reader of a shard another handle writes shares its cache entries
+    /// with the `Db` opened for it later: what a handoff recipient warms
+    /// through it is a hit once it owns the shard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reader_warms_the_later_db() {
+        let (store, gets) = shard_with_l0s("reader-warm", 3).await;
+        let reader = Arc::new(open_reader(&store, ShardId(0)).await.unwrap());
+        warm(std::slice::from_ref(&reader)).await;
+        reader.close().await.unwrap();
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
+        gets.take();
+        for i in 0..3u32 {
+            assert!(db.get(format!("k{i:02}-0100")).await.unwrap().is_some());
+        }
+        assert_eq!(gets.take(), 0, "the Db re-fetched what the reader warmed");
         db.close().await.unwrap();
     }
 

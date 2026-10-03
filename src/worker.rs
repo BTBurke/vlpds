@@ -1419,6 +1419,15 @@ fn signature_fault(e: &crate::crypto::SignatureFault) -> WriteError {
     WriteError::SignatureFault(e.to_string())
 }
 
+/// Reads what a cold load of `did` reads (head, account, the `M/`
+/// read-ahead), only for their blocks to land in the block cache.
+pub async fn warm_repo<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str) -> anyhow::Result<()> {
+    db.get(state::head_key(did)).await?;
+    db.get(state::account_key(did)).await?;
+    crate::mst_store::prefetch(db, did, DEFAULT_PREFETCH_BYTES).await?;
+    Ok(())
+}
+
 /// Opens a repo cold: its root, nothing else.
 pub async fn load_repo(
     partition: Arc<Partition>,

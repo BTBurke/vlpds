@@ -20,6 +20,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/internal/v1/cluster", get(cluster_status))
         .route("/internal/v1/cluster/nudge", post(cluster_nudge))
         .route("/internal/v1/cluster/hello", post(cluster_hello))
+        .route("/internal/v1/cluster/prewarm", post(cluster_prewarm))
         .route("/internal/v1/admin/searchAccounts", get(admin_search_accounts))
         .route("/internal/v1/admin/inviteCodes", get(admin_invite_codes))
         .route("/internal/v1/sync/listRepos", get(sync_list_repos))
@@ -73,6 +74,48 @@ async fn cluster_nudge(State(app): AppState, headers: HeaderMap, axum::Json(inp)
         c.nudge(inp.handoffs);
     }
     Ok(Json(json!({})))
+}
+
+#[derive(serde::Serialize, Deserialize)]
+pub struct PrewarmShard {
+    pub shard: crate::slots::ShardId,
+    /// Its recently written repos, newest first.
+    #[serde(default)]
+    pub recent: Vec<String>,
+}
+
+#[derive(serde::Serialize, Deserialize)]
+struct PrewarmIn {
+    shards: Vec<PrewarmShard>,
+}
+
+/// A peer is about to hand us these shards: warm our caches from their
+/// state while it still serves them (`Node::warm_handoff`). Answers once
+/// done or out of time.
+async fn cluster_prewarm(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<PrewarmIn>) -> XResult<Json<J>> {
+    check(&app, &headers)?;
+    app.node.warm_handoff(inp.shards).await;
+    Ok(Json(json!({})))
+}
+
+/// Asks each recipient to warm the shards it is about to get, and waits
+/// (each at most `timeout`). Best effort: a recipient that doesn't answer
+/// just starts cold.
+pub async fn prewarm_peers(http: &crate::http::PeerClient, token: &str, plan: Vec<(String, Vec<PrewarmShard>)>, timeout: std::time::Duration) {
+    let sends = plan.into_iter().map(|(addr, shards)| async move {
+        let r = http
+            .post(format!("{}/internal/v1/cluster/prewarm", addr.trim_end_matches('/')))
+            .header(HDR, token)
+            .json(&PrewarmIn { shards })
+            .timeout(timeout)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status());
+        if let Err(e) = r {
+            tracing::warn!(%addr, "handoff prewarm failed: {e}");
+        }
+    });
+    futures::future::join_all(sends).await;
 }
 
 #[derive(serde::Serialize, Deserialize)]
