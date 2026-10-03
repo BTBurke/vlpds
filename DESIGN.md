@@ -2419,16 +2419,19 @@ root through the store).
   shared tree. getRepo streams from the snapshot in one pass, in the
   repository spec's streamable CAR order ("Streamable CAR Block Ordering",
   atproto.com/specs/repository; work in progress as of Feb 2026, readers
-  must still accept any order): the commit first, then the MST pre-order
-  from the root, each node followed by its entries as the node lists them,
-  a child subtree by recursing and a record by its block. So a node's
-  left subtree (`l`) comes before its first record, and each entry's
-  record before that entry's right subtree (`t`): records come in key
-  order, right after the node naming them
-  (`mst_lazy::export_blocks`; `tests/all/export_order.rs` checks the order
-  against the loaded tree and the block set against the old
-  nodes-then-records export's). The header and commit go out before
-  anything is read (time to first byte ~0). One forward `R/` scan
+  must still accept any order; `car_order.rs` defines it for both export
+  and import): the commit first, then the MST pre-order from the root,
+  each node followed by its slots as the node lists them, a child subtree
+  by recursing and a record by its block. So a node's left subtree (`l`)
+  comes before its first record, and each entry's record before that
+  entry's right subtree (`t`): records come in key order, right after the
+  node naming them (`mst_lazy::export_blocks`, which encodes leaves
+  straight from records rather than stepping `car_order::Walk` over
+  decoded nodes; `tests/all/export_order.rs` checks its order against
+  `Walk` and its block set against the old nodes-then-records export's,
+  and `tests/all/import_stream.rs` that importRepo takes these exports in
+  its one-pass parse). The header and commit go out before anything is
+  read (time to first byte ~0). One forward `R/` scan
   (`xrpc::sync::feed_records`, on its own task) hands each record's key,
   CID and block (none for records `since` excludes), in batches of 512 or
   256 KiB, 16 queued (~4 MiB ahead), to the MST walk on a blocking thread
@@ -2446,7 +2449,16 @@ root through the store).
   records written after it (the same set as before). Records with
   identical contents share a CID: the block comes by each entry naming it
   (the order's point is that a single-pass reader finds each record by its
-  node), where the nodes-first CAR wrote it once.
+  node), where the nodes-first CAR wrote it once. Measured against the
+  nodes-then-records export (record buffer, rescan past 64 MiB) on a shared
+  laptop (load 31-58, `--memory`, release builds, 4 interleaved rounds of 3
+  exports, loadgen fill): 10M records (2.77 GB CAR, same bytes) median
+  7.8 s (4.3-19.5) against 16.8 s (9.7-29.8), 1M (276 MB) 0.82 s against
+  1.7 s; first body byte 1-3 ms against 0.45-1.9 s at 10M and 65-110 ms at
+  1M (the next bytes still wait for the `M/` read-ahead: first 2 MiB
+  0.4-2.2 s at 10M); peak RSS over the process's for two concurrent 10M
+  exports +256/+301 MiB against +708/+751 MiB (single exports too noisy to
+  rank: the in-memory store's background work moves RSS by GBs).
   The walk visits every node, so it first reads the repo's whole `M/`
   range with one scan (`mst_store::prefetch_tree`: blocks packed in large
   buffers behind a sorted digest index, ~32 B/record held, ~320 MB at 10M

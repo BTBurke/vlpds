@@ -44,8 +44,9 @@ async fn import(s: &TestServer, a: &TestAccount, car: Vec<u8>) -> Resp {
 }
 
 /// Migration: a repo exported from one server imports into another in its
-/// export order, in the streamable order and shuffled, with the same
-/// records and tree each time.
+/// export order (the streamable order, records sharing a block repeated by
+/// each entry: the one-pass parse), in the reference writer's order and
+/// shuffled, with the same records and tree each time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn streamed_and_buffered_imports_agree() {
     let old = TestServer::spawn().await;
@@ -61,19 +62,23 @@ async fn streamed_and_buffered_imports_agree() {
             .await
             .ok();
     }
+    for _ in 0..2 {
+        old.create_record(&a, "com.example.same", json!({"$type": "com.example.same", "same": true})).await;
+    }
     let want = contents(&old, &a.did).await;
-    assert_eq!(want.1.len(), 180);
+    assert_eq!(want.1.len(), 182);
     let exported = old.xrpc.get("com.atproto.sync.getRepo", &[("did", &a.did)], &Auth::None).await;
     assert_eq!(exported.status, 200);
     let exported = exported.body.to_vec();
+    assert!(exported == stream_order(&exported), "getRepo writes the streamable order");
 
     let cases: [(&str, Vec<u8>); 3] = [("export", exported.clone()), ("stream", stream_order(&exported)), ("shuffled", shuffled(&exported))];
     for (name, car) in cases {
         let b = new.create_account("dst").await;
         let streamed = parses("stream");
         import(&new, &b, car).await.ok();
-        if name == "stream" {
-            assert!(parses("stream") > streamed, "the streamable order takes the one-pass parse");
+        if name != "shuffled" {
+            assert!(parses("stream") > streamed, "{name}: the streamable order takes the one-pass parse");
         }
         let got = contents(&new, &b.did).await;
         assert_eq!(got.0, want.0, "{name}: MST root");

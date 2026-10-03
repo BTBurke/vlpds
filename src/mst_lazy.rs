@@ -881,13 +881,15 @@ pub fn persisted_blocks<'a>(root: &Cid, blocks: &[(Cid, &'a [u8])], persist_min:
     Ok(blocks.iter().filter(|(c, _)| keep.contains(c)).map(|(c, b)| (*c, *b)).collect())
 }
 
-/// The tree at `root` in the streamable CAR order of the atproto repository
-/// spec ("Streamable CAR Block Ordering"): each node block, then its
-/// entries in order, a child by recursing and a record by its block, which
-/// [`Source::record_blocks`] gives (none from a source without them: node
-/// blocks alone, in `Tree::walk_blocks` order). Records come in key order,
-/// as a forward `R/` scan reads them, with one root-to-leaf path of nodes in
-/// memory. A record the tree doesn't name still comes at its key's place.
+/// The tree at `root` in the streamable CAR order ([`crate::car_order`]):
+/// each node block, then its slots in order, a child by recursing and a
+/// record by its block, which [`Source::record_blocks`] gives (none from a
+/// source without them: node blocks alone, in `Tree::walk_blocks` order).
+/// Records come in key order, as a forward `R/` scan reads them, with one
+/// root-to-leaf path of nodes in memory. Not driven by
+/// [`car_order::Walk`](crate::car_order::Walk): that takes each node
+/// decoded, and leaves here are encoded straight from their records. A
+/// record the tree doesn't name still comes at its key's place.
 ///
 /// The root is hash-checked against `root`, and every subtree rebuilt from
 /// records against its parent's link, so the records exported are the ones

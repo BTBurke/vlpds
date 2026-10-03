@@ -1,4 +1,4 @@
-//! getRepo streams one pass in the atproto spec's streamable CAR order
+//! getRepo streams one pass in the streamable CAR order (`car_order`)
 //! (commit, then each MST node followed by its entries: children
 //! recursively, records in place), with and without `since`, at every `M/`
 //! read-ahead split and with `M/` nodes missing. Its blocks are the set the

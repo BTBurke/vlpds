@@ -924,24 +924,29 @@ pub(crate) enum Slot {
     Record(Vec<u8>, Cid),
 }
 
-/// A loaded tree in the spec's streamable CAR order (after the commit):
-/// each node, then its entries as the node lists them, a child recursively
-/// and a record (key, CID) in place.
+/// A loaded tree in the streamable CAR order after the commit, as
+/// `vlpds::car_order` defines it: each node, then its slots as it lists
+/// them, a child recursively and a record (key, CID) in place.
 pub(crate) fn streamable(t: &Tree) -> Vec<Slot> {
-    fn rec(n: &vlpds::mst::Node, out: &mut Vec<Slot>) {
-        out.push(Slot::Node(n.cid.unwrap(), n.block().unwrap().into_owned()));
-        for e in &n.entries {
-            match e {
-                vlpds::mst::Entry::Child { node: Some(c), .. } => rec(c, out),
-                vlpds::mst::Entry::Child { cid: Some(c), .. } => panic!("child {c} not loaded"),
-                vlpds::mst::Entry::Child { .. } => {}
-                vlpds::mst::Entry::Value { key, val } => out.push(Slot::Record(key.to_vec(), *val)),
+    use vlpds::car_order::{Next, Walk};
+    let mut nodes = HashMap::new();
+    t.walk_blocks(&mut |c, b| {
+        nodes.insert(c, b.to_vec());
+    })
+    .unwrap();
+    let mut walk = Walk::new(t.root.cid.unwrap());
+    let mut out = Vec::new();
+    loop {
+        match walk.next() {
+            Next::Node(c) => {
+                let b = nodes[&c].clone();
+                walk.enter(vlpds::mst::decode_node(&b, c).unwrap()).unwrap();
+                out.push(Slot::Node(c, b));
             }
+            Next::Record { key, cid } => out.push(Slot::Record(key.to_vec(), cid)),
+            Next::Done => return out,
         }
     }
-    let mut out = Vec::new();
-    rec(&t.root, &mut out);
-    out
 }
 
 /// CAR blocks after the first (the commit), in order.
