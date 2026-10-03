@@ -394,24 +394,25 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         }
         None => crate::http::PeerClient::lone(),
     };
-    let node = crate::node::Node::new(
-        cluster.clone(),
-        log.clone(),
-        store.clone(),
-        state_store.clone(),
-        table.clone(),
-        firehose.clone(),
+    let node = Arc::new(crate::node::Node {
+        cluster: cluster.clone(),
+        log: log.clone(),
+        store: store.clone(),
+        state_store: state_store.clone(),
+        table: table.clone(),
+        firehose: firehose.clone(),
         merger_tx,
-        workers.clone(),
-        cfg.cache_dir.clone().map(|dir| crate::partition::DiskCacheConfig {
+        workers: workers.clone(),
+        disk_cache: cfg.cache_dir.clone().map(|dir| crate::partition::DiskCacheConfig {
             dir,
             node_bytes: cfg.disk_cache_bytes,
             shard_bytes: cfg.disk_cache_shard_bytes,
         }),
-        cfg.internal_token.clone(),
-        http.clone(),
-        cfg.preload_recent,
-    );
+        internal_token: cfg.internal_token.clone(),
+        http: http.clone(),
+        recent_cap: cfg.preload_recent,
+        followers: Default::default(),
+    });
     let host: Arc<dyn ShardHost> = node.clone();
     let node_handle = node.clone();
     // first membership step inline, so a lone node serves with all its shards
@@ -426,16 +427,14 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         let (c, l) = (cluster.clone(), cluster.clone());
         let members = crate::retention::Membership {
             live_logs: Box::new(move || c.peers().into_iter().map(|p| p.log_id).chain([c.log_id.clone()]).collect()),
-            // dead logs are pruned by the owner of the shard holding slot 0
-            leader: Box::new(move || l.owner_of(l.layout().shard_of_slot(0)).is_some_and(|(o, _)| o == l.cfg.node_id)),
+            leader: Box::new(move || l.leads_slot0()),
         };
         crate::retention::Retention::new(store.clone(), log.clone(), rc, members).spawn();
     }
     if let Some(gc) = cfg.reshard_gc.clone() {
         let (l, v, t) = (cluster.clone(), cluster.clone(), table.clone());
         let hooks = crate::reshard_gc::Hooks {
-            // like dead-log retention: the owner of the shard holding slot 0
-            leader: Box::new(move || l.owner_of(l.layout().shard_of_slot(0)).is_some_and(|(o, _)| o == l.cfg.node_id)),
+            leader: Box::new(move || l.leads_slot0()),
             lease_ok: Box::new(move || v.lease_valid()),
             owned: Box::new(move || t.owned().into_iter().map(|p| (p.id, p.db.clone())).collect()),
             crash_at: None,

@@ -21,6 +21,27 @@ pub struct Opts {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Cmd {
+    /// Print the shard layout and any split/merge in progress.
+    Layout,
+    /// Split a shard in two, online.
+    ShardSplit {
+        shard: u32,
+        /// First slot of the upper half (default: the range's midpoint).
+        #[arg(long)]
+        at: Option<u32>,
+        /// Return once planned instead of waiting for the flip.
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Merge two adjacent shards (`left` holds the lower slots), online.
+    ShardMerge {
+        left: u32,
+        right: u32,
+        #[arg(long)]
+        no_wait: bool,
+    },
+    /// Abort the split/merge in progress (only before it flips).
+    ReshardAbort,
     /// Accounts (pdsadmin account ...).
     #[command(subcommand)]
     Account(AccountCmd),
@@ -303,6 +324,14 @@ fn pretty(out: &mut dyn Write, j: &J) -> Result<()> {
 pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
     let c = Client::new(&opts.url, &opts.token);
     match cmd {
+        Cmd::Layout => pretty(out, &c.get("vlpds.admin.getShardLayout", &[]).await?),
+        Cmd::ShardSplit { shard, at, no_wait } => {
+            pretty(out, &c.post("vlpds.admin.splitShard", &json!({"shard": shard, "at": at, "wait": !no_wait})).await?)
+        }
+        Cmd::ShardMerge { left, right, no_wait } => {
+            pretty(out, &c.post("vlpds.admin.mergeShards", &json!({"left": left, "right": right, "wait": !no_wait})).await?)
+        }
+        Cmd::ReshardAbort => pretty(out, &c.post("vlpds.admin.abortReshard", &json!({})).await?),
         Cmd::Account(a) => account(&c, a, opts, out).await,
         Cmd::CreateInviteCode { uses, count, for_account } => {
             let mut codes = Vec::new();

@@ -312,7 +312,7 @@ pub fn parse_refresh_token(t: &str) -> Option<ParsedRefresh> {
 impl ParsedRefresh {
     /// Issued for `s`, any generation.
     pub fn authentic(&self, key: &[u8; 32], s: &Session) -> bool {
-        super::util::ct_eq(&refresh_mac(key, s, self.generation), &self.mac)
+        crate::auth::ct_eq(&refresh_mac(key, s, self.generation), &self.mac)
     }
 }
 

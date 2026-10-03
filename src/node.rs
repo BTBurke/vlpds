@@ -33,42 +33,10 @@ pub struct Node {
     pub http: crate::http::PeerClient,
     /// 0 = off.
     pub recent_cap: usize,
-    followers: Mutex<HashMap<String, Follower>>,
+    pub(crate) followers: Mutex<HashMap<String, Follower>>,
 }
 
 impl Node {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        cluster: Arc<Cluster>,
-        log: Arc<NodeLog>,
-        store: Store,
-        state_store: Store,
-        table: Arc<PartitionTable>,
-        firehose: Arc<Firehose>,
-        merger_tx: mpsc::UnboundedSender<LogBatch>,
-        workers: Workers,
-        disk_cache: Option<partition::DiskCacheConfig>,
-        internal_token: String,
-        http: crate::http::PeerClient,
-        recent_cap: usize,
-    ) -> Arc<Node> {
-        Arc::new(Node {
-            cluster,
-            log,
-            store,
-            state_store,
-            table,
-            firehose,
-            merger_tx,
-            workers,
-            disk_cache,
-            internal_token,
-            http,
-            recent_cap,
-            followers: Mutex::new(HashMap::new()),
-        })
-    }
-
     /// Retires followers of dead logs once drained to their fence.
     pub fn sync_followers(&self) {
         let peers = self.cluster.peers();

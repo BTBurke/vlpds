@@ -205,11 +205,12 @@ pub fn service_auth_jwt(
 /// timing. An empty `expected` (unset secret) never matches.
 pub fn token_eq(expected: &str, given: &str) -> bool {
     use sha2::Digest;
-    if expected.is_empty() {
-        return false;
-    }
-    let (a, b) = (Sha256::digest(expected), Sha256::digest(given));
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    !expected.is_empty() && ct_eq(&Sha256::digest(expected), &Sha256::digest(given))
+}
+
+/// Constant time for equal lengths.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
 }
 
 /// `b64` is the `Authorization: Basic` value after the scheme.

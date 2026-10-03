@@ -467,7 +467,7 @@ async fn update_handle(
     // early refusal; set_handle re-checks against the worker's state
     let acct = app.account(&did).await?;
     if super::server::is_takendown_account(&acct) {
-        return Err(super::server::takedown_error());
+        return Err(super::takedown_error());
     }
     let handle = inp.handle.trim().to_ascii_lowercase();
     if handle != acct.handle {
@@ -503,7 +503,7 @@ pub(super) async fn set_handle(app: &App, did: &str, handle: &str, user: bool) -
     let res = app
         .mutate_account(did, true, false, false, move |a| {
             if user && super::server::is_takendown_account(a) {
-                return Err(super::server::takedown_error());
+                return Err(super::takedown_error());
             }
             if a.handle != h && !claimed {
                 // renamed since the read above: we hold no claim on `h`

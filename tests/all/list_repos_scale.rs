@@ -87,7 +87,7 @@ async fn populate(nodes: &[TestServer], shards: u32, n: u64) -> std::collections
     let mut by_shard: Vec<Vec<(String, u64)>> = vec![Vec::new(); shards as usize];
     for i in 0..n {
         let did = state::bulk_did(i);
-        by_shard[state::partition_of(&did, shards).0 as usize].push((did, i));
+        by_shard[vlpds::slots::shard_of(&did, shards).0 as usize].push((did, i));
     }
     let mut want = std::collections::HashMap::new();
     let commit = Cid::dag_cbor(b"commit");

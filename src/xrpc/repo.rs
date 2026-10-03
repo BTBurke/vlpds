@@ -775,7 +775,7 @@ async fn import_repo(
     let did = creds.user_did()?.to_string();
     creds.need_account("repo", "manage")?;
     if super::server::is_takendown_account(&app.account(&did).await?) {
-        return Err(super::server::takedown_error());
+        return Err(super::takedown_error());
     }
     // off the repo's worker, which only writes the result
     let parsed = tokio::task::spawn_blocking(move || parse_import(&body).map(|r| (did, r)))

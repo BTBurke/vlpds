@@ -137,6 +137,33 @@ pub fn refresh_metrics() {
     crate::metrics::PROCESS_START_STD.set(*STARTED);
 }
 
+/// Test hook: asked at each named phase of some multi-step work; true stops
+/// that work dead there, as a crash would.
+pub type CrashHook = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Test crash hooks keyed by whatever names the work (a node id, a DID).
+pub(crate) struct CrashHooks(parking_lot::RwLock<Option<std::collections::HashMap<String, CrashHook>>>);
+
+impl CrashHooks {
+    pub const fn new() -> Self {
+        CrashHooks(parking_lot::RwLock::new(None))
+    }
+
+    pub fn set(&self, key: &str, h: Option<CrashHook>) {
+        let mut g = self.0.write();
+        let m = g.get_or_insert_with(Default::default);
+        match h {
+            Some(h) => m.insert(key.to_string(), h),
+            None => m.remove(key),
+        };
+    }
+
+    pub fn fires(&self, key: &str, phase: &str) -> bool {
+        let h = self.0.read().as_ref().and_then(|m| m.get(key).cloned());
+        h.is_some_and(|h| h(phase))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -21,13 +21,14 @@ use clap::Parser;
 use futures::{StreamExt, TryStreamExt};
 use hdrhistogram::Histogram;
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use vlpds::cluster::if_match;
 use vlpds::store::{S3Config, Store};
 
 #[derive(Parser)]
@@ -153,10 +154,6 @@ fn opts(mode: PutMode) -> PutOptions {
     PutOptions { mode, ..Default::default() }
 }
 
-fn cas(e_tag: Option<String>, version: Option<String>) -> PutMode {
-    PutMode::Update(UpdateVersion { e_tag, version })
-}
-
 fn data(n: usize, seed: u8) -> Vec<u8> {
     (0..n).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
 }
@@ -164,9 +161,6 @@ fn data(n: usize, seed: u8) -> Vec<u8> {
 fn payload(n: usize, seed: u8) -> PutPayload {
     PutPayload::from(data(n, seed))
 }
-
-/// (ETag, version) returned by an object's latest PUT.
-type Version = (Option<String>, Option<String>);
 
 struct Probe {
     store: Arc<dyn ObjectStore>,
@@ -192,10 +186,10 @@ impl Probe {
         Path::from(format!("{}/{}", self.root, rel))
     }
 
-    async fn get_bytes(&self, p: &Path) -> object_store::Result<(bytes::Bytes, Option<String>, Option<String>)> {
+    async fn get_bytes(&self, p: &Path) -> object_store::Result<(bytes::Bytes, Option<String>)> {
         let r = self.store.get(p).await?;
-        let (e, v) = (r.meta.e_tag.clone(), r.meta.version.clone());
-        Ok((r.bytes().await?, e, v))
+        let e = r.meta.e_tag.clone();
+        Ok((r.bytes().await?, e))
     }
 
     /// Check 1: If-None-Match: * creates once; the second create is refused.
@@ -204,7 +198,7 @@ impl Probe {
         let first = tryf!(self.store.put_opts(&p, PutPayload::from_static(b"first"), opts(PutMode::Create)).await, "first create");
         match self.store.put_opts(&p, PutPayload::from_static(b"second"), opts(PutMode::Create)).await {
             Ok(_) => {
-                let (b, _, _) = tryf!(self.get_bytes(&p).await, "GET after second create");
+                let (b, _) = tryf!(self.get_bytes(&p).await, "GET after second create");
                 fail!(
                     "second If-None-Match:* create of an existing key succeeded (object now {:?}): the store ignores conditional creates, so a zombie writer could overwrite a durable segment or a fence",
                     String::from_utf8_lossy(&b)
@@ -213,7 +207,7 @@ impl Probe {
             Err(object_store::Error::AlreadyExists { .. }) => {}
             Err(e) => fail!("second create failed with {} instead of AlreadyExists", kind(&e)),
         }
-        let (b, _, _) = tryf!(self.get_bytes(&p).await, "GET");
+        let (b, _) = tryf!(self.get_bytes(&p).await, "GET");
         if &b[..] != b"first" {
             fail!("object was changed by the refused create: {:?}", String::from_utf8_lossy(&b));
         }
@@ -228,7 +222,7 @@ impl Probe {
     async fn compare_and_swap(&self) -> Outcome {
         let p = self.path("checks/cas/lease");
         let created = tryf!(self.store.put_opts(&p, PutPayload::from_static(b"v1"), opts(PutMode::Create)).await, "create");
-        let (b, e1, v1) = tryf!(self.get_bytes(&p).await, "GET v1");
+        let (b, e1) = tryf!(self.get_bytes(&p).await, "GET v1");
         if &b[..] != b"v1" {
             fail!("read-after-create returned {:?}", String::from_utf8_lossy(&b));
         }
@@ -239,39 +233,39 @@ impl Probe {
         if created.e_tag.is_some() && created.e_tag != e1 {
             notes.push(format!("PUT ETag {:?} != GET ETag {:?}", created.e_tag, e1));
         }
-        let put2 = match self.store.put_opts(&p, PutPayload::from_static(b"v2"), opts(cas(e1.clone(), v1.clone()))).await {
+        let put2 = match self.store.put_opts(&p, PutPayload::from_static(b"v2"), opts(if_match(e1.clone()))).await {
             Ok(r) => r,
             Err(object_store::Error::NotImplemented { .. } | object_store::Error::NotSupported { .. }) => {
                 fail!("conditional update (If-Match) is not supported by this store/client")
             }
             Err(e) => fail!("CAS with the current ETag failed: {}", kind(&e)),
         };
-        let (b, e2, _) = tryf!(self.get_bytes(&p).await, "GET v2");
+        let (b, e2) = tryf!(self.get_bytes(&p).await, "GET v2");
         if &b[..] != b"v2" {
             fail!("read-after-overwrite returned {:?}, not v2 (stale read)", String::from_utf8_lossy(&b));
         }
         if e2 == e1 {
             fail!("ETag did not change on overwrite ({e1:?}): a stale CAS could not be detected");
         }
-        match self.store.put_opts(&p, PutPayload::from_static(b"stale"), opts(cas(e1.clone(), v1.clone()))).await {
+        match self.store.put_opts(&p, PutPayload::from_static(b"stale"), opts(if_match(e1.clone()))).await {
             Ok(_) => fail!("CAS with a stale ETag succeeded: two nodes could both hold a lease or an assignment"),
             Err(e) if is_conflict(&e) => {}
             Err(e) => fail!("CAS with a stale ETag failed with {} instead of Precondition", kind(&e)),
         }
-        let (b, _, _) = tryf!(self.get_bytes(&p).await, "GET after stale CAS");
+        let (b, _) = tryf!(self.get_bytes(&p).await, "GET after stale CAS");
         if &b[..] != b"v2" {
             fail!("a refused stale CAS changed the object to {:?}", String::from_utf8_lossy(&b));
         }
         // renewals CAS on the ETag the previous PUT returned, without a GET
         match put2.e_tag {
             None => notes.push("PUT responses carry no ETag (renewals will need a GET)".into()),
-            Some(et) => match self.store.put_opts(&p, PutPayload::from_static(b"v3"), opts(cas(Some(et), put2.version))).await {
+            Some(et) => match self.store.put_opts(&p, PutPayload::from_static(b"v3"), opts(if_match(Some(et)))).await {
                 Ok(_) => {}
                 Err(e) => fail!("CAS with the ETag returned by the previous PUT failed ({}): lease renewals would fail", kind(&e)),
             },
         }
         let missing = self.path("checks/cas/missing");
-        match self.store.put_opts(&missing, PutPayload::from_static(b"x"), opts(cas(e1, None))).await {
+        match self.store.put_opts(&missing, PutPayload::from_static(b"x"), opts(if_match(e1))).await {
             Ok(_) => fail!("CAS on a missing key created it"),
             Err(e) if is_conflict(&e) || matches!(e, object_store::Error::NotFound { .. }) => {}
             Err(e) => fail!("CAS on a missing key failed with {} instead of Precondition", kind(&e)),
@@ -291,8 +285,8 @@ impl Probe {
             let p = self.path(&format!("checks/race-{}/{round}", if use_cas { "cas" } else { "create" }));
             let mode = if use_cas {
                 tryf!(self.store.put_opts(&p, PutPayload::from_static(b"base"), opts(PutMode::Create)).await, "create base");
-                let (_, e, v) = tryf!(self.get_bytes(&p).await, "GET base");
-                cas(e, v)
+                let (_, e) = tryf!(self.get_bytes(&p).await, "GET base");
+                if_match(e)
             } else {
                 PutMode::Create
             };
@@ -321,7 +315,7 @@ impl Probe {
             if !others.is_empty() {
                 fail!("round {round}: losers got non-conflict errors, so the outcome is ambiguous: {}", others.join("; "));
             }
-            let (b, _, _) = tryf!(self.get_bytes(&p).await, "GET winner");
+            let (b, _) = tryf!(self.get_bytes(&p).await, "GET winner");
             let want = format!("racer-{}", winners[0]);
             if b[..] != *want.as_bytes() {
                 fail!("round {round}: {want} won but the object holds {:?}", String::from_utf8_lossy(&b));
@@ -533,7 +527,7 @@ impl Probe {
             async move { s.put_opts(&path, body, opts(PutMode::Create)).await.map(|_| ()) }
         });
         // one lease object per worker, renewed by CAS on the last PUT's ETag
-        let leases: Arc<Vec<Mutex<Option<Version>>>> = Arc::new((0..conc).map(|_| Mutex::new(None)).collect());
+        let leases: Arc<Vec<Mutex<Option<Option<String>>>>> = Arc::new((0..conc).map(|_| Mutex::new(None)).collect());
         let (s1, p1) = (s.clone(), p.clone());
         run!("put_cas_small", 200, move |w, i| {
             let (s, path, leases) = (s1.clone(), p1(format!("lat/lease/{w}")), leases.clone());
@@ -541,10 +535,10 @@ impl Probe {
                 let prev = leases[w].lock().clone();
                 let mode = match prev {
                     None => PutMode::Create,
-                    Some((e, v)) => cas(e, v),
+                    Some(e) => if_match(e),
                 };
                 let r = s.put_opts(&path, payload(200, i as u8), opts(mode)).await?;
-                *leases[w].lock() = Some((r.e_tag, r.version));
+                *leases[w].lock() = Some(r.e_tag);
                 Ok(())
             }
         });

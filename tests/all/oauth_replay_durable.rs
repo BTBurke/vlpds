@@ -123,7 +123,7 @@ async fn dpop_proof_replay_refused_after_owner_change() {
     // a key whose proofs are claimed on a; requests go through b
     let mut key = loop {
         let k = DpopKey { sk: SigningKey::random(&mut rand::rngs::OsRng), nonce: None };
-        let p = vlpds::state::partition_of(&format!("oauth:jkt:{}", k.jkt()), SHARDS);
+        let p = vlpds::slots::shard_of(&format!("oauth:jkt:{}", k.jkt()), SHARDS);
         if a.app.partitions.get(p).is_some() {
             break k;
         }

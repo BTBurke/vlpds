@@ -12,7 +12,7 @@
 use super::config::{self, Audit, Doc};
 use super::Limiter;
 use crate::store::Store;
-use object_store::{GetOptions, ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion};
+use object_store::{GetOptions, ObjectStore, PutMode, PutOptions, PutPayload};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -297,7 +297,7 @@ pub async fn save(limiter: &Limiter, store: &Store, req: SaveReq) -> Result<Doc,
     doc.history = history;
     let body = serde_json::to_vec_pretty(&doc).map_err(|e| SaveError::Store(e.to_string()))?;
     let mode = match etag {
-        Some(e) => PutMode::Update(UpdateVersion { e_tag: Some(e), version: None }),
+        Some(e) => crate::cluster::if_match(Some(e)),
         None => PutMode::Create,
     };
     let put = bounded(store.raw.put_opts(&config_path(store), PutPayload::from(body), PutOptions { mode, ..Default::default() })).await;

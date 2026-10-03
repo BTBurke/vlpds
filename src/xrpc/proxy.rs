@@ -864,7 +864,7 @@ async fn check_takedown(app: &App, did: &str, allow_takendown: bool) -> XResult<
         _ => e,
     })?;
     if !allow_takendown && matches!(acct.status.as_deref(), Some("takendown") | Some("suspended")) {
-        return Err(super::server::takedown_error());
+        return Err(super::takedown_error());
     }
     Ok(acct)
 }

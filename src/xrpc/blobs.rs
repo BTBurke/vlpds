@@ -61,7 +61,7 @@ async fn upload_blob(
     // applies to user service JWTs too: one issued before a takedown would
     // otherwise still upload for up to an hour.
     if super::server::is_takendown_account(&app.account(&did).await?) {
-        return Err(super::server::takedown_error());
+        return Err(super::takedown_error());
     }
     let max = app.config.max_blob_size;
     let declared = headers

@@ -191,7 +191,7 @@ async fn takedown_applies_at_once_through_any_node() {
     let body = json!({"handle": handle, "password": PASSWORD, "email": email});
     let j = past_handoffs(|| n1.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None)).await.ok();
     let (did, auth) = (j["did"].as_str().unwrap().to_string(), Auth::Bearer(j["accessJwt"].as_str().unwrap().into()));
-    let p = vlpds::state::partition_of(&did, SHARDS);
+    let p = vlpds::slots::shard_of(&did, SHARDS);
     let owner = nodes.iter().position(|n| n.app.partitions.get(p).is_some()).expect("owned");
     let (own, other) = (nodes[owner], nodes[1 - owner]);
     let status = |s: bool| {

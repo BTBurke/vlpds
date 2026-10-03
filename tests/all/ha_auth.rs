@@ -88,7 +88,7 @@ pub(crate) async fn balanced(nodes: &[&TestServer]) {
 }
 
 pub(crate) fn owner_of<'a>(nodes: &[&'a TestServer], key: &str) -> &'a TestServer {
-    let p = vlpds::state::partition_of(key, SHARDS);
+    let p = vlpds::slots::shard_of(key, SHARDS);
     nodes.iter().find(|n| n.app.partitions.get(p).is_some()).expect("owned")
 }
 
@@ -150,7 +150,7 @@ async fn takedowns_and_revocations_are_cluster_wide_and_survive_failover() {
 
     // an account owned by a; everything below goes through b and c
     let acct = a.create_account("hat").await;
-    assert!(a.app.partitions.get(vlpds::state::partition_of(&acct.did, SHARDS)).is_some());
+    assert!(a.app.partitions.get(vlpds::slots::shard_of(&acct.did, SHARDS)).is_some());
     let rec = b.create_record(&acct, "app.bsky.feed.post", post_record("taken down soon")).await;
     let keep = c.create_record(&acct, "app.bsky.feed.post", post_record("stays")).await;
     let up = c

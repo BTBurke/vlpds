@@ -141,10 +141,6 @@ fn expired_token(message: &str) -> XrpcError {
     XrpcError::bad("ExpiredToken", message)
 }
 
-pub(super) fn takedown_error() -> XrpcError {
-    err(StatusCode::UNAUTHORIZED, "AccountTakedown", "Account has been taken down")
-}
-
 fn oauth_forbidden() -> XrpcError {
     err(StatusCode::FORBIDDEN, "Forbidden", "OAuth credentials are not supported for this endpoint")
 }

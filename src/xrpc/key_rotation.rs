@@ -9,33 +9,26 @@ use super::*;
 use crate::plc::PlcError;
 use crate::state::PendingSigningKey;
 use crate::worker::{AccountOp, KeyStep};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::time::Duration;
 
 pub const RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
 
 const INTERRUPTED: &str = "KeyRotationInterrupted";
 
-/// Test hook: asked at each phase of a rotation of a DID ("begun": the
-/// pending key is durable; "plc_updated": the directory names it, the repo
-/// isn't re-signed yet). Returning true stops the rotation there, as a crash
-/// would (the test halts the node in the hook): no retry is scheduled.
-pub type CrashHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+pub use crate::lifecycle::CrashHook;
 
-static CRASH_HOOKS: parking_lot::Mutex<Option<HashMap<String, CrashHook>>> = parking_lot::Mutex::new(None);
+/// Phases of a DID's rotation: "begun" (the pending key is durable) and
+/// "plc_updated" (the directory names it, the repo isn't re-signed yet). A
+/// firing hook schedules no retry; the test halts the node in the hook.
+static CRASH_HOOKS: crate::lifecycle::CrashHooks = crate::lifecycle::CrashHooks::new();
 
 pub fn set_crash_hook(did: &str, h: Option<CrashHook>) {
-    let mut g = CRASH_HOOKS.lock();
-    let m = g.get_or_insert_with(HashMap::new);
-    match h {
-        Some(h) => m.insert(did.to_string(), h),
-        None => m.remove(did),
-    };
+    CRASH_HOOKS.set(did, h)
 }
 
 fn crash_at(did: &str, phase: &str) -> Result<(), XrpcError> {
-    let h = CRASH_HOOKS.lock().as_ref().and_then(|m| m.get(did).cloned());
-    match h.is_some_and(|h| h(phase)) {
+    match CRASH_HOOKS.fires(did, phase) {
         true => Err(XrpcError::bad(INTERRUPTED, format!("key rotation of {did} stopped at {phase} (crash hook)"))),
         false => Ok(()),
     }

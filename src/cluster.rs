@@ -380,7 +380,7 @@ pub(crate) fn is_conflict(e: &object_store::Error) -> bool {
 }
 
 /// A CAS on the version read with `e_tag`.
-pub(crate) fn if_match(e_tag: Option<String>) -> PutMode {
+pub fn if_match(e_tag: Option<String>) -> PutMode {
     PutMode::Update(UpdateVersion { e_tag, version: None })
 }
 
@@ -1037,6 +1037,12 @@ impl Cluster {
     /// (node_id, addr)
     pub fn owner_of(&self, shard: ShardId) -> Option<(String, String)> {
         self.table.read().get(&shard).cloned()
+    }
+
+    /// Whether we own the shard holding slot 0: the one node that runs
+    /// cluster-wide singleton work (dead-log retention, reshard dir GC).
+    pub fn leads_slot0(&self) -> bool {
+        self.owner_of(self.layout().shard_of_slot(0)).is_some_and(|(o, _)| o == self.cfg.node_id)
     }
 
     pub fn assignment(&self, shard: ShardId) -> Option<Assignment> {

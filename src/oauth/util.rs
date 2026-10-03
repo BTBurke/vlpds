@@ -41,11 +41,6 @@ pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     m.finalize().into_bytes().into()
 }
 
-/// Constant time for equal lengths.
-pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
-}
-
 /// Every node shares `jwt_secret`, so derived keys agree across nodes with
 /// no stored state.
 pub fn derive_secret(server_secret: &str, label: &str) -> [u8; 32] {

@@ -383,12 +383,15 @@ pub(crate) use authn::{authed_repo, Auth, Credentials, MaybeAuth};
 
 /// As the reference's findAccount with checkTakedown/checkDeactivated.
 pub fn inactive_account_error(status: &str) -> XrpcError {
-    let unauthorized = |error: &str, message: &str| XrpcError { status: StatusCode::UNAUTHORIZED, error: error.into(), message: message.into() };
     match status {
-        "takendown" | "suspended" => unauthorized("AccountTakedown", "Account has been taken down"),
-        "deactivated" => unauthorized("AccountDeactivated", "Account is deactivated"),
+        "takendown" | "suspended" => takedown_error(),
+        "deactivated" => XrpcError { status: StatusCode::UNAUTHORIZED, error: "AccountDeactivated".into(), message: "Account is deactivated".into() },
         st => XrpcError::bad(&inactive_error(st), format!("repo is {st}")),
     }
+}
+
+pub(crate) fn takedown_error() -> XrpcError {
+    XrpcError { status: StatusCode::UNAUTHORIZED, error: "AccountTakedown".into(), message: "Account has been taken down".into() }
 }
 
 /// RepoDeactivated, RepoTakendown, ...
@@ -398,6 +401,31 @@ pub fn inactive_error(status: &str) -> String {
         Some(f) => format!("Repo{}{}", f.to_ascii_uppercase(), c.as_str()),
         None => "RepoInactive".into(),
     }
+}
+
+/// Private rows through `p`'s log, never forwarded. A shard that closed
+/// between the caller's lookup and the enqueue is refused by the log with
+/// nothing written: ShardMoved, so the entry node resends the request to the
+/// new owner (which re-runs any conditional write's checks).
+pub(crate) async fn write_private_local(p: &crate::partition::Partition, muts: Vec<crate::segment::Mutation>) -> Result<(), XrpcError> {
+    let (tx, rx) = oneshot::channel();
+    let entry = crate::partition::LogEntry {
+        shard: p.id,
+        frames: Vec::new(),
+        muts,
+        ack: Some(Box::new(move |r| {
+            let _ = tx.send(r);
+        })),
+        pending: None,
+        enqueued: Instant::now(),
+    };
+    p.tx.send(entry).await.map_err(|_| XrpcError::internal("partition sequencer gone"))?;
+    rx.await.map_err(|_| XrpcError::internal("log dropped write"))?.map_err(|e| {
+        if e.to_string() == crate::nodelog::NOT_HELD {
+            return XrpcError::unavailable(crate::forward::SHARD_MOVED, format!("partition {} closed under this write", p.id));
+        }
+        XrpcError::internal(e.to_string())
+    })
 }
 
 impl App {
@@ -475,26 +503,7 @@ impl App {
             return internal::forward_put_private(self, &owner, did, muts).await;
         }
         let p = self.partition(did)?;
-        let (tx, rx) = oneshot::channel();
-        let entry = crate::partition::LogEntry {
-            shard: p.id,
-            frames: Vec::new(),
-            muts,
-            ack: Some(Box::new(move |r| {
-                let _ = tx.send(r);
-            })),
-            pending: None,
-            enqueued: Instant::now(),
-        };
-        p.tx.send(entry).await.map_err(|_| XrpcError::internal("partition sequencer gone"))?;
-        rx.await.map_err(|_| XrpcError::internal("log dropped write"))?.map_err(|e| {
-            // the shard closed between our lookup and the enqueue: nothing was
-            // done, so the entry node resends it to the new owner
-            if e.to_string() == crate::nodelog::NOT_HELD {
-                return XrpcError::unavailable(crate::forward::SHARD_MOVED, format!("partition {} closed under this write", p.id));
-            }
-            XrpcError::internal(e.to_string())
-        })
+        write_private_local(&p, muts).await
     }
 
     pub async fn get_private(&self, did: &str, name: &str) -> Result<Option<Bytes>, XrpcError> {

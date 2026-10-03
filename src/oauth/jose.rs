@@ -217,7 +217,7 @@ impl DpopNonces {
 
     pub fn check(&self, nonce: &str) -> bool {
         let c = now_secs() / NONCE_ROTATION_SECS;
-        (c - 1..=c + 1).any(|n| super::util::ct_eq(self.compute(n).as_bytes(), nonce.as_bytes()))
+        (c - 1..=c + 1).any(|n| crate::auth::ct_eq(self.compute(n).as_bytes(), nonce.as_bytes()))
     }
 }
 

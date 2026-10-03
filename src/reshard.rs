@@ -33,25 +33,17 @@ pub struct Policy {
 
 const POLICY_EVERY: Duration = Duration::from_secs(60);
 
-/// Test hook: asked at each phase of a reshard on a node ("planned",
-/// "closed", "frozen", "cloned", "children", "flipped"); true makes that
-/// node's reshard work stop dead there, as a crash would.
-pub type CrashHook = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+pub use crate::lifecycle::CrashHook;
 
-static CRASH_HOOKS: parking_lot::RwLock<Option<HashMap<String, CrashHook>>> = parking_lot::RwLock::new(None);
+/// Phases: "planned", "closed", "frozen", "cloned", "children", "flipped".
+static CRASH_HOOKS: crate::lifecycle::CrashHooks = crate::lifecycle::CrashHooks::new();
 
 pub fn set_crash_hook(node_id: &str, h: Option<CrashHook>) {
-    let mut g = CRASH_HOOKS.write();
-    let m = g.get_or_insert_with(HashMap::new);
-    match h {
-        Some(h) => m.insert(node_id.to_string(), h),
-        None => m.remove(node_id),
-    };
+    CRASH_HOOKS.set(node_id, h)
 }
 
 pub(crate) fn crash_at(node: &str, phase: &str) -> bool {
-    let h = CRASH_HOOKS.read().as_ref().and_then(|m| m.get(node).cloned());
-    h.is_some_and(|h| h(phase))
+    CRASH_HOOKS.fires(node, phase)
 }
 
 /// Err if the crash hook fires at `phase`: reshard work stops as if we died.

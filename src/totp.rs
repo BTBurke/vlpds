@@ -14,7 +14,7 @@ use axum::http::StatusCode;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use crate::oauth::util::ct_eq;
+use crate::auth::ct_eq;
 use sha2::Sha256;
 
 pub const STEP_SECS: u64 = 30;

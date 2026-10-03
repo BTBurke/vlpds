@@ -151,30 +151,11 @@ pub(super) async fn private_cas_local(app: &App, routing: &str, conds: Vec<Cond>
     if !muts.is_empty() {
         let sec = state::private_key(routing, super::server::SEC);
         let touches_sec = muts.iter().any(|m| m.key.starts_with(&sec));
-        let r = write_local(&p, muts).await;
+        let r = super::write_private_local(&p, muts).await;
         if touches_sec {
             super::server::ctl_changed(app, routing);
         }
         r?;
     }
     Ok(Outcome { applied: true, deleted })
-}
-
-/// Never forwarded: if the shard moved since the checks, the log refuses it.
-async fn write_local(p: &crate::partition::Partition, muts: Vec<Mutation>) -> Result<(), XrpcError> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let entry = crate::partition::LogEntry {
-        shard: p.id,
-        frames: Vec::new(),
-        muts,
-        ack: Some(Box::new(move |r| {
-            let _ = tx.send(r);
-        })),
-        pending: None,
-        enqueued: std::time::Instant::now(),
-    };
-    p.tx.send(entry).await.map_err(|_| XrpcError::internal("partition sequencer gone"))?;
-    rx.await
-        .map_err(|_| XrpcError::internal("log dropped write"))?
-        .map_err(|e| XrpcError::internal(e.to_string()))
 }

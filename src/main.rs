@@ -661,27 +661,6 @@ struct AdminArgs {
 
 #[derive(clap::Subcommand)]
 enum AdminCmd {
-    /// Print the shard layout and any split/merge in progress.
-    Layout,
-    /// Split a shard in two, online.
-    ShardSplit {
-        shard: u32,
-        /// First slot of the upper half (default: the range's midpoint).
-        #[arg(long)]
-        at: Option<u32>,
-        /// Return once planned instead of waiting for the flip.
-        #[arg(long)]
-        no_wait: bool,
-    },
-    /// Merge two adjacent shards (`left` holds the lower slots), online.
-    ShardMerge {
-        left: u32,
-        right: u32,
-        #[arg(long)]
-        no_wait: bool,
-    },
-    /// Abort the split/merge in progress (only before it flips).
-    ReshardAbort,
     /// Peer mTLS certificates (local files; no node is called).
     #[command(subcommand)]
     Tls(TlsCmd),
@@ -779,37 +758,14 @@ fn tls_main(cmd: TlsCmd) -> anyhow::Result<()> {
 }
 
 fn admin_main(args: AdminArgs) -> anyhow::Result<()> {
-    if let AdminCmd::Tls(cmd) = args.cmd {
-        return tls_main(cmd);
-    }
+    let cmd = match args.cmd {
+        AdminCmd::Tls(cmd) => return tls_main(cmd),
+        AdminCmd::Ops(cmd) => cmd,
+    };
+    let token = args.admin_token.unwrap_or_else(|| server::DEV_ADMIN_TOKEN.to_string());
+    let opts = vlpds::cli::admin::Opts { url: args.url, token, json: args.json };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    rt.block_on(async move {
-        let token = args.admin_token.unwrap_or_else(|| server::DEV_ADMIN_TOKEN.to_string());
-        if let AdminCmd::Ops(cmd) = args.cmd {
-            let opts = vlpds::cli::admin::Opts { url: args.url, token, json: args.json };
-            return vlpds::cli::admin::run(cmd, &opts, &mut std::io::stdout()).await;
-        }
-        let http = reqwest::Client::new();
-        let url = |nsid: &str| format!("{}/xrpc/{nsid}", args.url.trim_end_matches('/'));
-        let rb = match args.cmd {
-            AdminCmd::Layout => http.get(url("vlpds.admin.getShardLayout")),
-            AdminCmd::ShardSplit { shard, at, no_wait } => {
-                http.post(url("vlpds.admin.splitShard")).json(&serde_json::json!({"shard": shard, "at": at, "wait": !no_wait}))
-            }
-            AdminCmd::ShardMerge { left, right, no_wait } => {
-                http.post(url("vlpds.admin.mergeShards")).json(&serde_json::json!({"left": left, "right": right, "wait": !no_wait}))
-            }
-            AdminCmd::ReshardAbort => http.post(url("vlpds.admin.abortReshard")).json(&serde_json::json!({})),
-            AdminCmd::Ops(_) | AdminCmd::Tls(_) => unreachable!("handled above"),
-        };
-        let r = rb.basic_auth("admin", Some(token)).timeout(Duration::from_secs(300)).send().await?;
-        let status = r.status();
-        let body = r.text().await?;
-        let pretty = serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| serde_json::to_string_pretty(&v).ok()).unwrap_or(body);
-        println!("{pretty}");
-        anyhow::ensure!(status.is_success(), "{status}");
-        Ok(())
-    })
+    rt.block_on(vlpds::cli::admin::run(cmd, &opts, &mut std::io::stdout()))
 }
 
 fn main() -> anyhow::Result<()> {

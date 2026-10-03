@@ -335,8 +335,8 @@ pub fn is_nsid(s: &str) -> bool {
 
 /// Hostname-level did:web only, with a port only for localhost.
 pub fn is_atproto_did(s: &str) -> bool {
-    if let Some(id) = s.strip_prefix("did:plc:") {
-        return s.len() == 32 && id.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7'));
+    if s.starts_with("did:plc:") {
+        return crate::plc::valid_plc_did(s);
     }
     if let Some(host) = s.strip_prefix("did:web:") {
         if host.is_empty() || host.contains(':') || host.len() > 253 {
@@ -1090,5 +1090,29 @@ mod tests {
         assert!(is_atproto_did("did:plc:abcdefghijklmnopqrstuvwx"));
         assert!(is_atproto_did("did:web:localhost%3A1234"));
         assert!(!is_atproto_did("did:web:example.com%3A1234"));
+    }
+    /// `is_atproto_did` delegates did:plc to `plc::valid_plc_did`; both must
+    /// accept exactly the old inline rule (24 base32-lowercase chars).
+    #[test]
+    fn plc_dids_match_old_rule() {
+        let old = |s: &str| {
+            s.strip_prefix("did:plc:")
+                .is_some_and(|id| s.len() == 32 && id.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')))
+        };
+        let base = "abcdefghijklmnopqrstuvwx";
+        let mut cases: Vec<String> = vec![String::new(), "did:plc:".into(), format!("did:plc:{base}a"), format!("did:plc:{}", &base[1..])];
+        for i in 0..24 {
+            for c in (0u8..=255).filter(|c| c.is_ascii()) {
+                let mut id = base.as_bytes().to_vec();
+                id[i] = c;
+                cases.push(format!("did:plc:{}", String::from_utf8(id).unwrap()));
+            }
+        }
+        cases.push(format!("did:plc:{}", "é".repeat(12)));
+        cases.push(format!("did:PLC:{base}"));
+        for c in &cases {
+            assert_eq!(is_atproto_did(c), old(c), "{c:?}");
+            assert_eq!(crate::plc::valid_plc_did(c), old(c), "{c:?}");
+        }
     }
 }

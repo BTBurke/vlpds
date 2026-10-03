@@ -109,7 +109,7 @@ async fn admin_listings_scatter_gather_across_nodes() {
         }
     }
     let n = SHARDS;
-    let shard = |did: &str| vlpds::state::partition_of(did, n);
+    let shard = |did: &str| vlpds::slots::shard_of(did, n);
     let owners: HashSet<String> = want
         .iter()
         .map(|t| {

@@ -789,7 +789,7 @@ fn check_csrf(
         }
     }
     match token {
-        Some(t) => ou::ct_eq(t.as_bytes(), csrf_token(app, &device.id, scope).as_bytes()),
+        Some(t) => crate::auth::ct_eq(t.as_bytes(), csrf_token(app, &device.id, scope).as_bytes()),
         None => false,
     }
 }
@@ -1804,7 +1804,7 @@ async fn token_inner(app: &Arc<App>, headers: &HeaderMap, body: &[u8]) -> Result
 }
 
 fn code_matches(req: &RequestData, code: &str) -> bool {
-    req.code_hash.as_deref().is_some_and(|h| ou::ct_eq(h.as_bytes(), store::hash_secret(code).as_bytes()))
+    req.code_hash.as_deref().is_some_and(|h| crate::auth::ct_eq(h.as_bytes(), store::hash_secret(code).as_bytes()))
 }
 
 fn verify_pkce(verifier: &str, challenge: &str) -> bool {
@@ -1813,7 +1813,7 @@ fn verify_pkce(verifier: &str, challenge: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b));
     (43..=128).contains(&verifier.len())
         && ok_chars
-        && ou::ct_eq(ou::sha256_b64u(verifier).as_bytes(), challenge.as_bytes())
+        && crate::auth::ct_eq(ou::sha256_b64u(verifier).as_bytes(), challenge.as_bytes())
 }
 
 async fn code_grant(
@@ -2180,7 +2180,7 @@ pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Crede
     let (s, acct) = tokio::join!(store::get_session(app, did, sid), account_any(app, did));
     let s = s.map_err(|e| XrpcError::internal(e.description))?;
     if acct.is_ok_and(|a| super::server::is_takendown_account(&a)) {
-        return Err(super::server::takedown_error());
+        return Err(super::takedown_error());
     }
     match s {
         Some(s) if s.token_id == jti && s.client_id == client_id => {}

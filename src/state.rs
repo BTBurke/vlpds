@@ -487,12 +487,6 @@ pub fn did_hash(did: &str) -> u64 {
     u64::from_be_bytes(Sha256::digest(did.as_bytes())[..8].try_into().unwrap())
 }
 
-/// Shard of `did` in the initial uniform layout of `shards` (layout v1).
-/// Splits and merges change it: route with `PartitionTable::shard_of`.
-pub fn partition_of(did: &str, shards: u32) -> crate::slots::ShardId {
-    crate::slots::shard_of(did, shards)
-}
-
 /// Deterministic, so load generators can address bulk account `i` without a lookup.
 pub fn bulk_did(i: u64) -> String {
     let h = Sha256::digest(format!("vlpds-bulk:{i}").as_bytes());

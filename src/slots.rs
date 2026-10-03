@@ -73,6 +73,8 @@ pub fn shard_of_slot(slot: u16, shards: u32) -> ShardId {
     ShardId((slot as u64 * shards as u64 / SLOTS as u64) as u32)
 }
 
+/// Shard of `did` in the initial uniform layout of `shards` (layout v1).
+/// Splits and merges change it: route with `PartitionTable::shard_of`.
 pub fn shard_of(did: &str, shards: u32) -> ShardId {
     shard_of_slot(slot_of(did), shards)
 }
