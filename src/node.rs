@@ -51,14 +51,8 @@ pub fn export_sst_meta_bytes(table: &Arc<PartitionTable>) {
     let weak = Arc::downgrade(table);
     crate::metrics::on_render(move || {
         let Some(table) = weak.upgrade() else { return false };
-        let (mut filter, mut index) = (0, 0);
-        for p in table.owned() {
-            let m = p.db.manifest();
-            for h in m.l0().iter().map(|v| &v.sst).chain(m.compacted().iter().flat_map(|r| r.sst_views().iter().map(|v| &v.sst))) {
-                filter += h.info.filter_len;
-                index += h.info.index_len;
-            }
-        }
+        let owned = table.owned();
+        let (filter, index) = crate::memory::sst_meta_bytes(owned.iter().map(|p| &*p.db));
         crate::metrics::SST_META_BYTES.with_label_values(&["filter"]).set(filter as i64);
         crate::metrics::SST_META_BYTES.with_label_values(&["index"]).set(index as i64);
         true

@@ -32,8 +32,9 @@ pub struct Config {
     pub shards: u32,
     pub workers: usize,
     pub cache_per_worker: usize,
-    /// 0: bounded by count only.
-    pub repo_cache_bytes: usize,
+    /// The memory budget and the SST metadata, SST block and repo caches'
+    /// sizes (default: automatic, src/memory.rs).
+    pub memory: crate::memory::Settings,
     pub lazy_mst_prefetch_bytes: usize,
     /// Tests: drop every idle repo's loaded paths after each worker pass, so
     /// every write and read walks from the root through the store.
@@ -117,7 +118,7 @@ pub struct Config {
     pub metrics_listen: Option<String>,
     /// None: keep every segment forever.
     pub log_retention: Option<crate::retention::Config>,
-    /// None: 10% of physical RAM or the cgroup limit.
+    /// None: 10% of the memory budget.
     pub cache_budget_bytes: Option<u64>,
     pub cache_entries: Vec<(crate::caches::Cache, usize)>,
     pub reshard_policy: crate::reshard::Policy,
@@ -176,6 +177,31 @@ impl Config {
     }
 }
 
+impl Config {
+    /// The memory plan's fixed costs.
+    pub fn memory_fixed(&self) -> crate::memory::Fixed {
+        crate::memory::Fixed {
+            in_memory_caches: self.cache_budget_bytes,
+            mst_node_cache: self.lazy_mst_node_cache_bytes as u64,
+            firehose_ring: self.firehose_ring_bytes as u64,
+            live_ring: self.live_ring_bytes as u64,
+            merge_queue: self.firehose_merge_queue_bytes as u64,
+            backfill_cache: self.backfill_cache_bytes as u64,
+            backfill_readahead: self.backfill_readahead_bytes as u64,
+            max_backfills: self.firehose_max_backfills as u64,
+            max_exports: self.max_exports as u64,
+            max_import: self.max_import_bytes as u64,
+        }
+    }
+
+    /// Refuses sizes that don't fit the memory budget.
+    pub fn memory_plan(&self) -> anyhow::Result<crate::memory::Plan> {
+        let mut s = self.memory.clone();
+        s.block = s.block.or(crate::partition::pinned_block_cache_bytes());
+        crate::memory::plan(&s, &self.memory_fixed(), crate::memory::limit_bytes())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -193,7 +219,7 @@ impl Default for Config {
             shards: 8,
             workers: 2,
             cache_per_worker: 10_000,
-            repo_cache_bytes: 4 << 30,
+            memory: Default::default(),
             lazy_mst_prefetch_bytes: crate::worker::DEFAULT_PREFETCH_BYTES,
             lazy_mst_unload_idle: std::env::var("VLPDS_LAZY_MST_UNLOAD_IDLE").is_ok_and(|v| v == "1"),
             lazy_mst_node_cache_bytes: crate::mst_store::DEFAULT_NODE_CACHE_BYTES,
@@ -264,18 +290,14 @@ impl Default for Config {
 }
 
 pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
-    let (caps, budget) = crate::caches::resolve(cfg.cache_budget_bytes, &cfg.cache_entries);
+    let plan = crate::memory::init(cfg.memory_plan()?);
+    let (caps, budget) = crate::caches::resolve(Some(cfg.cache_budget_bytes.unwrap_or(plan.part("in_memory_caches"))), &cfg.cache_entries);
     crate::caches::apply(&caps);
-    if let Some(m) = crate::caches::memory_bytes() {
+    if let Some(m) = plan.limit {
         crate::metrics::MEMORY_LIMIT.set(m as i64);
     }
-    crate::metrics::REPO_CACHE_CAPACITY.set(cfg.repo_cache_bytes as i64);
-    tracing::info!(
-        budget_mb = budget >> 20,
-        memory_mb = crate::caches::memory_bytes().map(|m| m >> 20),
-        full_mb = caps.total_bytes() >> 20,
-        "cache caps: {caps}"
-    );
+    crate::xrpc::size_export_prefetch_pool(cfg.max_exports);
+    tracing::info!(budget_mb = budget >> 20, full_mb = caps.total_bytes() >> 20, "in-memory cache caps: {caps}");
     // Separate connection pools for the commit log, the control plane and
     // everything else, each bounded (objlimit.rs), so a takeover's burst
     // can't starve lease renewals or exhaust ephemeral ports.
@@ -315,7 +337,8 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let table = crate::partitions::PartitionTable::new(n);
     let lookup_parts = table.clone();
     let lookup: worker::PartitionLookup = Arc::new(move |did: &str| lookup_parts.for_key(did));
-    let limits = worker::CacheLimits { entries: cfg.cache_per_worker, bytes: cfg.repo_cache_bytes / cfg.workers.max(1), prefetch_bytes: cfg.lazy_mst_prefetch_bytes, unload_idle: cfg.lazy_mst_unload_idle };
+    let repo_bytes = crate::memory::current().map_or(0, |s| s.repo) as usize;
+    let limits = worker::CacheLimits { entries: cfg.cache_per_worker, bytes: repo_bytes / cfg.workers.max(1), prefetch_bytes: cfg.lazy_mst_prefetch_bytes, unload_idle: cfg.lazy_mst_unload_idle };
     crate::mst_store::NODE_CACHE.set_bytes(cfg.lazy_mst_node_cache_bytes);
     let secrets = Arc::new(crate::secrets::Secrets::from_config(&cfg.kek, cfg.dev_mode)?);
     tracing::info!(kek = secrets.current_kid(), unwrap_keks = ?secrets.kids(), dev = secrets.is_dev(), "secrets at rest");
@@ -411,6 +434,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         followers: Default::default(),
     });
     crate::node::export_sst_meta_bytes(&table);
+    crate::memory::register(&table, &cluster, &workers);
     let host: Arc<dyn ShardHost> = node.clone();
     let node_handle = node.clone();
     // first membership step inline, so a lone node serves with all its shards

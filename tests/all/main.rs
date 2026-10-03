@@ -73,6 +73,7 @@ mod lexicons;
 mod list_repos_scale;
 mod log_pipeline;
 mod log_retention;
+mod memory_budget;
 mod migration;
 mod moderation;
 mod move_warm;

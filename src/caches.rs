@@ -1,5 +1,5 @@
 //! Entry caps of the in-memory caches, sized from one memory budget (by
-//! default a fraction of the process's memory) split by weight and divided
+//! default a fraction of the node's memory budget, src/memory.rs) split by weight and divided
 //! by each cache's approximate entry size. The caps are process-wide (most
 //! caches are statics) and read on every insert, so a lowered cap applies
 //! on the next insert into a full shard.
@@ -163,17 +163,9 @@ pub fn parse_overrides(v: &[String]) -> anyhow::Result<Vec<(Cache, usize)>> {
         .collect()
 }
 
-/// Physical RAM, or the cgroup limit when lower.
-pub fn memory_bytes() -> Option<u64> {
-    match (sys::physical_memory(), sys::cgroup_limit()) {
-        (Some(p), Some(c)) => Some(p.min(c)),
-        (p, c) => p.or(c),
-    }
-}
-
-/// Also returns the budget (None: [`DEFAULT_BUDGET_FRACTION`] of [`memory_bytes`]).
+/// Also returns the budget (None: [`DEFAULT_BUDGET_FRACTION`] of the memory limit).
 pub fn resolve(budget: Option<u64>, overrides: &[(Cache, usize)]) -> (Caps, u64) {
-    let budget = budget.unwrap_or_else(|| (memory_bytes().unwrap_or(FALLBACK_MEMORY) as f64 * DEFAULT_BUDGET_FRACTION) as u64);
+    let budget = budget.unwrap_or_else(|| (crate::memory::limit_bytes().unwrap_or(FALLBACK_MEMORY) as f64 * DEFAULT_BUDGET_FRACTION) as u64);
     let mut caps = Caps::from_budget(budget);
     for (c, n) in overrides {
         caps.set(*c, *n);
@@ -244,57 +236,6 @@ pub fn refresh_metrics() {
     }
 }
 
-#[cfg(target_os = "linux")]
-mod sys {
-    pub fn physical_memory() -> Option<u64> {
-        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let kb: u64 = s.lines().find_map(|l| l.strip_prefix("MemTotal:"))?.split_whitespace().next()?.parse().ok()?;
-        Some(kb * 1024)
-    }
-
-    /// cgroup v2 `memory.max` of our cgroup (or the root of the mount, as
-    /// in a container), else cgroup v1 `memory.limit_in_bytes`.
-    pub fn cgroup_limit() -> Option<u64> {
-        let own = std::fs::read_to_string("/proc/self/cgroup")
-            .ok()
-            .and_then(|s| s.lines().find_map(|l| l.strip_prefix("0::").map(|p| p.trim().to_string())));
-        let mut paths = Vec::new();
-        if let Some(p) = own.filter(|p| p != "/") {
-            paths.push(format!("/sys/fs/cgroup{p}/memory.max"));
-        }
-        paths.push("/sys/fs/cgroup/memory.max".into());
-        paths.push("/sys/fs/cgroup/memory/memory.limit_in_bytes".into());
-        // "max" (v2) or a near-u64::MAX value (v1) mean no limit
-        paths.iter().find_map(|p| std::fs::read_to_string(p).ok()?.trim().parse::<u64>().ok().filter(|v| *v < 1 << 60))
-    }
-}
-
-#[cfg(target_os = "macos")]
-mod sys {
-    pub fn physical_memory() -> Option<u64> {
-        extern "C" {
-            fn sysctlbyname(name: *const std::ffi::c_char, old: *mut std::ffi::c_void, oldlen: *mut usize, new: *mut std::ffi::c_void, newlen: usize) -> i32;
-        }
-        let (mut v, mut len) = (0u64, std::mem::size_of::<u64>());
-        let ok = unsafe { sysctlbyname(c"hw.memsize".as_ptr(), &mut v as *mut u64 as *mut _, &mut len, std::ptr::null_mut(), 0) } == 0;
-        (ok && v > 0).then_some(v)
-    }
-
-    pub fn cgroup_limit() -> Option<u64> {
-        None
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-mod sys {
-    pub fn physical_memory() -> Option<u64> {
-        None
-    }
-    pub fn cgroup_limit() -> Option<u64> {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,12 +257,6 @@ mod tests {
         assert!(parse_overrides(&["nope=1".into()]).is_err());
         assert!(parse_overrides(&["did_docs".into()]).is_err());
         assert!(format!("{c}").contains("proxy_accounts=5 (~0 MiB)"));
-    }
-
-    #[test]
-    fn memory_is_detected() {
-        let m = memory_bytes().expect("RAM size on linux/macos");
-        assert!(m >= 256 << 20, "{m}");
     }
 
     #[test]

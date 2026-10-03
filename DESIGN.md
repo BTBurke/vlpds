@@ -262,9 +262,9 @@ swappable.
   block cache holds decoded blocks, so only misses decompress, and the local
   disk cache holds 2.5× more).
 - One block cache (foyer, `--block-cache-mb`) and one SST metadata cache
-  (bloom filters, indexes, stats; `--meta-cache-mb`, default a quarter of
-  the block cache) serve every
-  shard DB. Flushes put their data blocks in it, so RSS climbs with commits
+  (bloom filters, indexes, stats; `--meta-cache-mb`) serve every
+  shard DB; both are sized from the memory budget by default (below,
+  "Memory budget"). Flushes put their data blocks in it, so RSS climbs with commits
   until the cache is full (about 2 KB per commit with partial MSTs, whose
   `M/` writes double state bytes per commit; 0.36 KB at a 64 MB cache) and
   then stays flat: the benchbox 4.8 → 11 GB "regression" at 50k/s was one
@@ -311,9 +311,9 @@ swappable.
     the shards the node already serves.
   Size: ~29 MB decoded per million accounts at the capacity test's records
   distribution (~1.3x the encoded `vlpds_sst_meta_bytes`), so 100M accounts
-  on 4 nodes is ~0.72 GB per node and ~0.96 GB with one node down:
-  `--meta-cache-mb` (default a quarter of the block cache) needs ~1.5 GB
-  there. Alerts: `VlpdsSstMetaCacheTooSmall`, `VlpdsSstMetaRefetching`.
+  on 4 nodes is ~0.72 GB per node and ~0.96 GB with one node down,
+  ~1.2 GB with compaction headroom: what the memory budget now sizes the
+  metadata cache to by itself (below). Alerts: `VlpdsSstMetaCacheTooSmall`, `VlpdsSstMetaRefetching`.
   Laptop repro (1 node, 4 shards, bulk at 64 MB of meta cache, MB of SST
   GETs per created account, bench/results/filtercache-2026-10-02-laptop):
   at 1.5M accounts 0.51 MB before, 0.023 MB after; at 2M the old binary's
@@ -323,6 +323,38 @@ swappable.
   bulk still slows (2-7k vs 7-24k accounts/s; 0.17 MB per account at 3M,
   ~1.3x over): filters are whole-SST, so overflow stays costly; size the
   cache.
+- **Memory budget** (src/memory.rs). The node's budget is its memory limit
+  (the tightest cgroup v2 `memory.max` on its cgroup's path, else physical
+  RAM) or `--memory-budget-mb` (MiB or a percentage of the limit). Off the
+  top: a 256 MiB runtime baseline, the in-memory caches
+  (`--cache-budget-mb`, default 10% of the budget), the MST node cache, the
+  firehose and live rings and merge queue, the backfill cache plus
+  read-ahead x `--firehose-max-backfills`, exports (8 MiB per
+  `--max-exports` slot plus the `M/` read-ahead pool, 16 MiB a slot up to
+  512 MiB), imports (`xrpc::IMPORT_MEMORY_BYTES`, 256 MiB, or
+  `--max-import-mb` if less) and max(15%, 512 MiB) headroom (memtables,
+  bodies in flight, allocator slack). The rest is the cache pool. The
+  metadata cache takes what the owned SSTs' filters and indexes need first:
+  their encoded size (`vlpds_sst_meta_bytes`) x the decode ratio measured
+  from the cache while it neither loads nor evicts (1.3 until then) x
+  N/(N-1) for N live nodes (capped at 2: room to inherit a dead peer's
+  share) x 1.25 for compactions in flight. The block and repo caches split
+  the rest evenly (the old defaults were 4 GiB each). A background thread
+  re-plans every 5 s from the owned shards' manifests, so acquiring,
+  releasing, splitting and compacting shards moves the target; growth
+  applies at once, shrinking only after the lower target held 5 minutes, so
+  a takeover and its hand-back don't thrash the caches. All three caches
+  resize in place: the CLOCK metadata cache evicts unreferenced entries
+  first, Foyer's block cache resizes its shards (vlpds wraps Foyer itself:
+  SlateDB's `FoyerCache` can't resize), and the repo workers get a new byte
+  budget. A pool too small for the metadata target is logged at error,
+  exported as `vlpds_meta_cache_shortfall_bytes`, and trips
+  `VlpdsSstMetaCacheTooSmall`. Explicit sizes pin their caches, and a node
+  whose explicit sizes and fixed costs don't fit its budget refuses to
+  start (`vlpds --memory-plan` prints the plan, or why it doesn't fit; the
+  bench harness, bench/memcap.py, uses it to refuse before launching).
+  Sized from a 2.5 GiB tiny container, the pool is ~0.9 GiB; from a 32 GB
+  host's 27 GiB container, ~16.8 GiB.
 - The local SST disk cache (`--cache-dir`, one directory per shard) is
   capped per shard: SlateDB's default is 16 GiB per DB, 1 TiB at 64 shards.
   `--disk-cache-mb` is the node's budget, divided by the layout's shard
@@ -2196,9 +2228,10 @@ one node, the survivors stay under ~60% CPU, i.e.
 - **Memory.** 32 GB works because of partial MSTs ("Partial MSTs"): full
   trees at ~240 B/record wouldn't fit (one hour of real writers is ~850 GB
   of trees). A day's writers' paths are ~5 GB per node today and ~50–75 GB
-  at 10× on 3 nodes (hence 128 GB); `--repo-cache-mb` (4 GiB by default)
-  bounds them, and an evicted path costs a few `M/` reads to load again
-  (the block cache adds 4 GB + a quarter for metadata by default). The persisted interior nodes (`M/`,
+  at 10× on 3 nodes (hence 128 GB); `--repo-cache-mb` (by default half
+  of the cache pool the SST metadata cache leaves, ~7.5 GiB in a 27 GiB
+  container; "Memory budget") bounds them, and an evicted path costs a few
+  `M/` reads to load again (the block cache gets as much). The persisted interior nodes (`M/`,
   +28 B/record) are ~220 GB per node's share at 3 nodes; they live in the
   object store, and the NVMe disk cache holds the hot part.
 - **Network.** Proxying is ~0.27 Gbit/s per node each direction today, and
@@ -2628,8 +2661,7 @@ root through the store).
   (`mst_store::NODE_CACHE`, `--lazy-mst-node-cache-mb`, 256 MiB): nodes are
   content-addressed, so an entry is valid in any version that links it.
 - **Stage 4: path cache.** A repo is charged `REPO_BASE + heap of its
-  loaded nodes`; `--repo-cache-mb` (4 GiB per node by default, was 16 GiB
-  of whole trees) bounds that, split per worker. Over budget, the
+  loaded nodes`; `--repo-cache-mb` (sized from the memory budget by default) bounds that, split per worker. Over budget, the
   least recently used idle repos (nothing in flight: every loaded node is
   then in `M/`/`R/`) drop back to their root, and their view is
   republished unloaded. A repo over 1 MiB (an import, a rebuild, a repo

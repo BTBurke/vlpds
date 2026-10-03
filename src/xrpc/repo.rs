@@ -17,6 +17,11 @@ pub fn routes() -> Router<Arc<App>> {
 /// The repo is held in memory and written as one log entry about its size.
 pub const DEFAULT_MAX_IMPORT_BYTES: usize = 1 << 30;
 
+/// importRepo memory the node's budget reserves (src/memory.rs), when
+/// --max-import-mb allows more: the imports in flight are expected to hold
+/// about this much together. Change it with the import path's working set.
+pub const IMPORT_MEMORY_BYTES: usize = 256 << 20;
+
 /// The reference sets no limit; our own writes refuse a record over 1 MB,
 /// so this leaves room for records made elsewhere while bounding what one
 /// record costs every later read.

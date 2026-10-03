@@ -283,6 +283,8 @@ pub enum WorkerMsg {
     /// Result of `Worker::start_fetch`: the tree to continue with (None:
     /// unchanged), and the blob refs and backlinks if it read them.
     Fetched { did: Arc<str>, res: Result<Box<FetchedState>, crate::mst::MstError> },
+    /// A new [`CacheLimits::bytes`] (src/memory.rs resizes the repo cache).
+    SetCacheBytes(usize),
 }
 
 pub type BlobRefs = HashMap<String, Vec<Cid>>;
@@ -448,6 +450,16 @@ impl std::ops::Deref for WorkerSenders {
     type Target = Vec<Sender<WorkerMsg>>;
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+impl WorkerSenders {
+    /// Splits `total` evenly between the workers; each evicts down to its
+    /// share on its next pass.
+    pub fn set_cache_bytes(&self, total: usize) {
+        for tx in &self.0 {
+            let _ = tx.send(WorkerMsg::SetCacheBytes(total / self.0.len().max(1)));
+        }
     }
 }
 
@@ -674,6 +686,10 @@ impl Worker {
             WorkerMsg::Fetched { did, res } => self.fetched(did, res, order, groups),
             WorkerMsg::CreateRepo(req) => self.create_repo(req),
             WorkerMsg::Shutdown => self.stop = true,
+            WorkerMsg::SetCacheBytes(n) => {
+                self.limits.bytes = n;
+                self.evict();
+            }
             WorkerMsg::CacheInfo { did, reply } => {
                 let _ = reply.send(self.cache.peek(&did).map(|st| CachedRepo {
                     loaded_nodes: st.mst.loaded_nodes(),

@@ -1041,9 +1041,13 @@ its normal not-found polls),
 ### VlpdsSstMetaCacheTooSmall
 
 **Means:** the bloom filters + indexes of every SST in this node's shards
-(`vlpds_sst_meta_bytes`, encoded; ~1.3x that decoded in the cache) are over
-80% of its metadata cache (`vlpds_meta_cache_capacity_bytes`:
-`--meta-cache-mb`, default a quarter of `--block-cache-mb`). Each point read
+(`vlpds_sst_meta_need_bytes`: the encoded `vlpds_sst_meta_bytes` x the
+measured decode ratio, `vlpds_sst_meta_decode_ratio`, ~1.3) are over 90% of
+its metadata cache (`vlpds_meta_cache_capacity_bytes`). By default the node
+sizes that cache itself from its memory budget (src/memory.rs: the need x
+N/(N-1) for N live nodes x 1.25, first out of the cache pool), so this means
+the pool can't fit it (`vlpds_meta_cache_shortfall_bytes` > 0, logged at
+error when it starts) or `--meta-cache-mb` pins it too small. Each point read
 checks a filter per sorted run of its shard, so under uniform keys (bulk
 imports, random repo loads) the whole set is hot. Past the cache, reads that
 miss fetch a whole filter or index (MBs for a big compacted SST) and the
@@ -1055,8 +1059,11 @@ About 29 MB decoded per million accounts at the capacity test's records
 distribution: 100M accounts on 4 nodes is ~0.72 GB per node, ~0.96 GB with one
 node down.
 
-**Do:** raise `--meta-cache-mb` (restart) to at least 1.25x the footprint the
-node would hold after losing a peer (its share x N / (N - 1)), or add nodes.
+**Do:** give the node more memory (container limit, or
+`--memory-budget-mb`), or add nodes; with an explicit `--meta-cache-mb`, raise
+it (restart) to at least 1.25x the footprint the node would hold after losing
+a peer (its share x N / (N - 1)), or drop it to let the node size it. The
+budget's breakdown: `vlpds_memory_budget_bytes{part}`, `vlpds --memory-plan`.
 Check `VlpdsSstMetaRefetching` to see whether it bites yet.
 
 ### VlpdsSstMetaRefetching
@@ -1204,13 +1211,16 @@ cgroup limit when lower, as the node reads it) for 10 minutes. A node that can't
 read either exports no limit and these alerts stay silent.
 
 **Confirm:** `vlpds_jemalloc_bytes{stat}` (allocated vs resident vs retained),
-`sum by (instance) (vlpds_repo_cache_bytes)` (loaded MST paths) vs `vlpds_repo_cache_capacity_bytes`
-(`--repo-cache-mb`, 4 GiB default), `mst_store` node cache (`--lazy-mst-node-cache-mb`, 256 MiB), `vlpds_cache_bytes`
-(`--cache-budget-mb`, default 10% of RAM/cgroup), SlateDB `--block-cache-mb`
-(4 GiB), `vlpds_firehose_ring_bytes`, `vlpds_log_live_ring_bytes`,
-`vlpds_firehose_merge_queue_bytes`, `slatedb_db_total_mem_size_bytes`.
+`vlpds_memory_budget_bytes{part}` (the node's plan: fixed costs and the cache
+pool, sized from the limit; `vlpds --memory-plan`),
+`vlpds_memory_cache_bytes{cache,kind}` (the pool's SST metadata, SST block and repo caches),
+`sum by (instance) (vlpds_repo_cache_bytes)` (loaded MST paths) vs `vlpds_repo_cache_capacity_bytes`,
+`mst_store` node cache (`--lazy-mst-node-cache-mb`, 256 MiB), `vlpds_cache_bytes`
+(`--cache-budget-mb`, default 10% of the budget), `vlpds_firehose_ring_bytes`, `vlpds_log_live_ring_bytes`,
+`vlpds_firehose_merge_queue_bytes`, `slatedb_db_total_mem_size_bytes`. The caches stay within the
+plan, so RSS past it is usually allocator retention (`vlpds_jemalloc_bytes`), memtables, or bodies in flight.
 
-**Do:** lower the budgets that dominate, or move to a bigger box.
+**Do:** lower the budget (`--memory-budget-mb`, e.g. 80%) or the fixed costs that dominate, or move to a bigger box.
 
 ### VlpdsMemoryCritical
 

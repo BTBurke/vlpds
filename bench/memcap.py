@@ -9,9 +9,11 @@ MemoryMax and MemorySwapMax=0 inside the vlpds-bench slice, whose MemoryMax
 is the budget minus MinIO. A runaway is OOM-killed inside its own cgroup and
 never pushes the host into swap.
 
-Each node's cache flags are derived from its cap (node_flags), and a
-requested flag (driver option, NODE_EXTRA / VLPDS_EXTRA) that doesn't fit
-the cap makes the driver refuse to start.
+Each node runs with `--memory-budget-mb <its cap>` and sizes its own caches
+(src/memory.rs); a requested flag (driver option, NODE_EXTRA / VLPDS_EXTRA)
+that `vlpds --memory-plan` says doesn't fit the cap makes the driver refuse
+to start (node_flags). Binaries from before the budget get every cache flag
+derived here instead (legacy_node_flags).
 
 Env:
   BENCH_MEMCAP        auto (default: wrap when `systemd-run --user` works),
@@ -24,7 +26,7 @@ Env:
   BENCH_SLICE         vlpds-bench.slice
 
     memcap.py plan --nodes 4 [--loadgens 4] [--no-minio]   # the split, as JSON
-    memcap.py node --cap-mb 8000 [-- <vlpds flags>]        # one node's cache flags
+    memcap.py node --cap-mb 8000 [--vlpds BIN] [-- <vlpds flags>]  # one node's memory flags (checked by BIN)
     memcap.py minio-mb | slice-mb | disk <path> | check-avail
 """
 import json
@@ -105,10 +107,16 @@ def host_plan(nodes, loadgens=0, minio=True, ram_mb=None, driver=True, budget_mb
 
 # ------------------------------------------------------------------ vlpds cache flags
 
-# src/main.rs defaults (MiB). Budgeted against a node's cap: the caches it
-# fills (block, meta, repo, MST nodes, `--cache-budget-mb`), the firehose and
-# log rings, backfill buffers, plus HEADROOM for memtables, in-flight bodies
-# and allocator slack.
+# vlpds sizes its own caches from a memory budget (src/memory.rs): each node
+# gets `--memory-budget-mb <its cap>` (the same as the scope's MemoryMax, so
+# runs without scopes size alike), and only flags the operator asked for.
+# `vlpds --memory-plan` is the refusal check: it exits non-zero when the
+# requested flags don't fit the cap.
+BUDGET_FLAG = "--memory-budget-mb"
+
+# The flags split_flags pulls out of NODE_EXTRA (passed to vlpds as requested
+# sizes), with the defaults of binaries older than BUDGET_FLAG (MiB), which
+# legacy_node_flags budgets itself.
 DEFAULTS = {"--block-cache-mb": 4096, "--meta-cache-mb": 0, "--repo-cache-mb": 4096, "--lazy-mst-node-cache-mb": 256,
             "--cache-budget-mb": 0, "--firehose-ring-mb": 512, "--live-ring-mb": 128, "--firehose-merge-queue-mb": 256,
             "--backfill-cache-mb": 256, "--backfill-readahead-mb": 64}
@@ -156,15 +164,53 @@ def vlpds_flags(exe):
     return _HELP[exe]
 
 
-def node_flags(cap_mb, requested=None, prefer=None, meta_mb=None, supported=None):
-    """Every budgeted flag for one node capped at `cap_mb`.
+def local_plan(exe):
+    """A `check` for node_flags that runs `exe --memory-plan` here."""
+    def check(argv):
+        try:
+            r = subprocess.run([exe, "--memory-plan", *argv], capture_output=True, text=True, timeout=60)
+        except OSError as e:
+            return False, str(e)
+        return r.returncode == 0, (r.stdout.strip().splitlines() or [""])[-1] if r.returncode == 0 else r.stderr.strip()[-600:]
+    return check
 
-    requested: flags the operator set (driver options, NODE_EXTRA); kept as
-    given, and if they don't fit the cap this refuses. prefer: wanted sizes for
-    the pool caches not requested (e.g. vlpds's defaults, for comparability);
-    shrunk to fit. Without `prefer` the pool fills what's left: meta_mb (or 10%),
-    the rest split evenly between block and repo.
-    Returns (argv, breakdown)."""
+
+def node_flags(cap_mb, requested=None, prefer=None, meta_mb=None, supported=None, check=None):
+    """The memory flags of one node capped at `cap_mb`: (argv, breakdown).
+
+    A binary with BUDGET_FLAG gets it and the requested flags (operator
+    choices: driver options, NODE_EXTRA), which `check(argv) -> (ok, out)`
+    (`vlpds --memory-plan`, here or on the node's host) must accept, or this
+    refuses; without `check`, vlpds refuses at start instead. A size of 0
+    for the block or metadata cache means automatic. `prefer` and `meta_mb`
+    only steer older binaries (legacy_node_flags)."""
+    supported = supported or set(DEFAULTS) | {BUDGET_FLAG}
+    if BUDGET_FLAG not in supported:
+        return legacy_node_flags(cap_mb, requested, prefer, meta_mb, supported)
+    req = {k: v for k, v in (requested or {}).items() if not (k in ("--block-cache-mb", "--meta-cache-mb") and not v)}
+    argv = [BUDGET_FLAG, str(int(cap_mb))]
+    for k, v in req.items():
+        if k in supported:
+            argv += [k, str(int(v))]
+    brk = {"cap_mb": int(cap_mb), "requested": req, "flags": dict(zip(argv[::2], argv[1::2]))}
+    if check:
+        ok, out = check(argv)
+        if not ok:
+            raise BudgetError(f"memcap: vlpds refuses {' '.join(argv)} for a {int(cap_mb)} MiB node: {out}. "
+                              f"Lower the requested sizes or give the node more (fewer nodes, BENCH_MEM_GB).")
+        try:
+            brk["plan"] = json.loads(out)
+        except ValueError:
+            pass
+    return argv, brk
+
+
+def legacy_node_flags(cap_mb, requested=None, prefer=None, meta_mb=None, supported=None):
+    """node_flags for binaries without BUDGET_FLAG: every budgeted flag,
+    derived here. requested: kept as given (refused if they don't fit the
+    cap). prefer: wanted sizes for the pool caches not requested, shrunk to
+    fit. Without `prefer` the pool fills what's left: meta_mb (or 10%), the
+    rest split evenly between block and repo."""
     BLK, META = "--block-cache-mb", "--meta-cache-mb"
     req = dict(requested or {})
     supported = supported or set(DEFAULTS)
@@ -219,12 +265,14 @@ def node_flags(cap_mb, requested=None, prefer=None, meta_mb=None, supported=None
 
 
 def plan_node_args(exe, cap_mb, extra=(), prefer=None, meta_mb=None, requested=None):
-    """node_flags for a native binary: pulls budgeted flags out of `extra`
-    (they'd be passed twice otherwise, which clap rejects). Returns (argv to
-    append, the rest of extra, breakdown)."""
+    """node_flags for a native binary, checked with its --memory-plan: pulls
+    budgeted flags out of `extra` (they'd be passed twice otherwise, which
+    clap rejects). Returns (argv to append, the rest of extra, breakdown)."""
     got, rest = split_flags(extra)
     req = {**(requested or {}), **got}
-    argv, brk = node_flags(cap_mb, req, prefer=prefer, meta_mb=meta_mb, supported=vlpds_flags(exe))
+    sup = vlpds_flags(exe)
+    argv, brk = node_flags(cap_mb, req, prefer=prefer, meta_mb=meta_mb, supported=sup,
+                           check=local_plan(exe) if BUDGET_FLAG in sup else None)
     return argv, rest, brk
 
 
@@ -377,6 +425,7 @@ def main(argv):
     ap.add_argument("--cap-mb", type=int, default=0)
     ap.add_argument("--meta-mb", type=int, default=0)
     ap.add_argument("--prefer-defaults", action="store_true")
+    ap.add_argument("--vlpds", default="", help="node: the binary whose --memory-plan checks the flags")
     a, extra = ap.parse_known_args(argv)
     extra = [x for x in extra if x != "--"]
     ram = int(a.ram_gb * GiB) if a.ram_gb else None
@@ -387,7 +436,10 @@ def main(argv):
         print(json.dumps(p, indent=1))
     elif a.cmd == "node":
         got, rest = split_flags(extra)
-        argv_, brk = node_flags(a.cap_mb, got, prefer=DEFAULTS if a.prefer_defaults else None, meta_mb=a.meta_mb)
+        if a.vlpds:
+            argv_, rest, brk = plan_node_args(a.vlpds, a.cap_mb, extra, prefer=DEFAULTS if a.prefer_defaults else None, meta_mb=a.meta_mb)
+        else:
+            argv_, brk = node_flags(a.cap_mb, got, prefer=DEFAULTS if a.prefer_defaults else None, meta_mb=a.meta_mb)
         print(" ".join(argv_ + rest))
         log(json.dumps(brk))
     elif a.cmd == "minio-mb":

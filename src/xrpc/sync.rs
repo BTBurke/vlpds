@@ -184,7 +184,30 @@ async fn get_checkout(
 /// MiB of `M/` nodes exports may hold at once: an export reads its repo's
 /// whole `M/` range with one scan (~32 B/record held), taking 1 MiB grants
 /// as it goes (past them, see [`crate::mst_store::prefetch_tree`]).
-static EXPORT_PREFETCH_MB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(512);
+static EXPORT_PREFETCH_MB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(EXPORT_PREFETCH_POOL_MAX_MB);
+const EXPORT_PREFETCH_POOL_MAX_MB: usize = 512;
+const EXPORT_PREFETCH_MB_PER_SLOT: usize = 16;
+
+fn export_prefetch_pool_mb(max_exports: usize) -> usize {
+    max_exports.saturating_mul(EXPORT_PREFETCH_MB_PER_SLOT).min(EXPORT_PREFETCH_POOL_MAX_MB)
+}
+
+/// Shrinks the exports' `M/` read-ahead pool to fit `max_exports` slots.
+/// Process-wide: the first call wins.
+pub fn size_export_prefetch_pool(max_exports: usize) {
+    static SIZED: std::sync::Once = std::sync::Once::new();
+    SIZED.call_once(|| {
+        EXPORT_PREFETCH_MB.forget_permits(EXPORT_PREFETCH_POOL_MAX_MB - export_prefetch_pool_mb(max_exports));
+    });
+}
+
+/// Memory `max_exports` streaming exports may hold: each one's records fed
+/// ahead of its walk and its queued body chunks, plus the shared `M/`
+/// read-ahead pool (src/memory.rs budgets it).
+pub fn export_memory_bytes(max_exports: usize) -> u64 {
+    let per = EXPORT_FEED * EXPORT_BATCH_BYTES + EXPORT_QUEUE * EXPORT_CHUNK;
+    (max_exports * per + (export_prefetch_pool_mb(max_exports) << 20)) as u64
+}
 static EXPORT_PREFETCH_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 /// Tests: caps each export's `M/` read-ahead (0: every node read one by one).

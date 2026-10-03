@@ -108,31 +108,70 @@ impl RecentRepos {
 }
 
 /// One block/meta cache shared by every shard DB in the process: SlateDB's
-/// default private caches per Db grow with the shard count.
+/// default private caches per Db grow with the shard count. Sized by
+/// src/memory.rs; these are the sizes they start at.
 static BLOCK_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(4 << 30);
-/// 0: a quarter of the block cache.
-static META_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static META_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1 << 30);
+/// 0: none.
+static BLOCK_CACHE_PINNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Takes effect only before the first shard DB opens.
+/// Tests and benches: a fixed block cache size, as `--block-cache-mb` (the
+/// process's memory plan, made by the first node built, takes it).
 pub fn set_block_cache_bytes(n: u64) {
-    BLOCK_CACHE_BYTES.store(n.max(64 << 20), std::sync::atomic::Ordering::Relaxed);
+    let n = n.max(MIN_BLOCK_CACHE_BYTES);
+    BLOCK_CACHE_PINNED.store(n, std::sync::atomic::Ordering::Relaxed);
+    resize_caches(n, META_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed));
 }
 
-/// The SST metadata (filter + index) cache, on top of the block cache; 0 =
-/// a quarter of the block cache. Takes effect only before the first shard
-/// DB opens.
-pub fn set_meta_cache_bytes(n: u64) {
-    META_CACHE_BYTES.store(n, std::sync::atomic::Ordering::Relaxed);
+pub fn pinned_block_cache_bytes() -> Option<u64> {
+    Some(BLOCK_CACHE_PINNED.load(std::sync::atomic::Ordering::Relaxed)).filter(|n| *n > 0)
 }
 
-pub fn meta_cache_bytes() -> u64 {
-    match META_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed) / 4,
-        n => n.max(MIN_META_CACHE_BYTES),
+const MIN_BLOCK_CACHE_BYTES: u64 = 16 << 20;
+const MIN_META_CACHE_BYTES: u64 = 4 << 20;
+
+/// Resizes the shared caches (or sets the sizes they will be created
+/// with). A smaller size evicts down to it now.
+pub fn resize_caches(block: u64, meta: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let block = block.max(MIN_BLOCK_CACHE_BYTES);
+    let meta = meta.max(MIN_META_CACHE_BYTES);
+    BLOCK_CACHE_BYTES.store(block, Relaxed);
+    META_CACHE_BYTES.store(meta, Relaxed);
+    if let Some(b) = BLOCK.get() {
+        b.resize(block);
+    }
+    if let Some(m) = META.get() {
+        m.0.set_capacity(meta as usize);
+        crate::metrics::META_CACHE_CAPACITY.set(meta as i64);
     }
 }
 
-const MIN_META_CACHE_BYTES: u64 = 4 << 20;
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheStats {
+    pub block_capacity: u64,
+    pub block_used: u64,
+    pub meta_capacity: u64,
+    pub meta_used: u64,
+    pub meta_loads: u64,
+    pub meta_evictions: u64,
+}
+
+/// The shared caches now (configured sizes before they exist).
+pub fn cache_stats() -> CacheStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut s = CacheStats { block_capacity: BLOCK_CACHE_BYTES.load(Relaxed), meta_capacity: META_CACHE_BYTES.load(Relaxed), ..Default::default() };
+    if let Some(b) = BLOCK.get() {
+        (s.block_capacity, s.block_used) = (b.capacity(), b.0.usage() as u64);
+    }
+    if let Some(m) = META.get() {
+        s.meta_capacity = m.capacity() as u64;
+        s.meta_used = m.bytes() as u64;
+        s.meta_loads = m.1.load(Relaxed);
+        s.meta_evictions = m.0.evictions();
+    }
+    s
+}
 
 static CACHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -141,25 +180,26 @@ pub fn bump_cache_epoch() {
     CACHE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+static BLOCK: std::sync::OnceLock<Arc<BlockCache>> = std::sync::OnceLock::new();
+static META: std::sync::OnceLock<Arc<MetaCache>> = std::sync::OnceLock::new();
+
 fn shared_db_cache() -> Arc<dyn slatedb::db_cache::DbCache> {
-    use slatedb::db_cache::{foyer::{FoyerCache, FoyerCacheOptions}, SplitCache};
+    use slatedb::db_cache::SplitCache;
     static CACHE: std::sync::OnceLock<Arc<dyn slatedb::db_cache::DbCache>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let mk = |cap| -> Arc<dyn slatedb::db_cache::DbCache> {
-                Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions { max_capacity: cap, ..Default::default() }))
-            };
-            let block = BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+            let block: Arc<dyn slatedb::db_cache::DbCache> = BLOCK
+                .get_or_init(|| Arc::new(BlockCache::new(BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed))))
+                .clone();
             let meta: Arc<dyn slatedb::db_cache::DbCache> = shared_meta_cache().clone();
-            Arc::new(SplitCache::new().with_block_cache(Some(mk(block))).with_meta_cache(Some(meta)))
+            Arc::new(SplitCache::new().with_block_cache(Some(block)).with_meta_cache(Some(meta)))
         })
         .clone()
 }
 
 fn shared_meta_cache() -> &'static Arc<MetaCache> {
-    static META: std::sync::OnceLock<Arc<MetaCache>> = std::sync::OnceLock::new();
     META.get_or_init(|| {
-        let meta = Arc::new(MetaCache::new(meta_cache_bytes()));
+        let meta = Arc::new(MetaCache::new(META_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed)));
         crate::metrics::META_CACHE_CAPACITY.set(meta.capacity() as i64);
         crate::metrics::on_render(|| {
             crate::metrics::META_CACHE_BYTES.set(shared_meta_cache().bytes() as i64);
@@ -169,11 +209,94 @@ fn shared_meta_cache() -> &'static Arc<MetaCache> {
     })
 }
 
+/// The shared SST block cache: Foyer, as SlateDB's `FoyerCache`, which
+/// can't be resized. Foyer's `capacity()` keeps the size it was built
+/// with, so the current one is kept here.
+pub struct BlockCache(foyer::Cache<slatedb::db_cache::CachedKey, slatedb::db_cache::CachedEntry>, std::sync::atomic::AtomicU64);
+
+impl BlockCache {
+    pub fn new(bytes: u64) -> BlockCache {
+        let shards = std::thread::available_parallelism().map_or(8, |n| n.get());
+        BlockCache(
+            foyer::CacheBuilder::new(bytes as usize)
+                .with_weighter(|_, v: &slatedb::db_cache::CachedEntry| v.size())
+                .with_shards(shards)
+                .build(),
+            std::sync::atomic::AtomicU64::new(bytes),
+        )
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.1.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn resize(&self, bytes: u64) {
+        if self.1.swap(bytes, std::sync::atomic::Ordering::Relaxed) != bytes {
+            if let Err(e) = self.0.resize(bytes as usize) {
+                tracing::warn!("resizing the SST block cache to {} MiB failed: {e}", bytes >> 20);
+            }
+        }
+    }
+
+    /// Single-flight per key (Foyer's `get_or_fetch`).
+    async fn fetch(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        use slatedb::db_cache::CacheFetch;
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = ran.clone();
+        let got = self.0.get_or_fetch(&key, move || {
+            r.store(true, std::sync::atomic::Ordering::Relaxed);
+            loader()
+        });
+        match got.await {
+            Ok(e) if ran.load(std::sync::atomic::Ordering::Relaxed) => Ok(CacheFetch::miss(e.value().clone())),
+            Ok(e) => Ok(CacheFetch::hit(e.value().clone())),
+            Err(e) => Err(slatedb::Error::unavailable(format!("SST block cache load: {e}"))),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl slatedb::db_cache::DbCache for BlockCache {
+    async fn get_block(&self, key: &MetaKey) -> Result<Option<MetaEntry>, slatedb::Error> {
+        Ok(self.0.get(key).map(|e| e.value().clone()))
+    }
+    async fn get_index(&self, key: &MetaKey) -> Result<Option<MetaEntry>, slatedb::Error> {
+        Ok(self.0.get(key).map(|e| e.value().clone()))
+    }
+    async fn get_filter(&self, key: &MetaKey) -> Result<Option<MetaEntry>, slatedb::Error> {
+        Ok(self.0.get(key).map(|e| e.value().clone()))
+    }
+    async fn get_stats(&self, key: &MetaKey) -> Result<Option<MetaEntry>, slatedb::Error> {
+        Ok(self.0.get(key).map(|e| e.value().clone()))
+    }
+    async fn insert(&self, key: MetaKey, value: MetaEntry) {
+        self.0.insert(key, value);
+    }
+    async fn remove(&self, key: &MetaKey) {
+        self.0.remove(key);
+    }
+    fn entry_count(&self) -> u64 {
+        self.0.entries() as u64
+    }
+    async fn fetch_block(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        self.fetch(key, loader).await
+    }
+    async fn fetch_index(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        self.fetch(key, loader).await
+    }
+    async fn fetch_filter(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        self.fetch(key, loader).await
+    }
+    async fn fetch_stats(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        self.fetch(key, loader).await
+    }
+}
+
 type MetaKey = slatedb::db_cache::CachedKey;
 type MetaEntry = slatedb::db_cache::CachedEntry;
 
 /// The shared SST metadata cache (filters, indexes, stats); see [`ClockCache`].
-pub struct MetaCache(ClockCache<MetaKey, MetaEntry>);
+pub struct MetaCache(ClockCache<MetaKey, MetaEntry>, std::sync::atomic::AtomicU64);
 
 impl Weigh for MetaEntry {
     fn weight(&self) -> usize {
@@ -183,7 +306,7 @@ impl Weigh for MetaEntry {
 
 impl MetaCache {
     pub fn new(bytes: u64) -> MetaCache {
-        MetaCache(ClockCache::new(bytes))
+        MetaCache(ClockCache::new(bytes), Default::default())
     }
 
     pub fn capacity(&self) -> usize {
@@ -204,6 +327,7 @@ impl MetaCache {
                 CacheFetch::hit(entry)
             }
             Lookup::Loaded => {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 crate::metrics::META_CACHE_LOADS.with_label_values(&[kind, "fetched"]).inc();
                 CacheFetch::miss(entry)
             }
@@ -278,8 +402,9 @@ type LoadLocks<K, V> = parking_lot::Mutex<std::collections::HashMap<K, Arc<tokio
 pub(crate) struct ClockCache<K, V> {
     shards: Vec<parking_lot::RwLock<ClockShard<K, V>>>,
     loading: Vec<LoadLocks<K, V>>,
-    capacity: usize,
+    capacity: std::sync::atomic::AtomicUsize,
     bytes: std::sync::atomic::AtomicUsize,
+    evictions: std::sync::atomic::AtomicU64,
     hasher: std::hash::RandomState,
 }
 
@@ -309,10 +434,20 @@ impl<K: std::hash::Hash + Eq + Clone, V> ClockShard<K, V> {
     /// rest) until it has freed `need` bytes, never `keep` (the entry just
     /// inserted). Returns the bytes freed.
     fn evict(&mut self, need: usize, keep: usize) -> usize {
+        self.sweep(need, keep, true)
+    }
+
+    /// One turn of the hand taking only unreferenced entries, bits kept.
+    fn evict_cold(&mut self, need: usize) -> usize {
+        self.sweep(need, usize::MAX, false)
+    }
+
+    fn sweep(&mut self, need: usize, keep: usize, clear: bool) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let n = self.slots.len();
         let (mut steps, mut freed) = (0, 0);
-        while freed < need && steps < 2 * n {
+        let turns = if clear { 2 } else { 1 };
+        while freed < need && steps < turns * n {
             let h = self.hand;
             self.hand = (h + 1) % n;
             steps += 1;
@@ -321,7 +456,8 @@ impl<K: std::hash::Hash + Eq + Clone, V> ClockShard<K, V> {
             }
             match &self.slots[h] {
                 None => continue,
-                Some(s) if s.used.swap(false, Relaxed) => continue,
+                Some(s) if clear && s.used.swap(false, Relaxed) => continue,
+                Some(s) if !clear && s.used.load(Relaxed) => continue,
                 Some(_) => {}
             }
             let s = self.slots[h].take().expect("checked above");
@@ -346,14 +482,39 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone + Weigh> ClockCache<K, V> {
         ClockCache {
             shards: (0..CLOCK_SHARDS).map(|_| Default::default()).collect(),
             loading: (0..CLOCK_SHARDS).map(|_| Default::default()).collect(),
-            capacity: bytes as usize,
+            capacity: std::sync::atomic::AtomicUsize::new(bytes as usize),
             bytes: Default::default(),
+            evictions: Default::default(),
             hasher: Default::default(),
         }
     }
 
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.capacity.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Lowering it evicts down to it now.
+    pub fn set_capacity(&self, bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.capacity.store(bytes, Relaxed);
+        let mut over = self.bytes().saturating_sub(bytes);
+        // unreferenced entries in every shard before any referenced one
+        for (cold, j) in (0..2 * CLOCK_SHARDS).map(|d| (d < CLOCK_SHARDS, d % CLOCK_SHARDS)) {
+            if over == 0 {
+                break;
+            }
+            let mut sh = self.shards[j].write();
+            let freed = if cold { sh.evict_cold(over) } else { sh.evict(over, usize::MAX) };
+            drop(sh);
+            self.bytes.fetch_sub(freed, Relaxed);
+            self.evictions.fetch_add((freed > 0) as u64, Relaxed);
+            over = over.saturating_sub(freed);
+        }
+    }
+
+    /// Inserts that went over the capacity, and shrinks that evicted.
+    pub fn evictions(&self) -> u64 {
+        self.evictions.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn bytes(&self) -> usize {
@@ -409,10 +570,11 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone + Weigh> ClockCache<K, V> {
                 i
             }
         };
-        let mut over = (self.bytes.fetch_add(size, Relaxed) + size).saturating_sub(self.capacity);
+        let mut over = (self.bytes.fetch_add(size, Relaxed) + size).saturating_sub(self.capacity());
         if over == 0 {
             return;
         }
+        self.evictions.fetch_add(1, Relaxed);
         let freed = s.evict(over, i);
         self.bytes.fetch_sub(freed, Relaxed);
         over = over.saturating_sub(freed);
@@ -712,7 +874,7 @@ pub async fn warm<D: slatedb::DbCacheManagerOps + slatedb::DbMetadataOps + Send 
     use futures::StreamExt;
     use slatedb::CacheTarget;
     let started = std::time::Instant::now();
-    let l0_budget = WARM_L0_BYTES.min(BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed) / 4 / dbs.len().max(1) as u64);
+    let l0_budget = WARM_L0_BYTES.min(cache_stats().block_capacity / 4 / dbs.len().max(1) as u64);
     let meta = shared_meta_cache();
     let mut meta_room = meta.capacity().saturating_sub(meta.bytes()) as u64;
     let mut jobs = Vec::new();
@@ -1773,6 +1935,39 @@ mod clock_cache_tests {
         c.put(keys[10], Kb(10));
         assert_eq!(keys.iter().filter(|k| c.get(k).is_some()).count(), 10, "one evicted for one inserted");
         assert!(c.get(&keys[10]).is_some(), "the new entry stays");
+    }
+
+    /// Lowering the capacity evicts down to it at once (cold entries
+    /// first); raising it lets the cache fill further.
+    #[test]
+    fn resize() {
+        let c = cache_kb(1000);
+        let keys: Vec<u64> = (0..100).collect();
+        for &k in &keys {
+            c.put(k, Kb(10));
+        }
+        for &k in &keys[..20] {
+            assert!(c.get(&k).is_some());
+        }
+        let ev = c.evictions();
+        c.set_capacity(300 << 10);
+        assert_eq!((c.capacity(), c.bytes()), (300 << 10, 300 << 10));
+        assert!(c.evictions() > ev);
+        assert!(keys[..20].iter().all(|k| c.get(k).is_some()), "the hot entries stay");
+        c.set_capacity(2000 << 10);
+        for k in 100..200 {
+            c.put(k, Kb(10));
+        }
+        assert_eq!(c.bytes(), 1300 << 10);
+    }
+
+    #[test]
+    fn block_cache_resizes() {
+        let c = BlockCache::new(64 << 20);
+        c.resize(32 << 20);
+        assert_eq!(c.capacity(), 32 << 20);
+        c.resize(128 << 20);
+        assert_eq!(c.capacity(), 128 << 20);
     }
 
     /// Entries hit since the hand passed outlive one-off loads.

@@ -130,9 +130,21 @@ struct Args {
     /// loaded MST paths (DESIGN.md "Partial MSTs": ~10-20 KB per written
     /// repo, ~3 KB once back to its root). Past it, idle repos drop back to
     /// their root, then the least recently used are evicted (as past
-    /// --cache-per-worker). 0 = no byte bound.
-    #[arg(long, env = "VLPDS_REPO_CACHE_MB", default_value_t = 4096)]
-    repo_cache_mb: usize,
+    /// --cache-per-worker). 0 = no byte bound. Default: half of what the
+    /// memory budget's cache pool leaves after the SST metadata cache.
+    #[arg(long, env = "VLPDS_REPO_CACHE_MB")]
+    repo_cache_mb: Option<u64>,
+    /// The node's memory budget, in MiB or as a percentage of its memory
+    /// limit (e.g. 80%). Default: the limit itself (the tightest cgroup
+    /// memory.max, else physical RAM). The caches not given explicit sizes
+    /// are sized from it (src/memory.rs), and explicit sizes that don't fit
+    /// it refuse to start.
+    #[arg(long, env = "VLPDS_MEMORY_BUDGET_MB")]
+    memory_budget_mb: Option<vlpds::memory::BudgetSpec>,
+    /// Print the memory plan (the budget, its fixed costs and the cache
+    /// pool) as JSON and exit; exits non-zero if the flags don't fit.
+    #[arg(long)]
+    memory_plan: bool,
     /// Cold open: read up to this much of the repo's M/ range (its persisted
     /// interior MST nodes) with one scan (KiB; the average active repo's is
     /// ~0.5 MB), so a disk-cache miss is ~1 object-store round trip instead
@@ -228,18 +240,21 @@ struct Args {
     /// cache dir = not kept (the next start reports reason "none").
     #[arg(long, env = "VLPDS_EXIT_STATE_FILE", default_value = "")]
     exit_state_file: String,
-    /// In-memory SST block cache shared by every shard DB on this node (MiB).
-    #[arg(long, env = "VLPDS_BLOCK_CACHE_MB", default_value_t = 4096)]
-    block_cache_mb: u64,
-    /// In-memory SST metadata (bloom filter + index) cache on top of the
-    /// block cache (MiB; 0 = a quarter of --block-cache-mb). Every point read
-    /// checks a filter per sorted run, so size it to hold
-    /// the filters and indexes of the shards a node may own after a failover
+    /// In-memory SST block cache shared by every shard DB on this node
+    /// (MiB). Default: half of what the memory budget's cache pool leaves
+    /// after the SST metadata cache, resized as that changes (also 0).
+    #[arg(long, env = "VLPDS_BLOCK_CACHE_MB")]
+    block_cache_mb: Option<u64>,
+    /// In-memory SST metadata (bloom filter + index) cache (MiB). Every
+    /// point read checks a filter per sorted run, so it must hold the
+    /// filters and indexes of the shards a node may own after a failover
     /// (~29 MB per million accounts at the capacity test's records
-    /// distribution; `vlpds_sst_meta_bytes` is their encoded size, ~1.3x
-    /// less), plus headroom for compactions in flight.
-    #[arg(long, env = "VLPDS_META_CACHE_MB", default_value_t = 0)]
-    meta_cache_mb: u64,
+    /// distribution), plus headroom for compactions in flight. Default:
+    /// exactly that, from the owned SSTs (`vlpds_sst_meta_need_bytes`) x
+    /// N/(N-1) for N live nodes x 1.25, resized as shards come and go,
+    /// first out of the memory budget's cache pool (also 0).
+    #[arg(long, env = "VLPDS_META_CACHE_MB")]
+    meta_cache_mb: Option<u64>,
     /// SlateDB SST block compression: none, lz4 or zstd.
     #[arg(long, env = "VLPDS_SST_COMPRESSION", default_value = "zstd")]
     sst_compression: String,
@@ -552,8 +567,8 @@ struct Args {
     rate_limit_bypass_key: Option<String>,
     /// Memory budget of the in-memory caches (verified tokens, proxy
     /// accounts and service JWTs, DID documents, lexicons, OAuth clients),
-    /// split between them by weight (MiB). Default: 10% of physical RAM or
-    /// the cgroup limit. The chosen caps are logged at startup.
+    /// split between them by weight (MiB). Default: 10% of the memory
+    /// budget (--memory-budget-mb). The chosen caps are logged at startup.
     #[arg(long, env = "VLPDS_CACHE_BUDGET_MB")]
     cache_budget_mb: Option<u64>,
     /// Entry caps overriding the budget's split, comma-separated
@@ -948,8 +963,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
     if args.wrap_plc_rotation_key {
         return wrap_plc_rotation_key(&args).await;
     }
-    vlpds::partition::set_block_cache_bytes(args.block_cache_mb << 20);
-    vlpds::partition::set_meta_cache_bytes(args.meta_cache_mb << 20);
     vlpds::partition::set_sst_compression(args.sst_compression.parse()?);
     vlpds::partition::set_compaction_polling(args.compaction_polling.parse()?);
     vlpds::partition::set_compaction_poll_interval(vlpds::retention::parse_duration(&args.compaction_poll)?);
@@ -1011,7 +1024,12 @@ async fn run(args: Args) -> anyhow::Result<()> {
         shards: args.shards,
         workers: args.workers.unwrap_or_else(default_workers).max(1),
         cache_per_worker: args.cache_per_worker,
-        repo_cache_bytes: args.repo_cache_mb << 20,
+        memory: vlpds::memory::Settings {
+            budget: args.memory_budget_mb,
+            block: args.block_cache_mb.filter(|m| *m > 0).map(|m| m << 20),
+            meta: args.meta_cache_mb.filter(|m| *m > 0).map(|m| m << 20),
+            repo: args.repo_cache_mb.map(|m| m << 20),
+        },
         lazy_mst_prefetch_bytes: (args.lazy_mst_prefetch_kb << 10) as usize,
         lazy_mst_unload_idle: false,
         lazy_mst_node_cache_bytes: (args.lazy_mst_node_cache_mb << 20) as usize,
@@ -1109,6 +1127,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
         forwarded_write_start: (args.forwarded_write_start_ms > 0).then(|| Duration::from_millis(args.forwarded_write_start_ms)),
         retry_unapplied_writes: args.retry_unapplied_writes,
     };
+    if args.memory_plan {
+        println!("{}", cfg.memory_plan()?.to_json());
+        return Ok(());
+    }
     cfg.check_secrets()?;
     if let Some(c) = &cfg.cluster {
         vlpds::metrics::export_lease_config(c.ttl, c.renew_every, c.skew);

@@ -16,6 +16,7 @@ pub mod events;
 pub mod lexicon;
 pub mod lifecycle;
 pub mod mail;
+pub mod memory;
 pub mod firehose;
 pub mod forward;
 pub mod handle_policy;

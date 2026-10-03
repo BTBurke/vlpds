@@ -569,6 +569,16 @@ ts("Repo cache: share of byte budget, repos held", [t(by_node(f"sum by (instance
                                                     t(f"sum(vlpds_cached_repos{{{I}}})", "cached repos (all)")], "percentunit",
    overrides=[right_axis("cached repos (all)", "short")],
    desc="Loaded MST paths per node over --repo-cache-mb. Near 100%, idle repos drop back to their roots, then the least recently used are evicted.")
+ts("Memory plan (busiest node)", [t(f'max by (part) (vlpds_memory_budget_bytes{{{I}, part!="budget"}})', "{{part}}")], "bytes", stack=True,
+   desc="The node's memory budget (its limit, or --memory-budget-mb) as fixed costs plus the pool for the SST metadata, SST block and repo "
+        "caches (src/memory.rs). `vlpds --memory-plan` prints it.")
+ts("Pool caches: target, capacity, used", [t(f'sum by (cache, kind) (vlpds_memory_cache_bytes{{{I}}})', "{{cache}} {{kind}}"),
+                                           t(f"sum(vlpds_repo_cache_bytes{{{I}}})", "repo used"),
+                                           t(f"sum(vlpds_meta_cache_shortfall_bytes{{{I}}})", "meta shortfall")], "bytes",
+   overrides=[dashed("meta shortfall")],
+   desc=f"meta target: the owned SSTs' decoded filters + indexes (vlpds_sst_meta_need_bytes) x N/(N-1) x 1.25; the block and repo caches split "
+        f"the rest of the pool. Grows at once, shrinks after 5 min. A shortfall (the pool can't fit the target) is logged and feeds "
+        f"{rb('VlpdsSstMetaCacheTooSmall')}.")
 ts("Lazy MST", [rate("vlpds_lazy_mst_reads_total", by="kind", legend="reads {{kind}}"), rate("vlpds_lazy_mst_fetches_total", by="result", legend="fetches {{result}}"),
                 rate("vlpds_lazy_mst_unloads_total", legend="unloads"), rate("vlpds_lazy_mst_fallbacks_total", by="reason", legend="fallback {{reason}}"),
                 rate("vlpds_repo_preloads_total", by="result", legend="preload {{result}}")], "ops", nonzero=True, empty="idle",

@@ -973,7 +973,7 @@ def config(argv):
     ap.add_argument("--block-cache-mb", type=int, default=0, help="default: derived from the node's memory cap")
     ap.add_argument("--repo-cache-mb", type=int, default=0, help="default: derived from the node's memory cap")
     ap.add_argument("--meta-cache-mb", type=int, default=0,
-                    help="default: ~29 MB per million accounts a node may own after a failover, within the node's cap")
+                    help="default: vlpds sizes it to the owned SSTs' metadata (src/memory.rs)")
     ap.add_argument("--cache-budget-mb", type=int, default=512)
     ap.add_argument("--log-retention", default="5m", help="segments kept for firehose backfill (bulk + stairs write ~0.6 KB/account and ~2-5 KB/commit)")
     ap.add_argument("--checkpoint-lifetime", default="2m")
@@ -1018,7 +1018,7 @@ def config(argv):
             raise
         c.node_flags, c.node_extra = [], os.environ.get("NODE_EXTRA", "").split()
     fl = dict(zip(c.node_flags[::2], c.node_flags[1::2]))
-    c.block_cache_mb, c.repo_cache_mb = fl.get("--block-cache-mb", "?"), fl.get("--repo-cache-mb", "?")
+    c.block_cache_mb, c.repo_cache_mb = fl.get("--block-cache-mb", "auto"), fl.get("--repo-cache-mb", "auto")
     c.dist_args_str = (f"real/scale={c.dist_scale:g}/knee={c.dist_knee}/group={c.dist_group}" if c.dist == "real" else f"fixed/{c.records}")
     return c
 
