@@ -238,15 +238,18 @@ def build(g):
     stat("Accounts", [t(f'sum(vlpds_accounts{{{C}, status="active"}})', "active"),
                       t(f'sum(vlpds_accounts{{{C}, status="deactivated"}})', "deactivated"),
                       t(f'sum(vlpds_accounts{{{C}, status=~"takendown|suspended"}})', "taken down / suspended")],
-         w=8, h=4, text_mode="value_and_name", spark=False, no_value="counting...",
-         desc="Accounts hosted here by status, counted every 15 minutes (--account-stats-interval-secs) by each server for its share; while a server is down its share is missing until the next count. "
+         w=8, h=4, text_mode="value_and_name", spark=False, no_value="no data",
+         desc="Accounts hosted here by status: exact, kept up to date with every account change, each server reporting the share it holds right now "
+              "(while a server is down, its share is missing until another server takes its accounts over, within seconds). "
               "Deactivated accounts were paused by their owner; taken down / suspended ones by a moderator.")
     stat("Accounts that posted or changed something", [t(f'sum(vlpds_repos_written_within{{{C}, window="1d"}})', "last day"),
                                                        t(f'sum(vlpds_repos_written_within{{{C}, window="7d"}})', "last week"),
                                                        t(f'sum(vlpds_repos_written_within{{{C}, window="30d"}})', "last month")],
-         w=8, h=4, text_mode="value_and_name", spark=False, no_value="counting...",
+         w=8, h=4, text_mode="value_and_name", spark=False, no_value="no data",
          desc="Accounts with any new post, like, follow, profile change etc. in the window (your active users), "
-              "counted every 15 minutes. People who only read don't show here; see Sign-ins.")
+              "counted in whole UTC days: \"last day\" is yesterday and today, \"last week\" the last 7 days and today, so each "
+              "covers up to one day more than its name. Exact otherwise, kept up to date with every write. "
+              "People who only read don't show here; see Sign-ins.")
     stat("Sign-ups (24 h)", [t(day("vlpds_signups_total", 'result="created"'), "new accounts"),
                              t(day("vlpds_signups_total", 'result!~"created|error"'), "refused")],
          w=4, h=4, text_mode="value_and_name", spark=False,
@@ -396,7 +399,7 @@ def build(g):
                         t(f'sum(vlpds_disk_cache_bytes{{{C}, kind="used"}}) / sum(vlpds_disk_cache_bytes{{{C}, kind="capacity"}})', "of its limit")],
          "bytes", w=8, h=4, decimals=1, no_value="not configured", spark=False, text_mode="value_and_name",
          overrides=[unit("of its limit", "percentunit")],
-         desc="Local disk cache (--cache-dir) used out of its size limit, updated every 15 minutes. It saves storage "
+         desc="Local disk cache (--cache-dir) used out of its size limit (the cache's own count of its files). It saves storage "
               "requests; full is normal (oldest entries make room).")
     stat("Estimated storage request bill",
          f'(sum(rate(vlpds_object_store_requests_total{{{C}, op=~"{CLASS_A_OPS}"}}[1h])) * {MONTH_SECONDS} / 1e6 * $class_a_price) '

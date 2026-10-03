@@ -113,6 +113,8 @@ async fn migrate_account_with_records_and_blobs() {
     assert_eq!((st["indexedRecords"].clone(), st["expectedBlobs"].clone()), (json!(0), json!(0)), "{st}");
     let rs = new.repo_status(&did).await.ok();
     assert_eq!((rs["active"].clone(), rs["status"].clone()), (json!(false), json!("deactivated")), "{rs}");
+    // the dashboard's totals count it as deactivated (created so, migration in)
+    assert_eq!(vlpds::xrpc::totals(&new.app).accounts, [0, 1, 0, 0, 0]);
 
     // repo
     new.import_repo(&auth, old.get_repo_car(&did).await).await.ok();
@@ -156,6 +158,7 @@ async fn migrate_account_with_records_and_blobs() {
     new.xrpc.post_empty("com.atproto.server.activateAccount", &auth).await.ok();
     let st = account_status(&new, &auth).await;
     assert_eq!(st["activated"], json!(true), "{st}");
+    assert_eq!(vlpds::xrpc::totals(&new.app).accounts, [1, 0, 0, 0, 0]);
 
     // the first events for the DID here are the activation's
     let frames = sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.did() == Some(did.as_str()) && f.kind() == "#sync")).await;

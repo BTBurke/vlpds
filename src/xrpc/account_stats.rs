@@ -1,41 +1,68 @@
-//! Periodic totals for the operator dashboard: accounts by status, repos
-//! written recently, and the SST disk cache's size. Each node exports its
-//! own shards' share and the dashboard sums the nodes; a shard moving
-//! mid-interval is counted by both or neither until the next pass. Scanned
-//! once per interval, never per scrape.
+//! Totals for the operator dashboard: accounts by status, repos written
+//! recently, and the SST disk cache's size. The account totals are kept by
+//! the shards themselves (crate::totals) and summed over this node's shards
+//! at scrape; the dashboard sums the nodes. A shard counts on the node that
+//! has it open, so its totals move with it.
 
 use super::*;
-use std::time::Duration;
+use crate::totals::{self, Totals};
 
-/// (label, seconds)
-const WINDOWS: [(&str, u64); 3] = [("1d", 86_400), ("7d", 7 * 86_400), ("30d", 30 * 86_400)];
-const STATUSES: [&str; 5] = ["active", "deactivated", "takendown", "suspended", "other"];
-
-#[derive(Default, Debug, PartialEq)]
-pub struct Counts {
-    /// By [`STATUSES`] index.
-    pub accounts: [i64; 5],
-    pub repos: i64,
-    pub written_within: [i64; 3],
+/// The totals of the shards this node has open, as of the last entry each
+/// one's sequencer took.
+pub fn totals(app: &App) -> Totals {
+    let mut t = Totals::default();
+    for s in app.log.sinks.all() {
+        t.merge(s.totals.lock().sum());
+    }
+    t
 }
 
-fn status_index(status: Option<&str>) -> usize {
-    match status {
-        None => 0,
-        Some(s) => STATUSES[1..4].iter().position(|k| *k == s).map_or(4, |i| i + 1),
+fn export(app: &App) {
+    let t = totals(app);
+    for (i, s) in totals::STATUSES.iter().enumerate() {
+        metrics::ACCOUNTS.with_label_values(&[s]).set(t.accounts[i]);
+    }
+    let today = totals::today();
+    for (w, days) in totals::WINDOWS {
+        metrics::REPOS_WRITTEN_WITHIN.with_label_values(&[w]).set(t.written_within(days, today));
+    }
+    metrics::REPOS_WRITTEN_WITHIN.with_label_values(&["all"]).set(t.repos());
+    if let Some(cfg) = &app.node.disk_cache {
+        let owned = app.partitions.owned().len().max(1) as u64;
+        let capacity = cfg.node_bytes.unwrap_or_else(|| app.node.shard_disk_cache().map_or(0, |c| c.shard_bytes) * owned);
+        metrics::DISK_CACHE_BYTES.with_label_values(&["capacity"]).set(capacity as i64);
+        if let Some(used) = metrics::slatedb_gauge("slatedb.object_store_cache.cache_bytes") {
+            metrics::DISK_CACHE_BYTES.with_label_values(&["used"]).set(used);
+        }
     }
 }
 
-/// Each shard within its layout range: a split child still reading its
-/// parent's SSTs sees the parent's other keys too.
-pub async fn count(app: &App, now_micros: u64) -> anyhow::Result<Counts> {
+/// Exports at every scrape while the app lives.
+pub fn export_account_totals(app: &Arc<App>) {
+    let app = Arc::downgrade(app);
+    metrics::on_render(move || match app.upgrade() {
+        Some(a) => {
+            export(&a);
+            true
+        }
+        None => false,
+    });
+}
+
+/// The same totals counted from scratch: every account and head row of
+/// this node's shards, from a snapshot each. Costs a read of every account;
+/// for checking the kept totals (tests, debugging), never on a schedule.
+/// Its `days` are uncut: compare windows, not the vector.
+#[doc(hidden)]
+pub async fn scan_totals(app: &App) -> anyhow::Result<Totals> {
     #[derive(serde::Deserialize)]
     struct Status<'a> {
         #[serde(borrow, default)]
         status: Option<std::borrow::Cow<'a, str>>,
     }
     let layout = app.partitions.layout();
-    let mut c = Counts::default();
+    let mut t = Totals::default();
+    let mut days = std::collections::BTreeMap::<u32, i64>::new();
     let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, ..Default::default() };
     for range in &layout.shards {
         let Some(p) = app.partitions.get(range.id) else { continue };
@@ -48,91 +75,17 @@ pub async fn count(app: &App, now_micros: u64) -> anyhow::Result<Counts> {
                 break;
             }
             let status = serde_json::from_slice::<Status>(&kv.value).ok().and_then(|s| s.status);
-            c.accounts[status_index(status.as_deref())] += 1;
+            t.accounts[totals::status_index(status.as_deref()) as usize] += 1;
         }
         let mut heads = state::FamilyScan::new(snap.as_ref(), state::HEAD_FAMILY, Some(state::slot_family(lo, state::HEAD_FAMILY)), &opts).await?;
         while let Some(kv) = heads.next().await? {
             if !in_range(&kv.key) {
                 break;
             }
-            c.repos += 1;
-            let Ok(head) = state::Head::decode(&kv.value) else { continue };
-            let age = now_micros.saturating_sub(head.rev.micros());
-            for (i, (_, secs)) in WINDOWS.iter().enumerate() {
-                if age <= secs * 1_000_000 {
-                    c.written_within[i] += 1;
-                }
-            }
+            let head = state::Head::decode(&kv.value)?;
+            *days.entry(totals::day_of(head.rev)).or_default() += 1;
         }
     }
-    Ok(c)
-}
-
-fn export(c: &Counts) {
-    for (i, s) in STATUSES.iter().enumerate() {
-        metrics::ACCOUNTS.with_label_values(&[s]).set(c.accounts[i]);
-    }
-    for (i, (w, _)) in WINDOWS.iter().enumerate() {
-        metrics::REPOS_WRITTEN_WITHIN.with_label_values(&[w]).set(c.written_within[i]);
-    }
-    metrics::REPOS_WRITTEN_WITHIN.with_label_values(&["all"]).set(c.repos);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
-    metrics::ACCOUNT_STATS_TIME.set(now);
-}
-
-fn dir_bytes(dir: &std::path::Path) -> u64 {
-    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
-    rd.flatten()
-        .map(|e| match e.file_type() {
-            Ok(t) if t.is_dir() => dir_bytes(&e.path()),
-            Ok(t) if t.is_file() => e.metadata().map_or(0, |m| m.len()),
-            _ => 0,
-        })
-        .sum()
-}
-
-async fn export_disk_cache(app: &App) {
-    let Some(cfg) = app.node.disk_cache.clone() else { return };
-    let owned = app.partitions.owned().len().max(1) as u64;
-    let capacity = cfg.node_bytes.unwrap_or_else(|| app.node.shard_disk_cache().map_or(0, |c| c.shard_bytes) * owned);
-    let dir = cfg.dir.clone();
-    let used = tokio::task::spawn_blocking(move || dir_bytes(&dir)).await.unwrap_or(0);
-    metrics::DISK_CACHE_BYTES.with_label_values(&["used"]).set(used as i64);
-    metrics::DISK_CACHE_BYTES.with_label_values(&["capacity"]).set(capacity as i64);
-}
-
-pub fn spawn_account_stats(app: Arc<App>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let every = app.config.account_stats_interval;
-        if every.is_zero() {
-            return;
-        }
-        // first pass soon after startup, once shards have opened
-        tokio::time::sleep(Duration::from_secs(30).min(every)).await;
-        let mut tick = tokio::time::interval(every);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
-            match count(&app, now).await {
-                Ok(c) => export(&c),
-                Err(e) => tracing::warn!("account stats: {e:#}"),
-            }
-            export_disk_cache(&app).await;
-        }
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn statuses() {
-        assert_eq!(status_index(None), 0);
-        assert_eq!(status_index(Some("deactivated")), 1);
-        assert_eq!(status_index(Some("takendown")), 2);
-        assert_eq!(status_index(Some("suspended")), 3);
-        assert_eq!(status_index(Some("deleted")), 4);
-    }
+    t.days = days.into_iter().collect();
+    Ok(t)
 }

@@ -1044,6 +1044,7 @@ impl Worker {
             })),
             pending: Some(pending.clone()),
             enqueued: Instant::now(),
+            totals: crate::totals::Delta::new(&did, None, crate::totals::RepoKey::of(&account, &head)),
         };
         let nodes = crate::mst::SharedNodeIndex::default();
         let mst = LazyTree::loaded(tree, 1);
@@ -1324,7 +1325,7 @@ fn backfill_nodes(st: &mut RepoState) {
     }
     let applied = track_inflight(st, None, Default::default());
     let ack: crate::partition::AckFn = Box::new(move |_| applied.store(true, Ordering::Release));
-    let entry = LogEntry { shard: st.partition.id, frames: Vec::new(), muts, ack: Some(ack), pending: Some(st.pending.clone()), enqueued: Instant::now() };
+    let entry = LogEntry { shard: st.partition.id, frames: Vec::new(), muts, ack: Some(ack), pending: Some(st.pending.clone()), enqueued: Instant::now(), totals: None };
     if let Err(e) = send_entry(st, entry) {
         tracing::warn!(did = %st.did, "MST node backfill not logged: {e}");
     }
@@ -1899,6 +1900,7 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
     let build_start = Instant::now();
     let mut mst_blocks = Vec::with_capacity(16);
     let prev_data = st.head.data;
+    let before = crate::totals::RepoKey::of(&st.account, &st.head);
     let mut coll_muts = Vec::new();
     for (coll, had) in &batch.colls {
         // only deletes from a collection that had records need the probe
@@ -2104,6 +2106,7 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
         })),
         pending: Some(st.pending.clone()),
         enqueued: Instant::now(),
+        totals: crate::totals::Delta::new(&st.did, before, crate::totals::RepoKey::of(&st.account, &st.head)),
     };
     send_entry(st, entry)
 }
@@ -2155,6 +2158,7 @@ fn ack_noop(st: &RepoState, reply: oneshot::Sender<Result<Head, WriteError>>) ->
         ack: Some(head_ack(reply, st.head.clone())),
         pending: Some(st.pending.clone()),
         enqueued: Instant::now(),
+        totals: None,
     };
     send_entry(st, entry)
 }
@@ -2263,6 +2267,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
     let time = events::now_rfc3339();
     let mut frames = Vec::new();
     let mut muts = Vec::new();
+    let before = crate::totals::RepoKey::of(&st.account, &st.head);
     let whole_tree = matches!(req.op, AccountOp::ReplaceRepo { .. } | AccountOp::Delete);
     // a re-signed head (KeyStep::Finish) extends read-after-write's log at the ack
     let mut resigned: Option<crate::recent_writes::Commit> = None;
@@ -2411,6 +2416,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
         })),
         pending: Some(st.pending.clone()),
         enqueued: Instant::now(),
+        totals: crate::totals::Delta::new(&st.did, before, crate::totals::RepoKey::of(&st.account, &st.head)),
     };
     send_entry(st, entry)
 }

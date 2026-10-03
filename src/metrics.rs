@@ -231,11 +231,10 @@ lazy!(HANDLE_RESOLUTIONS: IntCounterVec = register_int_counter_vec!("vlpds_handl
 lazy!(IDENTITY_EVENTS: IntCounterVec = register_int_counter_vec!("vlpds_identity_events_total", "#identity and #account firehose events built (new accounts, handle changes, status changes), by kind", &["kind"]));
 lazy!(REQUEST_CRAWL: IntCounterVec = register_int_counter_vec!("vlpds_request_crawl_total", "requestCrawl calls to relays (at startup, and vlpds.admin.requestCrawl) by result (ok; rejected: non-2xx answer; failed: unreachable)", &["result"]));
 lazy!(REQUEST_CRAWL_LAST_OK: Gauge = register_gauge!("vlpds_request_crawl_last_success_time_seconds", "Unix time of this node's last requestCrawl a relay accepted (0: none since the process started)"));
-lazy!(ACCOUNTS: IntGaugeVec = register_int_gauge_vec!("vlpds_accounts", "Accounts on the shards this node owns, by status (active, deactivated, takendown, suspended, other), as of the last periodic count (--account-stats-interval-secs); sum over nodes for the PDS", &["status"]));
-lazy!(REPOS_WRITTEN_WITHIN: IntGaugeVec = register_int_gauge_vec!("vlpds_repos_written_within", "Repos on this node's shards whose latest commit is within the window (1d, 7d, 30d), and all of them (all), as of the last periodic count", &["window"]));
-lazy!(ACCOUNT_STATS_TIME: Gauge = register_gauge!("vlpds_account_stats_time_seconds", "Unix time of this node's last completed account count (0: none yet)"));
+lazy!(ACCOUNTS: IntGaugeVec = register_int_gauge_vec!("vlpds_accounts", "Accounts on the shards this node has open, by status (active, deactivated, takendown, suspended, other); exact, kept per slot with every account change (crate::totals); sum over nodes for the PDS", &["status"]));
+lazy!(REPOS_WRITTEN_WITHIN: IntGaugeVec = register_int_gauge_vec!("vlpds_repos_written_within", "Repos on the shards this node has open whose latest commit's UTC day is within the window of today's (1d: yesterday or today; 7d, 30d), and all of them (all); exact, kept per slot with every commit", &["window"]));
 lazy!(CPU_CORES: Gauge = register_gauge!("vlpds_cpu_cores", "CPU cores available to this process (std::thread::available_parallelism: affinity and cgroup quota aware)"));
-lazy!(DISK_CACHE_BYTES: IntGaugeVec = register_int_gauge_vec!("vlpds_disk_cache_bytes", "SST disk cache (--cache-dir): used (bytes of its files, as of the last periodic count) and capacity (configured)", &["kind"]));
+lazy!(DISK_CACHE_BYTES: IntGaugeVec = register_int_gauge_vec!("vlpds_disk_cache_bytes", "SST disk cache (--cache-dir): used (bytes of the open shards' cache files, as SlateDB's evictor tracks them) and capacity (configured)", &["kind"]));
 
 /// The last entry, `other`, takes every collection not listed.
 const KNOWN_COLLECTIONS: [&str; 18] = [
@@ -677,6 +676,18 @@ pub fn with_slatedb_metrics<P: Into<slatedb::object_store::path::Path>>(
     b
 }
 
+/// A SlateDB gauge (its dotted name) summed over this node's open DBs;
+/// None if no DB registered it.
+pub fn slatedb_gauge(name: &str) -> Option<i64> {
+    #[cfg(feature = "slatedb-metrics")]
+    return slatedb_bridge::gauge_sum(name);
+    #[allow(unreachable_code)]
+    {
+        let _ = name;
+        None
+    }
+}
+
 #[cfg(feature = "slatedb-metrics")]
 pub fn slatedb_recorder() -> std::sync::Arc<dyn slatedb_common::metrics::MetricsRecorder> {
     slatedb_bridge::RECORDER.clone()
@@ -696,7 +707,14 @@ mod slatedb_bridge {
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::sync::{Arc, LazyLock};
 
-    pub static RECORDER: LazyLock<Arc<dyn MetricsRecorder>> = LazyLock::new(|| Arc::new(Bridge::default()));
+    static BRIDGE: LazyLock<Arc<Bridge>> = LazyLock::new(Default::default);
+    pub static RECORDER: LazyLock<Arc<dyn MetricsRecorder>> = LazyLock::new(|| BRIDGE.clone());
+
+    pub fn gauge_sum(name: &str) -> Option<i64> {
+        use prometheus::core::Collector;
+        let v = BRIDGE.gauges.lock().get(name)?.clone()?;
+        Some(v.collect().iter().flat_map(|f| f.get_metric()).map(|m| m.get_gauge().get_value() as i64).sum())
+    }
 
     #[derive(Default)]
     struct Bridge {

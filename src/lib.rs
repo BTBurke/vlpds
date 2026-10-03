@@ -48,6 +48,7 @@ pub mod state;
 pub mod stats;
 pub mod store;
 pub mod tid;
+pub mod totals;
 pub mod totp;
 pub mod version;
 pub mod worker;

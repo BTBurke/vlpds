@@ -18,6 +18,7 @@
 //! M/{did}\0{cid digest}   -> MST node block, height >= 1 (DESIGN.md "Partial MSTs")
 //! K/{did}                 -> empty (signing-key rotation pending: `Account::pending_signing_key`)
 //! bl/{did}\0{code}{subject} -> rkeys linking `subject` (crate::backlinks, DESIGN.md "Backlinks")
+//! T/                      -> the slot's account totals (crate::totals; keyed by slot alone)
 
 use crate::cid::{Cid, CID_BYTES_LEN};
 use crate::tid::Tid;

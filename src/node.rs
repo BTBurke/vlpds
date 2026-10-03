@@ -216,14 +216,17 @@ impl ShardHost for Node {
             crate::metrics::REPLAY_SECONDS.observe(replay_started.elapsed().as_secs_f64());
         }
         let replayed_ms = started.elapsed().as_millis() as u64;
-        // make replayed state durable before serving
-        let flushed: Vec<(ShardId, u64, Arc<slatedb::Db>, anyhow::Result<()>)> = futures::stream::iter(ready)
+        // make replayed state durable before serving; the sequencer needs
+        // the totals as of the replayed state before it takes an entry
+        let flushed: Vec<(ShardId, u64, Arc<slatedb::Db>, anyhow::Result<crate::totals::ShardTotals>)> = futures::stream::iter(ready)
             .map(|(s, e, _, db)| async move {
-                let r = if replayed == 0 {
-                    Ok(())
-                } else {
-                    db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.map_err(anyhow::Error::from)
-                };
+                let r = async {
+                    if replayed > 0 {
+                        db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await?;
+                    }
+                    crate::totals::ShardTotals::load(db.as_ref()).await.map_err(|e| e.context("loading account totals"))
+                }
+                .await;
                 (s, e, db, r)
             })
             .buffer_unordered(32)
@@ -233,14 +236,17 @@ impl ShardHost for Node {
         let _ = tokio::time::timeout_at((started + WARM_MAX).into(), warm).await;
         let mut preload = Vec::new();
         for (shard, epoch, db, r) in flushed {
-            if let Err(e) = r {
-                results.push((shard, Err(e)));
-                continue;
-            }
+            let totals = match r {
+                Ok(t) => t,
+                Err(e) => {
+                    results.push((shard, Err(e)));
+                    continue;
+                }
+            };
             let recent = Arc::new(partition::RecentRepos::new(self.recent_cap));
             preload.push((shard, db.clone(), recent.clone()));
             let apply_lock = Arc::new(tokio::sync::RwLock::new(()));
-            self.log.sinks.insert(Arc::new(ShardSink { id: shard, epoch, db: db.clone(), apply_lock: apply_lock.clone(), applied: Default::default(), recent: recent.clone(), barrier: Default::default() }));
+            self.log.sinks.insert(Arc::new(ShardSink { id: shard, epoch, db: db.clone(), apply_lock: apply_lock.clone(), applied: Default::default(), recent: recent.clone(), barrier: Default::default(), totals: Mutex::new(totals) }));
             self.table.set(
                 shard,
                 Some(Arc::new(Partition {

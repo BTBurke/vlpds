@@ -684,7 +684,7 @@ mod tests {
         let ncfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(10), lease_ok: None };
         let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
         let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, ShardId(3), None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: ShardId(3), epoch: 7, db, apply_lock: Default::default(), applied: Default::default(), recent: Default::default(), barrier: Default::default() }));
+        log.sinks.insert(Arc::new(ShardSink { id: ShardId(3), epoch: 7, db, apply_lock: Default::default(), applied: Default::default(), recent: Default::default(), barrier: Default::default(), totals: Default::default() }));
         let send = |i: usize| {
             let log = log.clone();
             async move {
@@ -698,6 +698,7 @@ mod tests {
                     })),
                     pending: None,
                     enqueued: std::time::Instant::now(),
+                    totals: None,
                 };
                 log.tx.send(e).await.ok().unwrap();
                 assert!(arx.await.unwrap());
@@ -746,7 +747,7 @@ mod tests {
         let log = NodeLog::start_with_inflight(store.clone(), ncfg, 1, tx);
         log.durable_ordinal.store(4, std::sync::atomic::Ordering::Release); // as if 0..=4 were durable
         let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, ShardId(1), None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: ShardId(1), epoch: 2, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default(), barrier: Default::default() }));
+        log.sinks.insert(Arc::new(ShardSink { id: ShardId(1), epoch: 2, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default(), barrier: Default::default(), totals: Default::default() }));
         log.checkpoint_all().await;
         assert!(db.get(nodelog::META_APPLIED).await.unwrap().is_none(), "no marker at 4 < insert floor 5");
         assert_eq!(log.sinks.replay_floor(), 4, "capped at the last durable segment");
@@ -784,7 +785,7 @@ mod tests {
         assert_eq!(ordinals(&store, "D").await, vec![0, 1, 2, 3, 4, 5]);
         // not the leader: never touches dead logs
         let db = Arc::new(crate::partition::open_db(&Store { prefix: "st".into(), ..store.clone() }, ShardId(0), None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: ShardId(0), epoch: 2, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default(), barrier: Default::default() }));
+        log.sinks.insert(Arc::new(ShardSink { id: ShardId(0), epoch: 2, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default(), barrier: Default::default(), totals: Default::default() }));
         let follower = Retention::new(store.clone(), log.clone(), cfg(Duration::ZERO), members(&["B"], false));
         assert_eq!(follower.pass().await.unwrap(), Pass::default());
         let p = r.pass().await.unwrap();

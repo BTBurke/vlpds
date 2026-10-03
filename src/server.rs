@@ -84,8 +84,6 @@ pub struct Config {
     pub terms_of_service_url: Option<String>,
     pub contact_email_address: Option<String>,
     pub blob_gc_grace: Duration,
-    /// Zero: off.
-    pub account_stats_interval: Duration,
     pub plc_url: String,
     /// Default: registration off, which only dev mode accepts.
     pub plc: crate::plc::PlcConfig,
@@ -235,7 +233,6 @@ impl Default for Config {
             terms_of_service_url: None,
             contact_email_address: None,
             blob_gc_grace: Duration::from_secs(6 * 3600),
-            account_stats_interval: Duration::ZERO,
             plc_url: crate::plc::DEFAULT_PLC_URL.into(),
             plc: Default::default(),
             invite_required: false,

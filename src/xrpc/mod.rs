@@ -24,7 +24,7 @@ mod ctl_load;
 mod sync;
 pub mod syntax;
 mod webui;
-pub use account_stats::spawn_account_stats;
+pub use account_stats::{export_account_totals, scan_totals, totals};
 pub use blobs::spawn_blob_gc;
 pub use server::{drop_revocation, reset_token_did, revocation_expired, set_stale_claim_grace, spawn_reserved_key_gc, sweep_reserved_keys};
 pub use server::{auth_epoch, auth_epoch_cond, epoch_for_login, new_auth_epoch_op, AUTH_EPOCH};
@@ -420,6 +420,7 @@ pub(crate) async fn write_private_local(p: &crate::partition::Partition, muts: V
         })),
         pending: None,
         enqueued: Instant::now(),
+        totals: None,
     };
     p.tx.send(entry).await.map_err(|_| XrpcError::internal("partition sequencer gone"))?;
     rx.await.map_err(|_| XrpcError::internal("log dropped write"))?.map_err(|e| {

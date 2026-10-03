@@ -105,7 +105,8 @@ operator panels in `grafana/gen_operator.py`):
   moderation (reports, takedowns, abusive traffic blocked), email,
   resources and an estimated storage request bill (Class A / B prices are
   dashboard variables), and the firing alerts in plain words. Account totals
-  come from a periodic count (`--account-stats-interval-secs`, 15 min).
+  are kept exact per slot with every change (DESIGN.md "Account totals");
+  active-account windows are counted in whole UTC days.
 - **vlpds internals** (uid `vlpds-internals`): the engineer's view, below.
 
 The internals dashboard's **Health** row at the top is always open and answers

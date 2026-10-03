@@ -186,6 +186,15 @@ this node takes every shard; in steady state an N-node cluster uses about
 (`--disk-cache-shard-mb`). Unset: 16 GiB per shard (1 TiB at 64 shards).
 The start-up line `SST disk cache (per shard)` shows `dir` and `shard_mb`.
 
+**Account totals** (`vlpds_accounts`, `vlpds_repos_written_within`): kept
+exact per slot with every account change and commit, and exported by the
+node holding each shard (sum over nodes). No periodic scan and no flag. A
+dip during a failover lasts until the shards reopen elsewhere. The windows
+count whole UTC days ("1d" = yesterday and today). If the totals ever look
+wrong, compare with a fresh count: `vlpds::xrpc::scan_totals` (used by
+`tests/all/account_totals.rs`) reads every account and head row of a node's
+shards. That is expensive, so don't run it on a schedule.
+
 **Useful log lines** (tracing, info/warn unless noted):
 `acquired shards` (shards, owned, fair, live), `shards opened` (shards,
 `segments_replayed`, `replayed_ms`, `elapsed_ms`), `shards closed`,

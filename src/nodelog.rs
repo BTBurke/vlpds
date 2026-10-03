@@ -60,6 +60,8 @@ pub struct LogEntry {
     /// Per-repo in-flight counter, decremented once durable.
     pub pending: Option<Arc<AtomicU32>>,
     pub enqueued: Instant,
+    /// The sequencer appends the slot's new totals row to `muts`.
+    pub totals: Option<crate::totals::Delta>,
 }
 
 /// Durable, ordered events from one log, handed to the firehose merger.
@@ -265,6 +267,8 @@ pub struct ShardSink {
     /// Shared with the shard's `Partition`; persisted by its checkpoints.
     pub recent: Arc<crate::partition::RecentRepos>,
     pub barrier: Barrier,
+    /// Only the sequencer changes it, in log order.
+    pub totals: Mutex<crate::totals::ShardTotals>,
 }
 
 /// A close barrier (`ShardSink::barrier_entry`) carries the sink's own token
@@ -284,7 +288,7 @@ impl ShardSink {
     /// every entry the log took for the shard is durable and applied, and
     /// the log takes no more for this sink.
     pub fn barrier_entry(&self, ack: AckFn) -> LogEntry {
-        LogEntry { shard: self.id, frames: Vec::new(), muts: Vec::new(), ack: Some(ack), pending: Some(self.barrier.token.clone()), enqueued: Instant::now() }
+        LogEntry { shard: self.id, frames: Vec::new(), muts: Vec::new(), ack: Some(ack), pending: Some(self.barrier.token.clone()), enqueued: Instant::now(), totals: None }
     }
 
     pub fn barrier_taken(&self) -> bool {
@@ -732,6 +736,9 @@ impl Open {
             e.pending = None;
         }
         let epoch = sink.epoch;
+        if let Some(d) = e.totals.take() {
+            e.muts.push(sink.totals.lock().apply(&d, crate::totals::today()));
+        }
         if e.frames.is_empty() {
             // private-state write: an empty frame, skipped by the firehose
             e.frames.push(Frame { prefix: Vec::new(), suffix: Vec::new(), derived_muts: 0 });
@@ -1586,7 +1593,7 @@ mod tests {
         let cfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes, hedge_after: Duration::from_secs(10), lease_ok: None };
         let log = NodeLog::start_with_inflight(store.clone(), cfg, k, tx);
         let db = Arc::new(crate::partition::open_db(&Store { prefix: "apply".into(), ..store.clone() }, shard, None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: shard, epoch: 1, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default(), barrier: Default::default() }));
+        log.sinks.insert(Arc::new(ShardSink { id: shard, epoch: 1, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default(), barrier: Default::default(), totals: Default::default() }));
         (log, db, rx)
     }
 
@@ -1598,6 +1605,7 @@ mod tests {
             ack,
             pending: None,
             enqueued: Instant::now(),
+            totals: None,
         }
     }
 

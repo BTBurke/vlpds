@@ -4,6 +4,7 @@
 
 mod account;
 mod account_deactivation;
+mod account_totals;
 mod account_races;
 mod account_status;
 mod admin_cli;

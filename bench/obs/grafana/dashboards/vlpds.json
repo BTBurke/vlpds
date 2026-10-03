@@ -985,7 +985,7 @@
    "type": "stat",
    "id": 11,
    "title": "Accounts",
-   "description": "Accounts hosted here by status, counted every 15 minutes (--account-stats-interval-secs) by each server for its share; while a server is down its share is missing until the next count. Deactivated accounts were paused by their owner; taken down / suspended ones by a moderator.",
+   "description": "Accounts hosted here by status: exact, kept up to date with every account change, each server reporting the share it holds right now (while a server is down, its share is missing until another server takes its accounts over, within seconds). Deactivated accounts were paused by their owner; taken down / suspended ones by a moderator.",
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -1035,7 +1035,7 @@
      "color": {
       "mode": "thresholds"
      },
-     "noValue": "counting...",
+     "noValue": "no data",
      "thresholds": {
       "mode": "absolute",
       "steps": [
@@ -1069,7 +1069,7 @@
    "type": "stat",
    "id": 12,
    "title": "Accounts that posted or changed something",
-   "description": "Accounts with any new post, like, follow, profile change etc. in the window (your active users), counted every 15 minutes. People who only read don't show here; see Sign-ins.",
+   "description": "Accounts with any new post, like, follow, profile change etc. in the window (your active users), counted in whole UTC days: \"last day\" is yesterday and today, \"last week\" the last 7 days and today, so each covers up to one day more than its name. Exact otherwise, kept up to date with every write. People who only read don't show here; see Sign-ins.",
    "datasource": {
     "type": "prometheus",
     "uid": "prom"
@@ -1119,7 +1119,7 @@
      "color": {
       "mode": "thresholds"
      },
-     "noValue": "counting...",
+     "noValue": "no data",
      "thresholds": {
       "mode": "absolute",
       "steps": [
@@ -3487,7 +3487,7 @@
    "type": "stat",
    "id": 36,
    "title": "Disk cache",
-   "description": "Local disk cache (--cache-dir) used out of its size limit, updated every 15 minutes. It saves storage requests; full is normal (oldest entries make room).",
+   "description": "Local disk cache (--cache-dir) used out of its size limit (the cache's own count of its files). It saves storage requests; full is normal (oldest entries make room).",
    "datasource": {
     "type": "prometheus",
     "uid": "prom"

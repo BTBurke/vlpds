@@ -230,6 +230,8 @@ swappable.
     rows in log segments carry the same wrapped form. See "Secrets at rest".
   - `K/{did}` → empty: a signing-key rotation is pending
     (`Account::pending_signing_key`; see "Signing-key rotation").
+  - `T/` → the slot's account totals (keyed by slot alone; see "Account
+    totals").
   - `p/{routing}\0{name}` → private per-account state: sessions, app
     password hashes, email-token digests, TOTP state (secret wrapped),
     reserved signing keys (`p/_reserved:{did:key}\0k`, wrapped), OAuth rows.
@@ -3964,6 +3966,59 @@ worker, and re-signing the remainder would drop data silently, unlike the
 reference, which trusts its records table. The sequencer-recovery scripts
 have no counterpart (no single sequencer DB; see "Backups and restore").
 `pdsadmin update` is a deploy concern.
+
+## Account totals (`src/totals.rs`)
+
+The operator dashboard shows accounts by status (`vlpds_accounts`) and repos
+by how recently they were written (`vlpds_repos_written_within{1d,7d,30d,all}`).
+These used to come from a scan of every account and head row of a node's
+shards every 15 minutes. At 50–100M accounts, that is heavy object-store
+traffic for one dashboard panel, and a down node's share was missing until
+the next count. Now the totals are kept exact as part of the state:
+
+- **One row per slot**, `0x01 ‖ slot ‖ T/`, holding the slot's account
+  count per status and, per UTC day, how many of its repos have their
+  latest commit on that day (the last 32 days, zigzag varints, ~100 bytes
+  when a slot has activity on every day). Since the rows are slot-major,
+  they split, merge and move with their slots like every other key. A
+  per-shard row would need splitting and merging logic, and no per-shard
+  summary can be divided at a split point.
+- **Exact deltas from the worker.** Each repo's worker holds its account
+  and head, so for every create, commit, status change (deactivate,
+  activate, takedown, suspend), import, key re-sign or delete, it knows
+  what the repo counted toward before and after: (status, day of its head's
+  rev) or nothing. It puts that `totals::Delta` on the log entry when they
+  differ. That is the first commit of a day per repo and every account
+  change; later commits on the same day carry nothing.
+- **Absolute rows, written by the sequencer.** The sequencer orders a
+  shard's entries, so it holds the shard's rows in memory
+  (`ShardSink::totals`), folds each delta in, and appends the slot's new
+  row to that entry's mutations. The row then lands in the same apply batch
+  as the change. Rows are values, not increments, so replaying an entry
+  twice (span boundaries replay more than needed) is harmless. A rejected
+  entry (shard closing) never reaches the fold.
+- **Loaded when a shard opens**, after its replay and before its sink
+  takes entries. This is one `T/` family scan: one row per slot, i.e.
+  `65,536 / shards` rows, read while the open already waits for its warm-up.
+- **Exported at scrape**: the sum over the node's open shards. A shard's
+  totals are reported by whichever node has it open, so after a failover
+  they return as soon as the shards reopen.
+- **Day windows.** A window counts repos whose latest commit's UTC day is
+  within N days of today's, so "1d" covers yesterday and today (24–48 h).
+  Exact counts for a rolling 24 h window would need hour buckets, which
+  means a row write per repo per active hour (about 24 times the writes)
+  for one panel. HyperLogLog sketches per shard and day were the
+  alternative. They are approximate (~1–2 %), can't be split along with a
+  shard, and still need a flush schedule. Day buckets keyed by the head's
+  rev are exact, split with their slot, and cost one ~100-byte put per
+  repo per active day.
+- **Reconciling.** `xrpc::scan_totals` still counts everything from
+  snapshots. Only tests and debugging call it
+  (`tests/all/account_totals.rs`: random lifecycles, splits, merges and
+  moves between nodes, compared to the scan after each step).
+- `vlpds_disk_cache_bytes{used}` is SlateDB's own count of the open shards'
+  cache files (`slatedb.object_store_cache.cache_bytes`). It used to come
+  from walking `--cache-dir`.
 
 ## Rolling upgrades and format versioning (design; phases 1-2 built)
 
