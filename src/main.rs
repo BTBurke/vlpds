@@ -508,8 +508,9 @@ struct Args {
     /// reference's PDS_RECOVERY_DID_KEY).
     #[arg(long, env = "VLPDS_PLC_RECOVERY_DID_KEY")]
     plc_recovery_did_key: Option<String>,
-    /// Print the PLC rotation key read from stdin (64 hex chars; empty
-    /// stdin = a new random key) wrapped under the configured KEK, in the
+    /// Print the PLC rotation key read from stdin (64 hex chars, a `vw1.`
+    /// wrapped key to rewrap under the current KEK, or empty stdin for a new
+    /// random key) wrapped under the configured KEK, in the
     /// --plc-rotation-key-file form, and exit. Its did:key goes to stderr.
     #[arg(long)]
     wrap_plc_rotation_key: bool,
@@ -916,10 +917,13 @@ async fn wrap_plc_rotation_key(args: &Args) -> anyhow::Result<()> {
     let secrets = vlpds::secrets::Secrets::from_config(&kek, args.dev_mode)?;
     let mut input = zeroize::Zeroizing::new(String::new());
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-    let key = if input.trim().is_empty() {
+    let t = input.trim();
+    let key = if t.is_empty() {
         std::sync::Arc::new(vlpds::crypto::Keypair::generate())
+    } else if t.starts_with("vw1.") {
+        vlpds::plc::RotationKey::Wrapped(t.to_string()).load(&secrets).await?
     } else {
-        vlpds::plc::RotationKey::Hex(zeroize::Zeroizing::new(input.trim().to_string())).load(&secrets).await?
+        vlpds::plc::RotationKey::Hex(zeroize::Zeroizing::new(t.to_string())).load(&secrets).await?
     };
     let wrapped = vlpds::plc::wrap_rotation_key(&secrets, &key).await?;
     println!("{wrapped}");
