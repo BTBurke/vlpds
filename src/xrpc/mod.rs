@@ -20,6 +20,7 @@ pub(crate) mod proxy;
 mod ratelimits;
 mod repo;
 mod server;
+mod ctl_load;
 mod sync;
 pub mod syntax;
 mod webui;
@@ -145,6 +146,7 @@ impl App {
     }
 }
 
+#[derive(Clone)]
 pub struct XrpcError {
     pub status: StatusCode,
     pub error: String,

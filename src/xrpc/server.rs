@@ -92,6 +92,7 @@ const LOCAL_RELOAD_SECS: u64 = 60;
 /// older fails closed.
 const STALE_MAX_SECS: u64 = 300;
 const CTL_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(3);
+const CTL_MOVE_WAIT_FORWARDED: std::time::Duration = crate::forward::TTFB_FAST.saturating_sub(std::time::Duration::from_millis(500));
 const EMAIL_TOKEN_TTL_MS: u64 = 15 * 60 * 1000;
 pub(super) const NEW_PASSWORD_MAX_LENGTH: usize = 256;
 pub(super) const OLD_PASSWORD_MAX_LENGTH: usize = 512;
@@ -310,6 +311,7 @@ fn standard_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> X
 /// like separate machines).
 pub(super) struct Ext {
     ctl: Arc<RwLock<HashMap<String, Arc<Ctl>>>>,
+    ctl_loads: super::ctl_load::Loads<Ctl>,
     /// Bumped by every change, so a load racing one is not cached.
     gen: AtomicU64,
     pub(super) dev_mail: PMutex<HashMap<String, Vec<Mail>>>,
@@ -331,6 +333,7 @@ pub(super) fn ext(app: &App) -> Arc<Ext> {
     }
     let e = Arc::new(Ext {
         ctl: crate::caches::track(crate::caches::Cache::SecurityControls, Default::default()),
+        ctl_loads: Default::default(),
         gen: AtomicU64::new(0),
         dev_mail: PMutex::new(HashMap::new()),
         locks: (0..64).map(|_| tokio::sync::Mutex::new(())).collect(),
@@ -426,10 +429,13 @@ async fn load_sets(app: &App, did: &str, local: Option<(crate::slots::ShardId, u
 }
 
 /// `did`'s revocations and takedowns, cached: on the owner until a change
-/// ([`ctl_changed`]) or an ownership move, elsewhere for [`RELOAD_SECS`]. An
-/// unreadable owner falls back to a view at most [`STALE_MAX_SECS`] old, else
-/// fails closed (503) rather than let revoked sessions or taken-down records
-/// through.
+/// ([`ctl_changed`]) or an ownership move, elsewhere for [`RELOAD_SECS`].
+/// Fails closed (503) rather than let revoked sessions or taken-down records
+/// through: an owner that can't be read falls back to a view at most
+/// [`STALE_MAX_SECS`] old. A shard in flight (moving, reopening) takes no
+/// writes, so a view from before the move is used at once, and without one
+/// the load waits for the move (one probe per shard), then answers
+/// ShardMoved: nothing was done, so the entry node resends a write.
 pub(super) async fn ctl(app: &App, did: &str) -> XResult<Arc<Ctl>> {
     let e = ext(app);
     let now = now_secs();
@@ -446,52 +452,102 @@ pub(super) async fn ctl(app: &App, did: &str) -> XResult<Arc<Ctl>> {
         }
     }
     let gen0 = e.gen.load(Ordering::SeqCst);
-    // a shard in flight (moving, frozen for a split, owner restarting) is
-    // retried briefly before failing closed
+    let (r, joined) = e.ctl_loads.single_flight(did, gen0, || load_ctl(app, &e, did, gen0, cached)).await;
+    if joined {
+        crate::metrics::CTL_LOADS.with_label_values(&["coalesced"]).inc();
+    }
+    r
+}
+
+async fn load_ctl(app: &App, e: &Ext, did: &str, gen0: u64, cached: Option<Arc<Ctl>>) -> XResult<Arc<Ctl>> {
+    use super::ctl_load::{in_flight, Attempt};
     let start = std::time::Instant::now();
-    let mut local = local;
+    // waiting out the move here is what lets a read through; a forwarded
+    // request still answers before its entry node's deadline (which then
+    // resends a write)
+    let move_budget = if crate::forward::is_forwarded() { CTL_MOVE_WAIT_FORWARDED } else { CTL_RETRY_FOR };
     let mut wait = std::time::Duration::from_millis(50);
-    let loaded = loop {
+    let failed = loop {
+        let now = now_secs();
+        let shard = app.partitions.shard_of(did);
+        let probe = match e.ctl_loads.attempt(shard) {
+            Attempt::Go(p) => p,
+            Attempt::Wait(d) => {
+                if let Some(c) = stale(&cached, now) {
+                    crate::metrics::CTL_LOADS.with_label_values(&["stale_moving"]).inc();
+                    return Ok(c);
+                }
+                let left = move_budget.saturating_sub(start.elapsed());
+                if left.is_zero() {
+                    break moved(did);
+                }
+                e.ctl_loads.wait(shard, d.min(left)).await;
+                continue;
+            }
+        };
+        let local = app.partitions.for_key(did).map(|p| (p.id, p.epoch));
         match load_sets(app, did, local).await {
-            Err(_) if start.elapsed() + wait < CTL_RETRY_FOR => {
+            Ok(c) => {
+                e.ctl_loads.reachable(shard, probe);
+                crate::metrics::CTL_LOADS.with_label_values(&["loaded"]).inc();
+                let c = Arc::new(c);
+                let mut m = e.ctl.write();
+                // a change since the read began: use it for this check only
+                if e.gen.load(Ordering::SeqCst) == gen0 {
+                    // full: evict the views older than RELOAD_SECS, else all of
+                    // them (a dropped view only costs a re-read)
+                    let cap = crate::caches::cap(crate::caches::Cache::SecurityControls);
+                    if m.len() >= cap && !m.contains_key(did) {
+                        m.retain(|_, v| now.saturating_sub(v.at) < RELOAD_SECS);
+                        if m.len() >= cap {
+                            m.clear();
+                        }
+                    }
+                    m.insert(did.to_string(), c.clone());
+                }
+                return Ok(c);
+            }
+            Err(err) if in_flight(&err) => {
+                e.ctl_loads.moving(shard, probe);
+                if let Some(c) = stale(&cached, now) {
+                    crate::metrics::CTL_LOADS.with_label_values(&["stale_moving"]).inc();
+                    return Ok(c);
+                }
+                if start.elapsed() >= move_budget {
+                    break moved(did);
+                }
+            }
+            // an owner timing out or erroring: retried briefly, then the
+            // stale view or 503
+            Err(err) => {
+                drop(probe);
+                if start.elapsed() + wait >= CTL_RETRY_FOR {
+                    tracing::warn!(%did, "loading session revocations/takedowns failed: {}", err.message);
+                    let r = stale_or_unavailable(cached, now);
+                    crate::metrics::CTL_LOADS.with_label_values(&[if r.is_ok() { "stale_unreachable" } else { "unavailable" }]).inc();
+                    return r;
+                }
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(std::time::Duration::from_millis(500));
-                local = app.partitions.for_key(did).map(|p| (p.id, p.epoch));
             }
-            r => break r,
         }
     };
-    match loaded {
-        Ok(c) => {
-            let c = Arc::new(c);
-            let mut m = e.ctl.write();
-            // a change since the read began: use it for this check only
-            if e.gen.load(Ordering::SeqCst) == gen0 {
-                // full: evict the views older than RELOAD_SECS, else all of
-                // them (a dropped view only costs a re-read)
-                let cap = crate::caches::cap(crate::caches::Cache::SecurityControls);
-                if m.len() >= cap && !m.contains_key(did) {
-                    m.retain(|_, v| now.saturating_sub(v.at) < RELOAD_SECS);
-                    if m.len() >= cap {
-                        m.clear();
-                    }
-                }
-                m.insert(did.to_string(), c.clone());
-            }
-            Ok(c)
-        }
-        Err(err) => {
-            tracing::warn!(%did, "loading session revocations/takedowns failed: {}", err.message);
-            stale_or_unavailable(cached, now)
-        }
-    }
+    crate::metrics::CTL_LOADS.with_label_values(&["moved"]).inc();
+    tracing::debug!(%did, "security controls unavailable: shard in flight");
+    Err(failed)
+}
+
+/// `cached` if young enough to stand in for an unreadable owner.
+fn stale(cached: &Option<Arc<Ctl>>, now: u64) -> Option<Arc<Ctl>> {
+    cached.as_ref().filter(|c| now.saturating_sub(c.at) <= STALE_MAX_SECS).cloned()
+}
+
+fn moved(did: &str) -> XrpcError {
+    XrpcError::unavailable(crate::forward::SHARD_MOVED, format!("security state of {did} is unavailable while its shard moves; try again"))
 }
 
 fn stale_or_unavailable(cached: Option<Arc<Ctl>>, now: u64) -> XResult<Arc<Ctl>> {
-    match cached {
-        Some(c) if now.saturating_sub(c.at) <= STALE_MAX_SECS => Ok(c),
-        _ => Err(XrpcError::unavailable("Unavailable", "account security state is unavailable; try again")),
-    }
+    stale(&cached, now).ok_or_else(|| XrpcError::unavailable("Unavailable", "account security state is unavailable; try again"))
 }
 
 pub(super) fn ctl_changed(app: &App, did: &str) {
@@ -2815,5 +2871,21 @@ mod ctl_tests {
         let status = |r: XResult<Arc<Ctl>>| r.err().map(|e| e.status);
         assert_eq!(status(stale_or_unavailable(view(STALE_MAX_SECS + 1), now)), Some(StatusCode::SERVICE_UNAVAILABLE));
         assert_eq!(status(stale_or_unavailable(None, now)), Some(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    /// A shard in flight: the same bound for the view standing in, and
+    /// without one a ShardMoved the entry node resends a write on.
+    #[test]
+    fn moving_shard_uses_the_same_stale_bound() {
+        let now = 1_000_000;
+        let view = |age: u64| Some(Arc::new(Ctl { at: now - age, ..Default::default() }));
+        assert!(stale(&view(0), now).is_some());
+        assert!(stale(&view(STALE_MAX_SECS), now).is_some());
+        assert!(stale(&view(STALE_MAX_SECS + 1), now).is_none());
+        assert!(stale(&None, now).is_none());
+        let e = moved("did:plc:a");
+        assert!(super::super::ctl_load::in_flight(&e));
+        assert_eq!(e.error, crate::forward::SHARD_MOVED);
+        assert!(CTL_MOVE_WAIT_FORWARDED < crate::forward::TTFB_FAST);
     }
 }

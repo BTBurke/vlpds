@@ -363,14 +363,30 @@ pub async fn scan_private_anywhere(app: &App, routing: &str, prefix: &str) -> XR
     let Some(owner) = app.remote_owner(routing) else {
         return super::server::scan_private(app, routing, prefix).await;
     };
-    let r = send(
-        app.http
-            .get(format!("{owner}/internal/v1/private/scan"))
-            .header(HDR, &app.config.internal_token)
-            .timeout(OWNER_CALL_TIMEOUT)
-            .query(&[("routing", routing), ("prefix", prefix)]),
-    )
-    .await?;
+    let r = app
+        .http
+        .get(format!("{owner}/internal/v1/private/scan"))
+        .header(HDR, &app.config.internal_token)
+        .timeout(OWNER_CALL_TIMEOUT)
+        .query(&[("routing", routing), ("prefix", prefix)])
+        .send()
+        .await
+        .map_err(upstream)?;
+    if r.status() == StatusCode::SERVICE_UNAVAILABLE {
+        // the shard left the owner we routed to (or is reopening there): a
+        // move under way, which callers wait out rather than take for an outage
+        let body = r.text().await.unwrap_or_default();
+        let code = serde_json::from_str::<J>(&body).ok().and_then(|v| v["error"].as_str().map(str::to_string));
+        return Err(match code.as_deref() {
+            Some(c @ (crate::forward::SHARD_MOVED | crate::forward::REPO_LOADING)) => {
+                XrpcError::unavailable(c, format!("partition owner: {body}"))
+            }
+            _ => upstream(format!("503: {body}")),
+        });
+    }
+    if !r.status().is_success() {
+        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
+    }
     #[derive(Deserialize)]
     struct Rows {
         rows: Vec<(String, String)>,

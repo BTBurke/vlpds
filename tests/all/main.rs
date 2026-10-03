@@ -35,6 +35,7 @@ mod cold_start;
 mod compaction_polling;
 mod cost_defaults;
 mod create_post;
+mod ctl_shard_move;
 mod crud;
 mod differential_shrike;
 mod e2e_regressions;

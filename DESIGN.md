@@ -3520,6 +3520,36 @@ on a node-local lock or on comparing node clocks:
   assertion is claimed until `iat` + 60 s + 10 s (it is refused after that
   whatever its `exp`), and the GC drops persisted claims past their window
   or claimed for longer than the cap.
+- **Security controls across shard moves** (`xrpc::server::ctl`,
+  `xrpc::ctl_load`). Every authenticated request reads the account's
+  `sec/` rows (revocations, takedowns) through a per-node view: cached on
+  the owner until a change or an epoch change, elsewhere for 10 s. It fails
+  closed: a view older than `STALE_MAX_SECS` (300 s) never stands in for an
+  owner that can't be read, and no view means 503. A shard in flight
+  (ShardMoved / RepoLoading, locally or from the owner we routed to) is a
+  normal event, not an outage: it takes no writes, so no revocation can
+  land while it moves, and a view from before the move (within the same
+  300 s bound) is used at once instead of after a 3 s retry. Without one,
+  the load waits for the shard (2.5 s if forwarded, under the entry's 3 s
+  deadline; 3 s otherwise) and then answers 503 ShardMoved, which an entry
+  node resends a write on (the check runs before anything is applied); it
+  used to answer `Unavailable`, which isn't resent, after holding the
+  request 3 s. Loads coalesce: one per DID at a time (joined only by
+  requests that arrived before any change on this node, so none misses a
+  revocation it could have seen), and once a shard is seen in flight one
+  probe per shard at a time (20 ms pause, doubling to 200 ms) while the
+  other loads there wait for it instead of each sending a failing read.
+  Metric: `vlpds_security_ctl_loads_total{result}`.
+  Not done: keeping every account's revocations and takedowns on every
+  node, so a miss is never a read. At 50M accounts the live set is mostly
+  revoke-all rows (90-day TTL, one per password change/reset, takedown or
+  deletion: ~1%/month churn is ~1.5M rows) plus family revocations (2 h
+  TTL) and takedowns, ~100–200 MB per node at ~100 B a row, plus a
+  cluster-wide change feed with gap detection and a full scan of every
+  shard's private rows on start (`sec/` rows sit among all of an account's
+  private rows, so that needs a new index). Its gain over the above is only
+  the uncached account whose shard is in flight past the wait (a kill -9
+  takeover), which the entry's write resend already covers for writes.
 - Not covered here: per-IP/per-client rate limits on `/oauth/par` and
   `/oauth/token` (src/ratelimit.rs).
 
