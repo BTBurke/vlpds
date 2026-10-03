@@ -12,29 +12,20 @@ async fn create_invite(s: &TestServer, uses: u32, for_account: Option<&str>) -> 
     if let Some(d) = for_account {
         body["forAccount"] = json!(d);
     }
-    s.xrpc
-        .post("com.atproto.server.createInviteCode", &body, &Auth::Admin)
-        .await
-        .ok()["code"]
-        .as_str()
-        .expect("code")
-        .to_string()
+    s.xrpc.post("com.atproto.server.createInviteCode", &body, &Auth::Admin).await.ok()["code"].as_str().expect("code").to_string()
 }
 
-async fn signup(s: &TestServer, code: &str) -> Resp {
+async fn signup(s: &TestServer, code: Option<&str>) -> Resp {
     let name = unique_name("inv");
-    s.xrpc
-        .post(
-            "com.atproto.server.createAccount",
-            &json!({"email": format!("{name}@example.com"), "handle": format!("{name}.{HANDLE_DOMAIN}"), "password": PASSWORD, "inviteCode": code}),
-            &Auth::None,
-        )
-        .await
+    let mut body = json!({"email": format!("{name}@example.com"), "handle": format!("{name}.{HANDLE_DOMAIN}"), "password": PASSWORD});
+    if let Some(c) = code {
+        body["inviteCode"] = json!(c);
+    }
+    s.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await
 }
 
 async fn signup_ok(s: &TestServer, code: &str) -> TestAccount {
-    let r = signup(s, code).await;
-    let j = r.ok();
+    let j = signup(s, Some(code)).await.ok();
     TestAccount {
         did: j["did"].as_str().unwrap().into(),
         handle: j["handle"].as_str().unwrap().into(),
@@ -57,18 +48,8 @@ async fn valid_bad_and_missing_codes() {
     let s = server().await;
     let code = create_invite(&s, 1, None).await;
     signup_ok(&s, &code).await;
-    signup(&s, "fake-invite").await.err(400, "InvalidInviteCode");
-    // no code at all
-    let name = unique_name("inv");
-    let r = s
-        .xrpc
-        .post(
-            "com.atproto.server.createAccount",
-            &json!({"email": format!("{name}@example.com"), "handle": format!("{name}.{HANDLE_DOMAIN}"), "password": PASSWORD}),
-            &Auth::None,
-        )
-        .await;
-    r.client_err();
+    signup(&s, Some("fake-invite")).await.err(400, "InvalidInviteCode");
+    signup(&s, None).await.client_err();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -76,16 +57,9 @@ async fn fails_on_invite_code_from_takendown_account() {
     let s = server().await;
     let acct = signup_ok(&s, &create_invite(&s, 1, None).await).await;
     let code = create_invite(&s, 1, Some(&acct.did)).await;
-    let subject = json!({"$type": "com.atproto.admin.defs#repoRef", "did": acct.did});
-    s.xrpc
-        .post("com.atproto.admin.updateSubjectStatus", &json!({"subject": subject, "takedown": {"applied": true}}), &Auth::Admin)
-        .await
-        .ok();
-    signup(&s, &code).await.err(400, "InvalidInviteCode");
-    s.xrpc
-        .post("com.atproto.admin.updateSubjectStatus", &json!({"subject": subject, "takedown": {"applied": false}}), &Auth::Admin)
-        .await
-        .ok();
+    set_repo_takedown(&s, &acct.did, true).await;
+    signup(&s, Some(&code)).await.err(400, "InvalidInviteCode");
+    set_repo_takedown(&s, &acct.did, false).await;
     signup_ok(&s, &code).await;
 }
 
@@ -95,7 +69,7 @@ async fn fails_on_used_up_invite_code() {
     let code = create_invite(&s, 2, None).await;
     signup_ok(&s, &code).await;
     signup_ok(&s, &code).await;
-    signup(&s, &code).await.err(400, "InvalidInviteCode");
+    signup(&s, Some(&code)).await.err(400, "InvalidInviteCode");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -104,9 +78,8 @@ async fn handles_racing_invite_code_uses() {
     let code = create_invite(&s, 1, None).await;
     let hs: Vec<_> = (0..10)
         .map(|_| {
-            let s = s.clone();
-            let code = code.clone();
-            tokio::spawn(async move { signup(&s, &code).await.is_ok() })
+            let (s, code) = (s.clone(), code.clone());
+            tokio::spawn(async move { signup(&s, Some(&code)).await.is_ok() })
         })
         .collect();
     let mut ok = 0;
@@ -139,21 +112,15 @@ async fn prevents_use_of_disabled_codes() {
     let first = create_invite(&s, 1, None).await;
     let acct = signup_ok(&s, &create_invite(&s, 1, None).await).await;
     let second = create_invite(&s, 1, Some(&acct.did)).await;
-    s.xrpc
-        .post("com.atproto.admin.disableInviteCodes", &json!({"codes": [first], "accounts": [acct.did]}), &Auth::Admin)
-        .await
-        .ok();
-    signup(&s, &first).await.err(400, "InvalidInviteCode");
-    signup(&s, &second).await.err(400, "InvalidInviteCode");
+    s.xrpc.post("com.atproto.admin.disableInviteCodes", &json!({"codes": [first], "accounts": [acct.did]}), &Auth::Admin).await.ok();
+    signup(&s, Some(&first)).await.err(400, "InvalidInviteCode");
+    signup(&s, Some(&second)).await.err(400, "InvalidInviteCode");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn does_not_allow_disabling_all_admin_codes() {
     let s = server().await;
-    let r = s
-        .xrpc
-        .post("com.atproto.admin.disableInviteCodes", &json!({"accounts": ["admin"]}), &Auth::Admin)
-        .await;
+    let r = s.xrpc.post("com.atproto.admin.disableInviteCodes", &json!({"accounts": ["admin"]}), &Auth::Admin).await;
     r.err_status(400);
     assert!(r.text().contains("cannot disable admin invite codes"), "{}", r.text());
 }
@@ -162,11 +129,8 @@ async fn does_not_allow_disabling_all_admin_codes() {
 async fn creates_many_invite_codes() {
     let s = server().await;
     let accounts = ["did:example:one", "did:example:two", "did:example:three"];
-    let j = s
-        .xrpc
-        .post("com.atproto.server.createInviteCodes", &json!({"useCount": 2, "codeCount": 2, "forAccounts": accounts}), &Auth::Admin)
-        .await
-        .ok();
+    let body = json!({"useCount": 2, "codeCount": 2, "forAccounts": accounts});
+    let j = s.xrpc.post("com.atproto.server.createInviteCodes", &body, &Auth::Admin).await.ok();
     let got = j["codes"].as_array().unwrap();
     assert_eq!(got.len(), 3);
     let mut all = Vec::new();
@@ -180,7 +144,7 @@ async fn creates_many_invite_codes() {
     for code in all.iter().take(1) {
         signup_ok(&s, code).await;
         signup_ok(&s, code).await;
-        signup(&s, code).await.err(400, "InvalidInviteCode");
+        signup(&s, Some(code)).await.err(400, "InvalidInviteCode");
     }
     // admin listing knows about them
     let r = s.xrpc.get("com.atproto.admin.getInviteCodes", &[("limit", "500")], &Auth::Admin).await.ok();
@@ -211,26 +175,34 @@ async fn get_invite_codes_validates_limit() {
 
 // ---------------------------------------------------------------------------
 // periodic invite codes (`invite_interval`; reference inviteInterval /
-// inviteEpoch). The reference cases backdate `actor.createdAt` in SQL; here
-// the interval is short and the test waits it out. The epoch arithmetic
-// with backdated accounts is unit-tested next to `codes_to_create`
-// (src/xrpc/server.rs).
+// inviteEpoch). The reference cases backdate `actor.createdAt` in SQL; so
+// do these (the account's `created_at`). The epoch arithmetic is
+// unit-tested next to `codes_to_create` (src/xrpc/server.rs).
 // ---------------------------------------------------------------------------
 
 async fn account_codes(s: &TestServer, a: &TestAccount, q: &[(&str, &str)]) -> Vec<J> {
-    s.xrpc.get("com.atproto.server.getAccountInviteCodes", q, &a.auth()).await.ok()["codes"]
-        .as_array()
-        .unwrap()
-        .clone()
+    s.xrpc.get("com.atproto.server.getAccountInviteCodes", q, &a.auth()).await.ok()["codes"].as_array().unwrap().clone()
+}
+
+/// Moves the account's creation `by` into the past.
+async fn backdate(s: &TestServer, did: &str, by: chrono::Duration) {
+    let created = (chrono::Utc::now() - by).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    s.app
+        .mutate_account(did, false, false, false, move |acct| {
+            acct.created_at = created;
+            Ok(true)
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.message));
 }
 
 /// "allow users to get available user invites" and "admin gifted codes to
-/// not impact a users available codes" (interval 2 s for 1 day).
+/// not impact a users available codes" (an hour standing in for the day).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ref_earns_invite_codes_on_an_interval() {
     let s = TestServer::spawn_with(|c| {
         c.invite_required = true;
-        c.invite_interval = Some(std::time::Duration::from_secs(2));
+        c.invite_interval = Some(std::time::Duration::from_secs(3600));
     })
     .await;
     let acct = signup_ok(&s, &create_invite(&s, 1, None).await).await;
@@ -239,8 +211,8 @@ async fn ref_earns_invite_codes_on_an_interval() {
     for _ in 0..3 {
         create_invite(&s, 1, Some(&acct.did)).await;
     }
-    // two intervals old
-    tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
+    // two and a half intervals old
+    backdate(&s, &acct.did, chrono::Duration::minutes(150)).await;
     // createAvailable=false only lists
     assert_eq!(account_codes(&s, &acct, &[("createAvailable", "false")]).await.len(), 3);
     let codes = account_codes(&s, &acct, &[]).await;
@@ -295,7 +267,7 @@ async fn ref_creates_disabled_codes_for_a_disabled_account() {
     // vlpds's enableAccountInvites re-enables the account's codes (the
     // reference only clears the flag and earns fresh ones): 5 unused, the cap
     s.xrpc.post("com.atproto.admin.enableAccountInvites", &json!({"account": carol.did}), &Auth::Admin).await.ok();
-    let info = s.xrpc.get("com.atproto.admin.getAccountInfo", &[("did", &carol.did)], &Auth::Admin).await.ok();
+    let info = s.account_info(&carol.did).await.ok();
     assert_eq!(info["invitesDisabled"], json!(false));
     let codes = account_codes(&s, &carol, &[]).await;
     assert!(!codes.is_empty());
