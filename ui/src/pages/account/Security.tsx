@@ -6,12 +6,14 @@ import { fmtTime } from '../../lib/format'
 import { useAction, useLoad, useSession } from '../../lib/hooks'
 import { Link } from '../../lib/router'
 import { acall, call, setSession } from '../../lib/xrpc'
+import { RecoveryKeys } from './RecoveryKeys'
 
 export function Security() {
   return (
     <>
-      <PageHead title="Security" desc="Two-factor sign-in, passwords for apps, and the apps you've connected." />
+      <PageHead title="Security" desc="Two-factor sign-in, your recovery key, passwords for apps, and the apps you've connected." />
       <Totp />
+      <RecoveryKeys />
       <AppPasswords />
       <ConnectedApps />
       <ChangePassword />

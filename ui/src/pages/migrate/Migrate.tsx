@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { CopyText, ErrorNotice, Field, Notice, Spinner, Status, Topbar } from '../../components/ui'
+import { RecoveryKeyExplainer, RecoveryKeyPicker, type RecoveryKeyChoice } from '../../components/RecoveryKey'
 import * as I from '../../components/icons'
 import { fmtBytes, fmtNum } from '../../lib/format'
 import { useLoad } from '../../lib/hooks'
@@ -32,12 +33,48 @@ type Describe = { did: string; availableUserDomains: string[]; inviteCodeRequire
 
 const here = location.host
 
+/** Advanced mode shows the protocol details (DIDs, keys, counts, raw
+ * errors); simple mode, the default, the same flow in plain words. */
+const Adv = createContext(false)
+const useAdv = () => useContext(Adv)
+const MODE_KEY = 'vlpds.migrate.advanced'
+
+function loadAdvanced(): boolean {
+  try {
+    return localStorage.getItem(MODE_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function storeAdvanced(on: boolean) {
+  try {
+    if (on) localStorage.setItem(MODE_KEY, '1')
+    else localStorage.removeItem(MODE_KEY)
+  } catch {
+    /* this tab only */
+  }
+}
+
+/** The simple mode's rail: fewer, bigger steps over the same state machine. */
+const SIMPLE_STEPS: { label: string; ids: StepId[] }[] = [
+  { label: 'Find your account', ids: ['find', 'signin'] },
+  { label: 'Get ready', ids: ['check', 'handle', 'create'] },
+  { label: 'Copy your posts and photos', ids: ['copy'] },
+  { label: 'Switch over', ids: ['identity', 'finish'] },
+]
+
 /** Moves an account from another PDS (the reference implementation, or
  * anything speaking the same XRPC) to this one, in the browser: the old
  * server is called directly (the reference PDS allows CORS from anywhere). */
 export function Migrate() {
   const q = useSearch()
   const describe = useLoad<Describe>(() => call('com.atproto.server.describeServer'), [])
+  const [advanced, setAdvancedRaw] = useState(loadAdvanced)
+  const setAdvanced = (on: boolean) => {
+    storeAdvanced(on)
+    setAdvancedRaw(on)
+  }
   const [saved, setSavedRaw] = useState<Saved | null>(loadSaved)
   // only for "use the same password here"; never stored
   const [oldPassword, setOldPassword] = useState('')
@@ -116,28 +153,87 @@ export function Migrate() {
     body = <DoneStep saved={saved} newPds={newPds!} onReset={reset} />
   }
 
+  const rail = advanced
+    ? STEPS.map((s) => ({ key: s.id, label: s.label, at: s.id === railStep, idx: STEPS.findIndex((x) => x.id === s.id) }))
+    : SIMPLE_STEPS.map((g, i) => ({ key: g.label, label: g.label, at: g.ids.includes(railStep), idx: i }))
+  const railAt = railStep === 'done' ? rail.length : rail.findIndex((r) => r.at)
   return (
-    <>
+    <Adv.Provider value={advanced}>
       <Topbar where="Move here" />
       <main className="mig">
         <aside className="mig-rail" aria-label="Steps">
           <ol>
-            {STEPS.map((s, i) => {
-              const at = STEPS.findIndex((x) => x.id === railStep)
-              const state = railStep === 'done' || i < at ? 'done' : i === at ? 'now' : 'todo'
+            {rail.map((s, i) => {
+              const state = i < railAt ? 'done' : i === railAt ? 'now' : 'todo'
               return (
-                <li key={s.id} className={state} aria-current={state === 'now' ? 'step' : undefined}>
+                <li key={s.key} className={state} aria-current={state === 'now' ? 'step' : undefined}>
                   <span className="n">{state === 'done' ? <I.Check /> : i + 1}</span>
                   {s.label}
                 </li>
               )
             })}
           </ol>
-          {saved && <Standing saved={saved} />}
+          {saved && (advanced ? <Standing saved={saved} /> : <SimpleStanding saved={saved} />)}
         </aside>
-        <section className="mig-main">{body}</section>
+        <section className="mig-main">
+          <label className="mig-mode check">
+            <input type="checkbox" name="advanced" checked={advanced} onChange={(e) => setAdvanced(e.target.checked)} />
+            <span>I'm familiar with AT Protocol: show the technical details</span>
+          </label>
+          {body}
+        </section>
       </main>
-    </>
+    </Adv.Provider>
+  )
+}
+
+/** Plain words first; the server's own message behind "Show details". */
+function Problem({ error }: { error: unknown }) {
+  const adv = useAdv()
+  if (!error) return null
+  if (adv) return <ErrorNotice error={error} />
+  const raw = error instanceof XrpcError ? `${error.error} (${error.status}): ${error.message}` : error instanceof Error ? error.message : String(error)
+  return (
+    <Notice kind="err">
+      <p>{plainError(error)}</p>
+      {raw !== plainError(error) && (
+        <details className="mig-details">
+          <summary>Show details</summary>
+          <p className="mono small">{raw}</p>
+        </details>
+      )}
+    </Notice>
+  )
+}
+
+function plainError(e: unknown): string {
+  if (e instanceof XrpcError) {
+    if (e.status === 429 || e.error === 'RateLimitExceeded') return 'Too many tries for now. Wait a few minutes, then try again.'
+    if (e.error === 'InvalidToken') return "That code isn't right. Check it and try again."
+    if (e.error === 'ExpiredToken') return 'That code has expired. Ask for a new one.'
+    if (e.error === 'AppPassword') return e.message
+    if (e.error === 'AuthenticationRequired' || e.status === 401) return 'You were signed out. Reload the page and sign in again.'
+    if (e.status >= 500) return 'A server had a problem. Wait a moment, then try again.'
+    return "That didn't work. Try again; if it keeps happening, the details below can help whoever runs this server."
+  }
+  // our own messages (flow.ts) are already written for people
+  if (e instanceof Error && !(e instanceof TypeError)) return e.message
+  return "Couldn't reach a server. Check your connection and try again."
+}
+
+function SimpleStanding({ saved: s }: { saved: Saved }) {
+  return (
+    <div className="mig-standing" aria-label="Where things stand">
+      <p>
+        {s.identityDone ? (
+          <>Your account now lives on {here}.</>
+        ) : (
+          <>
+            Your account will be hosted at <b>{here}</b>. Until the last step, nothing changes: you can stop any time and keep using {hostOf(s.oldPds)}.
+          </>
+        )}
+      </p>
+    </div>
   )
 }
 
@@ -238,6 +334,7 @@ function once<T>(key: string, fn: () => Promise<T>): Promise<T> {
 // ---------------------------------------------------------------- 1. find
 
 function FindStep({ onFound, invite }: { onFound: (s: Saved) => void; invite: string }) {
+  const adv = useAdv()
   const [ident, setIdent] = useState('')
   const [host, setHost] = useState('')
   const [needHost, setNeedHost] = useState(false)
@@ -282,22 +379,36 @@ function FindStep({ onFound, invite }: { onFound: (s: Saved) => void; invite: st
     <Card
       title="Move your account here"
       sub={
-        <>
-          Bring your Bluesky / atproto account to {here}. Your posts, follows, likes, images and settings come along, and your followers keep
-          following you. It takes a few minutes, and nothing changes for anyone else until the last step.
-        </>
+        adv ? (
+          <>
+            Bring your Bluesky / atproto account to {here}: repository, blobs and preferences, then your DID's PLC entry. Your followers keep following
+            you. Nothing changes for anyone else until the identity step.
+          </>
+        ) : (
+          <>
+            Bring your Bluesky account to {here}. Your posts, follows, likes, photos and settings come along, and your followers keep following you. It
+            takes a few minutes, and nothing changes for anyone else until the last step.
+          </>
+        )
       }
     >
       <div className="mig-need">
         <strong>You'll need</strong>
         <ul>
           <li>Your account's <b>main password</b> (not an app password).</li>
-          <li>Access to the <b>email</b> on your account: your current server emails you a confirmation code.</li>
+          <li>Access to the <b>email</b> on your account: we'll email you a code to confirm the move.</li>
           <li>To keep this tab open while your data copies.</li>
         </ul>
       </div>
       <form onSubmit={submit}>
-        {error instanceof DidWeb ? (
+        {error instanceof DidWeb && !adv ? (
+          <Notice kind="err">
+            <p>
+              This account's address is managed on its own website, so this page can't move it. Turn on the technical details above to see the manual
+              steps.
+            </p>
+          </Notice>
+        ) : error instanceof DidWeb ? (
           <Notice kind="err">
             <p>
               <b>{error.did}</b> is a did:web. Its DID document lives on a web server you control, so this page can't move it for you. Copy your data
@@ -306,9 +417,13 @@ function FindStep({ onFound, invite }: { onFound: (s: Saved) => void; invite: st
             </p>
           </Notice>
         ) : error instanceof HandleUnresolved ? (
-          <Notice kind="warn">We couldn't look up @{error.handle} from here. Enter your DID instead, or the address of the server your account is on now.</Notice>
+          <Notice kind="warn">
+            {adv
+              ? `We couldn't look up @${error.handle} from here. Enter your DID instead, or the address of the PDS your account is on now.`
+              : `We couldn't look up @${error.handle} from here. Tell us where you sign in today (for example bsky.social).`}
+          </Notice>
         ) : (
-          <ErrorNotice error={error} />
+          <Problem error={error} />
         )}
         {already && (
           <Notice kind="ok">
@@ -317,7 +432,10 @@ function FindStep({ onFound, invite }: { onFound: (s: Saved) => void; invite: st
             </p>
           </Notice>
         )}
-        <Field label="Your handle or DID" hint="For example alice.bsky.social, your own domain, or did:plc:…">
+        <Field
+          label={adv ? 'Your handle or DID' : 'Your account address'}
+          hint={adv ? 'For example alice.bsky.social, your own domain, or did:plc:…' : 'Your handle, for example alice.bsky.social'}
+        >
           <input
             type="text"
             name="identifier"
@@ -349,6 +467,7 @@ function FindStep({ onFound, invite }: { onFound: (s: Saved) => void; invite: st
 // ---------------------------------------------------------------- resume / sign in
 
 function ResumeStep({ saved, onContinue, onReset }: { saved: Saved; onContinue: () => void; onReset: () => void }) {
+  const adv = useAdv()
   const [sure, setSure] = useState(false)
   return (
     <Card title={`Continue moving @${saved.oldHandle}?`} sub={<>You started moving this account on {new Date(saved.startedAt).toLocaleString()}. Pick up where you left off.</>}>
@@ -356,7 +475,10 @@ function ResumeStep({ saved, onContinue, onReset }: { saved: Saved; onContinue: 
         <Notice kind="info">An inactive copy of your account already exists on {here}. Continuing reuses it.</Notice>
       )}
       {saved.identityDone && (
-        <Notice kind="warn">Your identity already points to {here}. Continue to finish switching over; starting over isn't possible past this point.</Notice>
+        <Notice kind="warn">
+          {adv ? 'Your identity already points to' : 'Your account already points to'} {here}. Continue to finish switching over; starting over isn't
+          possible past this point.
+        </Notice>
       )}
       <div className="row between">
         {!saved.identityDone ? (
@@ -393,6 +515,7 @@ function SignInStep({
   onDone: (password: string, session: { handle: string }) => void
   onReset: () => void
 }) {
+  const adv = useAdv()
   const [password, setPassword] = useState('')
   const [code, setCode] = useState('')
   const [needCode, setNeedCode] = useState(false)
@@ -423,8 +546,9 @@ function SignInStep({
       sub={
         side === 'old' ? (
           <>
-            Signing in as <b>@{saved.oldHandle}</b> <span className="mono small">({saved.did})</span>. Your password goes only to {host}; this page keeps it in
-            memory for the move and never stores it.
+            Signing in as <b>@{saved.oldHandle}</b>
+            {adv && <span className="mono small"> ({saved.did})</span>}. Your password goes only to {host}; this page keeps it in memory for the move and
+            never stores it.
           </>
         ) : (
           <>The account you created here for @{saved.newHandle ?? saved.oldHandle} is waiting. Enter the password you chose for it.</>
@@ -440,7 +564,7 @@ function SignInStep({
               : 'Use the password you set when creating the account here.'}
           </Notice>
         ) : (
-          <ErrorNotice error={error} />
+          <Problem error={error} />
         )}
         {needCode && (
           <Notice kind="info">
@@ -490,6 +614,8 @@ function CheckStep({
   update: (p: Partial<Saved>) => void
   onReset: () => void
 }) {
+  const adv = useAdv()
+  const say = (e: unknown) => (adv ? errText(e) : plainError(e))
   const [checks, setChecks] = useState<Record<string, CheckResult>>({})
   const [tick, setTick] = useState(0)
   const [existing, setExisting] = useState<'none' | 'deactivated' | 'active'>()
@@ -499,7 +625,7 @@ function CheckStep({
     setChecks({})
     const did = saved.did
     put('server', { state: 'ok', title: `${here} is ready`, detail: describe.inviteCodeRequired ? 'New accounts here need an invite code.' : 'Open to new accounts.' })
-    put('did', { state: 'ok', title: 'Your identity can move', detail: <>A did:plc: the PLC directory records which server hosts it.</> })
+    put('did', adv ? { state: 'ok', title: 'Your identity can move', detail: <>A did:plc: the PLC directory records which server hosts it.</> } : { state: 'ok', title: 'Your account can move' })
     put('here', { state: 'wait', title: 'Looking for an earlier copy here' })
     call('com.atproto.sync.getRepoStatus', { params: { did } })
       .then((r) => {
@@ -515,7 +641,7 @@ function CheckStep({
         if (e instanceof XrpcError && e.status === 400) {
           setExisting('none')
           put('here', { state: 'ok', title: 'Not on this server yet' })
-        } else put('here', { state: 'bad', title: "Couldn't check this server", detail: errText(e) })
+        } else put('here', { state: 'bad', title: "Couldn't check this server", detail: say(e) })
       })
     put('old', { state: 'wait', title: `Checking your account on ${hostOf(saved.oldPds)}` })
     oldPds
@@ -526,13 +652,13 @@ function CheckStep({
         const big = st.indexedRecords > 500_000 || st.expectedBlobs > 20_000
         put('size', {
           state: big ? 'warn' : 'ok',
-          title: `${fmtNum(st.indexedRecords)} records, ${fmtNum(st.expectedBlobs)} images and videos`,
+          title: adv ? `${fmtNum(st.indexedRecords)} records, ${fmtNum(st.expectedBlobs)} images and videos` : 'Your posts, follows and photos are ready to copy',
           detail: big
             ? 'A large account: copying can take a long time. Keep this tab open; if it stops, reload and it picks up where it was.'
             : 'About a minute or two to copy.',
         })
       })
-      .catch((e) => put('old', { state: 'bad', title: `Couldn't read your account on ${hostOf(saved.oldPds)}`, detail: errText(e) }))
+      .catch((e) => put('old', { state: 'bad', title: `Couldn't read your account on ${hostOf(saved.oldPds)}`, detail: say(e) }))
     put('email', { state: 'wait', title: 'Checking your email' })
     oldPds
       .call('com.atproto.server.getSession')
@@ -547,7 +673,7 @@ function CheckStep({
           })
         }
       })
-      .catch((e) => put('email', { state: 'bad', title: "Couldn't read your account's email", detail: errText(e) }))
+      .catch((e) => put('email', { state: 'bad', title: "Couldn't read your account's email", detail: say(e) }))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick])
 
@@ -555,7 +681,10 @@ function CheckStep({
   const pending = list.some((c) => c.state === 'wait')
   const blocked = list.some((c) => c.state === 'bad')
   return (
-    <Card title="Pre-flight checks" sub="Nothing has been changed anywhere yet. These checks make sure the move can finish.">
+    <Card
+      title={adv ? 'Pre-flight checks' : 'Checking your account'}
+      sub={adv ? 'Nothing has been changed anywhere yet. These checks make sure the move can finish.' : "Nothing has changed yet. We're making sure the move can finish."}
+    >
       <ul className="mig-checks">
         {list.map((c) => (
           <Checkline key={c.title} state={c.state} title={c.title}>
@@ -595,6 +724,7 @@ function maskEmail(e: string) {
 // ---------------------------------------------------------------- 4. handle
 
 function HandleStep({ saved, describe, update }: { saved: Saved; describe: Describe; update: (p: Partial<Saved>) => void }) {
+  const adv = useAdv()
   const domain = describe.availableUserDomains[0] ?? ''
   const provided = saved.oldDomains.some((d) => saved.oldHandle.endsWith(d))
   const custom = !provided && !saved.oldHandle.startsWith('did:') && saved.oldHandle !== 'handle.invalid'
@@ -635,7 +765,14 @@ function HandleStep({ saved, describe, update }: { saved: Saved; describe: Descr
 
   const ready = mode === 'keep' || (avail && 'ok' in avail && avail.ok && avail.handle === full)
   return (
-    <Card title="Choose your handle" sub="Your handle is the name people see and mention. Your followers and DID stay the same whichever you pick.">
+    <Card
+      title="Choose your handle"
+      sub={
+        adv
+          ? 'Your handle is the name people see and mention. Your followers and DID stay the same whichever you pick.'
+          : 'Your handle is the name people see and mention. Your followers stay with you whichever you pick.'
+      }
+    >
       {provided && (
         <Notice kind="info">
           <b>@{saved.oldHandle}</b> belongs to {hostOf(saved.oldPds)}, so it stops working when you leave. Pick a new one here; you can switch to your own
@@ -652,6 +789,11 @@ function HandleStep({ saved, describe, update }: { saved: Saved; describe: Descr
             ) : keepCheck.data ? (
               <div className="small muted">
                 It points to your account through DNS or your own website, not through {hostOf(saved.oldPds)}, so it keeps working. Nothing to change.
+              </div>
+            ) : !adv ? (
+              <div className="small">
+                <Status kind="warn">We couldn't confirm it resolves.</Status> If you set this address up yourself, check your domain's settings; otherwise
+                pick a handle here instead.
               </div>
             ) : (
               <div className="small">
@@ -685,7 +827,7 @@ function HandleStep({ saved, describe, update }: { saved: Saved; describe: Descr
               <span className="mono">{domain}</span>
             </span>
           </Field>
-          {mode === 'new' && avail && 'error' in avail && <ErrorNotice error={avail.error} />}
+          {mode === 'new' && avail && 'error' in avail && <Problem error={avail.error} />}
           {mode === 'new' && avail && 'ok' in avail && avail.handle === full && (
             <div className="small">
               {avail.ok ? (
@@ -738,6 +880,7 @@ function CreateStep({
   invite: string
   update: (p: Partial<Saved>) => void
 }) {
+  const adv = useAdv()
   const [email, setEmail] = useState(saved.email ?? '')
   const [same, setSame] = useState(!!oldPassword)
   const [password, setPassword] = useState('')
@@ -797,10 +940,16 @@ function CreateStep({
   return (
     <Card
       title={`Create @${saved.newHandle} on ${here}`}
-      sub={<>This makes an inactive account here with your same DID. Nothing changes on {hostOf(saved.oldPds)} yet.</>}
+      sub={
+        adv ? (
+          <>This makes an inactive account here with your same DID. Nothing changes on {hostOf(saved.oldPds)} yet.</>
+        ) : (
+          <>We'll set up your account here. It stays switched off until the last step, and nothing changes on {hostOf(saved.oldPds)} yet.</>
+        )
+      }
     >
       <form onSubmit={submit}>
-        {friendly ? <Notice kind="err">{friendly}</Notice> : <ErrorNotice error={error} />}
+        {friendly ? <Notice kind="err">{friendly}</Notice> : <Problem error={error} />}
         <Field label="Email" hint="For password resets and security codes on this server.">
           <input type="email" name="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required />
         </Field>
@@ -854,7 +1003,7 @@ function createError(e: unknown): ReactNode {
   if (e.error === 'HandleNotAvailable') return 'That handle was just taken. Go back and pick another (reload the page, then change it).'
   if (/^Email already taken/.test(e.message)) return 'Another account here uses that email. Use a different address.'
   if (e.error === 'BadJwtSignature' || e.error === 'BadJwtAudience' || e.error === 'BadJwtLexiconMethod' || e.error === 'JwtExpired')
-    return `Your current server's authorization didn't check out (${e.error}). Try again.`
+    return `Your current server's approval didn't check out (${e.error}). Try again.`
   return null
 }
 
@@ -878,7 +1027,7 @@ function SignInInline({ pds, onDone }: { pds: Pds; onDone: (handle: string) => v
         }
       }}
     >
-      <ErrorNotice error={error} />
+      <Problem error={error} />
       <Field label="Password">
         <input type="password" name="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required autoFocus />
       </Field>
@@ -904,6 +1053,7 @@ type CopyView = {
 }
 
 function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds; newPds: Pds; update: (p: Partial<Saved>) => void }) {
+  const adv = useAdv()
   const [v, setV] = useState<CopyView>({ repo: { bytes: 0 }, blobs: { done: 0, bytes: 0, failed: [] }, running: false })
   const set = (f: (v: CopyView) => CopyView) => setV((x) => f(x))
   const savedRef = useRef(saved)
@@ -983,10 +1133,10 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
       <ul className="mig-checks">
         <Checkline
           state={saved.repoDone ? 'ok' : v.mismatch ? 'warn' : v.error && !saved.repoDone ? 'bad' : 'wait'}
-          title="Posts, follows, likes and profile (your repository)"
+          title={adv ? 'Posts, follows, likes and profile (your repository)' : 'Your posts, follows, likes and profile'}
         >
           {saved.repoDone ? (
-            r.records ? `${fmtNum(r.records[1])} records copied and checked.` : 'Copied.'
+            r.records && adv ? `${fmtNum(r.records[1])} records copied and checked.` : r.records ? 'Copied and checked.' : 'Copied.'
           ) : r.phase === 'download' ? (
             <>
               Downloading from {hostOf(saved.oldPds)}: {fmtBytes(r.bytes)}
@@ -1006,7 +1156,7 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
         </Checkline>
         <Checkline
           state={saved.blobsDone ? 'ok' : v.blobs.failed.length && !v.running ? 'warn' : saved.repoDone ? 'wait' : 'wait'}
-          title="Images and videos"
+          title={adv ? 'Images and videos (blobs)' : 'Your photos and videos'}
         >
           {saved.blobsDone ? (
             saved.unavailableBlobs?.length ? (
@@ -1015,7 +1165,7 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
               'All copied.'
             )
           ) : !saved.repoDone ? (
-            'After the repository.'
+            adv ? 'After the repository.' : 'Next.'
           ) : (
             <>
               {fmtNum(v.blobs.done)}
@@ -1036,7 +1186,14 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
       {v.mismatch && (
         <Notice kind="warn">
           <p>
-            <b>The record counts don't match.</b> {v.mismatch} Retrying usually fixes a copy cut short.
+            {adv ? (
+              <>
+                <b>The record counts don't match.</b> {v.mismatch}
+              </>
+            ) : (
+              <b>Some of your posts or likes seem to be missing from the copy.</b>
+            )}{' '}
+            Retrying usually fixes a copy cut short.
           </p>
           <div className="row">
             <button type="button" className="btn" onClick={() => run()}>
@@ -1051,8 +1208,14 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
       {!v.running && v.blobs.failed.length > 0 && !saved.blobsDone && (
         <Notice kind="warn">
           <p>
-            <b>{v.blobs.failed.length} files couldn't be copied.</b> The first: <span className="mono">{v.blobs.failed[0].cid}</span> ({v.blobs.failed[0].reason}
-            ). If {hostOf(saved.oldPds)} no longer has them, they'd be missing here too.
+            <b>{v.blobs.failed.length} {adv ? "files couldn't be copied." : "photos or videos couldn't be copied."}</b>
+            {adv && (
+              <>
+                {' '}
+                The first: <span className="mono">{v.blobs.failed[0].cid}</span> ({v.blobs.failed[0].reason}).
+              </>
+            )}{' '}
+            If {hostOf(saved.oldPds)} no longer has them, they'd be missing here too.
           </p>
           <div className="row">
             <button type="button" className="btn" onClick={() => run()}>
@@ -1066,7 +1229,7 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
       )}
       {!!v.error && !v.running && (
         <>
-          <ErrorNotice error={v.error} />
+          <Problem error={v.error} />
           <div className="row end">
             <button type="button" className="btn primary" onClick={() => run()}>
               Retry
@@ -1088,6 +1251,7 @@ type Recommended = {
 }
 
 function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds; newPds: Pds; update: (p: Partial<Saved>) => void }) {
+  const adv = useAdv()
   const rec = useLoad<Recommended>(() => newPds.call('com.atproto.identity.getRecommendedDidCredentials'), [])
   const doc = useLoad<DidDoc>(() => call('com.atproto.identity.resolveDid', { params: { did: saved.did } }).then((r) => r.didDoc), [])
   const [token, setToken] = useState('')
@@ -1095,6 +1259,8 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
   const [busy, setBusy] = useState<'' | 'request' | 'move'>('')
   const [error, setError] = useState<unknown>()
   const [sentNow, setSentNow] = useState(false)
+  const [keyOpen, setKeyOpen] = useState(false)
+  const [userKey, setUserKey] = useState<RecoveryKeyChoice>({ status: 'empty' })
   const pending = signedOp(saved.did)
   const requested = !!saved.plcRequestedAt
   useEffect(() => {
@@ -1105,6 +1271,15 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
       .catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // only an open advanced section counts: simple mode never adds a key
+  const ownKey = adv && keyOpen && userKey.status === 'ready' ? userKey.didKey : undefined
+  const keyUnfinished = adv && keyOpen && userKey.status === 'incomplete'
+  const r = rec.data
+  // highest priority first: the user's key can undo the server's ops for 72 h
+  const rotationKeys = r ? [...(ownKey ? [ownKey] : []), ...r.rotationKeys.filter((k) => k !== ownKey)] : []
+  const signedKeys = (pending as { rotationKeys?: string[] } | undefined)?.rotationKeys
+  const shownKeys = signedKeys ?? rotationKeys
 
   const request = async () => {
     setBusy('request')
@@ -1127,9 +1302,8 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
     try {
       let op = signedOp(saved.did)
       if (!op) {
-        const r = rec.data!
         const out = await oldPds.call('com.atproto.identity.signPlcOperation', {
-          body: { token: token.trim(), rotationKeys: r.rotationKeys, alsoKnownAs: r.alsoKnownAs, verificationMethods: r.verificationMethods, services: r.services },
+          body: { token: token.trim(), rotationKeys, alsoKnownAs: r!.alsoKnownAs, verificationMethods: r!.verificationMethods, services: r!.services },
         })
         op = out.operation
         keepSignedOp(saved.did, op)
@@ -1144,21 +1318,28 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
     }
   }
 
-  const r = rec.data
   const d = doc.data
+  const old = hostOf(saved.oldPds)
   const tokenError = error instanceof XrpcError && (error.error === 'InvalidToken' || error.error === 'ExpiredToken')
+  const moveLabel = adv ? 'Move my identity' : 'Move my account'
   return (
     <Card
-      title="Move your identity"
+      title={adv ? 'Move your identity' : 'Confirm the move'}
       sub={
-        <>
-          Your data is all here. The last step tells the PLC directory that <b>{here}</b> now hosts <span className="mono">{saved.did}</span>. Apps and
-          relays follow that record, so this is the switch-over moment.
-        </>
+        adv ? (
+          <>
+            Your data is all here. The last step tells the PLC directory that <b>{here}</b> now hosts <span className="mono">{saved.did}</span>. Apps and
+            relays follow that record, so this is the switch-over moment.
+          </>
+        ) : (
+          <>
+            Your posts and photos are all here. This last step points your account at <b>{here}</b>: it's the moment the switch happens.
+          </>
+        )
       }
     >
-      <ErrorNotice error={rec.error || doc.error} />
-      {r && (
+      <Problem error={rec.error || doc.error} />
+      {adv && r && (
         <table className="data mig-diff">
           <thead>
             <tr>
@@ -1170,7 +1351,7 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
           <tbody>
             <tr>
               <th>Hosting server</th>
-              <td className="mono">{d ? pdsOf(d) : hostOf(saved.oldPds)}</td>
+              <td className="mono">{d ? pdsOf(d) : old}</td>
               <td className="mono">{r.services.atproto_pds.endpoint}</td>
             </tr>
             <tr>
@@ -1189,11 +1370,12 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
             </tr>
             <tr>
               <th>Rotation keys</th>
-              <td className="muted">{hostOf(saved.oldPds)}'s key{d ? '' : ''}</td>
-              <td className="mono">
-                {r.rotationKeys.map((k) => (
+              <td className="muted">{old}'s</td>
+              <td className="mono mig-rotation">
+                {shownKeys.map((k) => (
                   <div key={k} title={k}>
                     {shortKey(k)}
+                    {k === ownKey && <span className="mig-yours">yours</span>}
                   </div>
                 ))}
               </td>
@@ -1201,30 +1383,58 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
           </tbody>
         </table>
       )}
-      <Notice kind="warn">
+      {!adv && r && (
         <p>
-          <b>This is the point of no return for this page.</b> Once the directory accepts the change, {here} controls your identity: {hostOf(saved.oldPds)}{' '}
-          can't move it back for you. Rotation keys you added yourself are replaced by the ones above (add them again later from here). Going back
-          later means moving again, from {here}.
+          Your account will be hosted at <b>{here}</b>
+          {r.alsoKnownAs[0] ? <>, as @{r.alsoKnownAs[0].replace(/^at:\/\//, '')}</> : null}.
         </p>
+      )}
+      <Notice kind="warn">
+        {adv ? (
+          <p>
+            <b>This is the point of no return for this page.</b> Once the directory accepts the change, {here} controls your identity: {old} can't move it
+            back for you. Rotation keys you added yourself are replaced by the ones above
+            {ownKey ? ' (your new recovery key included)' : ' (add one below, or later from your account page here)'}. Going back later means moving again,
+            from {here}.
+          </p>
+        ) : (
+          <p>
+            <b>After this step your account lives here.</b> You can still sign in to {old} for a while, but it won't be in use. Moving back later means
+            moving again, from {here}.
+          </p>
+        )}
       </Notice>
+      {adv && !pending && (
+        <details className="mig-adv" open={keyOpen} onToggle={(e) => setKeyOpen((e.target as HTMLDetailsElement).open)}>
+          <summary>Advanced: add your own recovery key</summary>
+          <p className="small">
+            <RecoveryKeyExplainer server={here} />
+          </p>
+          <RecoveryKeyPicker onChange={setUserKey} />
+          {ownKey && (
+            <Notice kind="ok">
+              <span className="mono small">{shortKey(ownKey)}</span> goes first in your rotation keys, ahead of {here}'s.
+            </Notice>
+          )}
+        </details>
+      )}
       {pending ? (
         <>
-          <Notice kind="info">Your current server already signed the change. It just needs to reach the directory.</Notice>
-          <ErrorNotice error={error} />
+          <Notice kind="info">Your current server already signed the change. It just needs to reach {adv ? 'the directory' : 'the finish line'}.</Notice>
+          <Problem error={error} />
           <div className="row end">
             <button type="button" className="btn primary" disabled={!!busy} onClick={() => move()}>
               {busy === 'move' && <Spinner />}
-              Finish moving my identity
+              {adv ? 'Finish moving my identity' : 'Finish moving my account'}
             </button>
           </div>
         </>
       ) : !requested ? (
         <>
           <p>
-            {hostOf(saved.oldPds)} has to approve the change: it emails a confirmation code to {saved.email ? maskEmail(saved.email) : 'your account email'}.
+            {old} has to approve the change: it emails a confirmation code to {saved.email ? maskEmail(saved.email) : 'your account email'}.
           </p>
-          <ErrorNotice error={error} />
+          <Problem error={error} />
           <div className="row end">
             <button type="button" className="btn primary" disabled={!!busy || !r} onClick={request}>
               {busy === 'request' && <Spinner />}
@@ -1234,29 +1444,39 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
         </>
       ) : (
         <form onSubmit={move}>
-          {sentNow && <Notice kind="ok">Code sent. Check your inbox (and spam) for mail from {hostOf(saved.oldPds)}.</Notice>}
+          {sentNow && <Notice kind="ok">Code sent. Check your inbox (and spam) for mail from {old}.</Notice>}
           {tokenError ? (
             <Notice kind="err">
               {(error as XrpcError).error === 'ExpiredToken' ? 'That code has expired.' : "That code isn't right."} Check it, or send a new code.
             </Notice>
           ) : (
-            <ErrorNotice error={error} />
+            <Problem error={error} />
           )}
-          <Field label="Confirmation code" hint="From the email titled something like “PLC Update Operation Requested”. It looks like ABCDE-12345.">
+          <Field
+            label="Confirmation code"
+            hint={
+              adv
+                ? 'From the email titled something like “PLC Update Operation Requested”. It looks like ABCDE-12345.'
+                : `From the email ${old} just sent you. It looks like ABCDE-12345.`
+            }
+          >
             <input type="text" name="plc-token" value={token} onChange={(e) => setToken(e.target.value)} autoComplete="one-time-code" spellCheck={false} required />
           </Field>
           <label className="check">
             <input type="checkbox" name="understood" checked={understood} onChange={(e) => setUnderstood(e.target.checked)} />
-            <span>I understand: after this, {here} hosts my account and my identity.</span>
+            <span>{adv ? <>I understand: after this, {here} hosts my account and my identity.</> : <>I understand: after this, my account lives on {here}.</>}</span>
           </label>
+          {keyUnfinished && (
+            <Notice kind="warn">Finish adding your recovery key above (or close that section) before moving.</Notice>
+          )}
           <div className="row between">
             <button type="button" className="btn quiet" disabled={!!busy} onClick={request}>
               {busy === 'request' && <Spinner />}
               Send a new code
             </button>
-            <button type="submit" className="btn primary" disabled={!!busy || !understood || !r}>
+            <button type="submit" className="btn primary" disabled={!!busy || !understood || !r || keyUnfinished}>
               {busy === 'move' && <Spinner />}
-              Move my identity
+              {moveLabel}
             </button>
           </div>
         </form>
@@ -1312,7 +1532,7 @@ function FinishStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: P
       </ul>
       {!!error && !running && (
         <>
-          <ErrorNotice error={error} />
+          <Problem error={error} />
           {saved.activated && (
             <Notice kind="info">
               Your account is already live here. The old copy is still switched on at {hostOf(saved.oldPds)}; retry, or deactivate it later from there.
@@ -1337,6 +1557,7 @@ function FinishStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: P
 // ---------------------------------------------------------------- done
 
 function DoneStep({ saved, newPds, onReset }: { saved: Saved; newPds: Pds; onReset: () => void }) {
+  const adv = useAdv()
   const st = useLoad<AccountStatus | null>(() => (newPds.tokens ? newPds.call('com.atproto.server.checkAccountStatus') : Promise.resolve(null)), [])
   const open = () => {
     if (newPds.tokens) setSession({ did: saved.did, handle: saved.newHandle ?? '', ...newPds.tokens })
@@ -1344,12 +1565,19 @@ function DoneStep({ saved, newPds, onReset }: { saved: Saved; newPds: Pds; onRes
     navigate('/account')
   }
   return (
-    <Card title="Welcome to your new home" sub={<>@{saved.newHandle} now lives on {here}. Your followers, posts and DID came with you.</>}>
+    <Card
+      title="Welcome to your new home"
+      sub={
+        <>
+          @{saved.newHandle} now lives on {here}. Your followers and posts came with you{adv ? ', and so did your DID' : ''}.
+        </>
+      }
+    >
       {st.data && (
         <div className="tiles">
           <div className="tile">
             <div className="v">{fmtNum(st.data.indexedRecords)}</div>
-            <div className="k">records</div>
+            <div className="k">{adv ? 'records' : 'posts, likes and follows'}</div>
           </div>
           <div className="tile">
             <div className="v">

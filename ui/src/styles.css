@@ -2522,3 +2522,92 @@ table.data.rl-side-table td {
     padding: 20px 16px 18px;
   }
 }
+
+/* /migrate: simple/advanced switch, error details, own recovery key */
+.mig-mode {
+  justify-content: flex-end;
+  color: var(--ink2);
+  font-size: 13px;
+  max-width: 640px;
+  margin: 0 0 10px;
+}
+.mig-details {
+  margin-top: 6px;
+}
+.mig-details summary,
+.mig-adv > summary {
+  cursor: pointer;
+  color: var(--ink2);
+  font-size: 13.5px;
+}
+.mig-details p {
+  margin: 6px 0 0;
+  overflow-wrap: anywhere;
+}
+.mig-adv {
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin: 0 0 16px;
+}
+.mig-adv[open] > summary {
+  margin-bottom: 8px;
+  color: var(--ink);
+  font-weight: 600;
+}
+.mig-yours {
+  margin-left: 8px;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--accent-wash);
+  color: var(--accent);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.rk-modes {
+  margin: 4px 0 10px;
+}
+.rk-modes .check {
+  margin-bottom: 6px;
+}
+.rk-bad {
+  color: var(--danger);
+}
+.rk-made .dl {
+  margin: 10px 0;
+}
+.rk-made .dl dd {
+  overflow-wrap: anywhere;
+}
+.rk-made .row {
+  margin-bottom: 12px;
+}
+.rk-list {
+  list-style: none;
+  margin: 0 0 14px;
+  padding: 0;
+}
+.rk-list li {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-top: 1px solid var(--rule2);
+  font-size: 13.5px;
+}
+.rk-list li:first-child {
+  border-top: 0;
+}
+.rk-list .who {
+  color: var(--ink2);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.rk-list .mono {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}

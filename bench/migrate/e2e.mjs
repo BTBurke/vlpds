@@ -8,7 +8,7 @@
 // Every URL is local; nothing here reaches the public network.
 
 import { chromium } from 'playwright'
-import { createHash, randomBytes } from 'node:crypto'
+import { createECDH, createHash, randomBytes } from 'node:crypto'
 import { deflateSync } from 'node:zlib'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 
@@ -125,6 +125,30 @@ function png(seed, w = 64, h = 64, pad = 0) {
   return Buffer.concat(parts)
 }
 const sha = (b) => createHash('sha256').update(b).digest('hex')
+
+// ---------------------------------------------------------------- did:key (secp256k1)
+
+const B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+function b58(bytes) {
+  let n = BigInt(`0x${Buffer.from(bytes).toString('hex') || '0'}`)
+  let out = ''
+  while (n > 0n) {
+    out = B58[Number(n % 58n)] + out
+    n /= 58n
+  }
+  for (const b of bytes) {
+    if (b !== 0) break
+    out = `1${out}`
+  }
+  return out
+}
+/** The did:key of a secp256k1 private key given as hex. */
+function didKeyOfPrivate(hex) {
+  const e = createECDH('secp256k1')
+  e.setPrivateKey(Buffer.from(hex, 'hex'))
+  return `did:key:z${b58(Buffer.concat([Buffer.from([0xe7, 0x01]), e.getPublicKey(null, 'compressed')]))}`
+}
+const newDidKey = () => didKeyOfPrivate(randomBytes(32).toString('hex'))
 
 // ---------------------------------------------------------------- seed
 
@@ -266,10 +290,34 @@ const load = () => JSON.parse(readFileSync(`${OUT}state.json`, 'utf8'))
 // ---------------------------------------------------------------- drive
 
 let shotN = 0
+/** Set while driving an account in simple mode: every /migrate screen is checked for protocol jargon. */
+let simpleMode = false
+const JARGON = /\b(PLC|DIDs?|did:\w*|repo|repository|CAR|blobs?|rotation keys?|service auth|PDS)\b/
 async function shot(page, name) {
   mkdirSync(SHOTS, { recursive: true })
+  if (simpleMode && page.url().includes('/migrate')) {
+    const text = await page.locator('.mig-main').innerText()
+    const m = text.match(JARGON)
+    check(!m, `simple mode, ${name}: no protocol jargon on screen`, m ? `found "${m[0]}" in: ${text.slice(Math.max(0, m.index - 60), m.index + 60)}` : '')
+  }
   await page.screenshot({ path: `${SHOTS}${String(++shotN).padStart(2, '0')}-${name}.png`, fullPage: true })
 }
+
+/** localStorage and sessionStorage of the page's origin, as one string. */
+const storageOf = (page) => page.evaluate(() => JSON.stringify({ ...localStorage }) + JSON.stringify({ ...sessionStorage }))
+
+/** The newest email token vlpds (dev mode) delivered to `email`, once it differs from `before`. */
+async function devMailToken(email, before) {
+  for (let i = 0; i < 60; i++) {
+    const r = await xrpc(VLPDS, 'vlpds.admin.getDevMail', { auth: basic, params: { email } })
+    if (r.token && r.token !== before) return r.token
+    await sleep(250)
+  }
+  throw new Error(`no new dev mail token for ${email}`)
+}
+const lastDevMailToken = (email) => xrpc(VLPDS, 'vlpds.admin.getDevMail', { auth: basic, params: { email } }).then((r) => r.token)
+
+const plcData = (did) => fetch(`${PLC}/${did}/data`).then((r) => r.json())
 
 const heading = (page) => page.locator('.mig-card h1')
 
@@ -278,7 +326,8 @@ async function waitHeading(page, re, timeout = 60_000) {
 }
 
 async function driveOne(ctx, a, state, opts) {
-  log(`drive: ${a.name} (${a.handle})`)
+  log(`drive: ${a.name} (${a.handle}), ${opts.advanced ? 'advanced' : 'simple'} mode`)
+  simpleMode = !opts.advanced
   let page = await ctx.newPage()
   page.on('pageerror', (e) => log(`  [pageerror] ${e.message}`))
   page.on('console', (m) => m.type() === 'error' && log(`  [console] ${m.text()}`))
@@ -296,6 +345,10 @@ async function driveOne(ctx, a, state, opts) {
     await page.goto(`${VLPDS}/migrate${invite ? `?invite=${invite}` : ''}`)
   }
   await waitHeading(page, /Move your account here/)
+  if (opts.advanced) {
+    await page.check('input[name=advanced]')
+    await page.getByText('Your handle or DID').waitFor()
+  }
   await shot(page, `${a.name}-find`)
 
   // 1. find: a .test handle can't be looked up by a dev-mode vlpds, so the
@@ -335,14 +388,15 @@ async function driveOne(ctx, a, state, opts) {
   }
 
   // 3. checks
-  await waitHeading(page, /Pre-flight checks/)
+  await waitHeading(page, opts.advanced ? /Pre-flight checks/ : /Checking your account/)
   for (let i = 0; (await page.locator('.mig-check .spinner').count()) > 0; i++) {
     if (i > 150) throw new Error('preflight checks never finished')
     await sleep(200)
   }
   await shot(page, `${a.name}-checks`)
   const checksText = await page.locator('.mig-checks').innerText()
-  check(checksText.includes(`${a.oldStatus.indexedRecords} records`), 'preflight shows the record count', checksText)
+  if (opts.advanced) check(checksText.includes(`${a.oldStatus.indexedRecords} records`), 'preflight shows the record count', checksText)
+  else check(!checksText.includes('records'), 'simple preflight shows no record count', checksText)
   await page.click('button:has-text("Continue")')
 
   // 4. handle
@@ -408,16 +462,20 @@ async function driveOne(ctx, a, state, opts) {
     let imports = 0
     page.on('request', (r) => r.url().includes('com.atproto.repo.importRepo') && imports++)
     await page.reload()
-    await waitHeading(page, /Copying your data|Move your identity/)
+    await waitHeading(page, /Copying your data|Move your identity|Confirm the move/)
     check(true, `reloaded mid-copy (${before.match(/\d+ of \d+ copied/)?.[0]}) and landed back on the copy step`)
-    await waitHeading(page, /Move your identity/, 300_000)
+    await waitHeading(page, /Move your identity|Confirm the move/, 300_000)
     check(imports === 0, 'the resumed copy did not import the repository again', `imports=${imports}`)
   } else {
-    await waitHeading(page, /Move your identity/, 300_000)
+    await waitHeading(page, /Move your identity|Confirm the move/, 300_000)
   }
 
   // 7. identity
-  await page.locator('.mig-diff').waitFor()
+  if (opts.advanced) await page.locator('.mig-diff').waitFor()
+  else {
+    await page.getByText('Your account will be hosted at').first().waitFor()
+    check((await page.locator('.mig-diff').count()) === 0, 'simple mode hides the key table')
+  }
   await shot(page, `${a.name}-identity-review`)
   let tPlc = Date.now()
   await page.click('button:has-text("Email me a confirmation code")')
@@ -436,15 +494,18 @@ async function driveOne(ctx, a, state, opts) {
     await waitHeading(page, /Sign in to your new account/)
     await page.fill('input[name=password]', a.newPassword ?? a.password)
     await page.click('button:has-text("Sign in")')
-    await waitHeading(page, /Move your identity/)
+    await waitHeading(page, /Move your identity|Confirm the move/)
     await page.locator('input[name=plc-token]').waitFor()
     check(true, 'a new tab resumed at the identity step after signing in to both servers')
   }
   const token = await mailToken(a.email, tPlc, /PLC|Update/i)
+  const moveBtn = page.getByRole('button', { name: /^Move my (identity|account)$/ })
+  if (!opts.advanced) check((await page.locator('summary', { hasText: 'recovery key' }).count()) === 0, 'simple mode offers no recovery key')
+  if (opts.ownKey) await addOwnKey(page, a, opts.ownKey, moveBtn, token)
   if (opts.wrongPlcToken) {
     await page.fill('input[name=plc-token]', 'AAAAA-BBBBB')
     await page.check('input[name=understood]')
-    await page.click('button:has-text("Move my identity")')
+    await moveBtn.click()
     await page.getByText(/That code isn't right|code has expired/).waitFor()
     await shot(page, `${a.name}-wrong-code`)
     check(true, 'a wrong PLC code is refused and the step stays put')
@@ -454,7 +515,7 @@ async function driveOne(ctx, a, state, opts) {
     await page.check('input[name=understood]')
   }
   await shot(page, `${a.name}-identity-code`)
-  await page.click('button:has-text("Move my identity")')
+  await moveBtn.click()
 
   // 8. finish
   await waitHeading(page, /Welcome to your new home/, 120_000)
@@ -465,23 +526,96 @@ async function driveOne(ctx, a, state, opts) {
   await page.getByText(a.newHandle).first().waitFor({ timeout: 20_000 })
   await shot(page, `${a.name}-account`)
   check(true, 'the account page opens signed in to the moved account')
+  if (a.ownPrivate) {
+    const stored = await storageOf(page)
+    check(!stored.includes(a.ownPrivate), 'the generated private key is in neither localStorage nor sessionStorage')
+    delete a.ownPrivate
+  }
+  if (opts.accountKey) await accountRecoveryKey(page, a)
   await page.close()
+}
+
+/** /migrate, advanced: add the user's own recovery key ahead of vlpds's keys. */
+async function addOwnKey(page, a, how, moveBtn, token) {
+  await page.click('summary:has-text("Advanced: add your own recovery key")')
+  if (how === 'generate') {
+    await page.click('button:has-text("Generate a recovery key")')
+    const priv = (await page.locator('.rk-private .mono').innerText()).trim()
+    const pub = (await page.locator('.rk-public .mono').innerText()).trim()
+    check(/^[0-9a-f]{64}$/.test(priv) && didKeyOfPrivate(priv) === pub, 'the shown private key (hex) derives the shown did:key', `${priv} ${pub}`)
+    await page.fill('input[name=plc-token]', token)
+    await page.check('input[name=understood]')
+    check(await moveBtn.isDisabled(), 'moving waits until "I saved it" is ticked')
+    check(!(await storageOf(page)).includes(priv), 'the private key is not stored in the browser')
+    await shot(page, `${a.name}-own-key-generated`)
+    await page.check('input[name=saved-key]')
+    a.ownPrivate = priv
+    a.userKey = pub
+  } else {
+    await page.check('input[name=rk-mode][value=paste]')
+    await page.fill('input[name=recovery-did-key]', 'did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBmf')
+    await page.locator('.rk-bad').waitFor()
+    await page.fill('input[name=plc-token]', token)
+    await page.check('input[name=understood]')
+    check(await moveBtn.isDisabled(), 'an invalid did:key is refused before anything is signed')
+    await shot(page, `${a.name}-own-key-invalid`)
+    a.userKey = newDidKey()
+    await page.fill('input[name=recovery-did-key]', a.userKey)
+  }
+  await page.locator('.mig-yours').waitFor()
+  check(!(await moveBtn.isDisabled()), 'with the key ready, the move can go ahead')
+  await shot(page, `${a.name}-own-key-ready`)
+}
+
+/** The account page: add a recovery key with an emailed code, then remove it. */
+async function accountRecoveryKey(page, a) {
+  await page.click('aside.sidenav a:has-text("Security")')
+  const panel = page.locator('#recovery-key')
+  await panel.locator('.rk-list li').first().waitFor({ timeout: 20_000 })
+  const rec = (await plcData(a.did)).rotationKeys
+  await shot(page, `${a.name}-account-keys`)
+  await panel.locator('button:has-text("Add a recovery key")').click()
+  await panel.locator('input[name=rk-mode][value=paste]').check()
+  const key = newDidKey()
+  await panel.locator('input[name=recovery-did-key]').fill(key)
+  let before = await lastDevMailToken(a.email)
+  await panel.locator('button:has-text("Continue")').click()
+  await panel.locator('input[name=plc-token]').fill(await devMailToken(a.email, before))
+  await panel.locator('button:has-text("Add recovery key")').click()
+  await panel.getByText('Your recovery key is added').waitFor()
+  let data = await plcData(a.did)
+  check(JSON.stringify(data.rotationKeys) === JSON.stringify([key, ...rec]), 'account page: the added key is first in PLC rotationKeys', JSON.stringify(data.rotationKeys))
+  await shot(page, `${a.name}-account-key-added`)
+  before = await lastDevMailToken(a.email)
+  await panel.locator('li', { hasText: key }).locator('button:has-text("Remove")').click()
+  await panel.locator('input[name=plc-token]').fill(await devMailToken(a.email, before))
+  await panel.locator('button:has-text("Remove key")').click()
+  await panel.getByText('That key is removed').waitFor()
+  data = await plcData(a.did)
+  check(JSON.stringify(data.rotationKeys) === JSON.stringify(rec), 'account page: removing the key restores the server keys', JSON.stringify(data.rotationKeys))
 }
 
 async function drive(state) {
   const browser = await chromium.launch({ headless: !HEADED })
   try {
+    // alice and dave in advanced mode with their own recovery keys; bob and carol in simple mode
     const plans = {
-      alice: { byHandle: true, inviteInUrl: true, appPasswordFirst: true },
-      bob: { loseCreateAnswer: true, wrongPlcToken: true, fromLanding: true },
+      alice: { byHandle: true, inviteInUrl: true, appPasswordFirst: true, advanced: true, ownKey: 'generate' },
+      bob: { loseCreateAnswer: true, wrongPlcToken: true, fromLanding: true, accountKey: true },
       carol: { reloadMidBlobs: true, newTabBeforePlc: true },
-      dave: { keepHandle: true },
+      dave: { keepHandle: true, advanced: true, ownKey: 'paste' },
     }
     for (const [name, opts] of Object.entries(plans)) {
       const ctx = await browser.newContext({ viewport: { width: 1180, height: 900 } })
-      await driveOne(ctx, state.accounts[name], state, opts)
+      try {
+        await driveOne(ctx, state.accounts[name], state, opts)
+      } catch (e) {
+        for (const p of ctx.pages()) await shot(p, `${name}-error`).catch(() => {})
+        throw e
+      }
       await ctx.close()
     }
+    simpleMode = false
     // the page refuses an account that already lives here
     const ctx = await browser.newContext()
     const page = await ctx.newPage()
@@ -493,9 +627,13 @@ async function drive(state) {
     check(true, 'an account that already moved here is recognised up front')
     await page.fill('input[name=identifier]', 'did:web:pds.example.com')
     await page.click('button:has-text("Find my account")')
+    await page.getByText(/managed on its own website/).waitFor()
+    await shot(page, 'did-web-simple')
+    check(true, 'simple mode: a did:web is refused in plain words')
+    await page.check('input[name=advanced]')
     await page.getByText(/is a did:web/).waitFor()
     await shot(page, 'did-web')
-    check(true, 'a did:web is refused with the manual steps')
+    check(true, 'advanced mode: a did:web is refused with the manual steps')
     await ctx.close()
   } finally {
     await browser.close()
@@ -555,7 +693,12 @@ async function verify(state) {
     const rec = await xrpc(VLPDS, 'com.atproto.identity.getRecommendedDidCredentials', { auth: jwt })
     check(data.services?.atproto_pds?.endpoint === VLPDS, `PLC: PDS endpoint is ${VLPDS}`, JSON.stringify(data.services))
     check(data.verificationMethods?.atproto === rec.verificationMethods.atproto, 'PLC: signing key is the vlpds one')
-    check(JSON.stringify(data.rotationKeys) === JSON.stringify(rec.rotationKeys), 'PLC: rotation keys are the vlpds ones')
+    const wantKeys = [...(a.userKey ? [a.userKey] : []), ...rec.rotationKeys]
+    check(
+      JSON.stringify(data.rotationKeys) === JSON.stringify(wantKeys),
+      a.userKey ? "PLC: rotation keys are the user's own key first, then vlpds's" : "PLC: rotation keys are vlpds's",
+      JSON.stringify(data.rotationKeys),
+    )
     check(data.alsoKnownAs?.[0] === `at://${a.newHandle}`, `PLC: handle at://${a.newHandle}`)
 
     // both sides' status
