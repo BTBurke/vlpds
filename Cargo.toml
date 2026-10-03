@@ -136,8 +136,8 @@ name = "level_gating"
 path = "tests/level_gating.rs"
 required-features = ["test-level"]
 
-# slatedb 0.17.0 (upstream c1e36fc) plus three patches on the fork branch
-# vlpds-0.17-submit-dest-guard (all pending an upstream report):
+# slatedb 0.17.0 (upstream c1e36fc) plus four patches on the fork branch
+# vlpds-0.17-filtercache (all pending an upstream report):
 # 1. a union clone (a shard merge) of two sources that inherited the same L0
 #    SST from a common ancestor (a split's halves merged back) repeated its L0
 #    view id, and the merged shard's first compaction of it dropped one half's
@@ -149,10 +149,13 @@ required-features = ["test-level"]
 #    destination check and could be promoted next to a running job into the
 #    same sorted run; the executor's assert! then panicked (validate_compaction
 #    now fails a submitted spec that collides with a claimed one).
+# 4. CompactionWorkerBuilder::with_db_cache: a standalone worker seeds its
+#    output SSTs' index and filters into the DB's cache, so a fresh SST isn't
+#    a guaranteed metadata miss for its first reads.
 [patch.crates-io]
-slatedb = { git = "https://github.com/jazware/slatedb", rev = "68106cc0a3d9042fd6e1e6964c462092163db383" }
+slatedb = { git = "https://github.com/jazware/slatedb", rev = "2a79077e0da057c4673137195409edfe7bb673c4" }
 # the same rev, so the metrics recorder (src/metrics.rs) and slatedb share one slatedb-common
-slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "68106cc0a3d9042fd6e1e6964c462092163db383" }
+slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "2a79077e0da057c4673137195409edfe7bb673c4" }
 
 [profile.release]
 opt-level = 3

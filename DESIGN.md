@@ -141,7 +141,8 @@ considered and measurements: "Partial MSTs".
     concurrent misses of one filter/index share one fetch (SlateDB's
     default `fetch_*` doesn't dedup; foyer, the block cache, does).
   - `partition::warm`, run by `open_many` alongside the log replay: every
-    SST's filters and index, and the newest L0s whole (one ranged GET
+    SST's filters and index that fit the meta cache's free room, and the
+    newest L0s whole (one ranged GET
     each; at most 64 MiB per shard and a quarter of the block cache per
     batch), 64 SSTs at a time. Shards wait for it at most 5 s from the
     start of the open before serving (writes meanwhile are `ShardMoved`,
@@ -250,7 +251,8 @@ swappable.
   block cache holds decoded blocks, so only misses decompress, and the local
   disk cache holds 2.5× more).
 - One block cache (foyer, `--block-cache-mb`) and one SST metadata cache
-  (bloom filters, indexes, stats; a quarter of the block cache) serve every
+  (bloom filters, indexes, stats; `--meta-cache-mb`, default a quarter of
+  the block cache) serve every
   shard DB. Flushes put their data blocks in it, so RSS climbs with commits
   until the cache is full (about 2 KB per commit with partial MSTs, whose
   `M/` writes double state bytes per commit; 0.36 KB at a 64 MB cache) and
@@ -269,6 +271,47 @@ swappable.
   Likely the benchbox regression (63k -> 35k/s at 10M, -13-28 % on small
   repos) from 2e64422's 6 IO threads to fa0975c's 32. Decompression was
   not it: blocks are cached decoded, and the sweep reads 2,000 records.
+- **The metadata cache must hold every owned SST's filter and index.** A
+  point read checks one filter per sorted run (and every L0), so under
+  uniform keys (bulk imports, random repo loads) the working set is all of
+  them, and SlateDB filters are whole-SST: a miss fetches and decodes the
+  SST's entire filter (MBs for a big compacted SST) to answer one key. The
+  100M capacity run (`benchbox-2026-10-02-round2` block 6) collapsed past
+  ~75M accounts (bulk 78k -> 3k accounts/s, 1-2.4 GB/s of ~800 KB SST GETs
+  per node for 10 MB/s of writes, `read_filters` 26% of CPU, then lease
+  lapses) with the working set still under the 0.9 GB cache. Causes and
+  fixes:
+  - The byte budget was per CLOCK shard (1/64 of the cache, ~14 MB there):
+    a few MB-sized filters hashing to one shard overflowed it and evicted
+    each other on every load, whatever the total. The budget is now
+    cache-wide (`partition::ClockCache`), and the hand evicts only what an
+    insert needs (it used to drop every entry not hit since the previous
+    insert).
+  - Misses are single-flight, and waiters get the loader's result even if
+    the cache already dropped it.
+  - The standalone compaction worker wrote its output without a cache, so
+    each new sorted run's SSTs were a guaranteed miss for every read at
+    once (fork patch: `CompactionWorkerBuilder::with_db_cache`; the
+    worker seeds their filters and indexes).
+  - Compacted SSTs roll at 64 MiB instead of 256: a miss fetches a quarter
+    as much (a read still checks one SST per sorted run).
+  - `partition::warm` puts metadata only into the cache's free room: a
+    takeover's warm into a full cache would push out the hot filters of
+    the shards the node already serves.
+  Size: ~29 MB decoded per million accounts at the capacity test's records
+  distribution (~1.3x the encoded `vlpds_sst_meta_bytes`), so 100M accounts
+  on 4 nodes is ~0.72 GB per node and ~0.96 GB with one node down:
+  `--meta-cache-mb` (default a quarter of the block cache) needs ~1.5 GB
+  there. Alerts: `VlpdsSstMetaCacheTooSmall`, `VlpdsSstMetaRefetching`.
+  Laptop repro (1 node, 4 shards, bulk at 64 MB of meta cache, MB of SST
+  GETs per created account, bench/results/filtercache-2026-10-02-laptop):
+  at 1.5M accounts 0.51 MB before, 0.023 MB after; at 2M the old binary's
+  bulk stalled at ~700 accounts/s and timed out, the new one ran at
+  6.7k/s (0.019 MB). With the cache sized to fit (1 GB) no filter or index
+  was fetched at all (2-8 KB per account, data blocks). Past the cache the
+  bulk still slows (2-7k vs 7-24k accounts/s; 0.17 MB per account at 3M,
+  ~1.3x over): filters are whole-SST, so overflow stays costly; size the
+  cache.
 - The local SST disk cache (`--cache-dir`, one directory per shard) is
   capped per shard: SlateDB's default is 16 GiB per DB, 1 TiB at 64 shards.
   `--disk-cache-mb` is the node's budget, divided by the layout's shard

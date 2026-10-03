@@ -228,10 +228,18 @@ struct Args {
     /// cache dir = not kept (the next start reports reason "none").
     #[arg(long, env = "VLPDS_EXIT_STATE_FILE", default_value = "")]
     exit_state_file: String,
-    /// In-memory SST block cache shared by every shard DB on this node (MiB;
-    /// the meta/index cache gets a quarter of this on top).
+    /// In-memory SST block cache shared by every shard DB on this node (MiB).
     #[arg(long, env = "VLPDS_BLOCK_CACHE_MB", default_value_t = 4096)]
     block_cache_mb: u64,
+    /// In-memory SST metadata (bloom filter + index) cache on top of the
+    /// block cache (MiB; 0 = a quarter of --block-cache-mb). Every point read
+    /// checks a filter per sorted run, so size it to hold
+    /// the filters and indexes of the shards a node may own after a failover
+    /// (~29 MB per million accounts at the capacity test's records
+    /// distribution; `vlpds_sst_meta_bytes` is their encoded size, ~1.3x
+    /// less), plus headroom for compactions in flight.
+    #[arg(long, env = "VLPDS_META_CACHE_MB", default_value_t = 0)]
+    meta_cache_mb: u64,
     /// SlateDB SST block compression: none, lz4 or zstd.
     #[arg(long, env = "VLPDS_SST_COMPRESSION", default_value = "zstd")]
     sst_compression: String,
@@ -940,6 +948,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         return wrap_plc_rotation_key(&args).await;
     }
     vlpds::partition::set_block_cache_bytes(args.block_cache_mb << 20);
+    vlpds::partition::set_meta_cache_bytes(args.meta_cache_mb << 20);
     vlpds::partition::set_sst_compression(args.sst_compression.parse()?);
     vlpds::partition::set_compaction_polling(args.compaction_polling.parse()?);
     vlpds::partition::set_compaction_poll_interval(vlpds::retention::parse_duration(&args.compaction_poll)?);

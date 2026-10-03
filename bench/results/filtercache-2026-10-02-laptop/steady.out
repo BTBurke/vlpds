@@ -1,0 +1,44 @@
+== base run
+=== result ===
+target 3000/s (fleet 3000 + hot 0) | achieved 3000/s ok | errors 0 | dropped 0
+all        n=120000    p50=    5.9ms p90=   13.0ms p99=   32.5ms p99.9=   59.5ms max=   84.3ms
+
+== base methods
+method                  ops/s    p50 ms    p90 ms    p99 ms    max ms  errors
+getRecord               14011      3.49      7.79     22.91     177.9       0
+listRecords             12176      4.51      8.37     17.84     111.9       0
+describeRepo             8409      6.94     11.43     20.08      88.4       0
+
+== new3 run
+=== result ===
+target 3000/s (fleet 3000 + hot 0) | achieved 3000/s ok | errors 0 | dropped 0
+all        n=120000    p50=    5.3ms p90=   11.8ms p99=   37.7ms p99.9=  102.0ms max=  133.5ms
+
+== new3 methods
+method                  ops/s    p50 ms    p90 ms    p99 ms    max ms  errors
+getRecord               22251      1.98      5.08     16.59      94.0       0
+listRecords              7580      6.60     15.02     36.67     113.5       0
+describeRepo             6440      8.65     15.49     30.24     146.0       0
+
+== base2 run
+=== result ===
+target 3000/s (fleet 3000 + hot 0) | achieved 3000/s ok | errors 0 | dropped 0
+all        n=120000    p50=    4.6ms p90=   13.1ms p99=   52.8ms p99.9=  120.3ms max=  153.3ms
+
+== base2 methods
+method                  ops/s    p50 ms    p90 ms    p99 ms    max ms  errors
+getRecord               14202      3.46      7.83     21.87     112.4       0
+listRecords              3473     10.73     40.80    136.96     335.1       0
+describeRepo             3567     12.44     36.67     87.68     195.2       0
+
+== new3b run
+=== result ===
+target 3000/s (fleet 3000 + hot 0) | achieved 3000/s ok | errors 0 | dropped 0
+all        n=120000    p50=    6.9ms p90=   17.3ms p99=   60.4ms p99.9=  113.8ms max=  143.5ms
+
+== new3b methods
+method                  ops/s    p50 ms    p90 ms    p99 ms    max ms  errors
+getRecord               24884      2.06      4.07      9.94     114.9       0
+listRecords             10154      5.66     10.01     17.81      86.1       0
+describeRepo             6471      8.37     15.86     35.84     151.7       0
+

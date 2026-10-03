@@ -45,6 +45,26 @@ pub struct Node {
     pub(crate) followers: Mutex<HashMap<String, Follower>>,
 }
 
+/// Exports `vlpds_sst_meta_bytes` at every render: the encoded filters and
+/// indexes of every SST in the shards this node owns.
+pub fn export_sst_meta_bytes(table: &Arc<PartitionTable>) {
+    let weak = Arc::downgrade(table);
+    crate::metrics::on_render(move || {
+        let Some(table) = weak.upgrade() else { return false };
+        let (mut filter, mut index) = (0, 0);
+        for p in table.owned() {
+            let m = p.db.manifest();
+            for h in m.l0().iter().map(|v| &v.sst).chain(m.compacted().iter().flat_map(|r| r.sst_views().iter().map(|v| &v.sst))) {
+                filter += h.info.filter_len;
+                index += h.info.index_len;
+            }
+        }
+        crate::metrics::SST_META_BYTES.with_label_values(&["filter"]).set(filter as i64);
+        crate::metrics::SST_META_BYTES.with_label_values(&["index"]).set(index as i64);
+        true
+    });
+}
+
 impl Node {
     /// Retires followers of dead logs once drained to their fence.
     pub fn sync_followers(&self) {

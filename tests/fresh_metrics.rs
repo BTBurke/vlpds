@@ -105,6 +105,10 @@ const PRESENT: &[&str] = &[
     "vlpds_commit_durable_seconds_count",
     "vlpds_firehose_emit_delay_seconds_count",
     "vlpds_runtime_late_seconds_total",
+    r#"vlpds_meta_cache_loads_total{kind="filter",result="fetched"}"#,
+    r#"vlpds_meta_cache_loads_total{kind="index",result="shared"}"#,
+    r#"vlpds_sst_meta_bytes{kind="filter"}"#,
+    "vlpds_meta_cache_capacity_bytes",
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

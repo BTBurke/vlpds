@@ -410,6 +410,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         recent_cap: cfg.preload_recent,
         followers: Default::default(),
     });
+    crate::node::export_sst_meta_bytes(&table);
     let host: Arc<dyn ShardHost> = node.clone();
     let node_handle = node.clone();
     // first membership step inline, so a lone node serves with all its shards

@@ -110,12 +110,29 @@ impl RecentRepos {
 /// One block/meta cache shared by every shard DB in the process: SlateDB's
 /// default private caches per Db grow with the shard count.
 static BLOCK_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(4 << 30);
+/// 0: a quarter of the block cache.
+static META_CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The meta cache gets a quarter on top. Takes effect only before the first
-/// shard DB opens.
+/// Takes effect only before the first shard DB opens.
 pub fn set_block_cache_bytes(n: u64) {
     BLOCK_CACHE_BYTES.store(n.max(64 << 20), std::sync::atomic::Ordering::Relaxed);
 }
+
+/// The SST metadata (filter + index) cache, on top of the block cache; 0 =
+/// a quarter of the block cache. Takes effect only before the first shard
+/// DB opens.
+pub fn set_meta_cache_bytes(n: u64) {
+    META_CACHE_BYTES.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn meta_cache_bytes() -> u64 {
+    match META_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed) / 4,
+        n => n.max(MIN_META_CACHE_BYTES),
+    }
+}
+
+const MIN_META_CACHE_BYTES: u64 = 4 << 20;
 
 static CACHE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -133,181 +150,334 @@ fn shared_db_cache() -> Arc<dyn slatedb::db_cache::DbCache> {
                 Arc::new(FoyerCache::new_with_opts(FoyerCacheOptions { max_capacity: cap, ..Default::default() }))
             };
             let block = BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
-            let meta: Arc<dyn slatedb::db_cache::DbCache> = Arc::new(MetaCache::new(block / 4));
+            let meta: Arc<dyn slatedb::db_cache::DbCache> = shared_meta_cache().clone();
             Arc::new(SplitCache::new().with_block_cache(Some(mk(block))).with_meta_cache(Some(meta)))
         })
         .clone()
 }
 
-/// The shared SST metadata cache (filters, indexes, stats): RwLock shards
-/// with CLOCK eviction, so a hit takes a shared lock and sets one bit.
-/// Foyer takes its shard's mutex on every hit, and every point read of a
-/// repo checks the same few SSTs' filters: threads serialized on those hot
-/// keys.
-///
-/// Misses are single-flight: a shard's new owner starts with none of its
-/// SSTs' filters and indexes cached, and every cold repo load in the shard
-/// misses the same ones at once. Without dedup each load fetched them all
-/// itself (10–65 range GETs per load after a move).
-pub struct MetaCache {
-    shards: Vec<parking_lot::RwLock<MetaShard>>,
-    shard_bytes: usize,
-    hasher: std::hash::RandomState,
-    loading: parking_lot::Mutex<std::collections::HashMap<slatedb::db_cache::CachedKey, tokio::sync::watch::Sender<Option<slatedb::db_cache::CachedEntry>>>>,
+fn shared_meta_cache() -> &'static Arc<MetaCache> {
+    static META: std::sync::OnceLock<Arc<MetaCache>> = std::sync::OnceLock::new();
+    META.get_or_init(|| {
+        let meta = Arc::new(MetaCache::new(meta_cache_bytes()));
+        crate::metrics::META_CACHE_CAPACITY.set(meta.capacity() as i64);
+        crate::metrics::on_render(|| {
+            crate::metrics::META_CACHE_BYTES.set(shared_meta_cache().bytes() as i64);
+            true
+        });
+        meta
+    })
 }
 
-#[derive(Default)]
-struct MetaShard {
-    map: std::collections::HashMap<slatedb::db_cache::CachedKey, MetaSlot>,
-    bytes: usize,
-}
+type MetaKey = slatedb::db_cache::CachedKey;
+type MetaEntry = slatedb::db_cache::CachedEntry;
 
-struct MetaSlot {
-    entry: slatedb::db_cache::CachedEntry,
-    size: usize,
-    /// CLOCK bit
-    used: std::sync::atomic::AtomicBool,
-}
+/// The shared SST metadata cache (filters, indexes, stats); see [`ClockCache`].
+pub struct MetaCache(ClockCache<MetaKey, MetaEntry>);
 
-const META_SHARDS: usize = 64;
+impl Weigh for MetaEntry {
+    fn weight(&self) -> usize {
+        self.size()
+    }
+}
 
 impl MetaCache {
     pub fn new(bytes: u64) -> MetaCache {
-        MetaCache {
-            shards: (0..META_SHARDS).map(|_| Default::default()).collect(),
-            shard_bytes: (bytes as usize / META_SHARDS).max(1 << 20),
-            hasher: Default::default(),
-            loading: Default::default(),
-        }
+        MetaCache(ClockCache::new(bytes))
     }
 
-    async fn fetch(&self, key: slatedb::db_cache::CachedKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.0.bytes()
+    }
+
+    async fn fetch(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader, kind: &'static str) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
         use slatedb::db_cache::CacheFetch;
-        if let Some(e) = self.get(&key) {
-            return Ok(CacheFetch::hit(e));
-        }
-        let follow = {
-            let mut l = self.loading.lock();
-            // a leader inserts before it leaves `loading`: checked under the
-            // lock, a load that just finished is never repeated
-            if let Some(e) = self.get(&key) {
-                return Ok(CacheFetch::hit(e));
+        let (entry, how) = self.0.get_or_load(key, loader()).await?;
+        Ok(match how {
+            Lookup::Hit => CacheFetch::hit(entry),
+            Lookup::Shared => {
+                crate::metrics::META_CACHE_LOADS.with_label_values(&[kind, "shared"]).inc();
+                CacheFetch::hit(entry)
             }
-            match l.get(&key) {
-                Some(tx) => Some(tx.subscribe()),
-                None => {
-                    l.insert(key.clone(), tokio::sync::watch::channel(None).0);
-                    None
-                }
+            Lookup::Loaded => {
+                crate::metrics::META_CACHE_LOADS.with_label_values(&[kind, "fetched"]).inc();
+                CacheFetch::miss(entry)
             }
-        };
-        if let Some(mut rx) = follow {
-            if let Ok(e) = rx.wait_for(Option::is_some).await {
-                return Ok(CacheFetch::hit(e.clone().expect("waited for Some")));
-            }
-            // the leader failed or was dropped
-            let e = loader().await?;
-            self.put(key, e.clone());
-            return Ok(CacheFetch::miss(e));
-        }
-        struct Leader<'a>(&'a MetaCache, &'a slatedb::db_cache::CachedKey);
-        impl Drop for Leader<'_> {
-            fn drop(&mut self) {
-                self.0.loading.lock().remove(self.1);
-            }
-        }
-        let _leader = Leader(self, &key);
-        let e = loader().await?;
-        self.put(key.clone(), e.clone());
-        if let Some(tx) = self.loading.lock().get(&key) {
-            tx.send_replace(Some(e.clone()));
-        }
-        Ok(CacheFetch::miss(e))
-    }
-
-    fn put(&self, key: slatedb::db_cache::CachedKey, value: slatedb::db_cache::CachedEntry) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let size = value.size();
-        let mut s = self.shard(&key).write();
-        let slot = MetaSlot { entry: value, size, used: std::sync::atomic::AtomicBool::new(false) };
-        if let Some(old) = s.map.insert(key, slot) {
-            s.bytes -= old.size;
-        }
-        s.bytes += size;
-        // CLOCK over the shard: drop entries not hit since the last sweep,
-        // clear the bit of the rest; a second pass evicts if all were hot
-        for _ in 0..2 {
-            if s.bytes <= self.shard_bytes {
-                break;
-            }
-            let mut freed = 0;
-            s.map.retain(|_, v| {
-                if v.used.swap(false, Relaxed) {
-                    true
-                } else {
-                    freed += v.size;
-                    false
-                }
-            });
-            s.bytes -= freed;
-        }
-    }
-
-    fn shard(&self, key: &slatedb::db_cache::CachedKey) -> &parking_lot::RwLock<MetaShard> {
-        use std::hash::BuildHasher;
-        &self.shards[(self.hasher.hash_one(key) >> 32) as usize % META_SHARDS]
-    }
-
-    fn get(&self, key: &slatedb::db_cache::CachedKey) -> Option<slatedb::db_cache::CachedEntry> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let s = self.shard(key).read();
-        let slot = s.map.get(key)?;
-        // load first: a hot entry's bit is already set, and a store would
-        // bounce its cache line between threads
-        if !slot.used.load(Relaxed) {
-            slot.used.store(true, Relaxed);
-        }
-        Some(slot.entry.clone())
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl slatedb::db_cache::DbCache for MetaCache {
-    async fn get_block(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> {
-        Ok(self.get(key))
+    async fn get_block(&self, key: &MetaKey) -> Result<Option<MetaEntry>, slatedb::Error> {
+        Ok(self.0.get(key))
     }
-    async fn get_index(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> {
-        Ok(self.get(key))
+    async fn get_index(&self, key: &MetaKey) -> Result<Option<MetaEntry>, slatedb::Error> {
+        Ok(self.0.get(key))
     }
-    async fn get_filter(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> {
-        Ok(self.get(key))
+    async fn get_filter(&self, key: &MetaKey) -> Result<Option<MetaEntry>, slatedb::Error> {
+        Ok(self.0.get(key))
     }
-    async fn get_stats(&self, key: &slatedb::db_cache::CachedKey) -> Result<Option<slatedb::db_cache::CachedEntry>, slatedb::Error> {
-        Ok(self.get(key))
+    async fn get_stats(&self, key: &MetaKey) -> Result<Option<MetaEntry>, slatedb::Error> {
+        Ok(self.0.get(key))
     }
-    async fn insert(&self, key: slatedb::db_cache::CachedKey, value: slatedb::db_cache::CachedEntry) {
-        self.put(key, value);
+    async fn insert(&self, key: MetaKey, value: MetaEntry) {
+        self.0.put(key, value);
     }
-    async fn fetch_block(&self, key: slatedb::db_cache::CachedKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
-        self.fetch(key, loader).await
-    }
-    async fn fetch_index(&self, key: slatedb::db_cache::CachedKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
-        self.fetch(key, loader).await
-    }
-    async fn fetch_filter(&self, key: slatedb::db_cache::CachedKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
-        self.fetch(key, loader).await
-    }
-    async fn fetch_stats(&self, key: slatedb::db_cache::CachedKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
-        self.fetch(key, loader).await
-    }
-    async fn remove(&self, key: &slatedb::db_cache::CachedKey) {
-        let mut s = self.shard(key).write();
-        if let Some(old) = s.map.remove(key) {
-            s.bytes -= old.size;
-        }
+    async fn remove(&self, key: &MetaKey) {
+        self.0.remove(key);
     }
     fn entry_count(&self) -> u64 {
-        self.shards.iter().map(|s| s.read().map.len() as u64).sum()
+        self.0.len() as u64
+    }
+    async fn fetch_index(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        self.fetch(key, loader, "index").await
+    }
+    async fn fetch_filter(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        self.fetch(key, loader, "filter").await
+    }
+    async fn fetch_stats(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+        self.fetch(key, loader, "stats").await
+    }
+}
+
+pub(crate) trait Weigh {
+    fn weight(&self) -> usize;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lookup {
+    Hit,
+    /// A concurrent caller loaded it while this one waited.
+    Shared,
+    Loaded,
+}
+
+/// Per key being loaded: the load's result, for the callers that waited on it.
+type LoadLocks<K, V> = parking_lot::Mutex<std::collections::HashMap<K, Arc<tokio::sync::Mutex<Option<V>>>>>;
+
+/// A byte-capped cache for large, read-mostly entries.
+///
+/// - Hits take a shard's shared lock and set one bit: Foyer takes its
+///   shard's mutex on every hit, and every point read of a repo checks the
+///   same few SSTs' filters, so threads serialized on those hot keys.
+/// - Eviction is CLOCK with a persistent hand per shard that frees only
+///   what an insert puts the cache over by. A new entry starts
+///   unreferenced, so a one-off load goes before anything hit since the
+///   hand last passed. The byte budget is cache-wide: a compacted SST's
+///   filter is MBs, a per-shard budget of a few of them overflowed on hash
+///   placement alone, and the overflow evicted hot filters.
+/// - Loads are single-flight per key. A compacted SST's filter is MBs, and
+///   every read of a cold SST waiting on the store otherwise fetched and
+///   decoded its own copy: under uniform random keys that is every read of
+///   the shard, and the duplicates grow with the store's latency.
+pub(crate) struct ClockCache<K, V> {
+    shards: Vec<parking_lot::RwLock<ClockShard<K, V>>>,
+    loading: Vec<LoadLocks<K, V>>,
+    capacity: usize,
+    bytes: std::sync::atomic::AtomicUsize,
+    hasher: std::hash::RandomState,
+}
+
+struct ClockShard<K, V> {
+    index: std::collections::HashMap<K, usize>,
+    slots: Vec<Option<ClockSlot<K, V>>>,
+    free: Vec<usize>,
+    hand: usize,
+}
+
+struct ClockSlot<K, V> {
+    key: K,
+    value: V,
+    size: usize,
+    /// CLOCK bit
+    used: std::sync::atomic::AtomicBool,
+}
+
+impl<K, V> Default for ClockShard<K, V> {
+    fn default() -> Self {
+        ClockShard { index: Default::default(), slots: Vec::new(), free: Vec::new(), hand: 0 }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V> ClockShard<K, V> {
+    /// Evicts entries the hand finds unreferenced (clearing the bits of the
+    /// rest) until it has freed `need` bytes, never `keep` (the entry just
+    /// inserted). Returns the bytes freed.
+    fn evict(&mut self, need: usize, keep: usize) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = self.slots.len();
+        let (mut steps, mut freed) = (0, 0);
+        while freed < need && steps < 2 * n {
+            let h = self.hand;
+            self.hand = (h + 1) % n;
+            steps += 1;
+            if h == keep {
+                continue;
+            }
+            match &self.slots[h] {
+                None => continue,
+                Some(s) if s.used.swap(false, Relaxed) => continue,
+                Some(_) => {}
+            }
+            let s = self.slots[h].take().expect("checked above");
+            self.index.remove(&s.key);
+            freed += s.size;
+            self.free.push(h);
+        }
+        freed
+    }
+
+    fn remove(&mut self, key: &K) -> usize {
+        let Some(i) = self.index.remove(key) else { return 0 };
+        self.free.push(i);
+        self.slots[i].take().expect("indexed slot").size
+    }
+}
+
+const CLOCK_SHARDS: usize = 64;
+
+impl<K: std::hash::Hash + Eq + Clone, V: Clone + Weigh> ClockCache<K, V> {
+    pub fn new(bytes: u64) -> Self {
+        ClockCache {
+            shards: (0..CLOCK_SHARDS).map(|_| Default::default()).collect(),
+            loading: (0..CLOCK_SHARDS).map(|_| Default::default()).collect(),
+            capacity: bytes as usize,
+            bytes: Default::default(),
+            hasher: Default::default(),
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.read().index.len()).sum()
+    }
+
+    fn shard_of(&self, key: &K) -> usize {
+        use std::hash::BuildHasher;
+        (self.hasher.hash_one(key) >> 32) as usize % CLOCK_SHARDS
+    }
+
+    pub fn get(&self, key: &K) -> Option<V> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let s = self.shards[self.shard_of(key)].read();
+        let slot = s.slots[*s.index.get(key)?].as_ref()?;
+        // load first: a hot entry's bit is already set, and a store would
+        // bounce its cache line between threads
+        if !slot.used.load(Relaxed) {
+            slot.used.store(true, Relaxed);
+        }
+        Some(slot.value.clone())
+    }
+
+    pub fn put(&self, key: K, value: V) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let size = value.weight();
+        let home = self.shard_of(&key);
+        let mut guard = self.shards[home].write();
+        let s = &mut *guard;
+        let slot = ClockSlot { key: key.clone(), value, size, used: std::sync::atomic::AtomicBool::new(false) };
+        let i = match s.index.get(&key) {
+            Some(&i) => {
+                let old = s.slots[i].replace(slot).expect("indexed slot");
+                self.bytes.fetch_sub(old.size, Relaxed);
+                i
+            }
+            None => {
+                let i = match s.free.pop() {
+                    Some(i) => {
+                        s.slots[i] = Some(slot);
+                        i
+                    }
+                    None => {
+                        s.slots.push(Some(slot));
+                        s.slots.len() - 1
+                    }
+                };
+                s.index.insert(key, i);
+                i
+            }
+        };
+        let mut over = (self.bytes.fetch_add(size, Relaxed) + size).saturating_sub(self.capacity);
+        if over == 0 {
+            return;
+        }
+        let freed = s.evict(over, i);
+        self.bytes.fetch_sub(freed, Relaxed);
+        over = over.saturating_sub(freed);
+        drop(guard);
+        // a shard with too little to give: take the rest from the others
+        for j in (1..CLOCK_SHARDS).map(|d| (home + d) % CLOCK_SHARDS) {
+            if over == 0 {
+                break;
+            }
+            let freed = self.shards[j].write().evict(over, usize::MAX);
+            self.bytes.fetch_sub(freed, Relaxed);
+            over = over.saturating_sub(freed);
+        }
+    }
+
+    pub fn remove(&self, key: &K) {
+        let freed = self.shards[self.shard_of(key)].write().remove(key);
+        self.bytes.fetch_sub(freed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `load` runs only if no concurrent caller is loading `key`; a failed
+    /// load leaves the next waiter to try its own.
+    pub async fn get_or_load<E>(&self, key: K, load: impl std::future::Future<Output = Result<V, E>>) -> Result<(V, Lookup), E> {
+        if let Some(v) = self.get(&key) {
+            return Ok((v, Lookup::Hit));
+        }
+        let gate = LoadGate::new(&self.loading[self.shard_of(&key)], &key);
+        let mut done = gate.lock().await;
+        // the leader's result even if the cache dropped it again already
+        if let Some(v) = done.clone().or_else(|| self.get(&key)) {
+            return Ok((v, Lookup::Shared));
+        }
+        let v = load.await?;
+        *done = Some(v.clone());
+        self.put(key, v.clone());
+        Ok((v, Lookup::Loaded))
+    }
+}
+
+/// A key's load lock, dropped from the map by its last holder (also when a
+/// waiting caller is cancelled).
+struct LoadGate<'a, K: std::hash::Hash + Eq, V> {
+    map: &'a LoadLocks<K, V>,
+    key: K,
+    lock: Option<Arc<tokio::sync::Mutex<Option<V>>>>,
+}
+
+impl<'a, K: std::hash::Hash + Eq + Clone, V> LoadGate<'a, K, V> {
+    fn new(map: &'a LoadLocks<K, V>, key: &K) -> Self {
+        let lock = map.lock().entry(key.clone()).or_default().clone();
+        LoadGate { map, key: key.clone(), lock: Some(lock) }
+    }
+
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, Option<V>> {
+        self.lock.as_ref().expect("held until drop").lock().await
+    }
+}
+
+impl<K: std::hash::Hash + Eq, V> Drop for LoadGate<'_, K, V> {
+    fn drop(&mut self) {
+        let mut m = self.map.lock();
+        drop(self.lock.take());
+        if m.get(&self.key).is_some_and(|l| Arc::strong_count(l) == 1) {
+            m.remove(&self.key);
+        }
     }
 }
 
@@ -509,14 +679,15 @@ pub async fn open_db(
     let settings = shard_settings(partition, cache);
     let path = db_path(store, partition);
     let codec = settings.compression_codec;
+    let id = cache_id(&path);
     let db = crate::metrics::with_slatedb_metrics(Db::builder(path.clone(), store.raw.clone()))
         .with_settings(settings)
-        .with_db_cache(shared_db_cache(), cache_id(&path))
+        .with_db_cache(shared_db_cache(), id)
         .with_sst_block_size(SST_BLOCK_SIZE)
         .build()
         .await?;
     let raw = external_sst_redirect(&db, &path, store.raw.clone());
-    spawn_compactor(&db, path, raw, codec);
+    spawn_compactor(&db, path, raw, codec, id);
     Ok(db)
 }
 
@@ -532,21 +703,35 @@ const WARM_CONCURRENCY: usize = 64;
 /// meta cache, and their newest L0s whole into the block cache: one ranged
 /// GET per SST component, in bulk, instead of the 10–65 random ones each
 /// cold repo load of a freshly moved shard made. Best effort.
+///
+/// Metadata goes only into the meta cache's free room: warming a takeover's
+/// shards into a full cache would push out the hot filters of the shards
+/// this node already serves (inserts outpace the reads that re-mark them),
+/// a larger loss than the moved shards' first misses, which load once each.
 pub async fn warm<D: slatedb::DbCacheManagerOps + slatedb::DbMetadataOps + Send + Sync>(dbs: &[Arc<D>]) {
     use futures::StreamExt;
     use slatedb::CacheTarget;
     let started = std::time::Instant::now();
     let l0_budget = WARM_L0_BYTES.min(BLOCK_CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed) / 4 / dbs.len().max(1) as u64);
+    let meta = shared_meta_cache();
+    let mut meta_room = meta.capacity().saturating_sub(meta.bytes()) as u64;
     let mut jobs = Vec::new();
+    let mut skipped = 0;
     for db in dbs {
         let m = db.manifest();
         let mut l0_bytes = 0;
-        for v in m.l0() {
-            l0_bytes += v.estimate_size();
-            jobs.push((db.clone(), v.sst.id, l0_bytes <= l0_budget));
-        }
-        for r in m.compacted() {
-            jobs.extend(r.sst_views().iter().map(|v| (db.clone(), v.sst.id, false)));
+        let views = m.l0().iter().map(|v| (v, true)).chain(m.compacted().iter().flat_map(|r| r.sst_views().iter().map(|v| (v, false))));
+        for (v, l0) in views {
+            let need = v.sst.info.filter_len + v.sst.info.index_len;
+            if need > meta_room {
+                skipped += 1;
+                continue;
+            }
+            meta_room -= need;
+            if l0 {
+                l0_bytes += v.estimate_size();
+            }
+            jobs.push((db.clone(), v.sst.id, l0 && l0_bytes <= l0_budget));
         }
     }
     let n = jobs.len();
@@ -562,7 +747,7 @@ pub async fn warm<D: slatedb::DbCacheManagerOps + slatedb::DbMetadataOps + Send 
     crate::metrics::SHARD_WARM_SECONDS.observe(started.elapsed().as_secs_f64());
     crate::metrics::SHARD_WARM_SSTS.with_label_values(&["ok"]).inc_by((n - failed) as u64);
     crate::metrics::SHARD_WARM_SSTS.with_label_values(&["error"]).inc_by(failed as u64);
-    tracing::info!(shards = dbs.len(), ssts = n, failed, elapsed_ms = started.elapsed().as_millis() as u64, "shards warmed");
+    tracing::info!(shards = dbs.len(), ssts = n, failed, skipped, elapsed_ms = started.elapsed().as_millis() as u64, "shards warmed");
 }
 
 /// A read-only view of a shard another node still writes, sharing the
@@ -720,12 +905,18 @@ async fn drop_clone_checkpoints(store: &Store, name: &str, sources: &[(ShardId, 
 }
 
 const SST_BLOCK_SIZE: slatedb::SstBlockSize = slatedb::SstBlockSize::Block16Kib;
+/// Compacted SSTs roll at this size (SlateDB: 256 MiB). A point read that
+/// misses an SST's filter or index in the meta cache fetches all of it,
+/// and both grow with the SST: with the metadata working set over the
+/// cache (uniform reads over a big node), smaller SSTs cut every miss's
+/// GET by as much. A read still checks one SST per sorted run.
+const MAX_SST_BYTES: usize = 64 << 20;
 
 /// Runs a shard's compactor (coordinator + one worker) until the DB
 /// closes. Started after the open instead of inside it: the embedded
 /// compactor's startup (~12 sequential store calls) delayed serving after a
 /// takeover or handback.
-fn spawn_compactor(db: &Db, path: String, raw: Arc<dyn object_store::ObjectStore>, codec: Option<slatedb::config::CompressionCodec>) {
+fn spawn_compactor(db: &Db, path: String, raw: Arc<dyn object_store::ObjectStore>, codec: Option<slatedb::config::CompressionCodec>, cache_id: u64) {
     spawn_deep_refresh(db);
     let mut status = db.subscribe();
     let watch = db.subscribe();
@@ -733,7 +924,7 @@ fn spawn_compactor(db: &Db, path: String, raw: Arc<dyn object_store::ObjectStore
         let polling = compaction_polling();
         let mut fast = polling == CompactionPolling::Fast;
         loop {
-            let (compactor, worker) = match build_compactor(&path, &raw, codec, fast).await {
+            let (compactor, worker) = match build_compactor(&path, &raw, codec, fast, cache_id).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!(%path, "compaction worker failed to start: {e}");
@@ -869,6 +1060,7 @@ async fn build_compactor(
     raw: &Arc<dyn object_store::ObjectStore>,
     codec: Option<slatedb::config::CompressionCodec>,
     fast: bool,
+    cache_id: u64,
 ) -> Result<(slatedb::compactor::Compactor, slatedb::CompactionWorker), slatedb::Error> {
     use slatedb::config::{CompactionWorkerOptions, CompactorOptions};
     let poll = if cfg!(test) {
@@ -879,9 +1071,14 @@ async fn build_compactor(
         slow_poll()
     };
     let opts = CompactorOptions { worker: None, checkpoint_lifetime: checkpoint_lifetime(), poll_interval: poll, ..Default::default() };
-    let worker_opts = CompactionWorkerOptions { compression_codec: codec, compactions_poll_interval: poll, ..Default::default() };
+    let worker_opts = CompactionWorkerOptions { compression_codec: codec, compactions_poll_interval: poll, max_sst_size: MAX_SST_BYTES, ..Default::default() };
     let compactor = slatedb::CompactorBuilder::new(path.to_string(), raw.clone()).with_options(opts);
-    let worker = slatedb::CompactionWorkerBuilder::new(path.to_string(), raw.clone()).with_options(worker_opts).with_sst_block_size(SST_BLOCK_SIZE);
+    // the output's index and filters go straight into the DB's cache: every
+    // read touching a new sorted run otherwise misses on them at once
+    let worker = slatedb::CompactionWorkerBuilder::new(path.to_string(), raw.clone())
+        .with_options(worker_opts)
+        .with_sst_block_size(SST_BLOCK_SIZE)
+        .with_db_cache(shared_db_cache(), cache_id);
     #[cfg(feature = "slatedb-metrics")]
     let (compactor, worker) = (compactor.with_metrics_recorder(crate::metrics::slatedb_recorder()), worker.with_metrics_recorder(crate::metrics::slatedb_recorder()));
     Ok((compactor.build(), worker.build().await?))
@@ -1524,5 +1721,136 @@ mod disk_cache_tests {
         assert_eq!(oc.root_folder, Some(std::path::Path::new("/var/cache/vlpds").join(ShardId(7).key())));
         assert!(oc.cache_on_flush && oc.cache_on_compaction);
         assert!(shard_settings(ShardId(7), None).object_store_cache_options.root_folder.is_none());
+    }
+}
+
+#[cfg(test)]
+mod clock_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct Kb(usize);
+    impl Weigh for Kb {
+        fn weight(&self) -> usize {
+            self.0 << 10
+        }
+    }
+
+    /// Keys that all land in one shard: its hand sees every entry.
+    fn keys_in_one_shard(c: &ClockCache<u64, Kb>, n: usize) -> Vec<u64> {
+        (0u64..).filter(|k| c.shard_of(k) == 0).take(n).collect()
+    }
+
+    fn cache_kb(kb: u64) -> ClockCache<u64, Kb> {
+        ClockCache::new(kb << 10)
+    }
+
+    /// The budget is cache-wide: one shard may hold far more than
+    /// capacity / CLOCK_SHARDS (a few MB-sized filters hashing together).
+    #[test]
+    fn budget_is_cache_wide() {
+        let c = cache_kb(1000);
+        let keys = keys_in_one_shard(&c, 3);
+        for &k in &keys {
+            c.put(k, Kb(300));
+        }
+        assert_eq!(c.len(), 3);
+        c.put(keys[2] + 1_000_000, Kb(300)); // any shard: over by 200 KB
+        assert_eq!(c.bytes(), 900 << 10);
+    }
+
+    /// An insert evicts only what it needs, not every entry that missed a
+    /// hit since the previous insert.
+    #[test]
+    fn full_shard_of_hot_entries_loses_only_what_an_insert_needs() {
+        let c = cache_kb(100);
+        let keys = keys_in_one_shard(&c, 11);
+        for &k in &keys[..10] {
+            c.put(k, Kb(10));
+            assert!(c.get(&k).is_some());
+        }
+        c.put(keys[10], Kb(10));
+        assert_eq!(keys.iter().filter(|k| c.get(k).is_some()).count(), 10, "one evicted for one inserted");
+        assert!(c.get(&keys[10]).is_some(), "the new entry stays");
+    }
+
+    /// Entries hit since the hand passed outlive one-off loads.
+    #[test]
+    fn unreferenced_entries_go_first() {
+        let c = cache_kb(100);
+        let keys = keys_in_one_shard(&c, 13);
+        for &k in &keys[..10] {
+            c.put(k, Kb(10));
+        }
+        let hit_hot = || {
+            for &k in &keys[..9] {
+                assert!(c.get(&k).is_some());
+            }
+        };
+        hit_hot();
+        c.put(keys[10], Kb(10)); // evicts keys[9], the only cold one
+        assert!(c.get(&keys[9]).is_none());
+        // while the hot set keeps being read, a stream of one-off loads only
+        // displaces itself
+        for &k in &keys[11..] {
+            hit_hot();
+            c.put(k, Kb(10));
+        }
+        hit_hot();
+        assert_eq!(c.bytes(), 100 << 10);
+    }
+
+    #[test]
+    fn oversized_entry_stays_alone() {
+        let c = cache_kb(100);
+        let keys = keys_in_one_shard(&c, 3);
+        c.put(keys[0], Kb(10));
+        c.put(keys[1], Kb(10));
+        c.put(keys[2], Kb(500));
+        assert!(c.get(&keys[2]).is_some());
+        assert_eq!(c.len(), 1);
+        c.remove(&keys[2]);
+        assert_eq!((c.len(), c.bytes()), (0, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_misses_load_once() {
+        let c = Arc::new(ClockCache::<u64, Kb>::new(64 << 20));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..32)
+            .map(|_| {
+                let (c, loads) = (c.clone(), loads.clone());
+                tokio::spawn(async move {
+                    let load = async {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok::<_, ()>(Kb(1))
+                    };
+                    c.get_or_load(7, load).await.unwrap().1
+                })
+            })
+            .collect();
+        let mut how = Vec::new();
+        for t in tasks {
+            how.push(t.await.unwrap());
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(how.iter().filter(|h| **h == Lookup::Loaded).count(), 1);
+        assert!(c.loading.iter().all(|m| m.lock().is_empty()));
+    }
+
+    #[tokio::test]
+    async fn failed_or_cancelled_load_lets_the_next_caller_try() {
+        let c = ClockCache::<u64, Kb>::new(64 << 20);
+        assert!(c.get_or_load(1, async { Err::<Kb, _>("store down") }).await.is_err());
+        let (_, how) = c.get_or_load(1, async { Ok::<_, ()>(Kb(1)) }).await.unwrap();
+        assert_eq!(how, Lookup::Loaded);
+
+        let stuck = c.get_or_load(2, std::future::pending::<Result<Kb, ()>>());
+        assert!(tokio::time::timeout(Duration::from_millis(20), stuck).await.is_err());
+        assert!(c.loading.iter().all(|m| m.lock().is_empty()), "a dropped load releases its key");
+        let (_, how) = c.get_or_load(2, async { Ok::<_, ()>(Kb(1)) }).await.unwrap();
+        assert_eq!(how, Lookup::Loaded);
     }
 }

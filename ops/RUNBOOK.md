@@ -1037,6 +1037,42 @@ its normal not-found polls),
 **Do:** fix store errors/latency; check CPU for the compactor. **(unverified)**
 `--compaction-polling` is adaptive by default; switching to fast polling may help.
 
+### VlpdsSstMetaCacheTooSmall
+
+**Means:** the bloom filters + indexes of every SST in this node's shards
+(`vlpds_sst_meta_bytes`, encoded; ~1.3x that decoded in the cache) are over
+80% of its metadata cache (`vlpds_meta_cache_capacity_bytes`:
+`--meta-cache-mb`, default a quarter of `--block-cache-mb`). Each point read
+checks a filter per sorted run of its shard, so under uniform keys (bulk
+imports, random repo loads) the whole set is hot. Past the cache, reads that
+miss fetch a whole filter or index (MBs for a big compacted SST) and the
+node's own reads can saturate the store: the 100M capacity run
+(bench/results/benchbox-2026-10-02-round2, block 6) pulled 1-2.4 GB/s of SST
+GETs per node for 10 MB/s of writes, and lease renewals then lapsed (see
+[Store saturated by the node's own reads](#store-saturated-by-the-nodes-own-reads)).
+About 29 MB decoded per million accounts at the capacity test's records
+distribution: 100M accounts on 4 nodes is ~0.72 GB per node, ~0.96 GB with one
+node down.
+
+**Do:** raise `--meta-cache-mb` (restart) to at least 1.25x the footprint the
+node would hold after losing a peer (its share x N / (N - 1)), or add nodes.
+Check `VlpdsSstMetaRefetching` to see whether it bites yet.
+
+### VlpdsSstMetaRefetching
+
+**Means:** the node fetched over 20 SST filters/indexes per second from the
+store for 10 minutes (`vlpds_meta_cache_loads_total{result="fetched"}`;
+`result="shared"` are reads that waited on another read's fetch of the same
+entry). Flushes and compactions put their SSTs' metadata in the cache, so
+steady state is near 0; shard opens and takeovers fetch theirs once.
+
+**Confirm:** `vlpds_sst_meta_bytes` vs `vlpds_meta_cache_bytes` /
+`vlpds_meta_cache_capacity_bytes`;
+`vlpds_object_store_bytes_total{dir="down",component="state_sst"}` (MB/s of
+SST reads) against `dir="up"`.
+
+**Do:** as [VlpdsSstMetaCacheTooSmall](#vlpdssstmetacachetoosmall).
+
 ### VlpdsCheckpointsStalled
 
 **Means:** the node writes segments but checkpointed no shard for 10 minutes.
@@ -1784,6 +1820,26 @@ What to do:
    (`vlpds_shard_open_seconds{kind="replay"}`, `shards opened` `replayed_ms`),
    `vlpds_last_exit_reason_info` / `vlpds_peer_takeovers_total` (who fail-stopped),
    firehose emit delay and retention catching up.
+
+### Store saturated by the node's own reads
+
+The ctl client's reserved lane keeps lease renewals from queueing behind
+vlpds' own requests *in the client*, but not behind other requests *in the
+store*: when the store's disks or network saturate, a renewal waits like
+everything else. The 100M capacity run lost 3 of 4 nodes this way (renewals
+35-48 s past a 30 s TTL) after metadata-cache misses had turned point reads
+into 1-2.4 GB/s of SST GETs per node on one MinIO box. Signs, in order:
+`VlpdsSstMetaRefetching` / `VlpdsSstMetaCacheTooSmall`, state SST download
+MB/s far above upload MB/s, `VlpdsObjectStorePermitsSaturated` (state client),
+`VlpdsControlPlaneLatencyHigh`, then the lease alerts.
+
+What to do:
+1. Stop the read load that drives it: pause bulk imports and backfills; shed
+   load at the edge if it's user traffic.
+2. Fix the cause (raise `--meta-cache-mb`, add nodes) before resuming.
+3. A store shared with other tenants or other clusters can do the same to
+   vlpds' leases: keep the cluster's store to itself, or give its prefix its own
+   capacity/limits.
 
 ### Shard split / merge
 

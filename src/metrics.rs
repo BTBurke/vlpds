@@ -113,6 +113,10 @@ lazy!(READ_AFTER_WRITE: IntCounterVec = register_int_counter_vec!("vlpds_proxy_r
 
 lazy!(CACHE_ENTRIES: IntGaugeVec = register_int_gauge_vec!("vlpds_cache_entries", "Entries held per in-memory cache", &["cache"]));
 lazy!(CACHE_BYTES: IntGaugeVec = register_int_gauge_vec!("vlpds_cache_bytes", "Approximate bytes held per in-memory cache (entries x estimated entry size)", &["cache"]));
+lazy!(META_CACHE_BYTES: IntGauge = register_int_gauge!("vlpds_meta_cache_bytes", "Bytes of SST filters, indexes and stats held by the shared SlateDB metadata cache (partition.rs MetaCache)"));
+lazy!(META_CACHE_CAPACITY: IntGauge = register_int_gauge!("vlpds_meta_cache_capacity_bytes", "Capacity of the shared SlateDB metadata cache (--meta-cache-mb, default a quarter of --block-cache-mb)"));
+lazy!(META_CACHE_LOADS: IntCounterVec = register_int_counter_vec!("vlpds_meta_cache_loads_total", "Metadata cache misses by kind (filter, index, stats) and outcome: fetched (read and decoded from the store) or shared (waited for a concurrent read's fetch of the same entry)", &["kind", "result"]));
+lazy!(SST_META_BYTES: IntGaugeVec = register_int_gauge_vec!("vlpds_sst_meta_bytes", "Encoded filter and index bytes of every SST in the shards this node owns (the metadata cache's working set under uniform reads), by kind", &["kind"]));
 lazy!(CACHE_CAPACITY: IntGaugeVec = register_int_gauge_vec!("vlpds_cache_capacity_entries", "Entry cap per in-memory cache (--cache-budget-mb, --cache-entries)", &["cache"]));
 
 lazy!(FORWARDED: IntCounter = register_int_counter!("vlpds_requests_forwarded_total", "Requests proxied to the partition owner"));
@@ -323,6 +327,11 @@ pub fn init_counters() {
         }
         for kind in ["replay", "clean"] {
             SHARD_OPEN_SECONDS.with_label_values(&[kind]);
+        }
+        for kind in ["filter", "index", "stats"] {
+            for r in ["fetched", "shared"] {
+                META_CACHE_LOADS.with_label_values(&[kind, r]);
+            }
         }
         LazyLock::force(&RECORD_COUNTERS);
         LazyLock::force(&BLOB_UPLOAD_BYTES);
