@@ -40,6 +40,7 @@ pub mod reshard;
 pub mod reshard_gc;
 pub mod profiling;
 pub mod ratelimit;
+pub mod real_dist;
 pub mod recent_writes;
 pub mod remote;
 pub mod retention;

@@ -75,7 +75,7 @@ fn gen(dir: &str, n: usize) {
     println!("wrote {} and {} bytes", cid.len(), stream.len());
 }
 
-fn jemalloc() -> (u64, u64) {
+pub(crate) fn jemalloc() -> (u64, u64) {
     use tikv_jemalloc_ctl::{epoch, stats};
     epoch::advance().unwrap();
     (stats::allocated::read().unwrap() as u64, stats::resident::read().unwrap() as u64)
@@ -180,9 +180,9 @@ async fn import_bench() {
 /// An in-memory bucket that counts the bytes it holds, so they can be told
 /// apart from the rest of the heap.
 #[derive(Debug, Default)]
-struct Sized {
+pub(crate) struct Sized {
     inner: object_store::memory::InMemory,
-    bytes: Arc<std::sync::atomic::AtomicI64>,
+    pub(crate) bytes: Arc<std::sync::atomic::AtomicI64>,
     sizes: Arc<parking_lot::Mutex<std::collections::HashMap<String, i64>>>,
 }
 

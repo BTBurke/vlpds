@@ -57,6 +57,7 @@ mod handles;
 mod harness;
 mod identity_races;
 mod import_bench;
+mod import_burst;
 mod import_limits;
 mod import_stream;
 mod imported_blobs;
