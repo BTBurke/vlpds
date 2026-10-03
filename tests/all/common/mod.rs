@@ -1327,6 +1327,12 @@ pub fn rand_b64url(n: usize) -> String {
     b64url(random_bytes(n))
 }
 
+/// The `csrf` hidden field of an OAuth page.
+pub fn csrf_of(html: &str) -> String {
+    let i = html.find("name=\"csrf\" value=\"").expect("csrf field") + "name=\"csrf\" value=\"".len();
+    html[i..i + html[i..].find('"').unwrap()].to_string()
+}
+
 /// An `application/x-www-form-urlencoded` body.
 pub fn form_body(pairs: &[(&str, &str)]) -> String {
     let enc = vlpds::oauth::util::form_encode_component;

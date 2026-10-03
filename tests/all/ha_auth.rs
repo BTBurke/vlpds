@@ -187,11 +187,6 @@ impl Browser {
     }
 }
 
-pub(crate) fn csrf_of(html: &str) -> String {
-    let i = html.find("name=\"csrf\" value=\"").expect("csrf field") + "name=\"csrf\" value=\"".len();
-    html[i..i + html[i..].find('"').unwrap()].to_string()
-}
-
 fn location_params(h: &reqwest::header::HeaderMap) -> HashMap<String, String> {
     let loc = h.get("location").expect("location").to_str().unwrap();
     let q = loc.split_once(['?', '#']).map(|(_, q)| q).unwrap_or("");

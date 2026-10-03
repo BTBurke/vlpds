@@ -18,11 +18,6 @@ use std::time::{Duration, Instant};
 /// request that queued instead would wait for the held permits (forever).
 const SHED_BOUND: Duration = Duration::from_secs(15);
 
-fn csrf_of(html: &str) -> String {
-    let i = html.find("name=\"csrf\" value=\"").expect("csrf field") + "name=\"csrf\" value=\"".len();
-    html[i..i + html[i..].find('"').unwrap()].to_string()
-}
-
 fn device_cookie(h: &reqwest::header::HeaderMap) -> Option<String> {
     h.get_all("set-cookie").iter().map(|sc| sc.to_str().unwrap().split(';').next().unwrap().to_string()).find(|c| c.starts_with("vlpds-device="))
 }

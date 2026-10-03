@@ -7,7 +7,7 @@
 //! twice nor lost. Two in-process nodes on one in-memory object store.
 
 use crate::common::*;
-use crate::ha_auth::{Browser, Client, PUBLIC, as_post, csrf_of, node};
+use crate::ha_auth::{Browser, Client, PUBLIC, as_post, node};
 use std::sync::Arc;
 
 /// Holds requests of `did` reaching pause point `point` until released.

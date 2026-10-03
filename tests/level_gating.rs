@@ -24,28 +24,16 @@ mod formats;
 use common::*;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use vlpds::version;
 
 const SHARDS: u32 = 6;
 const PREFIX: &str = "vlpds";
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
-    let (id, store) = (id.to_string(), store.clone());
-    TestServer::spawn_with(move |c| {
-        c.memory_store = Some(store);
-        c.shards = SHARDS;
+    cluster_node(id, store.clone(), SHARDS, |c| {
         // reports every 100 ms; nothing is old enough to prune
         c.log_retention = Some(vlpds::retention::Config { window: Duration::from_secs(3600), interval: Duration::from_millis(100), max_deletes: 100, fence_retention: None });
-        c.cluster = Some(vlpds::cluster::ClusterConfig {
-            node_id: id,
-            addr: peer_url(c),
-            shards: SHARDS,
-            ttl: Duration::from_millis(1500),
-            renew_every: Duration::from_millis(100),
-            skew: Duration::from_millis(200),
-            ..Default::default()
-        });
     })
     .await
 }
@@ -55,10 +43,6 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
 /// the fence while the in-process node lingers.
 async fn stop(n: TestServer) {
     vlpds::server::shutdown(&n.app).await;
-}
-
-fn cluster(n: &TestServer) -> &vlpds::cluster::Cluster {
-    n.app.cluster.as_deref().unwrap()
 }
 
 /// Every object under the prefix: (path relative to it, bytes).
@@ -157,23 +141,6 @@ async fn scan(store: &object_store::memory::InMemory, at_most: Option<u32>) -> S
     s
 }
 
-async fn wait_until<F: std::future::Future<Output = bool>>(what: &str, secs: u64, mut f: impl FnMut() -> F) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    while !f().await {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn balanced(nodes: &[&TestServer]) {
-    wait_until("every shard owned once, every node holding some", 30, || async {
-        let owned: Vec<usize> = nodes.iter().map(|n| n.app.partitions.owned().len()).collect();
-        let shards = cluster(nodes[0]).layout().shards.len();
-        owned.iter().all(|k| *k > 0) && owned.iter().sum::<usize>() == shards
-    })
-    .await;
-}
-
 /// Writes `n` posts per account, round-robin through `via`; returns (did, rev) per ack.
 async fn write(via: &[&TestServer], accts: &[TestAccount], n: usize, tag: &str, acked: &mut Vec<(String, RecordRef)>) {
     for i in 0..n {
@@ -263,8 +230,7 @@ async fn one_level_below_max_writes_nothing_new() {
     let c = node("lg-c", &store).await;
     balanced(&[&a, &b, &c]).await;
     write(&[&a, &b, &c], &accts, 2, "c back", &mut acked).await;
-    // every node has published a retention report by now
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    retry("every node's retention report", || async { (scan(&store, None).await.reports.1 >= 3).then_some(()) }).await;
 
     let s = scan(&store, Some(below)).await;
     eprintln!("at level {below}: {s:?}");
@@ -279,12 +245,12 @@ async fn one_level_below_max_writes_nothing_new() {
     a.xrpc.post("vlpds.admin.setFeatureLevel", &json!({"level": below, "lower": true}), &Auth::Admin).await.err(400, "InvalidRequest");
     // every node observes it within a TTL; writers switch at their next segment
     for n in [&a, &b, &c] {
-        wait_until("nodes observing the raise", 10, || async { cluster(n).own_lease().seen_level == version::MAX_LEVEL }).await;
+        wait_until("nodes observing the raise", Duration::from_secs(10), || cluster(n).own_lease().seen_level == version::MAX_LEVEL).await;
     }
     write(&[&a, &b, &c], &accts, 3, "finalized", &mut acked).await;
-    wait_until("test-level segments and reports", 10, || async {
+    retry("test-level segments and reports", || async {
         let s = scan(&store, None).await;
-        s.segments.get(&version::TEST_LEVEL).is_some_and(|n| *n >= 3) && s.reports.0 >= 3
+        (s.segments.get(&version::TEST_LEVEL).is_some_and(|n| *n >= 3) && s.reports.0 >= 3).then_some(())
     })
     .await;
     verify(&[&a, &b, &c], &acked).await;
