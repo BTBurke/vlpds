@@ -17,21 +17,14 @@ async fn optional_invite_code_is_checked_and_recorded() {
     let s = TestServer::spawn().await;
     let j = s.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok();
     assert_eq!(j["inviteCodeRequired"], json!(false));
-    let code = s
-        .xrpc
-        .post("com.atproto.server.createInviteCode", &json!({"useCount": 1}), &Auth::Admin)
-        .await
-        .ok()["code"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let code = s.xrpc.post("com.atproto.server.createInviteCode", &json!({"useCount": 1}), &Auth::Admin).await.ok()["code"].as_str().unwrap().to_string();
 
     let did = signup(&s, Some(&code)).await.ok()["did"].as_str().unwrap().to_string();
     let codes = s.xrpc.get("com.atproto.admin.getInviteCodes", &[("limit", "500")], &Auth::Admin).await.ok();
     let c = codes["codes"].as_array().unwrap().iter().find(|c| c["code"] == json!(code)).expect("code listed");
     let used: Vec<&str> = c["uses"].as_array().unwrap().iter().map(|u| u["usedBy"].as_str().unwrap()).collect();
     assert_eq!(used, vec![did.as_str()], "{c}");
-    let info = s.xrpc.get("com.atproto.admin.getAccountInfo", &[("did", &did)], &Auth::Admin).await.ok();
+    let info = s.account_info(&did).await.ok();
     assert_eq!(info["invitedBy"]["code"], json!(code), "{info}");
 
     // used up, or unknown: refused even though invites are optional

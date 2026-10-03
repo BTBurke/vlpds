@@ -18,21 +18,13 @@ async fn every_commit_inverts_to_prev_data() {
     }
     for p in &posts {
         let a = accts.iter().find(|a| a.did == p.did()).unwrap();
-        s.xrpc
-            .post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": p.collection(), "rkey": p.rkey()}), &a.auth())
-            .await
-            .ok();
+        s.delete_record(a, p.collection(), p.rkey()).await.ok();
     }
     let dids: HashSet<String> = accts.iter().map(|a| a.did.clone()).collect();
     let mut sub = s.subscribe(Some(0)).await;
     let mut deletes = 0;
     let mut creates = 0;
-    let frames = sub
-        .until(FH_TIMEOUT, |fs| {
-            let ops: usize = fs.iter().filter_map(|f| f.commit()).map(|c| c.ops.len()).sum();
-            ops >= 160
-        })
-        .await;
+    let frames = sub.until(FH_TIMEOUT, |fs| fs.iter().filter_map(|f| f.commit()).map(|c| c.ops.len()).sum::<usize>() >= 160).await;
     let mut checked = 0;
     for f in &frames {
         let Some(c) = f.commit() else { continue };

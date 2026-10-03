@@ -39,13 +39,6 @@ fn cbor(j: J) -> Vec<u8> {
     Value::from_json(&j).unwrap().to_cbor()
 }
 
-fn png(tag: u8) -> Vec<u8> {
-    let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
-    v.extend((0..2000).map(|_| rand::random::<u8>()));
-    v.push(tag);
-    v
-}
-
 async fn import(s: &TestServer, a: &TestAccount, car: Vec<u8>) -> Resp {
     s.xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &a.auth()).await
 }
@@ -57,8 +50,7 @@ async fn import(s: &TestServer, a: &TestAccount, car: Vec<u8>) -> Resp {
 async fn legacy_blob_refs_are_indexed_on_import() {
     let s = TestServer::spawn().await;
     let a = s.create_account("legacy").await;
-    let up = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", png(1), "image/png", &a.auth()).await.ok();
-    let have = up["blob"]["ref"]["$link"].as_str().unwrap().to_string();
+    let have = s.upload_blob(&a, &random_png(1), "image/png").await["ref"]["$link"].as_str().unwrap().to_string();
     let missing = Cid::raw(b"never uploaded").to_string();
     let post = |cid: &str| {
         cbor(json!({"$type": "app.bsky.feed.post", "text": "old", "createdAt": "2023-01-01T00:00:00Z",
@@ -67,27 +59,18 @@ async fn legacy_blob_refs_are_indexed_on_import() {
     // not a legacy ref: an extra field
     let other = cbor(json!({"$type": "app.bsky.feed.post", "text": "x", "createdAt": "2023-01-01T00:00:00Z",
         "x": {"cid": Cid::raw(b"other").to_string(), "mimeType": "image/png", "size": 1}}));
-    let car = import_car(
-        &a.did,
-        &[
-            ("app.bsky.feed.post/3jzfcijpj2z2a", post(&have)),
-            ("app.bsky.feed.post/3jzfcijpj2z2b", post(&missing)),
-            ("app.bsky.feed.post/3jzfcijpj2z2c", other),
-        ],
-    );
+    let car = import_car(&a.did, &[("app.bsky.feed.post/3jzfcijpj2z2a", post(&have)), ("app.bsky.feed.post/3jzfcijpj2z2b", post(&missing)), ("app.bsky.feed.post/3jzfcijpj2z2c", other)]);
     import(&s, &a, car).await.ok();
-    let listed = s.xrpc.get("com.atproto.sync.listBlobs", &[("did", &a.did)], &Auth::None).await.ok();
-    let mut cids: Vec<&str> = listed["cids"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+    let mut cids = s.list_blobs(&a.did).await;
     cids.sort();
-    let mut want = vec![have.as_str(), missing.as_str()];
+    let mut want = vec![have.clone(), missing.clone()];
     want.sort();
     assert_eq!(cids, want);
     let m = s.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &a.auth()).await.ok();
     assert_eq!(m["blobs"].as_array().unwrap().iter().map(|b| b["cid"].as_str().unwrap()).collect::<Vec<_>>(), vec![missing.as_str()]);
     // the GC sees the reference
     vlpds::xrpc::blobs::sweep_blobs_settle(&s.app, Duration::ZERO, Duration::ZERO).await.unwrap();
-    let g = s.xrpc.get("com.atproto.sync.getBlob", &[("did", &a.did), ("cid", &have)], &Auth::None).await;
-    assert_eq!(g.status, 200);
+    assert_eq!(s.get_blob(&a.did, &have).await.status, 200);
 }
 
 /// A record block over 2 MiB is refused; one under it imports.
@@ -96,10 +79,7 @@ async fn oversized_import_records_are_refused() {
     let s = TestServer::spawn().await;
     let a = s.create_account("bigrec").await;
     let rec = |n: usize| {
-        let mut m = vec![
-            ("$type".to_string(), Value::Text("com.example.big".into())),
-            ("b".to_string(), Value::Bytes(vec![7; n])),
-        ];
+        let mut m = vec![("$type".to_string(), Value::Text("com.example.big".into())), ("b".to_string(), Value::Bytes(vec![7; n]))];
         m.sort_by(|a, b| key_cmp(&a.0, &b.0));
         Value::Map(m).to_cbor()
     };
