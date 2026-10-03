@@ -788,10 +788,22 @@ async fn claim(app: &App, path: &object_store::path::Path, did: &str, holds: imp
 }
 
 pub(super) async fn release_email(app: &App, email: &str, did: &str) {
-    if did_by_email(app, email).await.ok().flatten().as_deref() == Some(did) {
-        if let Err(e) = app.store.raw.delete(&email_path(app, email)).await {
-            tracing::warn!(%did, "failed to release email claim: {e}");
-        }
+    if let Err(e) = try_release_email(app, email, did).await {
+        tracing::warn!(%did, "failed to release email claim: {}", e.message);
+    }
+}
+
+async fn try_release_email(app: &App, email: &str, did: &str) -> XResult<()> {
+    if did_by_email(app, email).await?.as_deref() == Some(did) {
+        delete_claim(app, &email_path(app, email)).await?;
+    }
+    Ok(())
+}
+
+async fn delete_claim(app: &App, path: &object_store::path::Path) -> XResult<()> {
+    match app.store.raw.delete(path).await {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(e) => Err(XrpcError::from_err(e)),
     }
 }
 
@@ -806,11 +818,16 @@ pub(super) async fn claim_handle(app: &App, handle: &str, did: &str) -> XResult<
 }
 
 pub(super) async fn release_handle(app: &App, handle: &str, did: &str) {
-    if app.resolve_handle(handle).await.ok().flatten().as_deref() == Some(did) {
-        if let Err(e) = app.store.raw.delete(&handle_path(app, handle)).await {
-            tracing::warn!(%did, %handle, "failed to release handle claim: {e}");
-        }
+    if let Err(e) = try_release_handle(app, handle, did).await {
+        tracing::warn!(%did, %handle, "failed to release handle claim: {}", e.message);
     }
+}
+
+async fn try_release_handle(app: &App, handle: &str, did: &str) -> XResult<()> {
+    if app.resolve_handle(handle).await?.as_deref() == Some(did) {
+        delete_claim(app, &handle_path(app, handle)).await?;
+    }
+    Ok(())
 }
 
 pub(super) fn normalize_handle(h: &str) -> XResult<String> {
@@ -1926,29 +1943,96 @@ async fn request_account_delete(State(app): AppState, Auth(creds): Auth) -> XRes
     Ok(StatusCode::OK)
 }
 
+/// A deletion in progress: written before the repo is deleted, removed once
+/// everything else is, so a retry after a failure past the repo delete (the
+/// account row gone) still knows the claims to release and the password
+/// that authorizes the user's retry.
+pub(super) const DELETING: &str = "deleting";
+
+#[derive(serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Deleting {
+    handle: String,
+    email: Option<String>,
+    password_hash: String,
+}
+
+static DELETE_HOOKS: crate::lifecycle::CrashHooks = crate::lifecycle::CrashHooks::new();
+
+/// Tests: `h("deleted")` true fails a deletion of `did` right after its repo
+/// delete, leaving the claims and private rows behind.
+pub fn set_delete_crash_hook(did: &str, h: Option<crate::lifecycle::CrashHook>) {
+    DELETE_HOOKS.set(did, h)
+}
+
+/// What deleting `did` has to do. Err(AccountNotFound): no account and no
+/// deletion of one left unfinished.
+enum DeleteFrom {
+    /// The account row: the whole deletion.
+    Account(Deleting),
+    /// A deletion that got past the repo delete: the rest.
+    Leftovers(Deleting),
+    /// An unreadable account row: the repo delete, the private rows; its
+    /// claims are taken over once stale.
+    Unreadable,
+}
+
+async fn delete_from(app: &App, did: &str) -> XResult<DeleteFrom> {
+    match super::internal::account_anywhere(app, did).await {
+        Ok(a) => Ok(DeleteFrom::Account(Deleting { handle: a.handle, email: a.email, password_hash: a.password_hash })),
+        Err(e) if e.error == "AccountNotFound" => match get_json::<Deleting>(app, did, DELETING).await? {
+            Some(d) => Ok(DeleteFrom::Leftovers(d)),
+            None => Err(e),
+        },
+        Err(_) => Ok(DeleteFrom::Unreadable),
+    }
+}
+
 /// Sessions, repo and account (#account deleted event), handle and email
-/// claims, private state.
+/// claims, private state. Retry-safe: a failure anywhere leaves either the
+/// account or its `DELETING` row, and a retry finishes from it.
 pub(super) async fn delete_account_fully(app: &App, did: &str) -> XResult<()> {
-    // an unreadable account leaves its claims to be taken over once stale
-    let acct = super::internal::account_anywhere(app, did).await.ok();
-    revoke_all_sessions(app, did).await?;
-    app.account_op(did, AccountOp::Delete).await?;
-    if let Some(a) = &acct {
-        release_handle(app, &a.handle, did).await;
-        if let Some(e) = &a.email {
-            release_email(app, e, did).await;
+    finish_delete(app, did, delete_from(app, did).await?).await
+}
+
+async fn finish_delete(app: &App, did: &str, from: DeleteFrom) -> XResult<()> {
+    let intent = match from {
+        DeleteFrom::Account(d) => {
+            app.put_private(did, vec![pmut(did, DELETING, Some(to_json_bytes(&d)))]).await?;
+            revoke_all_sessions(app, did).await?;
+            app.account_op(did, AccountOp::Delete).await?;
+            crate::metrics::ACCOUNT_EVENTS.with_label_values(&["deleted"]).inc();
+            Some(d)
+        }
+        DeleteFrom::Unreadable => {
+            revoke_all_sessions(app, did).await?;
+            app.account_op(did, AccountOp::Delete).await?;
+            crate::metrics::ACCOUNT_EVENTS.with_label_values(&["deleted"]).inc();
+            None
+        }
+        DeleteFrom::Leftovers(d) => Some(d),
+    };
+    if DELETE_HOOKS.fires(did, "deleted") {
+        return Err(XrpcError::internal(format!("deletion of {did} stopped after the repo delete (crash hook)")));
+    }
+    if let Some(d) = &intent {
+        try_release_handle(app, &d.handle, did).await?;
+        if let Some(e) = &d.email {
+            try_release_email(app, e, did).await?;
         }
     }
     // revocations stay (TTL'd), so a DID that comes back (migration) doesn't
     // revive access tokens issued before; so does the credential epoch
     // (device logins and codes from before must not match a fresh account)
     let mut private = scan_private(app, did, "").await?;
-    private.retain(|(name, _)| !name.starts_with(REVOKED_ALL) && !name.starts_with(REVOKED_FAMILY) && name != AUTH_EPOCH);
+    private.retain(|(name, _)| !name.starts_with(REVOKED_ALL) && !name.starts_with(REVOKED_FAMILY) && name != AUTH_EPOCH && name != DELETING);
     for chunk in private.chunks(500) {
         app.put_private(did, chunk.iter().map(|(name, _)| pmut(did, name, None)).collect()).await?;
     }
+    if intent.is_some() {
+        app.put_private(did, vec![pmut(did, DELETING, None)]).await?;
+    }
     ctl_changed(app, did);
-    crate::metrics::ACCOUNT_EVENTS.with_label_values(&["deleted"]).inc();
     Ok(())
 }
 
@@ -1963,12 +2047,24 @@ async fn delete_account(State(app): AppState, Json(inp): Json<DeleteAccountIn>) 
     if inp.password.len() > OLD_PASSWORD_MAX_LENGTH {
         return Err(XrpcError::auth("Password too long. Consider resetting your password."));
     }
-    let acct = app.account(&inp.did).await.map_err(|_| invalid_request("account not found"))?;
-    if !verify_password(&acct, &inp.password).await? {
+    let from = delete_from(&app, &inp.did).await.map_err(|e| match e.error.as_str() {
+        "AccountNotFound" => invalid_request("account not found"),
+        _ => e,
+    })?;
+    let hash = match &from {
+        DeleteFrom::Account(d) | DeleteFrom::Leftovers(d) => &d.password_hash,
+        DeleteFrom::Unreadable => return Err(XrpcError::internal("account unreadable")),
+    };
+    if hash.is_empty() || !state::try_verify_password_hash(hash, &inp.password).await? {
         return Err(XrpcError::auth("Invalid did or password"));
     }
-    assert_email_token(&app, &acct.did, "delete_account", &inp.token).await?;
-    delete_account_fully(&app, &acct.did).await?;
+    // A deletion past the repo delete was authorized with a token when it
+    // began (the token row may be gone with the private rows): the
+    // password alone lets its owner finish it.
+    if matches!(from, DeleteFrom::Account(_)) {
+        assert_email_token(&app, &inp.did, "delete_account", &inp.token).await?;
+    }
+    finish_delete(&app, &inp.did, from).await?;
     Ok(StatusCode::OK)
 }
 
@@ -2735,6 +2831,8 @@ pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow:
         typed_row::<EmailToken>("email token", val)
     } else if name == AUTH_EPOCH {
         typed_row::<String>("credential epoch", val)
+    } else if name == DELETING {
+        typed_row::<Deleting>("deletion in progress", val)
     } else if name.starts_with(REVOKED_ALL) || name.starts_with(REVOKED_FAMILY) {
         let fields: &[(&str, char)] = if name.starts_with(REVOKED_ALL) { &[("before", 'u'), ("exp", 'u')] } else { &[("exp", 'u')] };
         json_row("session revocation", val, fields).and_then(|k| {

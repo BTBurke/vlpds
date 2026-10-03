@@ -805,8 +805,10 @@ struct DeleteAccountIn {
 
 async fn delete_account(State(app): AppState, Auth(creds): Auth, Json(inp): Json<DeleteAccountIn>) -> XResult<StatusCode> {
     require_admin(&creds)?;
-    ensure_account(&app, &inp.did).await?;
-    delete_account_fully(&app, &inp.did).await?;
+    delete_account_fully(&app, &inp.did).await.map_err(|e| match e.error.as_str() {
+        "AccountNotFound" => invalid_request(format!("Account not found: {}", inp.did)),
+        _ => e,
+    })?;
     Ok(StatusCode::OK)
 }
 

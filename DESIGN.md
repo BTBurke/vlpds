@@ -4137,6 +4137,25 @@ succeeded; handle claims were never reclaimed. This is also the GC for
 claims a failed release or a deletion that couldn't read the account left
 behind (deletion now reads it from the owner wherever it is).
 
+**Account deletion is retry-safe** (`server::delete_account_fully`). It
+first writes a `deleting` private row (the handle, email and password hash
+it needs later), then revokes sessions, runs the worker's `Delete` (repo,
+indexes, `S/` counts, account row, `n/` handle row, the totals delta; the
+blob refs go with the repo, so the blob GC collects the bytes), releases
+the handle and email claims (a failure now fails the call), drops the DID's
+private rows (sessions, app passwords, email tokens, OAuth sessions and
+consent, stored-blob rows; revocations and the credential epoch stay), and
+drops `deleting` last. A failure anywhere leaves either the account or
+`deleting`, and a retry finishes from whichever is there:
+`admin.deleteAccount` with the DID alone, `server.deleteAccount` with the
+account's password checked against the hash in `deleting`. The email
+token isn't checked again once the account is gone (it was, before
+`deleting` was written, and its row may already be dropped), so the retry
+can only finish a deletion its owner authorized; without the password no
+one can. With neither row left the account is "not found", as before. No
+PLC tombstone, as the reference's deleteAccount
+(`tests/all/delete_account_retry.rs`).
+
 **createAccount failures.** A CreateRepo failure that may have applied
 (the worker's reply dropped, the log write failing or timing out, "repo
 already exists") is not compensated blindly: the account is looked up and,
@@ -4461,7 +4480,7 @@ effect at the next segment). Not built yet: everything under "Later".
 | Index `c/ C/ b/ bl/ n/` | `state.rs` | key layout only, empty/plain values | key not found |
 | MST nodes `M/` | `state.rs`, `mst_lazy.rs` | dag-cbor, content-addressed | stable by construction |
 | Account `a/` | `state::Account` JSON | none; tolerant (`#[serde(default)]`, `#[serde(flatten)] extra` keeps unknown fields) | round-trips unknown fields |
-| Private `p/` rows | sessions, app passwords, tokens, TOTP (`totp.rs`), OAuth (`oauth/store.rs`), `sec/` revocations/takedowns (`xrpc/server.rs`) | none; mostly JSON | per type; mostly serde-default |
+| Private `p/` rows | sessions, app passwords, tokens, TOTP (`totp.rs`), OAuth (`oauth/store.rs`), `sec/` revocations/takedowns, `deleting` (`xrpc/server.rs`) | none; mostly JSON | per type; mostly serde-default |
 | Shard meta | `meta/applied2` (`nodelog::encode_marker`), `meta/recent` | key-name suffix (`applied2`): the only precedent | **(built)** `decode_marker` of anything but exactly its bytes is an error (the shard doesn't open, `format="applied_marker"`), never "no marker" |
 | SlateDB SSTs + manifest | `state/{id}/` | slatedb's own (pinned fork rev, `Cargo.toml`); SST compression from flags | slatedb error at open |
 | Node lease | `nodes/{id}`, `cluster::NodeLease` | none; serde ignores unknown fields | **(built)** level 1 has `rev`, `min_level`, `max_level`, `seen_level`; a later level's new fields default |
