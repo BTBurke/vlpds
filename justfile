@@ -96,7 +96,7 @@ profile host="127.0.0.1:2583" seconds="10" *args:
 # Benchbox bench campaigns (bench/benchbox/README.md): unattended, packed into batch pipeline windows,
 # results in bench/results/<name>/ (SUMMARY.md).
 
-# ~20 min regression check of HEAD (or the given commits): 2 write grids, read sweep 1M/10M, methods, proxy, failover
+# ~20 min regression check of HEAD (each given commit: ~15 min of steps + a ~5 min build if uncached): 2 write grids, read sweep 1M/10M, methods, proxy, failover
 benchbox-quick *shas:
     bench/benchbox/campaign.sh quick {{shas}}
 

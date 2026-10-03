@@ -17,12 +17,20 @@ Phases of `all` (each skipped when state.json says it's done):
 
 Nodes: --mode native (processes) or docker (one container per node:
 --network host, --ipc host, --log-driver none (logs to a bind-mounted file),
-seccomp unconfined, nofile 1M, no cgroup limits; the release binary is
+seccomp unconfined, nofile 1M, --memory = --memory-swap = the node's cap; the release binary is
 bind-mounted into DOCKER_IMAGE (default ubuntu:24.04), or DOCKER_BIN=image
 uses the image's own `vlpds`). Ports --base-port.. (benchbox's Alloy scrapes
 2700-2715 and 7100-7105/7700-7705 every second into the vlpds dashboard);
 each node's mTLS peer listener on --base-port+100.., all nodes sharing the
 dev-mode --peer-tls-dir <state>/peer-tls (the first node creates the CA).
+
+Memory (bench/memcap.py): native nodes and loadgens each run in a capped
+`systemd-run --user --scope` (MemoryMax, no swap); the node cap is the box's
+bench budget (--mem-gb, default RAM - BENCH_RESERVE_GB) less MinIO, the
+driver and one loadgen per node, split over --nodes, and the cache flags are
+derived from it. Requested cache flags (options, NODE_EXTRA) that don't fit
+refuse the run. --cache-dir is refused on MinIO's disk while the bulk is
+pending.
 
 Every --scrape-s (1 s) every node's /metrics (vlpds_*/slatedb_* family sums,
 no histogram buckets) and MinIO's cluster metrics (S3 requests by API, bytes)
@@ -52,6 +60,10 @@ import time
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# memcap.py: next to this file when shipped (benchbox, xhost), bench/ in the repo
+sys.path[:0] = [HERE, os.path.join(HERE, "..")]
+import memcap  # noqa: E402
+
 PKG = os.path.abspath(os.path.join(HERE, "..", ".."))
 BIN = os.environ.get("BENCH_BIN") or os.path.join(PKG, "target", "release")
 VLPDS = os.path.join(BIN, "vlpds")
@@ -219,7 +231,7 @@ class Node:
         self.dir = os.path.join(cfg.state_dir, self.name)
         os.makedirs(self.dir, exist_ok=True)
         self.logpath = os.path.join(self.dir, "server.log")
-        self.cache = os.path.join(self.dir, "cache") if cfg.cache_dir else ""
+        self.cache = os.path.join(cfg.cache_root, cfg.name, self.name, "cache") if cfg.cache_dir else ""
         self.container = f"vlpds-cap-{cfg.name}-{self.name}"
         self.p = None
 
@@ -229,9 +241,7 @@ class Node:
              "--prefix", c.prefix, "--no-rate-limits", "--dev-mode",
              "--node-id", self.name, "--peer-listen", f"127.0.0.1:{self.peer_port}",
              "--advertise-url", f"https://127.0.0.1:{self.peer_port}", "--peer-tls-dir", self.tls_dir,
-             "--workers", str(c.workers), "--io-threads", str(c.io_threads),
-             "--block-cache-mb", str(c.block_cache_mb), "--repo-cache-mb", str(c.repo_cache_mb),
-             "--cache-budget-mb", str(c.cache_budget_mb),
+             "--workers", str(c.workers), "--io-threads", str(c.io_threads), *c.node_flags,
              "--log-retention", c.log_retention, "--slatedb-checkpoint-lifetime", c.checkpoint_lifetime,
              "--slatedb-gc-min-age", c.gc_min_age, "--lease-ttl-ms", str(c.lease_ttl_ms), "--shards", str(SHARDS)]
         if self.cache:
@@ -247,7 +257,8 @@ class Node:
             self.f = open(self.logpath, "ab")
             env = dict(os.environ)
             env.setdefault("RUST_LOG", "info,slatedb=warn")
-            self.p = subprocess.Popen(self.args(VLPDS), stdout=self.f, stderr=subprocess.STDOUT, start_new_session=True, env=env)
+            self.p = subprocess.Popen(memcap.scope_args(self.cfg.node_mb, f"{self.cfg.name}-{self.name}") + self.args(VLPDS),
+                                      stdout=self.f, stderr=subprocess.STDOUT, start_new_session=True, env=env)
         else:
             subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
             image = os.environ.get("DOCKER_IMAGE", "ubuntu:24.04")
@@ -257,9 +268,12 @@ class Node:
             run = ["docker", "run", "-d", "--name", self.container, "--network", "host", "--ipc", "host",
                    "--log-driver", "none", "--security-opt", "seccomp=unconfined",
                    "--ulimit", "nofile=1048576:1048576", "--user", f"{os.getuid()}:{os.getgid()}",
+                   "--memory", f"{self.cfg.node_mb}m", "--memory-swap", f"{self.cfg.node_mb}m",
                    "-e", "RUST_LOG=info,slatedb=warn", "-v", f"{self.dir}:{self.dir}", "-v", f"{self.tls_dir}:{self.tls_dir}"]
             if not own:
                 run += ["-v", f"{BIN}:/opt/vlpds:ro"]
+            if self.cache and not self.cache.startswith(self.dir + os.sep):
+                run += ["-v", f"{os.path.dirname(self.cache)}:{os.path.dirname(self.cache)}"]
             run += ["--entrypoint", "/bin/sh", image, "-c", "exec " + cmd]
             r = subprocess.run(run, capture_output=True, text=True)
             if r.returncode:
@@ -465,7 +479,7 @@ def phase_populate(cfg, st, nodes, scr):
         save_state(cfg, st)
         t0 = time.time()
         du0 = scr.du
-        procs = [subprocess.Popen([LOADGEN, "--host", n.url, "--threads", str(cfg.loadgen_threads), "bulk", "--start", str(s), "--count", str(c),
+        procs = [subprocess.Popen(memcap.scope_args(memcap.LOADGEN_MB) + [LOADGEN, "--host", n.url, "--threads", str(cfg.loadgen_threads), "bulk", "--start", str(s), "--count", str(c),
                                    "--batch", str(cfg.bulk_batch), "--concurrency", str(cfg.bulk_concurrency), "--progress-file", pf] + dist_flags(cfg),
                                   stdout=subprocess.PIPE, stderr=open(os.path.join(cfg.state_dir, f"bulk-{n.name}.stderr"), "a"), text=True)
                  for n, pf in zip(nodes, pfiles)]
@@ -596,7 +610,7 @@ def run_step(cfg, st, nodes, tag, rate, duration, event=None, lg_nodes=None):
              "--sim-offset", str(offset), "--report-secs", "1", "--max-inflight", str(cfg.max_inflight)]
         if i == 0:
             a.append("--firehose")
-        lgs.append(subprocess.Popen(a, stdout=subprocess.PIPE, stderr=open(ep, "w"), text=True))
+        lgs.append(subprocess.Popen(memcap.scope_args(memcap.LOADGEN_MB) + a, stdout=subprocess.PIPE, stderr=open(ep, "w"), text=True))
     ev = event(nodes, t0) if event else None
     texts = [lg.communicate()[0] for lg in lgs]
     t1 = time.time()
@@ -796,10 +810,14 @@ def phase_report(cfg, st):
     L = [f"# vlpds capacity test: {cfg.name}", ""]
     L.append(f"Driver: `bench/capacity/run.py` (`{' '.join(sys.argv[1:])}`). {cfg.nodes} {cfg.mode} nodes on one box "
              f"(ports {cfg.base_port}-{cfg.base_port + cfg.nodes - 1}), MinIO at {S3}, prefix `{cfg.prefix}`, binaries `{BIN}`.")
-    L.append(f"Per node: `--workers {cfg.workers} --io-threads {cfg.io_threads} --block-cache-mb {cfg.block_cache_mb} "
-             f"--repo-cache-mb {cfg.repo_cache_mb} --log-retention {cfg.log_retention} --slatedb-checkpoint-lifetime "
+    L.append(f"Per node: `--workers {cfg.workers} --io-threads {cfg.io_threads} {' '.join(cfg.node_flags)} "
+             f"--log-retention {cfg.log_retention} --slatedb-checkpoint-lifetime "
              f"{cfg.checkpoint_lifetime} --slatedb-gc-min-age {cfg.gc_min_age}` {' '.join(cfg.node_extra)}"
              f"{' --inject-put-ms ' + str(cfg.inject) if cfg.inject else ''}{' (SST disk cache on)' if cfg.cache_dir else ' (no SST disk cache)'}.")
+    if cfg.mem:
+        L.append(f"Memory caps (memcap.py): node {cfg.mem.get('node_mb')} MiB, loadgen {cfg.mem.get('loadgen_mb')} MiB, MinIO "
+                 f"{cfg.mem.get('minio_mb')} MiB, bench total {cfg.mem.get('bench_mb')} MiB of {cfg.mem.get('ram_mb')} MiB RAM "
+                 f"(reserve {cfg.mem.get('reserve_mb')} MiB).")
     L.append("")
     L.append("## Population")
     L.append("")
@@ -950,15 +968,20 @@ def config(argv):
     ap.add_argument("--inject", type=float, default=0, help="--inject-put-ms on every node")
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--io-threads", type=int, default=0)
-    ap.add_argument("--mem-gb", type=float, default=0, help="RAM budget for all nodes' caches (default 60%% of RAM)")
-    ap.add_argument("--block-cache-mb", type=int, default=0)
-    ap.add_argument("--repo-cache-mb", type=int, default=0)
+    ap.add_argument("--mem-gb", type=float, default=0,
+                    help="memory budget of the whole bench on this box: MinIO, loadgens, nodes (default RAM - BENCH_RESERVE_GB; memcap.py)")
+    ap.add_argument("--block-cache-mb", type=int, default=0, help="default: derived from the node's memory cap")
+    ap.add_argument("--repo-cache-mb", type=int, default=0, help="default: derived from the node's memory cap")
+    ap.add_argument("--meta-cache-mb", type=int, default=0,
+                    help="default: ~29 MB per million accounts a node may own after a failover, within the node's cap")
     ap.add_argument("--cache-budget-mb", type=int, default=512)
     ap.add_argument("--log-retention", default="5m", help="segments kept for firehose backfill (bulk + stairs write ~0.6 KB/account and ~2-5 KB/commit)")
     ap.add_argument("--checkpoint-lifetime", default="2m")
     ap.add_argument("--gc-min-age", default="2m")
     ap.add_argument("--lease-ttl-ms", type=int, default=10000)
     ap.add_argument("--cache-dir", action="store_true", help="SST disk cache per node (counts against disk)")
+    ap.add_argument("--cache-root", default="", help="--cache-dir under <this>/<name>/<node>/cache (default the state dir); "
+                    "refused on MinIO's disk while a bulk load is pending")
     ap.add_argument("--loadgen-threads", type=int, default=4)
     ap.add_argument("--scrape-s", type=float, default=1.0)
     ap.add_argument("--cleanup", action="store_true", help="`all`: delete the population at the end")
@@ -977,15 +1000,25 @@ def config(argv):
     # share the box: N nodes + loadgens + MinIO
     c.io_threads = c.io_threads or max(2, cores // (c.nodes + 1))
     c.workers = c.workers or max(2, cores // (2 * (c.nodes + 1)))
+    c.cache_root = c.cache_root or SCRATCH
+    if c.mem_gb:
+        os.environ["BENCH_MEM_GB"] = str(c.mem_gb)
+    requested = {k: v for k, v in (("--block-cache-mb", c.block_cache_mb), ("--repo-cache-mb", c.repo_cache_mb),
+                                   ("--meta-cache-mb", c.meta_cache_mb), ("--cache-budget-mb", c.cache_budget_mb)) if v}
+    meta_hint = int(29 * c.total / 1e6 / max(1, c.nodes - 1) * 1.25)
+    c.mem, c.node_mb = {}, 0
     try:
-        ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
-    except (ValueError, OSError):
-        ram = 32
-    mem = c.mem_gb or 0.6 * ram
-    per = mem * 1024 / c.nodes
-    c.block_cache_mb = c.block_cache_mb or int(per * 0.35)
-    c.repo_cache_mb = c.repo_cache_mb or int(per * 0.35)
-    c.node_extra = os.environ.get("NODE_EXTRA", "").split()
+        # one loadgen per node in every phase
+        c.mem = memcap.host_plan(c.nodes, loadgens=c.nodes)
+        c.node_mb = c.mem["node_mb"]
+        c.node_flags, c.node_extra, c.mem["node"] = memcap.plan_node_args(VLPDS, c.node_mb, os.environ.get("NODE_EXTRA", "").split(),
+                                                                         meta_mb=meta_hint, requested=requested)
+    except memcap.BudgetError:
+        if c.cmd not in ("plan", "status", "report", "cleanup"):
+            raise
+        c.node_flags, c.node_extra = [], os.environ.get("NODE_EXTRA", "").split()
+    fl = dict(zip(c.node_flags[::2], c.node_flags[1::2]))
+    c.block_cache_mb, c.repo_cache_mb = fl.get("--block-cache-mb", "?"), fl.get("--repo-cache-mb", "?")
     c.dist_args_str = (f"real/scale={c.dist_scale:g}/knee={c.dist_knee}/group={c.dist_group}" if c.dist == "real" else f"fixed/{c.records}")
     return c
 
@@ -994,7 +1027,7 @@ def main():
     cfg = config(sys.argv[1:])
     if cfg.cmd == "plan":
         p = plan(cfg)
-        print(json.dumps(p, indent=1))
+        print(json.dumps({**p, "memory": cfg.mem, "node_flags": " ".join(cfg.node_flags)}, indent=1))
         return
     if cfg.cmd == "cleanup":
         phase_cleanup(cfg)
@@ -1008,8 +1041,12 @@ def main():
         phase_report(cfg, st)
         return
     check_disk()
+    if cfg.cache_dir:
+        memcap.check_cache_disk(os.path.join(cfg.cache_root, cfg.name), MINIO_DATA,
+                                bulk=cfg.cmd in ("all", "populate") and not st.get("populate", {}).get("done"))
+    memcap.setup_host(cfg.nodes, cfg.nodes)
     log(f"{cfg.cmd}: {cfg.name}: {cfg.nodes} {cfg.mode} nodes, {cfg.total} accounts ({cfg.dist_args_str}), active {cfg.active} churn {cfg.churn:g}/s, "
-        f"rates {cfg.rates}; per node workers {cfg.workers} io {cfg.io_threads} block cache {cfg.block_cache_mb} MB repo cache {cfg.repo_cache_mb} MB; "
+        f"rates {cfg.rates}; per node workers {cfg.workers} io {cfg.io_threads}, memory cap {cfg.node_mb} MiB: {' '.join(cfg.node_flags)}; "
         f"minio data {MINIO_DATA or '?'}; out {cfg.out}")
     nodes = [Node(cfg, i) for i in range(cfg.nodes)]
     stopping = []

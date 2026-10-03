@@ -78,6 +78,10 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# memcap.py: next to this file when shipped (benchbox), bench/ in the repo
+sys.path[:0] = [HERE, os.path.join(HERE, "..")]
+import memcap  # noqa: E402
+
 PKG = os.path.abspath(os.path.join(HERE, "..", ".."))
 BIN = os.environ.get("BENCH_BIN") or os.path.join(PKG, "target", "release")
 VLPDS = os.path.join(BIN, "vlpds")
@@ -803,12 +807,11 @@ class Node:
              "--peer-listen", f"127.0.0.1:{self.peer_port}", "--advertise-url", f"https://127.0.0.1:{self.peer_port}",
              "--peer-tls-dir", self.tls_dir,
              "--shards", str(c.shards), "--workers", str(c.workers), "--io-threads", str(c.io_threads),
-             "--block-cache-mb", str(c.block_cache_mb), "--repo-cache-mb", str(c.repo_cache_mb),
-             "--cache-budget-mb", str(c.cache_budget_mb), "--log-retention", c.log_retention,
+             *c.node_flags, "--log-retention", c.log_retention,
              "--slatedb-checkpoint-lifetime", c.checkpoint_lifetime, "--slatedb-gc-min-age", c.gc_min_age,
              "--lease-ttl-ms", str(c.lease_ttl_ms)]
         if c.cache_dir:
-            a += ["--cache-dir", os.path.join(self.dir, "cache")]
+            a += ["--cache-dir", os.path.join(c.cache_root, c.name, self.name, "cache")]
         if c.inject:
             a += ["--inject-put-ms", str(c.inject)]
         return a + c.node_extra
@@ -818,7 +821,8 @@ class Node:
         self.f = open(self.logpath, "ab")
         env = dict(os.environ)
         env.setdefault("RUST_LOG", "info,slatedb=warn")
-        self.p = subprocess.Popen(self.args(), stdout=self.f, stderr=subprocess.STDOUT, start_new_session=True, env=env)
+        self.p = subprocess.Popen(memcap.scope_args(self.cfg.node_mb, f"{self.cfg.name}-{self.name}") + self.args(),
+                                  stdout=self.f, stderr=subprocess.STDOUT, start_new_session=True, env=env)
         t = time.time()
         while time.time() - t < timeout:
             if self.p.poll() is not None:
@@ -1477,7 +1481,7 @@ def setup(cfg, st, nodes):
         if count <= 0 or st.get(f"setup_{name}"):
             continue
         log(f"setup: bulk {name}: {count} accounts x {recs} records")
-        procs = [subprocess.Popen([LOADGEN, "--host", n.url, "--threads", "4", "bulk", "--start", str(start), "--count", str(count),
+        procs = [subprocess.Popen(memcap.scope_args(memcap.LOADGEN_MB) + [LOADGEN, "--host", n.url, "--threads", "4", "bulk", "--start", str(start), "--count", str(count),
                                    "--batch", str(1 if recs > 500 else 500), "--concurrency", "8", "--dist", "fixed", "--records", str(recs)],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for n in nodes]
         outs = [p.communicate() for p in procs]
@@ -1601,6 +1605,10 @@ def run(cfg):
     log(f"soak {cfg.name}: {cfg.nodes} nodes (stable {cfg.stable_nodes}), {cfg.shards} shards, population {cfg.population} "
         f"x {cfg.pop_records} + {cfg.mid_repos} mid x {cfg.mid_records}; writes {cfg.write_rate}/s reads {cfg.read_rate}/s; "
         f"cycle {cfg.cycle_str}; resume at {st['soak_s']/3600:.2f} h of {cfg.hours} h; minio data {MINIO_DATA or '?'}; out {cfg.out}")
+    if cfg.cache_dir:
+        memcap.check_cache_disk(os.path.join(cfg.cache_root, cfg.name), MINIO_DATA, bulk=not st.get("setup_done"))
+    memcap.setup_host(cfg.nodes, cfg.nodes)
+    log(f"memory: node cap {cfg.node_mb} MiB: {' '.join(cfg.node_flags)}")
     nodes = [Node(cfg, i) for i in range(cfg.nodes)]
     stop = {"why": None}
 
@@ -2282,10 +2290,12 @@ def config(argv):
     ap.add_argument("--inject", type=float, default=0, help="--inject-put-ms on every node")
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--io-threads", type=int, default=0)
-    ap.add_argument("--block-cache-mb", type=int, default=0)
-    ap.add_argument("--repo-cache-mb", type=int, default=0)
+    ap.add_argument("--block-cache-mb", type=int, default=0, help="default: derived from the node's memory cap (memcap.py)")
+    ap.add_argument("--repo-cache-mb", type=int, default=0, help="default: derived from the node's memory cap")
     ap.add_argument("--cache-budget-mb", type=int, default=256)
     ap.add_argument("--cache-dir", action="store_true", help="SST disk cache per node")
+    ap.add_argument("--cache-root", default="", help="--cache-dir under <this>/<name>/<node>/cache (default the scratch dir); "
+                    "refused on MinIO's disk while the setup bulk load is pending")
     c = ap.parse_args(argv)
     c.prefix = c.name
     c.state_dir = os.path.join(SCRATCH, c.name)
@@ -2295,14 +2305,18 @@ def config(argv):
     cores = os.cpu_count() or 8
     c.io_threads = c.io_threads or max(2, cores // (c.nodes + 1))
     c.workers = c.workers or max(2, cores // (2 * (c.nodes + 1)))
-    try:
-        ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
-    except (ValueError, OSError):
-        ram = 32
-    per = 0.3 * ram * 1024 / c.nodes
-    c.block_cache_mb = c.block_cache_mb or int(per * 0.4)
-    c.repo_cache_mb = c.repo_cache_mb or int(per * 0.4)
-    c.node_extra = os.environ.get("NODE_EXTRA", "").split()
+    c.cache_root = c.cache_root or SCRATCH
+    requested = {k: v for k, v in (("--block-cache-mb", c.block_cache_mb), ("--repo-cache-mb", c.repo_cache_mb),
+                                   ("--cache-budget-mb", c.cache_budget_mb)) if v}
+    c.node_mb, c.node_flags, c.node_extra = 0, [], os.environ.get("NODE_EXTRA", "").split()
+    if c.cmd == "run":
+        # one bulk loadgen per node at setup; the load processes run in the driver's scope
+        p = memcap.host_plan(c.nodes, loadgens=c.nodes)
+        c.node_mb = p["node_mb"]
+        # earlier soaks' sizing (40% block / 40% repo of 30% of RAM over the nodes) where it fits the cap
+        old = int(0.12 * p["ram_mb"] / c.nodes)
+        c.node_flags, c.node_extra, _ = memcap.plan_node_args(VLPDS, c.node_mb, c.node_extra, requested=requested,
+                                                              prefer={"--block-cache-mb": old, "--repo-cache-mb": old})
     return c
 
 
