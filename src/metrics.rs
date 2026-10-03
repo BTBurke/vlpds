@@ -96,6 +96,7 @@ lazy!(FIREHOSE_BACKFILLS: IntGaugeVec = register_int_gauge_vec!("vlpds_firehose_
 lazy!(FIREHOSE_REJECTED: IntCounterVec = register_int_counter_vec!("vlpds_firehose_rejected_total", "subscribeRepos connections refused before the upgrade, by reason (per_ip: --firehose-max-per-ip)", &["reason"]));
 lazy!(SYNC_EXPORTS: IntGaugeVec = register_int_gauge_vec!("vlpds_sync_exports", "getRepo exports streaming, and waiting for a slot (--max-exports)", &["state"]));
 lazy!(SYNC_EXPORTS_ENDED: IntCounterVec = register_int_counter_vec!("vlpds_sync_exports_ended_total", "getRepo exports by how they ended: done, client_gone, stalled (the client read nothing for --export-stall-secs), error, shed (no slot within 10 s: 503)", &["reason"]));
+lazy!(IMPORT_REPO_PARSES: IntCounterVec = register_int_counter_vec!("vlpds_import_repo_parses_total", "importRepo bodies parsed, by path: stream (one pass over a CAR in the streamable block order) or buffered (any other order, or a CAR refused)", &["path"]));
 lazy!(FIREHOSE_BACKFILL_RETRIES: IntCounterVec = register_int_counter_vec!("vlpds_firehose_backfill_retries_total", "Cursor backfill retries: seek (a log seek re-run after retention pruned the log's head below the cursor under it), pruned (a whole backfill re-run for the same reason) or error (S3)", &["reason"]));
 lazy!(LOG_LIVE_BYTES: IntGauge = register_int_gauge!("vlpds_log_live_ring_bytes", "Segment bytes pinned by the node log's live ring (peer streams)"));
 lazy!(LOG_STREAM_LAGGED: IntCounter = register_int_counter!("vlpds_log_stream_lagged_total", "Peer log streams dropped for falling behind the live ring (they catch up from S3)"));
@@ -416,6 +417,7 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&FIREHOSE_DISCONNECTS, &["too_slow"]),
     (&FIREHOSE_REJECTED, &["per_ip"]),
     (&SYNC_EXPORTS_ENDED, &["done", "client_gone", "stalled", "error", "shed"]),
+    (&IMPORT_REPO_PARSES, &["stream", "buffered"]),
     (&SIGNUPS, &["created", "invite", "email_policy", "handle_policy", "taken", "invalid", "error"]),
     (&ACCOUNT_EVENTS, &["created", "deleted", "deactivated", "reactivated"]),
     (&PASSWORD_RESETS, &["requested", "completed"]),

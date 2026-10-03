@@ -2332,7 +2332,23 @@ root through the store).
   account deletion write or clear the whole set. importRepo parses the
   CAR, checks it and builds the new tree on the blocking pool (record
   bytes are slices of the body, no copies; a record block over 2 MiB is
-  refused; the CAR is capped by `--max-import-mb`, 1 GiB default) and
+  refused; the CAR is capped by `--max-import-mb`, 1 GiB default, counted
+  as the body streams in). A CAR in the spec's streamable block order
+  (`car_order.rs`: commit, then the MST in preorder with each record
+  after the slot that names it) is parsed as it arrives in one pass that
+  holds only the root-to-current path: each node and record must be the
+  block its parent named, keys must ascend, and the tree rebuilt from the
+  records must reproduce the commit's `data`, which proves every node
+  streamed was the canonical one (`xrpc/import_stream.rs`). Any other
+  order, and any CAR it would refuse, falls back to the buffered parse of
+  the whole body (kept as received for this), which reports the error; so
+  both paths accept exactly the same CARs with the same result. The
+  stream skips the buffered parse's block map and its second tree: for 1M
+  records (299 MB CAR, laptop, `tests/all/import_bench.rs`) the parse
+  peaks ~665 MB over baseline vs ~825 MB and finishes ~1.0 s after the
+  request starts vs ~1.5 s; but the worker's single log entry then peaks
+  ~3.6 GB either way, so streaming `ReplaceRepo` itself (a multi-entry
+  atomic import) is where the memory is. Either way the parse
   hands the worker the built tree, which only writes it: still one log
   entry for the whole repo (a segment of its own when over the segment
   size), so the cap also bounds that entry. No rate limit of its own yet

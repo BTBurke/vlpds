@@ -2,7 +2,7 @@ use super::extract::RecordBody;
 use super::*;
 use crate::cbor::{JsonValue, RecordRefs};
 
-pub fn routes(max_import_bytes: usize) -> Router<Arc<App>> {
+pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/xrpc/com.atproto.repo.createRecord", post(create_record))
         .route("/xrpc/com.atproto.repo.putRecord", post(put_record))
@@ -11,13 +11,10 @@ pub fn routes(max_import_bytes: usize) -> Router<Arc<App>> {
         .route("/xrpc/com.atproto.repo.getRecord", get(get_record))
         .route("/xrpc/com.atproto.repo.listRecords", get(list_records))
         .route("/xrpc/com.atproto.repo.describeRepo", get(describe_repo))
-        .route(
-            "/xrpc/com.atproto.repo.importRepo",
-            post(import_repo).layer(axum::extract::DefaultBodyLimit::max(max_import_bytes)),
-        )
+        .route("/xrpc/com.atproto.repo.importRepo", post(import_repo))
 }
 
-/// The CAR is parsed in memory and written as one log entry about its size.
+/// The repo is held in memory and written as one log entry about its size.
 pub const DEFAULT_MAX_IMPORT_BYTES: usize = 1 << 30;
 
 /// The reference sets no limit; our own writes refuse a record over 1 MB,
@@ -770,18 +767,16 @@ async fn describe_repo(State(app): AppState, Query(q): Query<RepoQ>) -> XResult<
 async fn import_repo(
     State(app): AppState,
     Auth(creds): Auth,
-    body: AxBytes,
+    headers: HeaderMap,
+    body: Body,
 ) -> XResult<StatusCode> {
     let did = creds.user_did()?.to_string();
     creds.need_account("repo", "manage")?;
     if super::server::is_takendown_account(&app.account(&did).await?) {
         return Err(super::takedown_error());
     }
-    // off the repo's worker, which only writes the result
-    let parsed = tokio::task::spawn_blocking(move || parse_import(&body).map(|r| (did, r)))
-        .await
-        .map_err(XrpcError::from_err)?;
-    let (did, (records, tree)) = parsed?;
+    // parsed off the repo's worker, which only writes the result
+    let (records, tree) = super::import_stream::read(body, &headers, app.config.max_import_bytes).await?;
     app.account_op(
         &did,
         crate::worker::AccountOp::ReplaceRepo { records, swap_commit: None, stale_keys: Vec::new(), tree: Some(tree) },
@@ -790,10 +785,22 @@ async fn import_repo(
     Ok(StatusCode::OK)
 }
 
-type ImportedRecord = (String, Cid, Bytes, Vec<Cid>);
+pub(super) type ImportedRecord = (String, Cid, Bytes, Vec<Cid>);
 
-/// Record bytes are sliced from `body`, not copied.
-fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate::mst::Tree)> {
+/// An imported record's blob refs, once its size and encoding are checked.
+pub(super) fn imported_record_blobs(path: &str, bytes: &[u8]) -> XResult<Vec<Cid>> {
+    if bytes.len() > MAX_IMPORT_RECORD_BYTES {
+        return Err(XrpcError::bad("InvalidRequest", format!("record at '{path}' too large ({} bytes)", bytes.len())));
+    }
+    let v = Value::decode(bytes).map_err(|_| XrpcError::bad("InvalidRequest", format!("Could not parse record at '{path}'")))?;
+    let mut blobs = Vec::new();
+    blob_refs(&v, &mut blobs);
+    Ok(blobs)
+}
+
+/// The import of a CAR in any block order. Record bytes are sliced from
+/// `body`, not copied.
+pub(super) fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate::mst::Tree)> {
     let bad = |m: String| XrpcError::bad("InvalidRequest", m);
     let (roots, blocks) = car::read_car(body).map_err(|e| bad(format!("invalid CAR: {e}")))?;
     if roots.len() != 1 {
@@ -801,8 +808,7 @@ fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate::mst::Tree)
     }
     let mut map: std::collections::HashMap<Cid, &[u8]> = std::collections::HashMap::with_capacity(blocks.len());
     for (c, b) in blocks {
-        let actual = if c.codec == crate::cid::CODEC_RAW { Cid::raw(b) } else { Cid::dag_cbor(b) };
-        if actual != c {
+        if !car::block_matches(&c, b) {
             return Err(bad(format!("block does not match its cid: {c}")));
         }
         map.insert(c, b);
@@ -843,12 +849,7 @@ fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate::mst::Tree)
             return Err(bad(format!("invalid record path {path}")));
         }
         let bytes = *map.get(&cid).ok_or_else(|| bad(format!("missing record block {cid} at {path}")))?;
-        if bytes.len() > MAX_IMPORT_RECORD_BYTES {
-            return Err(bad(format!("record at '{path}' too large ({} bytes)", bytes.len())));
-        }
-        let v = Value::decode(bytes).map_err(|_| bad(format!("Could not parse record at '{path}'")))?;
-        let mut blobs = Vec::new();
-        blob_refs(&v, &mut blobs);
+        let blobs = imported_record_blobs(&path, bytes)?;
         out.push((path, cid, body.slice_ref(bytes), blobs));
     }
     Ok((out, check))

@@ -19,6 +19,7 @@ pub mod oauth;
 pub(crate) mod proxy;
 mod ratelimits;
 mod repo;
+mod import_stream;
 mod server;
 mod ctl_load;
 mod sync;
@@ -246,7 +247,7 @@ pub fn router(app: Arc<App>) -> Router {
             Router::new()
                 .merge(server::routes())
                 .merge(identity::routes())
-                .merge(repo::routes(app.config.max_import_bytes))
+                .merge(repo::routes())
                 .merge(sync::routes())
                 .merge(blobs::routes())
                 .merge(admin::routes())

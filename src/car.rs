@@ -48,21 +48,7 @@ pub fn read_car(b: &[u8]) -> anyhow::Result<(Vec<Cid>, Vec<(Cid, &[u8])>)> {
         anyhow::bail!("short car");
     }
     let mut pos = n + hlen as usize;
-    // go-car and the reference refuse a v2 or rootless header
-    let header = cbor::ValueRef::decode(&b[n..pos])?;
-    if header.get("version") != Some(&cbor::ValueRef::Int(1)) {
-        anyhow::bail!("car header version must be 1");
-    }
-    let roots = match header.get("roots") {
-        Some(cbor::ValueRef::Array(a)) => a
-            .iter()
-            .map(|v| match v {
-                cbor::ValueRef::Link(c) => Ok(*c),
-                _ => Err(anyhow::anyhow!("car root is not a CID")),
-            })
-            .collect::<anyhow::Result<Vec<Cid>>>()?,
-        _ => anyhow::bail!("car header has no roots array"),
-    };
+    let roots = read_header(&b[n..pos])?;
     let mut blocks = Vec::new();
     while pos < b.len() {
         let (len, n) = read_varint(&b[pos..]).ok_or_else(|| anyhow::anyhow!("bad block len"))?;
@@ -77,6 +63,31 @@ pub fn read_car(b: &[u8]) -> anyhow::Result<(Vec<Cid>, Vec<(Cid, &[u8])>)> {
         pos = end;
     }
     Ok((roots, blocks))
+}
+
+/// The roots of a CAR header (the bytes after its length varint).
+pub fn read_header(h: &[u8]) -> anyhow::Result<Vec<Cid>> {
+    // go-car and the reference refuse a v2 or rootless header
+    let header = cbor::ValueRef::decode(h)?;
+    if header.get("version") != Some(&cbor::ValueRef::Int(1)) {
+        anyhow::bail!("car header version must be 1");
+    }
+    match header.get("roots") {
+        Some(cbor::ValueRef::Array(a)) => a
+            .iter()
+            .map(|v| match v {
+                cbor::ValueRef::Link(c) => Ok(*c),
+                _ => Err(anyhow::anyhow!("car root is not a CID")),
+            })
+            .collect(),
+        _ => anyhow::bail!("car header has no roots array"),
+    }
+}
+
+/// Whether an untrusted block's bytes hash to its CID.
+pub fn block_matches(c: &Cid, data: &[u8]) -> bool {
+    let actual = if c.codec == crate::cid::CODEC_RAW { Cid::raw(data) } else { Cid::dag_cbor(data) };
+    actual == *c
 }
 
 #[cfg(test)]

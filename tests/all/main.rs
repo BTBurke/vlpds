@@ -4,9 +4,9 @@
 
 mod account;
 mod account_deactivation;
-mod account_totals;
 mod account_races;
 mod account_status;
+mod account_totals;
 mod admin_cli;
 mod admin_cluster;
 mod app_passwords;
@@ -50,7 +50,9 @@ mod handle_validation;
 mod handles;
 mod harness;
 mod identity_races;
+mod import_bench;
 mod import_limits;
+mod import_stream;
 mod internal_auth;
 mod interop_crypto;
 mod interop_data_model;
@@ -118,6 +120,7 @@ mod takedown_routes;
 mod totp;
 mod untrusted_repo_data;
 mod user_service_auth;
+#[cfg(feature = "jemalloc")]
 
 /// `--features bench-jemalloc`: the server's allocator, for benches
 /// (CPU per op); the suite otherwise runs on the system allocator.
