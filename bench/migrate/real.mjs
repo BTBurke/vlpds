@@ -116,6 +116,8 @@ function chunk(type, data) {
   crc.writeUInt32BE(crc32(td))
   return Buffer.concat([len, td, crc])
 }
+// Raw pixel bytes stay under 1 MB, so the PNG fits app.bsky's 1 MB image limit
+// even where deflate gains nothing.
 function png(seed, w, h) {
   const raw = Buffer.alloc((w * 3 + 1) * h)
   const s = createHash('sha256').update(String(seed)).digest()
@@ -183,7 +185,7 @@ async function seed() {
   const state = load()
   log(`seed on ${REF}: ${NAMES.join(', ')}`)
   for (const [i, name] of NAMES.entries()) {
-    if (state.accounts[name]?.seeded) continue
+    if (state.accounts[name]) continue
     const handle = `${name}.${new URL(REF).hostname}`
     const email = `${name}@example.com`
     const password = randomBytes(15).toString('base64url')
@@ -204,13 +206,15 @@ async function seed() {
       const a = state.accounts[name]
       if (a.seeded) return
       const jwt = sessions[name]
+      // blobs from an interrupted run were never referenced, so they won't migrate
+      a.blobs = {}
       const up = async (bytes) => {
         const r = await paced(() => xrpc(REF, 'com.atproto.repo.uploadBlob', { bytes, type: 'image/png', auth: jwt }))
         a.blobs[r.blob.ref.$link] = sha(bytes)
         return r.blob
       }
       const avatar = await up(png(`${a.did}-avatar`, 400, 400))
-      const banner = await up(png(`${a.did}-banner`, 1500, 500))
+      const banner = await up(png(`${a.did}-banner`, 900, 300))
       await paced(() =>
         xrpc(REF, 'com.atproto.repo.putRecord', {
           auth: jwt,
@@ -235,7 +239,7 @@ async function seed() {
         if (p % 6 === 0) {
           const n = 1 + (p % 4)
           const images = []
-          for (let k = 0; k < n; k++) images.push({ alt: `test image ${p}.${k}`, image: await up(png(`${a.did}-${p}-${k}`, 800 + k * 40, 600)), aspectRatio: { width: 800 + k * 40, height: 600 } })
+          for (let k = 0; k < n; k++) images.push({ alt: `test image ${p}.${k}`, image: await up(png(`${a.did}-${p}-${k}`, 600 + k * 10, 480)), aspectRatio: { width: 600 + k * 10, height: 480 } })
           record.embed = { $type: 'app.bsky.embed.images', images }
         }
         await paced(() => xrpc(REF, 'com.atproto.repo.createRecord', { auth: jwt, body: { repo: a.did, collection: 'app.bsky.feed.post', record } }))
