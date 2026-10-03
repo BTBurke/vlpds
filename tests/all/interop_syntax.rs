@@ -7,23 +7,13 @@
 //! through (or rejected a good one).
 use crate::common::*;
 
-/// Runs every case, then fails once with the full list of mismatches.
-struct Mismatches(Vec<String>);
-impl Mismatches {
-    fn new() -> Self {
-        Mismatches(Vec::new())
-    }
-    fn push(&mut self, s: String) {
-        self.0.push(s)
-    }
-    #[track_caller]
-    fn assert_none(&self, what: &str) {
-        assert!(self.0.is_empty(), "{what}: {} mismatches:\n  {}", self.0.len(), self.0.join("\n  "));
-    }
+async fn create(s: &TestServer, a: &TestAccount, collection: &str, record: J) -> Resp {
+    s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": collection, "record": record}), &a.auth()).await
 }
 
-fn short(s: &str) -> String {
-    if s.len() > 60 { format!("{}…({} chars)", &s[..60], s.len()) } else { format!("{s:?}") }
+async fn signup(s: &TestServer, handle: &str) -> Resp {
+    let body = json!({"handle": handle, "password": PASSWORD, "email": format!("{}@example.com", unique_name("syn"))});
+    s.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await
 }
 
 // ---------------------------------------------------------------------------
@@ -34,16 +24,9 @@ fn short(s: &str) -> String {
 async fn record_keys_valid_accepted_by_put_record() {
     let s = TestServer::spawn().await;
     let a = s.create_account("rkv").await;
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("valid record keys");
     for rkey in fixture_lines("interop/syntax/recordkey_syntax_valid.txt") {
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.repo.putRecord",
-                &json!({"repo": a.did, "collection": "com.example.record", "rkey": rkey, "record": {"$type": "com.example.record", "k": rkey}}),
-                &a.auth(),
-            )
-            .await;
+        let r = s.put_record(&a, "com.example.record", &rkey, json!({"$type": "com.example.record", "k": rkey})).await;
         if !r.is_ok() {
             bad.push(format!("putRecord rkey {} rejected: {}", short(&rkey), r.text()));
             continue;
@@ -53,32 +36,23 @@ async fn record_keys_valid_accepted_by_put_record() {
             bad.push(format!("getRecord rkey {} after put: {}", short(&rkey), g.text()));
         }
     }
-    bad.assert_none("valid record keys");
+    bad.assert_none();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_keys_invalid_rejected() {
     let s = TestServer::spawn().await;
     let a = s.create_account("rki").await;
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("invalid record keys");
     for rkey in fixture_lines("interop/syntax/recordkey_syntax_invalid.txt") {
         for nsid in ["com.atproto.repo.createRecord", "com.atproto.repo.putRecord"] {
-            let r = s
-                .xrpc
-                .post(nsid, &json!({"repo": a.did, "collection": "com.example.record", "rkey": rkey, "record": {"$type": "com.example.record"}}), &a.auth())
-                .await;
+            let body = json!({"repo": a.did, "collection": "com.example.record", "rkey": rkey, "record": {"$type": "com.example.record"}});
+            let r = s.xrpc.post(nsid, &body, &a.auth()).await;
             if r.status != 400 {
                 bad.push(format!("{nsid} accepted invalid rkey {} -> {}", short(&rkey), r.text()));
             }
         }
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.repo.applyWrites",
-                &json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": "com.example.record", "rkey": rkey, "value": {"$type": "com.example.record"}}]}),
-                &a.auth(),
-            )
-            .await;
+        let r = s.apply_writes(&a, json!([{"$type": "com.atproto.repo.applyWrites#create", "collection": "com.example.record", "rkey": rkey, "value": {"$type": "com.example.record"}}])).await;
         if r.status != 400 {
             bad.push(format!("applyWrites accepted invalid rkey {} -> {}", short(&rkey), r.text()));
         }
@@ -90,7 +64,7 @@ async fn record_keys_invalid_rejected() {
             bad.push(format!("record with invalid key was stored: {}", r["uri"]));
         }
     }
-    bad.assert_none("invalid record keys");
+    bad.assert_none();
 }
 
 // ---------------------------------------------------------------------------
@@ -101,33 +75,32 @@ async fn record_keys_invalid_rejected() {
 async fn nsids_valid_accepted_as_collections() {
     let s = TestServer::spawn().await;
     let a = s.create_account("nsv").await;
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("valid NSIDs as collections");
     for nsid in fixture_lines("interop/syntax/nsid_syntax_valid.txt") {
-        let r = s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": nsid, "record": {"$type": nsid, "x": 1}}), &a.auth()).await;
+        let r = create(&s, &a, &nsid, json!({"$type": nsid, "x": 1})).await;
         if !r.is_ok() {
             bad.push(format!("collection {} rejected: {}", short(&nsid), r.text()));
         }
     }
-    bad.assert_none("valid NSIDs as collections");
+    bad.assert_none();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nsids_invalid_rejected_as_collections() {
     let s = TestServer::spawn().await;
     let a = s.create_account("nsi").await;
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("invalid NSIDs as collections");
     for nsid in fixture_lines("interop/syntax/nsid_syntax_invalid.txt") {
-        let r = s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": nsid, "record": {"$type": nsid}}), &a.auth()).await;
+        let r = create(&s, &a, &nsid, json!({"$type": nsid})).await;
         if r.status != 400 {
             bad.push(format!("createRecord accepted collection {} -> {}", short(&nsid), r.text()));
         }
-        let r =
-            s.xrpc.post("com.atproto.repo.putRecord", &json!({"repo": a.did, "collection": nsid, "rkey": "self", "record": {"$type": nsid}}), &a.auth()).await;
+        let r = s.put_record(&a, &nsid, "self", json!({"$type": nsid})).await;
         if r.status != 400 {
             bad.push(format!("putRecord accepted collection {} -> {}", short(&nsid), r.text()));
         }
     }
-    bad.assert_none("invalid NSIDs as collections");
+    bad.assert_none();
 }
 
 // ---------------------------------------------------------------------------
@@ -137,29 +110,15 @@ async fn nsids_invalid_rejected_as_collections() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn handles_invalid_rejected_by_create_account() {
     let s = TestServer::spawn().await;
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("invalid handles");
     for h in fixture_lines("interop/syntax/handle_syntax_invalid.txt") {
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.server.createAccount",
-                &json!({"handle": h, "password": PASSWORD, "email": format!("{}@example.com", unique_name("syn"))}),
-                &Auth::None,
-            )
-            .await;
+        let r = signup(&s, &h).await;
         if r.status != 400 {
             bad.push(format!("createAccount accepted handle {} -> {}", short(&h), r.text()));
         }
         // and the same label under our own domain
         let under = format!("{h}.{HANDLE_DOMAIN}");
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.server.createAccount",
-                &json!({"handle": under, "password": PASSWORD, "email": format!("{}@example.com", unique_name("syn"))}),
-                &Auth::None,
-            )
-            .await;
+        let r = signup(&s, &under).await;
         // Some invalid handles become valid with a suffix (e.g. a bare TLD); only
         // flag success for strings that are invalid in any position.
         let still_invalid =
@@ -168,34 +127,34 @@ async fn handles_invalid_rejected_by_create_account() {
             bad.push(format!("createAccount accepted handle {} -> {}", short(&under), r.text()));
         }
     }
-    bad.assert_none("invalid handles");
+    bad.assert_none();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn handles_resolve_handle_param_validation() {
     let s = TestServer::spawn().await;
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("resolveHandle handle syntax");
     for h in fixture_lines("interop/syntax/handle_syntax_invalid.txt") {
-        let r = s.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", &h)], &Auth::None).await;
+        let r = s.resolve_handle(&h).await;
         if !(r.status == 400 && r.error_name() == Some("InvalidRequest")) {
             bad.push(format!("resolveHandle({}) -> {} (want 400 InvalidRequest)", short(&h), r.text()));
         }
     }
     for h in fixture_lines("interop/syntax/handle_syntax_valid.txt") {
-        let r = s.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", &h)], &Auth::None).await;
+        let r = s.resolve_handle(&h).await;
         // Unknown but syntactically valid: must not be a param validation error.
         if r.error_name() == Some("InvalidRequest") {
             bad.push(format!("resolveHandle rejected valid handle {} as InvalidRequest", short(&h)));
         }
     }
-    bad.assert_none("resolveHandle handle syntax");
+    bad.assert_none();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn handles_valid_labels_under_service_domain_accepted() {
     // Take each valid handle's first label and register it under the service domain.
     let s = TestServer::spawn().await;
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("valid handle labels");
     let mut seen = std::collections::HashSet::new();
     for h in fixture_lines("interop/syntax/handle_syntax_valid.txt") {
         let label = h.split('.').next().unwrap().to_ascii_lowercase();
@@ -204,14 +163,7 @@ async fn handles_valid_labels_under_service_domain_accepted() {
             continue;
         }
         let handle = format!("{label}.{HANDLE_DOMAIN}");
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.server.createAccount",
-                &json!({"handle": handle, "password": PASSWORD, "email": format!("{}@example.com", unique_name("syn"))}),
-                &Auth::None,
-            )
-            .await;
+        let r = signup(&s, &handle).await;
         if r.error_name() == Some("HandleNotAvailable") && r.text().contains("Reserved") {
             // reserved words (e.g. "friend") are a policy rejection, not syntax
         } else if !r.is_ok() {
@@ -220,7 +172,7 @@ async fn handles_valid_labels_under_service_domain_accepted() {
             bad.push(format!("createAccount {handle} returned handle {}", r.json["handle"]));
         }
     }
-    bad.assert_none("valid handle labels");
+    bad.assert_none();
 }
 
 // ---------------------------------------------------------------------------
@@ -230,7 +182,7 @@ async fn handles_valid_labels_under_service_domain_accepted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dids_param_validation() {
     let s = TestServer::spawn().await;
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("DID params");
     for did in fixture_lines("interop/syntax/did_syntax_invalid.txt") {
         for nsid in ["com.atproto.sync.getLatestCommit", "com.atproto.sync.getRepoStatus", "com.atproto.sync.getRepo"] {
             let r = s.xrpc.get(nsid, &[("did", &did)], &Auth::None).await;
@@ -245,15 +197,15 @@ async fn dids_param_validation() {
             bad.push(format!("getLatestCommit(valid unknown did {}) -> {} (want RepoNotFound)", short(&did), r.text()));
         }
     }
-    bad.assert_none("DID params");
+    bad.assert_none();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn at_identifiers_as_repo_param() {
     let s = TestServer::spawn().await;
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("at-identifier params");
     for id in fixture_lines("interop/syntax/atidentifier_syntax_invalid.txt") {
-        let r = s.xrpc.get("com.atproto.repo.describeRepo", &[("repo", &id)], &Auth::None).await;
+        let r = s.describe_repo(&id).await;
         if !(r.status == 400 && r.error_name() == Some("InvalidRequest")) {
             bad.push(format!("describeRepo(repo={}) -> {} (want 400 InvalidRequest)", short(&id), r.text()));
         }
@@ -262,7 +214,7 @@ async fn at_identifiers_as_repo_param() {
             bad.push(format!("listRecords(repo={}) -> {} (want 400 InvalidRequest)", short(&id), r.text()));
         }
     }
-    bad.assert_none("at-identifier params");
+    bad.assert_none();
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +223,7 @@ async fn at_identifiers_as_repo_param() {
 
 #[test]
 fn tids_parse() {
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("TIDs");
     for t in fixture_lines("interop/syntax/tid_syntax_valid.txt") {
         match vlpds::tid::Tid::parse(&t) {
             Some(tid) if tid.to_string() == t => {}
@@ -286,7 +238,7 @@ fn tids_parse() {
             bad.push(format!("harness is_tid accepted invalid {}", short(&t)));
         }
     }
-    bad.assert_none("TIDs");
+    bad.assert_none();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -312,7 +264,7 @@ async fn revs_and_generated_rkeys_are_tids() {
 fn cids_parse_library() {
     // vlpds only handles CIDv1 sha2-256 dag-cbor/raw; every invalid fixture
     // must be rejected, and every valid one that is in that subset must round-trip.
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("CIDs");
     for c in fixture_lines("interop/syntax/cid_syntax_invalid.txt") {
         if let Ok(cid) = Cid::parse(&c) {
             bad.push(format!("invalid CID {} parsed as {cid}", short(&c)));
@@ -325,7 +277,7 @@ fn cids_parse_library() {
             }
         }
     }
-    bad.assert_none("CIDs");
+    bad.assert_none();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -333,28 +285,20 @@ async fn cids_invalid_rejected_in_params() {
     let s = TestServer::spawn().await;
     let a = s.create_account("cid").await;
     let p = s.post(&a, "cid").await;
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("CID params");
     for c in fixture_lines("interop/syntax/cid_syntax_invalid.txt") {
-        let r = s
-            .xrpc
-            .get("com.atproto.repo.getRecord", &[("repo", &a.did), ("collection", "app.bsky.feed.post"), ("rkey", p.rkey()), ("cid", &c)], &Auth::None)
-            .await;
+        let q = [("repo", a.did.as_str()), ("collection", "app.bsky.feed.post"), ("rkey", p.rkey()), ("cid", &c)];
+        let r = s.xrpc.get("com.atproto.repo.getRecord", &q, &Auth::None).await;
         if !(r.status == 400 && r.error_name() == Some("InvalidRequest")) {
             bad.push(format!("getRecord(cid={}) -> {} (want 400 InvalidRequest)", short(&c), r.text()));
         }
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.repo.createRecord",
-                &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x"), "swapCommit": c}),
-                &a.auth(),
-            )
-            .await;
+        let body = json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x"), "swapCommit": c});
+        let r = s.xrpc.post("com.atproto.repo.createRecord", &body, &a.auth()).await;
         if r.status != 400 {
             bad.push(format!("createRecord(swapCommit={}) -> {}", short(&c), r.text()));
         }
     }
-    bad.assert_none("CID params");
+    bad.assert_none();
 }
 
 // ---------------------------------------------------------------------------
@@ -367,34 +311,21 @@ async fn datetimes_in_known_records() {
     // createdAt is format=datetime).
     let s = TestServer::spawn().await;
     let a = s.create_account("dt").await;
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("datetimes in app.bsky.feed.post");
+    let post = |dt: &str| json!({"$type": "app.bsky.feed.post", "text": "t", "createdAt": dt});
     for dt in fixture_lines("interop/syntax/datetime_syntax_valid.txt") {
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.repo.createRecord",
-                &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": {"$type": "app.bsky.feed.post", "text": "t", "createdAt": dt}}),
-                &a.auth(),
-            )
-            .await;
+        let r = create(&s, &a, "app.bsky.feed.post", post(&dt)).await;
         if !r.is_ok() {
             bad.push(format!("valid datetime {} rejected: {}", short(&dt), r.text()));
         }
     }
     for dt in fixture_lines("interop/syntax/datetime_syntax_invalid.txt") {
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.repo.createRecord",
-                &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": {"$type": "app.bsky.feed.post", "text": "t", "createdAt": dt}}),
-                &a.auth(),
-            )
-            .await;
+        let r = create(&s, &a, "app.bsky.feed.post", post(&dt)).await;
         if r.status != 400 {
             bad.push(format!("invalid datetime {} accepted: {}", short(&dt), r.text()));
         }
     }
-    bad.assert_none("datetimes in app.bsky.feed.post");
+    bad.assert_none();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -403,32 +334,19 @@ async fn at_uris_in_known_records() {
     let s = TestServer::spawn().await;
     let a = s.create_account("uri").await;
     let cid = "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm";
-    let mut bad = Mismatches::new();
+    let mut bad = Diffs::new("at-uris in app.bsky.feed.like");
+    let like = |u: &str| json!({"$type": "app.bsky.feed.like", "subject": {"uri": u, "cid": cid}, "createdAt": now_iso()});
     for u in fixture_lines("interop/syntax/aturi_syntax_valid.txt") {
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.repo.createRecord",
-                &json!({"repo": a.did, "collection": "app.bsky.feed.like", "record": {"$type": "app.bsky.feed.like", "subject": {"uri": u, "cid": cid}, "createdAt": now_iso()}}),
-                &a.auth(),
-            )
-            .await;
+        let r = create(&s, &a, "app.bsky.feed.like", like(&u)).await;
         if !r.is_ok() {
             bad.push(format!("valid at-uri {} rejected: {}", short(&u), r.text()));
         }
     }
     for u in fixture_lines("interop/syntax/aturi_syntax_invalid.txt") {
-        let r = s
-            .xrpc
-            .post(
-                "com.atproto.repo.createRecord",
-                &json!({"repo": a.did, "collection": "app.bsky.feed.like", "record": {"$type": "app.bsky.feed.like", "subject": {"uri": u, "cid": cid}, "createdAt": now_iso()}}),
-                &a.auth(),
-            )
-            .await;
+        let r = create(&s, &a, "app.bsky.feed.like", like(&u)).await;
         if r.status != 400 {
             bad.push(format!("invalid at-uri {} accepted: {}", short(&u), r.text()));
         }
     }
-    bad.assert_none("at-uris in app.bsky.feed.like");
+    bad.assert_none();
 }

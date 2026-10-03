@@ -1258,6 +1258,35 @@ pub async fn set_repo_takedown(s: &TestServer, did: &str, applied: bool) {
         .ok();
 }
 
+/// Collects mismatches and fails once with all of them.
+pub struct Diffs {
+    what: String,
+    list: Vec<String>,
+}
+
+impl Diffs {
+    pub fn new(what: &str) -> Diffs {
+        Diffs { what: what.to_string(), list: Vec::new() }
+    }
+
+    pub fn push(&mut self, s: impl Into<String>) {
+        let s = s.into();
+        if !self.list.contains(&s) {
+            self.list.push(s);
+        }
+    }
+
+    #[track_caller]
+    pub fn assert_none(self) {
+        assert!(self.list.is_empty(), "{}: {} mismatches:\n  {}", self.what, self.list.len(), self.list.iter().take(400).cloned().collect::<Vec<_>>().join("\n  "));
+    }
+}
+
+/// `s` quoted, cut at 80 bytes.
+pub fn short(s: &str) -> String {
+    if s.len() > 80 { format!("{:?}…({} bytes)", &s[..s.floor_char_boundary(80)], s.len()) } else { format!("{s:?}") }
+}
+
 pub fn repo_ref(did: &str) -> J {
     json!({"$type": "com.atproto.admin.defs#repoRef", "did": did})
 }

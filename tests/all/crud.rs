@@ -264,12 +264,6 @@ async fn requires_valid_rkey() {
     }
     // nothing was written
     assert_eq!(count(&s, &a.did, "com.example.record").await, 0);
-    // valid record keys from the interop fixtures are accepted
-    for rk in fixture_lines("interop/syntax/recordkey_syntax_valid.txt") {
-        let r = put(&s, &a, json!({"collection": "com.example.record", "rkey": rk, "record": {"a": 1}})).await;
-        assert!(r.is_ok(), "valid rkey {rk:?} rejected: {}", r.text());
-        s.get_record(&a.did, "com.example.record", &rk).await.ok();
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

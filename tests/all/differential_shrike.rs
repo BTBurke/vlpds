@@ -58,42 +58,6 @@ fn shrike_fixture(rel: &str) -> String {
     read_fixture(&format!("shrike/{rel}"))
 }
 
-/// Collects disagreements and fails once with all of them.
-struct Diffs {
-    what: &'static str,
-    list: Vec<String>,
-}
-
-impl Diffs {
-    fn new(what: &'static str) -> Self {
-        Diffs { what, list: Vec::new() }
-    }
-    fn push(&mut self, s: impl Into<String>) {
-        let s = s.into();
-        if !self.list.contains(&s) {
-            self.list.push(s);
-        }
-    }
-    #[track_caller]
-    fn assert_none(self) {
-        assert!(
-            self.list.is_empty(),
-            "{}: {} disagreements:\n  {}",
-            self.what,
-            self.list.len(),
-            self.list.iter().take(400).cloned().collect::<Vec<_>>().join("\n  ")
-        );
-    }
-}
-
-fn short(s: &str) -> String {
-    if s.len() > 80 {
-        format!("{:?}…({} bytes)", &s[..s.floor_char_boundary(80)], s.len())
-    } else {
-        format!("{s:?}")
-    }
-}
-
 fn s_cid(c: &Cid) -> sc::Cid {
     sc::Cid::from_bytes(&c.to_bytes()).unwrap()
 }

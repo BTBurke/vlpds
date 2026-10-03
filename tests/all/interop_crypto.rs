@@ -5,7 +5,6 @@
 //! the harness applies to commits (compact 64-byte, low-S). P-256 vectors are
 //! only checked for being recognized as non-K-256 keys.
 use crate::common::*;
-use base64::Engine;
 use k256::ecdsa::signature::Verifier;
 
 #[derive(serde::Deserialize)]
@@ -24,10 +23,6 @@ struct SigFixture {
 struct DidKeyFixture {
     private_key_bytes_hex: String,
     public_did_key: String,
-}
-
-fn b64(s: &str) -> Vec<u8> {
-    base64::engine::general_purpose::STANDARD_NO_PAD.decode(s.trim_end_matches('=')).unwrap()
 }
 
 /// atproto signature rules: 64-byte compact (r||s), low-S, ES256K over sha256(msg).
@@ -79,7 +74,7 @@ fn signature_fixtures_k256() {
     for c in cases.iter().filter(|c| c.algorithm == "ES256K") {
         n += 1;
         let key = decode_did_key_k256(&c.public_key_did).unwrap();
-        let (msg, sig) = (b64(&c.message_base64), b64(&c.signature_base64));
+        let (msg, sig) = (b64_decode(&c.message_base64), b64_decode(&c.signature_base64));
         let ok = atproto_verify_k256(&key, &msg, &sig);
         assert_eq!(ok, c.valid_signature, "{}", c.comment);
         // the production verifier (libsecp256k1) agrees, incl. rejecting high-S
@@ -95,7 +90,7 @@ fn harness_commit_verifier_rejects_high_s() {
     // CommitObj::verify (used across the suite) must reject the high-S vector.
     let cases: Vec<SigFixture> = serde_json::from_str(&read_fixture("interop/crypto/signature-fixtures.json")).unwrap();
     let c = cases.iter().find(|c| c.algorithm == "ES256K" && c.comment.contains("non-low-S")).unwrap();
-    let sig = k256::ecdsa::Signature::from_slice(&b64(&c.signature_base64)).unwrap();
+    let sig = k256::ecdsa::Signature::from_slice(&b64_decode(&c.signature_base64)).unwrap();
     assert!(sig.normalize_s().is_some(), "fixture should be high-S");
 }
 
@@ -125,16 +120,15 @@ fn service_auth_jwt_is_es256k_and_verifies() {
     let tok = vlpds::auth::service_auth_jwt(&kp, "did:plc:abc", "did:web:example.com", Some("com.example.method"), 60).unwrap();
     let parts: Vec<&str> = tok.split('.').collect();
     assert_eq!(parts.len(), 3);
-    let dec = |s: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).unwrap();
-    let header: J = serde_json::from_slice(&dec(parts[0])).unwrap();
+    let header: J = serde_json::from_slice(&b64url_decode(parts[0])).unwrap();
     assert_eq!(header["alg"], "ES256K");
-    let claims: J = serde_json::from_slice(&dec(parts[1])).unwrap();
+    let claims = jwt_claims(&tok);
     assert_eq!(claims["iss"], "did:plc:abc");
     assert_eq!(claims["aud"], "did:web:example.com");
     assert_eq!(claims["lxm"], "com.example.method");
     assert!(claims["exp"].as_u64().unwrap() > claims["iat"].as_u64().unwrap());
     let vk = decode_did_key_k256(&kp.did_key()).unwrap();
-    assert!(atproto_verify_k256(&vk, format!("{}.{}", parts[0], parts[1]).as_bytes(), &dec(parts[2])));
+    assert!(atproto_verify_k256(&vk, format!("{}.{}", parts[0], parts[1]).as_bytes(), &b64url_decode(parts[2])));
 }
 
 #[test]
