@@ -85,6 +85,10 @@ pub fn record_exit(code: i32, reason: &str) {
 /// shutdown couldn't fence its own log, 9 a critical thread or task panicked.
 pub fn fail_stop(code: i32, reason: &str) -> ! {
     record_exit(code, reason);
+    // Straight to fd 2, not eprintln!: libtest captures eprintln! and loses
+    // it when exit kills the binary, leaving a bare "exit status: N".
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "vlpds fail-stop: exit {code} ({reason}) on thread {}", std::thread::current().name().unwrap_or("?"));
     std::process::exit(code)
 }
 

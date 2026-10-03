@@ -818,6 +818,12 @@ async fn run_sequencer(
                         return;
                     }
                 }
+                // Nothing aborts upload tasks: a cancelled one means the
+                // runtime is shutting down, and this task is about to be
+                // dropped too. Its entries were never acked, so nothing
+                // acknowledged is lost; a fail-stop would only turn a clean
+                // exit into exit 2.
+                Some(Err(e)) if e.is_cancelled() => return,
                 Some(Err(e)) => {
                     tracing::error!(%log_id, "segment upload task failed: {e}; exiting");
                     crate::lifecycle::fail_stop(2, "segment_upload");
@@ -1628,6 +1634,34 @@ mod tests {
 
     async fn exists(store: &Store, ord: u64) -> bool {
         matches!(read_head(store, "L", ord).await.unwrap(), Head::Segment(_))
+    }
+
+    /// Dropping the runtime while a segment PUT is in flight is not an
+    /// upload failure. Shutdown cancels the PUT's task on one worker while
+    /// another is still polling the sequencer, which then sees the PUT's
+    /// JoinHandle fail.
+    #[test]
+    fn runtime_shutdown_mid_upload_is_not_a_fail_stop() {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.block_on(async {
+            let (fs, store) = fault_store();
+            fs.holds.lock().insert(0);
+            let shard = ShardId(9);
+            let (log, _db, _rx) = test_log(&store, 1, shard, 1 << 20).await;
+            log.tx.send(entry(shard, "k".into(), 10, None)).await.ok().unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            // An entry for a shard the log doesn't hold is rejected inside
+            // the sequencer's poll, so its ack holds the sequencer mid-poll
+            // while the runtime shuts down around it.
+            let (polling_tx, polling_rx) = tokio::sync::oneshot::channel();
+            let ack: AckFn = Box::new(move |_| {
+                let _ = polling_tx.send(());
+                std::thread::sleep(Duration::from_millis(300));
+            });
+            log.tx.send(entry(ShardId(10), "x".into(), 10, Some(ack))).await.ok().unwrap();
+            polling_rx.await.unwrap();
+        });
+        drop(rt);
     }
 
     /// A checkpoint on a slow state store doesn't hold the apply lock
