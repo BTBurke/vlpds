@@ -297,8 +297,10 @@ async fn plc_ops_during_a_key_rotation() {
         })
         .unwrap();
     plc.race_next_post(&a.did, raced);
-    let r = vlpds::xrpc::key_rotation::recover_pending(&s.app).await;
-    assert_eq!((r.finished, r.aborted), (1, 0), "{r:?}");
+    let pending = s.app.account(&a.did).await.ok().unwrap().pending_signing_key.unwrap();
+    // a retry finishes the pending rotation
+    let j = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.ok();
+    assert_eq!(j["signingKey"], json!(format!("did:key:{}", pending.pubkey)));
     let acct = s.app.account(&a.did).await.ok().unwrap();
     assert!(acct.pending_signing_key.is_none());
     let data = plc.data(&a.did).unwrap();

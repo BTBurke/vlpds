@@ -16,7 +16,6 @@
 //! b/{did}\0{cid}\0{path}  -> empty (blob references)
 //! p/{routing}\0{name}     -> private per-account state (slot of the routing key)
 //! M/{did}\0{cid digest}   -> MST node block, height >= 1 (DESIGN.md "Partial MSTs")
-//! K/{did}                 -> empty (signing-key rotation pending: `Account::pending_signing_key`)
 //! bl/{did}\0{code}{subject} -> rkeys linking `subject` (crate::backlinks, DESIGN.md "Backlinks")
 //! T/                      -> the slot's account totals (crate::totals; keyed by slot alone)
 //! S/{did}                 -> repo counts (`RepoStats`: checkAccountStatus)
@@ -146,14 +145,6 @@ pub fn mst_node_prefix(did: &str) -> Vec<u8> {
 }
 
 pub const MST_NODE_FAMILY: &[u8] = b"M/";
-
-/// Set and cleared with `Account::pending_signing_key`, so recovery finds
-/// pending rotations with one family scan instead of reading every account.
-pub fn key_rotation_key(did: &str) -> Vec<u8> {
-    keyed(did, KEY_ROTATION_FAMILY, &[did.as_bytes()])
-}
-
-pub const KEY_ROTATION_FAMILY: &[u8] = b"K/";
 
 pub fn backlink_key(did: &str, link: &[u8]) -> Vec<u8> {
     keyed(did, b"bl/", &[did.as_bytes(), b"\0", link])

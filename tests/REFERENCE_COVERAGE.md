@@ -64,7 +64,7 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
     (and `publishIdentity` with `syncPlc`, the rotate-keys script) writes an empty commit signed with the new key and emits
     `#identity` then `#sync`, so `getRepo` and the firehose verify against the new DID document right away. The new key is
     recorded before PLC is updated, writes wait out the rotation, and a rotation interrupted by an outage or a crash is finished
-    from durable state (DESIGN.md "Signing-key rotation").
+    from durable state by a retried call or the first write it fences (DESIGN.md "Signing-key rotation").
 14. **Duplicate likes/reposts/follows/blocks are pruned** (`src/backlinks.rs`, a `bl/` backlink index). createRecord (unless
     `validate: false`) deletes the account's earlier record of the collection with the same subject (`subject.uri` for likes and
     reposts, the `subject` DID for follows and blocks) in the new record's commit, as the reference's `getBacklinkConflicts`
@@ -212,7 +212,7 @@ None.
 | case | status | vlpds |
 |---|---|---|
 | recovers repos based on the sequencer | N/A | operator script restoring SQLite actor stores from the sequencer DB. vlpds has no separate actor stores: the log is the WAL and state is rebuilt from it on restart/takeover (`cold_start::*`, `fast_failover::*`, `firehose_backfill::*`) |
-| rotates keys for users | ported | `ref_account::ref_signing_key_rotation_resigns_the_repo`: `admin.updateAccountSigningKey` re-signs the head with the new key (same data, new rev) and emits `#identity` + `#sync`, as the reference's `rotate-keys`. Product fix: it used to emit `#identity` only and sign just the next commit with the new key. `tests/all/key_rotation.rs` adds writers racing the rotation, PLC refusal/outage, a deactivated account, and the owner crashing after recording the key and after the PLC update; `go_checker::go_checker_accepts_key_rotation_resync` runs the Go checker over it |
+| rotates keys for users | ported | `ref_account::ref_signing_key_rotation_resigns_the_repo`: `admin.updateAccountSigningKey` re-signs the head with the new key (same data, new rev) and emits `#identity` + `#sync`, as the reference's `rotate-keys`. Product fix: it used to emit `#identity` only and sign just the next commit with the new key. `tests/all/key_rotation.rs` adds writers racing the rotation, PLC refusal/outage, a deactivated account, and the owner crashing after recording the key and after the PLC update (finished by an admin retry or by the first fenced write); `go_checker::go_checker_accepts_key_rotation_resync` runs the Go checker over it |
 
 ### takedown-appeal.test.ts
 

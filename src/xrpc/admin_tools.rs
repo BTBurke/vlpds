@@ -54,7 +54,7 @@ async fn publish_identity(State(app): AppState, Auth(creds): Auth, Json(inp): Js
         plc_updated = json!(plc.update_signing_key(&did, &format!("did:key:{}", acct.signing_pubkey)).await?);
     }
     let key = app.secrets.account_signing_key(&acct).await?;
-    let head = app.account_op(&did, crate::worker::AccountOp::SigningKey(crate::worker::KeyStep::Finish { key })).await?;
+    let head = app.account_op(&did, crate::worker::AccountOp::SigningKey(crate::worker::KeyStep::Resign { key })).await?;
     app.did_resolver.invalidate(&did);
     Ok(Json(json!({"did": did, "handle": acct.handle, "plcUpdated": plc_updated, "rev": head.rev.to_string()})))
 }

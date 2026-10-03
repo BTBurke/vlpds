@@ -217,18 +217,21 @@ pub enum AccountOp {
 /// rotation"): `Begin` before the DID document names the new key, then
 /// `Finish` (or `Abort` if it never will).
 pub enum KeyStep {
-    /// Records the pending key and its `K/` marker. Until `Finish` or
-    /// `Abort`, writes and imports are refused (retryable), so no commit is
-    /// signed with the old key once the DID document may list the new one.
-    /// The same key already pending is a no-op; another one is refused.
+    /// Records the pending key. Until `Finish` or `Abort`, writes and
+    /// imports are refused (retryable), so no commit is signed with the old
+    /// key once the DID document may list the new one. The same key already
+    /// pending is a no-op; another one is refused.
     Begin(state::PendingSigningKey),
     /// A no-op unless `pubkey` is the pending key.
     Abort { pubkey: String },
-    /// Makes `key` the signing key and re-signs the head with it (the
-    /// reference's empty rotate-keys commit): #identity, then #sync unless
-    /// the account is inactive. `key` must be the pending key or the
-    /// current one (a re-sign alone, or a repeated `Finish`).
+    /// Makes the pending `key` the signing key and re-signs the head with
+    /// it (the reference's empty rotate-keys commit): #identity, then #sync
+    /// unless the account is inactive. A no-op once `key` is the current
+    /// key (a repeated `Finish`).
     Finish { key: Arc<Keypair> },
+    /// Re-signs the head with the current `key`, as `Finish` does
+    /// (publishIdentity syncPlc). Refused while a rotation is pending.
+    Resign { key: Arc<Keypair> },
 }
 
 enum KeyOutcome {
@@ -2514,7 +2517,6 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             muts.push(del(state::head_key(&st.did)));
             muts.push(del(state::account_key(&st.did)));
             muts.push(del(state::handle_key(&st.did, &st.account.handle)));
-            muts.push(del(state::key_rotation_key(&st.did)));
             muts.push(del(state::repo_stats_key(&st.did)));
             frames.push(events::account_frame(&st.did, false, Some("deleted"), &time));
             st.account.status = Some("deleted".into());
@@ -2563,9 +2565,9 @@ fn key_step(st: &mut RepoState, step: KeyStep, clock_id: u64, time: &str, frames
     if st.account.status.as_deref() == Some("deleted") {
         return Ok(KeyOutcome::Refused(WriteError::RepoNotFound));
     }
-    let marker = Bytes::from(state::key_rotation_key(&st.did));
     let mut account = st.account.clone();
     let mut resigned = None;
+    let finish = matches!(step, KeyStep::Finish { .. });
     match step {
         KeyStep::Begin(p) => {
             match &account.pending_signing_key {
@@ -2577,26 +2579,25 @@ fn key_step(st: &mut RepoState, step: KeyStep, clock_id: u64, time: &str, frames
                 None => {}
             }
             account.pending_signing_key = Some(p);
-            muts.push(put(marker, Bytes::new()));
         }
         KeyStep::Abort { pubkey } => {
             if account.pending_signing_key.as_ref().is_none_or(|p| p.pubkey != pubkey) {
                 return Ok(KeyOutcome::Noop);
             }
             account.pending_signing_key = None;
-            muts.push(del(marker));
         }
-        KeyStep::Finish { key } => {
+        KeyStep::Finish { key } | KeyStep::Resign { key } => {
             let pubkey = key.public_multibase();
-            match account.pending_signing_key.take() {
-                Some(p) if p.pubkey == pubkey => {
+            match (account.pending_signing_key.take(), finish) {
+                (Some(p), true) if p.pubkey == pubkey => {
                     account.wrapped_signing_key = p.wrapped;
                     account.signing_pubkey = p.pubkey;
-                    muts.push(del(marker));
                 }
-                None if account.signing_pubkey == pubkey => {}
-                Some(_) => return Ok(KeyOutcome::Refused(WriteError::Invalid("another signing key rotation is in progress".into()))),
-                None => return Ok(KeyOutcome::Refused(WriteError::Invalid("not the account's signing key or its pending one".into()))),
+                // finished already
+                (None, true) if account.signing_pubkey == pubkey => return Ok(KeyOutcome::Noop),
+                (None, false) if account.signing_pubkey == pubkey => {}
+                (Some(_), _) => return Ok(KeyOutcome::Refused(WriteError::Invalid("a signing key rotation is in progress".into()))),
+                (None, _) => return Ok(KeyOutcome::Refused(WriteError::Invalid("not the account's signing key or its pending one".into()))),
             }
             // the empty commit: same data root, new rev, signed with the new key
             let rev = tid::next_rev(Some(st.head.rev), clock_id);

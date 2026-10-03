@@ -237,8 +237,6 @@ swappable.
     bound to the DID) next to its public key (`signing_pubkey`, which DID
     documents and service-auth checks read without unwrapping); account
     rows in log segments carry the same wrapped form. See "Secrets at rest".
-  - `K/{did}` → empty: a signing-key rotation is pending
-    (`Account::pending_signing_key`; see "Signing-key rotation").
   - `T/` → the slot's account totals (keyed by slot alone; see "Account
     totals"); `T/{seq}` → a delta row written while the shard's totals
     were loading.
@@ -4215,15 +4213,14 @@ in three steps ordered with the repo's commits by its worker
 (`AccountOp::SigningKey(KeyStep)`):
 
 1. **Begin.** The new key, wrapped under the KEK, goes into the account row
-   as `pending_signing_key`, with a `K/{did}` marker, in one durable log
-   entry (no events). From then on the worker refuses the repo's writes and
+   as `pending_signing_key`, in one durable log entry (no events). From then on the worker refuses the repo's writes and
    imports with a retryable 503 `KeyUnavailable`. The key is durable before
    any directory can name it (the old code updated PLC first, so a crash
    right after lost the only copy of the key PLC now listed), and nothing
    is signed with the old key once the document may have changed.
 2. **PLC.** A did:plc's `atproto` key is set to it (with PLC registration
    on; a did:web's document is its owner's to change).
-3. **Finish.** The account takes the new key (marker deleted) and the head
+3. **Finish.** The account takes the new key and the head
    is re-signed: same data root, next rev, signed through the hedged
    verify-after-sign signer. One log entry carries the head, the row,
    `#identity` and `#sync` (only `#identity` while the account is
@@ -4240,31 +4237,45 @@ immediately followed by `#sync`, then commits signed with the new key
 `go_checker::go_checker_accepts_key_rotation_resync` runs the independent
 Go checker over it).
 
-**Pending rotations.** A rotation stopped between Begin and Finish (an
-outage of the directory or the key service, a crash, the shard moving)
-stays pending, its writes fenced. `key_rotation::complete` finishes one
-from durable state alone and may run any number of times, concurrently
-too: it sets the directory's key to the pending one (a no-op when it
-already is), unwraps the pending key and runs Finish (a repeat re-signs
-once more with the same key, harmlessly). It abandons the rotation
-(`Abort`: pending key and marker dropped) only if the directory refused
-the update definitely (4xx, tombstoned DID) and still doesn't name the key;
-an ambiguous failure (5xx, timeout) is never taken as "not applied", since
-the update may still land. The handler retries in the background after an
-undecided failure (1 s backoff doubling to 60 s, while the node owns the
-repo), and each node runs `key_rotation::recover_pending` at start and
-every 60 s over the `K/` markers of its shards, so after a crash or
-takeover the new owner finishes it (`tests/all/key_rotation.rs`
-`crash_after_*`: the owner is killed after Begin and after the PLC
-update). A second rotation while one is pending is refused (400).
+**Pending rotations: retry to finish.** A rotation stopped between Begin
+and Finish (an outage of the directory or the key service, a crash, the
+shard moving) stays pending, its writes fenced. `key_rotation::complete`
+finishes one from durable state alone and may run any number of times,
+concurrently too: it sets the directory's key to the pending one (a no-op
+when it already is), unwraps the pending key and runs Finish (a no-op once
+the key is the account's: no second `#identity`/`#sync`). It abandons the
+rotation (`Abort`: pending key dropped) only if the directory refused the
+update definitely (4xx, tombstoned DID) and still doesn't name the key; an
+ambiguous failure (5xx, timeout) is never taken as "not applied", since
+the update may still land. Nothing sweeps for pending rotations; two
+things finish one:
+
+- **A retry.** `updateAccountSigningKey` on an account with a rotation
+  pending runs `complete` on it and answers with the pending key, so the
+  admin re-runs the call that failed. A retry naming a different reserved
+  key finishes the pending rotation, then is refused (400) without taking
+  the reservation: the admin re-runs it to rotate again. (A retry after
+  the rotation did finish, unseen, is a new rotation; the account's
+  current key tells.)
+- **The first fenced write.** A write refused with `KeyUnavailable` kicks
+  `complete` in the background on the node that owns the repo, one driver
+  per DID (`DRIVING`, also held by the admin call, so writers racing an
+  admin rotation don't start a second PLC update). A failed kick holds its
+  slot 1 s, so writers retrying through a directory outage cost one PLC
+  attempt per second, not one per write. A fenced account that nobody
+  writes to stays pending until the admin retries; nothing else needs its
+  key meanwhile.
+
+`tests/all/key_rotation.rs` `crash_after_*` kill the owner after Begin and
+after the PLC update; the survivor finishes the rotation on an admin retry
+and on a write.
 
 `vlpds.admin.publishIdentity` with `syncPlc` (CLI `rotate-keys`) runs
-Finish with the account's current key after setting PLC's key to it, the
-script's empty commit and `#sync`.
+`Resign` with the account's current key after setting PLC's key to it, the
+script's empty commit and `#sync` (refused while a rotation is pending).
 
 **Not done.** `rewrapSecrets` doesn't rewrap a pending key (it lives until
-the rotation ends; retiring its KEK meanwhile strands it). The marker sweep
-costs one seek per populated slot of each owned shard per minute.
+the rotation ends; retiring its KEK meanwhile strands it).
 
 ## Admin CLI (`src/cli/admin.rs`, `src/xrpc/admin_tools.rs`)
 
@@ -4277,7 +4288,17 @@ ours. It is a client of admin XRPC on any node, nothing else: no direct
 bucket access, so it needs only the URL and the admin token, and a node's
 routing (`crate::forward`) sends DID-keyed calls to the repo's owner. Calls
 that act on "this node's shards" (rotatePlcKeys, rewrapSecrets) are sent to
-every node `getClusterStatus` lists. The library entry (`cli::admin::run`)
+every node `getClusterStatus` lists, one after another. Each answer lists
+the shards the node scanned (`scanned`, with its `layoutVersion`); a shard
+that moved between two nodes' calls is in neither list, so the CLI checks
+the union against the current layout and reruns the missing shards on
+their owners (the call's `shards` field restricts a node to those), up to
+3 rounds, then fails naming any still missing. Shard ids are never reused,
+so a split or merge meanwhile just reruns the children (both calls are
+idempotent). A node that errored is covered the same way: in a cluster the
+command fails on missing shards and per-account failures, not on a node
+error whose shards were rerun (`tests/all/maintenance_coverage.rs`). The
+library entry (`cli::admin::run`)
 is what the binary calls and what `tests/all/admin_cli.rs` drives.
 
 Endpoints added where com.atproto.admin.* has nothing:
@@ -4285,8 +4306,7 @@ Endpoints added where com.atproto.admin.* has nothing:
 `sequenceIdentity`, an unchanged account row rewritten through the repo's
 worker carrying `#identity`; `syncPlc` is the rotate-keys script: it sets
 the PLC `atproto` key to the held signing key, then re-signs the repo with
-it, `#identity` + `#sync`, the worker's `KeyStep::Finish` with the current
-key), `vlpds.admin.checkRepo?did=` (one shard
+it, `#identity` + `#sync`, the worker's `KeyStep::Resign`), `vlpds.admin.checkRepo?did=` (one shard
 snapshot under the apply lock: commit hash / data / DID / signature,
 records hash, MST from `R/` vs the head's data root, `M/` vs that tree,
 record-CID / blob-ref / collection indexes; no worker involved, so it works
@@ -4438,7 +4458,7 @@ effect at the next segment). Not built yet: everything under "Later".
 | Head `h/` | `state.rs` `Head::encode` | none (fixed binary: cid ‖ cid ‖ rev ‖ block) | `decode` "short head" or garbage |
 | Record `R/` | `state::record_value` | none (cid ‖ rev ‖ bytes) | garbage |
 | Repo stats `S/` | `state.rs` `RepoStats::encode` | none (fixed binary: 3 × u64) | `decode` of another length is an error |
-| Index `c/ C/ b/ bl/ n/ K/` | `state.rs` | key layout only, empty/plain values | key not found |
+| Index `c/ C/ b/ bl/ n/` | `state.rs` | key layout only, empty/plain values | key not found |
 | MST nodes `M/` | `state.rs`, `mst_lazy.rs` | dag-cbor, content-addressed | stable by construction |
 | Account `a/` | `state::Account` JSON | none; tolerant (`#[serde(default)]`, `#[serde(flatten)] extra` keeps unknown fields) | round-trips unknown fields |
 | Private `p/` rows | sessions, app passwords, tokens, TOTP (`totp.rs`), OAuth (`oauth/store.rs`), `sec/` revocations/takedowns (`xrpc/server.rs`) | none; mostly JSON | per type; mostly serde-default |

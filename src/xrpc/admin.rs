@@ -598,11 +598,17 @@ struct UpdateSigningKeyIn {
 
 /// The PDS signs commits, so it must hold the private key: `signingKey` is
 /// a did:key reserved with server.reserveSigningKey, or omitted/"generate"
-/// for a fresh key (src/xrpc/key_rotation.rs).
+/// for a fresh key (src/xrpc/key_rotation.rs). With a rotation pending (an
+/// earlier call failed midway), the call finishes that one instead.
 async fn update_account_signing_key(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdateSigningKeyIn>) -> XResult<Json<J>> {
     require_admin(&creds)?;
-    ensure_account(&app, &inp.did).await?;
-    let key = match inp.signing_key.as_deref().filter(|k| !k.is_empty() && *k != "generate") {
+    let acct = app.account(&inp.did).await.map_err(|_| invalid_request(format!("Account not found: {}", inp.did)))?;
+    let requested = inp.signing_key.as_deref().filter(|k| !k.is_empty() && *k != "generate");
+    if let Some(p) = &acct.pending_signing_key {
+        let did_key = super::key_rotation::finish_pending(&app, &inp.did, p, requested).await?;
+        return Ok(Json(json!({"signingKey": did_key})));
+    }
+    let key = match requested {
         Some(dk) => {
             if !dk.starts_with("did:key:") {
                 return Err(invalid_request("signingKey must be a did:key"));
@@ -1171,10 +1177,25 @@ async fn bulk_password_hash(password: Option<String>) -> XResult<String> {
 static BULK_RANDOM_PASSWORD_HASH: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| state::hash_password_blocking(&hex::encode(rand::random::<[u8; 32]>())));
 
-/// Every account of the shards this node owns.
-async fn owned_accounts(app: &App) -> XResult<Vec<Account>> {
+/// The shards a per-node maintenance call scans: those this node owns, or
+/// of them only `only` (the CLI rerunning shards a move made it miss).
+/// Answers carry `scanned` and `layoutVersion`, so the CLI can check that
+/// the union of the nodes' answers covers the layout (a shard moving
+/// between two nodes' calls is otherwise skipped by both).
+fn scan_set(app: &App, only: &Option<Vec<crate::slots::ShardId>>) -> (Vec<Arc<Partition>>, J) {
+    let mut parts = app.partitions.owned();
+    if let Some(only) = only {
+        parts.retain(|p| only.contains(&p.id));
+    }
+    parts.sort_by_key(|p| p.id);
+    let ids: Vec<crate::slots::ShardId> = parts.iter().map(|p| p.id).collect();
+    (parts, json!({"scanned": ids, "layoutVersion": app.partitions.layout().version}))
+}
+
+/// Every account of `parts`.
+async fn accounts_of(parts: &[Arc<Partition>]) -> XResult<Vec<Account>> {
     let mut out = Vec::new();
-    for p in app.partitions.owned() {
+    for p in parts {
         let mut it = state::FamilyScan::new(p.db.as_ref(), state::ACCOUNT_FAMILY, None, &Default::default())
             .await
             .map_err(XrpcError::from_err)?;
@@ -1190,6 +1211,7 @@ async fn owned_accounts(app: &App) -> XResult<Vec<Account>> {
 struct RotatePlcIn {
     #[serde(default)]
     dry_run: bool,
+    shards: Option<Vec<crate::slots::ShardId>>,
 }
 
 /// The directory rate-limits.
@@ -1202,9 +1224,10 @@ async fn rotate_plc_keys(State(app): AppState, Auth(creds): Auth, body: Option<J
     use futures::StreamExt;
     require_admin(&creds)?;
     let plc = app.plc.clone().ok_or_else(|| invalid_request("PLC registration is off on this PDS"))?;
-    let dry = body.map(|Json(b)| b).unwrap_or_default().dry_run;
-    let dids: Vec<String> =
-        owned_accounts(&app).await?.into_iter().map(|a| a.did).filter(|d| crate::plc::valid_plc_did(d)).collect();
+    let inp = body.map(|Json(b)| b).unwrap_or_default();
+    let dry = inp.dry_run;
+    let (parts, coverage) = scan_set(&app, &inp.shards);
+    let dids: Vec<String> = accounts_of(&parts).await?.into_iter().map(|a| a.did).filter(|d| crate::plc::valid_plc_did(d)).collect();
     let accounts = dids.len();
     let results: Vec<(String, Result<crate::plc::KeyRotation, crate::plc::PlcError>)> = futures::stream::iter(dids)
         .map(|did| {
@@ -1232,7 +1255,7 @@ async fn rotate_plc_keys(State(app): AppState, Auth(creds): Auth, body: Option<J
     tracing::info!(accounts, current, rotated, foreign, errors = errors.len(), dry_run = dry, rotation_key = plc.rotation_did_key(), "rotate PLC keys");
     let failed = errors.len();
     errors.truncate(20);
-    Ok(Json(json!({
+    Ok(Json(with_coverage(coverage, json!({
         "rotationKey": plc.rotation_did_key(),
         "dryRun": dry,
         "accounts": accounts,
@@ -1241,7 +1264,14 @@ async fn rotate_plc_keys(State(app): AppState, Auth(creds): Auth, body: Option<J
         "foreign": foreign,
         "failed": failed,
         "errors": errors,
-    })))
+    }))))
+}
+
+fn with_coverage(coverage: J, mut res: J) -> J {
+    if let (Some(r), J::Object(c)) = (res.as_object_mut(), coverage) {
+        r.extend(c);
+    }
+    res
 }
 
 #[derive(Deserialize, Default)]
@@ -1253,6 +1283,7 @@ struct RewrapIn {
     /// under an older version of a Cloud KMS key (one KMS decrypt each).
     #[serde(default)]
     check_versions: bool,
+    shards: Option<Vec<crate::slots::ShardId>>,
 }
 
 /// Rewraps this node's secrets at rest (signing keys, reserved keys, TOTP)
@@ -1263,7 +1294,8 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
     require_admin(&creds)?;
     let inp = body.map(|Json(b)| b).unwrap_or_default();
     let started = std::time::Instant::now();
-    let dids: Vec<(String, String)> = owned_accounts(&app).await?.into_iter().map(|a| (a.did, a.wrapped_signing_key)).collect();
+    let (parts, coverage) = scan_set(&app, &inp.shards);
+    let dids: Vec<(String, String)> = accounts_of(&parts).await?.into_iter().map(|a| (a.did, a.wrapped_signing_key)).collect();
     let (accounts, check, dry) = (dids.len(), inp.check_versions, inp.dry_run);
     let app2 = app.clone();
     // (stale signing key, stale TOTP, error)
@@ -1314,7 +1346,7 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
     }
     // the did:key-indexed rows carry the wrapped key
     let mut reserved = 0u64;
-    for (routing, name, val) in super::server::scan_private_routing(&app, "_reserved:").await? {
+    for (routing, name, val) in super::server::scan_private_routing_in(&parts, "_reserved:").await? {
         let Some(did_key) = routing.strip_prefix("_reserved:").filter(|r| r.starts_with("did:key:") && name == "k") else {
             continue;
         };
@@ -1343,7 +1375,7 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
     tracing::info!(accounts, signing_keys = keys, totp, reserved, errors = errors.len(), dry_run = dry, kek = app.secrets.current_kid(), elapsed_ms = started.elapsed().as_millis() as u64, "rewrap secrets");
     let failed = errors.len();
     errors.truncate(20);
-    Ok(Json(json!({
+    Ok(Json(with_coverage(coverage, json!({
         "kek": app.secrets.current_kid(),
         "dryRun": dry,
         "accounts": accounts,
@@ -1354,5 +1386,5 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
         "reservedKeys": reserved,
         "failed": failed,
         "errors": errors,
-    })))
+    }))))
 }

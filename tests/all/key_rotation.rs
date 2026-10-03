@@ -4,8 +4,8 @@
 //! rotate-keys; writes racing the rotation are either before it (old key)
 //! or after it (new key, chained off the `#sync`); a PLC refusal changes
 //! nothing; a PLC outage or a crash between the steps leaves the rotation
-//! pending, and it is finished from durable state (in the background, or by
-//! the shard's next owner).
+//! pending (writes fenced), and it is finished from durable state by a
+//! retried `updateAccountSigningKey` or by the first write it fences.
 
 use crate::common::*;
 use k256::ecdsa::VerifyingKey;
@@ -152,9 +152,10 @@ async fn rotation_under_concurrent_writes() {
 
 /// A refusal by the directory changes nothing (the account keeps writing
 /// with its key). An outage leaves the rotation pending: writes get a
-/// retryable 503, another rotation is refused, and it finishes in the
-/// background once the directory answers, with the key the directory
-/// names. publishIdentity with syncPlc re-signs with the held key.
+/// retryable 503, and a retry once the directory answers finishes it with
+/// the pending key; a retry naming another key finishes the pending one and
+/// refuses the other (still reserved). publishIdentity with syncPlc re-signs
+/// with the held key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn plc_refusal_and_outage() {
     let plc = MockPlc::start().await;
@@ -176,17 +177,24 @@ async fn plc_refusal_and_outage() {
     create(&s, &a, "after the refusal").await.ok();
 
     plc.set_down(true);
-    rotate(&s, &a.did).await.err(500, "InternalServerError");
+    let r = rotate(&s, &a.did).await;
+    r.err(500, "InternalServerError");
+    assert!(r.text().contains("retry updateAccountSigningKey"), "{}", r.text());
     let pending = s.app.account(&a.did).await.ok().unwrap().pending_signing_key.expect("pending");
     let new_did_key = format!("did:key:{}", pending.pubkey);
+    // fenced; its kick fails against the outage too
     create(&s, &a, "during").await.err(503, "KeyUnavailable");
-    let r = rotate(&s, &a.did).await;
-    r.err(400, "InvalidRequest");
-    assert!(r.text().contains("in progress"), "{}", r.text());
+    rotate(&s, &a.did).await.err(500, "InternalServerError");
     assert_eq!(local_key(&s, &a.did).await, before);
+    wait_until("the kick's backoff", Duration::from_secs(10), || !vlpds::xrpc::key_rotation::driving(&a.did)).await;
+    assert!(s.app.account(&a.did).await.ok().unwrap().pending_signing_key.is_some());
     plc.set_down(false);
-    // the background driver retries (1 s, then backing off)
-    eventually(Duration::from_secs(15), || async { (local_key(&s, &a.did).await == new_did_key).then_some(()) }).await.expect("pending rotation finished in the background");
+    // the retry asks for a reserved key: the pending rotation wins
+    let other = s.xrpc.post("com.atproto.server.reserveSigningKey", &json!({"did": a.did}), &Auth::None).await.ok()["signingKey"].as_str().unwrap().to_string();
+    let r = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did, "signingKey": other}), &Auth::Admin).await;
+    r.err(400, "InvalidRequest");
+    assert!(r.text().contains("now finished"), "{}", r.text());
+    assert_eq!(local_key(&s, &a.did).await, new_did_key);
     assert_eq!(plc_key(&plc, &a.did), new_did_key);
     let repo = s.get_repo(&a.did).await;
     repo.commit().verify(&key_of(&new_did_key)).expect("re-signed with the pending key");
@@ -196,8 +204,7 @@ async fn plc_refusal_and_outage() {
     create(&s, &a, "after").await.ok();
     let st = s.xrpc.get("com.atproto.server.checkAccountStatus", &[], &a.auth()).await.ok();
     assert_eq!(st["validDid"], json!(true), "{st}");
-    // nothing left to recover
-    assert_eq!(vlpds::xrpc::key_rotation::recover_pending(&s.app).await, Default::default());
+    assert!(s.app.account(&a.did).await.ok().unwrap().pending_signing_key.is_none());
 
     // publishIdentity syncPlc (rotate-keys): re-signed with the held key
     let (head1, rev1) = s.latest_commit(&a.did).await;
@@ -244,13 +251,21 @@ async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, plc: &MockPl
     .await
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum FinishBy {
+    /// The admin re-runs updateAccountSigningKey.
+    Retry,
+    /// A write is fenced and kicks the finish; it succeeds once done.
+    Write,
+}
+
 /// The repo's owner dies (`Node::halt`, kill -9) mid-rotation, at `phase`:
 /// "begun" (the pending key is durable, the directory not updated yet) or
 /// "plc_updated" (the directory names the new key, the repo still carries
-/// the old one). The survivor replays the log, finds the rotation pending
-/// (writes refused meanwhile) and finishes it: the directory and the
+/// the old one). The survivor replays the log and finds the rotation
+/// pending, its writes fenced; `by` finishes it: the directory and the
 /// re-signed head agree, `#identity` then `#sync`, writes resume.
-async fn crash_mid_rotation(phase: &'static str) {
+async fn crash_mid_rotation(phase: &'static str, by: FinishBy) {
     let plc = MockPlc::start().await;
     let rot = Arc::new(Keypair::generate());
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
@@ -298,34 +313,64 @@ async fn crash_mid_rotation(phase: &'static str) {
         assert_eq!(plc_key(&plc, &x.did), new_did_key);
     }
     a.get_repo(&x.did).await.commit().verify(&key_of(&old_did_key)).unwrap();
-    create(&a, &x, "fenced").await.err(503, "KeyUnavailable");
 
-    let r = vlpds::xrpc::key_rotation::recover_pending(&a.app).await;
-    assert_eq!((r.pending, r.finished, r.aborted), (1, 1, 0), "{r:?}");
+    match by {
+        FinishBy::Retry => {
+            // the fenced write's kick can't finish against the outage
+            plc.set_down(true);
+            create(&a, &x, "fenced").await.err(503, "KeyUnavailable");
+            wait_until("the kick's backoff", Duration::from_secs(10), || !vlpds::xrpc::key_rotation::driving(&x.did)).await;
+            plc.set_down(false);
+            assert!(a.app.account(&x.did).await.ok().unwrap().pending_signing_key.is_some());
+            let j = rotate(&a, &x.did).await.ok();
+            assert_eq!(j["signingKey"], json!(new_did_key), "the retry finished the pending rotation");
+            create(&a, &x, "after").await.ok();
+        }
+        FinishBy::Write => {
+            create(&a, &x, "fenced").await.err(503, "KeyUnavailable");
+            eventually(Duration::from_secs(15), || async {
+                let r = create(&a, &x, "after").await;
+                if r.status == 503 && r.error_name() == Some("KeyUnavailable") {
+                    return None;
+                }
+                r.ok();
+                Some(())
+            })
+            .await
+            .expect("the write kicked the rotation's finish");
+        }
+    }
     assert_eq!(plc_key(&plc, &x.did), new_did_key);
     assert_eq!(plc.ops(&x.did).len(), plc_ops + 1, "one PLC update in all");
     let acct = a.app.account(&x.did).await.ok().unwrap();
     assert!(acct.pending_signing_key.is_none());
     assert_eq!(format!("did:key:{}", acct.signing_pubkey), new_did_key);
     let new_key = key_of(&new_did_key);
-    a.get_repo(&x.did).await.commit().verify(&new_key).expect("re-signed on recovery");
     let mut sub = a.subscribe(Some(cursor)).await;
-    let frames = identity_then_sync(&mut sub, &x.did).await;
-    assert_eq!(frames.iter().map(|f| f.kind()).collect::<Vec<_>>(), vec!["#identity", "#sync"]);
-    frames[1].sync().unwrap().commit_obj().verify(&new_key).unwrap();
-    // idempotent: nothing left, and writes resume with the new key
-    assert_eq!(vlpds::xrpc::key_rotation::recover_pending(&a.app).await, Default::default());
-    create(&a, &x, "after").await.ok();
-    let c = sub.wait_for(FH_TIMEOUT, &x.did, "#commit").await;
-    c.last().unwrap().commit().unwrap().commit_obj().verify(&new_key).unwrap();
+    let frames = sub.wait_for(FH_TIMEOUT, &x.did, "#commit").await;
+    let frames: Vec<&Frame> = frames.iter().filter(|f| f.did() == Some(x.did.as_str())).collect();
+    assert_eq!(frames.iter().map(|f| f.kind()).collect::<Vec<_>>(), vec!["#identity", "#sync", "#commit"]);
+    frames[1].sync().unwrap().commit_obj().verify(&new_key).expect("re-signed with the pending key");
+    frames[2].commit().unwrap().commit_obj().verify(&new_key).unwrap();
+    a.get_repo(&x.did).await.commit().verify(&new_key).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn crash_after_begin_is_finished_on_recovery() {
-    crash_mid_rotation("begun").await;
+async fn crash_after_begin_is_finished_by_a_retry() {
+    crash_mid_rotation("begun", FinishBy::Retry).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn crash_after_plc_update_is_finished_on_recovery() {
-    crash_mid_rotation("plc_updated").await;
+async fn crash_after_plc_update_is_finished_by_a_retry() {
+    crash_mid_rotation("plc_updated", FinishBy::Retry).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crash_after_begin_is_finished_by_a_write() {
+    crash_mid_rotation("begun", FinishBy::Write).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crash_after_plc_update_is_finished_by_a_write() {
+    crash_mid_rotation("plc_updated", FinishBy::Write).await;
 }

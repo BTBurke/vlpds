@@ -192,10 +192,14 @@ pub(super) async fn scan_private(app: &App, routing: &str, name_prefix: &str) ->
 /// (routing key, name, value) of every private row whose routing key starts
 /// with `routing_prefix`, across the partitions this node owns.
 pub(super) async fn scan_private_routing(app: &App, routing_prefix: &str) -> XResult<Vec<(String, String, Bytes)>> {
+    scan_private_routing_in(&app.partitions.owned(), routing_prefix).await
+}
+
+pub(super) async fn scan_private_routing_in(parts: &[Arc<Partition>], routing_prefix: &str) -> XResult<Vec<(String, String, Bytes)>> {
     // keys are slot-major: walk each slot's run of p/{routing_prefix}
     let fam = [state::PRIVATE_FAMILY, routing_prefix.as_bytes()].concat();
     let mut out = Vec::new();
-    for p in app.partitions.owned() {
+    for p in parts {
         let mut iter = state::FamilyScan::new(p.db.as_ref(), &fam, None, &Default::default())
             .await
             .map_err(XrpcError::from_err)?;

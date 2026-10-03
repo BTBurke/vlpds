@@ -1,9 +1,11 @@
 //! Signing-key rotation (DESIGN.md "Signing-key rotation"): `Begin` records
 //! the new key as pending (before any directory can name it, and repo
 //! writes are refused from then on), the PLC directory is updated, `Finish`
-//! re-signs the head. A rotation stopped in between stays pending and
-//! [`complete`] drives it to its end from durable state alone; only a
-//! definite refusal by a directory that doesn't name the key abandons it.
+//! re-signs the head. A rotation stopped in between stays pending until
+//! [`complete`] drives it to its end from durable state alone: the admin
+//! re-running `updateAccountSigningKey`, or the first write it fences
+//! ([`kick`]). Only a definite refusal by a directory that doesn't name the
+//! key abandons it.
 
 use super::*;
 use crate::plc::PlcError;
@@ -12,15 +14,17 @@ use crate::worker::{AccountOp, KeyStep};
 use std::collections::HashSet;
 use std::time::Duration;
 
-pub const RECOVERY_INTERVAL: Duration = Duration::from_secs(60);
+/// A failed kick holds its slot this long, so writers retrying against a
+/// directory outage don't each start a PLC round trip.
+const KICK_BACKOFF: Duration = Duration::from_secs(1);
 
 const INTERRUPTED: &str = "KeyRotationInterrupted";
 
 pub use crate::lifecycle::CrashHook;
 
 /// Phases of a DID's rotation: "begun" (the pending key is durable) and
-/// "plc_updated" (the directory names it, the repo isn't re-signed yet). A
-/// firing hook schedules no retry; the test halts the node in the hook.
+/// "plc_updated" (the directory names it, the repo isn't re-signed yet).
+/// The test halts the node in the hook.
 static CRASH_HOOKS: crate::lifecycle::CrashHooks = crate::lifecycle::CrashHooks::new();
 
 pub fn set_crash_hook(did: &str, h: Option<CrashHook>) {
@@ -34,8 +38,9 @@ fn crash_at(did: &str, phase: &str) -> Result<(), XrpcError> {
     }
 }
 
-/// DIDs whose rotation this node is driving, so the sweep doesn't start a
-/// second driver. Only an economy: every step is safe to repeat or race.
+/// DIDs whose rotation this node is driving. Kicks skip a held DID; the
+/// admin path drives regardless. Only an economy: every step is safe to
+/// repeat or race.
 static DRIVING: parking_lot::Mutex<Option<HashSet<String>>> = parking_lot::Mutex::new(None);
 
 struct Driving(String);
@@ -54,6 +59,12 @@ impl Drop for Driving {
     }
 }
 
+/// Whether a driver (an admin call or a kick, incl. a failed kick's
+/// backoff) holds `did` on this node.
+pub fn driving(did: &str) -> bool {
+    DRIVING.lock().as_ref().is_some_and(|s| s.contains(did))
+}
+
 pub enum Done {
     Finished(Head),
     /// The directory refused the new key and doesn't name it.
@@ -69,8 +80,10 @@ async fn plc_names(plc: &crate::plc::Plc, did: &str, did_key: &str) -> Result<bo
     }
 }
 
-/// Idempotent. `key`: the new key, if the caller holds it (else unwrapped
-/// from `p`). Err: undecided; the rotation is still pending.
+/// Idempotent: once the rotation finished, a repeat changes nothing (Finish
+/// of the current key is a no-op). `key`: the new key, if the caller holds
+/// it (else unwrapped from `p`). Err: undecided; the rotation is still
+/// pending.
 pub async fn complete(app: &App, did: &str, p: &PendingSigningKey, key: Option<Arc<Keypair>>) -> Result<Done, XrpcError> {
     let did_key = format!("did:key:{}", p.pubkey);
     if let (Some(plc), true) = (&app.plc, did.starts_with("did:plc:")) {
@@ -100,122 +113,69 @@ pub async fn complete(app: &App, did: &str, p: &PendingSigningKey, key: Option<A
     Ok(Done::Finished(head))
 }
 
+fn pending_hint(mut e: XrpcError) -> XrpcError {
+    if e.status.is_server_error() {
+        e.message = format!("{}; the rotation is pending (writes are refused): retry updateAccountSigningKey to finish it", e.message);
+    }
+    e
+}
+
 /// The new key's did:key once the repo is re-signed with it. On an
-/// undecided failure the rotation is finished in the background.
-pub(super) async fn rotate(app: &Arc<App>, did: &str, key: Keypair) -> XResult<String> {
+/// undecided failure the rotation stays pending: a retry finishes it
+/// ([`finish_pending`]), as does the next write it fences ([`kick`]).
+pub(super) async fn rotate(app: &App, did: &str, key: Keypair) -> XResult<String> {
     let key = Arc::new(key);
     let did_key = key.did_key();
     // wrapped for the row; cached unwrapped too (the re-sign needs no unwrap)
     let (wrapped, pubkey) = app.secrets.wrap_signing_key(did, &key).await?;
     let p = PendingSigningKey { wrapped, pubkey };
-    let driving = Driving::take(did);
+    let _driving = Driving::take(did);
     app.account_op(did, AccountOp::SigningKey(KeyStep::Begin(p.clone()))).await?;
-    let r = match crash_at(did, "begun") {
-        Ok(()) => complete(app, did, &p, Some(key)).await,
-        Err(e) => Err(e),
-    };
-    match r {
-        Ok(Done::Finished(_)) => Ok(did_key),
-        Ok(Done::Aborted(e)) => Err(e),
-        Err(e) => {
-            drop(driving);
-            if retryable(app, did, &e) {
-                tracing::warn!(%did, key = %did_key, "signing key rotation pending, retrying in the background: {}", e.message);
-                spawn_resolver(app.clone(), did.to_string());
-            }
-            Err(e)
-        }
+    crash_at(did, "begun")?;
+    match complete(app, did, &p, Some(key)).await.map_err(pending_hint)? {
+        Done::Finished(_) => Ok(did_key),
+        Done::Aborted(e) => Err(e),
     }
 }
 
-/// A moved repo is the new owner's to finish.
-fn retryable(app: &App, did: &str, e: &XrpcError) -> bool {
-    e.status.is_server_error() && e.error != INTERRUPTED && app.partition(did).is_ok()
+/// A retried `updateAccountSigningKey` on an account with a rotation
+/// pending finishes that rotation. `requested`: the did:key the retry
+/// asked for, if any; a different one than the pending key is refused once
+/// the pending rotation is finished (left reserved, for the next call).
+pub(super) async fn finish_pending(app: &App, did: &str, p: &PendingSigningKey, requested: Option<&str>) -> XResult<String> {
+    let did_key = format!("did:key:{}", p.pubkey);
+    let _driving = Driving::take(did);
+    match complete(app, did, p, None).await.map_err(pending_hint)? {
+        Done::Finished(_) => {}
+        Done::Aborted(e) => return Err(e),
+    }
+    match requested {
+        Some(r) if r != did_key => Err(XrpcError::bad(
+            "InvalidRequest",
+            format!("an interrupted rotation to {did_key} was pending and is now finished; {r} was not used (still reserved): retry to rotate to it"),
+        )),
+        _ => Ok(did_key),
+    }
 }
 
-/// None: nothing pending.
-async fn resolve_once(app: &App, did: &str) -> Result<Option<Done>, XrpcError> {
-    let acct = app.account(did).await?;
-    let Some(p) = acct.pending_signing_key else { return Ok(None) };
-    complete(app, did, &p, None).await.map(Some)
-}
-
-fn spawn_resolver(app: Arc<App>, did: String) {
-    let Some(driving) = Driving::take(&did) else { return };
+/// A write fenced by a pending rotation: finish it in the background, one
+/// driver per DID. A DID whose key is merely unavailable (key service
+/// down) has nothing pending, and the kick ends at the account read.
+pub(super) fn kick(app: &Arc<App>, did: &str) {
+    let Some(driving) = Driving::take(did) else { return };
+    let (app, did) = (app.clone(), did.to_string());
     tokio::spawn(async move {
-        let _driving = driving;
-        let mut wait = Duration::from_secs(1);
-        loop {
-            tokio::time::sleep(wait).await;
-            match resolve_once(&app, &did).await {
-                Ok(_) => return,
-                Err(e) if retryable(&app, &did, &e) => {
-                    tracing::warn!(%did, "pending signing key rotation: {}", e.message);
-                    wait = (wait * 2).min(RECOVERY_INTERVAL);
-                }
-                Err(e) => {
-                    tracing::warn!(%did, "pending signing key rotation left to its next owner or sweep: {}", e.message);
-                    return;
-                }
-            }
-        }
-    });
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Recovered {
-    pub pending: usize,
-    pub finished: usize,
-    pub aborted: usize,
-}
-
-/// One attempt at each rotation pending in this node's shards; undecided
-/// ones are retried in the background.
-pub async fn recover_pending(app: &Arc<App>) -> Recovered {
-    let mut dids = Vec::new();
-    for p in app.partitions.owned() {
-        let fam = state::KEY_ROTATION_FAMILY;
-        let scan = async {
-            let mut it = state::FamilyScan::new(p.db.as_ref(), fam, None, &Default::default()).await?;
-            while let Some(kv) = it.next().await? {
-                dids.push(String::from_utf8_lossy(&state::key_body(&kv.key)[fam.len()..]).into_owned());
-            }
-            Ok::<_, slatedb::Error>(())
+        let r = match app.account(&did).await {
+            Ok(acct) => match acct.pending_signing_key {
+                Some(p) => complete(&app, &did, &p, None).await.map(|_| ()),
+                None => Ok(()),
+            },
+            Err(e) => Err(e),
         };
-        if let Err(e) = scan.await {
-            tracing::warn!(shard = %p.id, "pending signing key rotations: scan failed: {e}");
+        if let Err(e) = r {
+            tracing::warn!(%did, "pending signing key rotation not finished yet: {}", e.message);
+            tokio::time::sleep(KICK_BACKOFF).await;
         }
-    }
-    let mut out = Recovered { pending: dids.len(), ..Default::default() };
-    for did in dids {
-        let Some(driving) = Driving::take(&did) else { continue };
-        match resolve_once(app, &did).await {
-            Ok(Some(Done::Finished(_))) => out.finished += 1,
-            Ok(Some(Done::Aborted(_))) => out.aborted += 1,
-            Ok(None) => {}
-            Err(e) => {
-                drop(driving);
-                if retryable(app, &did, &e) {
-                    spawn_resolver(app.clone(), did.clone());
-                }
-                tracing::warn!(%did, "pending signing key rotation: {}", e.message);
-            }
-        }
-    }
-    if out.pending > 0 {
-        tracing::info!(pending = out.pending, finished = out.finished, aborted = out.aborted, "pending signing key rotations recovered");
-    }
-    out
-}
-
-/// A crash or a shard move leaves a rotation to the shard's next owner.
-pub fn spawn_recovery(app: Arc<App>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(RECOVERY_INTERVAL);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            recover_pending(&app).await;
-        }
-    })
+        drop(driving);
+    });
 }

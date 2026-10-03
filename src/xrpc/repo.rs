@@ -186,7 +186,7 @@ async fn check_blobs(app: &App, did: &str, decls: &[BlobDecl]) -> XResult<super:
 }
 
 async fn submit(
-    app: &App,
+    app: &Arc<App>,
     did: Arc<str>,
     writes: Vec<Write>,
     swap_commit: Option<Cid>,
@@ -205,6 +205,7 @@ async fn submit(
     let start = Instant::now();
     STATS.write_requests.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = oneshot::channel();
+    let did_kick = did.clone();
     // A forwarding peer fails this at its time-to-first-byte deadline: if the
     // write can't start soon (cold repo load), give it up unapplied and say
     // so; the peer resends it (crate::forward, "RepoLoading").
@@ -250,7 +251,10 @@ async fn submit(
             WriteError::Invalid(_) => "invalid",
             WriteError::Internal(_) => "internal",
             WriteError::Unavailable(_) => "unavailable",
-            WriteError::KeyUnavailable(_) => "key_unavailable",
+            WriteError::KeyUnavailable(_) => {
+                super::key_rotation::kick(app, &did_kick);
+                "key_unavailable"
+            }
             WriteError::SignatureFault(_) => "signature_fault",
         };
         metrics::WRITE_ERRORS.with_label_values(&[kind]).inc();

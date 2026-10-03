@@ -678,25 +678,88 @@ async fn cluster_nodes(c: &Client) -> Result<Vec<(String, String, Option<String>
     Ok(nodes)
 }
 
-/// Prints a table of `cols` per node and the totals.
+pub type NodeHook = std::sync::Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+static AFTER_NODE: parking_lot::Mutex<Option<NodeHook>> = parking_lot::Mutex::new(None);
+
+/// Tests: awaited after each node's answer to a per-node command, with the
+/// node's name (to move a shard between two nodes' calls).
+pub fn set_after_node_hook(h: Option<NodeHook>) {
+    *AFTER_NODE.lock() = h;
+}
+
+/// Rounds of rerunning shards no answer covered on their current owners.
+const COVERAGE_ROUNDS: usize = 3;
+
+/// Prints a table of `cols` per node and the totals. Each node scans the
+/// shards it owns when called and lists them (`scanned`); a shard that moved
+/// between two nodes' calls is in neither list, so the union is checked
+/// against the current layout and missing shards are rerun on their owners
+/// (`shards` in the body). Shards still missing after that fail the command.
 async fn per_node(c: &Client, node_only: bool, opts: &Opts, out: &mut dyn Write, nsid: &str, body: J, cols: &[&str]) -> Result<()> {
     let nodes = if node_only { vec![("this node".to_string(), c.base.clone(), None)] } else { cluster_nodes(c).await? };
-    let (mut results, mut failed) = (Vec::new(), 0usize);
-    for (node, url, id) in &nodes {
-        let r = match id {
+    let mut results = Vec::new();
+    let mut covered = std::collections::HashSet::new();
+    let call = |name: String, url: String, id: Option<String>, body: J| async move {
+        let r = match &id {
             Some(id) => c.post_to_node(id, nsid, &body).await,
             None => c.post(nsid, &body).await,
         };
-        match r {
-            Ok(r) => {
-                failed += r["failed"].as_u64().unwrap_or(0) as usize;
-                results.push(json!({"node": node, "url": url, "ok": true, "result": r}));
-            }
-            Err(e) => {
-                failed += 1;
-                results.push(json!({"node": node, "url": url, "ok": false, "error": format!("{e:#}")}));
+        let row = match r {
+            Ok(r) => json!({"node": name, "url": url, "ok": true, "result": r}),
+            Err(e) => json!({"node": name, "url": url, "ok": false, "error": format!("{e:#}")}),
+        };
+        let hook = AFTER_NODE.lock().clone();
+        if let Some(h) = hook {
+            h(name).await;
+        }
+        row
+    };
+    for (node, url, id) in &nodes {
+        results.push(call(node.clone(), url.clone(), id.clone(), body.clone()).await);
+    }
+    let mut missing = Vec::new();
+    // in a cluster, a node's error leaves its shards missing (rerun below)
+    let mut coverage_checked = false;
+    for round in 0..=COVERAGE_ROUNDS {
+        if node_only {
+            break;
+        }
+        for r in &results {
+            covered.extend(r["result"]["scanned"].as_array().into_iter().flatten().filter_map(J::as_u64));
+        }
+        let st = c.get("vlpds.admin.getClusterStatus", &[]).await?;
+        // not a cluster: the one node owns every shard
+        let Some(shards) = st["layout"]["shards"].as_array() else { break };
+        coverage_checked = true;
+        let owners = st["table"].as_array().cloned().unwrap_or_default();
+        missing = shards
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let id = r["id"].as_u64()?;
+                (!covered.contains(&id)).then(|| (id, owners.get(i).and_then(J::as_str).map(str::to_string)))
+            })
+            .collect::<Vec<(u64, Option<String>)>>();
+        if missing.is_empty() || round == COVERAGE_ROUNDS {
+            break;
+        }
+        let mut by_owner: std::collections::BTreeMap<String, Vec<u64>> = Default::default();
+        for (id, owner) in &missing {
+            if let Some(o) = owner {
+                by_owner.entry(o.clone()).or_default().push(*id);
             }
         }
+        for (owner, ids) in by_owner {
+            let mut b = body.clone();
+            b["shards"] = json!(ids);
+            let url = nodes.iter().find(|n| n.0 == owner).map(|n| n.1.clone()).unwrap_or_default();
+            results.push(call(format!("{owner} (rerun)"), url, Some(owner), b).await);
+        }
+    }
+    let mut failed: usize = results.iter().map(|r| r["result"]["failed"].as_u64().unwrap_or(0) as usize).sum();
+    if !coverage_checked {
+        failed += results.iter().filter(|r| r["ok"] != json!(true)).count();
     }
     if opts.json {
         pretty(out, &J::Array(results.clone()))?;
@@ -727,6 +790,10 @@ async fn per_node(c: &Client, node_only: bool, opts: &Opts, out: &mut dyn Write,
         if body["dryRun"] == json!(true) {
             writeln!(out, "(dry run: nothing changed)")?;
         }
+    }
+    if !missing.is_empty() {
+        let ids: Vec<String> = missing.iter().map(|(id, owner)| format!("{id} (owner {})", owner.as_deref().unwrap_or("none"))).collect();
+        bail!("shards not scanned by any node: {}", ids.join(", "));
     }
     if failed > 0 {
         bail!("{failed} failure(s)");

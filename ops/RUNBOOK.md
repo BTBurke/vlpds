@@ -215,7 +215,9 @@ XRPC to one node (the three flags are accepted before or after the command) (`--
 token from `VLPDS_ADMIN_TOKEN`, as the node's). Any node will do: calls naming
 a DID are routed to the repo's owner, and the per-node maintenance commands
 (`rotate-plc-keys`, `rewrap-secrets`) are sent to every node that
-`getClusterStatus` lists (`--node-only`: just `--url`). Output is a table or a
+`getClusterStatus` lists (`--node-only`: just `--url`); shards that moved
+between two nodes' calls are rerun on their new owner (rows marked
+`(rerun)`), and shards no node scanned fail the command. Output is a table or a
 short message; `--json` prints the raw results. Exit 1 on an XRPC error, on any
 failed item of a batch (the other items still run, as the reference scripts
 do), and from `check-repo` when it finds a problem. Destructive commands
