@@ -18,6 +18,8 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/admin", get(shell))
         .route("/admin/", get(shell))
         .route("/admin/{*rest}", get(shell))
+        .route("/migrate", get(migrate_shell))
+        .route("/migrate/", get(migrate_shell))
         .route("/assets/{*path}", get(asset))
         .route("/fonts/{*path}", get(asset))
         .route("/favicon.svg", get(asset))
@@ -31,13 +33,30 @@ const SPA_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; 
 img-src 'self' data: blob:; connect-src 'self'; manifest-src 'self'; frame-ancestors 'none'; \
 base-uri 'none'; form-action 'none'";
 
+/// The migration page talks to the account's current PDS, which can be any
+/// host; a dev server's (and a local e2e's) old PDS may be plain http.
+const MIGRATE_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; \
+img-src 'self' data: blob:; connect-src 'self' https:; manifest-src 'self'; frame-ancestors 'none'; \
+base-uri 'none'; form-action 'none'";
+const MIGRATE_CSP_DEV: &str = "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; \
+img-src 'self' data: blob:; connect-src 'self' https: http:; manifest-src 'self'; frame-ancestors 'none'; \
+base-uri 'none'; form-action 'none'";
+
 async fn shell() -> Response {
+    shell_with(SPA_CSP)
+}
+
+async fn migrate_shell(State(app): AppState) -> Response {
+    shell_with(if app.config.dev_mode { MIGRATE_CSP_DEV } else { MIGRATE_CSP })
+}
+
+fn shell_with(csp: &'static str) -> Response {
     let Some(f) = Assets::get("index.html") else {
         return (StatusCode::NOT_FOUND, "UI not built: run `just ui`").into_response();
     };
     let mut r = ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], f.data).into_response();
     let h = r.headers_mut();
-    h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static(SPA_CSP));
+    h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static(csp));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
     h.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
     h.insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));

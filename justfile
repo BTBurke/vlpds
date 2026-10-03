@@ -58,6 +58,11 @@ bench name rate *args:
     CARGO_TARGET_DIR=target cargo build --release --bins
     bench/step.sh {{name}} {{rate}} {{args}}
 
+# Account migration e2e (bench/migrate/README.md): local PLC, reference PDS and mail catcher in docker,
+# a local vlpds, then /migrate driven headlessly for several accounts and both sides verified (KEEP=1 leaves it up)
+migrate-e2e:
+    bench/migrate/run.sh
+
 # Build the Go sync 1.1 firehose checker and run it against a vlpds (extra flags e.g. -cursor 0 -strict)
 checker host="http://127.0.0.1:2620" *args:
     cd checker && go build -o checker . && ./checker -host {{host}} {{args}}

@@ -1,0 +1,77 @@
+# Local stand-ins for the migration e2e (README.md): a PLC directory, the
+# reference PDS the accounts migrate from, and a mail catcher for its email
+# tokens. Nothing here talks to the public network once the images exist.
+name: vlpds-migrate-e2e
+
+services:
+  plc-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    tmpfs: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 1s
+      retries: 30
+
+  # did-method-plc publishes amd64-only images; built from source so it runs natively
+  plc:
+    build:
+      context: https://github.com/did-method-plc/did-method-plc.git#9c8ea2fe23b89a5c1011246cbb4957dad9dbf7db
+      dockerfile: packages/server/Dockerfile
+    image: vlpds-migrate-plc:9c8ea2f
+    depends_on:
+      plc-db:
+        condition: service_healthy
+    environment:
+      DB_CREDS_JSON: '{"host":"plc-db","password":"postgres"}'
+      DB_MIGRATE_CREDS_JSON: '{"host":"plc-db","password":"postgres"}'
+      ENABLE_MIGRATIONS: "true"
+      PORT: "2582"
+    ports:
+      - "127.0.0.1:${PLC_PORT:-2782}:2582"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2582/_health"]
+      interval: 1s
+      retries: 60
+
+  mail:
+    image: axllent/mailpit:latest
+    ports:
+      - "127.0.0.1:${MAIL_PORT:-2785}:8025"
+
+  # The reference PDS (bluesky-social/atproto packages/pds). In dev mode with
+  # hostname localhost its public URL is http://localhost:$REF_PDS_PORT and
+  # its handles end in .test.
+  ref-pds:
+    image: ghcr.io/bluesky-social/pds:${REF_PDS_TAG:-0.4}
+    depends_on:
+      plc:
+        condition: service_healthy
+    environment:
+      PDS_HOSTNAME: localhost
+      PDS_PORT: "${REF_PDS_PORT:-2783}"
+      PDS_DEV_MODE: "true"
+      PDS_DATA_DIRECTORY: /pds
+      PDS_BLOBSTORE_DISK_LOCATION: /pds/blocks
+      PDS_JWT_SECRET: e2e-jwt-secret
+      PDS_ADMIN_PASSWORD: e2e-admin
+      PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: 3b4e3e9a5d2f4c1b8e7a6d5c4b3a29181716151413121110f0e0d0c0b0a09080
+      PDS_DID_PLC_URL: http://plc:2582
+      PDS_INVITE_REQUIRED: "false"
+      PDS_EMAIL_SMTP_URL: smtp://mail:1025
+      PDS_EMAIL_FROM_ADDRESS: noreply@ref.test
+      PDS_CRAWLERS: ""
+      # app.bsky.actor.{get,put}Preferences are only routed with an AppView
+      # configured; nothing listens here and nothing else proxies to it
+      PDS_BSKY_APP_VIEW_URL: http://127.0.0.1:9
+      PDS_BSKY_APP_VIEW_DID: did:web:appview.invalid
+      PDS_RATE_LIMITS_ENABLED: "false"
+      LOG_ENABLED: "true"
+    tmpfs: /pds
+    ports:
+      - "127.0.0.1:${REF_PDS_PORT:-2783}:${REF_PDS_PORT:-2783}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${REF_PDS_PORT:-2783}/xrpc/_health"]
+      interval: 1s
+      retries: 60

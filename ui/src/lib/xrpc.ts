@@ -25,7 +25,7 @@ export type Session = {
 
 type Params = Record<string, string | number | boolean | string[] | undefined | null>
 
-function qs(params?: Params): string {
+export function qs(params?: Params): string {
   if (!params) return ''
   const u = new URLSearchParams()
   for (const [k, v] of Object.entries(params)) {
@@ -37,7 +37,7 @@ function qs(params?: Params): string {
   return s ? `?${s}` : ''
 }
 
-async function parse(r: Response) {
+export async function parse(r: Response) {
   const text = await r.text()
   let body: any = undefined
   if (text) {
@@ -54,14 +54,15 @@ async function parse(r: Response) {
   return body
 }
 
-export type CallOpts = { params?: Params; body?: unknown; auth?: string; raw?: boolean; method?: 'GET' | 'POST' }
+/** `base`: another server's origin (the migration page's old PDS); default this one. */
+export type CallOpts = { params?: Params; body?: unknown; auth?: string; raw?: boolean; method?: 'GET' | 'POST'; base?: string }
 
 export async function call<T = any>(nsid: string, o: CallOpts = {}): Promise<T> {
   const method = o.method ?? (o.body !== undefined ? 'POST' : 'GET')
   const headers: Record<string, string> = {}
   if (o.auth) headers.Authorization = o.auth
   if (o.body !== undefined) headers['Content-Type'] = 'application/json'
-  const r = await fetch(`/xrpc/${nsid}${qs(o.params)}`, {
+  const r = await fetch(`${o.base ?? ''}/xrpc/${nsid}${qs(o.params)}`, {
     method,
     headers,
     body: o.body !== undefined ? JSON.stringify(o.body) : undefined,

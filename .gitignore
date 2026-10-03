@@ -11,3 +11,4 @@
 # the repo-root Go rule `bin/` would hide the Rust binaries in src/bin
 !/src/bin/
 __pycache__/
+/bench/migrate/out/

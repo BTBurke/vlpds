@@ -210,3 +210,25 @@ async fn import_of_another_dids_repo_is_accepted_like_the_reference() {
     assert_eq!(repo.commit().did, b.did);
     repo.commit().verify(&s.signing_key(&b.did).await).unwrap();
 }
+
+/// The migration page calls the account's current PDS from the browser, so
+/// its CSP lets it connect out (plain http only on a dev server); the rest of
+/// the UI stays same-origin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn migrate_page_may_connect_to_other_servers() {
+    let s = TestServer::spawn().await;
+    let csp = |path: &'static str| {
+        let x = s.xrpc.clone();
+        let url = format!("{}{path}", s.url);
+        async move {
+            let r = x.send(x.http.get(url)).await;
+            assert_eq!(r.status, 200, "{path}");
+            r.header("content-security-policy").unwrap()
+        }
+    };
+    let migrate = csp("/migrate").await;
+    assert!(migrate.contains("connect-src 'self' https: http:;"), "{migrate}");
+    assert!(migrate.contains("script-src 'self';") && migrate.contains("frame-ancestors 'none'"), "{migrate}");
+    let landing = csp("/").await;
+    assert!(landing.contains("connect-src 'self';"), "{landing}");
+}
