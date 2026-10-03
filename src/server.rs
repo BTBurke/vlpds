@@ -70,7 +70,10 @@ pub struct Config {
     pub report_service: Option<(String, String)>,
     /// None: the PDS's own getBlob URL.
     pub appview_cdn_url_pattern: Option<String>,
+    /// Relays told to crawl us (`xrpc::crawlers`) while the bucket's
+    /// `config/crawlers.json` sets none.
     pub crawlers: Vec<String>,
+    pub crawl_interval: Duration,
     pub dev_mode: bool,
     pub allow_bulk_create: bool,
     /// Empty: the dev KEK, dev mode only.
@@ -252,6 +255,7 @@ impl Default for Config {
             report_service: None,
             appview_cdn_url_pattern: None,
             crawlers: Vec::new(),
+            crawl_interval: xrpc::crawlers::DEFAULT_INTERVAL,
             dev_mode: true,
             allow_bulk_create: false,
             kek: Default::default(),
@@ -492,6 +496,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         did_resolver: Arc::new(crate::did_resolver::DidResolver::new(&cfg.plc_url, cfg.dev_mode)),
         http,
         ratelimit: Arc::new(crate::ratelimit::Limiter::new(&cfg)),
+        crawlers: Arc::new(xrpc::crawlers::Crawlers::new(&cfg.crawlers, cfg.crawl_interval)),
         secrets,
         plc,
         config: Arc::new(cfg),

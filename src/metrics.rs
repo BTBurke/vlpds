@@ -250,8 +250,8 @@ lazy!(UPSTREAM_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_upstre
 lazy!(UPSTREAM_DURATION: HistogramVec = register_histogram_vec!("vlpds_upstream_request_seconds", "Proxied request time until the upstream service's response head, by service (unreachable ones included)", &["service"], latency_buckets()));
 lazy!(HANDLE_RESOLUTIONS: IntCounterVec = register_int_counter_vec!("vlpds_handle_resolutions_total", "Custom-domain handle lookups by result (dns: TXT _atproto record; http: /.well-known/atproto-did; not_found: neither answered with a DID)", &["result"]));
 lazy!(IDENTITY_EVENTS: IntCounterVec = register_int_counter_vec!("vlpds_identity_events_total", "#identity and #account firehose events built (new accounts, handle changes, status changes), by kind", &["kind"]));
-lazy!(REQUEST_CRAWL: IntCounterVec = register_int_counter_vec!("vlpds_request_crawl_total", "requestCrawl calls to relays (at startup, and vlpds.admin.requestCrawl) by result (ok; rejected: non-2xx answer; failed: unreachable)", &["result"]));
-lazy!(REQUEST_CRAWL_LAST_OK: Gauge = register_gauge!("vlpds_request_crawl_last_success_time_seconds", "Unix time of this node's last requestCrawl a relay accepted (0: none since the process started)"));
+lazy!(REQUEST_CRAWL: IntCounterVec = register_int_counter_vec!("vlpds_request_crawl_total", "requestCrawl calls to relays (the slot-0 leader's startup/after-activity asks, and vlpds.admin.requestCrawl) by relay and result (ok; rejected: non-2xx answer; failed: unreachable)", &["relay", "result"]));
+lazy!(REQUEST_CRAWL_LAST_OK: GaugeVec = register_gauge_vec!("vlpds_request_crawl_last_success_time_seconds", "Unix time of this node's last requestCrawl the relay accepted (0: none since the process started)", &["relay"]));
 lazy!(ACCOUNTS: IntGaugeVec = register_int_gauge_vec!("vlpds_accounts", "Accounts on the shards this node has open, by status (active, deactivated, takendown, suspended, other); exact, kept per slot with every account change (crate::totals); sum over nodes for the PDS", &["status"]));
 lazy!(REPOS_WRITTEN_WITHIN: IntGaugeVec = register_int_gauge_vec!("vlpds_repos_written_within", "Repos on the shards this node has open whose latest commit's UTC day is within the window of today's (1d: yesterday or today; 7d, 30d), and all of them (all); exact, kept per slot with every commit", &["window"]));
 lazy!(CPU_CORES: Gauge = register_gauge!("vlpds_cpu_cores", "CPU cores available to this process (std::thread::available_parallelism: affinity and cgroup quota aware)"));
@@ -361,7 +361,6 @@ pub fn init_counters() {
         }
         LazyLock::force(&IMPORT_RESERVED_BYTES);
         LazyLock::force(&BLOB_UPLOAD_BYTES);
-        LazyLock::force(&REQUEST_CRAWL_LAST_OK);
         CPU_CORES.set(std::thread::available_parallelism().map_or(0, |n| n.get()) as f64);
         for method in ["password", "app_password", "oauth"] {
             for r in LOGIN_RESULTS {
@@ -387,11 +386,21 @@ pub fn init_counters() {
     });
 }
 
-pub fn request_crawl(result: &str) {
-    REQUEST_CRAWL.with_label_values(&[result]).inc();
+/// At 0 for each configured relay, so an alert sees its first failure.
+pub fn init_request_crawl(relays: &[String]) {
+    for relay in relays {
+        for r in ["ok", "rejected", "failed"] {
+            REQUEST_CRAWL.with_label_values(&[relay.as_str(), r]);
+        }
+        REQUEST_CRAWL_LAST_OK.with_label_values(&[relay]);
+    }
+}
+
+pub fn request_crawl(relay: &str, result: &str) {
+    REQUEST_CRAWL.with_label_values(&[relay, result]).inc();
     if result == "ok" {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
-        REQUEST_CRAWL_LAST_OK.set(now);
+        REQUEST_CRAWL_LAST_OK.with_label_values(&[relay]).set(now);
     }
 }
 
@@ -465,7 +474,6 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&REPORTS, &["ok", "failed"]),
     (&HANDLE_RESOLUTIONS, &["dns", "http", "not_found"]),
     (&IDENTITY_EVENTS, &["identity", "account"]),
-    (&REQUEST_CRAWL, &["ok", "rejected", "failed"]),
 ];
 
 /// Only nodes that run retention, so `VlpdsRetentionNotRunning` stays quiet

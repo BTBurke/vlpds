@@ -27,6 +27,7 @@ mod commit_cpu;
 mod common;
 mod compaction_polling;
 mod cost_defaults;
+mod crawlers;
 mod create_post;
 mod crud;
 mod ctl_shard_move;

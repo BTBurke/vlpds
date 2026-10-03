@@ -88,7 +88,6 @@ const AT_ZERO: &[&str] = &[
     r#"vlpds_upstream_requests_total{result="server_error",service="appview"}"#,
     r#"vlpds_upstream_request_seconds_count{service="appview"}"#,
     r#"vlpds_handle_resolutions_total{result="not_found"}"#,
-    r#"vlpds_request_crawl_total{result="failed"}"#,
     r#"vlpds_import_admissions_total{result="rejected"}"#,
     r#"vlpds_import_growths_total{result="rejected"}"#,
     r#"vlpds_import_wait_seconds_count{kind="admit"}"#,
@@ -118,11 +117,28 @@ const PRESENT: &[&str] = &[
     "vlpds_meta_cache_capacity_bytes",
 ];
 
+/// A local relay stand-in that accepts every requestCrawl.
+async fn accepting_relay() -> String {
+    let app = axum::Router::new().route("/xrpc/com.atproto.sync.requestCrawl", axum::routing::post(|| async { axum::Json(serde_json::json!({})) }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    url
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fresh_node_exports_alerting_counters_at_zero() {
-    let s = TestServer::spawn().await;
+    let relay = accepting_relay().await;
+    let r = relay.clone();
+    let s = TestServer::spawn_with(move |c| c.crawlers = vec![r]).await;
     let text = reqwest::get(format!("{}/metrics", s.url)).await.unwrap().text().await.unwrap();
     let series = parse(&text);
+    // per configured relay; the startup ask may already have counted "ok"
+    for result in ["failed", "rejected"] {
+        let name = format!(r#"vlpds_request_crawl_total{{relay="{relay}",result="{result}"}}"#);
+        assert_eq!(series.get(&name), Some(&0.0), "{name} at 0 on a fresh node");
+    }
+    assert!(series.contains_key(&format!(r#"vlpds_request_crawl_last_success_time_seconds{{relay="{relay}"}}"#)));
     for name in AT_ZERO {
         assert_eq!(series.get(*name), Some(&0.0), "{name} at 0 on a fresh node");
     }

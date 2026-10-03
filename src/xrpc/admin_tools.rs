@@ -10,7 +10,6 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/vlpds.admin.publishIdentity", post(publish_identity))
         .route("/xrpc/vlpds.admin.checkRepo", get(check_repo))
         .route("/xrpc/vlpds.admin.rebuildRepo", post(rebuild_repo))
-        .route("/xrpc/vlpds.admin.requestCrawl", post(request_crawl))
 }
 
 fn invalid(message: impl Into<String>) -> XrpcError {
@@ -377,50 +376,3 @@ async fn rebuild_repo(State(app): AppState, Auth(creds): Auth, Json(inp): Json<R
     Ok(Json(out))
 }
 
-#[derive(Deserialize, Default)]
-struct RequestCrawlIn {
-    /// Hostnames or URLs (default: `--crawlers`).
-    #[serde(default)]
-    relays: Vec<String>,
-}
-
-/// Unlike the startup crawl, reports each relay's result.
-async fn request_crawl(State(app): AppState, Auth(creds): Auth, body: Option<Json<RequestCrawlIn>>) -> XResult<Json<J>> {
-    require_admin(&creds)?;
-    let given = body.map(|Json(b)| b).unwrap_or_default().relays;
-    let relays: Vec<String> = if given.iter().any(|r| !r.trim().is_empty()) { given } else { app.config.crawlers.clone() }
-        .into_iter()
-        .map(|r| r.trim().trim_end_matches('/').to_string())
-        .filter(|r| !r.is_empty())
-        .collect();
-    if relays.is_empty() {
-        return Err(invalid("no relays given and none configured (--crawlers)"));
-    }
-    let hostname = super::sync::public_hostname(&app.config.public_url);
-    let client = crate::http::public();
-    let results = futures::future::join_all(relays.into_iter().map(|relay| {
-        let hostname = hostname.clone();
-        async move {
-            let base = if relay.contains("://") { relay.clone() } else { format!("https://{relay}") };
-            let url = format!("{base}/xrpc/com.atproto.sync.requestCrawl");
-            let r = client.post(&url).json(&json!({"hostname": hostname})).timeout(std::time::Duration::from_secs(10)).send().await;
-            crate::metrics::request_crawl(match &r {
-                Ok(r) if r.status().is_success() => "ok",
-                Ok(_) => "rejected",
-                Err(_) => "failed",
-            });
-            match r {
-                Ok(r) if r.status().is_success() => json!({"relay": relay, "url": url, "ok": true, "status": r.status().as_u16()}),
-                Ok(r) => {
-                    let st = r.status().as_u16();
-                    let body = r.text().await.unwrap_or_default();
-                    json!({"relay": relay, "url": url, "ok": false, "status": st, "error": body.chars().take(500).collect::<String>()})
-                }
-                Err(e) => json!({"relay": relay, "url": url, "ok": false, "error": e.to_string()}),
-            }
-        }
-    }))
-    .await;
-    tracing::info!(%hostname, relays = results.len(), ok = results.iter().filter(|r| r["ok"] == json!(true)).count(), "admin requestCrawl");
-    Ok(Json(json!({"hostname": hostname, "results": results})))
-}

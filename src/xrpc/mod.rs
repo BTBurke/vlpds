@@ -4,6 +4,7 @@
 mod account_stats;
 mod admin;
 mod admin_tools;
+pub mod crawlers;
 pub mod cas;
 mod email2fa;
 mod feature_level;
@@ -31,7 +32,7 @@ pub use account_stats::{export_account_totals, scan_totals, totals, totals_loadi
 pub use blobs::spawn_blob_gc;
 pub use server::{drop_revocation, set_delete_crash_hook, reset_token_did, revocation_expired, set_stale_claim_grace, spawn_reserved_key_gc, sweep_reserved_keys};
 pub use server::{auth_epoch, auth_epoch_cond, epoch_for_login, new_auth_epoch_op, AUTH_EPOCH};
-pub use sync::{export_memory_bytes, request_crawl, set_export_prefetch_max_bytes, size_export_prefetch_pool, DEFAULT_EXPORT_STALL, DEFAULT_MAX_EXPORTS};
+pub use sync::{export_memory_bytes, set_export_prefetch_max_bytes, size_export_prefetch_pool, DEFAULT_EXPORT_STALL, DEFAULT_MAX_EXPORTS};
 pub use import_budget::ImportBudget;
 pub use repo::DEFAULT_MAX_IMPORT_BYTES;
 pub use server::{LogMailer, Mail, Mailer};
@@ -99,6 +100,7 @@ pub struct App {
     pub log: Arc<crate::nodelog::NodeLog>,
     pub node: Arc<crate::node::Node>,
     pub ratelimit: Arc<crate::ratelimit::Limiter>,
+    pub crawlers: Arc<crawlers::Crawlers>,
     pub secrets: Arc<crate::secrets::Secrets>,
     /// None = DIDs minted locally and never registered (dev only).
     pub plc: Option<Arc<crate::plc::Plc>>,
@@ -296,7 +298,8 @@ pub fn router(app: Arc<App>) -> Router {
                 .merge(sync::routes())
                 .merge(blobs::routes())
                 .merge(admin::routes())
-                .merge(admin_tools::routes()),
+                .merge(admin_tools::routes())
+                .merge(crawlers::routes()),
         ))
         .merge(proxy::routes())
         .merge(oauth::routes())
@@ -312,6 +315,7 @@ pub fn router(app: Arc<App>) -> Router {
         .layer(tower_http::decompression::RequestDecompressionLayer::new())
         .fallback(proxy::fallback);
     ratelimits::start(&app);
+    crawlers::start(&app);
     let r = oauth::with_dpop_layer(r, &app);
     let r = if app.config.rate_limits_enabled {
         let limiter = app.ratelimit.clone();

@@ -1152,52 +1152,6 @@ async fn subscribe_repos(State(app): AppState, Query(q): Query<SubQ>, req: axum:
     app.firehose.upgrade(req, q.cursor, shard, client)
 }
 
-/// Failures are logged, not returned.
-pub async fn request_crawl(app: Arc<App>) {
-    let hostname = public_hostname(&app.config.public_url);
-    let client = crate::http::public();
-    let reqs = app
-        .config
-        .crawlers
-        .iter()
-        .filter(|c| !c.trim().is_empty())
-        .map(|crawler| {
-            let crawler = crawler.trim().trim_end_matches('/');
-            let base = if crawler.contains("://") {
-                crawler.to_string()
-            } else {
-                format!("https://{crawler}")
-            };
-            let url = format!("{base}/xrpc/com.atproto.sync.requestCrawl");
-            let hostname = hostname.clone();
-            async move {
-                match client
-                    .post(&url)
-                    .json(&json!({"hostname": hostname}))
-                    .timeout(std::time::Duration::from_secs(10))
-                    .send()
-                    .await
-                {
-                    Ok(r) if r.status().is_success() => {
-                        crate::metrics::request_crawl("ok");
-                        tracing::info!(%url, %hostname, "requestCrawl ok")
-                    }
-                    Ok(r) => {
-                        crate::metrics::request_crawl("rejected");
-                        let st = r.status();
-                        let body = r.text().await.unwrap_or_default();
-                        tracing::warn!(%url, %hostname, %st, %body, "requestCrawl rejected")
-                    }
-                    Err(e) => {
-                        crate::metrics::request_crawl("failed");
-                        tracing::warn!(%url, %hostname, "requestCrawl failed: {e}")
-                    }
-                }
-            }
-        });
-    futures::future::join_all(reqs).await;
-}
-
 /// "https://pds.example.com/" -> "pds.example.com" (port kept if present).
 pub(super) fn public_hostname(url: &str) -> String {
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);

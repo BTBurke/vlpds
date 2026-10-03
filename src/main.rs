@@ -365,9 +365,16 @@ struct Args {
     /// PDS's getBlob URL.
     #[arg(long, env = "VLPDS_BSKY_APP_VIEW_CDN_URL_PATTERN")]
     bsky_app_view_cdn_url_pattern: Option<String>,
-    /// Relays to send requestCrawl to at startup (comma-separated hostnames/urls).
-    #[arg(long, env = "VLPDS_CRAWLERS", value_delimiter = ',')]
+    /// Relays told to crawl this PDS (requestCrawl at startup and after new
+    /// activity; comma-separated hostnames or http(s) origins; empty for
+    /// none). A list set in the console (vlpds.admin.setCrawlers, stored in
+    /// the bucket) overrides this until reset.
+    #[arg(long, env = "VLPDS_CRAWLERS", value_delimiter = ',', default_value = "bsky.network")]
     crawlers: Vec<String>,
+    /// At most one requestCrawl per relay per this many seconds after
+    /// activity (the reference's 20 min). The console's value overrides it.
+    #[arg(long, env = "VLPDS_CRAWL_INTERVAL_SECS", default_value_t = 1200, value_parser = clap::value_parser!(u64).range(1..=604_800))]
+    crawl_interval_secs: u64,
     /// Dev mode: email/password tokens are logged instead of mailed, and the
     /// well-known dev secrets are accepted.
     #[arg(long, env = "VLPDS_DEV_MODE")]
@@ -1061,6 +1068,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         report_service: url_did(&args.report_service)?,
         appview_cdn_url_pattern: args.bsky_app_view_cdn_url_pattern.clone().filter(|p| !p.is_empty()),
         crawlers: args.crawlers.clone(),
+        crawl_interval: Duration::from_secs(args.crawl_interval_secs),
         dev_mode: args.dev_mode,
         allow_bulk_create: args.allow_bulk_create,
         kek: kek_config(&args)?,
@@ -1171,7 +1179,6 @@ async fn run(args: Args) -> anyhow::Result<()> {
     vlpds::xrpc::spawn_reserved_key_gc(app.clone());
     vlpds::oauth::gc::spawn_gc(app.clone());
     vlpds::xrpc::staged_import::spawn_import_gc(app.clone());
-    tokio::spawn(vlpds::xrpc::request_crawl(app.clone()));
     // Keep serving through a graceful shutdown: peers forward to us until
     // our handoff nudges reach them, and a forward we drop mid-request is
     // ambiguous to them (a client 503), while one we answer "not owned"
