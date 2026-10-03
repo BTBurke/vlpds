@@ -3786,7 +3786,7 @@ are stored as hashes.
 | OAuth codes, refresh tokens | `oauth/*` rows | hashes / MACs under keys derived from `jwt_secret` (unchanged) |
 | Sessions | `p/{did}\0sess/{id}` | ids only: tokens are JWTs under `jwt_secret` (unchanged) |
 | PLC rotation key | flag / env, or a KEK-wrapped file (`--plc-rotation-key-file`) | never in the bucket; unwrapped at startup ("PLC identity") |
-| `jwt_secret`, admin / internal tokens, SMTP credentials | flags / env | never in the bucket |
+| `jwt_secret`, admin / internal tokens, S3 keys, SMTP credentials, rate-limit bypass key | flags / env, or files (`--<name>-file`, RUNBOOK "Secrets as files") | never in the bucket |
 | DPoP keys | clients | never on the server |
 
 **Wrapping.** A `KeyWrapper` holds one KEK and wraps a secret with

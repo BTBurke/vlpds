@@ -379,3 +379,112 @@ async fn the_binary_runs_admin_commands() {
     let o = run_bin(vec!["admin".into(), "--url".into(), s.url.clone(), "account".into(), "takedown".into(), "nope".into()]).await;
     assert!(!o.status.success());
 }
+
+fn secret_file(name: &str, contents: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("vlpds-cli-{name}-{}-{}", std::process::id(), rand::random::<u64>()));
+    std::fs::write(&p, contents).unwrap();
+    p
+}
+
+const SECRET_ENV: &[&str] = &[
+    "VLPDS_JWT_SECRET",
+    "VLPDS_JWT_SECRET_FILE",
+    "VLPDS_ADMIN_TOKEN",
+    "VLPDS_ADMIN_TOKEN_FILE",
+    "VLPDS_INTERNAL_TOKEN",
+    "VLPDS_INTERNAL_TOKEN_FILE",
+    "VLPDS_S3_ACCESS_KEY",
+    "VLPDS_S3_ACCESS_KEY_FILE",
+    "VLPDS_S3_SECRET_KEY",
+    "VLPDS_S3_SECRET_KEY_FILE",
+    "VLPDS_DEV_MODE",
+];
+
+/// `vlpds admin` reads the token from VLPDS_ADMIN_TOKEN_FILE (as the node's
+/// container provides it); VLPDS_ADMIN_TOKEN wins over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_binary_reads_the_admin_token_file() {
+    let s = TestServer::spawn().await;
+    let bin = env!("CARGO_BIN_EXE_vlpds");
+    let good = secret_file("admin-good", &format!("{}\n", vlpds::server::DEV_ADMIN_TOKEN));
+    let bad = secret_file("admin-bad", "not-the-admin-token\n");
+    let run_bin = |env: Vec<(&'static str, String)>| {
+        let url = s.url.clone();
+        async move {
+            let mut c = tokio::process::Command::new(bin);
+            c.args(["admin", "--url", &url, "account", "list", "--json"]);
+            for k in SECRET_ENV {
+                c.env_remove(k);
+            }
+            c.envs(env).output().await.unwrap()
+        }
+    };
+    let file = |p: &std::path::Path| ("VLPDS_ADMIN_TOKEN_FILE", p.display().to_string());
+    let o = run_bin(vec![file(&good)]).await;
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let o = run_bin(vec![file(&bad)]).await;
+    assert!(!o.status.success(), "a wrong token from the file is used");
+    let o = run_bin(vec![file(&bad), ("VLPDS_ADMIN_TOKEN", vlpds::server::DEV_ADMIN_TOKEN.into())]).await;
+    assert!(o.status.success(), "VLPDS_ADMIN_TOKEN wins: {}", String::from_utf8_lossy(&o.stderr));
+    let missing = std::env::temp_dir().join("vlpds-cli-admin-missing");
+    let o = run_bin(vec![file(&missing)]).await;
+    assert!(String::from_utf8_lossy(&o.stderr).contains("--admin-token-file"), "{}", String::from_utf8_lossy(&o.stderr));
+    for p in [good, bad] {
+        std::fs::remove_file(p).unwrap();
+    }
+}
+
+/// The node's `--<secret>-file` options: read at startup (one trailing
+/// newline dropped), refused when empty or together with the plain form
+/// (flag or env), and never echoed.
+#[tokio::test]
+async fn the_node_reads_secret_files() {
+    let bin = env!("CARGO_BIN_EXE_vlpds");
+    let run = |args: Vec<String>, env: Vec<(&'static str, String)>| async move {
+        let mut c = tokio::process::Command::new(bin);
+        c.arg("--memory").args(args);
+        for k in SECRET_ENV {
+            c.env_remove(k);
+        }
+        let o = c.envs(env).output().await.unwrap();
+        (o.status.code(), String::from_utf8_lossy(&o.stderr).into_owned())
+    };
+    let long = "a-jwt-secret-of-well-over-32-bytes-0123456789";
+    let jwt = secret_file("jwt", &format!("{long}\n"));
+    let short = secret_file("short", "shhh-short\n");
+    let empty = secret_file("empty", "\n");
+    let path = |p: &std::path::Path| p.display().to_string();
+
+    // A short secret from the file is refused for its length, not as unset.
+    let (code, err) = run(vec!["--jwt-secret-file".into(), path(&short)], vec![]).await;
+    assert_ne!(code, Some(0));
+    assert!(err.contains("VLPDS_JWT_SECRET must be at least"), "{err}");
+    assert!(!err.contains("shhh-short"), "secret echoed: {err}");
+    let (_, err) = run(vec!["--jwt-secret-file".into(), path(&jwt), "--admin-token-file".into(), path(&short)], vec![]).await;
+    assert!(err.contains("VLPDS_ADMIN_TOKEN must be at least"), "{err}");
+    let env = vec![("VLPDS_JWT_SECRET_FILE", path(&jwt)), ("VLPDS_ADMIN_TOKEN_FILE", path(&jwt)), ("VLPDS_INTERNAL_TOKEN_FILE", path(&short))];
+    let (_, err) = run(vec![], env).await;
+    assert!(err.contains("VLPDS_INTERNAL_TOKEN must be at least"), "{err}");
+
+    let (code, err) = run(vec!["--rate-limit-bypass-key-file".into(), path(&empty)], vec![]).await;
+    assert_ne!(code, Some(0));
+    assert!(err.contains("--rate-limit-bypass-key-file") && err.contains("is empty"), "{err}");
+
+    // Flag + file and env + file conflict; the S3 defaults don't count.
+    for (args, env) in [
+        (vec!["--jwt-secret".to_string(), long.into(), "--jwt-secret-file".into(), path(&jwt)], vec![]),
+        (vec!["--internal-token-file".into(), path(&jwt)], vec![("VLPDS_INTERNAL_TOKEN", long.to_string())]),
+        (vec![], vec![("VLPDS_S3_SECRET_KEY", long.to_string()), ("VLPDS_S3_SECRET_KEY_FILE", path(&jwt))]),
+        (vec!["--email-smtp-url".into(), "smtp://x".into(), "--email-smtp-url-file".into(), path(&jwt)], vec![]),
+    ] {
+        let (code, err) = run(args, env).await;
+        assert_eq!(code, Some(2), "{err}");
+        assert!(err.contains("cannot be used with"), "{err}");
+        assert!(!err.contains(long), "secret echoed: {err}");
+    }
+    let (_, err) = run(vec!["--s3-access-key-file".into(), path(&short)], vec![]).await;
+    assert!(!err.contains("cannot be used with"), "{err}");
+    for p in [jwt, short, empty] {
+        std::fs::remove_file(p).unwrap();
+    }
+}

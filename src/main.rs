@@ -64,14 +64,25 @@ struct Args {
     /// only with --dev-mode).
     #[arg(long, env = "VLPDS_JWT_SECRET", hide_env_values = true)]
     jwt_secret: Option<String>,
+    /// File holding --jwt-secret (one trailing newline ignored). Every
+    /// secret flag has a -file form; prefer it in production, where env vars
+    /// show in `docker inspect`.
+    #[arg(long, env = "VLPDS_JWT_SECRET_FILE", conflicts_with = "jwt_secret")]
+    jwt_secret_file: Option<std::path::PathBuf>,
     /// Admin Basic-auth token (>= 32 bytes; dev default only with --dev-mode).
     #[arg(long, env = "VLPDS_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
+    /// File holding --admin-token (also read by `vlpds admin`).
+    #[arg(long, env = "VLPDS_ADMIN_TOKEN_FILE", conflicts_with = "admin_token")]
+    admin_token_file: Option<std::path::PathBuf>,
     /// Node-to-node token (`x-vlpds-internal`), the same on every node of a
     /// cluster (>= 32 bytes, distinct from the admin token; dev default only
     /// with --dev-mode).
     #[arg(long, env = "VLPDS_INTERNAL_TOKEN", hide_env_values = true)]
     internal_token: Option<String>,
+    /// File holding --internal-token.
+    #[arg(long, env = "VLPDS_INTERNAL_TOKEN_FILE", conflicts_with = "internal_token")]
+    internal_token_file: Option<std::path::PathBuf>,
 
     #[arg(
         long,
@@ -84,9 +95,15 @@ struct Args {
     /// S3 access key (the MinIO default is refused without --dev-mode).
     #[arg(long, env = "VLPDS_S3_ACCESS_KEY", default_value = server::DEV_S3_CREDENTIAL, hide_env_values = true, hide_default_value = true)]
     s3_access_key: String,
+    /// File holding --s3-access-key.
+    #[arg(long, env = "VLPDS_S3_ACCESS_KEY_FILE", conflicts_with = "s3_access_key")]
+    s3_access_key_file: Option<std::path::PathBuf>,
     /// S3 secret key (the MinIO default is refused without --dev-mode).
     #[arg(long, env = "VLPDS_S3_SECRET_KEY", default_value = server::DEV_S3_CREDENTIAL, hide_env_values = true, hide_default_value = true)]
     s3_secret_key: String,
+    /// File holding --s3-secret-key.
+    #[arg(long, env = "VLPDS_S3_SECRET_KEY_FILE", conflicts_with = "s3_secret_key")]
+    s3_secret_key_file: Option<std::path::PathBuf>,
     #[arg(long, env = "VLPDS_S3_REGION", default_value = "us-east-1")]
     s3_region: String,
     /// Key prefix inside the bucket (one prefix = one PDS).
@@ -425,6 +442,9 @@ struct Args {
     /// (DESIGN.md "Email").
     #[arg(long, env = "VLPDS_EMAIL_SMTP_URL", hide_env_values = true)]
     email_smtp_url: Option<String>,
+    /// File holding --email-smtp-url (it may carry SMTP credentials).
+    #[arg(long, env = "VLPDS_EMAIL_SMTP_URL_FILE", conflicts_with = "email_smtp_url")]
+    email_smtp_url_file: Option<std::path::PathBuf>,
     /// From address for email ("addr@host" or "Name <addr@host>"); falls
     /// back to PDS_EMAIL_FROM_ADDRESS. Required with --email-smtp-url.
     #[arg(long, env = "VLPDS_EMAIL_FROM_ADDRESS")]
@@ -453,6 +473,9 @@ struct Args {
     /// Unset: admin sendEmail goes through the main mailer.
     #[arg(long, env = "VLPDS_MODERATION_EMAIL_SMTP_URL", hide_env_values = true)]
     moderation_email_smtp_url: Option<String>,
+    /// File holding --moderation-email-smtp-url.
+    #[arg(long, env = "VLPDS_MODERATION_EMAIL_SMTP_URL_FILE", conflicts_with = "moderation_email_smtp_url")]
+    moderation_email_smtp_url_file: Option<std::path::PathBuf>,
     /// From address for moderation mail (falls back to
     /// PDS_MODERATION_EMAIL_ADDRESS). Required with --moderation-email-smtp-url.
     #[arg(long, env = "VLPDS_MODERATION_EMAIL_ADDRESS")]
@@ -580,8 +603,11 @@ struct Args {
     #[arg(long, env = "VLPDS_PEER_CONNECTIONS", default_value_t = vlpds::http::DEFAULT_PEER_CONNECTIONS)]
     peer_connections: usize,
     /// `x-ratelimit-bypass` header value that skips rate limits.
-    #[arg(long, env = "VLPDS_RATE_LIMIT_BYPASS_KEY")]
+    #[arg(long, env = "VLPDS_RATE_LIMIT_BYPASS_KEY", hide_env_values = true)]
     rate_limit_bypass_key: Option<String>,
+    /// File holding --rate-limit-bypass-key.
+    #[arg(long, env = "VLPDS_RATE_LIMIT_BYPASS_KEY_FILE", conflicts_with = "rate_limit_bypass_key")]
+    rate_limit_bypass_key_file: Option<std::path::PathBuf>,
     /// Memory budget of the in-memory caches (verified tokens, proxy
     /// accounts and service JWTs, DID documents, lexicons, OAuth clients),
     /// split between them by weight (MiB). Default: 10% of the memory
@@ -688,6 +714,11 @@ struct AdminArgs {
     /// Admin token (default: the dev token).
     #[arg(long, global = true, env = "VLPDS_ADMIN_TOKEN", hide_env_values = true)]
     admin_token: Option<String>,
+    /// File holding the admin token, as the node's (one trailing newline
+    /// ignored). --admin-token / VLPDS_ADMIN_TOKEN win over it, so a token
+    /// given by hand works inside the node's container too.
+    #[arg(long, global = true, env = "VLPDS_ADMIN_TOKEN_FILE")]
+    admin_token_file: Option<std::path::PathBuf>,
     /// Print raw JSON results instead of tables.
     #[arg(long, global = true)]
     json: bool,
@@ -798,23 +829,51 @@ fn admin_main(args: AdminArgs) -> anyhow::Result<()> {
         AdminCmd::Tls(cmd) => return tls_main(cmd),
         AdminCmd::Ops(cmd) => cmd,
     };
-    let token = args.admin_token.unwrap_or_else(|| server::DEV_ADMIN_TOKEN.to_string());
+    let token = admin_token(&args.admin_token, &args.admin_token_file)?;
     let opts = vlpds::cli::admin::Opts { url: args.url, token, json: args.json };
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(vlpds::cli::admin::run(cmd, &opts, &mut std::io::stdout()))
+}
+
+fn admin_token(token: &Option<String>, file: &Option<std::path::PathBuf>) -> anyhow::Result<String> {
+    match (token, file) {
+        (Some(t), _) => Ok(t.clone()),
+        (None, Some(p)) => vlpds::secret_file::read("admin-token-file", p),
+        (None, None) => Ok(server::DEV_ADMIN_TOKEN.to_string()),
+    }
+}
+
+/// Replaces each secret given as a file with the file's contents, before
+/// anything reads the plain fields.
+fn read_secret_files(args: &mut Args) -> anyhow::Result<()> {
+    use vlpds::secret_file::{read, resolve};
+    resolve("jwt-secret-file", &args.jwt_secret_file, &mut args.jwt_secret)?;
+    resolve("admin-token-file", &args.admin_token_file, &mut args.admin_token)?;
+    resolve("internal-token-file", &args.internal_token_file, &mut args.internal_token)?;
+    resolve("email-smtp-url-file", &args.email_smtp_url_file, &mut args.email_smtp_url)?;
+    resolve("moderation-email-smtp-url-file", &args.moderation_email_smtp_url_file, &mut args.moderation_email_smtp_url)?;
+    resolve("rate-limit-bypass-key-file", &args.rate_limit_bypass_key_file, &mut args.rate_limit_bypass_key)?;
+    if let Some(p) = &args.s3_access_key_file {
+        args.s3_access_key = read("s3-access-key-file", p)?;
+    }
+    if let Some(p) = &args.s3_secret_key_file {
+        args.s3_secret_key = read("s3-secret-key-file", p)?;
+    }
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("admin") {
         return admin_main(AdminArgs::parse_from(std::env::args().skip(1)));
     }
-    let args = Args::parse();
+    let mut args = Args::parse();
     if args.generate_did_key {
         let key = vlpds::crypto::Keypair::generate();
         println!("private key (hex): {}", hex::encode(key.to_bytes().as_slice()));
         println!("did:key: {}", key.did_key());
         return Ok(());
     }
+    read_secret_files(&mut args)?;
     init_logging(args.log_format)?;
     vlpds::lifecycle::install_panic_hook();
     raise_nofile_limit();

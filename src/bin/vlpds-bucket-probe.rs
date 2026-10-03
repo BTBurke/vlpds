@@ -4,7 +4,8 @@
 //!       --s3-bucket my-bucket [--prefix p] [--ops 200] [--concurrency 4] [--json out.json]
 //!
 //! Uses the node's client (`vlpds::store::Store::s3`: same HTTP pool, timeouts,
-//! path-style addressing) and the node's `VLPDS_S3_*` env vars. Everything is
+//! path-style addressing) and the node's `VLPDS_S3_*` env vars (credentials
+//! also as `VLPDS_S3_{ACCESS,SECRET}_KEY_FILE`). Everything is
 //! written under a fresh `vlpds-probe/<random>/` prefix (or `--prefix`, which
 //! must be empty) and deleted at the end unless `--keep`.
 //!
@@ -38,10 +39,16 @@ struct Args {
     s3_endpoint: String,
     #[arg(long, env = "VLPDS_S3_BUCKET", default_value = "vlpds")]
     s3_bucket: String,
-    #[arg(long, env = "VLPDS_S3_ACCESS_KEY", default_value = "minioadmin")]
+    #[arg(long, env = "VLPDS_S3_ACCESS_KEY", default_value = "minioadmin", hide_env_values = true)]
     s3_access_key: String,
+    /// File holding --s3-access-key (as the node's).
+    #[arg(long, env = "VLPDS_S3_ACCESS_KEY_FILE", conflicts_with = "s3_access_key")]
+    s3_access_key_file: Option<std::path::PathBuf>,
     #[arg(long, env = "VLPDS_S3_SECRET_KEY", default_value = "minioadmin", hide_env_values = true)]
     s3_secret_key: String,
+    /// File holding --s3-secret-key (as the node's).
+    #[arg(long, env = "VLPDS_S3_SECRET_KEY_FILE", conflicts_with = "s3_secret_key")]
+    s3_secret_key_file: Option<std::path::PathBuf>,
     #[arg(long, env = "VLPDS_S3_REGION", default_value = "us-east-1")]
     s3_region: String,
     /// Key prefix to work under (must be empty). Default: vlpds-probe/<random>.
@@ -649,7 +656,13 @@ async fn main() {
     });
 }
 
-async fn run(args: Args) -> anyhow::Result<bool> {
+async fn run(mut args: Args) -> anyhow::Result<bool> {
+    if let Some(p) = &args.s3_access_key_file {
+        args.s3_access_key = vlpds::secret_file::read("s3-access-key-file", p)?;
+    }
+    if let Some(p) = &args.s3_secret_key_file {
+        args.s3_secret_key = vlpds::secret_file::read("s3-secret-key-file", p)?;
+    }
     let cfg = S3Config {
         endpoint: args.s3_endpoint.clone(),
         bucket: args.s3_bucket.clone(),

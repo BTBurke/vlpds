@@ -44,6 +44,7 @@ pub mod real_dist;
 pub mod recent_writes;
 pub mod remote;
 pub mod retention;
+pub mod secret_file;
 pub mod secrets;
 pub mod segment;
 pub mod slots;

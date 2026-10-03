@@ -212,7 +212,9 @@ shards. That is expensive, so don't run it on a schedule.
 
 `vlpds admin [--url URL] [--admin-token T] [--json] <command>` talks admin
 XRPC to one node (the three flags are accepted before or after the command) (`--url`, default `http://127.0.0.1:2583`, env `VLPDS_URL`;
-token from `VLPDS_ADMIN_TOKEN`, as the node's). Any node will do: calls naming
+token from `VLPDS_ADMIN_TOKEN`, else the file `--admin-token-file` /
+`VLPDS_ADMIN_TOKEN_FILE` names, as the node's: `docker exec vlpds vlpds admin
+...` needs no token argument). Any node will do: calls naming
 a DID are routed to the repo's owner, and the per-node maintenance commands
 (`rotate-plc-keys`, `rewrap-secrets`) are sent to every node that
 `getClusterStatus` lists (`--node-only`: just `--url`); shards that moved
@@ -1444,6 +1446,28 @@ nodes must trust the CA every node's cert comes from; mid CA rotation, both).
 ---
 
 ## Procedures
+
+### Secrets as files
+
+Every secret setting can be read from a file instead of the environment
+(env vars show in `docker inspect` and in a compose file). The node reads each
+file once at startup, drops one trailing newline, and refuses to start on an
+unreadable or empty file or when the plain form is also set (flag or env).
+
+| Secret | Plain | File |
+|---|---|---|
+| JWT secret | `VLPDS_JWT_SECRET` | `--jwt-secret-file` / `VLPDS_JWT_SECRET_FILE` |
+| Admin token | `VLPDS_ADMIN_TOKEN` | `--admin-token-file` / `VLPDS_ADMIN_TOKEN_FILE` (also `vlpds admin`) |
+| Internal token | `VLPDS_INTERNAL_TOKEN` | `--internal-token-file` / `VLPDS_INTERNAL_TOKEN_FILE` |
+| S3 access / secret key | `VLPDS_S3_ACCESS_KEY`, `VLPDS_S3_SECRET_KEY` | `--s3-access-key-file`, `--s3-secret-key-file` / `VLPDS_S3_*_KEY_FILE` (also `vlpds-bucket-probe`) |
+| SMTP URLs (credentials) | `VLPDS_EMAIL_SMTP_URL`, `VLPDS_MODERATION_EMAIL_SMTP_URL` | `--email-smtp-url-file`, `--moderation-email-smtp-url-file` / `VLPDS_*_SMTP_URL_FILE` |
+| Rate-limit bypass key | `VLPDS_RATE_LIMIT_BYPASS_KEY` | `--rate-limit-bypass-key-file` / `VLPDS_RATE_LIMIT_BYPASS_KEY_FILE` |
+| KEK, PLC rotation key, GCP credentials | `VLPDS_KEK`, `VLPDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` | `--kek-file`, `--plc-rotation-key-file`, `--gcp-credentials-file` ([KEK provisioning](#kek-provisioning)) |
+
+The Ansible role (`deploy/ansible/roles/vlpds`) writes each to
+`<vlpds_secrets_path>/<name>` (0400, uid 10001), mounted read-only at
+`/run/vlpds`, and sets only the `_FILE` variables. A changed secret restarts
+the node gracefully on the next run.
 
 ### KEK provisioning
 
