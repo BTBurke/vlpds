@@ -68,7 +68,8 @@ async fn random_lifecycles_match_a_scan() {
     check(&[&s], "start").await;
     let mut done = std::collections::BTreeMap::<&str, usize>::new();
     for step in 0..80 {
-        let op = if live.len() < 3 { 0 } else { rng.gen_range(0..12) };
+        // every op once first, so each kind is exercised whatever the seed
+        let op = if live.len() < 3 { 0 } else if step < 12 { step } else { rng.gen_range(0..12) };
         let i = rng.gen_range(0..live.len().max(1));
         let ok = match op {
             0 => {
@@ -85,7 +86,7 @@ async fn random_lifecycles_match_a_scan() {
             3 => ("deactivate", s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &live[i].auth()).await.is_ok()),
             4 => ("activate", s.xrpc.post_empty("com.atproto.server.activateAccount", &live[i].auth()).await.is_ok()),
             5 => {
-                let applied = rng.gen_bool(0.6);
+                let applied = step < 12 || rng.gen_bool(0.6);
                 set_repo_takedown(&s, &live[i].did, applied).await;
                 (if applied { "takedown" } else { "untakedown" }, true)
             }
