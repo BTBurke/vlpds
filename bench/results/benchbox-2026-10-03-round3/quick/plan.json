@@ -1,0 +1,108 @@
+{
+ "name": "benchbox-2026-10-03-round3/quick",
+ "profile": "quick",
+ "scale": "benchbox",
+ "created": 1790993619.759725,
+ "shas": [
+  "b252b08"
+ ],
+ "fmt": {
+  "b252b08": "eff9d72"
+ },
+ "baseline": "benchbox-2026-10-02-round2",
+ "steps": [
+  {
+   "id": "grid-1m-inj25",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "q-g1m25",
+    "1000000",
+    "50000",
+    "25",
+    "25000,50000,75000"
+   ],
+   "env": {
+    "OUT": "grid-1m-inj25.jsonl"
+   },
+   "est_s": 140,
+   "sha": "b252b08"
+  },
+  {
+   "id": "grid-10k-inj25",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "q-g10k25",
+    "10000",
+    "5000",
+    "25",
+    "25000,50000,75000"
+   ],
+   "env": {
+    "OUT": "grid-10k-inj25.jsonl"
+   },
+   "est_s": 120,
+   "sha": "b252b08"
+  },
+  {
+   "id": "sweep",
+   "driver": "bench.py",
+   "args": [
+    "sweep",
+    "1000000,10000000"
+   ],
+   "env": {
+    "OUT": "sweep.jsonl"
+   },
+   "est_s": 400,
+   "sha": "b252b08"
+  },
+  {
+   "id": "methods",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "b252b08"
+  },
+  {
+   "id": "proxy",
+   "driver": "bench.py",
+   "args": [
+    "proxy",
+    "1000000",
+    "512"
+   ],
+   "env": {
+    "OUT": "proxy.jsonl",
+    "PROXY_TOTAL": "1000000"
+   },
+   "est_s": 75,
+   "sha": "b252b08"
+  },
+  {
+   "id": "failover",
+   "driver": "bench.py",
+   "args": [
+    "cluster",
+    "1000000",
+    "50000",
+    "25",
+    "10000"
+   ],
+   "env": {
+    "OUT": "cluster.jsonl",
+    "FAILOVER_RATE": "10000"
+   },
+   "est_s": 270,
+   "sha": "b252b08"
+  }
+ ]
+}

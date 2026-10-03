@@ -1,0 +1,200 @@
+{
+ "name": "benchbox-2026-10-03-round3/ab",
+ "profile": "custom",
+ "scale": "benchbox",
+ "created": 1790998321.197089,
+ "shas": [
+  "999f7f0",
+  "b252b08",
+  "8be1e84"
+ ],
+ "fmt": {
+  "8be1e84": "eff9d72",
+  "b252b08": "eff9d72",
+  "999f7f0": "999f7f0"
+ },
+ "baseline": "",
+ "steps": [
+  {
+   "id": "ab-grid1m-8be1e84-r1",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab1m-8be1e84",
+    "1000000",
+    "50000",
+    "25",
+    "25000,50000,75000"
+   ],
+   "env": {
+    "OUT": "ab-grid-1m-inj25.jsonl"
+   },
+   "est_s": 140,
+   "sha": "8be1e84"
+  },
+  {
+   "id": "ab-grid1m-b252b08-r1",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab1m-b252b08",
+    "1000000",
+    "50000",
+    "25",
+    "25000,50000,75000"
+   ],
+   "env": {
+    "OUT": "ab-grid-1m-inj25.jsonl"
+   },
+   "est_s": 140,
+   "sha": "b252b08"
+  },
+  {
+   "id": "ab-grid1m-b252b08-r2",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab1m-b252b08",
+    "1000000",
+    "50000",
+    "25",
+    "25000,50000,75000"
+   ],
+   "env": {
+    "OUT": "ab-grid-1m-inj25.jsonl"
+   },
+   "est_s": 140,
+   "sha": "b252b08"
+  },
+  {
+   "id": "ab-grid1m-8be1e84-r2",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab1m-8be1e84",
+    "1000000",
+    "50000",
+    "25",
+    "25000,50000,75000"
+   ],
+   "env": {
+    "OUT": "ab-grid-1m-inj25.jsonl"
+   },
+   "est_s": 140,
+   "sha": "8be1e84"
+  },
+  {
+   "id": "sweep-999f7f0",
+   "driver": "bench.py",
+   "args": [
+    "sweep",
+    "1000000,10000000"
+   ],
+   "env": {
+    "OUT": "sweep-999f7f0.jsonl"
+   },
+   "est_s": 400,
+   "sha": "999f7f0"
+  },
+  {
+   "id": "ab-sweep1m-8be1e84-r1",
+   "driver": "bench.py",
+   "args": [
+    "sweep",
+    "1000000"
+   ],
+   "env": {
+    "OUT": "ab-sweep-1m.jsonl"
+   },
+   "est_s": 120,
+   "sha": "8be1e84"
+  },
+  {
+   "id": "ab-sweep1m-b252b08-r1",
+   "driver": "bench.py",
+   "args": [
+    "sweep",
+    "1000000"
+   ],
+   "env": {
+    "OUT": "ab-sweep-1m.jsonl"
+   },
+   "est_s": 120,
+   "sha": "b252b08"
+  },
+  {
+   "id": "ab-sweep1m-b252b08-r2",
+   "driver": "bench.py",
+   "args": [
+    "sweep",
+    "1000000"
+   ],
+   "env": {
+    "OUT": "ab-sweep-1m.jsonl"
+   },
+   "est_s": 120,
+   "sha": "b252b08"
+  },
+  {
+   "id": "ab-sweep1m-8be1e84-r2",
+   "driver": "bench.py",
+   "args": [
+    "sweep",
+    "1000000"
+   ],
+   "env": {
+    "OUT": "ab-sweep-1m.jsonl"
+   },
+   "est_s": 120,
+   "sha": "8be1e84"
+  },
+  {
+   "id": "acctstatus-b252b08-r1",
+   "driver": "acctstatus.py",
+   "args": [
+    "1000000"
+   ],
+   "env": {
+    "OUT": "acctstatus.jsonl"
+   },
+   "est_s": 120,
+   "sha": "b252b08"
+  },
+  {
+   "id": "acctstatus-999f7f0-r1",
+   "driver": "acctstatus.py",
+   "args": [
+    "1000000"
+   ],
+   "env": {
+    "OUT": "acctstatus.jsonl"
+   },
+   "est_s": 120,
+   "sha": "999f7f0"
+  },
+  {
+   "id": "acctstatus-999f7f0-r2",
+   "driver": "acctstatus.py",
+   "args": [
+    "1000000"
+   ],
+   "env": {
+    "OUT": "acctstatus.jsonl"
+   },
+   "est_s": 120,
+   "sha": "999f7f0"
+  },
+  {
+   "id": "acctstatus-b252b08-r2",
+   "driver": "acctstatus.py",
+   "args": [
+    "1000000"
+   ],
+   "env": {
+    "OUT": "acctstatus.jsonl"
+   },
+   "est_s": 120,
+   "sha": "b252b08"
+  }
+ ]
+}
