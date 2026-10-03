@@ -14,7 +14,6 @@ use crate::mst_lazy::{Key, Source};
 use crate::state;
 use slatedb::DbReadOps;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 type Result<T> = std::result::Result<T, MstError>;
@@ -83,7 +82,137 @@ impl NodeCache {
 }
 
 /// Persisted nodes read ahead of a walk by one scan of the repo's `M/` range.
-pub type Prefetched = HashMap<Cid, Arc<[u8]>>;
+/// [`prefetch_tree`] keeps the height-1 nodes (~70% of `M/`) apart, to let
+/// them go when the rest wouldn't fit.
+#[derive(Default)]
+pub struct Prefetched {
+    upper: Arena,
+    h1: Arena,
+    h1_dropped: bool,
+}
+
+impl Prefetched {
+    pub fn get(&self, cid: &Cid) -> Option<&[u8]> {
+        self.upper.get(cid).or_else(|| self.h1.get(cid))
+    }
+
+    pub fn len(&self) -> usize {
+        self.upper.index.len() + self.h1.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The blocks' own bytes.
+    pub fn node_bytes(&self) -> usize {
+        self.upper.node_bytes + self.h1.node_bytes
+    }
+
+    pub fn heap_bytes(&self) -> usize {
+        self.upper.heap_bytes() + self.h1.heap_bytes()
+    }
+
+    /// The `persist_min` to walk the tree with: 2 once the height-1 nodes
+    /// were let go (the walk rebuilds them from records instead of reading
+    /// each).
+    pub fn persist_min(&self) -> i32 {
+        if self.h1_dropped {
+            2
+        } else {
+            1
+        }
+    }
+}
+
+/// Blocks in digest order, each behind its digest and length in a few large
+/// buffers, indexed by a sorted array: [`Arena::heap_bytes`] is all it holds
+/// (no allocation per node), so a budget can be checked before each node.
+#[derive(Default)]
+struct Arena {
+    chunks: Vec<Vec<u8>>,
+    index: Vec<PrefetchEnt>,
+    node_bytes: usize,
+}
+
+struct PrefetchEnt {
+    /// The digest's first 8 bytes, big-endian: the index's sort key.
+    prefix: u64,
+    chunk: u32,
+    off: u32,
+}
+
+const PREFETCH_CHUNK: usize = 1 << 20;
+/// Digest, then the block's length (u32 LE).
+const PREFETCH_HEAD: usize = 32 + 4;
+
+impl Arena {
+    fn heap_bytes(&self) -> usize {
+        self.chunk_bytes() + self.index.capacity() * std::mem::size_of::<PrefetchEnt>()
+    }
+
+    fn chunk_bytes(&self) -> usize {
+        self.chunks.iter().map(|c| c.capacity()).sum()
+    }
+
+    /// [`heap_bytes`](Self::heap_bytes) once a block of `len` bytes is added
+    /// (an index that grows holds both arrays while it copies).
+    fn heap_bytes_with(&self, len: usize) -> usize {
+        let mut h = self.heap_bytes();
+        if self.chunk_full(len) {
+            h += self.next_chunk(len);
+        }
+        if self.index.len() == self.index.capacity() {
+            h += self.index.capacity().max(4) * 2 * std::mem::size_of::<PrefetchEnt>();
+        }
+        h
+    }
+
+    fn chunk_full(&self, len: usize) -> bool {
+        self.chunks.last().is_none_or(|c| c.capacity() - c.len() < PREFETCH_HEAD + len)
+    }
+
+    /// Chunks double from 4 KiB, so a small repo's read-ahead stays small.
+    fn next_chunk(&self, len: usize) -> usize {
+        self.chunk_bytes().clamp(4096, PREFETCH_CHUNK).max(PREFETCH_HEAD + len)
+    }
+
+    /// In ascending digest order.
+    fn push(&mut self, digest: &[u8; 32], b: &[u8]) {
+        if self.chunk_full(b.len()) {
+            let n = self.next_chunk(b.len());
+            self.chunks.push(Vec::with_capacity(n));
+        }
+        let chunk = self.chunks.len() - 1;
+        let c = &mut self.chunks[chunk];
+        let off = c.len() as u32;
+        c.extend_from_slice(digest);
+        c.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        c.extend_from_slice(b);
+        self.index.push(PrefetchEnt { prefix: digest_prefix(digest), chunk: chunk as u32, off });
+        self.node_bytes += b.len();
+    }
+
+    fn get(&self, cid: &Cid) -> Option<&[u8]> {
+        if cid.codec != CODEC_DAG_CBOR || self.index.is_empty() {
+            return None;
+        }
+        let p = digest_prefix(&cid.digest);
+        let i = self.index.partition_point(|e| e.prefix < p);
+        for e in self.index[i..].iter().take_while(|e| e.prefix == p) {
+            let c = &self.chunks[e.chunk as usize][e.off as usize..];
+            if c[..32] == cid.digest {
+                let len = u32::from_le_bytes(c[32..PREFETCH_HEAD].try_into().expect("4 bytes")) as usize;
+                return Some(&c[PREFETCH_HEAD..PREFETCH_HEAD + len]);
+            }
+        }
+        None
+    }
+}
+
+fn digest_prefix(d: &[u8; 32]) -> u64 {
+    u64::from_be_bytes(d[..8].try_into().expect("8 bytes"))
+}
 
 fn store_err(e: impl std::fmt::Display) -> MstError {
     MstError::Store(e.to_string())
@@ -173,7 +302,7 @@ impl<R: DbReadOps + Sync + ?Sized> Source for DbSource<'_, R> {
 
     fn node(&self, cid: &Cid) -> Result<Option<Arc<[u8]>>> {
         if let Some(b) = self.prefetched.and_then(|p| p.get(cid)) {
-            return Ok(Some(b.clone()));
+            return Ok(Some(Arc::from(b)));
         }
         self.reads.set(self.reads.get() + 1);
         metrics::LAZY_MST_READS.with_label_values(&["node"]).inc();
@@ -352,24 +481,71 @@ impl<N: Source> Source for FedSource<N> {
 /// 7-11 dependent node reads. Also returns whether the range was read to its
 /// end.
 pub async fn prefetch<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, max_bytes: usize) -> anyhow::Result<(Prefetched, bool)> {
-    let mut out = Prefetched::new();
     if max_bytes == 0 {
-        return Ok((out, false));
+        return Ok((Prefetched::default(), false));
     }
+    scan_nodes(db, did, &read_ahead_opts(), false, |b| b <= max_bytes).await
+}
+
+/// For a walk of the whole tree (an export): `did`'s `M/` range for as long
+/// as `admit` takes the [`heap_bytes`](Prefetched::heap_bytes) the next node
+/// would bring it to. When a node doesn't fit, the height-1 nodes are let go
+/// and the scan goes on with the rest (walk with
+/// [`Prefetched::persist_min`]); when those don't fit either, it stops there.
+pub async fn prefetch_tree<R: DbReadOps + Sync + ?Sized>(
+    db: &R,
+    did: &str,
+    opts: &slatedb::config::ScanOptions,
+    admit: impl FnMut(usize) -> bool,
+) -> anyhow::Result<Prefetched> {
+    Ok(scan_nodes(db, did, opts, true, admit).await?.0)
+}
+
+async fn scan_nodes<R: DbReadOps + Sync + ?Sized>(
+    db: &R,
+    did: &str,
+    opts: &slatedb::config::ScanOptions,
+    split: bool,
+    mut admit: impl FnMut(usize) -> bool,
+) -> anyhow::Result<(Prefetched, bool)> {
+    let mut out = Prefetched::default();
     let prefix = state::mst_node_prefix(did);
-    let mut it = state::BatchedScan::new(db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &read_ahead_opts()).await?);
-    let mut bytes = 0;
+    let mut it = state::BatchedScan::new(db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), opts).await?);
+    let mut complete = true;
     while let Some(kv) = it.next().await? {
         let Ok(digest) = <[u8; 32]>::try_from(&kv.key[prefix.len()..]) else { continue };
-        bytes += kv.value.len();
-        out.insert(Cid { codec: CODEC_DAG_CBOR, digest }, Arc::from(&kv.value[..]));
-        if bytes >= max_bytes {
-            metrics::LAZY_MST_PREFETCH_BYTES.observe(bytes as f64);
-            return Ok((out, false));
+        let b = &kv.value[..];
+        // a node misplaced by a bad first key only changes what is let go
+        let h1 = split && crate::mst::first_key_height(b) == Some(1);
+        if h1 && out.h1_dropped {
+            continue;
+        }
+        let total = match h1 {
+            true => out.h1.heap_bytes_with(b.len()) + out.upper.heap_bytes(),
+            false => out.upper.heap_bytes_with(b.len()) + out.h1.heap_bytes(),
+        };
+        if !admit(total) {
+            if !split || out.h1_dropped {
+                complete = false;
+                break;
+            }
+            out.h1 = Arena::default();
+            out.h1_dropped = true;
+            if h1 {
+                continue;
+            }
+            if !admit(out.upper.heap_bytes_with(b.len())) {
+                complete = false;
+                break;
+            }
+        }
+        match h1 {
+            true => out.h1.push(&digest, b),
+            false => out.upper.push(&digest, b),
         }
     }
-    metrics::LAZY_MST_PREFETCH_BYTES.observe(bytes as f64);
-    Ok((out, true))
+    metrics::LAZY_MST_PREFETCH_BYTES.observe(out.node_bytes() as f64);
+    Ok((out, complete))
 }
 
 /// `Tree::proof_blocks` of `key` on a lazy tree at `root`, without blocking
@@ -483,4 +659,82 @@ async fn load_child_uncached<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, ci
     let mut recs = Vec::new();
     scan_records(db, did, lo, hi, &mut recs).await?;
     crate::mst_lazy::rebuilt_subtree(&recs, height, cid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mst_lazy::{build_tree, export_blocks, persisted_nodes, MemStore};
+
+    /// Nodes from `M/` in a DB (through the read-ahead), records from memory.
+    struct Split<'a> {
+        nodes: DbSource<'a, slatedb::Db>,
+        recs: &'a MemStore,
+    }
+
+    impl Source for Split<'_> {
+        fn node(&self, cid: &Cid) -> Result<Option<Arc<[u8]>>> {
+            self.nodes.node(cid)
+        }
+        fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()> {
+            self.recs.records(lo, hi, out)
+        }
+    }
+
+    /// Past its budget the read-ahead lets the height-1 nodes go and keeps
+    /// the rest (the walk then rebuilds height-1 subtrees from records), or
+    /// stops: every split exports the same blocks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prefetch_tree_splits_export_the_same_blocks() {
+        let db = slatedb::Db::open("t", Arc::new(object_store::memory::InMemory::new())).await.unwrap();
+        let did = "did:plc:prefetchtest";
+        let recs: Vec<(Key, Cid)> = (0..20_000u64).map(|i| (Arc::from(format!("app.x.y/{i:08}").as_bytes()), Cid::dag_cbor(&i.to_le_bytes()))).collect();
+        let mut tree = build_tree(&recs).unwrap();
+        let root = tree.root_cid().unwrap();
+        let mut want = Vec::new();
+        tree.walk_blocks(&mut |c, b| want.push((c, b.to_vec()))).unwrap();
+        let nodes = persisted_nodes(&tree, 1);
+        for (c, b) in &nodes {
+            db.put(state::mst_node_key(did, c), b).await.unwrap();
+        }
+        let h1 = nodes.values().filter(|b| crate::mst::first_key_height(b) == Some(1)).count();
+        assert!(h1 > nodes.len() / 2, "{h1} of {} nodes at height 1", nodes.len());
+        let mem = MemStore { records: recs.iter().cloned().collect(), ..Default::default() };
+        let opts = read_ahead_opts();
+        // the most it asked for (a growing index briefly holds two arrays)
+        let mut peak = 0;
+        let full = prefetch_tree(&db, did, &opts, |b| {
+            peak = peak.max(b);
+            true
+        })
+        .await
+        .unwrap();
+        assert_eq!((full.len(), full.persist_min()), (nodes.len(), 1));
+        let all = full.heap_bytes();
+        let db = Arc::new(db);
+        let mem = Arc::new(mem);
+        for cap in [usize::MAX, peak, all / 2, all / 5, 1] {
+            let pre = prefetch_tree(&*db, did, &opts, |b| b <= cap).await.unwrap();
+            assert!(pre.heap_bytes() <= cap, "cap {cap}: holds {}", pre.heap_bytes());
+            let (persist_min, held) = (pre.persist_min(), pre.len());
+            let (db, mem) = (db.clone(), mem.clone());
+            let (got, reads) = tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Handle::current();
+                let src = Split { nodes: DbSource::new(&*db, did, &rt).with_prefetched(Some(&pre)), recs: &mem };
+                let mut got = Vec::new();
+                export_blocks(root, pre.persist_min(), &src, &mut |c, b| got.push((c, b.to_vec()))).unwrap();
+                (got, src.nodes.reads.get())
+            })
+            .await
+            .unwrap();
+            assert!(got == want, "cap {cap} (persist_min {persist_min}, {held} nodes held): blocks differ");
+            if cap >= peak {
+                assert_eq!((persist_min, reads), (1, 0), "cap {cap}");
+            } else if cap == all / 2 {
+                assert_eq!((persist_min, held, reads), (2, nodes.len() - h1, 0), "cap {cap}: every node above height 1 held");
+            } else {
+                assert_eq!(persist_min, 2, "cap {cap}");
+            }
+        }
+    }
 }

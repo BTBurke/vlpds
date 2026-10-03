@@ -2368,11 +2368,26 @@ root through the store).
   second scan (`tests/all/mst_lazy.rs` `export_buffer_caps_give_same_bytes`).
   Records with identical contents share a CID: the export writes that block
   once (a per-export set of written record CIDs, 16 B each).
+  The walk visits every node, so it first reads the repo's whole `M/`
+  range with one scan (`mst_store::prefetch_tree`: blocks packed in large
+  buffers behind a sorted digest index, ~32 B/record held, ~320 MB at 10M
+  records); a point read per interior node was 31% of a 10M export's CPU
+  and made it 2.1-2.6x slower than a resident full tree. Past its memory
+  grant the read-ahead lets the height-1 nodes go (~70% of `M/`) and keeps
+  the rest, and the walk rebuilds height-1 subtrees from the records it is
+  fed anyway (`persist_min` 2: one key hash per record); only nodes above
+  height 1 that don't fit either are point reads
+  (`tests/all/export_scan.rs`, `mst_store` tests). The getBlocks node
+  index build and checkAccountStatus walk the same way. Measured on a
+  loaded laptop (load 17-45, `--memory`, release builds, interleaved): a
+  10M-record export took 9.7-21 s (3.0M node point reads before, ~0 now)
+  against 28-84 s before; two at once (both past the grant: height-1
+  nodes rebuilt) 17-18 s each against 27 s; 1M unchanged within noise.
   Exports are bounded (`tests/all/export_limits.rs`): at most
   `--max-exports` (32) stream at once (each holds a blocking-pool thread for
   its walk; more wait up to 10 s for a slot, then 503 `Overloaded`); the
-  `M/` prefetch (64 MiB per export) comes from a process-wide 512 MiB budget
-  (less, or point reads only, while others hold it); and an export whose
+  `M/` read-ahead takes 1 MiB grants from a process-wide 512 MiB budget as
+  it grows; and an export whose
   client is gone, or has read nothing for `--export-stall-secs` (60; an h2
   stream at a zero window), stops at once: the walk at its next read, the
   scans, and its queued body chunks are freed, and the body ends with an

@@ -1875,11 +1875,13 @@ async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResul
     let acct = app.account(&did).await?;
     let (view, snap) = app.repo_view(&did).await?;
     let (d, root) = (did.clone(), view.head.data);
+    let (pre, _budget) = super::sync::prefetch_nodes(&snap, &did).await;
     let nodes = tokio::task::spawn_blocking(move || {
         let rt = tokio::runtime::Handle::current();
         let mut nodes = HashSet::new();
-        let scan = crate::mst_store::ScanSource::open(&*snap, &d, crate::mst_store::DbSource::new(&*snap, &d, &rt), &rt)?;
-        crate::mst_lazy::export_blocks(root, 1, &scan, &mut |c, b| {
+        let src = crate::mst_store::DbSource::new(&*snap, &d, &rt).with_prefetched(Some(&pre));
+        let scan = crate::mst_store::ScanSource::open(&*snap, &d, src, &rt)?;
+        crate::mst_lazy::export_blocks(root, pre.persist_min(), &scan, &mut |c, b| {
             // the empty tree's root isn't counted
             if crate::mst::decode_node(b, c).is_ok_and(|n| !n.entries.is_empty()) {
                 nodes.insert(c);

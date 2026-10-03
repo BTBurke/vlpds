@@ -181,12 +181,16 @@ async fn get_checkout(
     export_repo(&app, &q.did, None).await
 }
 
-/// An export reads up to this much of the repo's `M/` range with one scan
-/// (~28 B/record), point reads beyond; less while other exports hold the
-/// process-wide [`EXPORT_PREFETCH_MB`].
-const EXPORT_PREFETCH_BYTES: usize = 64 << 20;
-
+/// MiB of `M/` nodes exports may hold at once: an export reads its repo's
+/// whole `M/` range with one scan (~32 B/record held), taking 1 MiB grants
+/// as it goes (past them, see [`crate::mst_store::prefetch_tree`]).
 static EXPORT_PREFETCH_MB: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(512);
+static EXPORT_PREFETCH_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Tests: caps each export's `M/` read-ahead (0: every node read one by one).
+pub fn set_export_prefetch_max_bytes(n: usize) {
+    EXPORT_PREFETCH_MAX.store(n, Ordering::Relaxed);
+}
 
 /// Each export holds a blocking-pool thread for its MST walk, so this also
 /// bounds what slow readers can take from that pool.
@@ -370,14 +374,37 @@ async fn export_slot(app: &App) -> XResult<ExportSlot> {
     Ok(ExportSlot(p))
 }
 
-fn prefetch_budget() -> (Option<tokio::sync::SemaphorePermit<'static>>, usize) {
-    let want = (EXPORT_PREFETCH_BYTES >> 20) as u32;
-    for mb in [want, want / 4, want / 16] {
-        if let Ok(p) = EXPORT_PREFETCH_MB.try_acquire_many(mb) {
-            return (Some(p), (mb as usize) << 20);
+/// A whole-tree walk's `M/` read-ahead, and its grants from
+/// [`EXPORT_PREFETCH_MB`]. Walk with its `persist_min()`.
+pub(crate) async fn prefetch_nodes(snap: &slatedb::DbSnapshot, did: &str) -> (crate::mst_store::Prefetched, Option<tokio::sync::SemaphorePermit<'static>>) {
+    let (mut held, mut mb) = (None::<tokio::sync::SemaphorePermit<'static>>, 0usize);
+    let max = EXPORT_PREFETCH_MAX.load(Ordering::Relaxed);
+    if max == 0 {
+        return (Default::default(), None);
+    }
+    let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, cache_blocks: true, ..Default::default() };
+    let r = crate::mst_store::prefetch_tree(snap, did, &opts, |bytes| {
+        if bytes > max {
+            return false;
+        }
+        while mb << 20 < bytes {
+            let Ok(p) = EXPORT_PREFETCH_MB.try_acquire() else { return false };
+            match &mut held {
+                Some(h) => h.merge(p),
+                None => held = Some(p),
+            }
+            mb += 1;
+        }
+        true
+    })
+    .await;
+    match r {
+        Ok(p) => (p, held),
+        Err(e) => {
+            tracing::debug!(%did, "getRepo: M/ prefetch failed, reading nodes one by one: {e:#}");
+            (Default::default(), None)
         }
     }
-    (None, 0)
 }
 
 type ChunkTx = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
@@ -501,8 +528,7 @@ async fn stream_export(
     car::write_block(&mut buf, &head.commit, &head.commit_block);
     let (ktx, krx) = tokio::sync::mpsc::channel(64);
     let walk = async {
-        let (budget, bytes) = prefetch_budget();
-        let pre = crate::mst_store::prefetch(&*snap, &did, bytes).await.map(|p| p.0).unwrap_or_default();
+        let (pre, budget) = prefetch_nodes(&snap, &did).await;
         let (snap2, did2, root, tx2) = (snap.clone(), did.clone(), head.data, tx.clone());
         let r = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -521,7 +547,7 @@ async fn stream_export(
             };
             let nodes = crate::mst_store::DbSource::new(&*snap2, &did2, &rt).with_prefetched(Some(&pre));
             let src = Stoppable { inner: crate::mst_store::FedSource::new(nodes, krx), stop: &stop };
-            let r = crate::mst_lazy::export_blocks(root, 1, &src, &mut emit).map(|_| ());
+            let r = crate::mst_lazy::export_blocks(root, pre.persist_min(), &src, &mut emit).map(|_| ());
             (r, stop.get(), buf)
         })
         .await;
@@ -802,12 +828,14 @@ async fn lazy_nodes(
         Some(r) => r,
         None => {
             let _slot = INDEX_BUILDS.acquire().await.expect("never closed");
+            let (pre, _budget) = prefetch_nodes(snap, did).await;
             let (snap, did, root) = (snap.clone(), did.to_string(), view.head.data);
             let ix = tokio::task::spawn_blocking(move || {
                 let rt = tokio::runtime::Handle::current();
                 let mut map = HashMap::new();
-                let scan = crate::mst_store::ScanSource::open(&*snap, &did, crate::mst_store::DbSource::new(&*snap, &did, &rt), &rt)?;
-                crate::mst_lazy::export_blocks(root, 1, &scan, &mut |c, b| {
+                let nodes = crate::mst_store::DbSource::new(&*snap, &did, &rt).with_prefetched(Some(&pre));
+                let scan = crate::mst_store::ScanSource::open(&*snap, &did, nodes, &rt)?;
+                crate::mst_lazy::export_blocks(root, pre.persist_min(), &scan, &mut |c, b| {
                     // nodes with keys of their own (all leaves): where they sit
                     if let Ok(n) = crate::mst::decode_node(b, c) {
                         if let Some(crate::mst::Entry::Value { key, .. }) = n.entries.iter().find(|e| matches!(e, crate::mst::Entry::Value { .. })) {

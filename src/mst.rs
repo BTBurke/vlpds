@@ -840,6 +840,17 @@ pub fn decode_trusted_node(data: &[u8], c: Cid, height: i32) -> Result<Node> {
     decode_node_fast(data, c, Some(height)).map_or_else(|| decode_node_reference(data, c), Ok)
 }
 
+/// The height of a canonical node's first key (whole: its prefix length is
+/// 0), hashing only that key. None for a node without keys, or bytes not in
+/// [`decode_node_fast`]'s encoding.
+pub fn first_key_height(data: &[u8]) -> Option<i32> {
+    let mut r = cbor::Cursor::new(data);
+    if !r.lit(&[0xa2, 0x61, b'e']) || r.head(4)? == 0 || !r.lit(&[0xa4, 0x61, b'k']) {
+        return None;
+    }
+    Some(height_for_key(r.bytes()?))
+}
+
 /// [`decode_node`] specialized to the one encoding a valid node can have,
 /// `{"e": [{"k", "p", "t", "v"}...], "l"}` with canonical heads, read
 /// straight off the bytes. Returns a node only when
