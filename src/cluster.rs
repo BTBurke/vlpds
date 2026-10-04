@@ -322,6 +322,13 @@ pub struct Cluster {
     gone: AtomicBool,
     /// Held across each renewal so shutdown can't delete the lease under one.
     renew_lock: tokio::sync::Mutex<()>,
+    /// With a lease plane every renewal runs there: callers elsewhere ask
+    /// its loop (`renew_now`) and wait for a renewal that started after
+    /// they asked (`renew_started`, then `renew_done` carrying its number).
+    renew_now: tokio::sync::Notify,
+    renew_started: AtomicU64,
+    renew_done: tokio::sync::watch::Sender<u64>,
+    on_plane: AtomicBool,
     /// Tests: this in-process node "crashed" (`halt`). Its store calls hang;
     /// it must never fail-stop the shared test process.
     halted: AtomicBool,
@@ -522,6 +529,10 @@ impl Cluster {
             step_lock: tokio::sync::Mutex::new(()),
             gone: AtomicBool::new(false),
             renew_lock: tokio::sync::Mutex::new(()),
+            renew_now: tokio::sync::Notify::new(),
+            renew_started: AtomicU64::new(0),
+            renew_done: tokio::sync::watch::channel(0).0,
+            on_plane: AtomicBool::new(false),
             halted: AtomicBool::new(false),
             bounded: AtomicBool::new(false),
             nudged: tokio::sync::Notify::new(),
@@ -1357,16 +1368,24 @@ impl Cluster {
         };
         let me = self.clone();
         let h = host.clone();
+        self.on_plane.store(self.cfg.lease_plane.is_some(), Ordering::Release);
         spawn(Box::pin(async move {
             let mut tick = tokio::time::interval(me.cfg.renew_every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = me.renew_now.notified() => {}
+                }
                 // keeps renewing through a graceful shutdown's drain
                 if me.gone.load(Ordering::Acquire) {
+                    me.on_plane.store(false, Ordering::Release);
+                    me.renew_done.send_replace(u64::MAX);
                     return;
                 }
-                me.renew(&h).await;
+                let n = me.renew_started.fetch_add(1, Ordering::AcqRel) + 1;
+                me.renew_here(&h).await;
+                me.renew_done.send_replace(n);
             }
         }));
         // Watchdog: a node whose store calls hang never reaches the
@@ -1614,8 +1633,22 @@ impl Cluster {
         Ok(host.follow_floors().get(&log_id).copied())
     }
 
-    /// A conflict means someone else rewrote our lease: fail-stop.
+    /// Renews now. On a lease plane the plane's loop does it: a renewal
+    /// sent from a starved runtime (a step's keepalive during a heavy shard
+    /// open) would hold the renew lock across a late answer and starve the
+    /// plane's own renewals too.
     async fn renew(&self, host: &Arc<dyn ShardHost>) {
+        if !self.on_plane.load(Ordering::Acquire) {
+            return self.renew_here(host).await;
+        }
+        let mut done = self.renew_done.subscribe();
+        let asked = self.renew_started.load(Ordering::Acquire);
+        self.renew_now.notify_one();
+        let _ = tokio::time::timeout(self.cfg.ttl, done.wait_for(|n| *n > asked)).await;
+    }
+
+    /// A conflict means someone else rewrote our lease: fail-stop.
+    async fn renew_here(&self, host: &Arc<dyn ShardHost>) {
         let _g = self.renew_lock.lock().await;
         if self.gone.load(Ordering::Acquire) {
             return;
