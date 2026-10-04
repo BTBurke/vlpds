@@ -125,6 +125,43 @@ pub struct ClusterConfig {
     pub clock_offset_ms: i64,
     /// The build's window; tests pose as other builds.
     pub levels: version::Window,
+    /// Where the lease is renewed. None: the caller's runtime and `store`.
+    pub lease_plane: Option<LeasePlane>,
+}
+
+/// A runtime and an object-store client for lease renewal alone. A node
+/// whose request runtime is saturated (a consumer reconnect storm, a
+/// backfill burst) or whose bucket connections are all busy would otherwise
+/// renew late, lapse and fail-stop. The store must point at the same bucket
+/// and prefix; its own client means its own connections, driven on
+/// `runtime`.
+#[derive(Clone)]
+pub struct LeasePlane {
+    pub runtime: tokio::runtime::Handle,
+    pub store: Store,
+}
+
+impl std::fmt::Debug for LeasePlane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeasePlane").finish_non_exhaustive()
+    }
+}
+
+impl LeasePlane {
+    /// One worker thread of its own: renewals are a PUT every fifth of the
+    /// TTL and the watchdog a timer.
+    pub fn new(store: Store) -> LeasePlane {
+        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        let rt = RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("lease")
+                .enable_all()
+                .build()
+                .expect("lease runtime")
+        });
+        LeasePlane { runtime: rt.handle().clone(), store }
+    }
 }
 
 impl Default for ClusterConfig {
@@ -138,6 +175,7 @@ impl Default for ClusterConfig {
             skew: Duration::from_secs(2),
             clock_offset_ms: 0,
             levels: version::Window::BUILD,
+            lease_plane: None,
         }
     }
 }
@@ -1055,7 +1093,6 @@ impl Cluster {
         self.bounded("put", self.put_json_unbounded(path, v, mode)).await
     }
 
-    /// Renewals: never cancelled.
     async fn put_json_unbounded<T: Serialize>(
         &self,
         path: &Path,
@@ -1063,8 +1100,18 @@ impl Cluster {
         mode: PutMode,
     ) -> Result<Option<String>, object_store::Error> {
         self.count("put");
+        Self::put_json_on(&self.store, path, v, mode).await
+    }
+
+    /// Renewals: never cancelled.
+    async fn put_json_on<T: Serialize>(
+        store: &Store,
+        path: &Path,
+        v: &T,
+        mode: PutMode,
+    ) -> Result<Option<String>, object_store::Error> {
         let body = PutPayload::from(serde_json::to_vec(v).unwrap());
-        self.store.raw.put_opts(path, body, PutOptions { mode, ..Default::default() }).await.map(|r| r.e_tag)
+        store.raw.put_opts(path, body, PutOptions { mode, ..Default::default() }).await.map(|r| r.e_tag)
     }
 
     /// (file name, ETag) of every object under `rel`.
@@ -1132,7 +1179,9 @@ impl Cluster {
         // the send time, so the cap never exceeds what peers read
         let expires_local_ms = now_ms() + self.cfg.ttl.as_millis() as u64;
         l.wm_cap = crate::nodelog::seq_floor(expires_local_ms * 1000);
-        let put = self.put_json_unbounded(&self.path(&format!("nodes/{}", self.cfg.node_id)), &l, mode).await;
+        let store = self.cfg.lease_plane.as_ref().map_or(&self.store, |p| &p.store);
+        let put = Self::put_json_on(store, &self.path(&format!("nodes/{}", self.cfg.node_id)), &l, mode).await;
+        self.count("put");
         crate::metrics::LEASE_RENEW_SECONDS.observe(sent.elapsed().as_secs_f64());
         let etag = put?;
         *self.lease_etag.write() = etag;
@@ -1302,9 +1351,13 @@ impl Cluster {
         self.spawned.store(true, Ordering::Release);
         // Renewals get their own loop: a step makes O(shards) store calls,
         // and one slow step must not let the lease lapse.
+        let spawn = |f: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>| match &self.cfg.lease_plane {
+            Some(p) => drop(p.runtime.spawn(f)),
+            None => drop(tokio::spawn(f)),
+        };
         let me = self.clone();
         let h = host.clone();
-        tokio::spawn(async move {
+        spawn(Box::pin(async move {
             let mut tick = tokio::time::interval(me.cfg.renew_every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -1315,14 +1368,14 @@ impl Cluster {
                 }
                 me.renew(&h).await;
             }
-        });
+        }));
         // Watchdog: a node whose store calls hang never reaches the
         // validity checks before a PUT or ack, and would hold requests open
         // as a zombie. Peers presume us dead no earlier than 2 x skew after
         // our validity ends: by then we can never ack again, so fail-stop.
         let me = self.clone();
         let h = host.clone();
-        tokio::spawn(async move {
+        spawn(Box::pin(async move {
             let mut tick = tokio::time::interval(me.cfg.renew_every / 2);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -1342,7 +1395,7 @@ impl Cluster {
                     return;
                 }
             }
-        });
+        }));
         let me = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(me.cfg.renew_every);
@@ -2736,6 +2789,25 @@ mod tests {
         }
     }
 
+    /// vlrelay's chaos `consumers` scenario: a node whose runtime was
+    /// saturated renewed late, lapsed and fail-stopped. On a lease plane the
+    /// renewals go on while the caller's only thread is stuck.
+    #[test]
+    fn a_starved_runtime_keeps_its_lease_on_the_lease_plane() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let store = Store::memory(None);
+            let plane = LeasePlane::new(store.clone());
+            let c = join(ClusterConfig { lease_plane: Some(plane), ..cfg("a") }, store).await.unwrap();
+            let h = Arc::new(Host::default());
+            c.spawn(h.clone());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            std::thread::sleep(Duration::from_millis(1800));
+            assert!(c.lease_valid(), "renewals stopped with the caller's runtime");
+            assert_eq!(h.lost.load(Ordering::SeqCst), 0);
+        });
+    }
+
     /// Joins as a node whose step loop runs (`spawn`): it greets peers, so
     /// its steps can join with live peers around (`try_join`). The mock
     /// host's greetings never reach a peer's `learn_peer`, so these nodes
@@ -2763,6 +2835,7 @@ mod tests {
             skew: Duration::from_millis(100),
             clock_offset_ms: 0,
             levels: version::Window::BUILD,
+            lease_plane: None,
         }
     }
 
