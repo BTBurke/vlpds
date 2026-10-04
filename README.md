@@ -1,42 +1,42 @@
 # Very Large PDS (vlpds)
 
-**An atproto PDS where the object store is the database.** Every acknowledged write is already in
-your S3, R2 or GCS bucket; nodes keep only caches, and scaling out means starting another node on
-the same bucket.
+vlpds is an atproto PDS that uses an object store as its database. Every acknowledged write is
+already in your S3, R2 or GCS bucket. Nodes only keep caches, so scaling out just means starting
+another node on the same bucket.
 
 ![The operator console's live metrics for a 5-node cluster on one MinIO bucket under write load](docs/assets/console.png)
 
 vlpds speaks the same XRPC, OAuth and sync 1.1 firehose as the reference PDS, so apps, relays and
-AppViews talk to it like any other PDS. It runs a personal server on one small VM and a cluster on
-as many nodes as you give it.
+AppViews talk to it like any other PDS. It can run a personal server on one small VM, or a cluster
+on as many nodes as you give it.
 
-**Example instance:** [vlpds.jazco.dev](https://vlpds.jazco.dev) is a small single-node deployment
-(one 4-vCPU VPS, data on Cloudflare R2). It serves these docs at
+There's an example instance at [vlpds.jazco.dev](https://vlpds.jazco.dev). It's a small
+single-node deployment (one 4-vCPU VPS with its data on Cloudflare R2), and it serves these docs at
 [vlpds.jazco.dev/docs](https://vlpds.jazco.dev/docs).
 
 ## Highlights
 
-- **The bucket is the only durable state.** Writes are group-committed into log segments with
-  conditional PUTs, and per-shard state lives in SlateDB on the same bucket. A lost node or disk costs
-  cache, never data. → [Overview](docs/overview.md), [Record storage](docs/record-storage.md)
-- **Clustered without a coordinator.** Any node serves any request. Shards are owned through leases
-  and compare-and-swap on objects in the bucket (no Raft, no ZooKeeper); a crashed node's shards
-  move in seconds, and shards split and merge online. → [Architecture](docs/architecture.md),
+- The bucket is the only durable state. Writes are group-committed into log segments with
+  conditional PUTs, and each shard's state lives in SlateDB on the same bucket. Losing a node or a
+  disk only costs you cache. → [Overview](docs/overview.md), [Record storage](docs/record-storage.md)
+- There's no coordinator. Any node serves any request. Nodes own shards through leases and
+  compare-and-swap on objects in the bucket (no Raft or ZooKeeper). A crashed node's shards move to
+  another node in seconds, and shards split and merge online. → [Architecture](docs/architecture.md),
   [Scaling and clustering](docs/operations/scaling-and-clustering.md)
-- **Fast, and cheap when idle.** ~60k commits/s on one 16-core node against a store with 25 ms of
-  injected latency, and a one-shard personal server that idles inside R2's free request tier
-  (measured: [`bench/results/`](bench/results)). Request costs follow node and shard count, not
-  write rate.
-- **Everything in one process.** XRPC, the OAuth authorization server with DPoP, the merged firehose,
-  the account pages, a `/migrate` page for moving an existing account in, the operator console and
-  these docs, all served by the `vlpds` binary. → [Migration](docs/migration.md),
+- It's fast, and cheap when idle. One 16-core node does ~60k commits/s against a store with 25 ms
+  of injected latency, and a one-shard personal server idles inside R2's free request tier
+  (measured: [`bench/results/`](bench/results)). Request costs depend on how many nodes and shards
+  you run, not on how fast you write.
+- Everything runs in one process. The `vlpds` binary serves XRPC, the OAuth authorization server
+  with DPoP, the merged firehose, the account pages, a `/migrate` page for moving an existing
+  account in, the operator console and these docs. → [Migration](docs/migration.md),
   [OAuth and 2FA](docs/oauth-2fa.md)
-- **An operator console.** Accounts, invites, takedowns and moderation cases, rate limits, relays,
-  cluster ownership and live metrics, with an admin CLI for the same calls.
+- The operator console covers accounts, invites, takedowns and moderation cases, rate limits,
+  relays, cluster ownership and live metrics. An admin CLI makes the same calls.
   → [Admin console and CLI](docs/operations/admin-console.md)
-- **Built to be operated.** Prometheus metrics, 80 alerts each with a runbook section, rolling
-  upgrades with feature levels, Cloud KMS or a local key wrapping every signing key, SMTP mail and
-  Ozone moderation. → [Operations](docs/operations/index.md)
+- It's built to be operated. It has Prometheus metrics, 80 alerts that each have a runbook
+  section, rolling upgrades with feature levels, Cloud KMS or a local key wrapping every signing
+  key, SMTP mail and Ozone moderation. → [Operations](docs/operations/index.md)
 
 ## Quickstart
 
@@ -49,14 +49,15 @@ just seed    # in another shell: 3 accounts with 200 records each (password: hun
 ```
 
 Open <http://127.0.0.1:2620> for the account pages, <http://127.0.0.1:2620/admin> for the console
-(dev admin token `dev-admin-token`) and <http://127.0.0.1:2620/docs> for the docs. The in-memory
-store keeps nothing: `just minio` starts a local MinIO to point a node at, and
-[Deploy](docs/operations/deploy.md) walks through a real server with the Ansible kit in
-[`deploy/ansible/`](deploy/ansible/README.md).
+(the dev admin token is `dev-admin-token`) and <http://127.0.0.1:2620/docs> for the docs.
+
+The in-memory store doesn't keep anything. `just minio` starts a local MinIO you can point a node
+at, and [Deploy](docs/operations/deploy.md) walks through setting up a real server with the Ansible
+kit in [`deploy/ansible/`](deploy/ansible/README.md).
 
 ## Documentation
 
-The docs live in [`docs/`](docs) and every node serves them at `/docs`.
+The docs live in [`docs/`](docs), and every node serves them at `/docs`.
 
 | Start here | Run it | How it works |
 |---|---|---|
@@ -68,14 +69,14 @@ The docs live in [`docs/`](docs) and every node serves them at `/docs`.
 | | [Upgrades](docs/operations/upgrades.md) | [Proxying](docs/proxying.md) |
 | | [Runbook](docs/operations/runbook.md) | [DESIGN.md](DESIGN.md) (the full design notes) |
 
-Operators also want [ops/RUNBOOK.md](ops/RUNBOOK.md) and [ops/alerts.yml](ops/alerts.yml).
-[tests/STATUS.md](tests/STATUS.md) describes the test suite and
-[bench/](bench) the load, HA and soak harnesses behind the numbers.
+If you're running a server, you'll also want [ops/RUNBOOK.md](ops/RUNBOOK.md) and
+[ops/alerts.yml](ops/alerts.yml). [tests/STATUS.md](tests/STATUS.md) describes the test suite, and
+[bench/](bench) has the load, HA and soak harnesses behind the numbers.
 
 ## Status
 
 vlpds is new. It has a conformance suite modeled on the reference PDS's tests, differential tests
-against a second atproto implementation, and HA, upgrade and soak harnesses, but it has not seen
+against a second atproto implementation, and HA, upgrade and soak harnesses, but it hasn't seen
 wide use yet. Expect rough edges, and keep the two offline secrets (the KEK and the PLC rotation
 key) backed up.
 

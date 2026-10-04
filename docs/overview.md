@@ -47,12 +47,13 @@ facts:
   - { value: "~12 s", label: to notice a crashed node, note: "then fence, replay, serve; a planned handoff is ~0.2 s", tone: violet }
 ```
 
-vlpds is a Rust [atproto](https://atproto.com) personal data server (PDS) built so that **the object store is the database**. Every
-acknowledged write is already in the bucket, nodes keep only caches, and adding capacity means adding
-nodes that point at the same bucket. It speaks the same XRPC, OAuth and sync 1.1 firehose as the
-reference PDS, so apps, relays and AppViews can't tell the difference.
+vlpds is an [atproto](https://atproto.com) personal data server (PDS) written in Rust that uses an
+object store as its database. Every acknowledged write is already in the bucket and nodes only keep
+caches, so adding capacity just means adding nodes that point at the same bucket. It speaks the same
+XRPC, OAuth and sync 1.1 firehose as the reference PDS, so apps, relays and AppViews can't tell the
+difference.
 
-This page is the one-screen tour. Each section links to the page that covers it in depth.
+Each section below links to the page with the details.
 
 ## The shape of the system
 
@@ -75,17 +76,18 @@ edges:
   - { from: seg.b10, to: fh.t, label: sealed segments, tone: blue }
 ```
 
-- **Repo workers** hold each active repo's MST paths in memory, apply the operations and sign the
-  commit. They don't wait for the previous commit to be durable, so one repo can take
-  hundreds of commits a second.
-- **The log** batches every shard's commits on a node into segments: whatever queued while the
-  previous PUT was in flight (up to 8 MiB) becomes the next one, PUT with `If-None-Match: *`. The log is the write-ahead log *and* the firehose: there is
-  no second copy.
-- **State** (records, repo heads, accounts, MST interior nodes) lives in one SlateDB per shard with its own WAL
-  turned off. A durable segment is applied to the memtable before the ack, so a read right after
-  a write sees it; SlateDB flushes SSTs to the bucket on its own schedule.
-- **The firehose** on every node merges every node's log and emits an event once every log's
-  durable watermark has passed it, so the order is the same on every node.
+- Repo workers keep each active repo's MST paths in memory, apply the operations and sign the
+  commit. A worker doesn't wait for the previous commit to be durable before starting the next one,
+  so a single repo can take hundreds of commits a second.
+- The log batches the commits for every shard on a node into segments. Whatever queued up while
+  the previous PUT was in flight (up to 8 MiB) becomes the next segment, written with
+  `If-None-Match: *`. The log is both the write-ahead log and the firehose, so every write is
+  stored once.
+- State (records, repo heads, accounts and MST interior nodes) lives in one SlateDB per shard,
+  with SlateDB's own WAL turned off. A durable segment is applied to the memtable before the ack,
+  so a read right after a write sees it. SlateDB flushes SSTs to the bucket on its own schedule.
+- The firehose on every node merges the logs from every node. It emits an event once every log's
+  durable watermark has passed it, so every node sends events in the same order.
 
 Details: [Architecture](architecture.md), [Record storage](record-storage.md),
 [State storage](state-storage.md), [Firehose](firehose.md).
@@ -114,15 +116,18 @@ notes:
   - { at: [21, 8.6], text: "split / merge online" }
 ```
 
-A DID hashes to one of 65,536 slots, forever. Slots are grouped into contiguous **shards**; a shard is
-the unit of ownership and of state (one SlateDB each), and shards can be split or merged online.
-Each node takes up to its fair share of shards (shards ÷ live nodes), renewing **one lease** for
-itself rather than one per shard. Leases and assignments are compare-and-swap writes on objects in
-the bucket: no ZooKeeper, no Raft, no quorum. Two nodes are enough for high availability.
+Every DID hashes to one of 65,536 slots, and that never changes. Slots are grouped into contiguous
+shards. A shard is the unit of ownership and of state (it gets its own SlateDB), and you can split
+or merge shards online.
 
-Any node accepts any request. Writes and repo reads for a shard it doesn't own are forwarded to
-the owner over HTTP/2 with mutual TLS; app reads are proxied to the AppView from the account's
-owner. See [Architecture](architecture.md#shards-and-ownership) and
+Each node takes up to its fair share of shards (shards ÷ live nodes). A node renews one lease for
+itself, no matter how many shards it owns. Leases and assignments are compare-and-swap writes on
+objects in the bucket, so there's no ZooKeeper, Raft or quorum to run. Two nodes are enough for
+high availability.
+
+Any node accepts any request. If a node gets a write or a repo read for a shard it doesn't own, it
+forwards the request to the owner over HTTP/2 with mutual TLS. App reads go to the account's owner,
+which proxies them to the AppView. See [Architecture](architecture.md#shards-and-ownership) and
 [Proxying](proxying.md).
 
 ## How big it gets
@@ -134,9 +139,9 @@ owner. See [Architecture](architecture.md#shards-and-ownership) and
 - { value: "~$1.7k", unit: /mo, label: "S3 bill for all of Bluesky's writes", note: "modeled; 3 nodes · 64 shards · in-region", tone: violet }
 ```
 
-These are round numbers from the benchmark campaigns (`bench/results/`). The object-store bill at
-Bluesky's load is modeled from measured request rates (`bench/results/cost-model-2026-10-02`). What
-they mean in practice:
+These are round numbers from the benchmark runs in `bench/results/`. The object-store bill at
+Bluesky's load is modeled from measured request rates (`bench/results/cost-model-2026-10-02`).
+Here's how they compare for a personal server and for all of Bluesky:
 
 | | Personal | Bluesky today |
 |---|---|---|
@@ -146,38 +151,40 @@ they mean in practice:
 | Busy cores, fleet-wide | ~0 | ~3 |
 | Object store requests | $0 on R2, ~$2–4 on S3 | ~$1.7k/mo (S3), ~$1.5k (R2), modeled |
 
-A few things to know about where the costs come from:
+A few things about where the costs come from:
 
-- **Logins and proxying use the CPU, not commits.** A commit costs ~100 µs of CPU end to end, while an
+- Most of the CPU goes to logins and proxying. A commit costs ~100 µs of CPU end to end, and an
   Argon2 login costs ~20 ms.
-- **The object-store bill follows shard and node count, not write rate.** A node PUTs about one segment
-  per store round trip whenever anything is queued (~27/s), whether it holds 300 or 20,000 commits.
-  Per-shard polling and checkpoints are fixed costs too, which is why the default is 64 shards and
-  a personal server runs one.
-- **Memory follows active repos, not total repos.** Only the MST paths that recent writes visited stay in
-  memory (~10–20 KB per active repo), so 32 GB nodes hold a day's writers at Bluesky's scale.
+- The object-store bill depends on how many shards and nodes you run, not on how fast you write.
+  Whenever anything is queued, a node PUTs about one segment per store round trip (~27/s), whether
+  that segment holds 300 commits or 20,000. Per-shard polling and checkpoints are fixed costs too.
+  That's why the default is 64 shards and a personal server runs one.
+- Memory depends on how many repos are active. Only the MST paths that recent writes visited stay
+  in memory (~10–20 KB per active repo), so at Bluesky's scale a 32 GB node holds a day's worth of
+  writers.
 
 Details: [Scaling and clustering](operations/scaling-and-clustering.md),
 [Configuration](operations/configuration.md).
 
 ## Design philosophy
 
-- **One source of truth.** The bucket holds everything durable: a lost node or a lost disk costs
-  cache, never data. A new host needs only the bucket's credentials and its secrets.
-- **Group commit, not per-write objects.** One PUT per commit would cost ~$43k a day at 100k
-  commits/s. vlpds batches every repo's commits on a node into one segment, so request cost follows nodes,
-  not traffic.
-- **Pipeline, don't wait.** A repo's next commit builds on the in-memory head while the previous one
-  is still uploading, and acks go out in log order. Durability latency doesn't limit a single repo's
-  throughput.
-- **The log is the WAL and the firehose.** A write is stored once. Recovery replays the same
+- The bucket is the one source of truth. It holds everything durable, so losing a node or a disk
+  only costs cache. A new host just needs the bucket's credentials and its secrets.
+- Commits are grouped. If we wrote one object per commit, we'd pay ~$43k a day in PUTs at 100k
+  commits/s. Instead, vlpds batches the commits from every repo on a node into one segment, so
+  request cost grows with the number of nodes instead of with traffic.
+- Commits are pipelined. A repo's next commit builds on the in-memory head while the previous one
+  is still uploading, and acks go out in log order. So waiting on the object store doesn't limit
+  how fast a single repo can write.
+- The log is both the WAL and the firehose. A write is stored once, and recovery replays the same
   segments that relays receive.
-- **Derive what you can.** MST leaves are rebuilt from records rather than stored, and record values
-  are rebuilt from a commit's CAR at replay. Less to write and less that can disagree.
-- **Fail-stop over guessing.** When a node can't be sure it's still allowed to write, it exits and
-  lets its supervisor restart it. Unavailability is recoverable; a forked repo is not.
-- **Boring dependencies.** S3-compatible storage, Caddy in front, Prometheus metrics, and a single
-  static binary beside its built web UI.
+- vlpds derives what it can. MST leaves are rebuilt from records instead of being stored, and
+  record values are rebuilt from a commit's CAR at replay. That means less to write and fewer
+  copies that could disagree.
+- If a node isn't sure it's still allowed to write, it exits and its supervisor restarts it. Being
+  unavailable for a while is recoverable, but a forked repo isn't.
+- The dependencies are boring: S3-compatible storage, Caddy in front, Prometheus metrics, and a
+  single static binary next to its built web UI.
 
 ## Robustness
 
@@ -185,23 +192,25 @@ Details: [Scaling and clustering](operations/scaling-and-clustering.md),
 - title: A node stops renewing its lease
   body: It crashed, lost the network, or fail-stopped on purpose. Peers notice when its lease object hasn't changed for 1.2 × TTL (12 s by default), or within a few seconds if its port refuses connections.
 - title: A peer fences the dead node's log
-  body: A conditional create of a fence object at the end of the log's durable prefix. From then on, nothing the old process might still be doing can append to that log.
+  body: It conditionally creates a fence object at the end of the log's durable prefix. After that, the old process can't append anything to that log, even if it's still running.
 - title: The new owner replays and serves
   body: It takes the shards by compare-and-swap on `assign/{shard}`, replays the dead log's tail for those shards from the bucket, waits out the old owner's last sequence number, and starts serving.
 ```
 
-- **Acknowledged means durable.** A write is acked only after its segment and every earlier one are in
-  the object store, and only while the node's lease is valid. Unacked work that was still in memory
-  when a node died was never confirmed to anyone or sent on the firehose, so discarding it is safe.
-- **Safety needs no clocks.** Fencing and compare-and-swap decide who may write; lease timing only decides
-  *when* a takeover happens. A wrong "it's dead" guess costs availability, never an acked write.
-- **Fail-stop is the safety valve.** A segment PUT that can't succeed, a lease renewal that takes too
-  long, or a panic in a critical thread makes the process exit with a specific code. The supervisor
-  restarts it and it rejoins.
-- **Planned moves are fast.** A graceful shutdown or rebalance warms the recipient's caches, writes one
-  barrier segment and hands shards over in ~0.2 s each, so rolling deploys cost almost no errors.
-- **Retention never outruns replay.** Log segments are kept for 72 h for firehose backfill, and never deleted
-  while any shard could still need them.
+- A write is acked only after its segment and every earlier one are in the object store, and only
+  while the node's lease is valid. If a node dies with unacked work in memory, that work was never
+  confirmed to anyone or sent on the firehose, so it's safe to throw away.
+- Safety doesn't depend on clocks. Fencing and compare-and-swap decide who may write, and lease
+  timing only decides when a takeover happens. If a peer wrongly decides a node is dead, it costs
+  some availability but never an acked write.
+- Fail-stop is the safety valve. If a segment PUT can't succeed, a lease renewal takes too long or
+  a critical thread panics, the process exits with a specific code. The supervisor restarts it and
+  it rejoins the cluster.
+- Planned moves are fast. On a graceful shutdown or a rebalance, the node warms the recipient's
+  caches, writes one barrier segment and hands each shard over in ~0.2 s. Rolling deploys cause
+  almost no errors.
+- Log segments are kept for 72 h for firehose backfill, and they're never deleted while any shard
+  could still need them for replay.
 
 Details: [Architecture](architecture.md#failure-and-takeover),
 [Runbook](operations/runbook.md), [Backups and recovery](operations/backups-and-recovery.md).
@@ -232,16 +241,18 @@ edges:
 | Shards | 1 | 64, split or merged online |
 | Lease TTL | 60 s (a crash restart waits ~1 TTL) | 10 s (takeover in ~12 s) |
 | Good for | a personal or small community PDS | many accounts, high availability |
-| Grows by | adding a second node with the same bucket and prefix | adding nodes; shards rebalance by themselves |
+| Grows by | adding a second node with the same bucket and prefix | adding nodes (shards rebalance by themselves) |
 
-Going from one node to several needs no migration: start another node on the same bucket and prefix, and
-it joins, follows the others' logs and takes its share of shards. See
+Going from one node to several doesn't need a migration. Start another node on the same bucket and
+prefix, and it joins the cluster, follows the other nodes' logs and takes its share of shards. See
 [Deploy](operations/deploy.md) and [Scaling and clustering](operations/scaling-and-clustering.md).
 
 ## Where to go next
 
-- Running a server: start at [Operations](operations/index.md), then [Deploy](operations/deploy.md).
-- Moving an account here: [Migration](migration.md).
-- How identity and keys are protected: [Keys and security](keys-security.md), [OAuth and 2FA](oauth-2fa.md).
-- The full design log, with every measurement and rejected alternative, stays in `DESIGN.md` in the
-  repository. These pages are the current, curated view.
+- If you're running a server, start at [Operations](operations/index.md), then
+  [Deploy](operations/deploy.md).
+- To move an account here, see [Migration](migration.md).
+- For how identity and keys are protected, see [Keys and security](keys-security.md) and
+  [OAuth and 2FA](oauth-2fa.md).
+- `DESIGN.md` in the repository is the full design log, with every measurement and rejected
+  alternative. These pages only cover how things work today.
