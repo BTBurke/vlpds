@@ -27,19 +27,16 @@ function App() {
     document.title = area === 'account' ? 'Account · vlpds' : area === 'admin' ? 'Console · vlpds' : area === 'migrate' ? 'Move here · vlpds' : `${location.hostname} · vlpds`
   }, [area])
   if (area === 'landing') return <Landing />
+  // the docs link the source repo from their top bar instead
+  if (area === 'docs')
+    return (
+      <Suspense fallback={null}>
+        <DocsApp path={path} />
+      </Suspense>
+    )
   return (
     <>
-      {area === 'account' ? (
-        <AccountApp path={path} />
-      ) : area === 'admin' ? (
-        <AdminApp path={path} />
-      ) : area === 'migrate' ? (
-        <Migrate />
-      ) : (
-        <Suspense fallback={null}>
-          <DocsApp path={path} />
-        </Suspense>
-      )}
+      {area === 'account' ? <AccountApp path={path} /> : area === 'admin' ? <AdminApp path={path} /> : <Migrate />}
       <SiteFooter />
     </>
   )

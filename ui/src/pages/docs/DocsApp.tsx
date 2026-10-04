@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent, type RefObject } from 'react'
 import { loaders, nav, pages, type DocMeta } from 'virtual:vlpds-docs'
-import { Topbar } from '../../components/ui'
+import { Topbar, SOURCE_URL } from '../../components/ui'
 import { Link, navigate } from '../../lib/router'
 import '../../docs.css'
 import { Lightbox, diagramOf, type Diagram } from './Lightbox'
@@ -77,7 +77,11 @@ export function DocsApp({ path }: { path: string }) {
 
   return (
     <>
-      <Topbar where="docs" />
+      <Topbar where="docs">
+        <a href={SOURCE_URL} className="btn sm">
+          GitHub
+        </a>
+      </Topbar>
       <div className="docs">
         <aside className={`docs-nav${navOpen ? ' open' : ''}`} aria-label="Documentation">
           <button className="docs-nav-toggle btn sm" aria-expanded={navOpen} onClick={() => setNavOpen((o) => !o)}>
