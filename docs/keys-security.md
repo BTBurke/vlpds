@@ -3,7 +3,7 @@ title: Keys and security
 section: vlPDS
 order: 8
 status: ready
-summary: "Which keys exist, where they live and how they're wrapped: the KEK (local or Cloud KMS), repo signing keys, the PLC rotation key, recovery keys, peer mTLS and the HTTP security headers."
+summary: "Which keys exist, where they live and how they're wrapped: the KEK (local, Cloud KMS or Vault Transit), repo signing keys, the PLC rotation key, recovery keys, peer mTLS and the HTTP security headers."
 ---
 
 ```hero
@@ -58,7 +58,7 @@ groups:
 
 | Key or secret | Used for | Where it lives | Protected by | Rotated by |
 |---|---|---|---|---|
-| KEK | wrapping the keys below | Cloud KMS (`--gcp-kms-key`) or a 32-byte file (`--kek-file`) | KMS IAM, or file mode 0400 | new KMS version or key, then `rewrap-secrets` |
+| KEK | wrapping the keys below | Cloud KMS (`--gcp-kms-key`), Vault Transit (`--vault-transit-key`) or a 32-byte file (`--kek-file`) | KMS IAM, a Vault policy, or file mode 0400 | new key version or key, then `rewrap-secrets` |
 | Repo signing key (secp256k1, one per account) | commits, service-auth JWTs | account row `a/{did}` | KEK, bound to the DID | admin `updateAccountSigningKey` |
 | Reserved signing key | migrations in (`reserveSigningKey`) | `p/_reserved:{did:key}` | KEK, bound to the did:key | used once |
 | TOTP secret | second factor | `p/{did}` private row | KEK, bound to the DID | the user re-enrolls |
@@ -97,7 +97,8 @@ edges:
 
 The wrapper takes the secret plus associated data (`vlpds-secret-v1`, the purpose, the DID or did:key) and
 produces `vw1.{kid}.{base64url}`. So a wrapped key copied into another account's row, or used for another
-purpose, fails to unwrap. The `kid` names the KEK (`G…` for a Cloud KMS key, `L…` for a local one).
+purpose, fails to unwrap. The `kid` names the KEK (`G…` for a Cloud KMS key, `V…` for a Vault Transit key,
+`L…` for a local one).
 
 - Cloud KMS (production). The secret goes to KMS `encrypt` / `decrypt` with the associated data and
   CRC32C checks. The KEK never leaves KMS, and every unwrap shows up in the KMS audit log. A copy of the
@@ -105,6 +106,12 @@ purpose, fails to unwrap. The `kid` names the KEK (`G…` for a Cloud KMS key, `
   server. Off GCE they come from a service-account JSON key (`--gcp-credentials-file`) that holds only
   `cloudkms.cryptoKeyEncrypterDecrypter` on that one key. `deploy/gcp` has an OpenTofu module that creates
   such a key in a multi-region key ring.
+- Vault Transit (`--vault-transit-key`, Vault 1.13+ or OpenBao). The same model as Cloud KMS, with
+  the associated data sent as Transit's `associated_data` on an AEAD key (aes256-gcm96, aes128-gcm96 or
+  chacha20-poly1305). Older Vaults silently drop that parameter, so a node checks that a wrong AAD fails
+  before it uses the key and refuses to start otherwise. Nodes log in with a Vault Agent token file,
+  AppRole or Kubernetes auth, and need only `update` on the key's `encrypt` and `decrypt` paths
+  ([Vault Transit](operations/kek-and-key-rotation.md#vault-transit)).
 - Local KEK (`--kek-file`). It's XChaCha20-Poly1305 with a random nonce per wrap, which is fine for a
   personal server. Back the file up offline, since it's the only way to read the stored keys. `--dev-mode`
   falls back to a well-known dev KEK, and nodes refuse that KEK outside dev mode.
@@ -112,8 +119,8 @@ purpose, fails to unwrap. The `kid` names the KEK (`G…` for a Cloud KMS key, `
 Unwrapped signing keys are cached per account (the `signing_keys` cache, sized from `--cache-budget-mb`).
 A loaded repo holds its key, so commits never touch the KEK. A key gets unwrapped once per account per
 cache lifetime, at a cold repo load, a proxy service-JWT miss, or `getServiceAuth`. New accounts never
-unwrap, because their key is cached when it's created. A local unwrap costs ~50 µs, and a Cloud KMS unwrap
-adds one round trip (typically 5–30 ms in-region). KMS calls are limited per node to 64 unwraps in flight
+unwrap, because their key is cached when it's created. A local unwrap costs ~50 µs, and a Cloud KMS or
+Vault unwrap adds one round trip (typically 5–30 ms in-region for Cloud KMS). KMS calls are limited per node to 64 unwraps in flight
 (`--kms-concurrency`) and a separate pool of 16 for wraps, with 5 s for each call.
 
 If the key service fails, warm accounts keep writing. A cold account's write gets 503 `KeyUnavailable`

@@ -115,7 +115,9 @@ copy them offline when you set up a deployment:
 - The KEK. If you lose a local KEK file, or a Cloud KMS key gets destroyed, no account can sign.
   Back the local KEK up offline (two copies). For Cloud KMS, use a multi-region key and the maximum
   destroy-scheduled duration, and use IAM to keep `cloudkms.cryptoKeyVersions.destroy` away from
-  node and operator roles.
+  node and operator roles. For Vault Transit, keep `deletion_allowed` false and never `trim` the key.
+  A Transit key can't be exported unless it was created exportable, so the key's only copy is in Vault's
+  storage. Take Vault snapshots (`vault operator raft snapshot save`) on the same schedule as the bucket.
 - The wrapped PLC rotation key. It needs the KEK to open.
 - After a KEK rotation, keep the old KEK (or keep the old KMS version disabled rather than
   destroyed) for as long as any log segment or bucket copy may still hold secrets wrapped under it.

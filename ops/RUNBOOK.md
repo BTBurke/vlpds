@@ -1405,7 +1405,7 @@ operator action on data.
 
 ### VlpdsKeyServiceUnavailable
 
-**Means:** calls to the KEK's key service (Cloud KMS) fail or time out
+**Means:** calls to the KEK's key service (Cloud KMS or Vault Transit) fail or time out
 (`vlpds_kms_requests_total{result="unavailable"}`). The `key service unavailable`
 warn log names the key and the error. Accounts whose signing key is cached keep
 writing. Cold accounts (first write since the node started or took the shard)
@@ -1419,13 +1419,15 @@ firehose and the proxy for warm accounts are unaffected.
 
 **Means:** a wrapped secret failed authentication under its KEK. That's a KEK
 file with the right id but other bytes, a Cloud KMS key that rejects the
-ciphertext, or a corrupt row. That account's writes fail with 500. A blob under a
+ciphertext, a Vault Transit 400 (a version below `min_decryption_version`, a
+ciphertext of another key), or a corrupt row. That account's writes fail with 500. A blob under a
 KEK the node doesn't have at all fails the same way but only logs (`wrapped under
-unknown key-encryption key L…/G…`). That's usually an old KEK retired before the
+unknown key-encryption key L…/G…/V…`). That's usually an old KEK retired before the
 rewrap finished.
 
 **Do:** find the DID in the `secret unwrap failed` / `repo load failed` logs. If
-the kid is unknown, add the old KEK back (`--kek-old-file` / `--gcp-kms-old-key`)
+the kid is unknown, add the old KEK back (`--kek-old-file` / `--gcp-kms-old-key` /
+`--vault-transit-old-key`)
 on every node and rerun the rewrap ([KEK rotation](#kek-rotation)). Otherwise,
 compare the node's KEK config with its peers'. Never "fix" a row by hand.
 
@@ -1613,6 +1615,7 @@ unreadable or empty file, or when the plain form is also set (flag or env).
 | SMTP URLs (credentials) | `VLPDS_EMAIL_SMTP_URL`, `VLPDS_MODERATION_EMAIL_SMTP_URL` | `--email-smtp-url-file`, `--moderation-email-smtp-url-file` / `VLPDS_*_SMTP_URL_FILE` |
 | Rate-limit bypass key | `VLPDS_RATE_LIMIT_BYPASS_KEY` | `--rate-limit-bypass-key-file` / `VLPDS_RATE_LIMIT_BYPASS_KEY_FILE` |
 | KEK, PLC rotation key, GCP credentials | `VLPDS_KEK`, `VLPDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` | `--kek-file`, `--plc-rotation-key-file`, `--gcp-credentials-file` ([KEK provisioning](#kek-provisioning)) |
+| Vault credentials | `VLPDS_VAULT_APPROLE_ROLE_ID` (no env form for the rest) | `--vault-token-file`, `--vault-approle-role-id-file`, `--vault-approle-secret-id-file`, `--vault-k8s-jwt-file` (re-read at every login) |
 
 The Ansible role (`deploy/ansible/roles/vlpds`) writes each one to
 `<vlpds_secrets_path>/<name>` (0400, uid 10001), mounted read-only at
@@ -1645,13 +1648,24 @@ refuses to start without one. Every node of a cluster needs the same KEK set.
   refreshes it before expiry or on a 401.
   Losing this key loses every account's signing key (each would need a PLC
   rotation), so it's part of the backup plan.
+- Vault Transit (Vault 1.13+ or OpenBao). `vault secrets enable transit`,
+  `vault write -f transit/keys/vlpds type=aes256-gcm96`, and a policy with only
+  `update` on `transit/encrypt/vlpds` and `transit/decrypt/vlpds`. Start nodes
+  with `--vault-addr https://vault.example:8200 --vault-transit-key transit/vlpds`
+  plus one auth method: `--vault-token-file` (a Vault Agent sink),
+  `--vault-approle-role-id-file` + `--vault-approle-secret-id-file`, or
+  `--vault-k8s-role`. `--vault-ca-file` for a private CA. The node refuses to
+  start if Vault doesn't enforce `associated_data` (Vault before 1.13, an RSA or
+  derived key). Use the same `--vault-addr` host name on every node, since it's
+  part of the kid. Details and the full policy: docs "KEK and key rotation",
+  "Vault Transit".
 - Local KEK. `openssl rand -out kek.bin 32` (raw 32 bytes, and 64 hex chars or
   base64 also work). Distribute it like the other secrets (sops / Ansible Vault),
   mode 0400. Pass `--kek-file /path/kek.bin` (`VLPDS_KEK_FILE`) or the value in
   `VLPDS_KEK`. Back it up offline, since it's the only way to read the stored
   keys.
 - Check after start. The `secrets at rest` log line prints `kek=` (the current
-  key id, `L…` local or `G…` Cloud KMS) and `unwrap_keks=`. It must match on
+  key id, `L…` local, `G…` Cloud KMS or `V…` Vault) and `unwrap_keks=`. It must match on
   every node. `vlpds_kms_requests_total` shows wraps (account creation) and
   unwraps (cold loads).
 - The node caches unwrapped signing keys (`signing_keys` cache, sized from
@@ -1675,18 +1689,24 @@ configured for unwrap.
    - Cloud KMS, another CryptoKey (or local -> KMS): `--gcp-kms-key NEW
      --gcp-kms-old-key OLD` (or `--gcp-kms-key NEW --kek-file old.bin`, since
      with `--gcp-kms-key` set the local KEK is unwrap-only).
+   - Vault Transit, new version of the same key: `vault write -f
+     transit/keys/vlpds/rotate`, nothing to configure. Wait a minute (nodes
+     re-check the latest version once a minute) before step 2.
+   - Vault Transit, another key or mount (or to/from local or Cloud KMS):
+     `--vault-transit-key NEW --vault-transit-old-key OLD`, or the old Vault key
+     as `--vault-transit-old-key` next to `--gcp-kms-key` / `--kek-file`.
 2. Rewrap on every node, since each covers the shards it owns. Run
    `vlpds admin rewrap-secrets` (every node at once), or per node
    `curl -XPOST -u admin:$ADMIN -H 'content-type: application/json' -d '{}' $NODE/xrpc/vlpds.admin.rewrapSecrets`.
-   For a version rotation inside one CryptoKey, pass `{"checkVersions": true}`
-   (one KMS decrypt per secret). It reports `stale` (rewrapped), `failed` and
+   For a version rotation inside one CryptoKey or Transit key, pass
+   `{"checkVersions": true}` (one decrypt per secret). It reports `stale` (rewrapped), `failed` and
    the first errors. Rewrapping doesn't change keys, emits no events and doesn't
    evict repos. Re-run until `failed` is 0.
 3. Verify on every node with `{"dryRun": true}` (plus `checkVersions` as above)
    until `stale` is 0. Shards that moved during step 2 show up here, so rerun
    step 2.
 4. Only then drop the old KEK (`--kek-old-file`), or disable the old KMS
-   version. **Keep the old KEK material (or keep the version disabled, not
+   version (Vault: raise `min_decryption_version`, never `trim`). **Keep the old KEK material (or keep the version disabled, not
    destroyed) for the backup retention period**, because backups and log
    segments still hold blobs wrapped under it.
 
@@ -1694,7 +1714,9 @@ configured for unwrap.
 
 1. Confirm it with `vlpds_kms_requests_total{result="unavailable"}` on all
    nodes, the `key service unavailable` log (HTTP status or timeout), Google
-   Cloud status, and IAM (a 403 from a removed role looks the same). Clients
+   Cloud status, and IAM (a 403 from a removed role looks the same). On Vault,
+   also check `vault status` (sealed is a 503), the policy, and the auth method
+   (a revoked secret ID or a broken Agent shows as a failed login). Clients
    retry 503s. After a failure, a node fails cold unwraps fast for 1 s before it
    tries KMS again.
 2. **Don't restart nodes and don't move shards** (no rolling deploys, splits or

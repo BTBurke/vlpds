@@ -60,7 +60,8 @@ edges:
   Ansible role passes those as command arguments.
 - Every secret can also come from a file, with a `--<secret>-file` / `VLPDS_*_FILE` form. That
   covers the JWT secret, the admin and internal tokens, the S3 keys, the SMTP URLs, the rate-limit
-  bypass key, the KEK, the PLC rotation key and GCP credentials. Use the files in production, since
+  bypass key, the KEK, the PLC rotation key, GCP credentials and the Vault AppRole role ID (the Vault token,
+  secret ID and service-account token only come from files). Use the files in production, since
   environment variables show up in `docker inspect`. The node refuses to start if a file is empty or
   unreadable, or if both forms are set. The procedure is RUNBOOK "Secrets as files".
 - Where the reference PDS has a setting, its `PDS_*` variable works as a fallback
@@ -251,6 +252,7 @@ has the flags the sections above don't cover.
 | Object store | `--s3-endpoint`, `--s3-bucket`, `--s3-region`, `--s3-access-key[-file]`, `--s3-secret-key[-file]`, `--prefix`, `--store-inflight` (1,024), `--log-store-inflight` (256) |
 | Secrets | `--jwt-secret[-file]`, `--admin-token[-file]`, `--internal-token[-file]` (32+ bytes, all different) |
 | Keys | `--kek[-file]`, `--kek-old[-file]`, `--gcp-kms-key`, `--gcp-kms-old-key`, `--gcp-credentials-file`, `--kms-concurrency` (see [KEK and key rotation](kek-and-key-rotation.md)) |
+| Vault KEK | `--vault-addr`, `--vault-transit-key` (`<mount>/<key>`), `--vault-transit-old-key`, `--vault-namespace`, `--vault-ca-file`, and one auth method: `--vault-token-file`, `--vault-approle-role-id[-file]` with `--vault-approle-secret-id-file` and `--vault-approle-mount` (`approle`), or `--vault-k8s-role` with `--vault-k8s-mount` (`kubernetes`) and `--vault-k8s-jwt-file` (see [Vault Transit](kek-and-key-rotation.md#vault-transit)) |
 | PLC | `--plc-url`, `--plc-mode` (`auto`, `directory`, `unregistered`), `--plc-rotation-key-file`, `--plc-rotation-key-old[-file]`, `--plc-recovery-did-key`, and the one-shot `--wrap-plc-rotation-key` and `--generate-did-key` |
 | Services | `--appview`, `--report-service` (`<url>,<did>`), `--bsky-app-view-cdn-url-pattern`, `--mod-service-did` |
 | Relays | `--crawlers` (`bsky.network`), `--crawl-interval-secs` (1,200). See [Relays and crawling](relays-and-crawling.md). |
