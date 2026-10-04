@@ -287,7 +287,7 @@ fn no_partitions() -> XrpcError {
 
 pub fn router(app: Arc<App>) -> Router {
     let r = Router::new()
-        .route("/xrpc/_health", get(|| async { Json(json!({"version": "vlpds"})) }))
+        .route("/xrpc/_health", get(|| async { Json(json!({"version": crate::version::version()})) }))
         .route("/metrics", get(|| async { metrics::render() }))
         // locally served XRPC methods; debug builds check their output schemas
         .merge(extract::debug_output_layer(

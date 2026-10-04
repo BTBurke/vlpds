@@ -185,6 +185,12 @@ pub fn build_rev() -> &'static str {
     &REV
 }
 
+/// `1.0.0+<rev>` (semver build metadata), as `/xrpc/_health` reports it.
+pub fn version() -> &'static str {
+    static V: LazyLock<String> = LazyLock::new(|| format!("{}+{}", env!("CARGO_PKG_VERSION"), build_rev()));
+    &V
+}
+
 /// The `vlpds_format_errors_total` labels.
 const FORMATS: &[&str] = &["segment", "log_stream", "applied_marker", "cluster_version", "control_object"];
 

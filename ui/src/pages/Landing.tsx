@@ -14,6 +14,7 @@ type Describe = {
 export function Landing() {
   const session = useSession()
   const d = useLoad<Describe>(() => call('com.atproto.server.describeServer'), [])
+  const health = useLoad<{ version?: string }>(() => call('_health'), [])
   const [host, port] = location.host.split(':')
   const info = d.data
   return (
@@ -122,7 +123,9 @@ export function Landing() {
         </aside>
       </main>
       <footer className="footer">
-        <span>vlpds</span>
+        <span title={health.data?.version ? `vlpds ${health.data.version}` : undefined}>
+          vlpds{health.data?.version ? <span className="mono muted"> {health.data.version.replace(/\+(.{0,12}).*/, '+$1')}</span> : null}
+        </span>
         <Link to="/docs">Docs</Link>
         <a href="/xrpc/_health">Health</a>
         <a href="/.well-known/oauth-authorization-server">OAuth metadata</a>

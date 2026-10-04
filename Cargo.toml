@@ -1,6 +1,6 @@
 [package]
 name = "vlpds"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 # tests/ is one binary (tests/all/main.rs), declared below: one link per run
 # instead of one per file.
