@@ -40,7 +40,19 @@ single-node deployment (one 4-vCPU VPS with its data on Cloudflare R2), and it s
 
 ## Quickstart
 
-With Rust, Node and [just](https://github.com/casey/just) installed:
+The quickest way to try it is the published image. This runs an in-memory server in dev mode:
+
+```sh
+docker run --rm -p 2583:2583 ghcr.io/jazware/vlpds --memory --dev-mode --public-url http://127.0.0.1:2583
+```
+
+Open <http://127.0.0.1:2583> for the account pages and <http://127.0.0.1:2583/admin> for the
+console (the dev admin token is `dev-admin-token`).
+
+The image is built for `linux/amd64` and `linux/arm64`. A release like v1.0.0 is tagged `1.0.0`,
+`1.0` and `latest`. `main` follows the main branch, and `sha-<commit>` pins one build of it.
+
+To build from source, with Rust, Node and [just](https://github.com/casey/just) installed:
 
 ```sh
 git clone https://github.com/jazware/vlpds && cd vlpds

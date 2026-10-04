@@ -120,7 +120,7 @@ at any TTL. Details: [Configuration](configuration.md#shards-and-lease-ttl).
 - title: Bucket
   body: "Create it, add the lifecycle rule that aborts incomplete multipart uploads after 1 day, and make a key pair for this bucket only. One prefix is one PDS, so never point two deployments at the same prefix. See [Object store](object-store.md)."
 - title: Image
-  body: "`just docker-push <tag> <registry>/vlpds` builds `linux/amd64` and pushes `<registry>/vlpds:<tag>`. Pin `vlpds_image` to that tag, never `:latest`. The image includes `vlpds-bucket-probe`."
+  body: "The published image is `ghcr.io/jazware/vlpds`, built for `linux/amd64` and `linux/arm64`. Releases get `X.Y.Z`, `X.Y` and `latest` tags, and every commit on main gets `main` and `sha-<commit>`. Pin `vlpds_image` to a release (`ghcr.io/jazware/vlpds:1.0.0`), never `:latest` or `:main`. To run your own build, `just docker-push <tag> <registry>/vlpds` builds `linux/amd64` and pushes it. The image includes `vlpds-bucket-probe`."
 - title: Secrets
   body: "Use `openssl rand -hex 32` for the JWT secret, admin token and internal token (three different values), and for a local KEK, or use Cloud KMS ([KEK and key rotation](kek-and-key-rotation.md#kek-provisioning)). Back up the KEK offline, since it wraps every signing key and isn't in the bucket."
 - title: PLC rotation key
@@ -186,7 +186,7 @@ docker run -d --name vlpds --restart unless-stopped --stop-timeout 90 \
   -e VLPDS_SLATEDB_MANIFEST_POLL=60s \
   -e VLPDS_CACHE_DIR=/var/lib/vlpds/cache -e VLPDS_DISK_CACHE_MB=4096 \
   -e VLPDS_METRICS_LISTEN=0.0.0.0:9583 -e VLPDS_LOG_FORMAT=json \
-  <registry>/vlpds:<tag>
+  ghcr.io/jazware/vlpds:<version>
 ```
 
 - Put a TLS proxy in front that serves the hostname and `*.<handle domain>`, sends everything to
