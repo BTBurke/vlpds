@@ -51,7 +51,7 @@ export function Landing() {
           </div>
           {/* a full page load: /migrate is served with a CSP that lets it reach your current server */}
           <a href="/migrate" className="move-here">
-            <strong>Already on Bluesky?</strong> Move your account here and keep your followers, posts and identity. <span aria-hidden="true">&rarr;</span>
+            Already on Bluesky? Move here <span aria-hidden="true">&rarr;</span>
           </a>
           <div className="facts">
             <dl className="dl">

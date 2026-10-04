@@ -2248,23 +2248,33 @@ table.data.rl-side-table td {
 /* ------------------------------------------------------------ migrate (move an account here) */
 
 .landing .move-here {
-  display: block;
-  margin: -22px 0 36px;
-  padding: 12px 14px;
-  border: 1px solid var(--accent);
-  border-left-width: 4px;
-  border-radius: 5px;
-  background: var(--accent-wash);
-  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin: -16px 0 40px;
+  padding: 14px 22px;
+  border: 2px solid var(--accent);
+  border-radius: 8px;
+  color: var(--accent);
+  font-size: clamp(17px, 2.4vw, 21px);
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
   text-decoration: none;
-  font-size: 14.5px;
-  max-width: 34em;
 }
 .landing .move-here:hover {
-  background: var(--sheet);
+  background: var(--accent-wash);
 }
-.landing .move-here strong {
-  color: var(--accent);
+.landing .move-here span {
+  transition: transform 0.15s ease;
+}
+.landing .move-here:hover span {
+  transform: translateX(4px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .landing .move-here span {
+    transition: none;
+  }
 }
 
 .mig {
