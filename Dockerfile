@@ -49,13 +49,17 @@ ARG VLPDS_FEATURES=""
 # with debug = 0 cargo also strips std's): ~half the image. Symbols stay, so
 # panics and backtraces still name functions.
 ENV CARGO_PROFILE_RELEASE_DEBUG=0
+ARG TARGETARCH
 # Both binaries in one invocation: the probe reuses the crate's compiled lib
 # and its LTO link runs beside vlpds's (+3 s; its own profile recompiled
 # the lib after the vlpds build, +40-55 s).
+# arm64: jemalloc aborts on a kernel page larger than the one it was built
+# for, and arm64 kernels use 4K, 16K (Raspberry Pi 5, Asahi) or 64K pages.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked --bin vlpds --bin vlpds-bucket-probe ${VLPDS_FEATURES:+--features "$VLPDS_FEATURES"} \
+    if [ "$TARGETARCH" = arm64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi \
+    && cargo build --release --locked --bin vlpds --bin vlpds-bucket-probe ${VLPDS_FEATURES:+--features "$VLPDS_FEATURES"} \
     && mkdir -p /out \
     && cp target/release/vlpds target/release/vlpds-bucket-probe /out/ \
     && /out/vlpds --help >/dev/null && /out/vlpds-bucket-probe --help >/dev/null
