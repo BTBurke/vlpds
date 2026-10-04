@@ -1615,7 +1615,7 @@ unreadable or empty file, or when the plain form is also set (flag or env).
 | SMTP URLs (credentials) | `VLPDS_EMAIL_SMTP_URL`, `VLPDS_MODERATION_EMAIL_SMTP_URL` | `--email-smtp-url-file`, `--moderation-email-smtp-url-file` / `VLPDS_*_SMTP_URL_FILE` |
 | Rate-limit bypass key | `VLPDS_RATE_LIMIT_BYPASS_KEY` | `--rate-limit-bypass-key-file` / `VLPDS_RATE_LIMIT_BYPASS_KEY_FILE` |
 | KEK, PLC rotation key, GCP credentials | `VLPDS_KEK`, `VLPDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` | `--kek-file`, `--plc-rotation-key-file`, `--gcp-credentials-file` ([KEK provisioning](#kek-provisioning)) |
-| Vault credentials | `VLPDS_VAULT_APPROLE_ROLE_ID` (no env form for the rest) | `--vault-token-file`, `--vault-approle-role-id-file`, `--vault-approle-secret-id-file`, `--vault-k8s-jwt-file` (re-read at every login) |
+| Vault credentials | `VLPDS_VAULT_APPROLE_ROLE_ID` (no env form for the rest) | `--vault-approle-role-id-file` (read once at startup), `--vault-approle-secret-id-file` and `--vault-k8s-jwt-file` (read at every login), `--vault-token-file` (read every minute and after a 403) |
 
 The Ansible role (`deploy/ansible/roles/vlpds`) writes each one to
 `<vlpds_secrets_path>/<name>` (0400, uid 10001), mounted read-only at
@@ -1654,14 +1654,21 @@ refuses to start without one. Every node of a cluster needs the same KEK set.
   with `--vault-addr https://vault.example:8200 --vault-transit-key transit/vlpds`
   plus one auth method: `--vault-token-file` (a Vault Agent sink),
   `--vault-approle-role-id-file` + `--vault-approle-secret-id-file`, or
-  `--vault-k8s-role`. `--vault-ca-file` for a private CA. The node refuses to
-  start if Vault doesn't enforce `associated_data` (Vault before 1.13, an RSA or
-  derived key), or if Vault answers its startup check with a 403/404 or refuses
-  the login. The error names the path and the likely cause (a missing key, a
-  policy without `encrypt` or `decrypt`, a wrong role or secret ID). A Vault that
-  doesn't answer (down, sealed) doesn't stop the start. The kid doesn't include
-  the address, so changing `--vault-addr` needs no rewrap. Details and the full
-  policy: docs "KEK and key rotation", "Vault Transit".
+  `--vault-k8s-role`. `--vault-ca-file` for a private CA. `--vault-addr` must be
+  https (http only to loopback or in dev mode) and point at the active node or
+  a load balancer in front of it, since standbys' redirects aren't followed.
+  While Vault answers, the node refuses to start if it doesn't enforce
+  `associated_data` (Vault before 1.13, an RSA or derived key), if it answers
+  the startup check with a 403/404 or refuses the login, or if the secret-ID or
+  service-account token file is missing. A refused token file is re-read 3
+  times first. The error names the path and the likely cause (a missing key, a
+  policy without `encrypt` or `decrypt`, a wrong role or secret ID). Unwrap-only
+  keys are checked the same way. A Vault that doesn't answer (down, sealed)
+  doesn't stop the start, unless the PLC rotation key file is Vault-wrapped. The
+  kid doesn't include the address, so changing `--vault-addr` needs no rewrap.
+  Never enable a Vault audit device with `log_raw` (it would log every signing
+  key). The Ansible role doesn't support Vault yet. Details and the full policy:
+  docs "KEK and key rotation", "Vault Transit".
 - Local KEK. `openssl rand -out kek.bin 32` (raw 32 bytes, and 64 hex chars or
   base64 also work). Distribute it like the other secrets (sops / Ansible Vault),
   mode 0400. Pass `--kek-file /path/kek.bin` (`VLPDS_KEK_FILE`) or the value in
@@ -1693,11 +1700,16 @@ configured for unwrap.
      --gcp-kms-old-key OLD` (or `--gcp-kms-key NEW --kek-file old.bin`, since
      with `--gcp-kms-key` set the local KEK is unwrap-only).
    - Vault Transit, new version of the same key: `vault write -f
-     transit/keys/vlpds/rotate`, nothing to configure. Wait a minute (nodes
-     re-check the latest version once a minute) before step 2.
-   - Vault Transit, another key or mount (or to/from local or Cloud KMS):
-     `--vault-transit-key NEW --vault-transit-old-key OLD`, or the old Vault key
-     as `--vault-transit-old-key` next to `--gcp-kms-key` / `--kek-file`.
+     transit/keys/vlpds/rotate`, nothing to configure. The rewrap asks Vault for
+     the latest version before it starts.
+   - Vault Transit, another key or mount (or to/from local or Cloud KMS): two
+     rolls. First add the new key as unwrap-only everywhere
+     (`--vault-transit-old-key NEW`, `--gcp-kms-old-key` or `--kek-old-file`),
+     then make it current with the old one unwrap-only
+     (`--vault-transit-key NEW --vault-transit-old-key OLD`, or the old Vault key
+     as `--vault-transit-old-key` next to `--gcp-kms-key` / `--kek-file`).
+     Moving off Vault needs Vault reachable from every node until the rewrap is
+     done.
 2. Rewrap on every node, since each covers the shards it owns. Run
    `vlpds admin rewrap-secrets` (every node at once), or per node
    `curl -XPOST -u admin:$ADMIN -H 'content-type: application/json' -d '{}' $NODE/xrpc/vlpds.admin.rewrapSecrets`.
@@ -1709,7 +1721,10 @@ configured for unwrap.
    until `stale` is 0. Shards that moved during step 2 show up here, so rerun
    step 2.
 4. Only then drop the old KEK (`--kek-old-file`), or disable the old KMS
-   version (Vault: raise `min_decryption_version`, never `trim`). **Keep the old KEK material (or keep the version disabled, not
+   version (Vault: raise `min_decryption_version` to at most the lowest
+   `minKeyVersions` the rewrap's `--json` output reports across nodes, never
+   `trim`). Before that, rewrap the PLC rotation key files and finish pending
+   signing-key rotations, since `rewrap-secrets` covers neither. **Keep the old KEK material (or keep the version disabled, not
    destroyed) for the backup retention period**, because backups and log
    segments still hold blobs wrapped under it.
 
@@ -1721,7 +1736,8 @@ configured for unwrap.
    also check `vault status` (sealed is a 503), the policy, and the auth method
    (a revoked secret ID or a broken Agent shows as a failed login). A node
    started while Vault was down or sealed logs `key service check deferred to
-   first use` and checks again on its first wrap or unwrap. A node started
+   first use` and checks again on its first wrap or unwrap (a node whose PLC
+   rotation key file is Vault-wrapped can't start then at all). A node started
    while Vault answers with a 403/404 refuses to start instead, so a crash loop
    with `is unusable` in the log is a setup problem (policy, key name, role),
    not an outage. Clients

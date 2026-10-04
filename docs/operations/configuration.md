@@ -63,7 +63,9 @@ edges:
   bypass key, the KEK, the PLC rotation key, GCP credentials and the Vault AppRole role ID (the Vault token,
   secret ID and service-account token only come from files). Use the files in production, since
   environment variables show up in `docker inspect`. The node refuses to start if a file is empty or
-  unreadable, or if both forms are set. The procedure is RUNBOOK "Secrets as files".
+  unreadable, or if both forms are set. The Vault credential files are read later, at each login or token
+  refresh, and a missing `--vault-token-file` only defers the Vault check (a Vault Agent may not have
+  written it yet). The procedure is RUNBOOK "Secrets as files".
 - Where the reference PDS has a setting, its `PDS_*` variable works as a fallback
   (`PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`, `PDS_EMAIL_SMTP_URL`, `PDS_INVITE_INTERVAL`, ...), so
   an existing `pds.env` mostly carries over.
@@ -252,7 +254,7 @@ has the flags the sections above don't cover.
 | Object store | `--s3-endpoint`, `--s3-bucket`, `--s3-region`, `--s3-access-key[-file]`, `--s3-secret-key[-file]`, `--prefix`, `--store-inflight` (1,024), `--log-store-inflight` (256) |
 | Secrets | `--jwt-secret[-file]`, `--admin-token[-file]`, `--internal-token[-file]` (32+ bytes, all different) |
 | Keys | `--kek[-file]`, `--kek-old[-file]`, `--gcp-kms-key`, `--gcp-kms-old-key`, `--gcp-credentials-file`, `--kms-concurrency` (see [KEK and key rotation](kek-and-key-rotation.md)) |
-| Vault KEK | `--vault-addr`, `--vault-transit-key` (`<mount>/<key>`), `--vault-transit-old-key`, `--vault-namespace`, `--vault-ca-file`, and one auth method: `--vault-token-file`, `--vault-approle-role-id[-file]` with `--vault-approle-secret-id-file` and `--vault-approle-mount` (`approle`), or `--vault-k8s-role` with `--vault-k8s-mount` (`kubernetes`) and `--vault-k8s-jwt-file` (see [Vault Transit](kek-and-key-rotation.md#vault-transit)). A node refuses to start if Vault answers its startup check with a 403/404 or refuses the login, and starts anyway if Vault is down or sealed. |
+| Vault KEK | `--vault-addr`, `--vault-transit-key` (`<mount>/<key>`), `--vault-transit-old-key`, `--vault-namespace`, `--vault-ca-file`, and one auth method: `--vault-token-file`, `--vault-approle-role-id[-file]` with `--vault-approle-secret-id-file` and `--vault-approle-mount` (`approle`), or `--vault-k8s-role` with `--vault-k8s-mount` (`kubernetes`) and `--vault-k8s-jwt-file` (see [Vault Transit](kek-and-key-rotation.md#vault-transit)). `--vault-ca-only` trusts only that CA. `--vault-addr` must be https (http only to loopback or in dev mode). A node refuses to start if Vault answers its startup check with a 403/404 or refuses the login, and starts anyway if Vault is down or sealed, unless its PLC rotation key file is Vault-wrapped. |
 | PLC | `--plc-url`, `--plc-mode` (`auto`, `directory`, `unregistered`), `--plc-rotation-key-file`, `--plc-rotation-key-old[-file]`, `--plc-recovery-did-key`, and the one-shot `--wrap-plc-rotation-key` and `--generate-did-key` |
 | Services | `--appview`, `--report-service` (`<url>,<did>`), `--bsky-app-view-cdn-url-pattern`, `--mod-service-did` |
 | Relays | `--crawlers` (`bsky.network`), `--crawl-interval-secs` (1,200). See [Relays and crawling](relays-and-crawling.md). |

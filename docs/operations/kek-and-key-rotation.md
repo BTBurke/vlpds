@@ -90,20 +90,29 @@ edges:
 vlpds can use a Transit key on HashiCorp Vault or OpenBao as the KEK, in place of Cloud KMS. It's the same
 model as Cloud KMS: the key never leaves Vault, every unwrap is a Vault call (and an audit log entry if you
 have an audit device), and a copy of the bucket is useless without decrypt permission on the key. A node
-uses one key service at a time, so `--vault-transit-key` and `--gcp-kms-key` can't both be set.
+uses one key service at a time, so `--vault-transit-key` and `--gcp-kms-key` can't both be set. The Ansible
+role doesn't support Vault yet (its checks want `vlpds_kek_hex` or `vlpds_gcp_kms_key`), so set the flags
+yourself for now.
 
 vlpds binds every wrapped secret to its purpose and DID through Transit's `associated_data`. Vault added
-that parameter in 1.13. Older Vaults accept it and drop it with only a warning, so a blob copied into
-another account's row would unwrap there. So a node checks before it uses the current key. It wraps a
-random value under one AAD and requires the decrypt under another AAD to fail. A Vault that drops the AAD,
-or a key that can't take it (RSA or a derived key), stops the node at startup with an
-error naming the key. Every Transit response is also checked for the "ignored parameters" warning.
+that parameter in 1.13. Older Vaults accept it and drop it (with a warning on some key types, silently on
+others), so a blob copied into another account's row would unwrap there. So a node checks every key
+before it uses it. The current key wraps a random value under one AAD, and the decrypt under another AAD
+has to fail. An unwrap-only key gets the same check on its first unwrap, with the blob it's unwrapping. A
+Vault that drops the AAD, or a key that can't take it (RSA or a derived key), is refused with an error
+naming the key. Every Transit response is also checked for the "ignored parameters" warning, and a passed
+key is checked again in the background every hour.
 
-The check also catches setup mistakes. If Vault answers it with a 403 or 404 (a key that doesn't exist, a
-policy missing `encrypt` or `decrypt`, a mount name typo) or refuses the login (a wrong role or secret ID),
-the node refuses to start and names the path and the likely cause. If Vault doesn't answer (a connection
-error, a timeout, a sealed Vault's 503), the node starts anyway and runs the check before its first wrap or
-unwrap. So a Vault restart can't crash-loop vlpds. Once a node is running, the same 403s count as an
+At startup the check also catches setup mistakes, as long as Vault answers. A 403 or 404 (a key that
+doesn't exist, a policy missing `encrypt` or `decrypt`, a mount name typo), a refused login (a wrong role
+or secret ID) or a missing secret-ID or service-account token file stops the node with the path and the
+likely cause. Unwrap-only keys are probed too, with a decrypt of a junk ciphertext that the policy must let
+through to Transit. A token file whose token Vault refuses is read again 3 times, 2 s apart, before the node
+gives up, because a Vault Agent sink on a persistent volume can still hold the last run's token. If Vault
+doesn't answer (a connection error, a timeout, a sealed Vault's 503) or the token file isn't there yet,
+the node starts anyway and runs the check, in the background with 15 s for it, before the key's first
+use. So a Vault restart can't crash-loop vlpds, unless the PLC rotation key file is wrapped under Vault:
+that file is unwrapped at startup and needs Vault then. Once a node is running, the same 403s count as an
 outage (503) and never stop it.
 
 ```steps
@@ -114,10 +123,15 @@ outage (503) and never stop it.
 - title: Pick an auth method
   body: "A token file, AppRole or Kubernetes (below). Exactly one."
 - title: Point the nodes at it
-  body: "`--vault-addr https://vault.example:8200 --vault-transit-key transit/vlpds`, the auth flags, and `--vault-ca-file` if Vault's certificate comes from a private CA. Add `--vault-namespace` on Vault Enterprise or OpenBao namespaces."
+  body: "`--vault-addr https://vault.example:8200 --vault-transit-key transit/vlpds` and the auth flags. Add `--vault-ca-file` if Vault's certificate comes from a private CA (and `--vault-ca-only` to trust nothing else), and `--vault-namespace` on Vault Enterprise or OpenBao namespaces."
 - title: Check
   body: "The `vault transit key` startup line maps the kid to the key and the address (`kid=V… key=vault:transit/vlpds addr=https://vault.example:8200`), and `secrets at rest` shows `kek=V…`. The kid must match on every node."
 ```
+
+`--vault-addr` must be `https://`, except to a loopback address or in `--dev-mode`. Point it at the active
+node or at a load balancer that only sends to the active node. vlpds doesn't follow redirects, so a
+standby's 307 looks like an outage. Vault calls ignore `HTTP_PROXY` and `HTTPS_PROXY`, so a proxy set for
+other egress never sees key traffic.
 
 ```hcl
 # vlpds-kek.hcl
@@ -127,13 +141,19 @@ path "transit/decrypt/vlpds" { capabilities = ["update"] }
 # Optional. Lets the startup check name a wrong key type instead of only failing the AAD test.
 path "transit/keys/vlpds" { capabilities = ["read"] }
 
-# AppRole and Kubernetes tokens renew themselves. This is in Vault's `default` policy,
-# so it's only needed if the role sets token_no_default_policy.
+# AppRole and Kubernetes tokens renew and revoke themselves. Both are in Vault's
+# `default` policy, so they're only needed if the role sets token_no_default_policy.
 path "auth/token/renew-self" { capabilities = ["update"] }
+path "auth/token/revoke-self" { capabilities = ["update"] }
 ```
 
 The login endpoints (`auth/approle/login`, `auth/kubernetes/login`) need no policy. While you move to another
 key, also grant `update` on the old key's `decrypt` path.
+
+> [!WARNING]
+> Never enable a Vault audit device with `log_raw`. Transit's request and response bodies hold the
+> plaintext, so every signing key a node wraps or unwraps would be written to the audit log. The default
+> (hashed values) is fine.
 
 The kid is a hash of the namespace, mount and key name. It has no version in it, so Transit's `rotate`
 keeps it. It has no address in it either, so you can move `--vault-addr` to a new host name, a load
@@ -145,8 +165,8 @@ key to vlpds, so point every node at the cluster that holds the real key.
 
 | Method | Flags | What vlpds does |
 |---|---|---|
-| Token file | `--vault-token-file` | Reads the file at start, every minute and after a 403. Pair it with a Vault Agent `auto_auth` sink that renews and rewrites the token. |
-| AppRole | `--vault-approle-role-id[-file]`, `--vault-approle-secret-id-file`, `--vault-approle-mount` (`approle`) | Logs in at first use and caches the token. It renews the token with `renew-self` before it expires (a third of the TTL early, at most a minute) and logs in again when the token isn't renewable or a renewal comes back capped by `token_max_ttl`. The secret ID file is read at every login, so you can replace it without a restart. |
+| Token file | `--vault-token-file` | Reads the file at first use, every minute and after a 403. Pair it with a Vault Agent `auto_auth` sink that renews and rewrites the token. |
+| AppRole | `--vault-approle-role-id[-file]`, `--vault-approle-secret-id-file`, `--vault-approle-mount` (`approle`) | Logs in at first use and caches the token. It renews the token with `renew-self` before it expires (a third of the TTL early, at most a minute) and logs in again when the token isn't renewable or a renewal comes back capped by `token_max_ttl`. The secret ID file is read at every login, so you can replace it without a restart. The role ID is read once at startup. |
 | Kubernetes | `--vault-k8s-role`, `--vault-k8s-mount` (`kubernetes`), `--vault-k8s-jwt-file` (the pod's service-account token) | Same as AppRole, logging in with the service-account token. The token file is read at every login, since projected tokens rotate. |
 
 For AppRole, something like `vault write auth/approle/role/vlpds token_policies=vlpds-kek token_ttl=1h
@@ -156,31 +176,46 @@ token_max_ttl=24h`, then `vault read -field=role_id auth/approle/role/vlpds/role
 (`bound_service_account_names=vlpds bound_service_account_namespaces=pds token_policies=vlpds-kek`).
 
 There's no flag for a token value. Tokens, secret IDs and service-account tokens are only read from files,
-and none of them is ever logged. On a 403 (an expired or revoked token, a rotated Agent token) a node logs
-in or re-reads the file once and retries. If that fails too, the call fails as unavailable.
+none of them is ever logged, and a node warns once if one of the files is world-readable. On a 403 (an
+expired or revoked token, a rotated Agent token) a node logs in or re-reads the file once and retries.
+Many calls refused at once share that one login, and a node logs in again this way at most every 5 s. A
+token vlpds replaces is revoked. If a refresh fails while the token is still valid, the token keeps
+serving until it expires.
 
 ### Rotation
 
 `vault write -f transit/keys/vlpds/rotate` makes a new key version current, with nothing to change on the
 nodes. New wraps use the new version right away. A blob under an older version than the latest one a node
-has seen counts as stale. A node learns the latest version from its own wraps, or with one dummy encrypt
-when an unwrap finds its answer is over a minute old. So wait a minute after `rotate`, then run
-`vlpds admin rewrap-secrets --check-versions` (one decrypt per secret) until a dry run shows `stale` 0
-everywhere. Then you can retire the old version with `vault write transit/keys/vlpds/config
-min_decryption_version=N`. That's reversible, unlike `trim`. Blobs under older versions then fail as
-rejected, and log segments still hold some until retention deletes them, so don't trim.
+knows of counts as stale. An unwrap never waits to find out: a node learns the latest version from its own
+wraps and from a dummy encrypt in the background about once a minute. `rewrap-secrets` asks Vault itself
+before it starts and fails if it can't, so run `vlpds admin rewrap-secrets --check-versions` (one decrypt
+per secret) any time after `rotate`, and repeat it until a dry run shows `stale` 0 everywhere.
 
-To move to another key or mount (or between Vault and Cloud KMS or a local KEK), roll the nodes with the new
-key as current and the old one unwrap-only, then rewrap without `--check-versions`:
+The rewrap's `--json` output has `minKeyVersions`, the lowest version each node still stores per kid (read
+from the `vault:vN:` prefixes, no decrypts). Once it shows the new version on every node, two more things
+need the new version before you retire the old one, since `rewrap-secrets` doesn't cover them:
 
-| From → to | Flags during the move |
-|---|---|
-| local → Vault | `--vault-transit-key transit/vlpds --kek-file old.bin` |
-| Vault key A → key B | `--vault-transit-key transit2/vlpds --vault-transit-old-key transit/vlpds` |
-| Vault → Cloud KMS | `--gcp-kms-key projects/… --vault-transit-old-key transit/vlpds` (plus the Vault address and auth) |
-| Vault → local | `--kek-file new.bin --vault-transit-old-key transit/vlpds` |
+- the PLC rotation key files. Pipe each through `vlpds --wrap-plc-rotation-key` and roll the result out.
+- signing-key rotations still pending (re-run `vlpds admin rotate-keys` for them).
+
+Then retire the old version with `vault write transit/keys/vlpds/config min_decryption_version=N`, with N at
+most the lowest `minKeyVersions` across nodes. That's reversible, unlike `trim`. Blobs under older versions
+then fail as rejected, and log segments still hold some until retention deletes them, so don't trim.
+
+To move to another key or mount (or between Vault and Cloud KMS or a local KEK), roll the change out in two
+steps. First add the new key everywhere as unwrap-only, then make it current everywhere. That way no node
+ever meets a blob under a key it doesn't have, even mid-roll. Then rewrap without `--check-versions`:
+
+| From → to | Step 1 (unwrap-only) | Step 2 (current) |
+|---|---|---|
+| local → Vault | `--kek-file old.bin --vault-transit-old-key transit/vlpds` | `--vault-transit-key transit/vlpds --kek-file old.bin` |
+| Vault key A → key B | `--vault-transit-key transit/a --vault-transit-old-key transit/b` | `--vault-transit-key transit/b --vault-transit-old-key transit/a` |
+| Vault → Cloud KMS | `--vault-transit-key transit/a --gcp-kms-old-key projects/…` | `--gcp-kms-key projects/… --vault-transit-old-key transit/a` |
+| Vault → local | `--vault-transit-key transit/a --kek-old-file new.bin` | `--kek-file new.bin --vault-transit-old-key transit/a` |
 
 `--vault-transit-old-key` takes a comma-separated list. Old keys live on the same Vault, with the same login.
+Moving off Vault still needs Vault reachable from every node for the whole move, since every unwrap of an
+old blob is a Vault decrypt.
 
 ### Vault outage
 
@@ -188,9 +223,10 @@ A Vault outage plays out exactly like a [Cloud KMS outage](#key-service-outage).
 writing, cold writes get 503 `KeyUnavailable`, and a node fails cold unwraps fast for 1 s after a failure.
 Timeouts, connection errors, 5xx (a sealed Vault is 503), 429s, failed logins and a 403 that survives a
 re-login all count as unavailable. Only the startup check treats a 403, a 404 or a refused login as fatal
-(above), and a running node never stops for one. A 400 from Transit counts as rejected and fires `VlpdsSecretUnwrapRejected`.
-That's a wrong AAD, a ciphertext of another key, or a version below `min_decryption_version`. The metrics
-carry `backend="vault"`, and calls share `--kms-concurrency` with 5 s each like Cloud KMS.
+(above), and a running node never stops for one. A 400 from Transit counts as rejected and fires
+`VlpdsSecretUnwrapRejected`. That's a wrong AAD, a ciphertext of another key, or a version below
+`min_decryption_version`. The metrics carry `backend="vault"`, and calls share `--kms-concurrency` with 5 s
+each like Cloud KMS.
 
 Runbook: "KEK provisioning", "Key service (KMS) outage".
 

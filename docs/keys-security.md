@@ -108,9 +108,11 @@ purpose, fails to unwrap. The `kid` names the KEK (`G…` for a Cloud KMS key, `
   such a key in a multi-region key ring.
 - Vault Transit (`--vault-transit-key`, Vault 1.13+ or OpenBao). The same model as Cloud KMS, with
   the associated data sent as Transit's `associated_data` on an AEAD key (aes256-gcm96, aes128-gcm96 or
-  chacha20-poly1305). Older Vaults silently drop that parameter, so a node checks that a wrong AAD fails
-  before it uses the key and refuses to start otherwise. Nodes log in with a Vault Agent token file,
-  AppRole or Kubernetes auth, and need only `update` on the key's `encrypt` and `decrypt` paths
+  chacha20-poly1305). Older Vaults drop that parameter (some with a warning, some silently), so a node
+  checks that a wrong AAD fails before it uses each key, and refuses the key otherwise (at startup, if
+  Vault answers then). Nodes log in with a Vault Agent token file, AppRole or Kubernetes auth, over https,
+  and need only `update` on the key's `encrypt` and `decrypt` paths. Never enable a Vault audit device
+  with `log_raw`, which would log the plaintext keys
   ([Vault Transit](operations/kek-and-key-rotation.md#vault-transit)).
 - Local KEK (`--kek-file`). It's XChaCha20-Poly1305 with a random nonce per wrap, which is fine for a
   personal server. Back the file up offline, since it's the only way to read the stored keys. `--dev-mode`
